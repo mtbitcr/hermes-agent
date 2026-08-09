@@ -2588,12 +2588,14 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "acknowledged")
+    __slots__ = ("event", "data", "result", "reason", "acknowledged", "approval_id")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
         self.data = dict(data)
         self.data.setdefault("request_id", uuid.uuid4().hex)
+        self.approval_id = str(self.data.get("approval_id") or self.data["request_id"])
+        self.data["approval_id"] = self.approval_id
         self.acknowledged = False
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
         # Optional free-text reason supplied with an explicit deny
@@ -2634,7 +2636,8 @@ def unregister_gateway_notify(session_key: str) -> None:
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
-                             request_id: Optional[str] = None) -> int:
+                             request_id: Optional[str] = None,
+                             approval_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -2652,15 +2655,28 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if request_id:
-            targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
+        if request_id and approval_id and request_id != approval_id:
+            return 0
+        selector = approval_id or request_id
+        if selector:
+            target = next(
+                (entry for entry in queue if entry.approval_id == selector or entry.data.get("request_id") == selector),
+                None,
+            )
+            if target is None:
+                return 0
+            if target.data.get("exact_operation") and choice not in ("once", "deny"):
+                return 0
+            queue.remove(target)
+            targets = [target]
+        elif resolve_all:
+            targets = [entry for entry in queue if not entry.data.get("exact_operation")]
             if not targets:
                 return 0
-            queue[:] = [entry for entry in queue if entry not in targets]
-        elif resolve_all:
-            targets = list(queue)
-            queue.clear()
+            queue[:] = [entry for entry in queue if entry.data.get("exact_operation")]
         else:
+            if queue[0].data.get("exact_operation"):
+                return 0
             targets = [queue.pop(0)]
         if not queue:
             _gateway_queues.pop(session_key, None)
@@ -4175,7 +4191,8 @@ def _await_coalesced_leader(session_key: str, leader, approval_data: dict,
 
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
-                            *, surface: str = "gateway") -> dict:
+                            *, surface: str = "gateway",
+                            timeout_seconds: Optional[float] = None) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
@@ -4215,7 +4232,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         for existing in _gateway_queues.get(session_key, []):
             data = existing.data
             if (
-                data.get("command") == approval_data.get("command")
+                not approval_data.get("exact_operation")
+                and data.get("command") == approval_data.get("command")
                 and list(data.get("pattern_keys") or [])
                 == list(approval_data.get("pattern_keys") or [])
             ):
@@ -4276,7 +4294,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # every ~10s to the agent's inactivity tracker — otherwise the gateway
     # watchdog kills the agent while the user is still responding. Mirrors
     # _wait_for_process() cadence.
-    timeout = _get_approval_timeout()
+    timeout = _get_approval_timeout() if timeout_seconds is None else timeout_seconds
 
     try:
         from tools.environments.base import touch_activity_if_due
@@ -4337,6 +4355,54 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         choice=_outcome,
     )
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+
+
+
+def request_exact_operation_approval(
+    session_key: str,
+    *,
+    operation: str,
+    payload_digest: str,
+    actor: str,
+    profile: str,
+    description: str,
+    timeout_seconds: Optional[float] = None,
+) -> dict:
+    """Require one fresh human decision for one owner-workspace mutation.
+
+    The confirmation is bound to the exact operation, canonical payload digest,
+    trusted actor, profile, and gateway session. It never consults YOLO, session,
+    permanent, or cached approvals. Exact entries require their opaque request id
+    and accept only once or deny; FIFO and bulk approval cannot satisfy them.
+    Missing UI delivery or timeout fails closed.
+    """
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(session_key)
+    if notify_cb is None:
+        return {"approved": False, "reason": "no_approval_surface"}
+
+    approval_data = {
+        "exact_operation": True,
+        "operation": operation,
+        "payload_digest": payload_digest,
+        "actor": actor,
+        "profile": profile,
+        "description": description,
+        "command": description,
+    }
+    outcome = _await_gateway_decision(
+        session_key,
+        notify_cb,
+        approval_data,
+        surface="owner_workspace",
+        timeout_seconds=timeout_seconds,
+    )
+    if not outcome.get("resolved"):
+        return {"approved": False, "reason": "timeout"}
+    choice = outcome.get("choice")
+    if choice != "once":
+        return {"approved": False, "reason": choice or "deny"}
+    return {"approved": True, "reason": None}
 
 
 def check_all_command_guards(command: str, env_type: str,

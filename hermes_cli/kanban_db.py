@@ -965,12 +965,31 @@ def write_board_metadata(
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    _atomic_write_text(path, json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` via same-directory tmp file + fsync + ``os.replace``.
+
+    ``board.json`` is a durable publication point crash-recovery flows (e.g.
+    owner-workspace bootstrap) reread to decide whether to reuse an already-
+    published board instead of creating another. A bare ``write_text`` can
+    leave a truncated/partial file behind if the process dies mid-write;
+    ``os.replace`` on the same filesystem is atomic, so readers only ever see
+    the fully-old or fully-new content, never a torn write.
+    """
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 
 def create_board(
@@ -1506,7 +1525,12 @@ CREATE TABLE IF NOT EXISTS task_comments (
     task_id    TEXT NOT NULL,
     author     TEXT NOT NULL,
     body       TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    -- Durable operation identity for idempotent replay (e.g. the
+    -- owner-workspace mutation kernel's actor/profile/idempotency-key
+    -- scoped key). NULL for ordinary comments that don't need dedup.
+    -- See add_comment()'s operation_key parameter.
+    operation_key TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -2839,6 +2863,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+
+    # Durable operation identity for idempotent comment replay (see
+    # add_comment()'s operation_key parameter). Partial unique index: NULL
+    # values (ordinary comments) are exempt, only two rows sharing the same
+    # (task_id, operation_key) collide — which is exactly what dedup wants.
+    # Guarded by a table-existence check (same pattern as kanban_notify_subs
+    # below) so callers that migrate a minimal/partial schema (e.g. a legacy
+    # DB with only `tasks` + `task_events`) don't hit "no such table".
+    comments_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_comments'"
+    ).fetchone() is not None
+    if comments_table_exists:
+        comment_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_comments)")}
+        if "operation_key" not in comment_cols:
+            _add_column_if_missing(conn, "task_comments", "operation_key", "operation_key TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_comments_operation_key "
+            "ON task_comments(task_id, operation_key) WHERE operation_key IS NOT NULL"
+        )
 
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
@@ -5050,12 +5093,29 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection, task_id: str, author: str, body: str,
+    *, operation_key: Optional[str] = None,
 ) -> int:
+    """Append a comment (+ a ``"commented"`` event) and return the comment id.
+
+    ``operation_key``, when given, makes the call idempotent across a
+    crash-and-retry: a prior call with the SAME ``(task_id, operation_key)``
+    returns the ORIGINAL comment's id without inserting a second comment or
+    appending a second event (enforced by a partial unique index — see
+    ``idx_comments_operation_key`` in ``_migrate_add_optional_columns``). A
+    retry whose ``author``/``body`` disagree with the original fails closed
+    instead of silently returning a mismatched comment — callers (e.g. the
+    owner-workspace kernel) that need conflict detection across the exact
+    payload rely on this; their own idempotency-key digest check already
+    rejects a differing payload before ever reaching here, so this is
+    defense in depth, not the primary guard.
+    """
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    author = author.strip()
+    body = body.strip()
     now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
@@ -5064,10 +5124,23 @@ def add_comment(
             "SELECT 1 FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
+        if operation_key:
+            existing = conn.execute(
+                "SELECT id, author, body FROM task_comments "
+                "WHERE task_id = ? AND operation_key = ?",
+                (task_id, operation_key),
+            ).fetchone()
+            if existing is not None:
+                if existing["author"] != author or existing["body"] != body:
+                    raise ValueError(
+                        f"operation_key {operation_key!r} was already used with a "
+                        "different author/body"
+                    )
+                return int(existing["id"])
         cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
+            "INSERT INTO task_comments (task_id, author, body, created_at, operation_key) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, author, body, now, operation_key),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
@@ -5378,6 +5451,40 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
             )
         )
     return out
+
+
+def get_next_event_after(conn: sqlite3.Connection, task_id: str, after_id: int) -> Optional[Event]:
+    """The earliest event for ``task_id`` with ``id > after_id``, if any.
+
+    ``task_events.id`` is a single AUTOINCREMENT sequence shared by every
+    task on the board, so it is NOT contiguous per task (another task's
+    event insert between two of THIS task's events consumes an id without
+    advancing this task's own revision). A replay caller holding
+    ``expected_revision`` (this task's own last-seen revision) therefore
+    cannot assume its own next event landed at exactly
+    ``expected_revision + 1`` — it must ask for "whatever this task's very
+    next event actually was", which is what this returns. Used by
+    idempotent-replay callers (e.g. the owner-workspace kernel) to recognize
+    whether a specific past mutation on this task already committed.
+    """
+    row = conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? AND id > ? ORDER BY id ASC LIMIT 1",
+        (task_id, after_id),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else None
+    except Exception:
+        payload = None
+    return Event(
+        id=row["id"],
+        task_id=row["task_id"],
+        kind=row["kind"],
+        payload=payload,
+        created_at=row["created_at"],
+        run_id=(int(row["run_id"]) if "run_id" in row.keys() and row["run_id"] is not None else None),
+    )
 
 
 def _append_event(
@@ -8617,6 +8724,93 @@ def decompose_triage_task(
     if auto_promote:
         recompute_ready(conn)
     return child_ids
+
+
+def task_event_revision(conn: sqlite3.Connection, task_id: str) -> int:
+    """Monotonic per-task revision: the highest ``task_events.id`` recorded
+    for ``task_id`` (0 if the task has no events yet — cannot happen for a
+    task that exists, since ``create_task`` always appends a ``"created"``
+    event in the same transaction).  Callers needing optimistic
+    concurrency control (compare-and-swap on status AND "nothing else about
+    this task changed since I last read it") pass this back as
+    ``expected_revision``; see :func:`cas_transition_task`.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS rev FROM task_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return int(row["rev"]) if row else 0
+
+
+def cas_transition_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_status: str,
+    expected_revision: int,
+    to_status: str,
+    event_kind: str = "cas_transition",
+    event_payload: Optional[dict] = None,
+) -> dict:
+    """Generic compare-and-swap status move, guarded by BOTH status and
+    event-revision, in the existing write transaction.
+
+    Unlike every other transition helper in this module (``claim_task``,
+    ``complete_task``, ``archive_task``, ...) — which each encode one fixed,
+    known-safe status pair — this is the ONE place a caller may request an
+    arbitrary ``expected_status -> to_status`` move. It exists so a generic
+    caller (the owner-workspace kernel) never has to reach past this module's
+    public surface into ``_append_event``/``_end_run`` to build its own
+    ad-hoc status-writing path — that would be exactly the kind of private
+    direct-status bypass this module's CAS discipline (see ``write_txn``'s
+    docstring) exists to prevent.
+
+    Returns a snapshot dict: ``{"moved": bool, "status": str, "revision": int}``.
+    ``moved`` is False when the current ``(status, revision)`` didn't match
+    the expectation — a conflict — in which case ``status``/``revision``
+    reflect the CURRENT row so the caller can hand back an authoritative
+    snapshot instead of guessing. Never raises for a plain conflict; raises
+    ``ValueError`` only for an unknown task id.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        current_status = row["status"]
+        current_revision = task_event_revision(conn, task_id)
+        if current_status != expected_status or current_revision != expected_revision:
+            return {
+                "moved": False,
+                "status": current_status,
+                "revision": current_revision,
+            }
+        cur = conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ? AND status = ?",
+            (to_status, task_id, expected_status),
+        )
+        if cur.rowcount != 1:
+            # Cannot happen while holding the IMMEDIATE write lock for the
+            # whole block above, but never silently pretend success.
+            return {
+                "moved": False,
+                "status": conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (task_id,),
+                ).fetchone()["status"],
+                "revision": task_event_revision(conn, task_id),
+            }
+        run_id = None
+        if to_status == "archived":
+            run_id = _end_run(
+                conn, task_id,
+                outcome="reclaimed", status="reclaimed",
+                summary=(event_payload or {}).get("summary")
+                or "task archived via cas_transition_task",
+            )
+        _append_event(conn, task_id, event_kind, event_payload, run_id=run_id)
+        new_revision = task_event_revision(conn, task_id)
+    return {"moved": True, "status": to_status, "revision": new_revision}
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:

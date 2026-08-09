@@ -77,6 +77,114 @@ def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> lis
     return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
 
 
+# ---------------------------------------------------------------------------
+# Per-profile ``gateway.api_server.allowed_routes`` least-privilege gate.
+#
+# Resolved fresh per request (never cached) from the profile-scoped
+# config.yaml so a multiplexed /p/<profile>/ request is gated by ITS OWN
+# profile's setting, not the listener-owning default profile's.
+# ---------------------------------------------------------------------------
+
+_ROUTES_UNRESTRICTED = "unrestricted"
+_ROUTES_DENY_ALL = "deny_all"
+_ROUTES_ALLOWLIST = "allowlist"
+
+# Always reachable regardless of ``allowed_routes`` — the liveness probe.
+_ALWAYS_ALLOWED_PATHS = ("/health",)
+
+
+def _resolve_api_server_allowed_routes() -> "tuple[str, list[str]]":
+    """Resolve ``gateway.api_server.allowed_routes`` for the CURRENT profile.
+
+    Returns ``(mode, patterns)``:
+      - ``(_ROUTES_UNRESTRICTED, [])`` — key omitted/``None``, OR the
+        intentionally-supported empty list/tuple. No gating.
+      - ``(_ROUTES_DENY_ALL, [])`` — an explicit malformed falsey value
+        (``False``, ``0``, ``{}``, ``""``), any other malformed type/entry,
+        or a config-load failure. Only ``/health`` is reachable.
+      - ``(_ROUTES_ALLOWLIST, patterns)`` — a non-empty string (single
+        pattern) or list/tuple of non-empty strings.
+
+    Uses ``read_user_config_raw()`` (profile-aware via ``get_hermes_home()``,
+    which the profile-prefix middleware has already scoped by the time this
+    runs) because it RAISES on unparseable YAML — unlike the gateway's usual
+    fail-open loader — so a genuine config-load failure can be distinguished
+    from "key simply not present" and denied closed, per contract.
+    """
+    try:
+        from hermes_cli.config import read_user_config_raw
+
+        raw = read_user_config_raw()
+    except Exception:
+        return (_ROUTES_DENY_ALL, [])
+    if not isinstance(raw, dict):
+        return (_ROUTES_DENY_ALL, [])
+
+    gateway_cfg = raw.get("gateway")
+    if gateway_cfg is None:
+        return (_ROUTES_UNRESTRICTED, [])
+    if not isinstance(gateway_cfg, dict):
+        return (_ROUTES_DENY_ALL, [])
+
+    api_server_cfg = gateway_cfg.get("api_server")
+    if api_server_cfg is None:
+        return (_ROUTES_UNRESTRICTED, [])
+    if not isinstance(api_server_cfg, dict):
+        return (_ROUTES_DENY_ALL, [])
+
+    if "allowed_routes" not in api_server_cfg:
+        return (_ROUTES_UNRESTRICTED, [])
+    value = api_server_cfg["allowed_routes"]
+
+    if value is None:
+        return (_ROUTES_UNRESTRICTED, [])
+    if isinstance(value, bool):
+        # bool is an int subclass — check before the general int/str/etc.
+        # fallthrough so True/False both land here (True is not a valid
+        # list/string either — malformed, deny-all).
+        return (_ROUTES_DENY_ALL, [])
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return (_ROUTES_UNRESTRICTED, [])
+        patterns: list[str] = []
+        for entry in value:
+            if not isinstance(entry, str) or not entry.strip():
+                return (_ROUTES_DENY_ALL, [])
+            patterns.append(entry.strip())
+        return (_ROUTES_ALLOWLIST, patterns)
+    if isinstance(value, str):
+        if value == "":
+            return (_ROUTES_DENY_ALL, [])
+        return (_ROUTES_ALLOWLIST, [value])
+    # int (incl. 0), float, dict (incl. {}), or any other type: malformed.
+    return (_ROUTES_DENY_ALL, [])
+
+
+def _owner_workspace_toolset_enabled(user_config: dict) -> bool:
+    """``gateway.api_server.owner_workspace.enabled`` — default OFF.
+
+    Fail-open to False on any resolution error: an owner-mutation surface
+    must never appear because a config read hiccuped.
+    """
+    try:
+        from hermes_cli.config import cfg_get
+
+        return bool(cfg_get(user_config, "gateway", "api_server", "owner_workspace", "enabled", default=False))
+    except Exception:
+        return False
+
+
+def _route_matches_any(path: str, patterns: "list[str]") -> bool:
+    """Segment-aware prefix match: ``/v1/runs`` matches itself and
+    descendants (``/v1/runs/abc``) but never a sibling with a shared
+    string prefix (``/v1/runs-evil``)."""
+    for pattern in patterns:
+        pat = pattern.rstrip("/") or "/"
+        if path == pat or path.startswith(pat + "/"):
+            return True
+    return False
+
+
 try:
     from aiohttp import web
     AIOHTTP_AVAILABLE = True
@@ -2050,6 +2158,44 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return profile_prefix_middleware
 
+    def _make_route_allowlist_middleware(self):
+        """Enforce ``gateway.api_server.allowed_routes`` for least privilege.
+
+        Runs AFTER the profile-prefix middleware (later in ``mws``) so
+        ``get_hermes_home()`` — and therefore config resolution — is already
+        scoped to the request's profile for a multiplexed ``/p/<profile>/``
+        call. Exactly one multiplex prefix is stripped before matching, per
+        contract: a route is gated the same way whether reached natively or
+        via its ``/p/<profile>/`` mirror.
+        """
+
+        @web.middleware
+        async def route_allowlist_middleware(request: "web.Request", handler):
+            path = request.path
+            prefix_profile = request.match_info.get("profile")
+            if prefix_profile is not None:
+                stripped = path[len(f"/p/{prefix_profile}"):]
+                path = stripped or "/"
+
+            if path in _ALWAYS_ALLOWED_PATHS:
+                return await handler(request)
+
+            mode, patterns = _resolve_api_server_allowed_routes()
+            if mode == _ROUTES_UNRESTRICTED:
+                return await handler(request)
+            if mode == _ROUTES_ALLOWLIST and _route_matches_any(path, patterns):
+                return await handler(request)
+
+            return web.json_response(
+                _openai_error(
+                    "Route not permitted for this profile",
+                    code="route_not_allowed",
+                ),
+                status=403,
+            )
+
+        return route_allowlist_middleware
+
     def _http_route_table(self) -> List[tuple]:
         """Return (method, path, handler) rows registered by ``connect()``.
 
@@ -2892,6 +3038,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if _owner_workspace_toolset_enabled(user_config):
+            # The ONLY place the owner_workspace toolset is folded into an
+            # agent's schema — absent from _HERMES_CORE_TOOLS and every
+            # composite in toolsets.py, so no other platform can reach it
+            # even if a profile's generic `toolsets:` config names it.
+            enabled_toolsets = sorted(set(enabled_toolsets) | {"owner_workspace"})
 
         max_iterations = _current_max_iterations()
 
@@ -6815,7 +6967,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
+                            smart_denied=bool(event.get("smart_denied"))
+                            or bool(event.get("exact_operation")),
                             allow_permanent=event.get("allow_permanent") is not False,
                         ),
                     })
@@ -7162,6 +7315,9 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        approval_id = body.get("approval_id")
+        if approval_id is not None:
+            approval_id = str(approval_id).strip() or None
         try:
             from tools.approval import resolve_gateway_approval
 
@@ -7169,6 +7325,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
+                approval_id=approval_id,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
@@ -7425,6 +7582,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 mw
                 for mw in (
                     self._make_profile_prefix_middleware(),
+                    self._make_route_allowlist_middleware(),
                     cors_middleware,
                     body_limit_middleware,
                     security_headers_middleware,

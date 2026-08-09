@@ -2407,7 +2407,7 @@ def _get_platform_tools(
     include_default_mcp_servers: bool = True,
 ) -> Set[str]:
     """Resolve which individual toolset names are enabled for a platform."""
-    from toolsets import resolve_toolset, TOOLSETS
+    from toolsets import resolve_toolset, get_kernel_gated_toolsets, TOOLSETS
 
     platform_toolsets = config.get("platform_toolsets") or {}
     toolset_names = platform_toolsets.get(platform)
@@ -2429,6 +2429,19 @@ def _get_platform_tools(
     # YAML may parse bare numeric names (e.g. ``12306:``) as int.
     # Normalise to str so downstream sorted() never mixes types.
     toolset_names = [str(ts) for ts in toolset_names]
+
+    # Kernel-gated toolsets (e.g. "owner_workspace") are reachable ONLY
+    # through their dedicated code-level enablement path — never via
+    # generic `platform_toolsets` config naming, on ANY platform (including
+    # api_server: that platform's admitted path is the separate
+    # `_owner_workspace_toolset_enabled()` union in api_server.py, applied
+    # AFTER this function returns). Stripping the name here — before the
+    # "explicit passthrough" step below — closes the leak for every caller
+    # of this function (CLI, cron, every messaging platform, TUI, ...) in
+    # one place instead of at each call site.
+    kernel_gated = get_kernel_gated_toolsets()
+    if kernel_gated:
+        toolset_names = [ts for ts in toolset_names if ts not in kernel_gated]
 
     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
     plugin_ts_keys = _get_plugin_toolset_keys()

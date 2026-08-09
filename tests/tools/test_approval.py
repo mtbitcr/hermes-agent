@@ -1782,3 +1782,111 @@ class TestCliApprovalTimeoutClassifiedSeparately:
         assert result.get("user_consent") is False
         assert "timed out without user response" in result["message"]
         assert "Silence is not consent" in result["message"]
+
+
+class TestExactOperationApprovalResolution:
+    """Contract tests for approval_id-scoped resolution of exact-operation
+    entries (owner-workspace mutation confirmations) vs. ordinary FIFO."""
+
+    def setup_method(self):
+        from tools import approval as mod
+
+        self.mod = mod
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+
+    def _enqueue_exact(self, session_key: str):
+        from tools import approval as mod
+
+        entry_ids = []
+        mod.register_gateway_notify(session_key, lambda data: entry_ids.append(data["approval_id"]))
+
+        import threading
+
+        result_box = {}
+
+        def _run():
+            result_box["outcome"] = mod._await_gateway_decision(
+                session_key,
+                mod._gateway_notify_cbs[session_key],
+                {"exact_operation": True, "operation": "op", "payload_digest": "d"},
+                surface="owner_workspace",
+                timeout_seconds=5,
+            )
+
+        t = threading.Thread(target=_run)
+        t.start()
+        # Wait for the entry to actually land in the queue before returning.
+        import time as _time
+
+        deadline = _time.monotonic() + 2
+        while not entry_ids and _time.monotonic() < deadline:
+            _time.sleep(0.005)
+        return t, entry_ids[0], result_box
+
+    def test_missing_approval_id_never_resolves_exact_entry(self):
+        mod = self.mod
+        session_key = "sess-exact-missing"
+        t, aid, box = self._enqueue_exact(session_key)
+        n = mod.resolve_gateway_approval(session_key, "once")  # no approval_id → FIFO
+        assert n == 0
+        n = mod.resolve_gateway_approval(session_key, "once", approval_id=aid)
+        assert n == 1
+        t.join()
+        assert box["outcome"]["choice"] == "once"
+
+    def test_mismatched_and_stale_ids_resolve_nothing(self):
+        mod = self.mod
+        session_key = "sess-exact-mismatch"
+        t, aid, box = self._enqueue_exact(session_key)
+        assert mod.resolve_gateway_approval(session_key, "once", approval_id="not-a-real-id") == 0
+        assert mod.resolve_gateway_approval(session_key, "once", approval_id=aid) == 1
+        t.join()
+        # Already consumed — reusing the same id now resolves nothing.
+        assert mod.resolve_gateway_approval(session_key, "once", approval_id=aid) == 0
+
+    def test_exact_entry_rejects_non_once_deny_choices(self):
+        mod = self.mod
+        session_key = "sess-exact-choice"
+        t, aid, box = self._enqueue_exact(session_key)
+        assert mod.resolve_gateway_approval(session_key, "always", approval_id=aid) == 0
+        assert mod.resolve_gateway_approval(session_key, "session", approval_id=aid) == 0
+        assert mod.resolve_gateway_approval(session_key, "deny", approval_id=aid) == 1
+        t.join()
+        assert box["outcome"]["choice"] == "deny"
+
+    def test_resolve_all_excludes_exact_operation_entries(self):
+        mod = self.mod
+        session_key = "sess-exact-resolve-all"
+        t, aid, box = self._enqueue_exact(session_key)
+        n = mod.resolve_gateway_approval(session_key, "deny", resolve_all=True)
+        assert n == 0
+        assert mod.resolve_gateway_approval(session_key, "once", approval_id=aid) == 1
+        t.join()
+        assert box["outcome"]["choice"] == "once"
+
+    def test_reversed_order_concurrent_exact_prompts(self):
+        mod = self.mod
+        session_key = "sess-exact-reversed"
+        t1, aid1, box1 = self._enqueue_exact(session_key)
+        t2, aid2, box2 = self._enqueue_exact(session_key)
+        assert aid1 != aid2
+
+        assert mod.resolve_gateway_approval(session_key, "once", approval_id=aid2) == 1
+        t2.join()
+        assert box2["outcome"]["choice"] == "once"
+        # First entry is untouched by resolving the second.
+        assert not box1
+
+        assert mod.resolve_gateway_approval(session_key, "deny", approval_id=aid1) == 1
+        t1.join()
+        assert box1["outcome"]["choice"] == "deny"
+
+    def test_ordinary_fifo_compatibility_unaffected(self):
+        mod = self.mod
+        session_key = "sess-ordinary-fifo"
+        entry = mod._ApprovalEntry({"command": "ls"})
+        mod._gateway_queues[session_key] = [entry]
+        n = mod.resolve_gateway_approval(session_key, "once")
+        assert n == 1
+        assert entry.result == "once"

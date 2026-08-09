@@ -134,6 +134,33 @@ def test_discord_toolsets_do_not_leak_to_other_platforms():
     assert "discord_admin" not in enabled
 
 
+# ─── owner_workspace is kernel_gated: unlike discord/discord_admin (merely
+# platform-restricted), it must be unreachable via `platform_toolsets` on
+# EVERY platform — including api_server, whose only admitted path is the
+# dedicated gateway.api_server.owner_workspace.enabled union applied by
+# api_server.py AFTER _get_platform_tools() returns, not this function. ───────
+
+
+@pytest.mark.parametrize("platform", ["cli", "telegram", "cron", "discord", "api_server"])
+def test_owner_workspace_toolset_never_reachable_via_platform_toolsets(platform):
+    config = {"platform_toolsets": {platform: ["owner_workspace"]}}
+    enabled = _get_platform_tools(config, platform)
+    assert "owner_workspace" not in enabled
+
+
+@pytest.mark.parametrize("platform", ["cli", "telegram", "cron"])
+def test_owner_workspace_toolset_never_reachable_mixed_with_platform_default(platform):
+    """Naming owner_workspace alongside the platform's own composite must not
+    smuggle it in either — the explicit_passthrough leak this regression
+    guards against triggered regardless of what else was in the list."""
+    config = {"platform_toolsets": {platform: [f"hermes-{platform}", "owner_workspace"]}}
+    enabled = _get_platform_tools(config, platform)
+    assert "owner_workspace" not in enabled
+    assert "owner_workspace_bootstrap" not in enabled
+    assert "owner_task_move" not in enabled
+    assert "owner_task_comment" not in enabled
+
+
 
 
 

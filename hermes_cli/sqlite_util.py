@@ -35,7 +35,22 @@ def write_txn(conn: sqlite3.Connection):
     The explicit ROLLBACK is guarded so a SQLite auto-rollback (no active
     transaction left under EIO / lock contention / corruption) cannot shadow
     the original exception with a spurious rollback error.
+
+    Reentrant on the same connection: if *conn* already has an open
+    transaction (``conn.in_transaction``), this call joins it instead of
+    issuing a second ``BEGIN`` (which SQLite rejects outright). This lets a
+    caller hold one outer fence — e.g. a lease-ownership check that must stay
+    valid across a mutation — around store functions (``create_project``,
+    ``update_project``, ...) that each open their own ``write_txn`` for
+    standalone use: nested under an outer fence, their statements land in the
+    SAME atomic transaction instead of racing it. Only the outermost caller's
+    ``with`` block actually commits/rolls back; an inner one is a no-op
+    wrapper so a raised exception still propagates to the outer block, which
+    is the one holding the real transaction.
     """
+    if conn.in_transaction:
+        yield conn
+        return
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
