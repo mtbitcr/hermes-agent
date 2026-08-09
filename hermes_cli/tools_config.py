@@ -2718,6 +2718,33 @@ def _get_platform_tools(
                 ", ".join(_named),
             )
 
+    # Post-resolution kernel gate — the airtight boundary. The by-name strip
+    # near the top of this function only covers a kernel_gated toolset named
+    # literally in `platform_toolsets`; names can still reach the returned set
+    # through generic routes that never mention it — the wildcard aliases
+    # ``all``/``*``, a registry toolset ALIAS whose canonical target is the
+    # gated toolset, an MCP/plugin/custom name preserved by
+    # `explicit_passthrough`, or any composite that (now or later) resolves
+    # indirectly onto gated tools. Every caller of this function (CLI, cron,
+    # TUI, every messaging platform, ACP, the gateway) turns these names into
+    # a tool list, so filtering by RESOLVED tools here — not by name — is what
+    # actually keeps e.g. `owner_workspace_bootstrap` off every generic
+    # platform. The dedicated API-server admission path is unaffected: it
+    # unions "owner_workspace" back in AFTER this function returns.
+    #
+    # Ordinary all/* behaviour is preserved: resolve_toolset() omits
+    # kernel_gated toolsets from wildcard expansion, so ``all``/``*`` survive
+    # this filter with every non-gated toolset intact.
+    if kernel_gated:
+        gated_tools: Set[str] = set()
+        for gated_ts in kernel_gated:
+            gated_tools.update(resolve_toolset(gated_ts))
+        if gated_tools:
+            enabled_toolsets = {
+                ts for ts in enabled_toolsets
+                if not gated_tools.intersection(resolve_toolset(ts))
+            }
+
     return enabled_toolsets
 
 

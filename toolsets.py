@@ -843,7 +843,17 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
     # This ensures future toolsets are automatically included without changes.
     if name in {"all", "*"}:
         all_tools: Set[str] = set()
+        # A kernel_gated toolset is reachable ONLY by naming it directly on its
+        # dedicated code-level admission path (owner_workspace ->
+        # api_server._owner_workspace_toolset_enabled). "Everything" must
+        # therefore mean "every ordinary toolset", or `platform_toolsets:
+        # {cli: [all]}` would hand a CLI/cron/messaging agent the owner
+        # mutation tools that the by-name gate in
+        # hermes_cli.tools_config._get_platform_tools deliberately strips.
+        kernel_gated = get_kernel_gated_toolsets()
         for toolset_name in get_toolset_names():
+            if toolset_name in kernel_gated:
+                continue
             # Use a fresh visited set per branch to avoid cross-branch contamination
             resolved = resolve_toolset(toolset_name, visited.copy(), include_registry=include_registry)
             all_tools.update(resolved)

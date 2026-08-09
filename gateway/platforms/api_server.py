@@ -92,32 +92,81 @@ _ROUTES_ALLOWLIST = "allowlist"
 # Always reachable regardless of ``allowed_routes`` — the liveness probe.
 _ALWAYS_ALLOWED_PATHS = ("/health",)
 
+# Returned by _read_raw_config_root() when there is genuinely NO config to
+# read: no file on disk, or a file with no YAML content at all (blank /
+# comments only). Distinct from a successfully parsed root that simply isn't a
+# mapping (``- a``, ``42``, ``null``), which is malformed and denies closed.
+_CONFIG_ROOT_ABSENT = object()
+
+
+def _read_raw_config_root() -> Any:
+    """Return the CURRENT profile's ``config.yaml`` YAML root, unnormalized.
+
+    Deliberately NOT ``read_user_config_raw()``: that helper collapses a
+    non-mapping root to ``{}``, making ``- a\\n- b`` (or ``42``, or ``null``)
+    indistinguishable from a missing file — which would resolve a malformed
+    config to "key simply not present" and therefore UNRESTRICTED. This
+    security boundary must tell those apart, so it reads the same
+    profile-aware path (``get_config_path()``) and returns exactly what YAML
+    parsed, plus a dedicated :data:`_CONFIG_ROOT_ABSENT` sentinel for "no
+    config at all".
+
+    Raises on unparseable YAML / unreadable file (callers deny closed).
+    """
+    from hermes_cli.config import get_config_path
+    from utils import fast_safe_load
+
+    path = get_config_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _CONFIG_ROOT_ABSENT
+    # A file that carries no YAML content (empty, whitespace, or only
+    # comments) parses to None but means "nothing configured" — treat it like
+    # a missing file rather than a malformed root, so an empty/commented-out
+    # config.yaml keeps its long-standing unrestricted behavior. An EXPLICIT
+    # ``null``/``~`` root is content, and stays malformed.
+    if not any(
+        line.strip() and not line.lstrip().startswith("#")
+        for line in text.splitlines()
+    ):
+        return _CONFIG_ROOT_ABSENT
+    return fast_safe_load(text)
+
 
 def _resolve_api_server_allowed_routes() -> "tuple[str, list[str]]":
     """Resolve ``gateway.api_server.allowed_routes`` for the CURRENT profile.
 
     Returns ``(mode, patterns)``:
-      - ``(_ROUTES_UNRESTRICTED, [])`` — key omitted/``None``, OR the
-        intentionally-supported empty list/tuple. No gating.
+      - ``(_ROUTES_UNRESTRICTED, [])`` — no config at all (missing/blank
+        file), key omitted/``None``, OR the intentionally-supported empty
+        list/tuple. No gating.
       - ``(_ROUTES_DENY_ALL, [])`` — an explicit malformed falsey value
         (``False``, ``0``, ``{}``, ``""``), any other malformed type/entry,
-        or a config-load failure. Only ``/health`` is reachable.
+        a non-mapping YAML root (list/scalar/``null``), or a config-load
+        failure. Only ``/health`` is reachable.
       - ``(_ROUTES_ALLOWLIST, patterns)`` — a non-empty string (single
         pattern) or list/tuple of non-empty strings.
 
-    Uses ``read_user_config_raw()`` (profile-aware via ``get_hermes_home()``,
-    which the profile-prefix middleware has already scoped by the time this
-    runs) because it RAISES on unparseable YAML — unlike the gateway's usual
-    fail-open loader — so a genuine config-load failure can be distinguished
-    from "key simply not present" and denied closed, per contract.
+    Uses ``_read_raw_config_root()`` (profile-aware via ``get_config_path()``
+    → ``get_hermes_home()``, which the profile-prefix middleware has already
+    scoped by the time this runs) because it RAISES on unparseable YAML —
+    unlike the gateway's usual fail-open loader — and because it reports a
+    successfully parsed NON-MAPPING root as itself instead of normalizing it
+    to ``{}``. Both a load failure and a malformed root are therefore
+    distinguishable from "key simply not present" and denied closed, per
+    contract.
     """
     try:
-        from hermes_cli.config import read_user_config_raw
-
-        raw = read_user_config_raw()
+        raw = _read_raw_config_root()
     except Exception:
         return (_ROUTES_DENY_ALL, [])
+    if raw is _CONFIG_ROOT_ABSENT:
+        # No config file / no YAML content — nothing configured, not malformed.
+        return (_ROUTES_UNRESTRICTED, [])
     if not isinstance(raw, dict):
+        # Parsed fine, but the root is a list/scalar/None — malformed config,
+        # never "unconfigured".
         return (_ROUTES_DENY_ALL, [])
 
     gateway_cfg = raw.get("gateway")
@@ -163,15 +212,24 @@ def _resolve_api_server_allowed_routes() -> "tuple[str, list[str]]":
 def _owner_workspace_toolset_enabled(user_config: dict) -> bool:
     """``gateway.api_server.owner_workspace.enabled`` — default OFF.
 
-    Fail-open to False on any resolution error: an owner-mutation surface
+    Enables ONLY on the literal boolean ``True``. Anything else — including
+    the truthy strings ``"true"``/``"yes"``/``"false"``, numbers, lists,
+    mappings, ``None``, and every other malformed value — leaves the owner
+    mutation surface disabled. A ``bool()`` coercion here would turn
+    ``enabled: "false"`` (a very ordinary YAML quoting slip) into a live
+    owner-mutation surface, so this admission gate demands the exact value
+    its documentation promises rather than guessing at intent.
+
+    Fail-closed to False on any resolution error: an owner-mutation surface
     must never appear because a config read hiccuped.
     """
     try:
         from hermes_cli.config import cfg_get
 
-        return bool(cfg_get(user_config, "gateway", "api_server", "owner_workspace", "enabled", default=False))
+        value = cfg_get(user_config, "gateway", "api_server", "owner_workspace", "enabled", default=False)
     except Exception:
         return False
+    return value is True
 
 
 def _route_matches_any(path: str, patterns: "list[str]") -> bool:

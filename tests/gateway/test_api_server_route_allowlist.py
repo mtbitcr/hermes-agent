@@ -129,23 +129,42 @@ class TestResolveApiServerAllowedRoutesDenyAll:
         _write_config({"gateway": {"api_server": "oops"}})
         assert _resolve_api_server_allowed_routes() == (_ROUTES_DENY_ALL, [])
 
-    def test_top_level_not_a_dict_is_defensively_denied(self, monkeypatch):
-        """read_user_config_raw() already coerces a non-dict YAML root to
-        ``{}`` (real files can never surface a non-dict here), so this
-        exercises the function's own defensive isinstance check directly."""
-        import hermes_cli.config as config_mod
-
-        monkeypatch.setattr(config_mod, "read_user_config_raw", lambda: ["just", "a", "list"])
+    @pytest.mark.parametrize(
+        "raw_yaml",
+        [
+            pytest.param("- just\n- a\n- list\n", id="list-root"),
+            pytest.param("just-a-string\n", id="string-root"),
+            pytest.param("42\n", id="int-root"),
+            pytest.param("3.14\n", id="float-root"),
+            pytest.param("true\n", id="bool-root"),
+            pytest.param("null\n", id="explicit-null-root"),
+            pytest.param("~\n", id="tilde-null-root"),
+            pytest.param("- gateway:\n    api_server:\n      allowed_routes: /v1/models\n",
+                         id="list-root-wrapping-real-keys"),
+        ],
+    )
+    def test_non_mapping_yaml_root_denies_all(self, raw_yaml):
+        """A config.yaml that PARSED FINE but whose root is not a mapping is
+        malformed, not unconfigured. Collapsing it to ``{}`` (as the generic
+        raw-config reader does) made ``gateway`` look merely absent and
+        resolved the boundary to UNRESTRICTED — a real file could silently
+        disable the least-privilege gate. Every non-mapping root must deny."""
+        _write_raw_yaml(raw_yaml)
         assert _resolve_api_server_allowed_routes() == (_ROUTES_DENY_ALL, [])
-
-    def test_top_level_not_a_dict_yaml_file_normalizes_to_unrestricted(self):
-        """A real config.yaml whose root isn't a dict is coerced to ``{}``
-        by read_user_config_raw() itself — same as a missing file."""
-        _write_raw_yaml("- just\n- a\n- list\n")
-        assert _resolve_api_server_allowed_routes() == (_ROUTES_UNRESTRICTED, [])
 
     def test_unparseable_yaml_fails_closed(self):
         _write_raw_yaml("gateway: {api_server: [unterminated\n")
+        assert _resolve_api_server_allowed_routes() == (_ROUTES_DENY_ALL, [])
+
+    def test_unreadable_config_fails_closed(self, monkeypatch):
+        """A config that cannot be read at all is a load failure, and a load
+        failure is never allowed to read as "nothing configured"."""
+        import gateway.platforms.api_server as api_server_mod
+
+        def _raise():
+            raise OSError("disk on fire")
+
+        monkeypatch.setattr(api_server_mod, "_read_raw_config_root", _raise)
         assert _resolve_api_server_allowed_routes() == (_ROUTES_DENY_ALL, [])
 
 
@@ -195,6 +214,30 @@ class TestOwnerWorkspaceToolsetEnabledFlag:
 
     def test_explicit_false_stays_disabled(self):
         cfg = {"gateway": {"api_server": {"owner_workspace": {"enabled": False}}}}
+        assert _owner_workspace_toolset_enabled(cfg) is False
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("true", id="str-true"),
+            pytest.param("True", id="str-True"),
+            pytest.param("yes", id="str-yes"),
+            pytest.param("on", id="str-on"),
+            pytest.param("false", id="str-false"),
+            pytest.param("0", id="str-zero"),
+            pytest.param(1, id="int-one"),
+            pytest.param(1.0, id="float-one"),
+            pytest.param(["owner_workspace"], id="non-empty-list"),
+            pytest.param({"enabled": True}, id="non-empty-mapping"),
+            pytest.param(None, id="explicit-null"),
+        ],
+    )
+    def test_malformed_truthy_values_stay_disabled(self, value):
+        """Only the literal boolean ``True`` opens this owner-mutation
+        surface. A ``bool()`` coercion would turn ordinary YAML quoting slips
+        (``enabled: "false"`` — a non-empty, therefore truthy, string) into a
+        live mutation surface, so every non-``True`` value must stay off."""
+        cfg = {"gateway": {"api_server": {"owner_workspace": {"enabled": value}}}}
         assert _owner_workspace_toolset_enabled(cfg) is False
 
     def test_resolution_error_fails_closed_to_disabled(self, monkeypatch):

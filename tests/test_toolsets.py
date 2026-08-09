@@ -1,5 +1,7 @@
 """Tests for toolsets.py — toolset resolution, validation, and composition."""
 
+import pytest
+
 import toolsets as toolsets_mod
 from tools.registry import ToolRegistry
 from toolsets import (

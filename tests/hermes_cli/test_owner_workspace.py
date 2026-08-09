@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -1068,3 +1071,164 @@ def test_comment_status_and_revision_feed_directly_into_move(ctx):
     t2.join()
     assert move_result["ok"] is True
     assert move_result["status"] == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Cross-profile board ownership — profile-local projects.db, GLOBAL kanban root
+#
+# Real multiprocessing, no mocked locking: the receipt lease only orders
+# claimants that share one projects.db, so only the kernel-held global board
+# guard can order two same-name bootstraps started from different profiles.
+# ---------------------------------------------------------------------------
+
+
+# "fork" keeps the already-imported, already-sandboxed interpreter state (the
+# children only need to repoint HERMES_HOME); "spawn" is a correct fallback
+# where fork is unavailable.
+_MP = multiprocessing.get_context(
+    "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+)
+
+_XPROFILE_KEY = "xprofile-bootstrap-1"
+_XPROFILE_NAME = "Shared Owner Board"
+_XPROFILE_PROFILES = ("alpha", "beta")
+
+
+def _xprofile_ctx(profile: str):
+    return ow.OwnerContext(actor="owner", profile=profile, session=f"run_owt_{profile}")
+
+
+def _expected_project_id(profile: str) -> str:
+    """The deterministic id bootstrap() will derive for this profile."""
+    return "p_" + ow._derive_id(_xprofile_ctx(profile), _XPROFILE_KEY, "project")
+
+
+def _enter_profile(root: str, profile: str) -> None:
+    """Repoint this process at ``<root>/profiles/<profile>``.
+
+    Gives each process its own profile-local ``projects.db`` while
+    ``kanban_db.kanban_home()`` still resolves back to the shared ``<root>``
+    — the exact production layout the global board guard exists for.
+    """
+    home = Path(root) / "profiles" / profile
+    home.mkdir(parents=True, exist_ok=True)
+    os.environ["HERMES_HOME"] = str(home)
+    assert kanban_db.kanban_home() == Path(root)
+
+
+def _xprofile_bootstrap_worker(root, profile, barrier, queue):
+    """Child process: bootstrap the same board name from its own profile."""
+    try:
+        _enter_profile(root, profile)
+        child_ctx = _xprofile_ctx(profile)
+        barrier.wait(timeout=60)
+        approver = _with_approver(child_ctx.session)
+        try:
+            result = ow.bootstrap(
+                child_ctx, idempotency_key=_XPROFILE_KEY, name=_XPROFILE_NAME,
+            )
+        finally:
+            approver.join(timeout=30)
+        queue.put((profile, result))
+    except ow.OwnerWorkspaceError as exc:
+        queue.put((profile, {"ok": False, "error": exc.code}))
+    except BaseException as exc:  # reported as a failure, never a silent hang
+        queue.put((profile, {"ok": False, "error": "worker_crashed", "detail": repr(exc)}))
+
+
+def _guard_holder_worker(root, slug, acquired, queue):
+    _enter_profile(root, "alpha")
+    with ow._global_board_guard(slug):
+        acquired.set()
+        time.sleep(0.5)
+        queue.put(("holder_released_at", time.monotonic()))
+
+
+def _guard_waiter_worker(root, slug, acquired, queue):
+    _enter_profile(root, "beta")
+    acquired.wait(timeout=60)
+    started = time.monotonic()
+    with ow._global_board_guard(slug):
+        queue.put(("waiter_acquired_at", time.monotonic()))
+    queue.put(("waiter_waited", time.monotonic() - started))
+
+
+def _run_workers(procs, queue, expected_messages):
+    """Start, drain and join child processes with bounded waits."""
+    for proc in procs:
+        proc.start()
+    try:
+        messages = [queue.get(timeout=120) for _ in range(expected_messages)]
+    finally:
+        for proc in procs:
+            proc.join(timeout=120)
+            if proc.is_alive():  # pragma: no cover - only on a real hang
+                proc.terminate()
+                proc.join(timeout=30)
+    for proc in procs:
+        assert proc.exitcode == 0, f"child exited {proc.exitcode}"
+    return messages
+
+
+def test_global_board_guard_serializes_across_processes(tmp_path):
+    """The guard is an OS lock on the GLOBAL board namespace, so two processes
+    in different profiles cannot hold the same board slug at once."""
+    root = tmp_path / "xprofile_root"
+    (root / "profiles").mkdir(parents=True)
+    acquired = _MP.Event()
+    queue = _MP.Queue()
+    procs = [
+        _MP.Process(target=_guard_holder_worker, args=(str(root), "shared-board", acquired, queue)),
+        _MP.Process(target=_guard_waiter_worker, args=(str(root), "shared-board", acquired, queue)),
+    ]
+
+    events = dict(_run_workers(procs, queue, 3))
+
+    assert events["waiter_acquired_at"] > events["holder_released_at"]
+    assert events["waiter_waited"] >= 0.4
+
+
+def test_cross_profile_bootstrap_of_same_board_elects_exactly_one_owner(tmp_path, monkeypatch):
+    """Two profiles concurrently bootstrap the SAME board name with DIFFERENT
+    deterministic project ids. Their receipts live in separate projects.db
+    files, so nothing but the global board guard orders them: exactly one may
+    create and own the board, the other must fail closed with the ownership
+    conflict instead of overwriting board.json's project_id."""
+    root = tmp_path / "xprofile_root"
+    (root / "profiles").mkdir(parents=True)
+    barrier = _MP.Barrier(len(_XPROFILE_PROFILES))
+    queue = _MP.Queue()
+    procs = [
+        _MP.Process(target=_xprofile_bootstrap_worker, args=(str(root), profile, barrier, queue))
+        for profile in _XPROFILE_PROFILES
+    ]
+
+    results = dict(_run_workers(procs, queue, len(_XPROFILE_PROFILES)))
+
+    project_ids = {p: _expected_project_id(p) for p in _XPROFILE_PROFILES}
+    assert len(set(project_ids.values())) == len(_XPROFILE_PROFILES)
+
+    winners = [p for p, r in results.items() if r.get("ok") is True]
+    losers = [p for p, r in results.items() if r.get("ok") is not True]
+    assert len(winners) == 1, f"expected exactly one owner, got {results}"
+    assert len(losers) == 1
+
+    winner, loser = winners[0], losers[0]
+    assert results[winner]["project_id"] == project_ids[winner]
+    assert results[loser]["error"] == "crash_recovery_failed", results[loser]
+
+    board = results[winner]["board"]
+
+    # The published board is owned by the winner, and the loser never got to
+    # restamp it.
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / winner))
+    assert kanban_db.board_exists(board)
+    assert kanban_db.read_board_metadata(board)["project_id"] == project_ids[winner]
+
+    # The loser's own profile-local project row exists but was never bound to
+    # the contested board.
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / loser))
+    with projects_db.connect_closing() as pconn:
+        loser_project = projects_db.get_project(pconn, project_ids[loser])
+    assert loser_project is not None
+    assert loser_project.board_slug != board

@@ -53,6 +53,15 @@ Security contract enforced HERE (not at the tool layer):
   token, the old claimant's stale token can no longer match — it fails
   closed (``lease_lost``) instead of mutating domain state, overwriting
   progress, or finalizing on the new claimant's behalf.
+* **Cross-profile board ownership.** Receipts and Project rows are
+  profile-local (``projects.db``), but kanban boards are shared across
+  profiles by design. The receipt lease therefore cannot order two
+  same-name bootstraps started from different profiles, so the whole
+  ownership check/create/bind decision is additionally held under
+  :func:`_global_board_guard` — an OS-level (``fcntl.flock`` /
+  ``msvcrt.locking``) exclusive lock whose identity is the canonical global
+  board namespace, revalidated inside the critical section and failing
+  closed if the guard cannot be created or acquired.
 * **Exact-operation confirmation.** Every mutation calls
   ``tools.approval.request_exact_operation_approval`` — payload-, actor-,
   profile-, session-, expiry-, and operation-bound, "once"/"deny" only.
@@ -65,11 +74,27 @@ import json
 import secrets
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from hermes_cli import kanban_db, projects_db
 from hermes_cli.sqlite_util import write_txn
+
+# fcntl is Unix-only; on Windows msvcrt provides the equivalent kernel file
+# lock. Both are stdlib and both are enforced by the OS across processes —
+# unlike the receipt lease, which only serializes claimants that share one
+# projects.db. Absence of BOTH is fatal for the board guard (see
+# :func:`_global_board_guard`), never a degraded no-op.
+msvcrt = None
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - platform-specific fallback
+    fcntl = None
+    try:
+        import msvcrt
+    except ImportError:
+        pass
 
 _LOCK_TTL_SECONDS = 30
 _POLL_INTERVAL_SECONDS = 0.02
@@ -326,6 +351,94 @@ def _derive_id(ctx: OwnerContext, idempotency_key: str, salt: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+@contextmanager
+def _global_board_guard(board_slug: str):
+    """Hold an exclusive OS file lock on one GLOBAL board namespace.
+
+    Kanban boards are shared across profiles by design
+    (:func:`kanban_db.kanban_home` resolves the profile-INDEPENDENT root),
+    while receipts and Project rows live in the caller's profile-local
+    ``projects.db``. So the receipt lease — which only serializes claimants
+    writing the same ``projects.db`` — cannot order two bootstraps run from
+    DIFFERENT profiles: both derive the same board slug from the same name,
+    both see "board does not exist", and both publish ``board.json``, so the
+    second silently overwrites the first's ownership metadata. That race is
+    invisible to every check in this module, because each check is itself
+    correct in its own profile.
+
+    The lock identity is therefore anchored to the contended resource, not to
+    the caller: ``<kanban_home>/kanban/locks/board-<slug>.lock``, resolved
+    through ``kanban_db`` so every competing profile computes the same path
+    for the same canonical board namespace. ``fcntl.flock`` (``msvcrt.locking``
+    on Windows) is a kernel-held lock: it serializes unrelated PROCESSES, and
+    the kernel drops it when the holder exits, so a crash inside the critical
+    section cannot wedge the namespace — no TTL, no daemon, no polling.
+
+    Fails CLOSED: if the lock directory/file cannot be created, the lock
+    cannot be acquired, or the platform offers neither primitive, the caller
+    gets :class:`OwnerWorkspaceError` and performs no board mutation at all.
+    """
+    slug = kanban_db._normalize_board_slug(board_slug) or kanban_db.DEFAULT_BOARD
+    fd = None
+    try:
+        if fcntl is None and msvcrt is None:  # pragma: no cover - exotic platform
+            raise RuntimeError("no OS file-locking primitive is available")
+        lock_dir = kanban_db.kanban_home() / "kanban" / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / f"board-{slug}.lock"
+        if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+            lock_path.write_text(" ", encoding="utf-8")
+        fd = open(lock_path, "r+" if msvcrt else "a+", encoding="utf-8")
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:  # pragma: no cover - Windows-only path
+            fd.seek(0)
+            msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
+    except OwnerWorkspaceError:
+        if fd is not None:
+            fd.close()
+        raise
+    except Exception as exc:
+        if fd is not None:
+            fd.close()
+        raise OwnerWorkspaceError(
+            "ownership_guard_unavailable",
+            f"could not acquire the global board ownership guard for {slug!r}: {exc}",
+        ) from exc
+
+    try:
+        yield
+    finally:
+        try:
+            if fcntl:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            elif msvcrt:  # pragma: no cover - Windows-only path
+                fd.seek(0)
+                msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        fd.close()
+
+
+def _assert_board_ownership(board_slug: str, project_id: str) -> None:
+    """Fail closed unless ``board_slug`` is absent or owned by ``project_id``.
+
+    Strict equality, not truthiness: an existing board this flow did not
+    create always carries its owning ``project_id``, so missing/empty/
+    malformed metadata is exactly as unsafe to adopt as a foreign one.
+    """
+    if not kanban_db.board_exists(board_slug):
+        return
+    owner = kanban_db.read_board_metadata(board_slug).get("project_id")
+    if owner != project_id:
+        raise OwnerWorkspaceError(
+            "crash_recovery_failed",
+            f"board {board_slug!r} has missing or foreign ownership metadata "
+            f"(project_id={owner!r}, expected {project_id!r}); refusing to "
+            "adopt ambiguous board ownership",
+        )
+
+
 # ---------------------------------------------------------------------------
 # owner_workspace_bootstrap
 # ---------------------------------------------------------------------------
@@ -353,7 +466,12 @@ def bootstrap(
     than an exact ``project_id`` match) fails closed instead of being
     silently adopted — objects this flow creates always carry exact
     ownership metadata, so an existing object without it can never be safely
-    attributed to this receipt. Every domain mutation (Project row, board,
+    attributed to this receipt. Because boards are GLOBAL while receipts are
+    profile-local, that ownership check/create/bind decision additionally runs
+    inside :func:`_global_board_guard` — a kernel-held file lock on the board
+    namespace, shared by every profile — and is revalidated inside it, so two
+    same-name bootstraps from different profiles resolve to exactly one owner
+    and one ownership conflict. Every domain mutation (Project row, board,
     Task) is fenced: the immediately-preceding lease check and the mutation
     itself share one held ``projects.db`` write lock (see
     :func:`_assert_owns_lease`), so a lease takeover can never land in the
@@ -408,36 +526,54 @@ def bootstrap(
         # re-derived from `name` or searched for.
         board_slug = project.slug
 
-        if kanban_db.board_exists(board_slug):
-            owner = kanban_db.read_board_metadata(board_slug).get("project_id")
-            # Strict equality, not truthiness: an existing board this flow
-            # did not just create always carries its owning project_id, so
-            # missing/empty/malformed metadata is exactly as unsafe to adopt
-            # as a foreign one — fail closed either way.
-            if owner != project_id:
-                raise OwnerWorkspaceError(
-                    "crash_recovery_failed",
-                    f"board {board_slug!r} has missing or foreign ownership metadata "
-                    f"(project_id={owner!r}, expected {project_id!r}); refusing to "
-                    "adopt ambiguous board ownership",
+        # Cheap fail-fast check outside the guard — an already-foreign board
+        # never becomes adoptable by waiting for a lock. It is NOT the
+        # decision: the authoritative check is re-run inside the guard below.
+        _assert_board_ownership(board_slug, project_id)
+
+        # Guard 1 (cross-profile, kernel-held): the ownership CHECK, the board
+        # CREATE and the project→board BIND are one indivisible decision over
+        # the global board namespace, so a same-name bootstrap from another
+        # profile's projects.db cannot slip between them and overwrite this
+        # board's ownership metadata (see :func:`_global_board_guard`).
+        # Acquired OUTSIDE the projects.db write lock, and only ever in that
+        # order, so the two locks cannot deadlock against each other.
+        with _global_board_guard(board_slug):
+            # Revalidate under the guard: whatever we observed above may have
+            # been published by a competitor between the check and the lock.
+            # This is the ownership decision that counts.
+            _assert_board_ownership(board_slug, project_id)
+            # Fence 2: the lease check and the create_board/update_project pair
+            # share one held write lock on pconn — create_board publishes
+            # board.json (a resource outside projects.db, so this cannot be one
+            # cross-database transaction), but no competing claimant can adopt
+            # this row (which requires the same pconn write lock) while it is
+            # open, so a takeover can never land strictly between "we own the
+            # lease" and "the board/project-row mutation actually happened".
+            with write_txn(pconn):
+                _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                # create_board is naturally idempotent ("mkdir -p" semantics — see
+                # its docstring), so no separate "already created?" progress
+                # check is needed: replaying this exact call is always safe.
+                published = kanban_db.create_board(
+                    board_slug, name=name, description=description, project_id=project_id,
                 )
-        # Fence 2: the lease check and the create_board/update_project pair
-        # share one held write lock on pconn — create_board publishes
-        # board.json (a resource outside projects.db, so this cannot be one
-        # cross-database transaction), but no competing claimant can adopt
-        # this row (which requires the same pconn write lock) while it is
-        # open, so a takeover can never land strictly between "we own the
-        # lease" and "the board/project-row mutation actually happened".
-        with write_txn(pconn):
-            _assert_owns_lease(pconn, ctx, idempotency_key, token)
-            # create_board is naturally idempotent ("mkdir -p" semantics — see
-            # its docstring), so no separate "already created?" progress
-            # check is needed: replaying this exact call is always safe.
-            kanban_db.create_board(
-                board_slug, name=name, description=description, project_id=project_id,
-            )
-            if project.board_slug != board_slug:
-                projects_db.update_project(pconn, project_id, board_slug=board_slug)
+                # create_board STAMPS ownership (write_board_metadata
+                # overwrites project_id) — which is exactly why the guarded
+                # revalidation above must have already established that this
+                # slug is ours or free. Verify what actually landed on disk
+                # before binding the project row to it, so any normalization
+                # or partial write fails closed instead of leaving a project
+                # bound to a board it does not own.
+                if published.get("project_id") != project_id:
+                    raise OwnerWorkspaceError(
+                        "crash_recovery_failed",
+                        f"board {board_slug!r} published ownership "
+                        f"{published.get('project_id')!r}, not {project_id!r}; "
+                        "refusing to bind a board this project does not own",
+                    )
+                if project.board_slug != board_slug:
+                    projects_db.update_project(pconn, project_id, board_slug=board_slug)
 
         task_idempotency_key = "owtask_" + _derive_id(ctx, idempotency_key, "task")
         kconn = kanban_db.connect(board=board_slug)
