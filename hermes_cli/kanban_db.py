@@ -134,6 +134,19 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# The five owner-reviewed (never auto-applied) advice kinds create_recommendation supports.
+VALID_RECOMMENDATION_KINDS = {"skill", "permission", "connection", "pipeline", "provider_model_policy"}
+
+# Bounds on the opaque recommendation display fields shown in the owner review UI.
+_RECOMMENDATION_SUBJECT_ID_MAX_LEN = 200
+_RECOMMENDATION_LABEL_MAX_LEN = 200
+_RECOMMENDATION_RATIONALE_MAX_LEN = 4000
+_RECOMMENDATION_PROVENANCE_AUTHORITY_MAX_LEN = 200
+_RECOMMENDATION_PROVENANCE_REF_MAX_LEN = 500
+
+# Fixed non-semantic title; recommendation cards are read via recommendation_* columns, never title/body.
+_RECOMMENDATION_TASK_TITLE = "hermes recommendation"
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -281,7 +294,8 @@ def notify_task_updated(
         return
     try:
         row = conn.execute(
-            "SELECT assignee, current_run_id FROM tasks WHERE id = ?",
+            "SELECT assignee, current_run_id FROM tasks "
+            "WHERE id = ? AND task_kind = 'work'",
             (task_id,),
         ).fetchone()
         _fire_kanban_lifecycle_hook(
@@ -1422,7 +1436,20 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Discriminates ordinary work tasks ('work', the create_task default) from native
+    -- recommendation cards (see create_recommendation). recommendation_* / target_profile /
+    -- review_policy / provenance_* are populated only when task_kind='recommendation' (NULL otherwise).
+    task_kind             TEXT NOT NULL DEFAULT 'work',
+    recommendation_kind        TEXT,
+    recommendation_subject_id  TEXT,
+    recommendation_label       TEXT,
+    recommendation_rationale   TEXT,
+    target_profile             TEXT,
+    review_policy              TEXT,
+    provenance_authority       TEXT,
+    provenance_ref             TEXT,
+    provenance_observed_at     INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2679,6 +2706,50 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "task_kind" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "task_kind", "task_kind TEXT NOT NULL DEFAULT 'work'"
+        )
+    if "recommendation_kind" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "recommendation_kind", "recommendation_kind TEXT"
+        )
+    if "recommendation_subject_id" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "recommendation_subject_id",
+            "recommendation_subject_id TEXT",
+        )
+    if "recommendation_label" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "recommendation_label", "recommendation_label TEXT"
+        )
+    if "recommendation_rationale" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "recommendation_rationale",
+            "recommendation_rationale TEXT",
+        )
+    if "target_profile" not in cols:
+        _add_column_if_missing(conn, "tasks", "target_profile", "target_profile TEXT")
+    if "review_policy" not in cols:
+        _add_column_if_missing(conn, "tasks", "review_policy", "review_policy TEXT")
+    if "provenance_authority" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "provenance_authority", "provenance_authority TEXT"
+        )
+    if "provenance_ref" not in cols:
+        _add_column_if_missing(conn, "tasks", "provenance_ref", "provenance_ref TEXT")
+    if "provenance_observed_at" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "provenance_observed_at",
+            "provenance_observed_at INTEGER",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2693,6 +2764,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    # Matches the recommendation GET's exact equality-filter + order shape.
+    if {"status", "created_at", "id"}.issubset(cols):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_recommendation_scope "
+            "ON tasks(task_kind, review_policy, status, project_id, "
+            "target_profile, created_at, id)"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -3401,7 +3479,7 @@ def create_task(
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
+            "AND status != 'archived' AND task_kind = 'work' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
@@ -3458,7 +3536,8 @@ def create_task(
                         # If any parent is not yet done, we're todo.
                         rows = conn.execute(
                             "SELECT status FROM tasks WHERE id IN "
-                            "(" + ",".join("?" * len(parents)) + ")",
+                            "(" + ",".join("?" * len(parents)) + ") "
+                            "AND task_kind = 'work'",
                             parents,
                         ).fetchall()
                         if any(r["status"] != "done" for r in rows):
@@ -3564,13 +3643,172 @@ def create_task(
     raise RuntimeError("unreachable")
 
 
+def _bounded_display_field(
+    value: Optional[str],
+    *,
+    name: str,
+    max_len: int,
+    required: bool,
+) -> Optional[str]:
+    """Validate, bound, and redact-before-durability an opaque recommendation display field.
+
+    Raises ``ValueError`` when ``required`` and blank/missing, when the type isn't ``str``,
+    or when the stripped value exceeds ``max_len``. Returns ``None`` for an optional blank
+    field, otherwise the redacted, stripped string.
+    """
+    if value is None:
+        if required:
+            raise ValueError(f"{name} is required")
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    cleaned = value.strip()
+    if not cleaned:
+        if required:
+            raise ValueError(f"{name} is required")
+        return None
+    if len(cleaned) > max_len:
+        raise ValueError(f"{name} exceeds {max_len} characters")
+    return redact_review_value(cleaned)
+
+
+def create_recommendation(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    target_profile: str,
+    recommendation_kind: str,
+    recommendation_subject_id: str,
+    recommendation_label: str,
+    recommendation_rationale: Optional[str] = None,
+    provenance_authority: str,
+    provenance_ref: Optional[str] = None,
+    provenance_observed_at: Optional[int] = None,
+) -> str:
+    """Create a native recommendation card for owner review.
+
+    Unlike :func:`create_task`, this is a dedicated seam for non-actionable advice for a
+    human owner to accept or reject, never dispatched to a worker: it writes the row
+    directly (no assignee, workspace/branch, or run; ``status='review'``,
+    ``review_policy='owner'`` unconditionally). Returns the new task id.
+    """
+    if recommendation_kind not in VALID_RECOMMENDATION_KINDS:
+        raise ValueError(
+            "recommendation_kind must be one of "
+            f"{sorted(VALID_RECOMMENDATION_KINDS)}, got {recommendation_kind!r}"
+        )
+
+    if not isinstance(project_id, str):
+        raise ValueError("project_id must be a string")
+    project_id = project_id.strip()
+    if not project_id:
+        raise ValueError("project_id is required")
+
+    from hermes_cli.profiles import normalize_profile_name
+
+    target_profile = normalize_profile_name(target_profile)
+
+    recommendation_subject_id = _bounded_display_field(
+        recommendation_subject_id,
+        name="recommendation_subject_id",
+        max_len=_RECOMMENDATION_SUBJECT_ID_MAX_LEN,
+        required=True,
+    )
+    recommendation_label = _bounded_display_field(
+        recommendation_label,
+        name="recommendation_label",
+        max_len=_RECOMMENDATION_LABEL_MAX_LEN,
+        required=True,
+    )
+    recommendation_rationale = _bounded_display_field(
+        recommendation_rationale,
+        name="recommendation_rationale",
+        max_len=_RECOMMENDATION_RATIONALE_MAX_LEN,
+        required=False,
+    )
+    provenance_authority = _bounded_display_field(
+        provenance_authority,
+        name="provenance_authority",
+        max_len=_RECOMMENDATION_PROVENANCE_AUTHORITY_MAX_LEN,
+        required=True,
+    )
+    provenance_ref = _bounded_display_field(
+        provenance_ref,
+        name="provenance_ref",
+        max_len=_RECOMMENDATION_PROVENANCE_REF_MAX_LEN,
+        required=False,
+    )
+    if provenance_observed_at is not None and (
+        isinstance(provenance_observed_at, bool)
+        or not isinstance(provenance_observed_at, int)
+    ):
+        raise ValueError("provenance_observed_at must be an integer unix timestamp")
+
+    now = int(time.time())
+    for attempt in range(2):
+        task_id = _new_task_id()
+        try:
+            with write_txn(conn, allow_nested=True):
+                conn.execute(
+                    """
+                    INSERT INTO tasks (
+                        id, title, body, status, created_at, project_id,
+                        task_kind, recommendation_kind, recommendation_subject_id,
+                        recommendation_label, recommendation_rationale,
+                        target_profile, review_policy,
+                        provenance_authority, provenance_ref, provenance_observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        _RECOMMENDATION_TASK_TITLE,
+                        None,
+                        "review",
+                        now,
+                        project_id,
+                        "recommendation",
+                        recommendation_kind,
+                        recommendation_subject_id,
+                        recommendation_label,
+                        recommendation_rationale,
+                        target_profile,
+                        "owner",
+                        provenance_authority,
+                        provenance_ref,
+                        provenance_observed_at,
+                    ),
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "recommendation_created",
+                    {
+                        "project_id": project_id,
+                        "target_profile": target_profile,
+                        "recommendation_kind": recommendation_kind,
+                        "recommendation_subject_id": recommendation_subject_id,
+                        "recommendation_label": recommendation_label,
+                        "provenance_authority": provenance_authority,
+                        "provenance_ref": provenance_ref,
+                        "provenance_observed_at": provenance_observed_at,
+                    },
+                )
+            return task_id
+        except sqlite3.IntegrityError:
+            if attempt == 1:
+                raise
+            # Retry with a fresh id.
+            continue
+    raise RuntimeError("unreachable")
+
+
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
     parents = list(parents)
     if not parents:
         return []
     placeholders = ",".join("?" * len(parents))
     rows = conn.execute(
-        f"SELECT id FROM tasks WHERE id IN ({placeholders})",
+        f"SELECT id FROM tasks WHERE id IN ({placeholders}) AND task_kind = 'work'",
         parents,
     ).fetchall()
     present = {r["id"] for r in rows}
@@ -3629,7 +3867,9 @@ def _inherit_notify_subs(
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
+    ).fetchone()
     return Task.from_row(row) if row else None
 
 
@@ -3660,7 +3900,7 @@ def list_tasks(
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
 ) -> list[Task]:
-    query = "SELECT * FROM tasks WHERE 1=1"
+    query = "SELECT * FROM tasks WHERE task_kind = 'work'"
     params: list[Any] = []
     if assignee is not None:
         query += " AND assignee = ?"
@@ -3708,7 +3948,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee FROM tasks "
+            "WHERE id = ? AND task_kind = 'work'",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
@@ -3763,7 +4005,7 @@ def set_model_override(
         provider = None
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
         ).fetchone()
         if not row:
             return False
@@ -3802,7 +4044,7 @@ def set_reasoning_effort(
     effort = normalize_reasoning_effort(effort)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
         ).fetchone()
         if not row:
             return False
@@ -3843,11 +4085,12 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         )
         # If child was ready but parent is not yet done, demote child to todo.
         parent_status = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (parent_id,)
+            "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'", (parent_id,)
         ).fetchone()["status"]
         if parent_status != "done":
             conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'ready' AND task_kind = 'work'",
                 (child_id,),
             )
         _append_event(
@@ -3933,7 +4176,8 @@ def task_graph_contexts(
     for row in conn.execute(
         "SELECT l.child_id AS owner_id, t.id, t.title, t.status "
         "FROM task_links l JOIN tasks t ON t.id = l.parent_id "
-        f"WHERE l.child_id IN ({placeholders}) ORDER BY l.child_id, t.id",
+        f"WHERE l.child_id IN ({placeholders}) AND t.task_kind = 'work' "
+        "ORDER BY l.child_id, t.id",
         tuple(ordered_ids),
     ).fetchall():
         contexts[row["owner_id"]]["parents"].append({
@@ -3944,7 +4188,8 @@ def task_graph_contexts(
     for row in conn.execute(
         "SELECT l.parent_id AS owner_id, t.id, t.title, t.status "
         "FROM task_links l JOIN tasks t ON t.id = l.child_id "
-        f"WHERE l.parent_id IN ({placeholders}) ORDER BY l.parent_id, t.id",
+        f"WHERE l.parent_id IN ({placeholders}) AND t.task_kind = 'work' "
+        "ORDER BY l.parent_id, t.id",
         tuple(ordered_ids),
     ).fetchall():
         contexts[row["owner_id"]]["children"].append({
@@ -3967,7 +4212,7 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
         SELECT t.id AS id, t.result AS result
         FROM tasks t
         JOIN task_links l ON l.parent_id = t.id
-        WHERE l.child_id = ? AND t.status = 'done'
+        WHERE l.child_id = ? AND t.status = 'done' AND t.task_kind = 'work'
         ORDER BY t.completed_at ASC
         """,
         (task_id,),
@@ -3991,7 +4236,7 @@ def add_comment(
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
         if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            "SELECT 1 FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
@@ -4005,7 +4250,9 @@ def add_comment(
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     rows = conn.execute(
-        "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
+        "SELECT * FROM task_comments WHERE task_id = ? "
+        "AND task_id IN (SELECT id FROM tasks WHERE task_kind = 'work') "
+        "ORDER BY created_at ASC",
         (task_id,),
     ).fetchall()
     return [
@@ -4032,7 +4279,9 @@ def list_comments_after(
     """
     rows = conn.execute(
         "SELECT id, task_id, author, body, created_at FROM task_comments "
-        "WHERE task_id = ? AND id > ? ORDER BY id ASC",
+        "WHERE task_id = ? AND id > ? "
+        "AND task_id IN (SELECT id FROM tasks WHERE task_kind = 'work') "
+        "ORDER BY id ASC",
         (task_id, int(after_id)),
     ).fetchall()
     return [
@@ -4185,7 +4434,7 @@ def add_attachment(
     now = int(time.time())
     with write_txn(conn):
         if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            "SELECT 1 FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
@@ -4213,7 +4462,9 @@ def add_attachment(
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
     rows = conn.execute(
-        "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY created_at ASC, id ASC",
+        "SELECT * FROM task_attachments WHERE task_id = ? "
+        "AND task_id IN (SELECT id FROM tasks WHERE task_kind = 'work') "
+        "ORDER BY created_at ASC, id ASC",
         (task_id,),
     ).fetchall()
     return [
@@ -4233,7 +4484,9 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
 
 def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Attachment]:
     r = conn.execute(
-        "SELECT * FROM task_attachments WHERE id = ?", (attachment_id,)
+        "SELECT * FROM task_attachments WHERE id = ? "
+        "AND task_id IN (SELECT id FROM tasks WHERE task_kind = 'work')",
+        (attachment_id,),
     ).fetchone()
     if r is None:
         return None
@@ -4274,8 +4527,13 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
 
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
+    # Ordinary public accessor: positively requires task_kind='work' so a
+    # recommendation's typed audit event is never exposed here. Inspecting
+    # it is test-only, via direct SQL against task_events.
     rows = conn.execute(
-        "SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ASC, id ASC",
+        "SELECT * FROM task_events WHERE task_id = ? "
+        "AND task_id IN (SELECT id FROM tasks WHERE task_kind = 'work') "
+        "ORDER BY created_at ASC, id ASC",
         (task_id,),
     ).fetchall()
     out = []
@@ -4342,7 +4600,8 @@ def _end_run(
     """
     now = int(time.time())
     row = conn.execute(
-        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        "SELECT current_run_id FROM tasks WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
     ).fetchone()
     if not row or not row["current_run_id"]:
         return None
@@ -4373,14 +4632,17 @@ def _end_run(
         ),
     )
     conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        "UPDATE tasks SET current_run_id = NULL "
+        "WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
     )
     return run_id
 
 
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     row = conn.execute(
-        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        "SELECT current_run_id FROM tasks WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
     ).fetchone()
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
@@ -4411,7 +4673,8 @@ def _synthesize_ended_run(
     """
     now = int(time.time())
     trow = conn.execute(
-        "SELECT assignee, current_step_key FROM tasks WHERE id = ?",
+        "SELECT assignee, current_step_key FROM tasks "
+        "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
     profile = trow["assignee"] if trow else None
@@ -4545,7 +4808,7 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') AND task_kind = 'work'"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -4559,7 +4822,7 @@ def recompute_ready(
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
+                "WHERE l.child_id = ? AND t.task_kind = 'work'",
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
@@ -4583,12 +4846,13 @@ def recompute_ready(
                         continue
                     conn.execute(
                         "UPDATE tasks SET status = ? "
-                        "WHERE id = ? AND status = 'blocked'",
+                        "WHERE id = ? AND status = 'blocked' AND task_kind = 'work'",
                         (resume_status, task_id),
                     )
                 else:
                     conn.execute(
-                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
+                        "UPDATE tasks SET status = ? "
+                        "WHERE id = ? AND status = 'todo' AND task_kind = 'work'",
                         (resume_status, task_id),
                     )
                 _append_event(
@@ -4609,7 +4873,7 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        "AND p.task_kind = 'work' AND p.status NOT IN ('done', 'archived') LIMIT 1",
         (task_id,),
     ).fetchone() is None
 
@@ -4641,13 +4905,14 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ? AND p.task_kind = 'work' "
+            "AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
         if undone:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'",
+                "WHERE id = ? AND status = 'ready' AND task_kind = 'work'",
                 (task_id,),
             )
             _append_event(
@@ -4660,7 +4925,8 @@ def claim_task(
         # it when the CAS resets the pointer below. No-op when the invariant
         # holds (the common case).
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
+            "SELECT current_run_id FROM tasks "
+            "WHERE id = ? AND status = 'ready' AND task_kind = 'work'",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -4685,6 +4951,7 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND task_kind = 'work'
             """,
             (lock, expires, now, task_id),
         )
@@ -4761,7 +5028,8 @@ def claim_review_task(
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL "
+                "AND task_kind = 'work'",
                 (task_id,),
             )
             if demoted.rowcount == 1:
@@ -4785,6 +5053,7 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND task_kind = 'work'
             """,
             (lock, expires, now, task_id),
         )
@@ -4930,7 +5199,8 @@ def heartbeat_claim(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+            "WHERE id = ? AND status = 'running' AND claim_lock = ? "
+            "AND task_kind = 'work'",
             (expires, task_id, lock),
         )
         if cur.rowcount == 1:
@@ -4982,7 +5252,7 @@ def release_stale_claims(
         "       assignee "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?",
+        "  AND claim_expires < ? AND task_kind = 'work'",
         (now,),
     ).fetchall()
     for row in stale:
@@ -5130,7 +5400,8 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid FROM tasks "
+        "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
     if not row:
@@ -5148,7 +5419,7 @@ def reclaim_task(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
+            "AND claim_lock IS ? AND task_kind = 'work'",
             (retry_status, task_id, prev_lock),
         )
         if cur.rowcount != 1:
@@ -5250,7 +5521,8 @@ def _verify_created_cards(
             ordered.append(cid)
 
     row = conn.execute(
-        "SELECT assignee FROM tasks WHERE id = ?", (completing_task_id,),
+        "SELECT assignee FROM tasks WHERE id = ? AND task_kind = 'work'",
+        (completing_task_id,),
     ).fetchone()
     if row is None:
         # Completing task not found — nothing resolves.
@@ -5260,7 +5532,8 @@ def _verify_created_cards(
     # Batch-fetch existence + created_by in one query.
     placeholders = ",".join(["?"] * len(ordered))
     rows = conn.execute(
-        f"SELECT id, created_by FROM tasks WHERE id IN ({placeholders})",
+        f"SELECT id, created_by FROM tasks WHERE id IN ({placeholders}) "
+        "AND task_kind = 'work'",
         tuple(ordered),
     ).fetchall()
     found = {r["id"]: r["created_by"] for r in rows}
@@ -5320,7 +5593,7 @@ def _scan_prose_for_phantom_ids(
             unique.append(m)
     placeholders = ",".join(["?"] * len(unique))
     rows = conn.execute(
-        f"SELECT id FROM tasks WHERE id IN ({placeholders})",
+        f"SELECT id FROM tasks WHERE id IN ({placeholders}) AND task_kind = 'work'",
         tuple(unique),
     ).fetchall()
     existing = {r["id"] for r in rows}
@@ -5435,7 +5708,7 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
@@ -5453,6 +5726,7 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND task_kind = 'work'
                 """,
                 (result, now, task_id),
             )
@@ -5471,6 +5745,7 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
+                   AND task_kind = 'work'
                 """,
                 (result, now, task_id, int(expected_run_id)),
             )
@@ -5612,7 +5887,8 @@ def _merge_completion_prose_artifacts(
     exists so cleanup cannot erase the file the user was promised.
     """
     row = conn.execute(
-        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        "SELECT workspace_kind, workspace_path FROM tasks "
+        "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
     if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
@@ -5655,7 +5931,8 @@ def _persist_scratch_completion_artifacts(
         return
 
     row = conn.execute(
-        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        "SELECT workspace_kind, workspace_path FROM tasks "
+        "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
     if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
@@ -6109,12 +6386,13 @@ def edit_completed_task_result(
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'",
+            (task_id,),
         ).fetchone()
         if not row or row["status"] != "done":
             return False
         conn.execute(
-            "UPDATE tasks SET result = ? WHERE id = ?",
+            "UPDATE tasks SET result = ? WHERE id = ? AND task_kind = 'work'",
             (result, task_id),
         )
         run = conn.execute(
@@ -6204,7 +6482,8 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences FROM tasks "
+            "WHERE id = ? AND task_kind = 'work'",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -6447,7 +6726,7 @@ def request_review(
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
             "SELECT assignee, status, claim_lock, current_run_id "
-            "FROM tasks WHERE id = ?", (task_id,),
+            "FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,),
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
@@ -6589,7 +6868,8 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, assignee, current_run_id FROM tasks "
+            "WHERE id = ? AND task_kind = 'work'",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -6707,7 +6987,7 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -6723,7 +7003,7 @@ def promote_task(
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?",
+            "WHERE l.child_id = ? AND t.task_kind = 'work'",
             (task_id,),
         ).fetchall()
         unsatisfied = [
@@ -6742,7 +7022,7 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
+            "WHERE id = ? AND status IN ('todo', 'blocked') AND task_kind = 'work'",
             (task_id,),
         )
         if upd.rowcount != 1:
@@ -6768,7 +7048,8 @@ def _reclaim_dangling_run(
     """
     placeholders = ", ".join("?" for _ in statuses)
     stale = conn.execute(
-        f"SELECT current_run_id FROM tasks WHERE id = ? AND status IN ({placeholders})",
+        f"SELECT current_run_id FROM tasks WHERE id = ? AND status IN ({placeholders}) "
+        "AND task_kind = 'work'",
         (task_id, *statuses),
     ).fetchone()
     if stale and stale["current_run_id"]:
@@ -6800,7 +7081,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        "AND p.task_kind = 'work' AND p.status NOT IN ('done', 'archived') LIMIT 1",
         (task_id,),
     ).fetchone()
     return "todo" if undone_parents else "ready"
@@ -6819,7 +7100,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'",
             (task_id,),
         ).fetchone()
         resume_status = (
@@ -6851,7 +7132,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "WHERE id = ? AND status IN ('blocked', 'scheduled') "
+            "AND task_kind = 'work'",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -6918,7 +7200,7 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             # not a success signal; only complete_task resets the breaker
             # counter (mirrors unblock_task, #35072).
             + assignee_sql
-            + " WHERE id = ? AND status = 'review'",
+            + " WHERE id = ? AND status = 'review' AND task_kind = 'work'",
             params,
         )
         if cur.rowcount != 1:
@@ -7013,6 +7295,7 @@ def invalidate_descendants_for_parent_reopen(
             SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock
             FROM descendants d
             JOIN tasks t ON t.id = d.id
+            WHERE t.task_kind = 'work'
             ORDER BY t.id
             """,
             (task_id,),
@@ -7135,7 +7418,8 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee FROM tasks "
+            "WHERE id = ? AND status = 'triage' AND task_kind = 'work'",
             (task_id,),
         ).fetchone()
         if existing is None:
@@ -7158,7 +7442,7 @@ def specify_triage_task(
         params.append(task_id)
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'",
+            f"WHERE id = ? AND status = 'triage' AND task_kind = 'work'",
             tuple(params),
         )
         if cur.rowcount != 1:
@@ -7290,7 +7574,7 @@ def decompose_triage_task(
     with write_txn(conn):
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?",
+            "FROM tasks WHERE id = ? AND task_kind = 'work'",
             (task_id,),
         ).fetchone()
         if root_row is None:
@@ -7434,7 +7718,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
+            "WHERE id = ? AND status != 'archived' AND task_kind = 'work'",
             (task_id,),
         )
         if cur.rowcount != 1:
@@ -7464,7 +7748,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'",
             (task_id,),
         ).fetchone()
         if not row or row["status"] != "archived":
@@ -7477,7 +7761,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        cur = conn.execute(
+            "DELETE FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
+        )
         return cur.rowcount == 1
 
 
@@ -7492,7 +7778,9 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        cur = conn.execute(
+            "DELETE FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
+        )
         if cur.rowcount != 1:
             return False
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
@@ -7812,7 +8100,7 @@ def set_workspace_path(
 ) -> None:
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            "UPDATE tasks SET workspace_path = ? WHERE id = ? AND task_kind = 'work'",
             (str(path), task_id),
         )
 
@@ -7822,7 +8110,7 @@ def set_branch_name(
 ) -> None:
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET branch_name = ? WHERE id = ?",
+            "UPDATE tasks SET branch_name = ? WHERE id = ? AND task_kind = 'work'",
             (str(branch_name), task_id),
         )
 
@@ -7851,6 +8139,7 @@ def schedule_task(
                    worker_pid   = NULL
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND task_kind = 'work'
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -8359,7 +8648,7 @@ def enforce_max_runtime(
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
-        "  AND t.worker_pid IS NOT NULL"
+        "  AND t.worker_pid IS NOT NULL AND t.task_kind = 'work'"
     ).fetchall()
     for row in rows:
         lock = row["claim_lock"] or ""
@@ -8407,7 +8696,7 @@ def enforce_max_runtime(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
+                "  AND worker_pid = ? AND claim_lock IS ? AND task_kind = 'work'",
                 (retry_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
@@ -8496,7 +8785,7 @@ def detect_stale_running(
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        "WHERE t.status = 'running' AND t.task_kind = 'work'"
     ).fetchall()
 
     for row in rows:
@@ -8615,7 +8904,7 @@ def reconcile_orphaned_running(
     rows = conn.execute(
         "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
         "WHERE status = 'running' "
-        "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
+        "  AND (claim_lock IS NULL OR claim_expires IS NULL) AND task_kind = 'work'"
     ).fetchall()
     for row in rows:
         tid = row["id"]
@@ -8803,7 +9092,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, assignee "
             "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "WHERE status = 'running' AND worker_pid IS NOT NULL "
+            "AND task_kind = 'work'"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -9463,7 +9753,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND task_kind = 'work'"
     ).fetchall()
     if not rows:
         return False
@@ -9489,7 +9779,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND task_kind = 'work'"
     ).fetchall()
     if not rows:
         return False
@@ -9697,13 +9987,14 @@ def _dispatch_once_locked(
     if max_spawn is not None:
         running_count = int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks "
+                "WHERE status = 'running' AND task_kind = 'work'"
             ).fetchone()[0]
         )
 
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "WHERE status = 'ready' AND claim_lock IS NULL AND task_kind = 'work' "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     spawned = 0
@@ -9724,7 +10015,7 @@ def _dispatch_once_locked(
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
+            "AND task_kind = 'work' GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
@@ -9945,7 +10236,7 @@ def _dispatch_once_locked(
     if review_dispatch_enabled():
         review_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
-            "WHERE status = 'review' AND claim_lock IS NULL "
+            "WHERE status = 'review' AND claim_lock IS NULL AND task_kind = 'work' "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
     for row in review_rows:
@@ -10812,7 +11103,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             "SELECT t.id, t.title, r.summary, r.ended_at "
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
             "WHERE r.profile = ? AND r.task_id != ? "
-            "  AND r.outcome = 'completed' "
+            "  AND r.outcome = 'completed' AND t.task_kind = 'work' "
             "ORDER BY r.ended_at DESC LIMIT 5",
             (task.assignee, task_id),
         ).fetchall()
@@ -10875,20 +11166,21 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     by_status: dict[str, int] = {}
     for row in conn.execute(
         "SELECT status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' GROUP BY status"
+        "WHERE status != 'archived' AND task_kind = 'work' GROUP BY status"
     ):
         by_status[row["status"]] = int(row["n"])
 
     by_assignee: dict[str, dict[str, int]] = {}
     for row in conn.execute(
         "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' AND assignee IS NOT NULL "
+        "WHERE status != 'archived' AND assignee IS NOT NULL AND task_kind = 'work' "
         "GROUP BY assignee, status"
     ):
         by_assignee.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
 
     oldest_row = conn.execute(
-        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
+        "SELECT MIN(created_at) AS ts FROM tasks "
+        "WHERE status = 'ready' AND task_kind = 'work'"
     ).fetchone()
     now = int(time.time())
     oldest_ready_age = (
@@ -11625,7 +11917,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     for row in conn.execute(
         "SELECT assignee, status, COUNT(*) AS n FROM tasks "
         "WHERE status != 'archived' AND assignee IS NOT NULL "
-        "GROUP BY assignee, status"
+        "AND task_kind = 'work' GROUP BY assignee, status"
     ):
         counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
 

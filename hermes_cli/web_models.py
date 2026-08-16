@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, SecretStr, field_validator
 
 
 # --- from web_server.py (originally lines 1273-1372) ---
@@ -738,4 +738,47 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
+
+
+# --- ITEM31BG Stage C: read-only scoped recommendations API ---
+#
+# Schema-closed owner-review view of a native recommendation card
+# (``task_kind='recommendation'``, see ``kanban_db.create_recommendation``).
+# ``extra="forbid"`` keeps this list exhaustive: only fields a plugin author
+# explicitly adds here can ever reach the response body, so a future field
+# added to the ``tasks`` row (title/body/workspace/branch/claim/result/...)
+# does not leak through by accident.
+
+
+class KanbanRecommendationItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: Literal[
+        "skill",
+        "permission",
+        "connection",
+        "pipeline",
+        "provider_model_policy",
+    ]
+    subject_id: str
+    label: str
+    rationale: Optional[str] = None
+    project_id: str
+    target_profile: str
+    status: Literal["review"]
+    review_policy: Literal["owner"]
+    provenance_authority: str
+    provenance_ref: Optional[str] = None
+    provenance_observed_at: Optional[int] = None
+    created_at: int
+    updated_at: int
+
+
+class KanbanRecommendationListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    items: List[KanbanRecommendationItem]
+    next_cursor: Optional[str] = None
 
