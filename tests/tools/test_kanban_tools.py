@@ -1231,6 +1231,51 @@ def test_recommend_is_hidden_from_untrusted_kanban_contexts(
         assert "kanban_recommend" not in _kanban_schema_names(monkeypatch)
 
 
+def test_recommend_visibility_transitions_within_one_check_fn_cache_window(
+    recommend_worker_env,
+):
+    """The check_fn TTL cache must be partitioned by dispatcher-ownership /
+    delegation context (ITEM31BH).
+
+    A worker's schema lookup caches ``_check_kanban_recommend_mode() == True``
+    for ~30s. Without partitioning that cache by context, an in-process cron
+    job or delegate_task child inheriting the worker's ``HERMES_KANBAN_TASK``
+    would see the stale cached ``True`` and leak ``kanban_recommend`` into
+    their schema during that window — even though the runtime call itself
+    would still refuse. This observes the worker -> cron -> delegated
+    transition back-to-back with no ``invalidate_check_fn_cache()`` call
+    between lookups, so a regression to the unpartitioned cache would fail it.
+    """
+    from agent.delegation_context import (
+        delegated_child_context,
+        non_dispatcher_owned_context,
+    )
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    toolset = set(resolve_toolset("hermes-cli"))
+
+    def _names():
+        schema = registry.get_definitions(toolset, quiet=True)
+        return {s["function"].get("name") for s in schema if "function" in s}
+
+    # Start from a clean cache (setup only — no invalidation between the
+    # three observations below).
+    invalidate_check_fn_cache()
+
+    # Dispatcher-owned worker: visible, and now cached True for this check_fn.
+    assert "kanban_recommend" in _names()
+
+    # In-process cron job inheriting the same HERMES_KANBAN_TASK: hidden,
+    # despite the worker's cached True still being within its TTL.
+    with non_dispatcher_owned_context():
+        assert "kanban_recommend" not in _names()
+
+    # delegate_task child, same process, same inherited env var: hidden too.
+    with delegated_child_context():
+        assert "kanban_recommend" not in _names()
+
+
 @pytest.mark.parametrize(
     "kind",
     ["skill", "permission", "connection", "pipeline", "provider_model_policy"],
