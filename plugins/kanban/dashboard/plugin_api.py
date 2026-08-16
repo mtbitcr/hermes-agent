@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import sqlite3
@@ -50,10 +51,23 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.dashboard_auth.token_auth import register_token_route
+from hermes_cli.web_models import (
+    KanbanRecommendationItem,
+    KanbanRecommendationListResponse,
+)
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# ITEM31BG Stage C: this exact path is guarded by the generic non-interactive
+# bearer-token seam (``token_auth_middleware``) instead of the dashboard's
+# cookie/session gate — see the route definition below for the full
+# rationale. Registering here (module import time) matches the existing
+# ``plugins/dashboard_auth/drain`` convention.
+RECOMMENDATIONS_ROUTE_PATH = "/api/plugins/kanban/recommendations"
+register_token_route(RECOMMENDATIONS_ROUTE_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -269,12 +283,12 @@ def _compute_task_diagnostics(
             return {}
         placeholders = ",".join(["?"] * len(task_ids))
         rows = conn.execute(
-            f"SELECT * FROM tasks WHERE id IN ({placeholders})",
+            f"SELECT * FROM tasks WHERE id IN ({placeholders}) AND task_kind = 'work'",
             tuple(task_ids),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE status != 'archived'",
+            "SELECT * FROM tasks WHERE status != 'archived' AND task_kind = 'work'",
         ).fetchall()
 
     if not rows:
@@ -1004,7 +1018,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.priority is not None:
             with kanban_db.write_txn(conn):
                 conn.execute(
-                    "UPDATE tasks SET priority = ? WHERE id = ?",
+                    "UPDATE tasks SET priority = ? WHERE id = ? AND task_kind = 'work'",
                     (int(payload.priority), task_id),
                 )
                 conn.execute(
@@ -1034,7 +1048,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     vals.append(payload.body)
                 vals.append(task_id)
                 conn.execute(
-                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
+                    f"UPDATE tasks SET {', '.join(sets)} "
+                    "WHERE id = ? AND task_kind = 'work'",
+                    vals,
                 )
                 conn.execute(
                     "INSERT INTO task_events (task_id, kind, payload, created_at) "
@@ -1086,7 +1102,7 @@ def _parents_blocking_ready(
     rows = conn.execute(
         "SELECT t.id, t.title, t.status FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND t.status != 'done'",
+        "WHERE l.child_id = ? AND t.status != 'done' AND t.task_kind = 'work'",
         (task_id,),
     ).fetchall()
     return [
@@ -1136,7 +1152,7 @@ def _set_status_direct(
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
             "SELECT status, current_run_id, worker_pid, claim_lock "
-            "FROM tasks WHERE id = ?",
+            "FROM tasks WHERE id = ? AND task_kind = 'work'",
             (task_id,),
         ).fetchone()
         if prev is None:
@@ -1160,7 +1176,7 @@ def _set_status_direct(
             parent_statuses = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
+                "WHERE l.child_id = ? AND t.task_kind = 'work'",
                 (task_id,),
             ).fetchall()
             if parent_statuses and not all(
@@ -1179,7 +1195,7 @@ def _set_status_direct(
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
             "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
-            "WHERE id = ?",
+            "WHERE id = ? AND task_kind = 'work'",
             (
                 effective_status,
                 effective_status,
@@ -1406,7 +1422,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.priority is not None:
                     with kanban_db.write_txn(conn):
                         conn.execute(
-                            "UPDATE tasks SET priority = ? WHERE id = ?",
+                            "UPDATE tasks SET priority = ? WHERE id = ? AND task_kind = 'work'",
                             (int(payload.priority), tid),
                         )
                         conn.execute(
@@ -2411,7 +2427,8 @@ def _board_counts(slug: str) -> dict[str, int]:
         conn = kanban_db.connect(board=slug)
         try:
             rows = conn.execute(
-                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+                "SELECT status, COUNT(*) AS n FROM tasks "
+                "WHERE task_kind = 'work' GROUP BY status"
             ).fetchall()
             return {r["status"]: int(r["n"]) for r in rows}
         finally:
@@ -2889,6 +2906,187 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
     return get_orchestration_settings()
 
 
+# ---------------------------------------------------------------------------
+# GET /recommendations — ITEM31BG Stage C: read-only, scoped, machine-token
+# view of native recommendation cards for owner review.
+#
+# Deliberately independent of every other handler in this file: no
+# ``_conn()``/``kanban_db.connect()`` (those init schema, run additive
+# migrations, and open the DB writable), no ordinary-task helpers (they
+# filter on ``task_kind = 'work'`` and would find nothing anyway), and no
+# service auth/owner-authorization call — the outer ``token_auth_middleware``
+# (registered above via ``register_token_route``) is the only gate. A
+# request that reaches this function has already presented a valid bearer
+# token; no further scope/claim check is layered on top here.
+# ---------------------------------------------------------------------------
+
+_RECOMMENDATION_SCOPE_WILDCARDS = {"", "all", "*", "any"}
+_RECOMMENDATION_CURSOR_VERSION = "v1"
+_RECOMMENDATION_CURSOR_SEP = "\x1f"
+
+
+def _require_exact_scope(value: str, *, field: str) -> str:
+    """Reject blank/all/wildcard scope values; return the trimmed exact value."""
+    v = (value or "").strip()
+    if v.lower() in _RECOMMENDATION_SCOPE_WILDCARDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must be a single, exact, non-blank, non-wildcard value",
+        )
+    return v
+
+
+def _resolve_recommendations_board(board: str) -> str:
+    raw = _require_exact_scope(board, field="board")
+    try:
+        normed = kanban_db._normalize_board_slug(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not normed:
+        raise HTTPException(status_code=400, detail="board is required")
+    if not kanban_db.board_exists(normed):
+        raise HTTPException(status_code=404, detail=f"board {normed!r} does not exist")
+    return normed
+
+
+def _encode_recommendations_cursor(
+    *, board: str, project_id: str, target_profile: str, created_at: int, id_: str,
+) -> str:
+    raw = _RECOMMENDATION_CURSOR_SEP.join(
+        [_RECOMMENDATION_CURSOR_VERSION, board, project_id, target_profile, str(created_at), id_]
+    )
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def _decode_recommendations_cursor(
+    cursor: str, *, board: str, project_id: str, target_profile: str,
+) -> tuple[int, str]:
+    """Decode an opaque cursor and verify it is bound to this exact scope.
+
+    Any malformed cursor, or one minted for a different board/project/
+    profile, is rejected as a plain 400 rather than silently ignored — a
+    cursor must never leak pagination state across scopes.
+    """
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+        parts = raw.split(_RECOMMENDATION_CURSOR_SEP)
+        version, c_board, c_project, c_profile, c_created_at, c_id = parts
+        if version != _RECOMMENDATION_CURSOR_VERSION:
+            raise ValueError("unsupported cursor version")
+        if c_board != board or c_project != project_id or c_profile != target_profile:
+            raise ValueError("cursor scope mismatch")
+        return int(c_created_at), c_id
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid cursor")
+
+
+def _recommendations_ro_conn(board: str) -> Optional[sqlite3.Connection]:
+    """Open the tracked kanban.db read-only, or ``None`` if it doesn't exist yet.
+
+    ``mode=ro`` + ``PRAGMA query_only=ON`` is belt-and-suspenders: even a
+    bug in the SQL below cannot write. Never calls ``kanban_db.connect()``/
+    ``init_db()`` — those create the file, run schema + additive migrations,
+    and open it writable, none of which a read-only scoped API may do.
+    """
+    path = kanban_db.kanban_db_path(board=board)
+    if not path.exists():
+        return None
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
+@router.get("/recommendations", response_model=KanbanRecommendationListResponse)
+def list_recommendations(
+    board: str = Query(...),
+    project_id: str = Query(...),
+    target_profile: str = Query(...),
+    limit: int = Query(50, ge=1, le=100),
+    cursor: Optional[str] = Query(None),
+):
+    board = _resolve_recommendations_board(board)
+    project_id = _require_exact_scope(project_id, field="project_id")
+    target_profile = _require_exact_scope(target_profile, field="target_profile")
+    from hermes_cli.profiles import normalize_profile_name
+    try:
+        target_profile = normalize_profile_name(target_profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    after: Optional[tuple[int, str]] = None
+    if cursor:
+        after = _decode_recommendations_cursor(
+            cursor, board=board, project_id=project_id, target_profile=target_profile,
+        )
+
+    conn = _recommendations_ro_conn(board)
+    if conn is None:
+        return KanbanRecommendationListResponse(schema_version=1, items=[], next_cursor=None)
+    try:
+        sql = (
+            "SELECT id, recommendation_kind, recommendation_subject_id, "
+            "recommendation_label, recommendation_rationale, project_id, "
+            "target_profile, status, review_policy, provenance_authority, "
+            "provenance_ref, provenance_observed_at, created_at FROM tasks "
+            "WHERE task_kind = 'recommendation' AND review_policy = 'owner' "
+            "AND status = 'review' AND project_id = ? AND target_profile = ?"
+        )
+        params: list[Any] = [project_id, target_profile]
+        if after is not None:
+            sql += " AND (created_at < ? OR (created_at = ? AND id < ?))"
+            params.extend([after[0], after[0], after[1]])
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit + 1)
+        rows = conn.execute(sql, params).fetchall()
+
+        page = rows[:limit]
+        ids = [r["id"] for r in page]
+        latest_event_at: dict[str, int] = {}
+        if ids:
+            placeholders = ",".join("?" * len(ids))
+            for ev in conn.execute(
+                f"SELECT task_id, MAX(created_at) AS latest FROM task_events "
+                f"WHERE task_id IN ({placeholders}) GROUP BY task_id",
+                ids,
+            ).fetchall():
+                latest_event_at[ev["task_id"]] = ev["latest"]
+
+        items = [
+            KanbanRecommendationItem(
+                id=r["id"],
+                kind=r["recommendation_kind"],
+                subject_id=kanban_db.redact_review_value(r["recommendation_subject_id"]),
+                label=kanban_db.redact_review_value(r["recommendation_label"]),
+                rationale=kanban_db.redact_review_value(r["recommendation_rationale"]),
+                project_id=r["project_id"],
+                target_profile=r["target_profile"],
+                status=r["status"],
+                review_policy=r["review_policy"],
+                provenance_authority=kanban_db.redact_review_value(r["provenance_authority"]),
+                provenance_ref=kanban_db.redact_review_value(r["provenance_ref"]),
+                provenance_observed_at=r["provenance_observed_at"],
+                created_at=r["created_at"],
+                updated_at=latest_event_at.get(r["id"], r["created_at"]),
+            )
+            for r in page
+        ]
+        next_cursor = None
+        if len(rows) > limit:
+            last = page[-1]
+            next_cursor = _encode_recommendations_cursor(
+                board=board, project_id=project_id, target_profile=target_profile,
+                created_at=last["created_at"], id_=last["id"],
+            )
+        return KanbanRecommendationListResponse(
+            schema_version=1, items=items, next_cursor=next_cursor,
+        )
+    finally:
+        conn.close()
+
+
 @router.websocket("/events")
 async def stream_events(ws: WebSocket):
     # Authorize the upgrade via the dashboard's canonical WS gate so the
@@ -2920,14 +3118,23 @@ async def stream_events(ws: WebSocket):
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             conn = kanban_db.connect(board=ws_board)
             try:
+                # LEFT JOIN so a recommendation (or dangling) event is
+                # scanned, not matched by the SQL WHERE — the cursor must
+                # still advance past it below, or an invisible
+                # recommendation-only tail would be rescanned forever.
                 rows = conn.execute(
-                    "SELECT id, task_id, run_id, kind, payload, created_at "
-                    "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 200",
+                    "SELECT e.id, e.task_id, e.run_id, e.kind, e.payload, "
+                    "e.created_at, t.task_kind FROM task_events e "
+                    "LEFT JOIN tasks t ON t.id = e.task_id "
+                    "WHERE e.id > ? ORDER BY e.id ASC LIMIT 200",
                     (cursor_val,),
                 ).fetchall()
                 out: list[dict] = []
                 new_cursor = cursor_val
                 for r in rows:
+                    new_cursor = r["id"]
+                    if r["task_kind"] != "work":
+                        continue
                     try:
                         payload = json.loads(r["payload"]) if r["payload"] else None
                     except Exception:
@@ -2940,7 +3147,6 @@ async def stream_events(ws: WebSocket):
                         "payload": payload,
                         "created_at": r["created_at"],
                     })
-                    new_cursor = r["id"]
                 return new_cursor, out
             finally:
                 conn.close()
