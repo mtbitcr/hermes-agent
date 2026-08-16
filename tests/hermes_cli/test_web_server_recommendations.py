@@ -1,19 +1,32 @@
-"""ITEM31BG Stage C: GET /api/plugins/kanban/recommendations — read-only, scoped,
-machine-token-gated view of native recommendation cards. Covers the bearer-token auth seam,
-mandatory exact board/project/profile scope, opaque scope-bound cursor pagination, read-only
-DB access, centralized redaction, and a closed single-GET OpenAPI surface."""
+"""ITEM31BG Stage C / ITEM31BI: GET /api/plugins/kanban/recommendations — read-only,
+scoped, machine-token-gated view of native recommendation cards. Covers the scoped
+bearer-token auth seam (a credential must carry this route's exact capability scope),
+mandatory exact board/project/profile scope, opaque scope-bound cursor pagination,
+read-only DB access, centralized redaction, and a closed single-GET OpenAPI surface."""
 from __future__ import annotations
 import base64
+import secrets
 import sqlite3
 import sys
 import time
 from pathlib import Path
 from typing import Optional
+from unittest.mock import MagicMock
 import pytest
+import plugins.dashboard_auth.recommendations as rec_plugin
 from hermes_cli import kanban_db as kb
 from hermes_cli.dashboard_auth import DashboardAuthProvider, TokenPrincipal, clear_providers, register_provider
+from hermes_cli.dashboard_auth import token_auth
 from hermes_cli.dashboard_auth.base import ProviderError
+from plugins.dashboard_auth.drain import DrainSecretProvider
+from plugins.dashboard_auth.recommendations import RecommendationsSecretProvider
 _ROUTE = "/api/plugins/kanban/recommendations"
+_REC_SCOPE = "kanban:recommendations:read"
+# The other bundled machine credential, used to prove one credential buys
+# exactly one endpoint. Its route is registered per-test (in production the
+# drain plugin registers it only when a strong drain secret is provisioned).
+_DRAIN_ROUTE = "/api/gateway/drain"
+_DRAIN_SCOPE = "drain"
 _PROVENANCE = dict(provenance_authority="static-analyzer", provenance_ref="finding-123", provenance_observed_at=1_700_000_000)
 _ITEM_KEYS = {"id", "kind", "subject_id", "label", "rationale", "project_id", "target_profile", "status",
     "review_policy", "provenance_authority", "provenance_ref", "provenance_observed_at", "created_at", "updated_at"}
@@ -22,7 +35,7 @@ class _StubProvider(DashboardAuthProvider):
     display_name = "Recommendations Test Provider"
     supports_token = True
     supports_session = False
-    def __init__(self, *, secret: str = "good-secret", scopes=()) -> None:
+    def __init__(self, *, secret: str = "good-secret", scopes=(_REC_SCOPE,)) -> None:
         self._secret = secret
         self._scopes = tuple(scopes)
     def verify_token(self, *, token: str) -> Optional[TokenPrincipal]:
@@ -68,32 +81,181 @@ def _params(**over) -> dict:
     base = {"board": "default", "project_id": "proj-1", "target_profile": "worker", "limit": 50}
     base.update(over)
     return base
+@pytest.fixture(autouse=True)
+def _isolated_token_routes(client):
+    """Snapshot/restore the token-route registry around each test.
+
+    The baseline is the Kanban plugin's own GET/_ROUTE/_REC_SCOPE policy.
+    ``client`` guarantees the app/plugin modules are imported, but in a
+    larger test run a module can already be cached from a prior test file,
+    so importing it again doesn't re-run its module-level route
+    registration. Re-installing the canonical policy here (a no-op if it's
+    already registered — ``register_token_route`` is idempotent for an
+    identical policy) guarantees the baseline is always correct before it's
+    captured. Tests that add a route — e.g. the drain endpoint — get it
+    wiped afterwards, and the baseline policy is put back exactly, so route
+    state never leaks between tests regardless of execution order.
+    """
+    token_auth.register_token_route(_ROUTE, method="GET", required_scope=_REC_SCOPE)
+    baseline = token_auth.get_token_route_policy("GET", _ROUTE)
+    yield
+    token_auth.clear_token_routes()
+    if baseline is not None:
+        token_auth.register_token_route(
+            baseline.path, method=baseline.method, required_scope=baseline.required_scope
+        )
 @pytest.fixture
 def _authed(client):
     register_provider(_StubProvider(secret="good-secret"))
     return _auth_headers("good-secret")
-# --- Auth gate ---
+@pytest.fixture
+def _no_downstream(client, monkeypatch):
+    """Make any attempt to read the recommendations DB an error.
+
+    Used by the refusal tests: a rejected request must be turned away by the
+    auth seam, never merely filtered by the handler.
+    """
+    def _boom(*a, **k):
+        raise AssertionError("downstream handler reached")
+    monkeypatch.setattr(_plugin_mod(), "_recommendations_ro_conn", _boom)
+@pytest.fixture
+def _drain_calls(monkeypatch):
+    """Count drain-marker writes without touching the real HERMES_HOME."""
+    from gateway import drain_control
+    calls = {"write": 0, "clear": 0}
+    def _write(**kwargs):
+        calls["write"] += 1
+        return {"requested_at": "1970-01-01T00:00:00Z", "suppress_notification": False}
+    def _clear(**kwargs):
+        calls["clear"] += 1
+        return False
+    monkeypatch.setattr(drain_control, "write_drain_request", _write)
+    monkeypatch.setattr(drain_control, "clear_drain_request", _clear)
+    monkeypatch.setattr(drain_control, "drain_requested", lambda **k: False)
+    return calls
+def _register_drain_route() -> None:
+    token_auth.register_token_route(_DRAIN_ROUTE, method="POST", required_scope=_DRAIN_SCOPE)
+# --- Auth gate: the route is token-only, and the token must carry this route's scope ---
+def test_route_is_registered_token_only_under_its_own_scope(client, kanban_home) -> None:
+    # Registered by the Kanban plugin API at import — unconditionally, with no
+    # dependency on a credential provider existing.
+    policy = token_auth.get_token_route_policy("GET", _ROUTE)
+    assert policy is not None
+    assert (policy.method, policy.path, policy.required_scope) == ("GET", _ROUTE, _REC_SCOPE)
 @pytest.mark.parametrize("provider,headers,expected_status", [
     (None, {}, 401),
+    (None, _auth_headers("anything"), 401),
+    (_StubProvider(secret="good-secret"), {}, 401),
     (_StubProvider(secret="good-secret"), _auth_headers("wrong"), 401),
+    (_StubProvider(secret="good-secret"), {"Authorization": "Basic Z29vZC1zZWNyZXQ="}, 401),
+    (_StubProvider(secret="good-secret"), {"Authorization": "good-secret"}, 401),
+    (_StubProvider(secret="good-secret"), {"Authorization": "Bearer"}, 401),
+    (_StubProvider(secret="good-secret"), {"Authorization": "Bearer "}, 401),
     (_UnreachableProvider(), _auth_headers("anything"), 503),
-], ids=["no-header-no-provider", "wrong-bearer", "provider-unreachable"])
-def test_bearer_gate_rejections(client, kanban_home, provider, headers, expected_status) -> None:
+], ids=["no-header-no-provider", "bearer-no-provider", "no-header", "wrong-bearer",
+        "basic-scheme", "scheme-less", "bearer-no-value", "bearer-empty-value",
+        "provider-unreachable"])
+def test_bearer_gate_rejections(client, kanban_home, _no_downstream, provider, headers, expected_status) -> None:
+    # Missing / malformed / unrecognised credentials never reach the handler.
     if provider is not None:
         register_provider(provider)
     assert client.get(_ROUTE, params=_params(), headers=headers).status_code == expected_status
-def test_valid_bearer_succeeds_and_cookie_session_alone_is_insufficient(client, kanban_home) -> None:
-    # A valid token principal suffices regardless of scopes; dashboard session creds alone (no token provider) must still 401.
-    register_provider(_StubProvider(secret="good-secret", scopes=("unrelated-scope",)))
+def test_correctly_scoped_bearer_succeeds(client, kanban_home) -> None:
+    register_provider(_StubProvider(secret="good-secret", scopes=(_REC_SCOPE,)))
     _make_recommendation()
     r = client.get(_ROUTE, params=_params(), headers=_auth_headers("good-secret"))
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["schema_version"] == 1 and len(body["items"]) == 1
-    clear_providers()
+def test_extra_scopes_alongside_the_required_one_still_pass(client, kanban_home) -> None:
+    register_provider(_StubProvider(secret="good-secret", scopes=("unrelated", _REC_SCOPE, _DRAIN_SCOPE)))
+    _make_recommendation()
+    assert client.get(_ROUTE, params=_params(), headers=_auth_headers("good-secret")).status_code == 200
+@pytest.mark.parametrize("scopes", [
+    (), ("unrelated-scope",), (_DRAIN_SCOPE,), ("kanban:recommendations",),
+    ("kanban:recommendations:read:extra",), ("KANBAN:RECOMMENDATIONS:READ",),
+], ids=["unscoped", "unrelated", "drain", "prefix", "superstring", "wrong-case"])
+def test_recognized_principal_without_the_required_scope_gets_generic_403(
+    client, kanban_home, _no_downstream, scopes
+) -> None:
+    register_provider(_StubProvider(secret="good-secret", scopes=scopes))
+    _make_recommendation()
+    r = client.get(_ROUTE, params=_params(), headers=_auth_headers("good-secret"))
+    assert r.status_code == 403
+    # Generic refusal: it discloses neither the scope held nor the scope wanted,
+    # and carries no recommendation data (the handler was never reached — see
+    # the _no_downstream fixture).
+    body = r.text
+    assert _REC_SCOPE not in body
+    for held in scopes:
+        assert held not in body
+    assert "items" not in r.json()
+def test_dashboard_session_credentials_do_not_substitute(client, kanban_home, _no_downstream) -> None:
+    # The machine credential is the only key to this route: the dashboard's own
+    # session token / header / cookies buy nothing, even with the recommendations
+    # credential provider registered and able to accept its own secret.
+    register_provider(_StubProvider(secret="good-secret", scopes=(_REC_SCOPE,)))
     from hermes_cli import web_server as ws
     assert client.get(_ROUTE, params=_params(), headers={"Authorization": f"Bearer {ws._SESSION_TOKEN}"}).status_code == 401
     assert client.get(_ROUTE, params=_params(), headers={ws._SESSION_HEADER_NAME: ws._SESSION_TOKEN}).status_code == 401
+    assert client.get(_ROUTE, params=_params(token=ws._SESSION_TOKEN)).status_code == 401
+    client.cookies.set("hermes_session_at", "session-access-token")
+    client.cookies.set("hermes_session_provider", "rec-test-provider")
+    try:
+        assert client.get(_ROUTE, params=_params()).status_code == 401
+    finally:
+        client.cookies.clear()
+def test_endpoint_stays_token_only_when_the_credential_plugin_is_a_no_op(
+    client, kanban_home, _no_downstream, monkeypatch
+) -> None:
+    # No HERMES_DASHBOARD_RECOMMENDATIONS_SECRET → the plugin registers nothing,
+    # but the route stays token-gated and answers 401 (fail-closed, never open).
+    monkeypatch.delenv(rec_plugin.SECRET_ENV_VAR, raising=False)
+    ctx = MagicMock()
+    rec_plugin.register(ctx)
+    ctx.register_dashboard_auth_provider.assert_not_called()
+    assert token_auth.get_token_route_policy("GET", _ROUTE) is not None
+    assert client.get(_ROUTE, params=_params()).status_code == 401
+    assert client.get(_ROUTE, params=_params(), headers=_auth_headers("any-secret")).status_code == 401
+# --- Method mismatch and cross-credential confinement ---
+@pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
+def test_method_mismatch_does_not_widen_token_authority(client, kanban_home, _no_downstream, method) -> None:
+    # The policy covers GET only. A correctly scoped bearer on another verb is
+    # not token-authenticated, so the ordinary session gate turns it away.
+    register_provider(_StubProvider(secret="good-secret", scopes=(_REC_SCOPE,)))
+    r = getattr(client, method)(_ROUTE, params=_params(), headers=_auth_headers("good-secret"))
+    assert r.status_code == 401
+def test_drain_credential_cannot_read_recommendations(client, kanban_home, _no_downstream) -> None:
+    drain_secret = secrets.token_urlsafe(32)
+    register_provider(DrainSecretProvider(secret=drain_secret, scope=_DRAIN_SCOPE))
+    _make_recommendation()
+    r = client.get(_ROUTE, params=_params(), headers=_auth_headers(drain_secret))
+    assert r.status_code == 403
+    assert _REC_SCOPE not in r.text and _DRAIN_SCOPE not in r.text
+def test_recommendations_credential_cannot_drive_drain(client, kanban_home, _drain_calls) -> None:
+    rec_secret = secrets.token_urlsafe(32)
+    drain_secret = secrets.token_urlsafe(32)
+    register_provider(RecommendationsSecretProvider(secret=rec_secret))
+    register_provider(DrainSecretProvider(secret=drain_secret, scope=_DRAIN_SCOPE))
+    _register_drain_route()
+    r = client.post(_DRAIN_ROUTE, json={"action": "cancel"}, headers=_auth_headers(rec_secret))
+    assert r.status_code == 403
+    assert _DRAIN_SCOPE not in r.text and _REC_SCOPE not in r.text
+    assert _drain_calls == {"write": 0, "clear": 0}  # downstream never reached
+    # Control: the drain credential itself is accepted on its own route, so the
+    # 403 above is about authority, not a broken registration.
+    ok = client.post(_DRAIN_ROUTE, json={"action": "cancel"}, headers=_auth_headers(drain_secret))
+    assert ok.status_code == 200, ok.text
+    assert _drain_calls == {"write": 0, "clear": 1}
+def test_recommendations_credential_is_accepted_on_its_own_route(client, kanban_home) -> None:
+    rec_secret = secrets.token_urlsafe(32)
+    register_provider(RecommendationsSecretProvider(secret=rec_secret))
+    register_provider(DrainSecretProvider(secret=secrets.token_urlsafe(32), scope=_DRAIN_SCOPE))
+    _register_drain_route()
+    rec_id = _make_recommendation()
+    r = client.get(_ROUTE, params=_params(), headers=_auth_headers(rec_secret))
+    assert r.status_code == 200, r.text
+    assert [i["id"] for i in r.json()["items"]] == [rec_id]
 # --- Mandatory exact scope + isolation ---
 @pytest.mark.parametrize("overrides,expected_status", [
     ({"board": ""}, 400), ({"board": "all"}, 400), ({"board": "*"}, 400),
