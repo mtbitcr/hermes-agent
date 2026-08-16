@@ -61,13 +61,26 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# ITEM31BG Stage C: this exact path is guarded by the generic non-interactive
-# bearer-token seam (``token_auth_middleware``) instead of the dashboard's
-# cookie/session gate — see the route definition below for the full
-# rationale. Registering here (module import time) matches the existing
-# ``plugins/dashboard_auth/drain`` convention.
+# ITEM31BG Stage C / ITEM31BI: this exact method + path is guarded by the
+# generic non-interactive bearer-token seam (``token_auth_middleware``)
+# instead of the dashboard's cookie/session gate — see the route definition
+# below for the full rationale. Registering here (module import time) matches
+# the existing ``plugins/dashboard_auth/drain`` convention.
+#
+# The required scope is fixed and registered unconditionally, even when no
+# credential provider for it exists: the endpoint must be token-only whether
+# or not ``dashboard_auth/recommendations`` loaded. With no provider able to
+# accept a token, the seam answers 401 — fail-closed. Only a principal that
+# actually carries this scope gets through, so the drain service credential
+# (scope ``drain``) is recognised here but refused with a generic 403.
 RECOMMENDATIONS_ROUTE_PATH = "/api/plugins/kanban/recommendations"
-register_token_route(RECOMMENDATIONS_ROUTE_PATH)
+RECOMMENDATIONS_ROUTE_METHOD = "GET"
+RECOMMENDATIONS_REQUIRED_SCOPE = "kanban:recommendations:read"
+register_token_route(
+    RECOMMENDATIONS_ROUTE_PATH,
+    method=RECOMMENDATIONS_ROUTE_METHOD,
+    required_scope=RECOMMENDATIONS_REQUIRED_SCOPE,
+)
 
 
 # ---------------------------------------------------------------------------

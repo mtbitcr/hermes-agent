@@ -45,163 +45,127 @@ Behavioural knobs live in config.yaml (canonical surface):
 
     dashboard:
       drain_auth:
-        scope: drain            # capability label attached to the principal
+        scope: drain            # optional; MUST be the fixed drain scope
         min_secret_chars: 43    # entropy bar (optional; default 43 ~= 256 bits)
+
+The scope is NOT a knob: it is the authority boundary this credential exists to
+enforce, so it is pinned to the exported :data:`DRAIN_SCOPE` constant. The key
+may be omitted, or spelled out as exactly ``drain`` (so an existing config that
+states it keeps working); any other value — notably the recommendations reader's
+``kanban:recommendations:read`` — is refused and the plugin registers NOTHING
+(no provider, no route). An operator-editable scope would otherwise be a way to
+mint a drain credential carrying another endpoint's capability, or to widen the
+drain route to accept another endpoint's credential.
 
 When ``HERMES_DASHBOARD_DRAIN_SECRET`` is unset, the plugin is a no-op (records
 a skip reason) — agents that don't want NAS-driven drain just don't set it.
 """
 from __future__ import annotations
 
-import hmac
 import logging
-import math
 import os
-from collections import Counter
 from typing import Optional
 
-from hermes_cli.dashboard_auth import (
-    DashboardAuthProvider,
-    LoginStart,
-    Session,
-    TokenPrincipal,
+from hermes_cli.dashboard_auth import TokenPrincipal
+from hermes_cli.dashboard_auth.static_secret import (
+    DEFAULT_MIN_SECRET_CHARS,
+    StaticBearerSecretProvider,
+    assess_secret_strength,
 )
 
 logger = logging.getLogger(__name__)
 
-# Default entropy bar: 43 url-safe-base64 chars ~= 256 bits. token_urlsafe(32)
-# produces 43 chars, so a correctly-provisioned secret clears this exactly.
-_DEFAULT_MIN_SECRET_CHARS = 43
-# A secret must contain at least this many DISTINCT characters — rejects
-# degenerate values like "aaaa..." that are long but trivially low-entropy.
-_MIN_DISTINCT_CHARS = 16
-# Shannon entropy floor (bits) over the secret's characters — a second,
-# distribution-aware guard on top of the length + distinct-count checks.
-_MIN_SHANNON_BITS = 128.0
+# The entropy gate and the constant-time secret compare live in the shared
+# ``hermes_cli.dashboard_auth.static_secret`` helper so this plugin and the
+# bundled ``dashboard_auth/recommendations`` plugin cannot drift apart on
+# security logic. ``assess_secret_strength`` is re-exported here because it is
+# part of this module's public surface
+# (``plugins.dashboard_auth.drain.assess_secret_strength``).
+_DEFAULT_MIN_SECRET_CHARS = DEFAULT_MIN_SECRET_CHARS
 
-# The path the begin/cancel-drain endpoint lives on. Registered as a
-# token-authable route by ``register()`` so the generic seam guards it. Kept
-# here (not imported from web_server) to avoid a heavy import at plugin load.
+# The exact method + path the begin/cancel-drain endpoint lives on, and the ONE
+# capability it grants. Registered as a token-authable route by ``register()``
+# under exactly this scope, so the generic seam guards it and no other machine
+# credential can drive it. All three are fixed constants, not configuration:
+# the provider vouches for ``DRAIN_SCOPE`` and the route demands ``DRAIN_SCOPE``,
+# so the credential and the policy are minted from one immutable value and
+# cannot drift or be widened. Kept here (not imported from web_server) to avoid
+# a heavy import at plugin load.
 DRAIN_ROUTE_PATH = "/api/gateway/drain"
+DRAIN_ROUTE_METHOD = "POST"
+DRAIN_SCOPE = "drain"
+DRAIN_PRINCIPAL = "drain-control"
 
 LAST_SKIP_REASON: str = ""
 
+__all__ = [
+    "DRAIN_PRINCIPAL",
+    "DRAIN_ROUTE_METHOD",
+    "DRAIN_ROUTE_PATH",
+    "DRAIN_SCOPE",
+    "DrainSecretProvider",
+    "assess_secret_strength",
+    "register",
+]
 
-def _shannon_bits(value: str) -> float:
-    """Total Shannon entropy (bits) of ``value`` over its character distribution.
 
-    H = len * sum(-p_i * log2(p_i)). A long string drawn from a wide alphabet
-    scores high; a long run of one character scores ~0.
+def _pin_drain_scope(scope: Optional[str]) -> str:
+    """Return :data:`DRAIN_SCOPE`, or raise for a request for any other scope.
+
+    ``None`` means "unspecified" and resolves to the fixed drain scope; the
+    literal fixed scope is accepted so an existing config/caller that states it
+    explicitly keeps working. Everything else — another endpoint's scope, a
+    renamed scope, a blank string — raises ``ValueError``, because the scope is
+    the authority boundary and no caller gets to choose it.
     """
-    if not value:
-        return 0.0
-    counts = Counter(value)
-    n = len(value)
-    per_char = -sum((c / n) * math.log2(c / n) for c in counts.values())
-    return per_char * n
+    if scope is None:
+        return DRAIN_SCOPE
+    candidate = str(scope).strip()
+    if candidate == DRAIN_SCOPE:
+        return DRAIN_SCOPE
+    raise ValueError(
+        f"drain scope is fixed at {DRAIN_SCOPE!r} and cannot be configured; "
+        f"got {candidate!r}"
+    )
 
 
-def assess_secret_strength(
-    secret: str, *, min_chars: int = _DEFAULT_MIN_SECRET_CHARS
-) -> Optional[str]:
-    """Return a rejection reason if ``secret`` is too weak, else ``None``.
+class DrainSecretProvider(StaticBearerSecretProvider):
+    """Non-interactive shared-bearer-secret provider for drain control.
 
-    Fail-closed entropy gate (decisions.md Q-A). Checks, in order:
-      * length >= ``min_chars`` (default 43 url-safe-b64 chars ~= 256 bits),
-      * at least ``_MIN_DISTINCT_CHARS`` distinct characters,
-      * Shannon entropy >= ``_MIN_SHANNON_BITS`` bits.
+    Everything security-relevant — the entropy gate enforced at construction
+    and the ``hmac.compare_digest`` verify on the request path — is inherited
+    from :class:`~hermes_cli.dashboard_auth.static_secret.StaticBearerSecretProvider`.
+    This class only pins the drain identity: the provider name, the
+    ``drain-control`` principal, and the fixed :data:`DRAIN_SCOPE` capability.
 
-    A ``None`` return means the secret passes. Any string return is a
-    human-readable reason the caller logs + records as the skip reason.
+    ``scope`` is not caller-chosen authority: it may be omitted, or passed as
+    exactly :data:`DRAIN_SCOPE`, and anything else raises ``ValueError``. A
+    provider carrying some other scope would either stand in for a different
+    endpoint's credential or leave the drain route demanding a capability no
+    drain credential holds.
     """
-    if not secret:
-        return "secret is empty"
-    if len(secret) < min_chars:
-        return (
-            f"secret too short: {len(secret)} chars (need >= {min_chars}; "
-            "use a >=256-bit value, e.g. `python -c \"import secrets; "
-            "print(secrets.token_urlsafe(32))\"`)"
-        )
-    distinct = len(set(secret))
-    if distinct < _MIN_DISTINCT_CHARS:
-        return (
-            f"secret has only {distinct} distinct characters (need >= "
-            f"{_MIN_DISTINCT_CHARS}); looks structured/low-entropy"
-        )
-    bits = _shannon_bits(secret)
-    if bits < _MIN_SHANNON_BITS:
-        return (
-            f"secret entropy too low: {bits:.0f} bits (need >= "
-            f"{_MIN_SHANNON_BITS:.0f}); looks structured/repeated"
-        )
-    return None
-
-
-class DrainSecretProvider(DashboardAuthProvider):
-    """Non-interactive shared-bearer-secret provider for drain control."""
 
     name = "drain-secret"
     display_name = "Drain Control (service credential)"
-    supports_token = True
-    supports_session = False
+    principal_id = DRAIN_PRINCIPAL
+    credential_label = "drain"
 
-    def __init__(self, *, secret: str, scope: str = "drain") -> None:
-        # Defence in depth: construction also enforces the entropy bar, so a
-        # caller that bypasses register()'s check still can't build a weak
-        # provider. register() does the friendly skip-reason path; this raises.
-        reason = assess_secret_strength(secret)
-        if reason is not None:
-            raise ValueError(f"drain secret rejected: {reason}")
-        self._secret = secret
-        self._scope = scope or "drain"
-
-    # ---- token capability (the only thing this provider implements) --------
+    def __init__(self, *, secret: str, scope: Optional[str] = None) -> None:
+        # Defence in depth: the base constructor also enforces the entropy
+        # bar, so a caller that bypasses register()'s check still can't build
+        # a weak provider. register() does the friendly skip-reason path; this
+        # raises. The scope pin is checked first, so a mis-scoped construction
+        # fails even for a perfectly strong secret.
+        super().__init__(secret=secret, scope=_pin_drain_scope(scope))
 
     def verify_token(self, *, token: str) -> Optional[TokenPrincipal]:
         """Constant-time compare against the per-agent shared secret.
 
-        Returns a ``drain-control`` principal on an exact match, else ``None``
-        (the generic seam falls through / fails closed). Uses
-        ``hmac.compare_digest`` so a wrong token can't be recovered by timing.
+        Returns a ``drain-control`` principal scoped to :data:`DRAIN_SCOPE` on
+        an exact match, else ``None`` (the generic seam falls through / fails
+        closed).
         """
-        if not token:
-            return None
-        if hmac.compare_digest(token.encode("utf-8"), self._secret.encode("utf-8")):
-            return TokenPrincipal(
-                principal="drain-control",
-                provider=self.name,
-                scopes=(self._scope,),
-            )
-        return None
-
-    # ---- interactive methods: unsupported (service credential only) --------
-
-    def start_login(self, *, redirect_uri: str) -> LoginStart:
-        raise NotImplementedError(
-            "DrainSecretProvider is a non-interactive service credential; "
-            "there is no login flow."
-        )
-
-    def complete_login(
-        self, *, code: str, state: str, code_verifier: str, redirect_uri: str
-    ) -> Session:
-        raise NotImplementedError(
-            "DrainSecretProvider is a non-interactive service credential."
-        )
-
-    def verify_session(self, *, access_token: str) -> Optional[Session]:
-        # Not a cookie-session provider — it never mints a Session, so it can
-        # never recognise a session cookie. Return None (don't raise) so it
-        # stacks harmlessly in the cookie-verify loop.
-        return None
-
-    def refresh_session(self, *, refresh_token: str) -> Session:
-        raise NotImplementedError(
-            "DrainSecretProvider is a non-interactive service credential."
-        )
-
-    def revoke_session(self, *, refresh_token: str) -> None:
-        return None
+        return super().verify_token(token=token)
 
 
 # ---------------------------------------------------------------------------
@@ -230,8 +194,14 @@ def register(ctx) -> None:
     """Plugin entry — registers DrainSecretProvider when a strong secret is set.
 
     No-op (records a skip reason) when ``HERMES_DASHBOARD_DRAIN_SECRET`` is
-    unset or fails the entropy gate. On success, also registers the
-    begin/cancel-drain route as token-authable via the generic seam.
+    unset, fails the entropy gate, or when ``dashboard.drain_auth.scope`` asks
+    for anything other than the fixed :data:`DRAIN_SCOPE`. On success, also
+    registers the begin/cancel-drain route as token-authable via the generic
+    seam, under that same fixed scope.
+
+    Every rejection path returns before ``ctx.register_dashboard_auth_provider``
+    and before ``register_token_route``, so a refused configuration never
+    leaves a half-registered endpoint behind.
     """
     global LAST_SKIP_REASON
     LAST_SKIP_REASON = ""
@@ -248,7 +218,21 @@ def register(ctx) -> None:
         return
 
     section = _load_config_drain_auth_section()
-    scope = str(section.get("scope", "drain") or "drain").strip() or "drain"
+    # Resolve the scope BEFORE anything is registered: a config that asks for
+    # any scope other than the fixed one is a configuration error, not a
+    # weaker-authority deployment, so the plugin registers neither the
+    # credential provider nor the route (no partial registration) and the drain
+    # endpoint stays on its ordinary cookie/session gate.
+    try:
+        scope = _pin_drain_scope(section.get("scope"))
+    except ValueError as exc:
+        LAST_SKIP_REASON = (
+            f"dashboard.drain_auth.scope rejected — {exc}. The drain endpoint "
+            "stays disabled (fail-closed)."
+        )
+        logger.warning("dashboard-auth-drain: %s", LAST_SKIP_REASON)
+        return
+
     try:
         min_chars = int(section.get("min_secret_chars", _DEFAULT_MIN_SECRET_CHARS))
     except (TypeError, ValueError):
@@ -274,18 +258,26 @@ def register(ctx) -> None:
 
     # Opt the begin/cancel-drain endpoint into the generic token-auth seam so
     # the dashboard's interactive cookie gate doesn't bounce NAS's bearer call.
+    # Registered ONLY here, after the strong credential provider was accepted,
+    # and only for POST with the fixed drain scope: a caller holding some other
+    # machine credential (e.g. the recommendations reader) is recognised but
+    # not authorised, and gets the seam's generic 403. When this plugin is a
+    # no-op the route is not a token route at all, preserving the existing
+    # browser-session fallback for dashboard-driven drain.
     try:
         from hermes_cli.dashboard_auth.token_auth import register_token_route
 
-        register_token_route(DRAIN_ROUTE_PATH)
+        register_token_route(
+            DRAIN_ROUTE_PATH, method=DRAIN_ROUTE_METHOD, required_scope=scope
+        )
     except Exception as exc:  # noqa: BLE001 — seam import must not crash plugin load
         logger.warning(
-            "dashboard-auth-drain: could not register token route %s: %s",
-            DRAIN_ROUTE_PATH, exc,
+            "dashboard-auth-drain: could not register token route %s %s: %s",
+            DRAIN_ROUTE_METHOD, DRAIN_ROUTE_PATH, exc,
         )
 
     logger.info(
         "dashboard-auth-drain: registered drain service-credential provider "
-        "(scope=%s, route=%s)",
-        scope, DRAIN_ROUTE_PATH,
+        "(scope=%s, route=%s %s)",
+        scope, DRAIN_ROUTE_METHOD, DRAIN_ROUTE_PATH,
     )

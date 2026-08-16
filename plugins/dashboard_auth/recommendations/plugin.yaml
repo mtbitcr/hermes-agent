@@ -1,0 +1,7 @@
+name: recommendations
+version: 1.0.0
+description: "Dashboard auth provider — non-interactive static-bearer-secret for the read-only Kanban recommendations endpoint (GET /api/plugins/kanban/recommendations). The second consumer of the generic token-auth capability (supports_token/verify_token), sharing the drain plugin's entropy gate and constant-time compare via hermes_cli.dashboard_auth.static_secret. A per-agent secret is provisioned via HERMES_DASHBOARD_RECOMMENDATIONS_SECRET; a match vouches for the fixed principal kanban-recommendations-reader carrying the single fixed scope kanban:recommendations:read, so this credential is refused (generic 403) on every other token route and other machine credentials are refused here. Fails CLOSED: a weak/short/low-entropy secret (< 256 bits) is rejected at registration and no provider is registered; the endpoint remains token-only and answers 401. No-op when the env var is unset. No behavioural knobs — the principal and scope are fixed, because the scope is the authority boundary."
+author: NousResearch
+kind: backend
+requires_env:
+  - HERMES_DASHBOARD_RECOMMENDATIONS_SECRET
