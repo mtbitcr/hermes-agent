@@ -1134,3 +1134,331 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# ITEM31BH — kanban_recommend (owner-review capability advice)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def recommend_worker_env(monkeypatch, tmp_path):
+    """A dispatcher-owned worker whose task is scoped to a project and assigned
+    to the *active* profile — the only context kanban_recommend accepts."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.profiles import get_active_profile_name
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    profile = get_active_profile_name()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="recommend-test", assignee=profile)
+        kb.claim_task(conn, tid)
+        # Stamp the project link directly: create_task drops ids that don't
+        # resolve in this profile's projects.db, and the tool only cares that
+        # the task row carries one.
+        conn.execute("UPDATE tasks SET project_id = 'proj-1' WHERE id = ?", (tid,))
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    return tid
+
+
+def _recommendation_rows():
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        return conn.execute(
+            "SELECT * FROM tasks WHERE task_kind = 'recommendation' "
+            "ORDER BY created_at, id"
+        ).fetchall()
+
+
+def _kanban_schema_names(monkeypatch, *, kanban_toolset_enabled=False):
+    import tools.kanban_tools as kt  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    monkeypatch.setattr(
+        kt, "_profile_has_kanban_toolset", lambda: kanban_toolset_enabled
+    )
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    invalidate_check_fn_cache()
+    return {n for n in names if n and n.startswith("kanban_")}
+
+
+def test_recommend_is_in_the_worker_schema(recommend_worker_env, monkeypatch):
+    assert "kanban_recommend" in _kanban_schema_names(monkeypatch)
+
+
+def test_recommend_is_hidden_from_orchestrator_and_plain_chat(monkeypatch, tmp_path):
+    """An orchestrator profile routes work but owns no task, so it has no
+    trusted scope to recommend from — it must not see the tool even though it
+    sees the rest of the kanban surface."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    orchestrator = _kanban_schema_names(monkeypatch, kanban_toolset_enabled=True)
+    assert "kanban_list" in orchestrator, orchestrator  # the orchestrator surface is live
+    assert "kanban_recommend" not in orchestrator
+    assert _kanban_schema_names(monkeypatch) == set()  # plain chat sees nothing at all
+
+
+@pytest.mark.parametrize("context", ["delegated-child", "cron-inherited"])
+def test_recommend_is_hidden_from_untrusted_kanban_contexts(
+    recommend_worker_env, monkeypatch, context
+):
+    """HERMES_KANBAN_TASK is set in both, but neither execution owns it."""
+    from agent.delegation_context import (
+        delegated_child_context,
+        non_dispatcher_owned_context,
+    )
+    ctx = (
+        delegated_child_context() if context == "delegated-child"
+        else non_dispatcher_owned_context()
+    )
+    with ctx:
+        assert "kanban_recommend" not in _kanban_schema_names(monkeypatch)
+
+
+def test_recommend_visibility_transitions_within_one_check_fn_cache_window(
+    recommend_worker_env,
+):
+    """The check_fn TTL cache must be partitioned by dispatcher-ownership /
+    delegation context (ITEM31BH).
+
+    A worker's schema lookup caches ``_check_kanban_recommend_mode() == True``
+    for ~30s. Without partitioning that cache by context, an in-process cron
+    job or delegate_task child inheriting the worker's ``HERMES_KANBAN_TASK``
+    would see the stale cached ``True`` and leak ``kanban_recommend`` into
+    their schema during that window — even though the runtime call itself
+    would still refuse. This observes the worker -> cron -> delegated
+    transition back-to-back with no ``invalidate_check_fn_cache()`` call
+    between lookups, so a regression to the unpartitioned cache would fail it.
+    """
+    import tools.kanban_tools  # ensure registered
+    from agent.delegation_context import (
+        delegated_child_context,
+        non_dispatcher_owned_context,
+    )
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    toolset = set(resolve_toolset("hermes-cli"))
+
+    def _names():
+        schema = registry.get_definitions(toolset, quiet=True)
+        return {s["function"].get("name") for s in schema if "function" in s}
+
+    # Start from a clean cache (setup only — no invalidation between the
+    # three observations below).
+    invalidate_check_fn_cache()
+
+    # Dispatcher-owned worker: visible, and now cached True for this check_fn.
+    assert "kanban_recommend" in _names()
+
+    # In-process cron job inheriting the same HERMES_KANBAN_TASK: hidden,
+    # despite the worker's cached True still being within its TTL.
+    with non_dispatcher_owned_context():
+        assert "kanban_recommend" not in _names()
+
+    # delegate_task child, same process, same inherited env var: hidden too.
+    with delegated_child_context():
+        assert "kanban_recommend" not in _names()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["skill", "permission", "connection", "pipeline", "provider_model_policy"],
+)
+def test_recommend_publishes_each_kind_with_server_derived_scope(
+    recommend_worker_env, kind
+):
+    from hermes_cli.profiles import get_active_profile_name
+    from tools import kanban_tools as kt
+
+    out = kt._handle_recommend(
+        {"kind": kind, "subject_id": f"subject-{kind}",
+         "label": "Give me this capability", "rationale": "it keeps coming up"}
+    )
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+    profile = get_active_profile_name()
+    assert d == {
+        "ok": True, "recommendation_id": d["recommendation_id"], "kind": kind,
+        "project_id": "proj-1", "target_profile": profile,
+        "status": "review", "review_policy": "owner",
+    }
+    rows = _recommendation_rows()
+    assert len(rows) == 1  # one call, at most one recommendation
+    row = rows[0]
+    assert row["id"] == d["recommendation_id"]
+    assert (row["recommendation_kind"], row["status"], row["review_policy"]) == (
+        kind, "review", "owner",
+    )
+    assert (row["project_id"], row["target_profile"]) == ("proj-1", profile)
+    # Provenance is fixed by the server from the verified profile and current task.
+    assert row["provenance_authority"] == f"hermes-profile:{profile}"
+    assert row["provenance_ref"] == f"kanban-task:{recommend_worker_env}"
+    assert isinstance(row["provenance_observed_at"], int)
+    assert row["assignee"] is None and row["current_run_id"] is None
+
+
+def test_recommend_response_never_echoes_label_or_rationale(recommend_worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_recommend(
+        {"kind": "skill", "subject_id": "translation",
+         "label": "Load the translation skill", "rationale": "seen repeatedly"}
+    )
+    assert "Load the translation skill" not in out and "seen repeatedly" not in out
+    assert set(json.loads(out)) == {
+        "ok", "recommendation_id", "kind", "project_id", "target_profile",
+        "status", "review_policy",
+    }
+
+
+def test_recommend_leaves_the_work_task_and_board_untouched(recommend_worker_env):
+    """Advice only: recommending must not dispatch, claim, promote, complete,
+    archive, or otherwise mutate ordinary board state."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect_closing() as conn:
+        before = dict(
+            conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (recommend_worker_env,)
+            ).fetchone()
+        )
+        events_before = len(kb.list_events(conn, recommend_worker_env))
+        tasks_before = {t.id for t in kb.list_tasks(conn)}
+
+    assert json.loads(
+        kt._handle_recommend(
+            {"kind": "permission", "subject_id": "fs.write", "label": "Allow writes"}
+        )
+    )["ok"] is True
+
+    with kb.connect_closing() as conn:
+        after = dict(
+            conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (recommend_worker_env,)
+            ).fetchone()
+        )
+        assert after == before
+        assert len(kb.list_events(conn, recommend_worker_env)) == events_before
+        assert {t.id for t in kb.list_tasks(conn)} == tasks_before  # card is not board work
+
+
+def test_repeat_recommend_returns_the_same_card(recommend_worker_env):
+    from tools import kanban_tools as kt
+
+    first = json.loads(kt._handle_recommend(
+        {"kind": "skill", "subject_id": "translation", "label": "Load translation"}
+    ))
+    again = json.loads(kt._handle_recommend(
+        {"kind": "skill", "subject_id": "translation",
+         "label": "Please load translation", "rationale": "asking again"}
+    ))
+    assert again["recommendation_id"] == first["recommendation_id"]
+    assert len(_recommendation_rows()) == 1
+
+
+def _fail_closed_cases():
+    return [
+        "no-task-in-env", "unknown-task", "no-project-id", "no-assignee",
+        "profile-mismatch", "delegated-child", "cron-inherited", "bad-kind",
+    ]
+
+
+@pytest.mark.parametrize("case", _fail_closed_cases())
+def test_recommend_fails_closed_with_zero_writes(
+    recommend_worker_env, monkeypatch, case
+):
+    import contextlib
+
+    from agent.delegation_context import (
+        delegated_child_context,
+        non_dispatcher_owned_context,
+    )
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    args = {"kind": "skill", "subject_id": "translation", "label": "Load translation"}
+    ctx = contextlib.nullcontext()
+    if case == "no-task-in-env":
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    elif case == "unknown-task":
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_deadbeef")
+    elif case in {"no-project-id", "no-assignee"}:
+        col = "project_id" if case == "no-project-id" else "assignee"
+        with kb.connect_closing() as conn:
+            conn.execute(
+                f"UPDATE tasks SET {col} = NULL WHERE id = ?", (recommend_worker_env,)
+            )
+            conn.commit()
+    elif case == "profile-mismatch":
+        with kb.connect_closing() as conn:
+            conn.execute(
+                "UPDATE tasks SET assignee = 'someone-else' WHERE id = ?",
+                (recommend_worker_env,),
+            )
+            conn.commit()
+    elif case == "delegated-child":
+        ctx = delegated_child_context()
+    elif case == "cron-inherited":
+        ctx = non_dispatcher_owned_context()
+    elif case == "bad-kind":
+        args = {**args, "kind": "install"}
+
+    with ctx:
+        out = kt._handle_recommend(args)
+    d = json.loads(out)
+    assert d.get("ok") is not True and d.get("error"), out
+    assert _recommendation_rows() == []
+
+
+def test_recommend_schema_exposes_only_the_advice_payload():
+    from tools.kanban_tools import KANBAN_RECOMMEND_SCHEMA as schema
+
+    params = schema["parameters"]
+    assert set(params["properties"]) == {"kind", "subject_id", "label", "rationale"}
+    assert params["required"] == ["kind", "subject_id", "label"]
+    # Scope, authority, decision, action, and bulk arguments are server-owned or
+    # simply do not exist — the model may not name any of them.
+    arg_names = " ".join(params["properties"]).lower()
+    for banned in (
+        "board", "task", "project", "profile", "provenance", "status", "review",
+        "policy", "assignee", "decision", "approve", "reject", "install",
+        "connect", "apply", "config", "command", "credential", "secret",
+        "action", "item", "bulk", "auto", "target",
+    ):
+        assert banned not in arg_names, f"kanban_recommend exposes {banned!r}"
+    # Every argument is one bounded scalar: no arrays, no nested objects, so a
+    # single call cannot carry a batch of recommendations.
+    assert [p["type"] for p in params["properties"].values()] == ["string"] * 4
+    assert all("maxLength" in p for n, p in params["properties"].items() if n != "kind")
+
+
+def test_recommend_kind_enum_tracks_the_db_and_adds_exactly_one_tool():
+    from hermes_cli import kanban_db as kb
+    from tools.kanban_tools import KANBAN_RECOMMEND_SCHEMA, _RECOMMENDATION_KINDS
+    from toolsets import TOOLSETS
+
+    assert set(_RECOMMENDATION_KINDS) == kb.VALID_RECOMMENDATION_KINDS
+    assert (
+        set(KANBAN_RECOMMEND_SCHEMA["parameters"]["properties"]["kind"]["enum"])
+        == kb.VALID_RECOMMENDATION_KINDS
+    )
+    # One new tool on the existing toolset — no new registry, route, or surface.
+    assert "kanban_recommend" in TOOLSETS["kanban"]["tools"]

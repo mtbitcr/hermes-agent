@@ -87,6 +87,9 @@ _HERMES_CORE_TOOLS = [
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+    # kanban_recommend is narrower still: dispatcher-owned workers only, never
+    # orchestrator profiles (see _check_kanban_recommend_mode).
+    "kanban_recommend",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
@@ -319,7 +322,9 @@ TOOLSETS = {
             "`kanban.dispatch_in_gateway` in config.yaml. Lets workers mark "
             "tasks done with structured handoffs, enter first-class review "
             "(request_review — not a block), return review changes, block for human input, "
-            "heartbeat during long ops, comment on threads, attach files, and "
+            "heartbeat during long ops, comment on threads, attach files, "
+            "recommend a capability for owner review (advice only — never "
+            "applied automatically), and "
             "(for orchestrators) list, unblock, and fan out tasks."
         ),
         "tools": [
@@ -329,6 +334,7 @@ TOOLSETS = {
             "kanban_create", "kanban_link",
             "kanban_unblock",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
+            "kanban_recommend",
         ],
         "includes": [],
     },

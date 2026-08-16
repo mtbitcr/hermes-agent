@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -133,6 +134,25 @@ def _check_kanban_orchestrator_mode() -> bool:
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return False
     return _profile_has_kanban_toolset()
+
+
+def _check_kanban_recommend_mode() -> bool:
+    """``kanban_recommend`` is dispatcher-owned-*worker*-only (ITEM31BH).
+
+    Narrower than ``_check_kanban_mode``: a configured orchestrator profile is
+    not enough. The tool derives its entire scope (project, target profile,
+    provenance) from the dispatcher's trusted ``HERMES_KANBAN_TASK``, so a
+    context without one has nothing trustworthy to derive from. Ordinary chat,
+    orchestrator profiles, delegate_task children, cron jobs fired in-process
+    from a worker, and non-Kanban sessions all see zero ``kanban_recommend``
+    in their schema. ``_require_recommendation_worker`` repeats every one of
+    these checks at call time in case a registration is stale.
+    """
+    if _is_delegated_child_context():
+        return False
+    if not _is_dispatcher_owned_worker():
+        return False
+    return bool(os.environ.get("HERMES_KANBAN_TASK"))
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +498,36 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
             "must use kanban_complete, kanban_block, kanban_heartbeat, or "
             "kanban_comment for their assigned task."
+        )
+    return None
+
+
+def _require_recommendation_worker(tool_name: str) -> Optional[str]:
+    """Runtime half of the ``kanban_recommend`` gate (ITEM31BH).
+
+    ``_check_kanban_recommend_mode`` keeps the tool out of every non-worker
+    schema, but a stale registration, a cached check_fn result, or a test rig
+    could still route a call here. Repeat all three checks so an untrusted
+    context fails closed with zero writes instead of publishing owner-facing
+    advice under someone else's identity.
+    """
+    if _is_delegated_child_context():
+        return tool_error(
+            f"{tool_name} refused: delegate_task child agents are not Kanban "
+            "run owners. Report the capability gap to the parent agent; only "
+            "the dispatcher-spawned worker may publish a recommendation."
+        )
+    if not _is_dispatcher_owned_worker():
+        return tool_error(
+            f"{tool_name} refused: HERMES_KANBAN_* is present but not owned by "
+            "this execution (e.g. a cron job fired in-process from a worker). "
+            "Inherited task scope is not proof of ownership."
+        )
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return tool_error(
+            f"{tool_name} refused: no dispatcher-assigned task in scope. This "
+            "tool derives its project, target profile, and provenance from the "
+            "current Kanban task and takes no scope arguments."
         )
     return None
 
@@ -1666,6 +1716,100 @@ def _handle_link(args: dict, **kw) -> str:
         return tool_error(f"kanban_link: {e}")
 
 
+def _handle_recommend(args: dict, **kw) -> str:
+    """Publish one non-actionable capability recommendation for owner review.
+
+    Everything that decides *who and what this is about* comes from trusted
+    server state, never from the model: the task from ``HERMES_KANBAN_TASK``,
+    the board from the pinned ``_connect()`` resolution, the project from that
+    task's row, and the target profile from the task's assignee — which must
+    equal the active profile, so a worker can only ever recommend for itself.
+    The model supplies only the opaque advice payload (kind/subject/label/
+    rationale), and the response echoes back scope, never the display text.
+    """
+    guard_err = _require_recommendation_worker("kanban_recommend")
+    if guard_err:
+        return guard_err
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    kind = str(args.get("kind") or "").strip()
+    try:
+        kb, conn = _connect()
+        try:
+            if kind not in kb.VALID_RECOMMENDATION_KINDS:
+                return tool_error(
+                    "kanban_recommend: kind must be one of "
+                    f"{sorted(kb.VALID_RECOMMENDATION_KINDS)}"
+                )
+            # get_task only ever resolves ordinary work tasks; a recommendation
+            # card can never be the seat a recommendation is published from.
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(
+                    f"kanban_recommend refused: task {tid} not found on this "
+                    "board; nothing trustworthy to derive scope from."
+                )
+            project_id = (task.project_id or "").strip()
+            if not project_id:
+                return tool_error(
+                    f"kanban_recommend refused: task {tid} has no project_id. "
+                    "Owner review is scoped per project; an unscoped "
+                    "recommendation has no reviewer."
+                )
+            assignee = _normalize_profile(task.assignee)
+            if not assignee:
+                return tool_error(
+                    f"kanban_recommend refused: task {tid} has no assignee, so "
+                    "there is no target profile to recommend for."
+                )
+            from hermes_cli.profiles import (
+                get_active_profile_name,
+                normalize_profile_name,
+            )
+
+            target_profile = normalize_profile_name(assignee)
+            active_profile = normalize_profile_name(get_active_profile_name())
+            if active_profile != target_profile:
+                return tool_error(
+                    f"kanban_recommend refused: active profile "
+                    f"{active_profile!r} does not own task {tid} (assigned to "
+                    f"{target_profile!r}). A worker may only recommend "
+                    "capabilities for itself."
+                )
+            rec_id = kb.create_recommendation(
+                conn,
+                project_id=project_id,
+                target_profile=target_profile,
+                recommendation_kind=kind,
+                recommendation_subject_id=args.get("subject_id"),
+                recommendation_label=args.get("label"),
+                recommendation_rationale=args.get("rationale"),
+                # Fixed, server-derived provenance: the identity that observed
+                # the gap and the task it was observed under. The model cannot
+                # forge either, and the ref is excluded from dedup identity so a
+                # later task cannot re-raise the same advice.
+                provenance_authority=f"hermes-profile:{active_profile}",
+                provenance_ref=f"kanban-task:{tid}",
+                provenance_observed_at=int(time.time()),
+            )
+            return _ok(
+                recommendation_id=rec_id,
+                kind=kind,
+                project_id=project_id,
+                target_profile=target_profile,
+                status="review",
+                review_policy="owner",
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        # Bounds / blank-field rejections from create_recommendation. These name
+        # the offending field, never its (possibly secret-bearing) value.
+        return tool_error(f"kanban_recommend: {e}")
+    except Exception as e:
+        logger.exception("kanban_recommend failed")
+        return tool_error(f"kanban_recommend: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -2348,6 +2492,75 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+# Mirrors ``kanban_db.VALID_RECOMMENDATION_KINDS`` so building the schema does
+# not force a kanban_db import at module import time (see ``_connect``). A test
+# pins the two lists together so they cannot drift.
+_RECOMMENDATION_KINDS = (
+    "skill", "permission", "connection", "pipeline", "provider_model_policy",
+)
+
+KANBAN_RECOMMEND_SCHEMA = {
+    "name": "kanban_recommend",
+    "description": (
+        "Recommend one capability your owner may want to give you, for "
+        "human review. Use this when a capability gap is blocking or "
+        "slowing your work — a skill you don't have loaded, a permission "
+        "you lack, a service you aren't connected to, a pipeline that "
+        "should exist, or a provider/model policy that fits this work "
+        "better. This is advice only: it creates a card a human reviews "
+        "and decides on. It installs, connects, enables, and changes "
+        "nothing, it does not unblock your current task, and nothing "
+        "happens automatically as a result. Scope is taken from your "
+        "current task (project and profile) — you cannot recommend for "
+        "another task, project, profile, or board, and you cannot approve "
+        "your own recommendation. Re-sending the same recommendation is "
+        "harmless but pointless: it returns the existing card rather than "
+        "nagging your owner twice. Keep ``subject_id`` a stable, "
+        "non-secret identifier and never put credentials, tokens, or "
+        "other secrets in any field."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": list(_RECOMMENDATION_KINDS),
+                "description": (
+                    "What kind of capability this is about: 'skill', "
+                    "'permission', 'connection', 'pipeline', or "
+                    "'provider_model_policy'."
+                ),
+            },
+            "subject_id": {
+                "type": "string",
+                "maxLength": 200,
+                "description": (
+                    "Stable, non-secret identifier of the capability itself "
+                    "(e.g. a skill name). Used to recognise repeats of the "
+                    "same recommendation, so keep it consistent."
+                ),
+            },
+            "label": {
+                "type": "string",
+                "maxLength": 200,
+                "description": (
+                    "Short owner-facing label for the review card, e.g. "
+                    "'Load the translation skill'."
+                ),
+            },
+            "rationale": {
+                "type": "string",
+                "maxLength": 4000,
+                "description": (
+                    "Optional short explanation of why this would help, in "
+                    "terms a human reviewer can judge."
+                ),
+            },
+        },
+        "required": ["kind", "subject_id", "label"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -2477,4 +2690,13 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_recommend",
+    toolset="kanban",
+    schema=KANBAN_RECOMMEND_SCHEMA,
+    handler=_handle_recommend,
+    check_fn=_check_kanban_recommend_mode,
+    emoji="💡",
 )

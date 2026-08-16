@@ -143,3 +143,91 @@ def test_create_recommendation_persists_exact_fields_isolated_shape_and_skips_cr
 def test_create_recommendation_rejects_invalid_input(kanban_home: Path, overrides: dict) -> None:
     with kb.connect_closing() as conn, pytest.raises(ValueError):
         kb.create_recommendation(conn, **{**_VALID_KWARGS, **overrides})
+# --- ITEM31BH: atomic identity-scoped idempotency ---
+def _rec_rows(conn) -> list:
+    return conn.execute("SELECT * FROM tasks WHERE task_kind = 'recommendation' ORDER BY created_at, id").fetchall()
+def _rec_events(conn) -> list:
+    return conn.execute(
+        "SELECT e.* FROM task_events e JOIN tasks t ON t.id = e.task_id WHERE t.task_kind = 'recommendation' ORDER BY e.id"
+    ).fetchall()
+def test_repeat_publish_returns_existing_id_with_no_second_row_or_event(kanban_home: Path) -> None:
+    # Rewording the advice, observing it later, and noticing it under a different task must not re-nag the owner.
+    with kb.connect_closing() as conn:
+        first = kb.create_recommendation(conn, **_VALID_KWARGS)
+        again = kb.create_recommendation(
+            conn, **{**_VALID_KWARGS, "recommendation_label": "totally different wording",
+                     "recommendation_rationale": "new evidence", "provenance_ref": "kanban-task:t-later",
+                     "provenance_observed_at": 1_800_000_000},
+        )
+        assert again == first
+        rows = _rec_rows(conn)
+        assert len(rows) == 1 and [r["kind"] for r in _rec_events(conn)] == ["recommendation_created"]
+        assert rows[0]["recommendation_label"] == "x"  # the first card wins; the later wording never overwrites it
+@pytest.mark.parametrize(
+    "overrides",
+    [dict(project_id="proj-2"), dict(target_profile="other-worker"), dict(provenance_authority="hermes-profile:other"),
+     dict(recommendation_kind="permission"), dict(recommendation_subject_id="different-subject")],
+    ids=["project", "profile", "authority", "kind", "subject"],
+)
+def test_each_identity_dimension_creates_a_distinct_recommendation(kanban_home: Path, overrides: dict) -> None:
+    with kb.connect_closing() as conn:
+        base = kb.create_recommendation(conn, **_VALID_KWARGS)
+        other = kb.create_recommendation(conn, **{**_VALID_KWARGS, **overrides})
+        assert other != base and len(_rec_rows(conn)) == 2
+def test_resolved_or_archived_recommendation_stays_the_dedup_authority(kanban_home: Path) -> None:
+    # The owner already decided. A worker must not be able to re-raise the same advice by outliving the card.
+    with kb.connect_closing() as conn:
+        first = kb.create_recommendation(conn, **_VALID_KWARGS)
+        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (first,))
+        conn.commit()
+        assert kb.create_recommendation(conn, **_VALID_KWARGS) == first
+        assert len(_rec_rows(conn)) == 1
+def test_concurrent_publishers_on_separate_connections_collapse_to_one_row(kanban_home: Path) -> None:
+    # Two workers racing the same advice: BEGIN IMMEDIATE serializes them, so the loser reads the winner's row.
+    from concurrent.futures import ThreadPoolExecutor
+    def _publish() -> str:
+        with kb.connect_closing() as conn:
+            return kb.create_recommendation(conn, **_VALID_KWARGS)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        ids = list(pool.map(lambda _: _publish(), range(4)))
+    assert len(set(ids)) == 1
+    with kb.connect_closing() as conn:
+        assert len(_rec_rows(conn)) == 1 and len(_rec_events(conn)) == 1
+def test_secret_bearing_fields_are_redacted_in_row_event_and_identity(kanban_home: Path) -> None:
+    # Two publishes whose subject differs only inside the secret: redaction happens before both durability and
+    # the identity digest, so the secret neither persists nor forks the identity into a second nag.
+    with kb.connect_closing() as conn:
+        first = kb.create_recommendation(
+            conn, **{**_VALID_KWARGS, "recommendation_subject_id": "api_key=aaa111bbb222",
+                     "recommendation_label": "password: hunter2secret", "recommendation_rationale": "token=aaa111bbb222"},
+        )
+        again = kb.create_recommendation(
+            conn, **{**_VALID_KWARGS, "recommendation_subject_id": "api_key=ccc333ddd444",
+                     "recommendation_label": "password: someothersecret", "recommendation_rationale": "token=ccc333ddd444"},
+        )
+        assert again == first
+        rows = _rec_rows(conn)
+        assert len(rows) == 1
+        assert (rows[0]["recommendation_subject_id"], rows[0]["recommendation_label"], rows[0]["recommendation_rationale"]) == (
+            "api_key=***", "password: ***", "token=***",
+        )
+        blob = json.dumps([dict(r) for r in rows]) + json.dumps([dict(e) for e in _rec_events(conn)])
+        for secret in ("aaa111bbb222", "ccc333ddd444", "hunter2secret", "someothersecret"):
+            assert secret not in blob
+def test_identity_digest_is_opaque_and_never_stores_its_input(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = kb.create_recommendation(conn, **_VALID_KWARGS)
+        key = conn.execute("SELECT idempotency_key FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+    assert key.startswith("rec1:") and len(key) == len("rec1:") + 64
+    for raw in ("proj-1", "worker", "skill", "static-analyzer"):
+        assert raw not in key
+def test_ordinary_work_task_idempotency_is_unchanged_by_recommendation_keys(kanban_home: Path) -> None:
+    # Neither namespace may see the other's key: work lookups filter task_kind='work', recommendations 'recommendation'.
+    with kb.connect_closing() as conn:
+        rec_id = kb.create_recommendation(conn, **_VALID_KWARGS)
+        shared = conn.execute("SELECT idempotency_key FROM tasks WHERE id = ?", (rec_id,)).fetchone()[0]
+        work_a = kb.create_task(conn, title="ordinary", idempotency_key=shared)
+        assert work_a != rec_id
+        assert kb.create_task(conn, title="ordinary", idempotency_key=shared) == work_a
+        assert kb.create_recommendation(conn, **_VALID_KWARGS) == rec_id
+        assert len(_rec_rows(conn)) == 1

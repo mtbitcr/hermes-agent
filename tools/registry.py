@@ -272,11 +272,48 @@ _CHECK_FN_TTL_SECONDS = 30.0
 # so a genuinely-down backend is reflected within a couple of turns.
 _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
 _CHECK_FN_CACHE_MAX = 512
-_check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
+_CacheKey = tuple[Callable, Optional[str], "tuple[bool, bool]"]
+_check_fn_cache: Dict[_CacheKey, tuple[float, bool]] = {}
 # Monotonic timestamp of the most recent True result per check_fn.
-_check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
+_check_fn_last_good: Dict[_CacheKey, float] = {}
 _check_fn_cache_lock = threading.Lock()
 CHECK_FN_CACHE_BYPASS = ""
+
+
+def _is_delegated_child_context() -> bool:
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        return is_delegated_child_context()
+    except Exception:
+        return False
+
+
+def _is_dispatcher_owned_worker_context() -> bool:
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        return True
+
+
+def _check_fn_context_key() -> tuple[bool, bool]:
+    """Return ``(is_delegated_child, is_dispatcher_owned_worker)``.
+
+    check_fn callables such as ``tools.kanban_tools._check_kanban_recommend_mode``
+    derive their verdict from these same ``agent.delegation_context`` ContextVars,
+    not only from ``os.environ``. Without this in the cache key, a dispatcher
+    worker's cached ``True`` verdict would otherwise leak — for the rest of the
+    TTL window — to an in-process delegate_task child or cron job that inherits
+    the worker's ``HERMES_KANBAN_TASK`` env var but does not own it, exposing a
+    tool schema the runtime call itself would still refuse (ITEM31BH). Included
+    in every check_fn cache key (not just Kanban's) so this stays one seam
+    rather than a per-tool special case; in the common case (no delegation/cron
+    in flight) the tuple is constant, so stable expensive probes keep their
+    normal TTL caching unaffected.
+    """
+    return (_is_delegated_child_context(), _is_dispatcher_owned_worker_context())
 
 
 def _prune_check_fn_caches(now: float) -> None:
@@ -343,7 +380,7 @@ def _check_fn_cached(fn: Callable) -> bool:
                 exc_info=True,
             )
             return False
-    cache_key = (fn, scope)
+    cache_key = (fn, scope, _check_fn_context_key())
     with _check_fn_cache_lock:
         _prune_check_fn_caches(now)
         cached = _check_fn_cache.get(cache_key)
@@ -414,7 +451,7 @@ def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
         # trustworthy cached verdict to report.
         return None
     with _check_fn_cache_lock:
-        cached = _check_fn_cache.get((fn, scope))
+        cached = _check_fn_cache.get((fn, scope, _check_fn_context_key()))
         if cached is None:
             return None
         ts, value = cached
