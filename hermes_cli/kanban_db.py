@@ -147,6 +147,11 @@ _RECOMMENDATION_PROVENANCE_REF_MAX_LEN = 500
 # Fixed non-semantic title; recommendation cards are read via recommendation_* columns, never title/body.
 _RECOMMENDATION_TASK_TITLE = "hermes recommendation"
 
+# ITEM31BH: version tag for the recommendation dedup identity stored in
+# ``tasks.idempotency_key``. Bump only if the identity tuple changes meaning —
+# a bump intentionally re-opens one new card per previously-deduped identity.
+_RECOMMENDATION_IDENTITY_VERSION = "rec1"
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -3672,6 +3677,42 @@ def _bounded_display_field(
     return redact_review_value(cleaned)
 
 
+def _recommendation_identity_key(
+    *,
+    project_id: str,
+    target_profile: str,
+    recommendation_kind: str,
+    provenance_authority: str,
+    recommendation_subject_id: str,
+) -> str:
+    """Digest the safe scope identity of a recommendation (ITEM31BH).
+
+    A recommendation is advice a human owner reviews, so re-publishing the same
+    advice — reworded, observed later, or noticed while working a different task
+    — must not create a second nag. Identity is therefore the *scope* only:
+    project, target profile, kind, provenance authority, and subject id. Label,
+    rationale, observed time, and provenance ref are deliberately excluded.
+
+    Callers must pass the already redacted/normalized values, so a secret that
+    leaked into a display field cannot fork the identity (it is ``[REDACTED]``
+    by the time it gets here) and never becomes durable state: only the digest
+    is stored, never the digest input.
+    """
+    payload = json.dumps(
+        {
+            "project_id": project_id,
+            "target_profile": target_profile,
+            "recommendation_kind": recommendation_kind,
+            "provenance_authority": provenance_authority,
+            "recommendation_subject_id": recommendation_subject_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"{_RECOMMENDATION_IDENTITY_VERSION}:{digest}"
+
+
 def create_recommendation(
     conn: sqlite3.Connection,
     *,
@@ -3691,6 +3732,14 @@ def create_recommendation(
     human owner to accept or reject, never dispatched to a worker: it writes the row
     directly (no assignee, workspace/branch, or run; ``status='review'``,
     ``review_policy='owner'`` unconditionally). Returns the new task id.
+
+    Creation is idempotent on the safe scope identity (see
+    :func:`_recommendation_identity_key`): a repeat publish returns the existing
+    card's id and writes no second row and no second event. The lookup runs
+    inside the same ``BEGIN IMMEDIATE`` write transaction as the insert, so
+    concurrent callers (including separate connections/processes) collapse to
+    one row. A resolved or archived card stays the dedup authority — owner
+    review is a decision, and re-nagging past it is exactly what this prevents.
     """
     if recommendation_kind not in VALID_RECOMMENDATION_KINDS:
         raise ValueError(
@@ -3744,11 +3793,32 @@ def create_recommendation(
     ):
         raise ValueError("provenance_observed_at must be an integer unix timestamp")
 
+    identity_key = _recommendation_identity_key(
+        project_id=project_id,
+        target_profile=target_profile,
+        recommendation_kind=recommendation_kind,
+        provenance_authority=provenance_authority,
+        recommendation_subject_id=recommendation_subject_id,
+    )
+
     now = int(time.time())
     for attempt in range(2):
         task_id = _new_task_id()
         try:
             with write_txn(conn, allow_nested=True):
+                # Inside the write transaction on purpose: BEGIN IMMEDIATE
+                # already serializes writers, so a concurrent publisher either
+                # loses the race and reads the winner's row here, or wins and
+                # is the row everyone else finds. No status filter — an
+                # archived/resolved card is still the dedup authority.
+                existing = conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    "AND task_kind = 'recommendation' "
+                    "ORDER BY created_at ASC, id ASC LIMIT 1",
+                    (identity_key,),
+                ).fetchone()
+                if existing is not None:
+                    return existing["id"]
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3756,8 +3826,9 @@ def create_recommendation(
                         task_kind, recommendation_kind, recommendation_subject_id,
                         recommendation_label, recommendation_rationale,
                         target_profile, review_policy,
-                        provenance_authority, provenance_ref, provenance_observed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        provenance_authority, provenance_ref, provenance_observed_at,
+                        idempotency_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3776,6 +3847,7 @@ def create_recommendation(
                         provenance_authority,
                         provenance_ref,
                         provenance_observed_at,
+                        identity_key,
                     ),
                 )
                 _append_event(
