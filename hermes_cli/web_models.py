@@ -754,7 +754,13 @@ class KanbanRecommendationItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    kind: str
+    kind: Literal[
+        "skill",
+        "permission",
+        "connection",
+        "pipeline",
+        "provider_model_policy",
+    ]
     subject_id: str
     label: str
     rationale: Optional[str] = None

@@ -216,3 +216,6 @@ def test_openapi_exposes_only_one_closed_get(client, kanban_home) -> None:
     item_schema = spec["components"]["schemas"][item_ref.rsplit("/", 1)[-1]]
     assert item_schema.get("additionalProperties") is False
     assert set(item_schema["properties"].keys()) == _ITEM_KEYS
+    assert item_schema["properties"]["kind"]["enum"] == [
+        "skill", "permission", "connection", "pipeline", "provider_model_policy",
+    ]
