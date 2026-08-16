@@ -1246,6 +1246,7 @@ def test_recommend_visibility_transitions_within_one_check_fn_cache_window(
     transition back-to-back with no ``invalidate_check_fn_cache()`` call
     between lookups, so a regression to the unpartitioned cache would fail it.
     """
+    import tools.kanban_tools  # ensure registered
     from agent.delegation_context import (
         delegated_child_context,
         non_dispatcher_owned_context,
