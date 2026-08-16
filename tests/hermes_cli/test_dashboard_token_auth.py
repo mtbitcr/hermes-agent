@@ -118,10 +118,11 @@ class _FakeClient:
 class _FakeRequest:
     """Minimal Request stand-in for the seam (no real Starlette needed)."""
 
-    def __init__(self, path="/api/gateway/drain", headers=None):
+    def __init__(self, path="/api/gateway/drain", headers=None, method="POST"):
         self.url = _FakeURL(path)
         self.headers = headers or {}
         self.client = _FakeClient()
+        self.method = method
 
         class _State:
             pass
@@ -225,13 +226,177 @@ async def _call_next_ok(request):
 
 
 
-def test_seam_rejects_wrong_token_401():
-    register_provider(_TokenProvider(secret="good"))
-    token_auth.register_token_route("/api/gateway/drain")
-    req = _FakeRequest(
-        path="/api/gateway/drain", headers={"authorization": "Bearer bad"}
-    )
+def _spy_call_next():
+    """A call_next stand-in that records whether the downstream was reached."""
+    calls = {"n": 0}
+
+    async def _call_next(request):
+        calls["n"] += 1
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"ok": True}, status_code=200)
+
+    return _call_next, calls
+
+
+def _register_route(path="/api/gateway/drain", method="POST", scope="drain"):
+    token_auth.register_token_route(path, method=method, required_scope=scope)
+
+
+# --------------------------------------------------------------------------
+# register_token_route / get_token_route_policy / is_token_route —
+# the (method, path, required_scope) registration contract (Item 31BI)
+# --------------------------------------------------------------------------
+
+
+def test_register_token_route_normalizes_method_case():
+    token_auth.register_token_route("/x", method="post", required_scope="s")
+    policy = token_auth.get_token_route_policy("POST", "/x")
+    assert policy is not None
+    assert policy.method == "POST"
+    assert policy.path == "/x"
+    assert policy.required_scope == "s"
+
+
+def test_get_token_route_policy_lookup_is_method_case_insensitive():
+    token_auth.register_token_route("/x", method="POST", required_scope="s")
+    assert token_auth.get_token_route_policy("post", "/x") is not None
+    assert token_auth.get_token_route_policy("PoSt", "/x") is not None
+
+
+def test_register_token_route_idempotent_reregistration():
+    token_auth.register_token_route("/x", method="POST", required_scope="s")
+    # Re-registering the identical (method, path, scope) triple is a no-op,
+    # not an error.
+    token_auth.register_token_route("/x", method="post", required_scope="s")
+    policy = token_auth.get_token_route_policy("POST", "/x")
+    assert policy.required_scope == "s"
+
+
+def test_register_token_route_conflicting_scope_rejected():
+    token_auth.register_token_route("/x", method="POST", required_scope="s")
+    with pytest.raises(ValueError):
+        token_auth.register_token_route("/x", method="POST", required_scope="other")
+    # The rejected re-registration must not have mutated the existing policy.
+    assert token_auth.get_token_route_policy("POST", "/x").required_scope == "s"
+
+
+@pytest.mark.parametrize("method", ["", "   ", "G3T", "GET POST", "get1"])
+def test_register_token_route_rejects_blank_or_invalid_method(method):
+    with pytest.raises(ValueError):
+        token_auth.register_token_route("/x", method=method, required_scope="s")
+
+
+@pytest.mark.parametrize("path", ["", "   "])
+def test_register_token_route_rejects_blank_path(path):
+    with pytest.raises(ValueError):
+        token_auth.register_token_route(path, method="GET", required_scope="s")
+
+
+@pytest.mark.parametrize("scope", ["", "   "])
+def test_register_token_route_rejects_blank_scope(scope):
+    with pytest.raises(ValueError):
+        token_auth.register_token_route("/x", method="GET", required_scope=scope)
+
+
+def test_get_token_route_policy_none_for_unregistered_path():
+    assert token_auth.get_token_route_policy("GET", "/nope") is None
+
+
+def test_is_token_route_true_only_for_exact_method_and_path():
+    token_auth.register_token_route("/x", method="POST", required_scope="s")
+    assert token_auth.is_token_route("/x", method="POST") is True
+    assert token_auth.is_token_route("/x", method="GET") is False
+    assert token_auth.is_token_route("/y", method="POST") is False
+
+
+# --------------------------------------------------------------------------
+# Middleware seam — scope enforcement, fail-closed statuses, pass-through
+# --------------------------------------------------------------------------
+
+
+def test_middleware_correctly_scoped_principal_passes_and_sets_state():
+    register_provider(_TokenProvider(secret="good", scopes=("drain",)))
+    _register_route(scope="drain")
+    req = _FakeRequest(headers={"authorization": "Bearer good"})
+    call_next, calls = _spy_call_next()
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    assert resp.status_code == 200
+    assert calls["n"] == 1
+    assert req.state.token_authenticated is True
+    assert req.state.token_principal.principal == "tok"
+    assert req.state.token_principal.scopes == ("drain",)
+
+
+def test_middleware_wrong_scope_gets_generic_403_no_downstream_no_disclosure():
+    register_provider(_TokenProvider(secret="good", scopes=("wrong-scope",)))
+    _register_route(scope="drain")
+    req = _FakeRequest(headers={"authorization": "Bearer good"})
+    call_next, calls = _spy_call_next()
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    assert resp.status_code == 403
+    # Downstream handler never reached, and the request is not marked as
+    # token-authenticated — this must never fall back to cookie/session auth.
+    assert calls["n"] == 0
+    assert not hasattr(req.state, "token_authenticated")
+    assert not hasattr(req.state, "token_principal")
+    body = resp.body.decode()
+    assert "wrong-scope" not in body
+    assert "drain" not in body
+
+
+def test_middleware_missing_bearer_401():
+    register_provider(_TokenProvider(secret="good", scopes=("drain",)))
+    _register_route(scope="drain")
+    req = _FakeRequest(headers={})
+    call_next, calls = _spy_call_next()
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    assert resp.status_code == 401
+    assert calls["n"] == 0
+
+
+def test_middleware_malformed_bearer_401():
+    register_provider(_TokenProvider(secret="good", scopes=("drain",)))
+    _register_route(scope="drain")
+    req = _FakeRequest(headers={"authorization": "Basic Z29vZA=="})
     resp = _run(token_auth.token_auth_middleware(req, _call_next_ok))
     assert resp.status_code == 401
 
+
+def test_middleware_unrecognized_bearer_401():
+    register_provider(_TokenProvider(secret="good", scopes=("drain",)))
+    _register_route(scope="drain")
+    req = _FakeRequest(headers={"authorization": "Bearer nope"})
+    resp = _run(token_auth.token_auth_middleware(req, _call_next_ok))
+    assert resp.status_code == 401
+
+
+def test_middleware_all_providers_unreachable_gets_503():
+    register_provider(_UnreachableTokenProvider())
+    _register_route(scope="drain")
+    req = _FakeRequest(headers={"authorization": "Bearer anything"})
+    resp = _run(token_auth.token_auth_middleware(req, _call_next_ok))
+    assert resp.status_code == 503
+
+
+def test_middleware_unreachable_provider_does_not_block_a_later_accepting_provider():
+    register_provider(_UnreachableTokenProvider())
+    register_provider(_TokenProvider(secret="good", scopes=("drain",)))
+    _register_route(scope="drain")
+    req = _FakeRequest(headers={"authorization": "Bearer good"})
+    call_next, calls = _spy_call_next()
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    assert resp.status_code == 200
+    assert calls["n"] == 1
+
+
+def test_middleware_method_mismatch_is_not_token_authenticated_and_passes_through():
+    _register_route(scope="drain")  # registered for POST only
+    req = _FakeRequest(headers={}, method="GET")
+    call_next, calls = _spy_call_next()
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    # No policy for GET on this path -> ordinary downstream gate handles it.
+    assert resp.status_code == 200
+    assert calls["n"] == 1
+    assert not hasattr(req.state, "token_authenticated")
 
