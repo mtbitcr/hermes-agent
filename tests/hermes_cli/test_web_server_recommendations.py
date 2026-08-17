@@ -28,8 +28,15 @@ _REC_SCOPE = "kanban:recommendations:read"
 _DRAIN_ROUTE = "/api/gateway/drain"
 _DRAIN_SCOPE = "drain"
 _PROVENANCE = dict(provenance_authority="static-analyzer", provenance_ref="finding-123", provenance_observed_at=1_700_000_000)
+_EVIDENCE = dict(schema_version=1, need="Need", expected_benefit="Benefit",
+    requested_scope={flag: False for flag in kb.RECOMMENDATION_SCOPE_FLAGS},
+    risks="Low", cost="None", rollback="Remove it")
 _ITEM_KEYS = {"id", "kind", "subject_id", "label", "rationale", "project_id", "target_profile", "status",
     "review_policy", "provenance_authority", "provenance_ref", "provenance_observed_at", "created_at", "updated_at"}
+_ITEM_V2_KEYS = _ITEM_KEYS | {
+    "evidence", "decision", "effective_state", "lifecycle_version",
+    "lifecycle_events",
+}
 class _StubProvider(DashboardAuthProvider):
     name = "rec-test-provider"
     display_name = "Recommendations Test Provider"
@@ -71,7 +78,8 @@ def _plugin_mod():
     return sys.modules["hermes_dashboard_plugin_kanban"]
 def _make_recommendation(board: Optional[str] = None, **overrides) -> str:
     kwargs = dict(project_id="proj-1", target_profile="worker", recommendation_kind="skill", recommendation_subject_id="translation",
-        recommendation_label="Load the translation skill", recommendation_rationale="seen repeatedly", **_PROVENANCE)
+        recommendation_label="Load the translation skill", recommendation_rationale="seen repeatedly",
+        recommendation_evidence=_EVIDENCE, **_PROVENANCE)
     kwargs.update(overrides)
     with kb.connect_closing(board=board) as conn:
         return kb.create_recommendation(conn, **kwargs)
@@ -311,6 +319,16 @@ def test_cursor_pagination_is_deterministic_and_opaque_and_scope_bound(client, k
     assert client.get(_ROUTE, params=_params(project_id="other-project", cursor=cursor), headers=_authed).status_code == 400
     assert client.get(_ROUTE, params=_params(target_profile="reviewer", cursor=cursor), headers=_authed).status_code == 400
     assert client.get(_ROUTE, params=_params(cursor="not-a-real-cursor"), headers=_authed).status_code == 400
+    assert client.get(
+        _ROUTE, params=_params(schema_version=2, cursor=cursor), headers=_authed
+    ).status_code == 400
+    cursor_v2 = client.get(
+        _ROUTE, params=_params(schema_version=2, limit=1), headers=_authed
+    ).json()["next_cursor"]
+    assert cursor_v2 is not None
+    assert client.get(
+        _ROUTE, params=_params(cursor=cursor_v2), headers=_authed
+    ).status_code == 400
 # --- Read-only DB access: mode=ro / query_only, zero side effects, no eager DB creation ---
 def test_read_only_access_has_zero_side_effects(client, kanban_home, _authed, monkeypatch) -> None:
     rec_id = _make_recommendation()
@@ -345,6 +363,11 @@ def test_read_only_access_has_zero_side_effects(client, kanban_home, _authed, mo
     r = client.get(_ROUTE, params=_params(board="empty-board"), headers=_authed)
     assert r.status_code == 200
     assert r.json() == {"schema_version": 1, "items": [], "next_cursor": None}
+    r_v2 = client.get(
+        _ROUTE, params=_params(board="empty-board", schema_version=2), headers=_authed
+    )
+    assert r_v2.status_code == 200
+    assert r_v2.json() == {"schema_version": 2, "items": [], "next_cursor": None}
     assert not empty_db_path.exists()
 # --- Recursive redaction + disclosure boundary ---
 def test_recursive_redaction_and_disclosure_boundary(client, kanban_home, _authed) -> None:
@@ -366,18 +389,151 @@ def test_recursive_redaction_and_disclosure_boundary(client, kanban_home, _authe
         "result", "commands", "prompts", "stored_path", "secrets", "token", "assignee", "worker_pid"}
     assert forbidden.isdisjoint(item.keys())
     assert set(item.keys()) == _ITEM_KEYS
-# --- OpenAPI: exactly one closed GET ---
+# --- v2 lifecycle projection and OpenAPI: still exactly one closed GET ---
+def test_v2_projects_allowlisted_lifecycle_without_raw_event_payload(
+    client, kanban_home, _authed
+) -> None:
+    rec_id = _make_recommendation(recommendation_kind="profile_setting")
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET recommendation_decision = 'accepted', "
+            "recommendation_effective_state = 'staged', "
+            "recommendation_lifecycle_version = 2 WHERE id = ?",
+            (rec_id,),
+        )
+        kb._append_event(
+            conn,
+            rec_id,
+            "recommendation_decided",
+            {
+                "lifecycle_version": 1,
+                "decision": "accepted",
+                "effective_state": "none",
+                "authority": "owner_approved",
+                "gate_ref": "owner-gate:item32e",
+                "reason": "private operator reasoning",
+                "actor": "raphael-owner",
+                "governance_task_id": "t_11111111",
+                "governance_run_id": 41,
+            },
+        )
+        kb._append_event(
+            conn,
+            rec_id,
+            "recommendation_transitioned",
+            {
+                "lifecycle_version": 2,
+                "decision": "accepted",
+                "effective_state": "staged",
+                "reason": "must-not-leak /private/operator/path manifest.json",
+                "actor": "raphael-owner",
+                "governance_task_id": "t_22222222",
+                "governance_run_id": 42,
+                "native_surface": "hermes.profile.agent.max_turns",
+                "config_identity": "a" * 64,
+                "rollback_identity": "b" * 64,
+            },
+        )
+
+    v1 = client.get(_ROUTE, params=_params(), headers=_authed)
+    assert v1.status_code == 200
+    assert set(v1.json()["items"][0]) == _ITEM_KEYS
+
+    response = client.get(
+        _ROUTE, params=_params(schema_version=2), headers=_authed
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["schema_version"] == 2 and body["next_cursor"] is None
+    item = body["items"][0]
+    assert item["id"] == rec_id and set(item) == _ITEM_V2_KEYS
+    assert item["kind"] == "profile_setting"
+    assert item["evidence"] == _EVIDENCE
+    assert (
+        item["decision"], item["effective_state"], item["lifecycle_version"]
+    ) == ("accepted", "staged", 2)
+    assert [event["kind"] for event in item["lifecycle_events"]] == [
+        "recommendation_created",
+        "recommendation_decided",
+        "recommendation_transitioned",
+    ]
+    assert [event["lifecycle_version"] for event in item["lifecycle_events"]] == [
+        0, 1, 2,
+    ]
+    rendered = response.text
+    for forbidden in (
+        "private operator reasoning", "/private/operator/path", "manifest.json",
+        '"reason"', '"payload"',
+    ):
+        assert forbidden not in rendered
+
+
+def test_v2_fails_closed_on_malformed_lifecycle_event_but_v1_stays_compatible(
+    client, kanban_home, _authed
+) -> None:
+    rec_id = _make_recommendation()
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'recommendation_decided', '{\"unexpected\":true}', ?)",
+            (rec_id, int(time.time())),
+        )
+        conn.commit()
+    assert client.get(_ROUTE, params=_params(), headers=_authed).status_code == 200
+    response = client.get(
+        _ROUTE, params=_params(schema_version=2), headers=_authed
+    )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "recommendation lifecycle data is invalid"}
+
+
+def test_v2_fails_closed_when_snapshot_and_events_disagree(
+    client, kanban_home, _authed
+) -> None:
+    rec_id = _make_recommendation()
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET recommendation_decision = ?, "
+            "recommendation_lifecycle_version = ? WHERE id = ?",
+            ("accepted", 1, rec_id),
+        )
+        conn.commit()
+    assert client.get(_ROUTE, params=_params(), headers=_authed).status_code == 200
+    response = client.get(
+        _ROUTE, params=_params(schema_version=2), headers=_authed
+    )
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "recommendation lifecycle data is invalid"
+    }
+
+
 def test_openapi_exposes_only_one_closed_get(client, kanban_home) -> None:
     spec = client.get("/openapi.json").json()
     path_item = spec["paths"][_ROUTE]
     assert set(path_item.keys()) == {"get"}
-    schema_ref = path_item["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
-    list_schema = spec["components"]["schemas"][schema_ref.rsplit("/", 1)[-1]]
-    assert list_schema.get("additionalProperties") is False
-    item_ref = list_schema["properties"]["items"]["items"]["$ref"]
-    item_schema = spec["components"]["schemas"][item_ref.rsplit("/", 1)[-1]]
-    assert item_schema.get("additionalProperties") is False
-    assert set(item_schema["properties"].keys()) == _ITEM_KEYS
-    assert item_schema["properties"]["kind"]["enum"] == [
+    response_schema = path_item["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    variants = response_schema.get("anyOf", [response_schema])
+    refs = {variant["$ref"].rsplit("/", 1)[-1] for variant in variants}
+    assert refs == {
+        "KanbanRecommendationListResponse",
+        "KanbanRecommendationListV2Response",
+    }
+    component_schemas = spec["components"]["schemas"]
+    item_schemas = {}
+    for list_name in refs:
+        list_schema = component_schemas[list_name]
+        assert list_schema.get("additionalProperties") is False
+        item_ref = list_schema["properties"]["items"]["items"]["$ref"]
+        item_name = item_ref.rsplit("/", 1)[-1]
+        item_schema = component_schemas[item_name]
+        assert item_schema.get("additionalProperties") is False
+        item_schemas[item_name] = item_schema
+    assert set(item_schemas["KanbanRecommendationItem"]["properties"]) == _ITEM_KEYS
+    assert set(item_schemas["KanbanRecommendationItemV2"]["properties"]) == _ITEM_V2_KEYS
+    assert item_schemas["KanbanRecommendationItem"]["properties"]["kind"]["enum"] == [
         "skill", "permission", "connection", "pipeline", "provider_model_policy",
+        "profile_setting",
     ]

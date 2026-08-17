@@ -54,6 +54,8 @@ from hermes_cli import kanban_diagnostics as kd
 from hermes_cli.dashboard_auth.token_auth import register_token_route
 from hermes_cli.web_models import (
     KanbanRecommendationItem,
+    KanbanRecommendationItemV2,
+    KanbanRecommendationListV2Response,
     KanbanRecommendationListResponse,
 )
 
@@ -2934,7 +2936,6 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
 # ---------------------------------------------------------------------------
 
 _RECOMMENDATION_SCOPE_WILDCARDS = {"", "all", "*", "any"}
-_RECOMMENDATION_CURSOR_VERSION = "v1"
 _RECOMMENDATION_CURSOR_SEP = "\x1f"
 
 
@@ -2963,16 +2964,22 @@ def _resolve_recommendations_board(board: str) -> str:
 
 
 def _encode_recommendations_cursor(
-    *, board: str, project_id: str, target_profile: str, created_at: int, id_: str,
+    *,
+    board: str,
+    project_id: str,
+    target_profile: str,
+    created_at: int,
+    id_: str,
+    schema_version: int = 1,
 ) -> str:
     raw = _RECOMMENDATION_CURSOR_SEP.join(
-        [_RECOMMENDATION_CURSOR_VERSION, board, project_id, target_profile, str(created_at), id_]
+        [f"v{schema_version}", board, project_id, target_profile, str(created_at), id_]
     )
     return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
 
 
 def _decode_recommendations_cursor(
-    cursor: str, *, board: str, project_id: str, target_profile: str,
+    cursor: str, *, board: str, project_id: str, target_profile: str, schema_version: int = 1,
 ) -> tuple[int, str]:
     """Decode an opaque cursor and verify it is bound to this exact scope.
 
@@ -2984,7 +2991,7 @@ def _decode_recommendations_cursor(
         raw = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
         parts = raw.split(_RECOMMENDATION_CURSOR_SEP)
         version, c_board, c_project, c_profile, c_created_at, c_id = parts
-        if version != _RECOMMENDATION_CURSOR_VERSION:
+        if version != f"v{schema_version}":
             raise ValueError("unsupported cursor version")
         if c_board != board or c_project != project_id or c_profile != target_profile:
             raise ValueError("cursor scope mismatch")
@@ -3012,11 +3019,107 @@ def _recommendations_ro_conn(board: str) -> Optional[sqlite3.Connection]:
     return conn
 
 
-@router.get("/recommendations", response_model=KanbanRecommendationListResponse)
+def _recommendation_event_projection(
+    *, kind: str, payload_text: Optional[str], created_at: int
+) -> dict[str, Any]:
+    if kind == "recommendation_created":
+        return {
+            "kind": kind,
+            "created_at": int(created_at),
+            "lifecycle_version": 0,
+            "decision": "pending",
+            "effective_state": "none",
+        }
+    try:
+        payload = json.loads(payload_text) if payload_text else {}
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid recommendation lifecycle event") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid recommendation lifecycle event")
+    version = payload.get("lifecycle_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ValueError("invalid recommendation lifecycle event version")
+    projected: dict[str, Any] = {
+        "kind": kind,
+        "created_at": int(created_at),
+        "lifecycle_version": version,
+    }
+    for field in (
+        "decision",
+        "effective_state",
+        "authority",
+        "gate_ref",
+        "actor",
+        "governance_task_id",
+        "governance_run_id",
+        "canary_task_id",
+        "canary_run_id",
+        "verifier_task_id",
+        "verifier_run_id",
+        "native_surface",
+        "config_identity",
+        "rollback_identity",
+        "readback_identity",
+    ):
+        if payload.get(field) is not None:
+            projected[field] = kanban_db.redact_review_value(payload[field])
+    return projected
+
+
+def _validate_recommendation_lifecycle_projection(
+    row: sqlite3.Row, events: list[dict[str, Any]]
+) -> None:
+    decision = row["recommendation_decision"] or "pending"
+    effective_state = row["recommendation_effective_state"] or "none"
+    lifecycle_version = int(row["recommendation_lifecycle_version"] or 0)
+    if lifecycle_version < 0 or not events:
+        raise ValueError("invalid recommendation lifecycle snapshot")
+    if [event["lifecycle_version"] for event in events] != list(
+        range(lifecycle_version + 1)
+    ):
+        raise ValueError("recommendation lifecycle event sequence mismatch")
+    latest = events[-1]
+    if (
+        latest.get("decision") != decision
+        or latest.get("effective_state") != effective_state
+    ):
+        raise ValueError("recommendation lifecycle snapshot mismatch")
+
+
+def _recommendation_item_kwargs(
+    row: sqlite3.Row, *, updated_at: int
+) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "kind": row["recommendation_kind"],
+        "subject_id": kanban_db.redact_review_value(row["recommendation_subject_id"]),
+        "label": kanban_db.redact_review_value(row["recommendation_label"]),
+        "rationale": kanban_db.redact_review_value(row["recommendation_rationale"]),
+        "project_id": row["project_id"],
+        "target_profile": row["target_profile"],
+        "status": row["status"],
+        "review_policy": row["review_policy"],
+        "provenance_authority": kanban_db.redact_review_value(
+            row["provenance_authority"]
+        ),
+        "provenance_ref": kanban_db.redact_review_value(row["provenance_ref"]),
+        "provenance_observed_at": row["provenance_observed_at"],
+        "created_at": row["created_at"],
+        "updated_at": updated_at,
+    }
+
+
+@router.get(
+    "/recommendations",
+    response_model=(
+        KanbanRecommendationListResponse | KanbanRecommendationListV2Response
+    ),
+)
 def list_recommendations(
     board: str = Query(...),
     project_id: str = Query(...),
     target_profile: str = Query(...),
+    schema_version: int = Query(1, ge=1, le=2),
     limit: int = Query(50, ge=1, le=100),
     cursor: Optional[str] = Query(None),
 ):
@@ -3032,18 +3135,69 @@ def list_recommendations(
     after: Optional[tuple[int, str]] = None
     if cursor:
         after = _decode_recommendations_cursor(
-            cursor, board=board, project_id=project_id, target_profile=target_profile,
+            cursor,
+            board=board,
+            project_id=project_id,
+            target_profile=target_profile,
+            schema_version=schema_version,
         )
 
     conn = _recommendations_ro_conn(board)
     if conn is None:
-        return KanbanRecommendationListResponse(schema_version=1, items=[], next_cursor=None)
+        if schema_version == 2:
+            return KanbanRecommendationListV2Response(
+                schema_version=2, items=[], next_cursor=None
+            )
+        return KanbanRecommendationListResponse(
+            schema_version=1, items=[], next_cursor=None
+        )
     try:
-        sql = (
-            "SELECT id, recommendation_kind, recommendation_subject_id, "
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        required = {
+            "task_kind",
+            "recommendation_kind",
+            "recommendation_subject_id",
+            "recommendation_label",
+            "recommendation_rationale",
+            "project_id",
+            "target_profile",
+            "status",
+            "review_policy",
+            "provenance_authority",
+            "provenance_ref",
+            "provenance_observed_at",
+            "created_at",
+        }
+        if schema_version == 2:
+            required.update(
+                {
+                    "recommendation_evidence",
+                    "recommendation_decision",
+                    "recommendation_effective_state",
+                    "recommendation_lifecycle_version",
+                }
+            )
+        if not required.issubset(columns):
+            raise HTTPException(
+                status_code=503,
+                detail="recommendation schema is unavailable",
+            )
+
+        selected = (
+            "id, recommendation_kind, recommendation_subject_id, "
             "recommendation_label, recommendation_rationale, project_id, "
             "target_profile, status, review_policy, provenance_authority, "
-            "provenance_ref, provenance_observed_at, created_at FROM tasks "
+            "provenance_ref, provenance_observed_at, created_at"
+        )
+        if schema_version == 2:
+            selected += (
+                ", recommendation_evidence, recommendation_decision, "
+                "recommendation_effective_state, recommendation_lifecycle_version"
+            )
+        sql = (
+            f"SELECT {selected} FROM tasks "
             "WHERE task_kind = 'recommendation' AND review_policy = 'owner' "
             "AND status = 'review' AND project_id = ? AND target_profile = ?"
         )
@@ -3056,49 +3210,104 @@ def list_recommendations(
         rows = conn.execute(sql, params).fetchall()
 
         page = rows[:limit]
-        ids = [r["id"] for r in page]
+        ids = [row["id"] for row in page]
         latest_event_at: dict[str, int] = {}
+        lifecycle_events: dict[str, list[dict[str, Any]]] = {
+            task_id: [] for task_id in ids
+        }
         if ids:
             placeholders = ",".join("?" * len(ids))
-            for ev in conn.execute(
+            for event in conn.execute(
                 f"SELECT task_id, MAX(created_at) AS latest FROM task_events "
                 f"WHERE task_id IN ({placeholders}) GROUP BY task_id",
                 ids,
             ).fetchall():
-                latest_event_at[ev["task_id"]] = ev["latest"]
+                latest_event_at[event["task_id"]] = int(event["latest"])
+            if schema_version == 2:
+                try:
+                    for event in conn.execute(
+                        f"SELECT task_id, kind, payload, created_at FROM task_events "
+                        f"WHERE task_id IN ({placeholders}) AND kind IN "
+                        "('recommendation_created', 'recommendation_decided', "
+                        "'recommendation_transitioned') ORDER BY id ASC",
+                        ids,
+                    ).fetchall():
+                        lifecycle_events[event["task_id"]].append(
+                            _recommendation_event_projection(
+                                kind=event["kind"],
+                                payload_text=event["payload"],
+                                created_at=event["created_at"],
+                            )
+                        )
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="recommendation lifecycle data is invalid",
+                    ) from exc
 
-        items = [
-            KanbanRecommendationItem(
-                id=r["id"],
-                kind=r["recommendation_kind"],
-                subject_id=kanban_db.redact_review_value(r["recommendation_subject_id"]),
-                label=kanban_db.redact_review_value(r["recommendation_label"]),
-                rationale=kanban_db.redact_review_value(r["recommendation_rationale"]),
-                project_id=r["project_id"],
-                target_profile=r["target_profile"],
-                status=r["status"],
-                review_policy=r["review_policy"],
-                provenance_authority=kanban_db.redact_review_value(r["provenance_authority"]),
-                provenance_ref=kanban_db.redact_review_value(r["provenance_ref"]),
-                provenance_observed_at=r["provenance_observed_at"],
-                created_at=r["created_at"],
-                updated_at=latest_event_at.get(r["id"], r["created_at"]),
-            )
-            for r in page
-        ]
+        if schema_version == 1:
+            items = [
+                KanbanRecommendationItem(
+                    **_recommendation_item_kwargs(
+                        row,
+                        updated_at=latest_event_at.get(row["id"], row["created_at"]),
+                    )
+                )
+                for row in page
+            ]
+        else:
+            try:
+                items = []
+                for row in page:
+                    events = lifecycle_events[row["id"]]
+                    _validate_recommendation_lifecycle_projection(row, events)
+                    items.append(
+                        KanbanRecommendationItemV2(
+                            **_recommendation_item_kwargs(
+                                row,
+                                updated_at=latest_event_at.get(
+                                    row["id"], row["created_at"]
+                                ),
+                            ),
+                            evidence=kanban_db.parse_recommendation_evidence(
+                                row["recommendation_evidence"]
+                            ),
+                            decision=row["recommendation_decision"] or "pending",
+                            effective_state=(
+                                row["recommendation_effective_state"] or "none"
+                            ),
+                            lifecycle_version=int(
+                                row["recommendation_lifecycle_version"] or 0
+                            ),
+                            lifecycle_events=events,
+                        )
+                    )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="recommendation lifecycle data is invalid",
+                ) from exc
+
         next_cursor = None
         if len(rows) > limit:
             last = page[-1]
             next_cursor = _encode_recommendations_cursor(
-                board=board, project_id=project_id, target_profile=target_profile,
-                created_at=last["created_at"], id_=last["id"],
+                board=board,
+                project_id=project_id,
+                target_profile=target_profile,
+                created_at=last["created_at"],
+                id_=last["id"],
+                schema_version=schema_version,
+            )
+        if schema_version == 2:
+            return KanbanRecommendationListV2Response(
+                schema_version=2, items=items, next_cursor=next_cursor
             )
         return KanbanRecommendationListResponse(
-            schema_version=1, items=items, next_cursor=next_cursor,
+            schema_version=1, items=items, next_cursor=next_cursor
         )
     finally:
         conn.close()
-
 
 @router.websocket("/events")
 async def stream_events(ws: WebSocket):

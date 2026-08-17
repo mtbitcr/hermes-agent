@@ -478,6 +478,58 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
 
+
+    # --- recommendation lifecycle (operator-only, evidence recording only) ---
+    p_recommendation = sub.add_parser(
+        "recommendation",
+        help="Record an owner decision or configuration-evidence transition",
+    )
+    recommendation_sub = p_recommendation.add_subparsers(
+        dest="recommendation_action"
+    )
+    p_rec_decide = recommendation_sub.add_parser(
+        "decide", help="Record deferred, rejected, or accepted"
+    )
+    p_rec_decide.add_argument("task_id")
+    p_rec_decide.add_argument(
+        "--decision", required=True, choices=("deferred", "rejected", "accepted")
+    )
+    p_rec_decide.add_argument(
+        "--authority",
+        required=True,
+        choices=("preauthorized_non_widening", "owner_approved"),
+    )
+    p_rec_decide.add_argument("--gate-ref", default=None)
+    p_rec_decide.add_argument("--reason", required=True)
+    p_rec_decide.add_argument("--governance-task", required=True)
+    p_rec_decide.add_argument("--governance-run", required=True, type=int)
+    p_rec_decide.add_argument("--expected-version", required=True, type=int)
+    p_rec_decide.add_argument("--json", action="store_true")
+
+    p_rec_transition = recommendation_sub.add_parser(
+        "transition", help="Record a governed effective-state transition"
+    )
+    p_rec_transition.add_argument("task_id")
+    p_rec_transition.add_argument(
+        "--state",
+        required=True,
+        choices=("staged", "canary_running", "verified", "promoted", "rolled_back", "revoked"),
+    )
+    p_rec_transition.add_argument("--reason", required=True)
+    p_rec_transition.add_argument("--governance-task", required=True)
+    p_rec_transition.add_argument("--governance-run", required=True, type=int)
+    p_rec_transition.add_argument("--expected-version", required=True, type=int)
+    p_rec_transition.add_argument("--native-surface", default=None)
+    p_rec_transition.add_argument("--config-identity", default=None)
+    p_rec_transition.add_argument("--rollback-identity", default=None)
+    p_rec_transition.add_argument("--readback-identity", default=None)
+    p_rec_transition.add_argument("--canary-task", default=None)
+    p_rec_transition.add_argument("--canary-run", default=None, type=int)
+    p_rec_transition.add_argument("--verifier-task", default=None)
+    p_rec_transition.add_argument("--verifier-run", default=None, type=int)
+    p_rec_transition.add_argument("--json", action="store_true")
+    p_recommendation.set_defaults(_recommendation_parser=p_recommendation)
+
     # --- set-model (per-task model/provider override) ---
     p_set_model = sub.add_parser(
         "set-model",
@@ -1093,6 +1145,13 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
+        if action == "recommendation" and os.environ.get("HERMES_KANBAN_TASK"):
+            print(
+                "kanban recommendation: operator-only command refused inside a worker task",
+                file=sys.stderr,
+            )
+            return 1
+
         # `repair` must dispatch BEFORE the auto-init below: on a corrupt DB
         # init_db() itself raises KanbanDbCorruptError, which would turn
         # every `hermes kanban repair` into "could not initialize database"
@@ -1113,6 +1172,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "ls":       _cmd_list,
             "show":     _cmd_show,
             "assign":   _cmd_assign,
+            "recommendation": _cmd_recommendation,
             "set-model": _cmd_set_model,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
@@ -1183,6 +1243,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init",
     "create",
+    "recommendation",
     "swarm",
     "assign",
     "reclaim",
@@ -1857,6 +1918,80 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
     return 0
 
+
+
+def _cmd_recommendation(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        print(
+            "kanban recommendation: operator-only command refused inside a worker task",
+            file=sys.stderr,
+        )
+        return 1
+    action = getattr(args, "recommendation_action", None)
+    if action == "decide":
+        return _cmd_recommendation_decide(args)
+    if action == "transition":
+        return _cmd_recommendation_transition(args)
+    parser = getattr(args, "_recommendation_parser", None)
+    if parser is not None:
+        parser.print_help()
+    return 2
+
+
+def _print_recommendation_lifecycle(
+    data: dict[str, Any], *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return
+    print(
+        f"Recommendation {data['recommendation_id']}: "
+        f"decision={data['decision']} "
+        f"effective_state={data['effective_state']} "
+        f"lifecycle_version={data['lifecycle_version']}"
+    )
+
+
+def _cmd_recommendation_decide(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        result = kb.decide_recommendation(
+            conn,
+            args.task_id,
+            decision=args.decision,
+            authority=args.authority,
+            gate_ref=args.gate_ref,
+            reason=args.reason,
+            actor=_profile_author(),
+            governance_task_id=args.governance_task,
+            governance_run_id=args.governance_run,
+            expected_lifecycle_version=args.expected_version,
+        )
+    _print_recommendation_lifecycle(result, as_json=bool(args.json))
+    return 0
+
+
+def _cmd_recommendation_transition(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        result = kb.transition_recommendation(
+            conn,
+            args.task_id,
+            effective_state=args.state,
+            reason=args.reason,
+            actor=_profile_author(),
+            governance_task_id=args.governance_task,
+            governance_run_id=args.governance_run,
+            expected_lifecycle_version=args.expected_version,
+            native_surface=args.native_surface,
+            config_identity=args.config_identity,
+            rollback_identity=args.rollback_identity,
+            readback_identity=args.readback_identity,
+            canary_task_id=args.canary_task,
+            canary_run_id=args.canary_run,
+            verifier_task_id=args.verifier_task,
+            verifier_run_id=args.verifier_run,
+        )
+    _print_recommendation_lifecycle(result, as_json=bool(args.json))
+    return 0
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile

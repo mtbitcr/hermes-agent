@@ -134,8 +134,37 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
-# The five owner-reviewed (never auto-applied) advice kinds create_recommendation supports.
-VALID_RECOMMENDATION_KINDS = {"skill", "permission", "connection", "pipeline", "provider_model_policy"}
+# The six owner-reviewed (never auto-applied) advice kinds
+# ``create_recommendation`` supports.
+VALID_RECOMMENDATION_KINDS = {
+    "skill",
+    "permission",
+    "connection",
+    "pipeline",
+    "provider_model_policy",
+    "profile_setting",
+}
+VALID_RECOMMENDATION_DECISIONS = {"pending", "deferred", "rejected", "accepted"}
+VALID_RECOMMENDATION_AUTHORITIES = {"preauthorized_non_widening", "owner_approved"}
+VALID_RECOMMENDATION_EFFECTIVE_STATES = {
+    "none",
+    "staged",
+    "canary_running",
+    "verified",
+    "promoted",
+    "rolled_back",
+    "revoked",
+}
+RECOMMENDATION_SCOPE_FLAGS = (
+    "credential_access",
+    "connector_access",
+    "data_access",
+    "network_access",
+    "external_write",
+    "paid_route",
+    "production_effect",
+    "permission_widening",
+)
 
 # Bounds on the opaque recommendation display fields shown in the owner review UI.
 _RECOMMENDATION_SUBJECT_ID_MAX_LEN = 200
@@ -143,6 +172,11 @@ _RECOMMENDATION_LABEL_MAX_LEN = 200
 _RECOMMENDATION_RATIONALE_MAX_LEN = 4000
 _RECOMMENDATION_PROVENANCE_AUTHORITY_MAX_LEN = 200
 _RECOMMENDATION_PROVENANCE_REF_MAX_LEN = 500
+_RECOMMENDATION_EVIDENCE_TEXT_MAX_LEN = 2000
+_RECOMMENDATION_EVIDENCE_MAX_BYTES = 12000
+_RECOMMENDATION_LIFECYCLE_TEXT_MAX_LEN = 1000
+_RECOMMENDATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,199}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # Fixed non-semantic title; recommendation cards are read via recommendation_* columns, never title/body.
 _RECOMMENDATION_TASK_TITLE = "hermes recommendation"
@@ -1454,7 +1488,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     review_policy              TEXT,
     provenance_authority       TEXT,
     provenance_ref             TEXT,
-    provenance_observed_at     INTEGER
+    provenance_observed_at     INTEGER,
+    recommendation_evidence          TEXT,
+    recommendation_decision          TEXT,
+    recommendation_effective_state   TEXT,
+    recommendation_lifecycle_version INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2754,6 +2792,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "provenance_observed_at",
             "provenance_observed_at INTEGER",
         )
+    if "recommendation_evidence" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "recommendation_evidence", "recommendation_evidence TEXT"
+        )
+    if "recommendation_decision" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "recommendation_decision", "recommendation_decision TEXT"
+        )
+    if "recommendation_effective_state" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "recommendation_effective_state", "recommendation_effective_state TEXT"
+        )
+    if "recommendation_lifecycle_version" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "recommendation_lifecycle_version",
+            "recommendation_lifecycle_version INTEGER",
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3677,6 +3734,96 @@ def _bounded_display_field(
     return redact_review_value(cleaned)
 
 
+def normalize_recommendation_evidence(value: Any) -> tuple[dict[str, Any], str]:
+    """Validate, redact, and canonically serialize recommendation evidence."""
+    if not isinstance(value, dict):
+        raise ValueError("recommendation_evidence must be an object")
+    expected = {
+        "schema_version",
+        "need",
+        "expected_benefit",
+        "requested_scope",
+        "risks",
+        "cost",
+        "rollback",
+    }
+    if set(value) != expected:
+        raise ValueError(
+            "recommendation_evidence must contain exactly "
+            + ", ".join(sorted(expected))
+        )
+    if value["schema_version"] != 1 or isinstance(value["schema_version"], bool):
+        raise ValueError("recommendation_evidence.schema_version must be 1")
+    scope = value["requested_scope"]
+    if not isinstance(scope, dict) or set(scope) != set(RECOMMENDATION_SCOPE_FLAGS):
+        raise ValueError(
+            "recommendation_evidence.requested_scope must contain exactly "
+            + ", ".join(RECOMMENDATION_SCOPE_FLAGS)
+        )
+    normalized_scope: dict[str, bool] = {}
+    for flag in RECOMMENDATION_SCOPE_FLAGS:
+        flag_value = scope[flag]
+        if not isinstance(flag_value, bool):
+            raise ValueError(
+                f"recommendation_evidence.requested_scope.{flag} must be boolean"
+            )
+        normalized_scope[flag] = flag_value
+    normalized: dict[str, Any] = {
+        "schema_version": 1,
+        "need": _bounded_display_field(
+            value["need"],
+            name="recommendation_evidence.need",
+            max_len=_RECOMMENDATION_EVIDENCE_TEXT_MAX_LEN,
+            required=True,
+        ),
+        "expected_benefit": _bounded_display_field(
+            value["expected_benefit"],
+            name="recommendation_evidence.expected_benefit",
+            max_len=_RECOMMENDATION_EVIDENCE_TEXT_MAX_LEN,
+            required=True,
+        ),
+        "requested_scope": normalized_scope,
+        "risks": _bounded_display_field(
+            value["risks"],
+            name="recommendation_evidence.risks",
+            max_len=_RECOMMENDATION_EVIDENCE_TEXT_MAX_LEN,
+            required=True,
+        ),
+        "cost": _bounded_display_field(
+            value["cost"],
+            name="recommendation_evidence.cost",
+            max_len=_RECOMMENDATION_EVIDENCE_TEXT_MAX_LEN,
+            required=True,
+        ),
+        "rollback": _bounded_display_field(
+            value["rollback"],
+            name="recommendation_evidence.rollback",
+            max_len=_RECOMMENDATION_EVIDENCE_TEXT_MAX_LEN,
+            required=True,
+        ),
+    }
+    serialized = json.dumps(
+        normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    if len(serialized.encode("utf-8")) > _RECOMMENDATION_EVIDENCE_MAX_BYTES:
+        raise ValueError(
+            f"recommendation_evidence exceeds {_RECOMMENDATION_EVIDENCE_MAX_BYTES} bytes"
+        )
+    return normalized, serialized
+
+
+def parse_recommendation_evidence(value: Optional[str]) -> Optional[dict[str, Any]]:
+    """Return validated evidence, or None for a legacy recommendation."""
+    if value is None:
+        return None
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("stored recommendation_evidence is invalid JSON") from exc
+    normalized, _ = normalize_recommendation_evidence(decoded)
+    return normalized
+
+
 def _recommendation_identity_key(
     *,
     project_id: str,
@@ -3722,6 +3869,7 @@ def create_recommendation(
     recommendation_subject_id: str,
     recommendation_label: str,
     recommendation_rationale: Optional[str] = None,
+    recommendation_evidence: dict[str, Any],
     provenance_authority: str,
     provenance_ref: Optional[str] = None,
     provenance_observed_at: Optional[int] = None,
@@ -3792,6 +3940,22 @@ def create_recommendation(
         or not isinstance(provenance_observed_at, int)
     ):
         raise ValueError("provenance_observed_at must be an integer unix timestamp")
+    normalized_evidence, serialized_evidence = normalize_recommendation_evidence(
+        recommendation_evidence
+    )
+    requested_scope = normalized_evidence["requested_scope"]
+    if recommendation_kind == "permission" and not requested_scope[
+        "permission_widening"
+    ]:
+        raise ValueError(
+            "permission recommendations must declare requested_scope.permission_widening"
+        )
+    if recommendation_kind == "connection" and not requested_scope[
+        "connector_access"
+    ]:
+        raise ValueError(
+            "connection recommendations must declare requested_scope.connector_access"
+        )
 
     identity_key = _recommendation_identity_key(
         project_id=project_id,
@@ -3812,12 +3976,42 @@ def create_recommendation(
                 # is the row everyone else finds. No status filter — an
                 # archived/resolved card is still the dedup authority.
                 existing = conn.execute(
-                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    "SELECT id, recommendation_evidence, recommendation_decision, "
+                    "recommendation_effective_state, recommendation_lifecycle_version "
+                    "FROM tasks WHERE idempotency_key = ? "
                     "AND task_kind = 'recommendation' "
                     "ORDER BY created_at ASC, id ASC LIMIT 1",
                     (identity_key,),
                 ).fetchone()
                 if existing is not None:
+                    if existing["recommendation_evidence"] is None:
+                        decision = existing["recommendation_decision"]
+                        effective_state = existing["recommendation_effective_state"]
+                        lifecycle_version = existing[
+                            "recommendation_lifecycle_version"
+                        ]
+                        if (
+                            decision not in {None, "pending"}
+                            or effective_state not in {None, "none"}
+                            or lifecycle_version not in {None, 0}
+                        ):
+                            raise ValueError(
+                                "legacy recommendation lifecycle cannot be backfilled"
+                            )
+                        conn.execute(
+                            "UPDATE tasks SET recommendation_evidence = ?, "
+                            "recommendation_decision = 'pending', "
+                            "recommendation_effective_state = 'none', "
+                            "recommendation_lifecycle_version = 0 "
+                            "WHERE id = ? AND recommendation_evidence IS NULL",
+                            (serialized_evidence, existing["id"]),
+                        )
+                        _append_event(
+                            conn,
+                            existing["id"],
+                            "recommendation_evidence_added",
+                            {"evidence_schema_version": 1, "lifecycle_version": 0},
+                        )
                     return existing["id"]
                 conn.execute(
                     """
@@ -3827,8 +4021,10 @@ def create_recommendation(
                         recommendation_label, recommendation_rationale,
                         target_profile, review_policy,
                         provenance_authority, provenance_ref, provenance_observed_at,
+                        recommendation_evidence, recommendation_decision,
+                        recommendation_effective_state, recommendation_lifecycle_version,
                         idempotency_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3847,6 +4043,10 @@ def create_recommendation(
                         provenance_authority,
                         provenance_ref,
                         provenance_observed_at,
+                        serialized_evidence,
+                        "pending",
+                        "none",
+                        0,
                         identity_key,
                     ),
                 )
@@ -3863,6 +4063,7 @@ def create_recommendation(
                         "provenance_authority": provenance_authority,
                         "provenance_ref": provenance_ref,
                         "provenance_observed_at": provenance_observed_at,
+                        "evidence_schema_version": 1,
                     },
                 )
             return task_id
@@ -3872,6 +4073,558 @@ def create_recommendation(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def _assert_recommendation_lifecycle_operator() -> None:
+    """Keep decision/apply evidence outside dispatcher-owned agent work."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        raise PermissionError(
+            "recommendation decisions and transitions are operator-only"
+        )
+
+
+def _recommendation_row(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM tasks WHERE id = ? AND task_kind = 'recommendation' "
+        "AND review_policy = 'owner'",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"recommendation {task_id!r} not found")
+    return row
+
+
+def recommendation_lifecycle_snapshot(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "recommendation_id": row["id"],
+        "decision": row["recommendation_decision"] or "pending",
+        "effective_state": row["recommendation_effective_state"] or "none",
+        "lifecycle_version": int(row["recommendation_lifecycle_version"] or 0),
+    }
+
+
+def _bounded_lifecycle_text(value: Any, *, name: str, required: bool = True) -> Optional[str]:
+    return _bounded_display_field(
+        value,
+        name=name,
+        max_len=_RECOMMENDATION_LIFECYCLE_TEXT_MAX_LEN,
+        required=required,
+    )
+
+
+def _lifecycle_reference(value: Any, *, name: str) -> str:
+    value = _bounded_lifecycle_text(value, name=name)
+    if value is None or not _RECOMMENDATION_ID_RE.fullmatch(value):
+        raise ValueError(
+            f"{name} must be a lowercase non-secret identifier using letters, "
+            "digits, dot, underscore, colon, or hyphen"
+        )
+    return value
+
+
+def _sha256_identity(value: Any, *, name: str, required: bool = True) -> Optional[str]:
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+        raise ValueError(f"{name} must be a lowercase sha256 digest")
+    return value
+
+
+def _completed_work_run_evidence(
+    conn: sqlite3.Connection,
+    *,
+    recommendation: sqlite3.Row,
+    task_id: Any,
+    run_id: Any,
+    role: str,
+    not_task_ids: set[str],
+    not_run_ids: set[int],
+    min_started_at: int,
+) -> dict[str, int | str]:
+    task_id = _lifecycle_reference(task_id, name=f"{role}_task_id")
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1:
+        raise ValueError(f"{role}_run_id must be a positive integer")
+    if task_id == recommendation["id"] or task_id in not_task_ids:
+        raise ValueError(f"{role} task must be distinct")
+    if run_id in not_run_ids:
+        raise ValueError(f"{role} run must be distinct")
+    row = conn.execute(
+        "SELECT t.status AS task_status, t.project_id, r.started_at, r.ended_at, "
+        "r.outcome, (SELECT MAX(r2.id) FROM task_runs r2 "
+        "WHERE r2.task_id = t.id) AS latest_run_id "
+        "FROM tasks t JOIN task_runs r ON r.task_id = t.id "
+        "WHERE t.id = ? AND t.task_kind = 'work' AND r.id = ?",
+        (task_id, run_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"{role} Task/run evidence was not found")
+    if (
+        row["task_status"] != "done"
+        or row["outcome"] != "completed"
+        or row["ended_at"] is None
+    ):
+        raise ValueError(f"{role} Task/run must be completed")
+    if int(row["latest_run_id"]) != run_id:
+        raise ValueError(f"{role} Task/run must be the latest run")
+    if recommendation["project_id"] and row["project_id"] != recommendation["project_id"]:
+        raise ValueError(f"{role} Task must belong to the recommendation project")
+    observed_at = row["started_at"] if role in {"canary", "verifier"} else row["ended_at"]
+    if int(observed_at) < int(min_started_at):
+        raise ValueError(f"{role} Task/run is stale for this lifecycle transition")
+    return {
+        "task_id": task_id,
+        "run_id": run_id,
+        "started_at": int(row["started_at"]),
+        "ended_at": int(row["ended_at"]),
+    }
+
+
+def _active_canary_run_evidence(
+    conn: sqlite3.Connection,
+    *,
+    recommendation: sqlite3.Row,
+    task_id: Any,
+    run_id: Any,
+    not_task_ids: set[str],
+    not_run_ids: set[int],
+    min_started_at: int,
+) -> dict[str, int | str]:
+    task_id = _lifecycle_reference(task_id, name="canary_task_id")
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1:
+        raise ValueError("canary_run_id must be a positive integer")
+    if task_id == recommendation["id"] or task_id in not_task_ids:
+        raise ValueError("canary task must be distinct")
+    if run_id in not_run_ids:
+        raise ValueError("canary run must be distinct")
+    row = conn.execute(
+        "SELECT t.status AS task_status, t.project_id, t.current_run_id, "
+        "r.started_at, r.ended_at, r.outcome FROM tasks t "
+        "JOIN task_runs r ON r.task_id = t.id "
+        "WHERE t.id = ? AND t.task_kind = 'work' AND r.id = ?",
+        (task_id, run_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError("canary Task/run evidence was not found")
+    if (
+        row["task_status"] != "running"
+        or row["current_run_id"] != run_id
+        or row["ended_at"] is not None
+        or row["outcome"] is not None
+    ):
+        raise ValueError("canary Task/run must be the active run")
+    if recommendation["project_id"] and row["project_id"] != recommendation["project_id"]:
+        raise ValueError("canary Task must belong to the recommendation project")
+    if int(row["started_at"]) < int(min_started_at):
+        raise ValueError("canary Task/run is stale for this lifecycle transition")
+    return {"task_id": task_id, "run_id": run_id, "started_at": int(row["started_at"])}
+
+
+def _recommendation_lifecycle_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    effective_state: Optional[str] = None,
+) -> Optional[tuple[dict[str, Any], int]]:
+    rows = conn.execute(
+        "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+        "AND kind IN ('recommendation_decided', 'recommendation_transitioned') "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if effective_state is None or payload.get("effective_state") == effective_state:
+            return payload, int(row["created_at"])
+    return None
+
+
+def _recommendation_lifecycle_references(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple[set[str], set[int], int]:
+    """Return prior Task/run evidence and the latest lifecycle timestamp."""
+    rows = conn.execute(
+        "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+        "AND kind IN ('recommendation_created', 'recommendation_evidence_added', "
+        "'recommendation_decided', 'recommendation_transitioned') ORDER BY id ASC",
+        (task_id,),
+    ).fetchall()
+    task_ids: set[str] = set()
+    run_ids: set[int] = set()
+    latest_at = 0
+    for row in rows:
+        latest_at = max(latest_at, int(row["created_at"]))
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid recommendation lifecycle event") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("invalid recommendation lifecycle event")
+        for role in ("governance", "canary", "verifier"):
+            prior_task = payload.get(f"{role}_task_id")
+            prior_run = payload.get(f"{role}_run_id")
+            if isinstance(prior_task, str):
+                task_ids.add(prior_task)
+            if isinstance(prior_run, int) and not isinstance(prior_run, bool):
+                run_ids.add(prior_run)
+    return task_ids, run_ids, latest_at
+
+
+def decide_recommendation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision: str,
+    authority: str,
+    gate_ref: Optional[str],
+    reason: str,
+    actor: str,
+    governance_task_id: str,
+    governance_run_id: int,
+    expected_lifecycle_version: int,
+) -> dict[str, Any]:
+    """Record an owner-governed decision; never apply configuration."""
+    _assert_recommendation_lifecycle_operator()
+    if decision not in {"deferred", "rejected", "accepted"}:
+        raise ValueError("decision must be deferred, rejected, or accepted")
+    if authority not in VALID_RECOMMENDATION_AUTHORITIES:
+        raise ValueError(
+            "authority must be preauthorized_non_widening or owner_approved"
+        )
+    if (
+        isinstance(expected_lifecycle_version, bool)
+        or not isinstance(expected_lifecycle_version, int)
+        or expected_lifecycle_version < 0
+    ):
+        raise ValueError("expected_lifecycle_version must be a non-negative integer")
+    reason = _bounded_lifecycle_text(reason, name="reason")
+    actor = _bounded_lifecycle_text(actor, name="actor")
+    gate_ref = _bounded_lifecycle_text(gate_ref, name="gate_ref", required=False)
+    if gate_ref is not None:
+        gate_ref = _lifecycle_reference(gate_ref, name="gate_ref")
+
+    with write_txn(conn):
+        row = _recommendation_row(conn, task_id)
+        snapshot = recommendation_lifecycle_snapshot(row)
+        if snapshot["lifecycle_version"] != expected_lifecycle_version:
+            raise ValueError(
+                "recommendation lifecycle version mismatch: "
+                f"expected {expected_lifecycle_version}, found "
+                f"{snapshot['lifecycle_version']}"
+            )
+        current = snapshot["decision"]
+        allowed = {
+            "pending": {"deferred", "rejected", "accepted"},
+            "deferred": {"rejected", "accepted"},
+        }
+        if decision not in allowed.get(current, set()):
+            raise ValueError(f"illegal recommendation decision transition {current} -> {decision}")
+
+        evidence = parse_recommendation_evidence(row["recommendation_evidence"])
+        if decision == "accepted":
+            if evidence is None:
+                raise ValueError("legacy recommendation without evidence cannot be accepted")
+            if not gate_ref:
+                raise ValueError("accepted recommendation requires gate_ref")
+            widens = any(evidence["requested_scope"].values())
+            if widens and authority != "owner_approved":
+                raise ValueError(
+                    "scope-widening recommendation requires owner_approved authority"
+                )
+            if authority == "preauthorized_non_widening" and widens:
+                raise ValueError(
+                    "preauthorized_non_widening requires every requested_scope flag false"
+                )
+
+        prior_task_ids, prior_run_ids, latest_at = (
+            _recommendation_lifecycle_references(conn, task_id)
+        )
+        governance = _completed_work_run_evidence(
+            conn,
+            recommendation=row,
+            task_id=governance_task_id,
+            run_id=governance_run_id,
+            role="governance",
+            not_task_ids=prior_task_ids,
+            not_run_ids=prior_run_ids,
+            min_started_at=max(int(row["created_at"]), latest_at),
+        )
+        next_version = expected_lifecycle_version + 1
+        cur = conn.execute(
+            "UPDATE tasks SET recommendation_decision = ?, "
+            "recommendation_effective_state = 'none', "
+            "recommendation_lifecycle_version = ? "
+            "WHERE id = ? AND task_kind = 'recommendation' "
+            "AND COALESCE(recommendation_lifecycle_version, 0) = ?",
+            (decision, next_version, task_id, expected_lifecycle_version),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("recommendation lifecycle version changed concurrently")
+        payload = {
+            "lifecycle_version": next_version,
+            "decision": decision,
+            "effective_state": "none",
+            "authority": authority,
+            "gate_ref": gate_ref,
+            "reason": reason,
+            "actor": actor,
+            "governance_task_id": governance["task_id"],
+            "governance_run_id": governance["run_id"],
+        }
+        _append_event(conn, task_id, "recommendation_decided", redact_review_value(payload))
+        return {
+            "recommendation_id": task_id,
+            "decision": decision,
+            "effective_state": "none",
+            "lifecycle_version": next_version,
+        }
+
+
+_RECOMMENDATION_EFFECTIVE_TRANSITIONS = {
+    "none": {"staged"},
+    "staged": {"canary_running", "rolled_back"},
+    "canary_running": {"verified", "rolled_back"},
+    "verified": {"promoted", "rolled_back"},
+    "promoted": {"revoked"},
+}
+
+
+def transition_recommendation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    effective_state: str,
+    reason: str,
+    actor: str,
+    governance_task_id: str,
+    governance_run_id: int,
+    expected_lifecycle_version: int,
+    native_surface: Optional[str] = None,
+    config_identity: Optional[str] = None,
+    rollback_identity: Optional[str] = None,
+    readback_identity: Optional[str] = None,
+    canary_task_id: Optional[str] = None,
+    canary_run_id: Optional[int] = None,
+    verifier_task_id: Optional[str] = None,
+    verifier_run_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """Record governed configuration evidence; never apply configuration."""
+    _assert_recommendation_lifecycle_operator()
+    if effective_state not in VALID_RECOMMENDATION_EFFECTIVE_STATES - {"none"}:
+        raise ValueError("invalid recommendation effective_state")
+    if (
+        isinstance(expected_lifecycle_version, bool)
+        or not isinstance(expected_lifecycle_version, int)
+        or expected_lifecycle_version < 0
+    ):
+        raise ValueError("expected_lifecycle_version must be a non-negative integer")
+    reason = _bounded_lifecycle_text(reason, name="reason")
+    actor = _bounded_lifecycle_text(actor, name="actor")
+
+    with write_txn(conn):
+        row = _recommendation_row(conn, task_id)
+        snapshot = recommendation_lifecycle_snapshot(row)
+        if snapshot["lifecycle_version"] != expected_lifecycle_version:
+            raise ValueError(
+                "recommendation lifecycle version mismatch: "
+                f"expected {expected_lifecycle_version}, found "
+                f"{snapshot['lifecycle_version']}"
+            )
+        if snapshot["decision"] != "accepted":
+            raise ValueError("only an accepted recommendation can enter configuration lifecycle")
+        current = snapshot["effective_state"]
+        if effective_state not in _RECOMMENDATION_EFFECTIVE_TRANSITIONS.get(current, set()):
+            raise ValueError(
+                f"illegal recommendation effective transition {current} -> {effective_state}"
+            )
+
+        prior_task_ids, prior_run_ids, latest_at = (
+            _recommendation_lifecycle_references(conn, task_id)
+        )
+        floor = max(int(row["created_at"]), latest_at)
+        governance = _completed_work_run_evidence(
+            conn,
+            recommendation=row,
+            task_id=governance_task_id,
+            run_id=governance_run_id,
+            role="governance",
+            not_task_ids=prior_task_ids,
+            not_run_ids=prior_run_ids,
+            min_started_at=floor,
+        )
+        payload: dict[str, Any] = {
+            "lifecycle_version": expected_lifecycle_version + 1,
+            "decision": "accepted",
+            "effective_state": effective_state,
+            "reason": reason,
+            "actor": actor,
+            "governance_task_id": governance["task_id"],
+            "governance_run_id": governance["run_id"],
+        }
+
+        if effective_state == "staged":
+            payload["native_surface"] = _lifecycle_reference(
+                native_surface, name="native_surface"
+            )
+            config = _sha256_identity(config_identity, name="config_identity")
+            rollback = _sha256_identity(
+                rollback_identity, name="rollback_identity"
+            )
+            if config == rollback:
+                raise ValueError(
+                    "config_identity and rollback_identity must be distinct"
+                )
+            payload["config_identity"] = config
+            payload["rollback_identity"] = rollback
+        elif effective_state == "canary_running":
+            canary = _active_canary_run_evidence(
+                conn,
+                recommendation=row,
+                task_id=canary_task_id,
+                run_id=canary_run_id,
+                not_task_ids=prior_task_ids | {str(governance["task_id"])},
+                not_run_ids=prior_run_ids | {int(governance["run_id"])},
+                min_started_at=floor,
+            )
+            payload["canary_task_id"] = canary["task_id"]
+            payload["canary_run_id"] = canary["run_id"]
+        elif effective_state == "verified":
+            canary_event = _recommendation_lifecycle_event(
+                conn, task_id, effective_state="canary_running"
+            )
+            staged_event = _recommendation_lifecycle_event(
+                conn, task_id, effective_state="staged"
+            )
+            if canary_event is None or staged_event is None:
+                raise ValueError("verified state requires staged and canary_running evidence")
+            canary_payload, _ = canary_event
+            if (
+                canary_task_id != canary_payload.get("canary_task_id")
+                or canary_run_id != canary_payload.get("canary_run_id")
+            ):
+                raise ValueError("verified state must reference the recorded canary Task/run")
+            canary = _completed_work_run_evidence(
+                conn,
+                recommendation=row,
+                task_id=canary_task_id,
+                run_id=canary_run_id,
+                role="canary",
+                not_task_ids={str(governance["task_id"])},
+                not_run_ids={int(governance["run_id"])},
+                min_started_at=staged_event[1],
+            )
+            if int(governance["ended_at"]) < int(canary["ended_at"]):
+                raise ValueError(
+                    "verified governance Task/run must end after the canary run"
+                )
+            verifier = _completed_work_run_evidence(
+                conn,
+                recommendation=row,
+                task_id=verifier_task_id,
+                run_id=verifier_run_id,
+                role="verifier",
+                not_task_ids=prior_task_ids
+                | {
+                    str(governance["task_id"]),
+                    str(canary["task_id"]),
+                },
+                not_run_ids=prior_run_ids
+                | {
+                    int(governance["run_id"]),
+                    int(canary["run_id"]),
+                },
+                min_started_at=max(
+                    int(canary["ended_at"]), int(governance["ended_at"])
+                ),
+            )
+            staged_payload, _ = staged_event
+            readback = _sha256_identity(readback_identity, name="readback_identity")
+            if readback != staged_payload.get("config_identity"):
+                raise ValueError("verified readback_identity must equal config_identity")
+            payload.update(
+                {
+                    "canary_task_id": canary["task_id"],
+                    "canary_run_id": canary["run_id"],
+                    "verifier_task_id": verifier["task_id"],
+                    "verifier_run_id": verifier["run_id"],
+                    "readback_identity": readback,
+                }
+            )
+        elif effective_state in {"rolled_back", "revoked"}:
+            staged_event = _recommendation_lifecycle_event(
+                conn, task_id, effective_state="staged"
+            )
+            if staged_event is None:
+                raise ValueError(f"{effective_state} requires staged evidence")
+            staged_payload, _ = staged_event
+            if current == "canary_running":
+                canary_event = _recommendation_lifecycle_event(
+                    conn, task_id, effective_state="canary_running"
+                )
+                if canary_event is None:
+                    raise ValueError("rolled_back requires canary_running evidence")
+                canary_payload, _ = canary_event
+                canary = _completed_work_run_evidence(
+                    conn,
+                    recommendation=row,
+                    task_id=canary_payload.get("canary_task_id"),
+                    run_id=canary_payload.get("canary_run_id"),
+                    role="canary",
+                    not_task_ids={str(governance["task_id"])},
+                    not_run_ids={int(governance["run_id"])},
+                    min_started_at=staged_event[1],
+                )
+                if int(governance["ended_at"]) < int(canary["ended_at"]):
+                    raise ValueError(
+                        "rollback governance Task/run must end after the canary run"
+                    )
+            readback = _sha256_identity(readback_identity, name="readback_identity")
+            if readback != staged_payload.get("rollback_identity"):
+                raise ValueError(
+                    f"{effective_state} readback_identity must equal rollback_identity"
+                )
+            verifier = _completed_work_run_evidence(
+                conn,
+                recommendation=row,
+                task_id=verifier_task_id,
+                run_id=verifier_run_id,
+                role="verifier",
+                not_task_ids=prior_task_ids | {str(governance["task_id"])},
+                not_run_ids=prior_run_ids | {int(governance["run_id"])},
+                min_started_at=int(governance["ended_at"]),
+            )
+            payload.update(
+                {
+                    "verifier_task_id": verifier["task_id"],
+                    "verifier_run_id": verifier["run_id"],
+                    "readback_identity": readback,
+                }
+            )
+
+        next_version = expected_lifecycle_version + 1
+        cur = conn.execute(
+            "UPDATE tasks SET recommendation_effective_state = ?, "
+            "recommendation_lifecycle_version = ? "
+            "WHERE id = ? AND task_kind = 'recommendation' "
+            "AND COALESCE(recommendation_lifecycle_version, 0) = ?",
+            (effective_state, next_version, task_id, expected_lifecycle_version),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("recommendation lifecycle version changed concurrently")
+        _append_event(
+            conn,
+            task_id,
+            "recommendation_transitioned",
+            redact_review_value(payload),
+        )
+        return {
+            "recommendation_id": task_id,
+            "decision": "accepted",
+            "effective_state": effective_state,
+            "lifecycle_version": next_version,
+        }
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
