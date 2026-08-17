@@ -1140,6 +1140,35 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
 # ITEM31BH — kanban_recommend (owner-review capability advice)
 # ---------------------------------------------------------------------------
 
+
+def _recommend_payload(**overrides):
+    from hermes_cli import kanban_db as kb
+
+    payload = {
+        "kind": "skill",
+        "subject_id": "translation",
+        "label": "Load translation",
+        "evidence": {
+            "schema_version": 1,
+            "need": "Repeated capability gap",
+            "expected_benefit": "Complete work safely",
+            "requested_scope": {
+                flag: False for flag in kb.RECOMMENDATION_SCOPE_FLAGS
+            },
+            "risks": "Low",
+            "cost": "No added cost",
+            "rollback": "Remove the staged configuration",
+        },
+    }
+    payload.update(overrides)
+    if "evidence" not in overrides:
+        if payload["kind"] == "permission":
+            payload["evidence"]["requested_scope"]["permission_widening"] = True
+        elif payload["kind"] == "connection":
+            payload["evidence"]["requested_scope"]["connector_access"] = True
+    return payload
+
+
 @pytest.fixture
 def recommend_worker_env(monkeypatch, tmp_path):
     """A dispatcher-owned worker whose task is scoped to a project and assigned
@@ -1279,7 +1308,7 @@ def test_recommend_visibility_transitions_within_one_check_fn_cache_window(
 
 @pytest.mark.parametrize(
     "kind",
-    ["skill", "permission", "connection", "pipeline", "provider_model_policy"],
+    ["skill", "permission", "connection", "pipeline", "provider_model_policy", "profile_setting"],
 )
 def test_recommend_publishes_each_kind_with_server_derived_scope(
     recommend_worker_env, kind
@@ -1287,10 +1316,10 @@ def test_recommend_publishes_each_kind_with_server_derived_scope(
     from hermes_cli.profiles import get_active_profile_name
     from tools import kanban_tools as kt
 
-    out = kt._handle_recommend(
-        {"kind": kind, "subject_id": f"subject-{kind}",
-         "label": "Give me this capability", "rationale": "it keeps coming up"}
-    )
+    out = kt._handle_recommend(_recommend_payload(
+        kind=kind, subject_id=f"subject-{kind}",
+        label="Give me this capability", rationale="it keeps coming up",
+    ))
     d = json.loads(out)
     assert d.get("ok") is True, out
     profile = get_active_profile_name()
@@ -1312,15 +1341,23 @@ def test_recommend_publishes_each_kind_with_server_derived_scope(
     assert row["provenance_ref"] == f"kanban-task:{recommend_worker_env}"
     assert isinstance(row["provenance_observed_at"], int)
     assert row["assignee"] is None and row["current_run_id"] is None
+    assert json.loads(row["recommendation_evidence"]) == _recommend_payload(
+        kind=kind
+    )["evidence"]
+    assert (
+        row["recommendation_decision"],
+        row["recommendation_effective_state"],
+        row["recommendation_lifecycle_version"],
+    ) == ("pending", "none", 0)
 
 
 def test_recommend_response_never_echoes_label_or_rationale(recommend_worker_env):
     from tools import kanban_tools as kt
 
-    out = kt._handle_recommend(
-        {"kind": "skill", "subject_id": "translation",
-         "label": "Load the translation skill", "rationale": "seen repeatedly"}
-    )
+    out = kt._handle_recommend(_recommend_payload(
+        kind="skill", subject_id="translation",
+        label="Load the translation skill", rationale="seen repeatedly",
+    ))
     assert "Load the translation skill" not in out and "seen repeatedly" not in out
     assert set(json.loads(out)) == {
         "ok", "recommendation_id", "kind", "project_id", "target_profile",
@@ -1343,11 +1380,9 @@ def test_recommend_leaves_the_work_task_and_board_untouched(recommend_worker_env
         events_before = len(kb.list_events(conn, recommend_worker_env))
         tasks_before = {t.id for t in kb.list_tasks(conn)}
 
-    assert json.loads(
-        kt._handle_recommend(
-            {"kind": "permission", "subject_id": "fs.write", "label": "Allow writes"}
-        )
-    )["ok"] is True
+    assert json.loads(kt._handle_recommend(
+        _recommend_payload(kind="permission", subject_id="fs.write", label="Allow writes")
+    ))["ok"] is True
 
     with kb.connect_closing() as conn:
         after = dict(
@@ -1363,13 +1398,13 @@ def test_recommend_leaves_the_work_task_and_board_untouched(recommend_worker_env
 def test_repeat_recommend_returns_the_same_card(recommend_worker_env):
     from tools import kanban_tools as kt
 
-    first = json.loads(kt._handle_recommend(
-        {"kind": "skill", "subject_id": "translation", "label": "Load translation"}
-    ))
-    again = json.loads(kt._handle_recommend(
-        {"kind": "skill", "subject_id": "translation",
-         "label": "Please load translation", "rationale": "asking again"}
-    ))
+    first = json.loads(kt._handle_recommend(_recommend_payload(
+        kind="skill", subject_id="translation", label="Load translation",
+    )))
+    again = json.loads(kt._handle_recommend(_recommend_payload(
+        kind="skill", subject_id="translation",
+        label="Please load translation", rationale="asking again",
+    )))
     assert again["recommendation_id"] == first["recommendation_id"]
     assert len(_recommendation_rows()) == 1
 
@@ -1378,6 +1413,7 @@ def _fail_closed_cases():
     return [
         "no-task-in-env", "unknown-task", "no-project-id", "no-assignee",
         "profile-mismatch", "delegated-child", "cron-inherited", "bad-kind",
+        "missing-evidence", "permission-without-scope",
     ]
 
 
@@ -1394,7 +1430,7 @@ def test_recommend_fails_closed_with_zero_writes(
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
-    args = {"kind": "skill", "subject_id": "translation", "label": "Load translation"}
+    args = _recommend_payload(kind="skill", subject_id="translation", label="Load translation")
     ctx = contextlib.nullcontext()
     if case == "no-task-in-env":
         monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -1420,6 +1456,10 @@ def test_recommend_fails_closed_with_zero_writes(
         ctx = non_dispatcher_owned_context()
     elif case == "bad-kind":
         args = {**args, "kind": "install"}
+    elif case == "missing-evidence":
+        args.pop("evidence")
+    elif case == "permission-without-scope":
+        args["kind"] = "permission"
 
     with ctx:
         out = kt._handle_recommend(args)
@@ -1428,26 +1468,40 @@ def test_recommend_fails_closed_with_zero_writes(
     assert _recommendation_rows() == []
 
 
-def test_recommend_schema_exposes_only_the_advice_payload():
+def test_recommend_schema_exposes_only_advice_and_required_evidence():
+    from hermes_cli import kanban_db as kb
     from tools.kanban_tools import KANBAN_RECOMMEND_SCHEMA as schema
 
     params = schema["parameters"]
-    assert set(params["properties"]) == {"kind", "subject_id", "label", "rationale"}
-    assert params["required"] == ["kind", "subject_id", "label"]
-    # Scope, authority, decision, action, and bulk arguments are server-owned or
-    # simply do not exist — the model may not name any of them.
-    arg_names = " ".join(params["properties"]).lower()
-    for banned in (
-        "board", "task", "project", "profile", "provenance", "status", "review",
-        "policy", "assignee", "decision", "approve", "reject", "install",
-        "connect", "apply", "config", "command", "credential", "secret",
-        "action", "item", "bulk", "auto", "target",
-    ):
-        assert banned not in arg_names, f"kanban_recommend exposes {banned!r}"
-    # Every argument is one bounded scalar: no arrays, no nested objects, so a
-    # single call cannot carry a batch of recommendations.
-    assert [p["type"] for p in params["properties"].values()] == ["string"] * 4
-    assert all("maxLength" in p for n, p in params["properties"].items() if n != "kind")
+    assert params["additionalProperties"] is False
+    assert set(params["properties"]) == {
+        "kind", "subject_id", "label", "rationale", "evidence",
+    }
+    assert params["required"] == ["kind", "subject_id", "label", "evidence"]
+    evidence = params["properties"]["evidence"]
+    assert evidence["additionalProperties"] is False
+    assert set(evidence["required"]) == {
+        "schema_version", "need", "expected_benefit", "requested_scope",
+        "risks", "cost", "rollback",
+    }
+    scope = evidence["properties"]["requested_scope"]
+    assert scope["additionalProperties"] is False
+    assert set(scope["properties"]) == set(kb.RECOMMENDATION_SCOPE_FLAGS)
+    assert set(scope["required"]) == set(kb.RECOMMENDATION_SCOPE_FLAGS)
+
+    # The worker can describe evidence, but cannot decide or apply anything.
+    def _keys(value):
+        if isinstance(value, dict):
+            return set(value) | set().union(*(_keys(v) for v in value.values()), set())
+        if isinstance(value, list):
+            return set().union(*(_keys(v) for v in value), set())
+        return set()
+    assert _keys(params).isdisjoint({
+        "board", "task_id", "project_id", "target_profile", "provenance",
+        "decision", "authority", "gate_ref", "approve", "reject", "apply",
+        "config_identity", "rollback_identity", "readback_identity", "command",
+    })
+    assert '"type": "array"' not in json.dumps(params)
 
 
 def test_recommend_kind_enum_tracks_the_db_and_adds_exactly_one_tool():

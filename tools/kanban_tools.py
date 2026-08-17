@@ -1783,6 +1783,7 @@ def _handle_recommend(args: dict, **kw) -> str:
                 recommendation_subject_id=args.get("subject_id"),
                 recommendation_label=args.get("label"),
                 recommendation_rationale=args.get("rationale"),
+                recommendation_evidence=args.get("evidence"),
                 # Fixed, server-derived provenance: the identity that observed
                 # the gap and the task it was observed under. The model cannot
                 # forge either, and the ref is excluded from dedup identity so a
@@ -2496,7 +2497,12 @@ KANBAN_LINK_SCHEMA = {
 # not force a kanban_db import at module import time (see ``_connect``). A test
 # pins the two lists together so they cannot drift.
 _RECOMMENDATION_KINDS = (
-    "skill", "permission", "connection", "pipeline", "provider_model_policy",
+    "skill",
+    "permission",
+    "connection",
+    "pipeline",
+    "provider_model_policy",
+    "profile_setting",
 )
 
 KANBAN_RECOMMEND_SCHEMA = {
@@ -2506,8 +2512,9 @@ KANBAN_RECOMMEND_SCHEMA = {
         "human review. Use this when a capability gap is blocking or "
         "slowing your work — a skill you don't have loaded, a permission "
         "you lack, a service you aren't connected to, a pipeline that "
-        "should exist, or a provider/model policy that fits this work "
-        "better. This is advice only: it creates a card a human reviews "
+        "should exist, a provider/model policy, or a profile setting that "
+        "fits this work better. This is advice only: it creates a card a "
+        "human reviews "
         "and decides on. It installs, connects, enables, and changes "
         "nothing, it does not unblock your current task, and nothing "
         "happens automatically as a result. Scope is taken from your "
@@ -2521,14 +2528,15 @@ KANBAN_RECOMMEND_SCHEMA = {
     ),
     "parameters": {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "kind": {
                 "type": "string",
                 "enum": list(_RECOMMENDATION_KINDS),
                 "description": (
                     "What kind of capability this is about: 'skill', "
-                    "'permission', 'connection', 'pipeline', or "
-                    "'provider_model_policy'."
+                    "'permission', 'connection', 'pipeline', "
+                    "'provider_model_policy', or 'profile_setting'."
                 ),
             },
             "subject_id": {
@@ -2556,8 +2564,69 @@ KANBAN_RECOMMEND_SCHEMA = {
                     "terms a human reviewer can judge."
                 ),
             },
+
+            "evidence": {
+                "type": "object",
+                "additionalProperties": False,
+                "description": (
+                    "Bounded owner-review evidence. Describe the need, expected "
+                    "benefit, risks, cost, rollback, and every requested scope "
+                    "widening explicitly. This is evidence only, never an apply request."
+                ),
+                "properties": {
+                    "schema_version": {"type": "integer", "const": 1},
+                    "need": {"type": "string", "maxLength": 2000},
+                    "expected_benefit": {"type": "string", "maxLength": 2000},
+                    "requested_scope": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "credential_access": {
+                                "type": "boolean",
+                                "description": "True if secret references or credentials are requested.",
+                            },
+                            "connector_access": {
+                                "type": "boolean",
+                                "description": "Must be true for every connection recommendation.",
+                            },
+                            "data_access": {"type": "boolean"},
+                            "network_access": {"type": "boolean"},
+                            "external_write": {"type": "boolean"},
+                            "paid_route": {"type": "boolean"},
+                            "production_effect": {"type": "boolean"},
+                            "permission_widening": {
+                                "type": "boolean",
+                                "description": "Must be true for every permission recommendation.",
+                            },
+                        },
+                        "required": [
+                            "credential_access",
+                            "connector_access",
+                            "data_access",
+                            "network_access",
+                            "external_write",
+                            "paid_route",
+                            "production_effect",
+                            "permission_widening",
+                        ],
+                    },
+                    "risks": {"type": "string", "maxLength": 2000},
+                    "cost": {"type": "string", "maxLength": 2000},
+                    "rollback": {"type": "string", "maxLength": 2000},
+                },
+                "required": [
+                    "schema_version",
+                    "need",
+                    "expected_benefit",
+                    "requested_scope",
+                    "risks",
+                    "cost",
+                    "rollback",
+                ],
+            },
+
         },
-        "required": ["kind", "subject_id", "label"],
+        "required": ["kind", "subject_id", "label", "evidence"],
     },
 }
 

@@ -179,3 +179,136 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# ITEM32E recommendation lifecycle — operator-only CLI
+# ---------------------------------------------------------------------------
+
+
+def _recommendation_evidence() -> dict:
+    return {
+        "schema_version": 1,
+        "need": "A bounded setting needs adjustment",
+        "expected_benefit": "Safer bounded execution",
+        "requested_scope": {
+            flag: False for flag in kb.RECOMMENDATION_SCOPE_FLAGS
+        },
+        "risks": "Low and reversible",
+        "cost": "No added cost",
+        "rollback": "Restore the prior setting",
+    }
+
+
+def _seed_completed_governance_run(
+    conn, *, label: str, project_id: str, stamp: int
+) -> tuple[str, int]:
+    task_id = kb.create_task(conn, title=label, initial_status="running")
+    cur = conn.execute(
+        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome) "
+        "VALUES (?, 'done', ?, ?, 'completed')",
+        (task_id, stamp, stamp),
+    )
+    run_id = int(cur.lastrowid)
+    conn.execute(
+        "UPDATE tasks SET status = 'done', project_id = ?, current_run_id = ?, "
+        "started_at = ?, completed_at = ? WHERE id = ?",
+        (project_id, run_id, stamp, stamp, task_id),
+    )
+    conn.commit()
+    return task_id, run_id
+
+
+def test_recommendation_cli_records_decision_and_stage_as_json(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "raphael-owner")
+    with kb.connect_closing() as conn:
+        rec_id = kb.create_recommendation(
+            conn,
+            project_id="proj-1",
+            target_profile="worker",
+            recommendation_kind="profile_setting",
+            recommendation_subject_id="agent.max_turns",
+            recommendation_label="Bound agent turns",
+            recommendation_evidence=_recommendation_evidence(),
+            provenance_authority="hermes-profile:worker",
+            provenance_ref="kanban-task:t_12345678",
+            provenance_observed_at=1_700_000_000,
+        )
+        created_at = conn.execute(
+            "SELECT created_at FROM tasks WHERE id = ?", (rec_id,)
+        ).fetchone()[0]
+        decision_task, decision_run = _seed_completed_governance_run(
+            conn,
+            label="governance decision",
+            project_id="proj-1",
+            stamp=created_at + 1,
+        )
+
+    decided = json.loads(
+        kc.run_slash(
+            f"recommendation decide {rec_id} --decision accepted "
+            "--authority owner_approved --gate-ref owner-gate:item32e "
+            f"--reason reviewed --governance-task {decision_task} "
+            f"--governance-run {decision_run} --expected-version 0 --json"
+        )
+    )
+    assert decided == {
+        "decision": "accepted",
+        "effective_state": "none",
+        "lifecycle_version": 1,
+        "recommendation_id": rec_id,
+    }
+
+    with kb.connect_closing() as conn:
+        stage_task, stage_run = _seed_completed_governance_run(
+            conn,
+            label="governance stage",
+            project_id="proj-1",
+            stamp=created_at + 2,
+        )
+    config_identity = "a" * 64
+    rollback_identity = "b" * 64
+    staged = json.loads(
+        kc.run_slash(
+            f"recommendation transition {rec_id} --state staged "
+            f"--reason staged --governance-task {stage_task} "
+            f"--governance-run {stage_run} --expected-version 1 "
+            "--native-surface hermes.profile.agent.max_turns "
+            f"--config-identity {config_identity} "
+            f"--rollback-identity {rollback_identity} --json"
+        )
+    )
+    assert staged["effective_state"] == "staged"
+    assert staged["lifecycle_version"] == 2
+    with kb.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT recommendation_decision, recommendation_effective_state, "
+            "recommendation_lifecycle_version FROM tasks WHERE id = ?",
+            (rec_id,),
+        ).fetchone()
+        assert tuple(row) == ("accepted", "staged", 2)
+
+
+def test_recommendation_cli_refuses_worker_context_before_database_init(
+    kanban_home, monkeypatch
+):
+    with kb.connect_closing() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
+    monkeypatch.setattr(
+        kb,
+        "init_db",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("init_db must not run")
+        ),
+    )
+    output = kc.run_slash(
+        "recommendation decide t_87654321 --decision rejected "
+        "--authority owner_approved --reason no --governance-task t_11111111 "
+        "--governance-run 1 --expected-version 0"
+    )
+    assert "operator-only command refused inside a worker task" in output
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before

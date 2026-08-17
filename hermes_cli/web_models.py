@@ -760,6 +760,7 @@ class KanbanRecommendationItem(BaseModel):
         "connection",
         "pipeline",
         "provider_model_policy",
+        "profile_setting",
     ]
     subject_id: str
     label: str
@@ -782,3 +783,92 @@ class KanbanRecommendationListResponse(BaseModel):
     items: List[KanbanRecommendationItem]
     next_cursor: Optional[str] = None
 
+
+class KanbanRecommendationRequestedScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    credential_access: bool
+    connector_access: bool
+    data_access: bool
+    network_access: bool
+    external_write: bool
+    paid_route: bool
+    production_effect: bool
+    permission_widening: bool
+
+
+class KanbanRecommendationEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    need: str
+    expected_benefit: str
+    requested_scope: KanbanRecommendationRequestedScope
+    risks: str
+    cost: str
+    rollback: str
+
+
+class KanbanRecommendationLifecycleEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal[
+        "recommendation_created",
+        "recommendation_decided",
+        "recommendation_transitioned",
+    ]
+    created_at: int
+    lifecycle_version: int
+    decision: Optional[Literal["pending", "deferred", "rejected", "accepted"]] = None
+    effective_state: Optional[
+        Literal[
+            "none",
+            "staged",
+            "canary_running",
+            "verified",
+            "promoted",
+            "rolled_back",
+            "revoked",
+        ]
+    ] = None
+    authority: Optional[
+        Literal["preauthorized_non_widening", "owner_approved"]
+    ] = None
+    gate_ref: Optional[str] = None
+    actor: Optional[str] = None
+    governance_task_id: Optional[str] = None
+    governance_run_id: Optional[int] = None
+    canary_task_id: Optional[str] = None
+    canary_run_id: Optional[int] = None
+    verifier_task_id: Optional[str] = None
+    verifier_run_id: Optional[int] = None
+    native_surface: Optional[str] = None
+    config_identity: Optional[str] = None
+    rollback_identity: Optional[str] = None
+    readback_identity: Optional[str] = None
+
+
+class KanbanRecommendationItemV2(KanbanRecommendationItem):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence: Optional[KanbanRecommendationEvidence] = None
+    decision: Literal["pending", "deferred", "rejected", "accepted"]
+    effective_state: Literal[
+        "none",
+        "staged",
+        "canary_running",
+        "verified",
+        "promoted",
+        "rolled_back",
+        "revoked",
+    ]
+    lifecycle_version: int
+    lifecycle_events: List[KanbanRecommendationLifecycleEvent]
+
+
+class KanbanRecommendationListV2Response(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[2] = 2
+    items: List[KanbanRecommendationItemV2]
+    next_cursor: Optional[str] = None

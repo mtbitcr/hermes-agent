@@ -9,6 +9,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from hermes_cli import kanban_db as kb
+_EVIDENCE = dict(schema_version=1, need="Need", expected_benefit="Benefit",
+    requested_scope={flag: False for flag in kb.RECOMMENDATION_SCOPE_FLAGS},
+    risks="Low", cost="None", rollback="Remove it")
 _PROVENANCE = dict(provenance_authority="static-analyzer", provenance_ref="finding-123", provenance_observed_at=1_700_000_000)
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -23,6 +26,7 @@ def _make_recommendation(conn, **overrides) -> str:
         project_id="proj-1", target_profile="worker", recommendation_kind="skill",
         recommendation_subject_id="translation", recommendation_label="Load the translation skill",
         recommendation_rationale="seen repeatedly", **_PROVENANCE,
+        recommendation_evidence=_EVIDENCE,
     )
     kwargs.update(overrides)
     return kb.create_recommendation(conn, **kwargs)
