@@ -3078,6 +3078,50 @@ def _validate_recommendation_lifecycle_projection(
         range(lifecycle_version + 1)
     ):
         raise ValueError("recommendation lifecycle event sequence mismatch")
+    first = events[0]
+    if (
+        first.get("kind") != "recommendation_created"
+        or first.get("decision") != "pending"
+        or first.get("effective_state") != "none"
+    ):
+        raise ValueError("invalid recommendation lifecycle origin")
+    current_decision = "pending"
+    current_state = "none"
+    decision_transitions = {
+        "pending": {"deferred", "rejected", "accepted"},
+        "deferred": {"rejected", "accepted"},
+    }
+    state_transitions = {
+        "none": {"staged"},
+        "staged": {"canary_running", "rolled_back"},
+        "canary_running": {"verified", "rolled_back"},
+        "verified": {"promoted", "rolled_back"},
+        "promoted": {"revoked"},
+    }
+    for event in events[1:]:
+        kind = event.get("kind")
+        next_decision = event.get("decision")
+        next_state = event.get("effective_state")
+        if kind == "recommendation_decided":
+            if (
+                current_state != "none"
+                or next_state != "none"
+                or next_decision not in decision_transitions.get(
+                    current_decision, set()
+                )
+            ):
+                raise ValueError("illegal recommendation decision event")
+            current_decision = next_decision
+        elif kind == "recommendation_transitioned":
+            if (
+                current_decision != "accepted"
+                or next_decision != "accepted"
+                or next_state not in state_transitions.get(current_state, set())
+            ):
+                raise ValueError("illegal recommendation transition event")
+            current_state = next_state
+        else:
+            raise ValueError("invalid recommendation lifecycle event kind")
     latest = events[-1]
     if (
         latest.get("decision") != decision

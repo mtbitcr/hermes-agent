@@ -508,6 +508,48 @@ def test_v2_fails_closed_when_snapshot_and_events_disagree(
     }
 
 
+def test_v2_fails_closed_on_semantically_illegal_lifecycle_sequence(
+    client, kanban_home, _authed
+) -> None:
+    rec_id = _make_recommendation()
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET recommendation_decision = 'accepted', "
+            "recommendation_effective_state = 'promoted', "
+            "recommendation_lifecycle_version = 2 WHERE id = ?",
+            (rec_id,),
+        )
+        kb._append_event(
+            conn,
+            rec_id,
+            "recommendation_decided",
+            {
+                "lifecycle_version": 1,
+                "decision": "accepted",
+                "effective_state": "none",
+            },
+        )
+        kb._append_event(
+            conn,
+            rec_id,
+            "recommendation_transitioned",
+            {
+                "lifecycle_version": 2,
+                "decision": "accepted",
+                "effective_state": "promoted",
+            },
+        )
+
+    assert client.get(_ROUTE, params=_params(), headers=_authed).status_code == 200
+    response = client.get(
+        _ROUTE, params=_params(schema_version=2), headers=_authed
+    )
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "recommendation lifecycle data is invalid"
+    }
+
+
 def test_openapi_exposes_only_one_closed_get(client, kanban_home) -> None:
     spec = client.get("/openapi.json").json()
     path_item = spec["paths"][_ROUTE]
