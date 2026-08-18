@@ -1,11 +1,12 @@
-"""On-disk registry for the Item 32G-A Raphael Workspace read credential.
+"""On-disk registry for Raphael's managed dashboard read credentials.
 
-Unlike the drain/recommendations providers (one static secret carried in an
-env var), this credential is multi-token: the CLI can issue any number of
-bearer tokens, each individually revocable and independently expiring. What
-is persisted here is auth METADATA ONLY — a per-token id, a SHA-256 digest of
-the secret (never the secret itself), the fixed principal/scope/project/board
-grant, and issued_at/expires_at/revoked_at. This is not a second Kanban
+The Workspace and owner-recommendations surfaces share one lifecycle registry
+but use disjoint fixed token prefixes, principals, scopes, and grants. The CLI
+can issue any number of bearer tokens, each individually revocable and
+independently expiring; recommendation tokens are hard-capped at eight hours.
+What is persisted here is auth METADATA ONLY — a per-token id, a SHA-256 digest
+of the secret (never the secret itself), the fixed grant, and
+issued_at/expires_at/revoked_at. This is not a second Kanban
 authority: it never stores task/board data, only facts about which bearer
 tokens exist and whether they are still good.
 
@@ -54,8 +55,33 @@ BOARD = "raphael-workspace"
 TOKEN_PREFIX = "hrw1_"
 GRANT = "raphael-workspace-kanban-read-v1"
 
+RECOMMENDATIONS_PRINCIPAL = "kanban-recommendations-reader"
+RECOMMENDATIONS_SCOPE = "kanban:recommendations:read"
+RECOMMENDATIONS_PROJECT = "raphael-workspace"
+RECOMMENDATIONS_BOARD = "raphael-workspace"
+RECOMMENDATIONS_TOKEN_PREFIX = "hrr1_"
+RECOMMENDATIONS_GRANT = "raphael-workspace-recommendations-read-v1"
+
+WORKSPACE_SURFACE = "workspace"
+RECOMMENDATIONS_SURFACE = "recommendations"
+
+
+@dataclass(frozen=True)
+class FixedTokenPolicy:
+    surface: str
+    token_prefix: str
+    principal: str
+    scope: str
+    project: str
+    board: str
+    grant: str
+    provider: str
+    default_ttl_seconds: int
+    max_ttl_seconds: int
+
+
 STORE_VERSION = 1
-_TOKEN_ID_RE = re.compile(r"^hrw1_[A-Za-z0-9_-]{12,64}$")
+_TOKEN_ID_SUFFIX_RE = re.compile(r"^[A-Za-z0-9_-]{12,64}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _TOKEN_RECORD_KEYS = frozenset(
     {
@@ -79,6 +105,55 @@ _store_thread_lock = threading.RLock()
 MIN_TTL_SECONDS = 3600  # 1 hour
 DEFAULT_TTL_SECONDS = 90 * 86400  # 90 days
 MAX_TTL_SECONDS = 397 * 86400  # ~13 months
+RECOMMENDATIONS_DEFAULT_TTL_SECONDS = 8 * 3600
+RECOMMENDATIONS_MAX_TTL_SECONDS = 8 * 3600
+
+_FIXED_TOKEN_POLICIES = {
+    WORKSPACE_SURFACE: FixedTokenPolicy(
+        surface=WORKSPACE_SURFACE,
+        token_prefix=TOKEN_PREFIX,
+        principal=PRINCIPAL,
+        scope=SCOPE,
+        project=PROJECT,
+        board=BOARD,
+        grant=GRANT,
+        provider="raphael-workspace-token",
+        default_ttl_seconds=DEFAULT_TTL_SECONDS,
+        max_ttl_seconds=MAX_TTL_SECONDS,
+    ),
+    RECOMMENDATIONS_SURFACE: FixedTokenPolicy(
+        surface=RECOMMENDATIONS_SURFACE,
+        token_prefix=RECOMMENDATIONS_TOKEN_PREFIX,
+        principal=RECOMMENDATIONS_PRINCIPAL,
+        scope=RECOMMENDATIONS_SCOPE,
+        project=RECOMMENDATIONS_PROJECT,
+        board=RECOMMENDATIONS_BOARD,
+        grant=RECOMMENDATIONS_GRANT,
+        provider="raphael-recommendations-token",
+        default_ttl_seconds=RECOMMENDATIONS_DEFAULT_TTL_SECONDS,
+        max_ttl_seconds=RECOMMENDATIONS_MAX_TTL_SECONDS,
+    ),
+}
+
+
+def policy_for_surface(surface: str) -> FixedTokenPolicy:
+    try:
+        return _FIXED_TOKEN_POLICIES[surface]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"unknown token surface: {surface!r}") from exc
+
+
+def policy_for_token_id(token_id: str) -> Optional[FixedTokenPolicy]:
+    if not isinstance(token_id, str):
+        return None
+    return next(
+        (
+            policy
+            for policy in _FIXED_TOKEN_POLICIES.values()
+            if token_id.startswith(policy.token_prefix)
+        ),
+        None,
+    )
 
 
 class TokenStoreError(Exception):
@@ -185,20 +260,25 @@ class TokenRecord:
             raise TokenStoreError("malformed token lifetime fields")
         if self.revoked_at is not None and type(self.revoked_at) is not int:
             raise TokenStoreError("malformed revoked_at in token record")
-        if not _TOKEN_ID_RE.fullmatch(self.token_id):
+        policy = policy_for_token_id(self.token_id)
+        if policy is None or not _TOKEN_ID_SUFFIX_RE.fullmatch(
+            self.token_id[len(policy.token_prefix) :]
+        ):
             raise TokenStoreError("malformed token_id in token record")
         if not _DIGEST_RE.fullmatch(self.digest):
             raise TokenStoreError("malformed digest in token record")
         if (
-            self.principal != PRINCIPAL
-            or self.scope != SCOPE
-            or self.project != PROJECT
-            or self.board != BOARD
-            or self.grant != GRANT
+            self.principal != policy.principal
+            or self.scope != policy.scope
+            or self.project != policy.project
+            or self.board != policy.board
+            or self.grant != policy.grant
         ):
             raise TokenStoreError("token record grant does not match the fixed policy")
         lifetime = self.expires_at - self.issued_at
-        if self.issued_at < 0 or not (MIN_TTL_SECONDS <= lifetime <= MAX_TTL_SECONDS):
+        if self.issued_at < 0 or not (
+            MIN_TTL_SECONDS <= lifetime <= policy.max_ttl_seconds
+        ):
             raise TokenStoreError("malformed token lifetime in token record")
         if self.revoked_at is not None and self.revoked_at < self.issued_at:
             raise TokenStoreError("malformed revocation time in token record")
@@ -432,8 +512,8 @@ def _save_records(records: list[TokenRecord]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _new_token_id() -> str:
-    return TOKEN_PREFIX + _secrets.token_urlsafe(12)
+def _new_token_id(policy: FixedTokenPolicy) -> str:
+    return policy.token_prefix + _secrets.token_urlsafe(12)
 
 
 def _new_secret() -> str:
@@ -443,8 +523,9 @@ def _new_secret() -> str:
 def issue(
     *,
     out_path: Path,
-    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    ttl_seconds: Optional[int] = None,
     replaces_token_id: Optional[str] = None,
+    surface: str = WORKSPACE_SURFACE,
 ) -> TokenRecord:
     """Mint, audit and activate one token without returning its plaintext.
 
@@ -452,12 +533,15 @@ def issue(
     Audit succeeds before the digest becomes active; a failed audit or store
     write removes the new output file and leaves no active credential.
     """
+    policy = policy_for_surface(surface)
+    if ttl_seconds is None:
+        ttl_seconds = policy.default_ttl_seconds
     if type(ttl_seconds) is not int or not (
-        MIN_TTL_SECONDS <= ttl_seconds <= MAX_TTL_SECONDS
+        MIN_TTL_SECONDS <= ttl_seconds <= policy.max_ttl_seconds
     ):
         raise ValueError(
             f"ttl_seconds must be between {MIN_TTL_SECONDS} and "
-            f"{MAX_TTL_SECONDS}, got {ttl_seconds}"
+            f"{policy.max_ttl_seconds} for {surface}, got {ttl_seconds}"
         )
     if replaces_token_id is not None:
         previous = find(replaces_token_id)
@@ -465,18 +549,23 @@ def issue(
             raise UnknownTokenError(
                 f"replacement token_id is not active: {replaces_token_id!r}"
             )
-    token_id = _new_token_id()
+        previous_policy = policy_for_token_id(previous.token_id)
+        if previous_policy != policy:
+            raise TokenStoreError(
+                "replacement token belongs to a different credential surface"
+            )
+    token_id = _new_token_id(policy)
     secret = _new_secret()
     digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()
     now = int(time.time())
     record = TokenRecord(
         token_id=token_id,
         digest=digest,
-        principal=PRINCIPAL,
-        scope=SCOPE,
-        project=PROJECT,
-        board=BOARD,
-        grant=GRANT,
+        principal=policy.principal,
+        scope=policy.scope,
+        project=policy.project,
+        board=policy.board,
+        grant=policy.grant,
         issued_at=now,
         expires_at=now + ttl_seconds,
         revoked_at=None,
@@ -488,13 +577,13 @@ def issue(
         audit_log(
             AuditEvent.MACHINE_TOKEN_ISSUED,
             strict=True,
-            provider="raphael-workspace-token",
-            principal=PRINCIPAL,
+            provider=policy.provider,
+            principal=policy.principal,
             credential_id=token_id,
-            scope=SCOPE,
-            project=PROJECT,
-            board=BOARD,
-            grant=GRANT,
+            scope=policy.scope,
+            project=policy.project,
+            board=policy.board,
+            grant=policy.grant,
             expires_at=record.expires_at,
             replaces_credential_id=replaces_token_id,
             decision="allow",
@@ -509,6 +598,10 @@ def issue(
                     raise UnknownTokenError(
                         "replacement token_id stopped being active before issuance: "
                         f"{replaces_token_id!r}"
+                    )
+                if policy_for_token_id(previous.token_id) != policy:
+                    raise TokenStoreError(
+                        "replacement token belongs to a different credential surface"
                     )
             if any(existing.token_id == token_id for existing in records):
                 raise TokenStoreError("generated token_id already exists")
@@ -560,16 +653,18 @@ def revoke(token_id: str) -> TokenRecord:
             break
         if updated is None:
             raise UnknownTokenError(f"no such token_id: {token_id!r}")
+    policy = policy_for_token_id(updated.token_id)
+    assert policy is not None  # TokenRecord.validate() already proved this.
     # Revocation is safety-monotonic: if the audit sink is unavailable, the
     # credential stays revoked and the CLI still fails closed instead of
     # reporting an unaudited success.
     audit_log(
         AuditEvent.MACHINE_TOKEN_REVOKED,
         strict=True,
-        provider="raphael-workspace-token",
-        principal=PRINCIPAL,
+        provider=policy.provider,
+        principal=policy.principal,
         credential_id=token_id,
-        grant=GRANT,
+        grant=policy.grant,
         decision="already_revoked" if already_revoked else "revoke",
         revoked_at=updated.revoked_at,
     )

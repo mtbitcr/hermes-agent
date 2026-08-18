@@ -69,6 +69,12 @@ from plugins.dashboard_auth.raphael_workspace import (
     PROJECT as WORKSPACE_PROJECT,
     SCOPE as WORKSPACE_REQUIRED_SCOPE,
     TOKEN_PREFIX as WORKSPACE_TOKEN_PREFIX,
+    RECOMMENDATIONS_BOARD,
+    RECOMMENDATIONS_GRANT,
+    RECOMMENDATIONS_PRINCIPAL,
+    RECOMMENDATIONS_PROJECT,
+    RECOMMENDATIONS_SCOPE,
+    RECOMMENDATIONS_TOKEN_PREFIX,
 )
 from hermes_cli.web_models import (
     KanbanRecommendationItem,
@@ -89,18 +95,29 @@ router = APIRouter()
 #
 # The required scope is fixed and registered unconditionally, even when no
 # credential provider for it exists: the endpoint must be token-only whether
-# or not ``dashboard_auth/recommendations`` loaded. With no provider able to
-# accept a token, the seam answers 401 — fail-closed. Only a principal that
-# actually carries this scope gets through, so the drain service credential
-# (scope ``drain``) is recognised here but refused with a generic 403.
+# or not either the legacy static provider or the managed JIT provider loaded.
+# With no provider able to accept a token, the seam answers 401 — fail-closed.
+# Only a principal that actually carries this scope gets through, so every
+# unrelated machine credential is recognised but refused with a generic 403.
 RECOMMENDATIONS_ROUTE_PATH = "/api/plugins/kanban/recommendations"
 RECOMMENDATIONS_ROUTE_METHOD = "GET"
-RECOMMENDATIONS_REQUIRED_SCOPE = "kanban:recommendations:read"
-register_token_route(
-    RECOMMENDATIONS_ROUTE_PATH,
-    method=RECOMMENDATIONS_ROUTE_METHOD,
-    required_scope=RECOMMENDATIONS_REQUIRED_SCOPE,
-)
+RECOMMENDATIONS_REQUIRED_SCOPE = RECOMMENDATIONS_SCOPE
+
+
+def _register_recommendations_machine_route() -> None:
+    """Install the fixed owner-inbox token contour idempotently."""
+    register_machine_token_family(
+        RECOMMENDATIONS_TOKEN_PREFIX,
+        strict_audit=True,
+    )
+    register_token_route(
+        RECOMMENDATIONS_ROUTE_PATH,
+        method=RECOMMENDATIONS_ROUTE_METHOD,
+        required_scope=RECOMMENDATIONS_REQUIRED_SCOPE,
+    )
+
+
+_register_recommendations_machine_route()
 
 # ITEM 32G-A: the exact nine-route, read-only "Raphael Workspace" machine
 # surface. Unlike the recommendations route above, these are EXISTING
@@ -3929,6 +3946,74 @@ def _recommendation_item_kwargs(
     }
 
 
+def _is_managed_recommendations_call(request: Request) -> bool:
+    principal = getattr(request.state, "token_principal", None)
+    return bool(
+        principal
+        and principal.provider == "raphael-recommendations-token"
+        and principal.principal == RECOMMENDATIONS_PRINCIPAL
+        and principal.credential_id
+        and RECOMMENDATIONS_SCOPE in principal.scopes
+    )
+
+
+def _enforce_managed_recommendations_scope(
+    request: Request, *, board: str, project_id: str
+) -> None:
+    """Bind the managed owner inbox to the native Workspace project/board."""
+    if not _is_managed_recommendations_call(request):
+        return
+    snapshot = _workspace_scope_snapshot()
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    project, board_meta = snapshot
+    if (
+        project.slug != RECOMMENDATIONS_PROJECT
+        or board_meta.get("slug") != RECOMMENDATIONS_BOARD
+        or board != RECOMMENDATIONS_BOARD
+        or project_id != project.id
+    ):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _audit_managed_recommendations_read(
+    request: Request,
+    *,
+    board: str,
+    project_id: str,
+    target_profile: str,
+    result_count: int,
+) -> None:
+    """Durably audit a managed owner-inbox read before returning its data."""
+    if not _is_managed_recommendations_call(request):
+        return
+    principal = request.state.token_principal
+    try:
+        audit_log(
+            AuditEvent.TOKEN_AUTH_SUCCESS,
+            strict=True,
+            provider=principal.provider,
+            principal=principal.principal,
+            credential_id=principal.credential_id,
+            grant=RECOMMENDATIONS_GRANT,
+            source="raphael-owner-recommendations",
+            method=request.method,
+            route_template=getattr(
+                request.state, "token_route_template", request.url.path
+            ),
+            board=board,
+            project=project_id,
+            target_profile=target_profile,
+            result_count=result_count,
+            decision="allow",
+            status=200,
+            ip=transport_peer_ip(request),
+        )
+        request.state.token_route_audited = True
+    except Exception:
+        raise HTTPException(status_code=503, detail="Service Unavailable")
+
+
 @router.get(
     "/recommendations",
     response_model=(
@@ -3936,6 +4021,7 @@ def _recommendation_item_kwargs(
     ),
 )
 def list_recommendations(
+    request: Request,
     board: str = Query(...),
     project_id: str = Query(...),
     target_profile: str = Query(...),
@@ -3952,6 +4038,10 @@ def list_recommendations(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    _enforce_managed_recommendations_scope(
+        request, board=board, project_id=project_id
+    )
+
     after: Optional[tuple[int, str]] = None
     if cursor:
         after = _decode_recommendations_cursor(
@@ -3964,6 +4054,13 @@ def list_recommendations(
 
     conn = _recommendations_ro_conn(board)
     if conn is None:
+        _audit_managed_recommendations_read(
+            request,
+            board=board,
+            project_id=project_id,
+            target_profile=target_profile,
+            result_count=0,
+        )
         if schema_version == 2:
             return KanbanRecommendationListV2Response(
                 schema_version=2, items=[], next_cursor=None
@@ -4119,6 +4216,13 @@ def list_recommendations(
                 id_=last["id"],
                 schema_version=schema_version,
             )
+        _audit_managed_recommendations_read(
+            request,
+            board=board,
+            project_id=project_id,
+            target_profile=target_profile,
+            result_count=len(items),
+        )
         if schema_version == 2:
             return KanbanRecommendationListV2Response(
                 schema_version=2, items=items, next_cursor=next_cursor
