@@ -1,4 +1,4 @@
-"""CLI for the Item 32G-A Raphael Workspace read-only Kanban credential.
+"""CLI for Raphael's managed Workspace and recommendations credentials.
 
 Wires ``hermes kanban-workspace-token <subcommand>``:
   issue    — mint a new bearer token, write it once to an explicit path
@@ -28,6 +28,15 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         help="Mint a new bearer token for the raphael-workspace read credential",
     )
     issue_p.add_argument(
+        "--surface",
+        choices=(token_store.WORKSPACE_SURFACE, token_store.RECOMMENDATIONS_SURFACE),
+        default=token_store.WORKSPACE_SURFACE,
+        help=(
+            "Fixed credential surface to grant. Recommendations credentials "
+            "have a hard maximum lifetime of 8 hours."
+        ),
+    )
+    issue_p.add_argument(
         "--out",
         required=True,
         help=(
@@ -45,15 +54,22 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
             "credential remains active until an explicit revoke after cutover."
         ),
     )
-    issue_p.add_argument(
+    ttl_group = issue_p.add_mutually_exclusive_group()
+    ttl_group.add_argument(
+        "--ttl-hours",
+        type=int,
+        help=(
+            "Expiry in hours from now. Use 1-8 for the recommendations "
+            "surface; omitted values use that surface's fixed default."
+        ),
+    )
+    ttl_group.add_argument(
         "--ttl-days",
         type=int,
-        default=token_store.DEFAULT_TTL_SECONDS // 86400,
         help=(
-            f"Expiry in days from now (default "
-            f"{token_store.DEFAULT_TTL_SECONDS // 86400}, min "
-            f"{max(1, token_store.MIN_TTL_SECONDS // 86400)}, max "
-            f"{token_store.MAX_TTL_SECONDS // 86400})"
+            f"Expiry in days from now for the workspace surface (max "
+            f"{token_store.MAX_TTL_SECONDS // 86400}); omitted values use "
+            "that surface's fixed default."
         ),
     )
 
@@ -66,14 +82,27 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 
 
 def _cmd_issue(
-    *, out: str, ttl_days: int, replaces_token_id: str | None = None
+    *,
+    out: str,
+    surface: str,
+    ttl_days: int | None,
+    ttl_hours: int | None,
+    replaces_token_id: str | None = None,
 ) -> int:
     out_path = Path(out).expanduser()
     try:
+        policy = token_store.policy_for_surface(surface)
+        if ttl_hours is not None:
+            ttl_seconds = ttl_hours * 3600
+        elif ttl_days is not None:
+            ttl_seconds = ttl_days * 86400
+        else:
+            ttl_seconds = policy.default_ttl_seconds
         record = token_store.issue(
             out_path=out_path,
-            ttl_seconds=ttl_days * 86400,
+            ttl_seconds=ttl_seconds,
             replaces_token_id=replaces_token_id,
+            surface=surface,
         )
     except (
         ValueError,
@@ -84,6 +113,7 @@ def _cmd_issue(
         print(f"error: {exc}")
         return 2
     print(f"issued token_id={record.token_id}")
+    print(f"  surface:    {surface}")
     print(f"  principal:  {record.principal}")
     print(f"  scope:      {record.scope}")
     print(f"  project:    {record.project}")
@@ -110,9 +140,12 @@ def _cmd_list() -> int:
         print("no tokens issued yet")
         return 0
     for r in records:
+        policy = token_store.policy_for_token_id(r.token_id)
+        assert policy is not None
         print(
-            f"{r.token_id}  status={r.status}  issued_at={r.issued_at}  "
-            f"expires_at={r.expires_at}  revoked_at={r.revoked_at}"
+            f"{r.token_id}  surface={policy.surface}  status={r.status}  "
+            f"issued_at={r.issued_at}  expires_at={r.expires_at}  "
+            f"revoked_at={r.revoked_at}"
         )
     return 0
 
@@ -135,7 +168,9 @@ def workspace_token_command(args: argparse.Namespace) -> int:
     if sub == "issue":
         return _cmd_issue(
             out=args.out,
+            surface=args.surface,
             ttl_days=args.ttl_days,
+            ttl_hours=args.ttl_hours,
             replaces_token_id=args.replaces_token_id,
         )
     if sub == "list":

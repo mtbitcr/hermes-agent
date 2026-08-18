@@ -1,27 +1,26 @@
-"""WorkspaceReadTokenProvider — Item 32G-A: revocable, expiring, audited
-machine credential for the exact Raphael Workspace read-only Kanban surface.
+"""Managed, revocable and expiring machine credentials for Raphael dashboards.
 
-What it is
-----------
-A service-to-service auth provider for the fixed set of 9 GET routes the
-Kanban dashboard plugin API registers for this credential (see
-``plugins/kanban/dashboard/plugin_api.py``, the "Item 32G-A" section). It
-verifies an inbound ``Authorization: Bearer <token_id>.<secret>`` against the
-on-disk registry in :mod:`token_store` and, on a match, vouches for the
-fixed ``raphael-workspace`` principal carrying the single fixed scope
-``kanban.read``.
+The providers below share one audited metadata registry while retaining
+separate fixed token families and scopes for the Workspace work view and the
+owner-only recommendations inbox.
 
-How this differs from drain / recommendations
-----------------------------------------------
-Those two are single static secrets carried in one env var — no lifecycle,
-no revocation, no expiry. This credential needs all three (issue/list/revoke,
-bounded expiry, immediate revocation), so it is backed by a small on-disk
-registry (:mod:`token_store`) instead: many tokens, each individually
-revocable, verified fresh against disk on every request (no cache — a
-``revoke`` takes effect on the very next call). What IS shared with the other
-two: the seam it plugs into (``supports_token`` / ``verify_token`` +
-``token_auth`` middleware), the ``TokenPrincipal`` contract, and the
-constant-time (``hmac.compare_digest``) comparison discipline.
+What they are
+-------------
+Two service-to-service providers verify
+``Authorization: Bearer <token_id>.<secret>`` against the same on-disk
+registry in :mod:`token_store`. ``hrw1_`` tokens carry only
+``kanban.read`` for the fixed Workspace GET surface; ``hrr1_`` tokens carry
+only ``kanban:recommendations:read`` for the owner inbox. A token from one
+family is rejected by the other provider before route scope enforcement.
+
+Lifecycle and isolation
+-----------------------
+Both managed families support issue/list/revoke, bounded expiry and immediate
+revocation through :mod:`token_store`. Every request verifies fresh against
+disk (no cache), so ``revoke`` takes effect on the next request. They share
+the existing ``supports_token`` / ``verify_token`` + ``token_auth``
+middleware seam and ``TokenPrincipal`` contract, while exact scopes keep the
+two surfaces mutually unusable.
 
 There is no login, cookie, session, or refresh: only the token capability is
 implemented.
@@ -29,14 +28,15 @@ implemented.
 Configuration
 -------------
 Nothing goes in ``.env`` or ``config.yaml`` — there is no operator-supplied
-secret to provision. Credentials are minted locally via
-``hermes kanban-workspace-token issue --out <path>``; the principal, scope,
-project, and board are fixed constants (see :mod:`token_store`), never
-configuration, because the grant IS the authority boundary this plugin
-exists to enforce.
+secret to provision. Credentials are minted locally via either:
 
-The provider always registers: an empty or missing token registry already
-denies every ``verify_token`` call (fail-closed), so there is no "unset env
+    hermes kanban-workspace-token issue --surface workspace --out <path>
+    hermes kanban-workspace-token issue --surface recommendations --ttl-hours 8 --out <path>
+
+The token family, principal, scope, grant and lifetime ceiling are fixed
+constants (see :mod:`token_store`), never operator-editable configuration.
+Both providers always register: an empty or missing registry denies every
+``verify_token`` call (fail-closed), so there is no "unset env
 var" skip-and-record-a-reason path like the static-secret plugins have — the
 CLI is what actually brings the credential into existence.
 """
@@ -69,6 +69,12 @@ PROJECT = token_store.PROJECT
 BOARD = token_store.BOARD
 TOKEN_PREFIX = token_store.TOKEN_PREFIX
 GRANT = token_store.GRANT
+RECOMMENDATIONS_PRINCIPAL = token_store.RECOMMENDATIONS_PRINCIPAL
+RECOMMENDATIONS_SCOPE = token_store.RECOMMENDATIONS_SCOPE
+RECOMMENDATIONS_PROJECT = token_store.RECOMMENDATIONS_PROJECT
+RECOMMENDATIONS_BOARD = token_store.RECOMMENDATIONS_BOARD
+RECOMMENDATIONS_TOKEN_PREFIX = token_store.RECOMMENDATIONS_TOKEN_PREFIX
+RECOMMENDATIONS_GRANT = token_store.RECOMMENDATIONS_GRANT
 
 __all__ = [
     "PRINCIPAL",
@@ -77,7 +83,14 @@ __all__ = [
     "BOARD",
     "TOKEN_PREFIX",
     "GRANT",
+    "RECOMMENDATIONS_PRINCIPAL",
+    "RECOMMENDATIONS_SCOPE",
+    "RECOMMENDATIONS_PROJECT",
+    "RECOMMENDATIONS_BOARD",
+    "RECOMMENDATIONS_TOKEN_PREFIX",
+    "RECOMMENDATIONS_GRANT",
     "WorkspaceReadTokenProvider",
+    "RecommendationsReadTokenProvider",
     "register",
 ]
 
@@ -87,6 +100,9 @@ class WorkspaceReadTokenProvider(DashboardAuthProvider):
 
     name = "raphael-workspace-token"
     display_name = "Raphael Workspace (read-only Kanban credential)"
+    token_prefix = TOKEN_PREFIX
+    expected_principal = PRINCIPAL
+    expected_scope = SCOPE
     supports_token = True
     supports_session = False
 
@@ -100,7 +116,7 @@ class WorkspaceReadTokenProvider(DashboardAuthProvider):
         then answers 503 rather than treating a broken store as "invalid
         credentials".
         """
-        if not token.startswith(TOKEN_PREFIX) or "." not in token:
+        if not token.startswith(self.token_prefix) or "." not in token:
             return None
         token_id, _, secret = token.partition(".")
         if not token_id or not secret:
@@ -109,7 +125,11 @@ class WorkspaceReadTokenProvider(DashboardAuthProvider):
             record = token_store.verify(token_id, secret)
         except token_store.TokenStoreError as exc:
             raise ProviderError(str(exc)) from exc
-        if record is None:
+        if (
+            record is None
+            or record.principal != self.expected_principal
+            or record.scope != self.expected_scope
+        ):
             return None
         return TokenPrincipal(
             principal=record.principal,
@@ -146,6 +166,16 @@ class WorkspaceReadTokenProvider(DashboardAuthProvider):
         return None
 
 
+class RecommendationsReadTokenProvider(WorkspaceReadTokenProvider):
+    """Managed, revocable credential for the owner recommendations inbox."""
+
+    name = "raphael-recommendations-token"
+    display_name = "Raphael Recommendations (JIT read credential)"
+    token_prefix = RECOMMENDATIONS_TOKEN_PREFIX
+    expected_principal = RECOMMENDATIONS_PRINCIPAL
+    expected_scope = RECOMMENDATIONS_SCOPE
+
+
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
@@ -161,20 +191,24 @@ def register(ctx) -> None:
     even if this plugin were somehow disabled.
     """
     ctx.register_dashboard_auth_provider(WorkspaceReadTokenProvider())
+    ctx.register_dashboard_auth_provider(RecommendationsReadTokenProvider())
     ctx.register_cli_command(
         name="kanban-workspace-token",
-        help="Issue/list/revoke the read-only Raphael Workspace Kanban credential",
+        help="Issue/list/revoke managed Raphael dashboard credentials",
         setup_fn=register_cli,
         handler_fn=workspace_token_command,
         description=(
-            "Manage the revocable, expiring machine credential for the fixed "
-            "Raphael Workspace read-only Kanban surface (Item 32G-A). "
-            "'issue' mints a new bearer token and writes it once to an "
-            "explicit path; 'list' shows non-secret metadata for every "
-            "issued token; 'revoke' disables one by its token_id."
+            "Manage revocable, expiring machine credentials for the fixed "
+            "Raphael Workspace and owner recommendations read surfaces. "
+            "Recommendations tokens are independently scoped and capped at "
+            "8 hours. 'issue' writes a new bearer once to an explicit path; "
+            "'list' exposes only metadata; 'revoke' disables one token_id."
         ),
     )
     logger.info(
-        "raphael-workspace-token: registered provider %r (principal=%s, scope=%s)",
-        WorkspaceReadTokenProvider.name, PRINCIPAL, SCOPE,
+        "raphael managed tokens: registered providers %r/%r (scopes=%s/%s)",
+        WorkspaceReadTokenProvider.name,
+        RecommendationsReadTokenProvider.name,
+        SCOPE,
+        RECOMMENDATIONS_SCOPE,
     )

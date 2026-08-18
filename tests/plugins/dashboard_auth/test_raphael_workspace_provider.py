@@ -1,4 +1,4 @@
-"""Item 32G-A: the revocable, expiring Raphael Workspace read credential.
+"""Managed Raphael Workspace and owner-recommendations read credentials.
 
 Covers the on-disk token registry (issue/list/revoke/expiry/restart
 persistence, exclusive/no-follow/mode/path failures for the plaintext
@@ -7,6 +7,7 @@ other-provider tokens, protocol compliance, non-interactive surface).
 """
 from __future__ import annotations
 
+import argparse
 import json
 import stat
 import sys
@@ -16,13 +17,27 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
-from hermes_cli.dashboard_auth import TokenPrincipal, assert_protocol_compliance
+from hermes_cli import kanban_db as kb
+from hermes_cli import projects_db as pdb
+from hermes_cli.dashboard_auth import (
+    TokenPrincipal,
+    assert_protocol_compliance,
+    clear_providers,
+    register_provider,
+)
+from hermes_cli.dashboard_auth import token_auth
 from hermes_cli.dashboard_auth.base import ProviderError
 
-from plugins.dashboard_auth.raphael_workspace import token_store
+from plugins.dashboard_auth.raphael_workspace import cli, token_store
 from plugins.dashboard_auth import raphael_workspace
-from plugins.dashboard_auth.raphael_workspace import WorkspaceReadTokenProvider
+from plugins.dashboard_auth.raphael_workspace import (
+    RecommendationsReadTokenProvider,
+    WorkspaceReadTokenProvider,
+)
+from plugins.kanban.dashboard import plugin_api
 
 
 pytestmark_posix = pytest.mark.skipif(
@@ -171,6 +186,51 @@ class TestLifecycle:
         with pytest.raises(token_store.UnknownTokenError):
             _issue(workspace_home, replaces_token_id=current.token_id)
 
+    def test_recommendations_token_is_fixed_capped_and_expires(
+        self, workspace_home, monkeypatch
+    ):
+        record, plaintext = _issue(
+            workspace_home,
+            surface=token_store.RECOMMENDATIONS_SURFACE,
+            ttl_seconds=8 * 3600,
+        )
+        assert record.token_id.startswith(token_store.RECOMMENDATIONS_TOKEN_PREFIX)
+        assert record.principal == token_store.RECOMMENDATIONS_PRINCIPAL
+        assert record.scope == token_store.RECOMMENDATIONS_SCOPE
+        assert record.expires_at - record.issued_at == 8 * 3600
+        token_id, secret = plaintext.split(".", 1)
+        assert token_store.verify(token_id, secret) == record
+        monkeypatch.setattr(token_store.time, "time", lambda: record.expires_at)
+        assert token_store.verify(token_id, secret) is None
+        with pytest.raises(ValueError):
+            _issue(
+                workspace_home,
+                surface=token_store.RECOMMENDATIONS_SURFACE,
+                ttl_seconds=8 * 3600 + 1,
+            )
+
+    def test_store_preserves_both_disjoint_token_families(self, workspace_home):
+        workspace, _ = _issue(workspace_home)
+        recommendations, _ = _issue(
+            workspace_home,
+            surface=token_store.RECOMMENDATIONS_SURFACE,
+            ttl_seconds=8 * 3600,
+        )
+        assert {r.token_id for r in token_store.load_records()} == {
+            workspace.token_id,
+            recommendations.token_id,
+        }
+
+    def test_replacement_cannot_cross_surfaces(self, workspace_home):
+        workspace, _ = _issue(workspace_home)
+        with pytest.raises(token_store.TokenStoreError):
+            _issue(
+                workspace_home,
+                surface=token_store.RECOMMENDATIONS_SURFACE,
+                ttl_seconds=8 * 3600,
+                replaces_token_id=workspace.token_id,
+            )
+
 
 # ---------------------------------------------------------------------------
 # Fail-closed on malformed/unsafe on-disk state
@@ -301,17 +361,21 @@ class TestProvider:
     def test_plugin_registers_provider_and_cli(self):
         ctx = MagicMock()
         raphael_workspace.register(ctx)
-        ctx.register_dashboard_auth_provider.assert_called_once()
-        assert isinstance(
-            ctx.register_dashboard_auth_provider.call_args.args[0],
+        assert ctx.register_dashboard_auth_provider.call_count == 2
+        providers = [
+            call.args[0] for call in ctx.register_dashboard_auth_provider.call_args_list
+        ]
+        assert [type(provider) for provider in providers] == [
             WorkspaceReadTokenProvider,
-        )
+            RecommendationsReadTokenProvider,
+        ]
         assert ctx.register_cli_command.call_args.kwargs["name"] == (
             "kanban-workspace-token"
         )
 
     def test_protocol_compliance(self):
         assert_protocol_compliance(WorkspaceReadTokenProvider)
+        assert_protocol_compliance(RecommendationsReadTokenProvider)
 
     def test_supports_token_only(self):
         p = WorkspaceReadTokenProvider()
@@ -326,6 +390,30 @@ class TestProvider:
         assert principal.principal == "raphael-workspace"
         assert principal.scopes == ("kanban.read",)
         assert principal.credential_id == record.token_id
+
+    def test_managed_providers_are_mutually_unusable(self, workspace_home):
+        workspace_record, workspace_token = _issue(workspace_home)
+        recommendations_record, recommendations_token = _issue(
+            workspace_home,
+            surface=token_store.RECOMMENDATIONS_SURFACE,
+            ttl_seconds=8 * 3600,
+        )
+        workspace_provider = WorkspaceReadTokenProvider()
+        recommendations_provider = RecommendationsReadTokenProvider()
+
+        assert workspace_provider.verify_token(token=recommendations_token) is None
+        assert recommendations_provider.verify_token(token=workspace_token) is None
+
+        principal = recommendations_provider.verify_token(
+            token=recommendations_token
+        )
+        assert principal == TokenPrincipal(
+            principal=token_store.RECOMMENDATIONS_PRINCIPAL,
+            provider="raphael-recommendations-token",
+            scopes=(token_store.RECOMMENDATIONS_SCOPE,),
+            credential_id=recommendations_record.token_id,
+        )
+        assert workspace_record.token_id != recommendations_record.token_id
 
     @pytest.mark.parametrize("token", ["", "no-dot-at-all", ".", "a.", ".b", "unknown.secret"])
     def test_verify_token_rejects_malformed_or_unknown(self, workspace_home, token):
@@ -374,3 +462,156 @@ class TestProvider:
             p.refresh_session(refresh_token="r")
         assert p.verify_session(access_token="anything") is None
         assert p.revoke_session(refresh_token="anything") is None
+
+
+class TestCli:
+    def test_issue_recommendations_uses_eight_hour_jit_default(
+        self, workspace_home, capsys
+    ):
+        output_dir = workspace_home / "cli-output"
+        output_dir.mkdir(mode=0o700)
+        output_path = output_dir / "recommendations.token"
+        parser = argparse.ArgumentParser()
+        cli.register_cli(parser)
+        args = parser.parse_args(
+            [
+                "issue",
+                "--surface",
+                "recommendations",
+                "--out",
+                str(output_path),
+            ]
+        )
+
+        assert cli.workspace_token_command(args) == 0
+        record = token_store.load_records()[0]
+        bearer = output_path.read_text(encoding="utf-8").strip()
+        assert record.expires_at - record.issued_at == 8 * 3600
+        assert record.token_id.startswith(token_store.RECOMMENDATIONS_TOKEN_PREFIX)
+        assert bearer not in capsys.readouterr().out
+
+
+@pytest.fixture
+def managed_recommendations_surface(workspace_home):
+    board = token_store.RECOMMENDATIONS_BOARD
+    repo = workspace_home / "project"
+    repo.mkdir()
+    pdb._INITIALIZED_PATHS.clear()
+    with pdb.connect_closing() as conn:
+        project_id = pdb.create_project(
+            conn,
+            name="Raphael Workspace",
+            slug=token_store.RECOMMENDATIONS_PROJECT,
+            primary_path=str(repo),
+            board_slug=board,
+        )
+    kb._INITIALIZED_PATHS.clear()
+    kb.create_board(
+        board,
+        name="Raphael Workspace",
+        project_id=project_id,
+    )
+    kb.init_db(board=board)
+    other_board = "other-existing-board"
+    kb.create_board(
+        other_board,
+        name="Other existing board",
+        project_id=project_id,
+    )
+    db_path = kb.kanban_db_path(board=board)
+    db_before = db_path.read_bytes()
+
+    token_dir = workspace_home / "integration-tokens"
+    token_dir.mkdir(mode=0o700)
+    recommendations_path = token_dir / "recommendations.token"
+    recommendations_record = token_store.issue(
+        out_path=recommendations_path,
+        surface=token_store.RECOMMENDATIONS_SURFACE,
+        ttl_seconds=8 * 3600,
+    )
+    recommendations_bearer = recommendations_path.read_text(
+        encoding="utf-8"
+    ).strip()
+    workspace_path = token_dir / "workspace.token"
+    token_store.issue(out_path=workspace_path)
+    workspace_bearer = workspace_path.read_text(encoding="utf-8").strip()
+
+    clear_providers()
+    token_auth.clear_token_routes()
+    register_provider(WorkspaceReadTokenProvider())
+    register_provider(RecommendationsReadTokenProvider())
+    plugin_api._register_recommendations_machine_route()
+    plugin_api._register_workspace_machine_routes()
+
+    app = FastAPI()
+    app.include_router(plugin_api.router, prefix="/api/plugins/kanban")
+
+    @app.middleware("http")
+    async def machine_auth(request, call_next):
+        return await token_auth.token_auth_middleware(request, call_next)
+
+    with TestClient(app) as client:
+        yield {
+            "client": client,
+            "board": board,
+            "other_board": other_board,
+            "project_id": project_id,
+            "db_path": db_path,
+            "db_before": db_before,
+            "recommendations_record": recommendations_record,
+            "recommendations_bearer": recommendations_bearer,
+            "workspace_bearer": workspace_bearer,
+        }
+
+    clear_providers()
+    token_auth.clear_token_routes()
+    kb._INITIALIZED_PATHS.clear()
+    pdb._INITIALIZED_PATHS.clear()
+
+
+def test_managed_recommendations_endpoint_is_jit_scoped_and_read_only(
+    managed_recommendations_surface,
+):
+    surface = managed_recommendations_surface
+    client = surface["client"]
+    route = (
+        "/api/plugins/kanban/recommendations"
+        f"?board={surface['board']}&project_id={surface['project_id']}"
+        "&target_profile=writer"
+    )
+    recommendations_headers = {
+        "Authorization": f"Bearer {surface['recommendations_bearer']}"
+    }
+    workspace_headers = {
+        "Authorization": f"Bearer {surface['workspace_bearer']}"
+    }
+
+    response = client.get(route, headers=recommendations_headers)
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "schema_version": 1,
+        "items": [],
+        "next_cursor": None,
+    }
+    assert client.get(route).status_code == 401
+    assert client.get(
+        route,
+        headers={"Authorization": "Bearer hrr1_unknown.secret"},
+    ).status_code == 401
+    assert client.get(route, headers=workspace_headers).status_code == 403
+    assert client.get(
+        route.replace(surface["board"], surface["other_board"]),
+        headers=recommendations_headers,
+    ).status_code == 404
+    assert client.get(
+        route.replace(surface["project_id"], "p_ffffffff"),
+        headers=recommendations_headers,
+    ).status_code == 404
+    assert client.get(
+        "/api/plugins/kanban/projects",
+        headers=recommendations_headers,
+    ).status_code == 403
+    assert surface["db_path"].read_bytes() == surface["db_before"]
+
+    token_store.revoke(surface["recommendations_record"].token_id)
+    assert client.get(route, headers=recommendations_headers).status_code == 401
