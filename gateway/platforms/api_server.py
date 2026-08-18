@@ -412,7 +412,7 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
 
 
 _REQUEST_OPTION_MISSING = object()
-_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _RUNTIME_AGENT_OVERRIDE_KEYS = (
     "api_key",
     "base_url",
@@ -7085,6 +7085,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         ),
                         "choices": choices,
                     }
+                    operation = str(event.get("operation") or "")
+                    if event.get("exact_operation") and operation in {
+                        "owner_workspace_bootstrap",
+                        "owner_task_graph_commit",
+                        "owner_task_move",
+                        "owner_task_comment",
+                    }:
+                        pending_approval["operation"] = operation
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",

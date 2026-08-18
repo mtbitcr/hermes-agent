@@ -288,6 +288,7 @@ class TestRunStatus:
                         "approval_id": "approval-1",
                         "description": "Create project with token sk-live-secret-value",
                         "exact_operation": True,
+                        "operation": "owner_task_graph_commit",
                     })
                     approval_ready.set()
                     release.wait(timeout=5)
@@ -306,6 +307,7 @@ class TestRunStatus:
                 assert waiting["status"] == "waiting_for_approval"
                 assert waiting["pending_approval"]["approval_id"] == "approval-1"
                 assert waiting["pending_approval"]["choices"] == ["once", "deny"]
+                assert waiting["pending_approval"]["operation"] == "owner_task_graph_commit"
                 assert "sk-live-secret-value" not in waiting["pending_approval"]["description"]
 
                 release.set()

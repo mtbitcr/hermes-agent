@@ -34,6 +34,7 @@ from gateway.platforms.api_server import (
     _derive_chat_session_id,
     _hermes_version,
     _redact_api_error_text,
+    _request_reasoning_config,
     _request_agent_overrides,
     check_api_server_requirements,
     cors_middleware,
@@ -51,6 +52,17 @@ class TestCheckRequirements:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self):
         assert check_api_server_requirements() is False
+
+
+class TestRequestReasoningConfig:
+    def test_accepts_max_effort(self):
+        assert _request_reasoning_config({"reasoning_effort": "max"}) == {
+            "enabled": True,
+            "effort": "max",
+        }
+
+    def test_ignores_unknown_effort(self):
+        assert _request_reasoning_config({"reasoning_effort": "ultra"}) is None
 
 
 # ---------------------------------------------------------------------------
