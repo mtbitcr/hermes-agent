@@ -3583,13 +3583,19 @@ def _workspace_assignees_response() -> dict:
         conn.close()
 
 
+def _workspace_work_task_exists(conn: sqlite3.Connection, task_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
+    ).fetchone() is not None
+
+
 def _workspace_task_runs_response(task_id: str) -> Optional[dict]:
     conn = _workspace_ro_conn()
     if conn is None:
         return None
     try:
-        task = kanban_db.get_task(conn, task_id)
-        if task is None:
+        if not _workspace_work_task_exists(conn, task_id):
             return None
         runs = kanban_db.list_runs(conn, task_id)
         return {"runs": [r.id for r in runs]}
@@ -3602,15 +3608,15 @@ def _workspace_task_attachments_response(task_id: str) -> Optional[dict]:
     if conn is None:
         return None
     try:
-        if kanban_db.get_task(conn, task_id) is None:
+        if not _workspace_work_task_exists(conn, task_id):
             return None
         atts = kanban_db.list_attachments(conn, task_id)
         return {
             "attachments": [
                 {
                     "id": a.id,
-                    "filename": a.filename,
-                    "media_type": a.content_type,
+                    "filename": _workspace_sanitize_filename(a.filename),
+                    "media_type": _workspace_validate_media_type(a.content_type),
                     "size": a.size,
                     "created_at": _workspace_iso_timestamp(a.created_at),
                 }
@@ -3628,7 +3634,9 @@ def _workspace_attachment_bytes(attachment_id: int):
         return None
     try:
         att = kanban_db.get_attachment(conn, attachment_id)
-        if att is None or kanban_db.get_task(conn, att.task_id) is None:
+        if att is None or not _workspace_work_task_exists(
+            conn, att.task_id
+        ):
             return None
         # Same fixed-board rule as _workspace_ro_conn: an attachments-root
         # override must not widen this credential to another directory.

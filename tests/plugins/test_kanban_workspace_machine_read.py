@@ -73,14 +73,38 @@ def workspace_surface(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         )
 
         # A recommendation is owner-review authority, not ordinary work. It
-        # must never leak into this work/task/count surface.
+        # must never leak into this work/task/count/attachment/run surface.
+        recommendation_task_id = "t_recommendation_hidden"
+        recommendation_run_id = 9001
+        recommendation_attachment_id = 9001
         conn.execute(
             "INSERT INTO tasks "
             "(id, title, status, created_at, workspace_kind, task_kind, "
             "project_id, review_policy) "
-            "VALUES ('t_recommendation_hidden', 'Hidden advice', 'review', 1, "
-            "'scratch', 'capability_recommendation', ?, 'owner')",
-            (project_id,),
+            "VALUES (?, 'Hidden advice', 'review', 1, 'scratch', "
+            "'capability_recommendation', ?, 'owner')",
+            (recommendation_task_id, project_id),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (id, task_id, status, started_at) "
+            "VALUES (?, ?, 'done', 1)",
+            (recommendation_run_id, recommendation_task_id),
+        )
+        recommendation_path = (
+            kb.task_attachments_dir(recommendation_task_id, board=BOARD)
+            / "hidden.txt"
+        )
+        recommendation_path.parent.mkdir(parents=True, exist_ok=True)
+        recommendation_path.write_bytes(b"hidden")
+        conn.execute(
+            "INSERT INTO task_attachments "
+            "(id, task_id, filename, stored_path, content_type, size, created_at) "
+            "VALUES (?, ?, 'hidden.txt', ?, 'text/plain', 6, 1)",
+            (
+                recommendation_attachment_id,
+                recommendation_task_id,
+                str(recommendation_path),
+            ),
         )
         conn.commit()
         baseline_event_count = conn.execute(
@@ -150,6 +174,9 @@ def workspace_surface(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "attachment_id": attachment_id,
             "attachment_body": attachment_body,
             "other_task_id": other_task_id,
+            "recommendation_task_id": recommendation_task_id,
+            "recommendation_run_id": recommendation_run_id,
+            "recommendation_attachment_id": recommendation_attachment_id,
             "baseline_event_count": baseline_event_count,
         }
 
@@ -314,6 +341,59 @@ def test_cross_board_objects_are_indistinguishable_from_missing(workspace_surfac
     )
     assert response.status_code == 404
     assert response.json() == {"detail": "Not Found"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/plugins/kanban/tasks/{recommendation_task_id}",
+        "/api/plugins/kanban/tasks/{recommendation_task_id}/attachments",
+        "/api/plugins/kanban/attachments/{recommendation_attachment_id}",
+        "/api/plugins/kanban/runs/{recommendation_run_id}",
+    ],
+)
+def test_recommendation_objects_are_indistinguishable_from_missing(
+    workspace_surface, path
+):
+    s = workspace_surface
+    response = _get(s, path.format(**s), query=f"?board={BOARD}")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}
+
+
+def test_attachment_metadata_is_sanitized(workspace_surface):
+    s = workspace_surface
+    conn = kb.connect(board=BOARD)
+    try:
+        conn.execute(
+            "UPDATE task_attachments SET filename = ?, content_type = ? "
+            "WHERE id = ?",
+            ("../../unsafe\n.txt", "text/html\r\nX-Injected: yes", s["attachment_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    metadata = _get(
+        s,
+        f"/api/plugins/kanban/tasks/{s['ready_id']}/attachments",
+        query=f"?board={BOARD}",
+    )
+    assert metadata.status_code == 200
+    item = metadata.json()["attachments"][0]
+    assert item["filename"] == "unsafe_.txt"
+    assert item["media_type"] == "application/octet-stream"
+
+    download = _get(
+        s,
+        f"/api/plugins/kanban/attachments/{s['attachment_id']}",
+        query=f"?board={BOARD}",
+    )
+    assert download.status_code == 200
+    assert download.headers["content-type"] == "application/octet-stream"
+    assert download.headers["content-disposition"] == (
+        'attachment; filename="unsafe_.txt"'
+    )
 
 
 @pytest.mark.parametrize(
