@@ -1,8 +1,8 @@
 """Owner-workspace mutation kernel.
 
 The single deep in-process boundary behind the API-server-only
-``owner_workspace`` toolset (``owner_workspace_bootstrap``, ``owner_task_move``,
-``owner_task_comment`` — see ``tools/owner_workspace_tools.py``). All three
+``owner_workspace`` toolset (``owner_workspace_bootstrap``, ``owner_task_graph_commit``,
+``owner_task_move``, ``owner_task_comment`` — see ``tools/owner_workspace_tools.py``). All four
 tools are thin wrappers that resolve trusted identity + validate shape, then
 call into this module.
 
@@ -621,6 +621,563 @@ def bootstrap(
         return result
     finally:
         pconn.close()
+
+
+
+# ---------------------------------------------------------------------------
+# owner_task_graph_commit
+# ---------------------------------------------------------------------------
+
+_MAX_GRAPH_TASKS = 12
+_MAX_LATER_MILESTONES = 12
+
+
+def _bounded_text(value: Any, field: str, *, limit: int, required: bool = True) -> Optional[str]:
+    text = str(value).strip() if value is not None else ""
+    if required and not text:
+        raise OwnerWorkspaceError("invalid_argument", f"{field} is required")
+    if not text:
+        return None
+    if len(text) > limit:
+        raise OwnerWorkspaceError(
+            "invalid_argument", f"{field} must be at most {limit} characters",
+        )
+    return text
+
+
+def _normalize_graph_tasks(tasks: Any) -> list[dict]:
+    """Validate one executable milestone, never a fake whole-project backlog."""
+    if not isinstance(tasks, list) or not tasks:
+        raise OwnerWorkspaceError("invalid_argument", "tasks must be a non-empty list")
+    if len(tasks) > _MAX_GRAPH_TASKS:
+        raise OwnerWorkspaceError(
+            "milestone_too_large",
+            f"tasks may contain at most {_MAX_GRAPH_TASKS} items; split large projects "
+            "into Now / Next / Later and commit only the executable milestone",
+        )
+
+    from agent.redact import redact_sensitive_text
+    from hermes_cli.profiles import normalize_profile_name, profile_exists
+
+    normalized: list[dict] = []
+    for index, raw in enumerate(tasks):
+        if not isinstance(raw, dict):
+            raise OwnerWorkspaceError("invalid_argument", f"tasks[{index}] must be an object")
+        title = _bounded_text(raw.get("title"), f"tasks[{index}].title", limit=240)
+        body = _bounded_text(raw.get("body"), f"tasks[{index}].body", limit=12_000)
+        assignee_raw = _bounded_text(
+            raw.get("assignee"), f"tasks[{index}].assignee", limit=64,
+        )
+        try:
+            assignee = normalize_profile_name(assignee_raw)
+        except ValueError as exc:
+            raise OwnerWorkspaceError("invalid_assignee", str(exc)) from exc
+        if not profile_exists(assignee):
+            raise OwnerWorkspaceError(
+                "invalid_assignee",
+                f"tasks[{index}].assignee names an unavailable profile: {assignee!r}",
+            )
+
+        parents = raw.get("parents", [])
+        if not isinstance(parents, list):
+            raise OwnerWorkspaceError(
+                "invalid_argument", f"tasks[{index}].parents must be a list",
+            )
+        clean_parents: list[int] = []
+        for parent in parents:
+            if isinstance(parent, bool) or not isinstance(parent, int):
+                raise OwnerWorkspaceError(
+                    "invalid_argument",
+                    f"tasks[{index}].parents must contain only task indices",
+                )
+            if parent < 0 or parent >= len(tasks) or parent == index:
+                raise OwnerWorkspaceError(
+                    "invalid_argument",
+                    f"tasks[{index}].parents contains invalid index {parent}",
+                )
+            if parent not in clean_parents:
+                clean_parents.append(parent)
+
+        normalized.append({
+            "title": redact_sensitive_text(title, force=True),
+            "body": redact_sensitive_text(body, force=True),
+            "assignee": assignee,
+            "parents": clean_parents,
+        })
+
+    # Reject the whole request before approval or persistence when sibling
+    # dependencies cycle. decompose_triage_task repeats this at the DB boundary.
+    indegree = [0] * len(normalized)
+    edges: list[list[int]] = [[] for _ in normalized]
+    for child_index, task in enumerate(normalized):
+        for parent_index in task["parents"]:
+            edges[parent_index].append(child_index)
+            indegree[child_index] += 1
+    queue = [index for index, degree in enumerate(indegree) if degree == 0]
+    seen = 0
+    while queue:
+        node = queue.pop()
+        seen += 1
+        for child in edges[node]:
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                queue.append(child)
+    if seen != len(normalized):
+        raise OwnerWorkspaceError("invalid_graph", "tasks contain a cyclic dependency")
+
+    return normalized
+
+
+def _normalize_later_milestones(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise OwnerWorkspaceError(
+            "invalid_argument", "later_milestones must be a list",
+        )
+    if len(value) > _MAX_LATER_MILESTONES:
+        raise OwnerWorkspaceError(
+            "invalid_argument",
+            f"later_milestones may contain at most {_MAX_LATER_MILESTONES} items",
+        )
+    from agent.redact import redact_sensitive_text
+
+    return [
+        redact_sensitive_text(
+            _bounded_text(item, f"later_milestones[{index}]", limit=500),
+            force=True,
+        )
+        for index, item in enumerate(value)
+    ]
+
+
+def _normalize_graph_assignee(value: Any, field: str) -> str:
+    from hermes_cli.profiles import normalize_profile_name, profile_exists
+
+    raw = _bounded_text(value, field, limit=64)
+    try:
+        name = normalize_profile_name(raw)
+    except ValueError as exc:
+        raise OwnerWorkspaceError("invalid_assignee", str(exc)) from exc
+    if not profile_exists(name):
+        raise OwnerWorkspaceError(
+            "invalid_assignee", f"{field} names an unavailable profile: {name!r}",
+        )
+    return name
+
+
+def _render_graph_root_body(
+    *, specification: str, current_milestone: str,
+    owner_visible_result: str, later_milestones: list[str],
+) -> str:
+    parts = [
+        "Specification",
+        specification,
+        "",
+        "Current milestone",
+        current_milestone,
+        "",
+        "Owner-visible result",
+        owner_visible_result,
+    ]
+    if later_milestones:
+        parts.extend(["", "Later roadmap"])
+        parts.extend(f"- {item}" for item in later_milestones)
+    return "\n".join(parts)
+
+
+def _ensure_graph_project_board(
+    pconn: sqlite3.Connection,
+    ctx: OwnerContext,
+    idempotency_key: str,
+    token: str,
+    *,
+    project_id: str,
+    create: bool,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+):
+    """Resolve/create one Project and bind its exact owner-stamped native board."""
+    with write_txn(pconn):
+        _assert_owns_lease(pconn, ctx, idempotency_key, token)
+        project = projects_db.get_project(pconn, project_id)
+        if project is None:
+            if not create:
+                raise OwnerWorkspaceError(
+                    "project_not_found", f"no such project {project_id!r}",
+                )
+            created_id = projects_db.create_project(
+                pconn, id=project_id, name=name, description=description,
+            )
+            if created_id != project_id:
+                raise OwnerWorkspaceError(
+                    "internal_error", "create_project did not honor the requested id",
+                )
+            project = projects_db.get_project(pconn, project_id)
+        elif create and (
+            project.name != name or (project.description or None) != (description or None)
+        ):
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                f"project {project_id!r} exists with different canonical fields",
+            )
+        if project is None or project.archived:
+            raise OwnerWorkspaceError(
+                "project_not_found", f"project {project_id!r} is unavailable",
+            )
+
+    board_slug = project.board_slug or project.slug
+    _assert_board_ownership(board_slug, project_id)
+    with _global_board_guard(board_slug):
+        _assert_board_ownership(board_slug, project_id)
+        with write_txn(pconn):
+            _assert_owns_lease(pconn, ctx, idempotency_key, token)
+            published = kanban_db.create_board(
+                board_slug,
+                name=project.name,
+                description=project.description,
+                project_id=project_id,
+            )
+            if published.get("project_id") != project_id:
+                raise OwnerWorkspaceError(
+                    "crash_recovery_failed",
+                    f"board {board_slug!r} did not retain exact project ownership",
+                )
+            if project.board_slug != board_slug:
+                projects_db.update_project(pconn, project_id, board_slug=board_slug)
+
+    project = projects_db.get_project(pconn, project_id)
+    return project, board_slug
+
+
+def _committed_graph_children(
+    kconn: sqlite3.Connection,
+    *,
+    root_task_id: str,
+    digest: str,
+    idempotency_key: str,
+    ctx: OwnerContext,
+) -> Optional[list[str]]:
+    """Recognize only this receipt's already-committed atomic decomposition."""
+    for event in kanban_db.list_events(kconn, root_task_id):
+        payload = event.payload or {}
+        if (
+            event.kind == "decomposed"
+            and payload.get("owner_task_graph_digest") == digest
+            and payload.get("idempotency_key") == idempotency_key
+            and payload.get("actor") == ctx.actor
+            and payload.get("profile") == ctx.profile
+        ):
+            child_ids = payload.get("child_ids")
+            if not isinstance(child_ids, list) or not all(
+                isinstance(child_id, str) and child_id for child_id in child_ids
+            ):
+                raise OwnerWorkspaceError(
+                    "crash_recovery_failed",
+                    "the committed task-graph event contains invalid child identities",
+                )
+            return child_ids
+    return None
+
+
+def commit_task_graph(
+    ctx: OwnerContext,
+    *,
+    idempotency_key: str,
+    mode: str,
+    request_title: str,
+    specification: str,
+    current_milestone: str,
+    owner_visible_result: str,
+    root_assignee: str,
+    tasks: Any,
+    later_milestones: Any = None,
+    project_name: Optional[str] = None,
+    project_description: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> dict:
+    """Commit one approved Conversation proposal to native Project + Task state.
+
+    Large goals are intentionally tranche-based: at most twelve executable
+    child Tasks are persisted now; future milestones remain visible in the root
+    specification and are reconsidered from facts inside the Project chat.
+    """
+    from agent.redact import redact_sensitive_text
+
+    idempotency_key = _bounded_text(
+        idempotency_key, "idempotency_key", limit=200,
+    )
+    mode = str(mode or "").strip().lower()
+    if mode not in {"new", "existing"}:
+        raise OwnerWorkspaceError("invalid_argument", "mode must be 'new' or 'existing'")
+
+    request_title = redact_sensitive_text(
+        _bounded_text(request_title, "request_title", limit=240), force=True,
+    )
+    specification = redact_sensitive_text(
+        _bounded_text(specification, "specification", limit=20_000), force=True,
+    )
+    current_milestone = redact_sensitive_text(
+        _bounded_text(current_milestone, "current_milestone", limit=1_000), force=True,
+    )
+    owner_visible_result = redact_sensitive_text(
+        _bounded_text(owner_visible_result, "owner_visible_result", limit=1_000),
+        force=True,
+    )
+    root_assignee = _normalize_graph_assignee(root_assignee, "root_assignee")
+    normalized_tasks = _normalize_graph_tasks(tasks)
+    normalized_later = _normalize_later_milestones(later_milestones)
+
+    if mode == "new":
+        if project_id is not None and str(project_id).strip():
+            raise OwnerWorkspaceError(
+                "invalid_argument", "project_id is not accepted when mode is 'new'",
+            )
+        project_name = redact_sensitive_text(
+            _bounded_text(project_name, "project_name", limit=160), force=True,
+        )
+        project_description = _bounded_text(
+            project_description, "project_description", limit=2_000, required=False,
+        )
+        if project_description:
+            project_description = redact_sensitive_text(project_description, force=True)
+        canonical_project_id = "p_" + _derive_id(ctx, idempotency_key, "graph-project")
+    else:
+        if project_name is not None and str(project_name).strip():
+            raise OwnerWorkspaceError(
+                "invalid_argument",
+                "project_name is not accepted when mode is 'existing'",
+            )
+        canonical_project_id = _bounded_text(project_id, "project_id", limit=100)
+        project_name = None
+        project_description = None
+
+    payload = {
+        "mode": mode,
+        "project_id": canonical_project_id if mode == "existing" else None,
+        "project_name": project_name,
+        "project_description": project_description,
+        "request_title": request_title,
+        "specification": specification,
+        "current_milestone": current_milestone,
+        "owner_visible_result": owner_visible_result,
+        "root_assignee": root_assignee,
+        "tasks": normalized_tasks,
+        "later_milestones": normalized_later,
+    }
+    digest = _digest(payload)
+    operation = "owner_task_graph_commit"
+
+    pconn = projects_db.connect()
+    try:
+        _ensure_schema(pconn)
+        state, row, token = _acquire_or_replay(
+            pconn, ctx, idempotency_key, operation, digest,
+        )
+        if state == "terminal":
+            return json.loads(row["result_json"])
+
+        approval = _confirm(
+            ctx,
+            operation=operation,
+            digest=digest,
+            description=(
+                f"Create project {project_name!r} with {len(normalized_tasks)} tasks"
+                if mode == "new"
+                else f"Add {len(normalized_tasks)} tasks to project {canonical_project_id!r}"
+            ),
+        )
+        if not approval.get("approved"):
+            result = {
+                "ok": False,
+                "error": "confirmation_denied",
+                "reason": approval.get("reason"),
+            }
+            _finalize_receipt(
+                pconn, ctx, idempotency_key, token, status="denied", result=result,
+            )
+            return result
+
+        project, board_slug = _ensure_graph_project_board(
+            pconn,
+            ctx,
+            idempotency_key,
+            token,
+            project_id=canonical_project_id,
+            create=(mode == "new"),
+            name=project_name,
+            description=project_description,
+        )
+        _update_progress(
+            pconn,
+            ctx,
+            idempotency_key,
+            token,
+            project_id=canonical_project_id,
+            board_slug=board_slug,
+        )
+
+        root_body = _render_graph_root_body(
+            specification=specification,
+            current_milestone=current_milestone,
+            owner_visible_result=owner_visible_result,
+            later_milestones=normalized_later,
+        )
+        root_key = "owgraph_" + _derive_id(ctx, idempotency_key, "graph-root")
+        kconn = kanban_db.connect(board=board_slug)
+        try:
+            with write_txn(pconn):
+                _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                root_task_id = kanban_db.create_task(
+                    kconn,
+                    title=request_title,
+                    body=root_body,
+                    created_by=ctx.actor,
+                    triage=True,
+                    board=board_slug,
+                    project_id=canonical_project_id,
+                    idempotency_key=root_key,
+                )
+                root = kanban_db.get_task(kconn, root_task_id)
+                if (
+                    root is None
+                    or root.project_id != canonical_project_id
+                    or root.idempotency_key != root_key
+                    or root.title != request_title
+                    or root.body != root_body
+                ):
+                    raise OwnerWorkspaceError(
+                        "crash_recovery_failed",
+                        "the task-graph root does not match the approved proposal",
+                    )
+
+            with write_txn(pconn):
+                _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                child_ids = _committed_graph_children(
+                    kconn,
+                    root_task_id=root_task_id,
+                    digest=digest,
+                    idempotency_key=idempotency_key,
+                    ctx=ctx,
+                )
+                if child_ids is None:
+                    child_ids = kanban_db.decompose_triage_task(
+                        kconn,
+                        root_task_id,
+                        root_assignee=root_assignee,
+                        children=normalized_tasks,
+                        author=ctx.actor,
+                        auto_promote=True,
+                        event_metadata={
+                            "owner_task_graph_digest": digest,
+                            "idempotency_key": idempotency_key,
+                            "actor": ctx.actor,
+                            "profile": ctx.profile,
+                        },
+                    )
+                if child_ids is None or len(child_ids) != len(normalized_tasks):
+                    raise OwnerWorkspaceError(
+                        "crash_recovery_failed",
+                        "the approved task graph could not be committed or recovered",
+                    )
+                for child_id in child_ids:
+                    child = kanban_db.get_task(kconn, child_id)
+                    if child is None or child.project_id != canonical_project_id:
+                        raise OwnerWorkspaceError(
+                            "crash_recovery_failed",
+                            f"child task {child_id!r} lost exact project ownership",
+                        )
+
+            root = kanban_db.get_task(kconn, root_task_id)
+            task_rows = [kanban_db.get_task(kconn, child_id) for child_id in child_ids]
+            result = {
+                "ok": True,
+                "mode": mode,
+                "project_id": canonical_project_id,
+                "project_slug": project.slug,
+                "board": board_slug,
+                "root_task_id": root_task_id,
+                "root_status": root.status,
+                "task_ids": child_ids,
+                "task_statuses": [task.status for task in task_rows],
+                "task_count": len(child_ids),
+            }
+        finally:
+            kconn.close()
+
+        _update_progress(
+            pconn, ctx, idempotency_key, token, task_id=root_task_id,
+        )
+        _finalize_receipt(
+            pconn, ctx, idempotency_key, token, status="committed", result=result,
+        )
+        return result
+    finally:
+        pconn.close()
+
+
+def list_committed_projects(ctx: OwnerContext) -> list[dict]:
+    """Read-only projection of projects proven by committed owner receipts."""
+    path = projects_db.projects_db_path()
+    if not path.is_file():
+        return []
+
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return []
+
+    try:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('projects', 'owner_workspace_receipts')"
+            )
+        }
+        if tables != {"projects", "owner_workspace_receipts"}:
+            return []
+        receipts = conn.execute(
+            "SELECT result_json FROM owner_workspace_receipts "
+            "WHERE actor = ? AND profile = ? AND status = 'committed' "
+            "AND operation IN ('owner_workspace_bootstrap', 'owner_task_graph_commit') "
+            "ORDER BY updated_at ASC",
+            (ctx.actor, ctx.profile),
+        ).fetchall()
+
+        project_ids: list[str] = []
+        for receipt in receipts:
+            try:
+                project_id = str(json.loads(receipt["result_json"]).get("project_id") or "")
+            except Exception:
+                continue
+            if project_id and project_id not in project_ids:
+                project_ids.append(project_id)
+
+        projects: list[dict] = []
+        for project_id in project_ids:
+            row = conn.execute(
+                "SELECT id, slug, name, description, board_slug "
+                "FROM projects WHERE id = ? AND archived = 0",
+                (project_id,),
+            ).fetchone()
+            if row is None or not row["board_slug"]:
+                continue
+            try:
+                _assert_board_ownership(row["board_slug"], project_id)
+            except OwnerWorkspaceError:
+                continue
+            projects.append({
+                "project_id": row["id"],
+                "slug": row["slug"],
+                "name": row["name"],
+                "description": row["description"],
+                "board": row["board_slug"],
+            })
+        return projects
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

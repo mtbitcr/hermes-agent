@@ -172,6 +172,186 @@ def test_bootstrap_denial_is_zero_change_and_replays_the_same_denial(ctx):
     assert replay == result
 
 
+
+def _task_graph_args(**overrides):
+    args = {
+        "idempotency_key": "graph-1",
+        "mode": "new",
+        "project_name": "Launch Shop",
+        "project_description": "A plain-English owner project.",
+        "project_id": None,
+        "request_title": "Launch the first useful version",
+        "specification": "Build and verify the smallest owner-visible release.",
+        "current_milestone": "Now: produce one working release.",
+        "owner_visible_result": "The owner can open and verify the release.",
+        "root_assignee": "default",
+        "tasks": [
+            {
+                "title": "Prepare the release",
+                "body": "Create the smallest complete release.",
+                "assignee": "default",
+                "parents": [],
+            },
+            {
+                "title": "Verify the release",
+                "body": "Check the owner-visible result.",
+                "assignee": "default",
+                "parents": [0],
+            },
+        ],
+        "later_milestones": [
+            "Next: learn from the first release.",
+            "Later: expand only after evidence.",
+        ],
+    }
+    args.update(overrides)
+    return args
+
+
+def test_task_graph_commit_creates_native_project_and_atomic_graph(ctx):
+    args = _task_graph_args()
+    approver = _with_approver(ctx.session)
+    result = ow.commit_task_graph(ctx, **args)
+    approver.join()
+
+    assert result["ok"] is True
+    assert result["mode"] == "new"
+    assert result["task_count"] == 2
+    assert result["task_statuses"] == ["ready", "todo"]
+
+    with projects_db.connect_closing() as pconn:
+        project = projects_db.get_project(pconn, result["project_id"])
+        assert project is not None
+        assert project.slug == result["project_slug"]
+        assert project.board_slug == result["board"]
+
+    with kanban_db.connect(board=result["board"]) as kconn:
+        root = kanban_db.get_task(kconn, result["root_task_id"])
+        first = kanban_db.get_task(kconn, result["task_ids"][0])
+        second = kanban_db.get_task(kconn, result["task_ids"][1])
+        second_parents = {
+            row["parent_id"]
+            for row in kconn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (second.id,),
+            )
+        }
+
+    assert root.project_id == result["project_id"]
+    assert root.status == "todo"
+    assert root.assignee == "default"
+    assert "Later roadmap" in root.body
+    assert first.project_id == result["project_id"]
+    assert second.project_id == result["project_id"]
+    assert first.id in second_parents
+
+
+def test_task_graph_commit_existing_project_reuses_exact_native_board(ctx):
+    setup = _bootstrap_board(ctx)
+    args = _task_graph_args(
+        idempotency_key="graph-existing",
+        mode="existing",
+        project_id=setup["project_id"],
+        project_name=None,
+        project_description=None,
+        later_milestones=[],
+    )
+
+    approver = _with_approver(ctx.session)
+    result = ow.commit_task_graph(ctx, **args)
+    approver.join()
+
+    assert result["ok"] is True
+    assert result["mode"] == "existing"
+    assert result["project_id"] == setup["project_id"]
+    assert result["board"] == setup["board"]
+
+
+def test_task_graph_exact_replay_creates_no_duplicate_tasks(ctx):
+    args = _task_graph_args(idempotency_key="graph-replay")
+    approver = _with_approver(ctx.session)
+    first = ow.commit_task_graph(ctx, **args)
+    approver.join()
+
+    with kanban_db.connect(board=first["board"]) as kconn:
+        before = kconn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?",
+            (first["project_id"],),
+        ).fetchone()["n"]
+
+    approval.unregister_gateway_notify(ctx.session)
+    second = ow.commit_task_graph(ctx, **args)
+
+    with kanban_db.connect(board=first["board"]) as kconn:
+        after = kconn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?",
+            (first["project_id"],),
+        ).fetchone()["n"]
+
+    assert second == first
+    assert before == after == 3
+
+
+def test_task_graph_rejects_fake_whole_project_before_persistence(ctx):
+    args = _task_graph_args(
+        idempotency_key="graph-too-large",
+        tasks=[
+            {
+                "title": f"Task {index}",
+                "body": "Too much speculative work.",
+                "assignee": "default",
+                "parents": [],
+            }
+            for index in range(13)
+        ],
+    )
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.commit_task_graph(ctx, **args)
+
+    assert excinfo.value.code == "milestone_too_large"
+    with projects_db.connect_closing() as pconn:
+        assert all(
+            project.name != "Launch Shop"
+            for project in projects_db.list_projects(pconn, include_archived=True)
+        )
+
+
+def test_task_graph_rejects_cycle_before_persistence(ctx):
+    args = _task_graph_args(
+        idempotency_key="graph-cycle",
+        tasks=[
+            {"title": "A", "body": "A", "assignee": "default", "parents": [1]},
+            {"title": "B", "body": "B", "assignee": "default", "parents": [0]},
+        ],
+    )
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.commit_task_graph(ctx, **args)
+
+    assert excinfo.value.code == "invalid_graph"
+
+
+def test_committed_project_projection_is_receipt_backed_and_read_only(ctx):
+    args = _task_graph_args(idempotency_key="graph-list", project_name="Listed Project")
+    approver = _with_approver(ctx.session)
+    result = ow.commit_task_graph(ctx, **args)
+    approver.join()
+
+    before = projects_db.projects_db_path().stat().st_mtime_ns
+    listed = ow.list_committed_projects(ctx)
+    after = projects_db.projects_db_path().stat().st_mtime_ns
+
+    assert before == after
+    assert listed == [{
+        "project_id": result["project_id"],
+        "slug": result["project_slug"],
+        "name": "Listed Project",
+        "description": "A plain-English owner project.",
+        "board": result["board"],
+    }]
+
+
 def _bootstrap_board(ctx):
     t = _with_approver(ctx.session)
     result = ow.bootstrap(ctx, idempotency_key=f"setup-{ctx.session}-{time.monotonic()}", name="Board Setup")

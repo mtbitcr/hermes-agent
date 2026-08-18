@@ -1,4 +1,4 @@
-"""Owner-workspace toolset — three thin model tools over the deep kernel in
+"""Owner-workspace toolset — four thin model tools over the deep kernel in
 ``hermes_cli.owner_workspace``.
 
 Default-off, API-server-only surface (see ``toolsets.py``'s ``owner_workspace``
@@ -42,6 +42,35 @@ def _handle_bootstrap(args: dict, **kw) -> str:
     except Exception:
         logger.exception("owner_workspace_bootstrap failed")
         return tool_error("owner_workspace_bootstrap: internal error")
+
+
+
+def _handle_task_graph(args: dict, **kw) -> str:
+    try:
+        ctx = resolve_owner_context()
+        result = _kernel.commit_task_graph(
+            ctx,
+            idempotency_key=args.get("idempotency_key"),
+            mode=args.get("mode"),
+            project_name=args.get("project_name"),
+            project_description=args.get("project_description"),
+            project_id=args.get("project_id"),
+            request_title=args.get("request_title"),
+            specification=args.get("specification"),
+            current_milestone=args.get("current_milestone"),
+            owner_visible_result=args.get("owner_visible_result"),
+            root_assignee=args.get("root_assignee"),
+            tasks=args.get("tasks"),
+            later_milestones=args.get("later_milestones"),
+        )
+        return _ok(result)
+    except OwnerWorkspaceError as e:
+        return tool_error(f"owner_task_graph_commit: {e.message}")
+    except ValueError as e:
+        return tool_error(f"owner_task_graph_commit: {e}")
+    except Exception:
+        logger.exception("owner_task_graph_commit failed")
+        return tool_error("owner_task_graph_commit: internal error")
 
 
 def _handle_task_move(args: dict, **kw) -> str:
@@ -121,6 +150,111 @@ registry.register(
     },
     handler=lambda args, **kw: _handle_bootstrap(args, **kw),
 )
+
+
+registry.register(
+    name="owner_task_graph_commit",
+    toolset="owner_workspace",
+    schema={
+        "name": "owner_task_graph_commit",
+        "description": (
+            "Commit one owner-approved Conversation proposal to the native "
+            "Project and Kanban Task graph. For large projects, create only the "
+            "current executable milestone (maximum 12 tasks) and keep future "
+            "milestones as roadmap context. The board, author, actor, profile, "
+            "session and filesystem scope are derived by the trusted kernel. "
+            "Idempotent and guarded by one exact human confirmation."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Stable proposal key so retries cannot duplicate work.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["new", "existing"],
+                    "description": "Create a new Project or add work to an existing Project.",
+                },
+                "project_name": {
+                    "type": "string",
+                    "description": "Required only for mode=new.",
+                },
+                "project_description": {
+                    "type": "string",
+                    "description": "Optional plain-English Project description for mode=new.",
+                },
+                "project_id": {
+                    "type": "string",
+                    "description": "Required only for mode=existing; its board is derived server-side.",
+                },
+                "request_title": {
+                    "type": "string",
+                    "description": "Plain-English umbrella outcome for the approved request.",
+                },
+                "specification": {
+                    "type": "string",
+                    "description": "Complete approved specification, without credentials or secrets.",
+                },
+                "current_milestone": {
+                    "type": "string",
+                    "description": "The bounded Now milestone being committed.",
+                },
+                "owner_visible_result": {
+                    "type": "string",
+                    "description": "What the owner can inspect when this milestone is complete.",
+                },
+                "root_assignee": {
+                    "type": "string",
+                    "description": "Existing coordinator profile that reviews the completed milestone.",
+                },
+                "tasks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 12,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "title": {"type": "string"},
+                            "body": {"type": "string"},
+                            "assignee": {
+                                "type": "string",
+                                "description": "Existing Hermes profile; validated by the kernel.",
+                            },
+                            "parents": {
+                                "type": "array",
+                                "items": {"type": "integer", "minimum": 0},
+                                "description": "Indices of prerequisite tasks in this same array.",
+                            },
+                        },
+                        "required": ["title", "body", "assignee", "parents"],
+                    },
+                },
+                "later_milestones": {
+                    "type": "array",
+                    "maxItems": 12,
+                    "items": {"type": "string"},
+                    "description": "Visible Next/Later roadmap only; not executable Tasks yet.",
+                },
+            },
+            "required": [
+                "idempotency_key",
+                "mode",
+                "request_title",
+                "specification",
+                "current_milestone",
+                "owner_visible_result",
+                "root_assignee",
+                "tasks",
+            ],
+        },
+    },
+    handler=lambda args, **kw: _handle_task_graph(args, **kw),
+)
+
 
 registry.register(
     name="owner_task_move",

@@ -11,7 +11,7 @@ Scope is deliberately narrow to the WRAPPER layer — the deep kernel
   - Schemas expose only the documented, narrow parameter surface — no
     author/profile/actor/session/path/scope field, and no broad execution
     capability.
-  - The registered tool surface is exactly the three documented tools.
+  - The registered tool surface is exactly the four documented tools.
 """
 from __future__ import annotations
 
@@ -24,7 +24,10 @@ from hermes_cli.owner_workspace import OwnerContext, OwnerWorkspaceError
 from tools.registry import registry
 from toolsets import TOOLSETS, get_kernel_gated_toolsets, resolve_toolset
 
-TOOL_NAMES = ("owner_workspace_bootstrap", "owner_task_move", "owner_task_comment")
+TOOL_NAMES = (
+    "owner_workspace_bootstrap", "owner_task_graph_commit",
+    "owner_task_move", "owner_task_comment",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +36,7 @@ TOOL_NAMES = ("owner_workspace_bootstrap", "owner_task_move", "owner_task_commen
 
 
 class TestToolSurface:
-    def test_exactly_three_tools_registered_under_owner_workspace(self):
+    def test_exactly_four_tools_registered_under_owner_workspace(self):
         assert registry.get_tool_names_for_toolset("owner_workspace") == sorted(TOOL_NAMES)
 
     def test_toolset_definition_lists_exactly_these_tools(self):
@@ -71,7 +74,9 @@ _FORBIDDEN_PARAM_NAMES = {
 _ALLOWED_PARAM_NAMES = {
     "idempotency_key", "name", "description",
     "task_id", "to_status", "expected_status", "expected_revision", "board",
-    "body",
+    "body", "mode", "project_name", "project_description", "project_id",
+    "request_title", "specification", "current_milestone",
+    "owner_visible_result", "root_assignee", "tasks", "later_milestones",
 }
 
 
@@ -94,6 +99,22 @@ class TestSchemas:
         assert required == {"idempotency_key", "name"}
         assert set(entry.schema["parameters"]["properties"]) == {
             "idempotency_key", "name", "description",
+        }
+
+    def test_task_graph_schema_is_closed_and_bounded(self):
+        entry = registry.get_entry("owner_task_graph_commit")
+        parameters = entry.schema["parameters"]
+        assert parameters["additionalProperties"] is False
+        assert set(parameters["required"]) == {
+            "idempotency_key", "mode", "request_title", "specification",
+            "current_milestone", "owner_visible_result", "root_assignee", "tasks",
+        }
+        tasks = parameters["properties"]["tasks"]
+        assert tasks["minItems"] == 1
+        assert tasks["maxItems"] == 12
+        assert tasks["items"]["additionalProperties"] is False
+        assert set(tasks["items"]["required"]) == {
+            "title", "body", "assignee", "parents",
         }
 
     def test_task_move_requires_full_cas_precondition(self):
@@ -156,6 +177,32 @@ class TestTrustedContextResolution:
         ctx, kwargs = kernel.calls[0]
         assert ctx is trusted_ctx
         assert ctx.actor == "trusted-actor"
+        assert "actor" not in kwargs
+        assert "profile" not in kwargs
+        assert "session" not in kwargs
+
+    def test_task_graph_uses_resolved_context_not_args(self, monkeypatch, trusted_ctx):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+        kernel = _RecordingKernel()
+        monkeypatch.setattr(owt._kernel, "commit_task_graph", kernel)
+
+        owt._handle_task_graph({
+            "idempotency_key": "g1",
+            "mode": "existing",
+            "project_id": "p1",
+            "request_title": "Improve checkout",
+            "specification": "Make checkout simpler.",
+            "current_milestone": "Ship the first improvement.",
+            "owner_visible_result": "The owner can verify checkout.",
+            "root_assignee": "coordinator",
+            "tasks": [],
+            "actor": "attacker",
+            "profile": "attacker-profile",
+            "session": "attacker-session",
+        })
+
+        ctx, kwargs = kernel.calls[0]
+        assert ctx is trusted_ctx
         assert "actor" not in kwargs
         assert "profile" not in kwargs
         assert "session" not in kwargs
@@ -235,6 +282,36 @@ class TestFieldDelegation:
 
         _, kwargs = kernel.calls[0]
         assert kwargs["description"] is None
+
+    def test_task_graph_passes_through_exact_fields(self, monkeypatch, trusted_ctx):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+        kernel = _RecordingKernel()
+        monkeypatch.setattr(owt._kernel, "commit_task_graph", kernel)
+        args = {
+            "idempotency_key": "g1",
+            "mode": "new",
+            "project_name": "Shoe shop",
+            "project_description": "Owner project",
+            "project_id": None,
+            "request_title": "Launch the shop",
+            "specification": "Build the first useful version.",
+            "current_milestone": "Launch",
+            "owner_visible_result": "A working shop",
+            "root_assignee": "coordinator",
+            "tasks": [{
+                "title": "Build",
+                "body": "Build it.",
+                "assignee": "coder",
+                "parents": [],
+            }],
+            "later_milestones": ["Learn from customers"],
+        }
+
+        owt._handle_task_graph(args)
+
+        ctx, kwargs = kernel.calls[0]
+        assert ctx is trusted_ctx
+        assert kwargs == args
 
     def test_task_move_passes_through_exact_fields(self, monkeypatch, trusted_ctx):
         monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)

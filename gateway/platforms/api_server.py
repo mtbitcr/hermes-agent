@@ -14,6 +14,7 @@ Exposes an HTTP server with endpoints:
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
+- GET  /v1/owner-workspace/projects — list receipt-backed owner Projects
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
@@ -2295,6 +2296,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            ("GET", "/v1/owner-workspace/projects", self._handle_owner_workspace_projects),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -6747,6 +6749,8 @@ class APIServerAdapter(BasePlatformAdapter):
         })
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
+        if status != "waiting_for_approval":
+            current.pop("pending_approval", None)
         self._run_statuses[run_id] = current
         return current
 
@@ -6842,6 +6846,48 @@ class APIServerAdapter(BasePlatformAdapter):
             # so clients can observe delegate_task timeouts and failures.
 
         return _callback
+
+
+    async def _handle_owner_workspace_projects(
+        self, request: "web.Request",
+    ) -> "web.Response":
+        """GET receipt-backed owner Projects without opening a mutation path."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from gateway.run import _load_gateway_config
+
+            if not _owner_workspace_toolset_enabled(_load_gateway_config()):
+                return web.json_response(
+                    _openai_error(
+                        "Owner workspace is not enabled for this profile",
+                        code="owner_workspace_not_enabled",
+                    ),
+                    status=404,
+                )
+            from hermes_cli.owner_workspace import (
+                list_committed_projects,
+                resolve_owner_context,
+            )
+
+            projects = list_committed_projects(resolve_owner_context())
+        except Exception:
+            logger.exception("[api_server] owner-workspace Project projection failed")
+            return web.json_response(
+                _openai_error(
+                    "Owner workspace Project projection is unavailable",
+                    code="owner_workspace_unavailable",
+                ),
+                status=500,
+            )
+
+        return web.json_response({
+            "object": "hermes.owner_workspace.project_list",
+            "data": projects,
+        })
+
 
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
@@ -7020,20 +7066,30 @@ class APIServerAdapter(BasePlatformAdapter):
                         from gateway.run import _redact_approval_command
 
                         event["command"] = _redact_approval_command(event.get("command"))
+                    choices = _approval_event_choices(
+                        smart_denied=bool(event.get("smart_denied"))
+                        or bool(event.get("exact_operation")),
+                        allow_permanent=event.get("allow_permanent") is not False,
+                    )
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied"))
-                            or bool(event.get("exact_operation")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
+                        "choices": choices,
                     })
+                    pending_approval = {
+                        "approval_id": str(event.get("approval_id") or ""),
+                        "description": redact_sensitive_text(
+                            str(event.get("description") or "Approve this operation"),
+                            force=True,
+                        ),
+                        "choices": choices,
+                    }
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
                         last_event="approval.request",
+                        pending_approval=pending_approval,
                     )
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, event)

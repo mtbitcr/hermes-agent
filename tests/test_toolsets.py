@@ -227,7 +227,10 @@ class TestToolsetConsistency:
         hermes_cli.tools_config._get_platform_tools)."""
         from toolsets import _HERMES_CORE_TOOLS, get_kernel_gated_toolsets
 
-        owner_tools = {"owner_workspace_bootstrap", "owner_task_move", "owner_task_comment"}
+        owner_tools = {
+            "owner_workspace_bootstrap", "owner_task_graph_commit",
+            "owner_task_move", "owner_task_comment",
+        }
         assert not owner_tools & set(_HERMES_CORE_TOOLS)
         for name, ts in TOOLSETS.items():
             if name == "owner_workspace":

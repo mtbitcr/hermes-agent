@@ -310,11 +310,15 @@ TOOLSETS = {
     "owner_workspace": {
         "description": (
             "Owner-workspace mutation tools (bootstrap a Project + Kanban "
-            "board + initial task; move a task via compare-and-swap; comment "
+            "board + initial task; commit an approved Task graph; move a task "
+            "via compare-and-swap; comment "
             "as the trusted caller). Opt-in, API-server-only — every "
             "mutation is idempotent and requires a fresh human confirmation."
         ),
-        "tools": ["owner_workspace_bootstrap", "owner_task_move", "owner_task_comment"],
+        "tools": [
+            "owner_workspace_bootstrap", "owner_task_graph_commit",
+            "owner_task_move", "owner_task_comment",
+        ],
         "includes": [],
         # See _get_platform_tools()'s explicit_passthrough filtering — a
         # kernel_gated toolset can NEVER be reached via generic

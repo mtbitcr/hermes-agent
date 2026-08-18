@@ -271,6 +271,7 @@ class TestOwnerWorkspaceAdmissionBoundary:
         enabled = _get_platform_tools(config, platform)
         assert "owner_workspace" not in enabled
         assert "owner_workspace_bootstrap" not in enabled
+        assert "owner_task_graph_commit" not in enabled
         assert "owner_task_move" not in enabled
         assert "owner_task_comment" not in enabled
 

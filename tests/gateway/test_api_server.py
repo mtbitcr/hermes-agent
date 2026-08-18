@@ -312,6 +312,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_get("/v1/owner-workspace/projects", adapter._handle_owner_workspace_projects)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
@@ -876,6 +877,59 @@ class TestCapabilitiesEndpoint:
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
+
+
+# ---------------------------------------------------------------------------
+# /v1/owner-workspace/projects endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestOwnerWorkspaceProjectsEndpoint:
+    @pytest.mark.asyncio
+    async def test_disabled_surface_is_not_discoverable(self, adapter):
+        app = _create_app(adapter)
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/owner-workspace/projects")
+                data = await resp.json()
+
+        assert resp.status == 404
+        assert data["error"]["code"] == "owner_workspace_not_enabled"
+
+    @pytest.mark.asyncio
+    async def test_enabled_surface_returns_only_kernel_projection(self, adapter):
+        expected = [{
+            "project_id": "p_1",
+            "slug": "shoe-shop",
+            "name": "Shoe shop",
+            "description": "Owner project",
+            "board": "shoe-shop",
+        }]
+        app = _create_app(adapter)
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch("hermes_cli.owner_workspace.resolve_owner_context", return_value=object()),
+            patch("hermes_cli.owner_workspace.list_committed_projects", return_value=expected) as listed,
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/owner-workspace/projects")
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {
+            "object": "hermes.owner_workspace.project_list",
+            "data": expected,
+        }
+        listed.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_surface_requires_bearer_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/owner-workspace/projects")
+
+        assert resp.status == 401
 
 
 # ---------------------------------------------------------------------------
