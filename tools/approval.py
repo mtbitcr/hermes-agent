@@ -2595,7 +2595,8 @@ class _ApprovalEntry:
         self.data = dict(data)
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.approval_id = str(self.data.get("approval_id") or self.data["request_id"])
-        self.data["approval_id"] = self.approval_id
+        if self.data.get("exact_operation"):
+            self.data["approval_id"] = self.approval_id
         self.acknowledged = False
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
         # Optional free-text reason supplied with an explicit deny
