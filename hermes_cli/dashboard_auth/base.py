@@ -46,11 +46,16 @@ class TokenPrincipal:
       * ``scopes`` — capability strings this principal is authorised for.
         Empty tuple means "unscoped" (the provider vouches for the caller but
         attaches no capability list); a route MAY enforce a required scope.
+      * ``credential_id`` — optional non-secret identifier for the exact
+        credential that authenticated the request. Providers with revocable
+        multi-token registries use it for audit without exposing bearer bytes;
+        legacy/static-token providers leave it unset.
     """
 
     principal: str
     provider: str
     scopes: tuple[str, ...] = ()
+    credential_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
