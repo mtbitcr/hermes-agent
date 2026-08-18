@@ -349,6 +349,7 @@ def create_project(
     conn: sqlite3.Connection,
     *,
     name: str,
+    id: Optional[str] = None,
     slug: Optional[str] = None,
     folders: Optional[Iterable[str]] = None,
     primary_path: Optional[str] = None,
@@ -369,13 +370,20 @@ def create_project(
     lanes), so a create whose resolved primary path already belongs to a
     non-archived project raises ``ValueError`` naming the existing project —
     pass ``allow_duplicate_path=True`` to bypass deliberately.
+
+    ``id``, when given, is used verbatim instead of minting a random one. This
+    is reserved for crash-safe callers that derive a deterministic identity
+    before the first write. Callers that want idempotent recovery must verify an
+    existing row with :func:`get_project` before attempting the insert.
     """
     name = str(name or "").strip()
     if not name:
         raise ValueError("project name must not be empty")
 
     slug_candidate = normalize_slug(slug) if slug else _slugify(name)
-    pid = _new_project_id()
+    pid = str(id).strip() if id else _new_project_id()
+    if not pid:
+        raise ValueError("id must not be empty")
     now = _now()
 
     folder_paths: List[str] = []

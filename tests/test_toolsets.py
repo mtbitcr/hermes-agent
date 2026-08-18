@@ -1,5 +1,7 @@
 """Tests for toolsets.py — toolset resolution, validation, and composition."""
 
+import pytest
+
 import toolsets as toolsets_mod
 from tools.registry import ToolRegistry
 from toolsets import (
@@ -217,6 +219,26 @@ class TestToolsetConsistency:
         # Sanity: the shared core must be non-trivial (i.e. we didn't
         # silently let a platform diverge so far that nothing is shared).
         assert len(core) > 20, f"Suspiciously small shared core: {len(core)} tools"
+
+    def test_owner_workspace_is_kernel_gated_and_absent_from_every_composite(self):
+        """owner_workspace must be absent from _HERMES_CORE_TOOLS and every
+        hermes-* / composite toolset, and marked kernel_gated so generic
+        platform_toolsets config can never resolve it (see
+        hermes_cli.tools_config._get_platform_tools)."""
+        from toolsets import _HERMES_CORE_TOOLS, get_kernel_gated_toolsets
+
+        owner_tools = {
+            "owner_workspace_bootstrap", "owner_task_graph_commit",
+            "owner_task_move", "owner_task_comment",
+        }
+        assert not owner_tools & set(_HERMES_CORE_TOOLS)
+        for name, ts in TOOLSETS.items():
+            if name == "owner_workspace":
+                continue
+            assert not owner_tools & set(ts.get("tools") or []), (
+                f"owner_workspace tools leaked into toolset {name!r}"
+            )
+        assert "owner_workspace" in get_kernel_gated_toolsets()
 
 
 class TestPluginToolsets:

@@ -292,6 +292,39 @@ TOOLSETS = {
         "tools": ["clarify"],
         "includes": []
     },
+
+    # Default-off, API-server-only owner-workspace mutation surface. Absent
+    # from _HERMES_CORE_TOOLS and every composite/platform toolset below —
+    # the ONLY place this is folded into an agent's enabled_toolsets is
+    # gateway/platforms/api_server.py's _create_agent(), and only when
+    # gateway.api_server.owner_workspace.enabled is true for the resolved
+    # (possibly multiplexed) profile. Never exposed on CLI/TUI/messaging/
+    # cron/ACP/desktop — enforced structurally by "kernel_gated" below, NOT
+    # by convention: _get_platform_tools() in hermes_cli/tools_config.py
+    # strips any kernel_gated toolset name out of a platform's config-driven
+    # resolution BEFORE the generic "explicit passthrough" step that would
+    # otherwise honor an explicit `platform_toolsets: {<platform>:
+    # [owner_workspace]}` entry for ANY platform, including api_server
+    # itself — the admitted path is exclusively the dedicated
+    # `_owner_workspace_toolset_enabled()` union in api_server.py.
+    "owner_workspace": {
+        "description": (
+            "Owner-workspace mutation tools (bootstrap a Project + Kanban "
+            "board + initial task; commit an approved Task graph; move a task "
+            "via compare-and-swap; comment "
+            "as the trusted caller). Opt-in, API-server-only — every "
+            "mutation is idempotent and requires a fresh human confirmation."
+        ),
+        "tools": [
+            "owner_workspace_bootstrap", "owner_task_graph_commit",
+            "owner_task_move", "owner_task_comment",
+        ],
+        "includes": [],
+        # See _get_platform_tools()'s explicit_passthrough filtering — a
+        # kernel_gated toolset can NEVER be reached via generic
+        # platform_toolsets config naming, on any platform, no exceptions.
+        "kernel_gated": True,
+    },
     
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
@@ -814,7 +847,17 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
     # This ensures future toolsets are automatically included without changes.
     if name in {"all", "*"}:
         all_tools: Set[str] = set()
+        # A kernel_gated toolset is reachable ONLY by naming it directly on its
+        # dedicated code-level admission path (owner_workspace ->
+        # api_server._owner_workspace_toolset_enabled). "Everything" must
+        # therefore mean "every ordinary toolset", or `platform_toolsets:
+        # {cli: [all]}` would hand a CLI/cron/messaging agent the owner
+        # mutation tools that the by-name gate in
+        # hermes_cli.tools_config._get_platform_tools deliberately strips.
+        kernel_gated = get_kernel_gated_toolsets()
         for toolset_name in get_toolset_names():
+            if toolset_name in kernel_gated:
+                continue
             # Use a fresh visited set per branch to avoid cross-branch contamination
             resolved = resolve_toolset(toolset_name, visited.copy(), include_registry=include_registry)
             all_tools.update(resolved)
@@ -952,6 +995,18 @@ def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
         if toolset:
             result[display_name] = toolset
     return result
+
+
+def get_kernel_gated_toolsets() -> Set[str]:
+    """Toolset names marked ``kernel_gated: True`` in ``TOOLSETS``.
+
+    These are reachable ONLY through a dedicated, hard-coded enablement path
+    in the code that owns them (e.g. ``owner_workspace`` via
+    ``gateway/platforms/api_server.py``'s ``_owner_workspace_toolset_enabled``
+    gate) — never via generic ``platform_toolsets`` config naming, on any
+    platform. See ``hermes_cli.tools_config._get_platform_tools``.
+    """
+    return {name for name, ts in TOOLSETS.items() if ts.get("kernel_gated")}
 
 
 def get_toolset_names() -> List[str]:

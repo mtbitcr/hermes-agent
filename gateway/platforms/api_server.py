@@ -14,6 +14,7 @@ Exposes an HTTP server with endpoints:
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
+- GET  /v1/owner-workspace/projects — list receipt-backed owner Projects
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
@@ -75,6 +76,172 @@ def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> lis
     if smart_denied:
         return ["once", "deny"]
     return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+
+
+# ---------------------------------------------------------------------------
+# Per-profile ``gateway.api_server.allowed_routes`` least-privilege gate.
+#
+# Resolved fresh per request (never cached) from the profile-scoped
+# config.yaml so a multiplexed /p/<profile>/ request is gated by ITS OWN
+# profile's setting, not the listener-owning default profile's.
+# ---------------------------------------------------------------------------
+
+_ROUTES_UNRESTRICTED = "unrestricted"
+_ROUTES_DENY_ALL = "deny_all"
+_ROUTES_ALLOWLIST = "allowlist"
+
+# Always reachable regardless of ``allowed_routes`` — the liveness probe.
+_ALWAYS_ALLOWED_PATHS = ("/health",)
+
+# Returned by _read_raw_config_root() when there is genuinely NO config to
+# read: no file on disk, or a file with no YAML content at all (blank /
+# comments only). Distinct from a successfully parsed root that simply isn't a
+# mapping (``- a``, ``42``, ``null``), which is malformed and denies closed.
+_CONFIG_ROOT_ABSENT = object()
+
+
+def _read_raw_config_root() -> Any:
+    """Return the CURRENT profile's ``config.yaml`` YAML root, unnormalized.
+
+    Deliberately NOT ``read_user_config_raw()``: that helper collapses a
+    non-mapping root to ``{}``, making ``- a\\n- b`` (or ``42``, or ``null``)
+    indistinguishable from a missing file — which would resolve a malformed
+    config to "key simply not present" and therefore UNRESTRICTED. This
+    security boundary must tell those apart, so it reads the same
+    profile-aware path (``get_config_path()``) and returns exactly what YAML
+    parsed, plus a dedicated :data:`_CONFIG_ROOT_ABSENT` sentinel for "no
+    config at all".
+
+    Raises on unparseable YAML / unreadable file (callers deny closed).
+    """
+    from hermes_cli.config import get_config_path
+    from utils import fast_safe_load
+
+    path = get_config_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _CONFIG_ROOT_ABSENT
+    # A file that carries no YAML content (empty, whitespace, or only
+    # comments) parses to None but means "nothing configured" — treat it like
+    # a missing file rather than a malformed root, so an empty/commented-out
+    # config.yaml keeps its long-standing unrestricted behavior. An EXPLICIT
+    # ``null``/``~`` root is content, and stays malformed.
+    if not any(
+        line.strip() and not line.lstrip().startswith("#")
+        for line in text.splitlines()
+    ):
+        return _CONFIG_ROOT_ABSENT
+    return fast_safe_load(text)
+
+
+def _resolve_api_server_allowed_routes() -> "tuple[str, list[str]]":
+    """Resolve ``gateway.api_server.allowed_routes`` for the CURRENT profile.
+
+    Returns ``(mode, patterns)``:
+      - ``(_ROUTES_UNRESTRICTED, [])`` — no config at all (missing/blank
+        file), key omitted/``None``, OR the intentionally-supported empty
+        list/tuple. No gating.
+      - ``(_ROUTES_DENY_ALL, [])`` — an explicit malformed falsey value
+        (``False``, ``0``, ``{}``, ``""``), any other malformed type/entry,
+        a non-mapping YAML root (list/scalar/``null``), or a config-load
+        failure. Only ``/health`` is reachable.
+      - ``(_ROUTES_ALLOWLIST, patterns)`` — a non-empty string (single
+        pattern) or list/tuple of non-empty strings.
+
+    Uses ``_read_raw_config_root()`` (profile-aware via ``get_config_path()``
+    → ``get_hermes_home()``, which the profile-prefix middleware has already
+    scoped by the time this runs) because it RAISES on unparseable YAML —
+    unlike the gateway's usual fail-open loader — and because it reports a
+    successfully parsed NON-MAPPING root as itself instead of normalizing it
+    to ``{}``. Both a load failure and a malformed root are therefore
+    distinguishable from "key simply not present" and denied closed, per
+    contract.
+    """
+    try:
+        raw = _read_raw_config_root()
+    except Exception:
+        return (_ROUTES_DENY_ALL, [])
+    if raw is _CONFIG_ROOT_ABSENT:
+        # No config file / no YAML content — nothing configured, not malformed.
+        return (_ROUTES_UNRESTRICTED, [])
+    if not isinstance(raw, dict):
+        # Parsed fine, but the root is a list/scalar/None — malformed config,
+        # never "unconfigured".
+        return (_ROUTES_DENY_ALL, [])
+
+    gateway_cfg = raw.get("gateway")
+    if gateway_cfg is None:
+        return (_ROUTES_UNRESTRICTED, [])
+    if not isinstance(gateway_cfg, dict):
+        return (_ROUTES_DENY_ALL, [])
+
+    api_server_cfg = gateway_cfg.get("api_server")
+    if api_server_cfg is None:
+        return (_ROUTES_UNRESTRICTED, [])
+    if not isinstance(api_server_cfg, dict):
+        return (_ROUTES_DENY_ALL, [])
+
+    if "allowed_routes" not in api_server_cfg:
+        return (_ROUTES_UNRESTRICTED, [])
+    value = api_server_cfg["allowed_routes"]
+
+    if value is None:
+        return (_ROUTES_UNRESTRICTED, [])
+    if isinstance(value, bool):
+        # bool is an int subclass — check before the general int/str/etc.
+        # fallthrough so True/False both land here (True is not a valid
+        # list/string either — malformed, deny-all).
+        return (_ROUTES_DENY_ALL, [])
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return (_ROUTES_UNRESTRICTED, [])
+        patterns: list[str] = []
+        for entry in value:
+            if not isinstance(entry, str) or not entry.strip():
+                return (_ROUTES_DENY_ALL, [])
+            patterns.append(entry.strip())
+        return (_ROUTES_ALLOWLIST, patterns)
+    if isinstance(value, str):
+        if value == "":
+            return (_ROUTES_DENY_ALL, [])
+        return (_ROUTES_ALLOWLIST, [value])
+    # int (incl. 0), float, dict (incl. {}), or any other type: malformed.
+    return (_ROUTES_DENY_ALL, [])
+
+
+def _owner_workspace_toolset_enabled(user_config: dict) -> bool:
+    """``gateway.api_server.owner_workspace.enabled`` — default OFF.
+
+    Enables ONLY on the literal boolean ``True``. Anything else — including
+    the truthy strings ``"true"``/``"yes"``/``"false"``, numbers, lists,
+    mappings, ``None``, and every other malformed value — leaves the owner
+    mutation surface disabled. A ``bool()`` coercion here would turn
+    ``enabled: "false"`` (a very ordinary YAML quoting slip) into a live
+    owner-mutation surface, so this admission gate demands the exact value
+    its documentation promises rather than guessing at intent.
+
+    Fail-closed to False on any resolution error: an owner-mutation surface
+    must never appear because a config read hiccuped.
+    """
+    try:
+        from hermes_cli.config import cfg_get
+
+        value = cfg_get(user_config, "gateway", "api_server", "owner_workspace", "enabled", default=False)
+    except Exception:
+        return False
+    return value is True
+
+
+def _route_matches_any(path: str, patterns: "list[str]") -> bool:
+    """Segment-aware prefix match: ``/v1/runs`` matches itself and
+    descendants (``/v1/runs/abc``) but never a sibling with a shared
+    string prefix (``/v1/runs-evil``)."""
+    for pattern in patterns:
+        pat = pattern.rstrip("/") or "/"
+        if path == pat or path.startswith(pat + "/"):
+            return True
+    return False
 
 
 try:
@@ -245,7 +412,7 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
 
 
 _REQUEST_OPTION_MISSING = object()
-_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _RUNTIME_AGENT_OVERRIDE_KEYS = (
     "api_key",
     "base_url",
@@ -2050,6 +2217,44 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return profile_prefix_middleware
 
+    def _make_route_allowlist_middleware(self):
+        """Enforce ``gateway.api_server.allowed_routes`` for least privilege.
+
+        Runs AFTER the profile-prefix middleware (later in ``mws``) so
+        ``get_hermes_home()`` — and therefore config resolution — is already
+        scoped to the request's profile for a multiplexed ``/p/<profile>/``
+        call. Exactly one multiplex prefix is stripped before matching, per
+        contract: a route is gated the same way whether reached natively or
+        via its ``/p/<profile>/`` mirror.
+        """
+
+        @web.middleware
+        async def route_allowlist_middleware(request: "web.Request", handler):
+            path = request.path
+            prefix_profile = request.match_info.get("profile")
+            if prefix_profile is not None:
+                stripped = path[len(f"/p/{prefix_profile}"):]
+                path = stripped or "/"
+
+            if path in _ALWAYS_ALLOWED_PATHS:
+                return await handler(request)
+
+            mode, patterns = _resolve_api_server_allowed_routes()
+            if mode == _ROUTES_UNRESTRICTED:
+                return await handler(request)
+            if mode == _ROUTES_ALLOWLIST and _route_matches_any(path, patterns):
+                return await handler(request)
+
+            return web.json_response(
+                _openai_error(
+                    "Route not permitted for this profile",
+                    code="route_not_allowed",
+                ),
+                status=403,
+            )
+
+        return route_allowlist_middleware
+
     def _http_route_table(self) -> List[tuple]:
         """Return (method, path, handler) rows registered by ``connect()``.
 
@@ -2091,6 +2296,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            ("GET", "/v1/owner-workspace/projects", self._handle_owner_workspace_projects),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -2892,6 +3098,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if _owner_workspace_toolset_enabled(user_config):
+            # The ONLY place the owner_workspace toolset is folded into an
+            # agent's schema — absent from _HERMES_CORE_TOOLS and every
+            # composite in toolsets.py, so no other platform can reach it
+            # even if a profile's generic `toolsets:` config names it.
+            enabled_toolsets = sorted(set(enabled_toolsets) | {"owner_workspace"})
 
         max_iterations = _current_max_iterations()
 
@@ -6537,6 +6749,8 @@ class APIServerAdapter(BasePlatformAdapter):
         })
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
+        if status != "waiting_for_approval":
+            current.pop("pending_approval", None)
         self._run_statuses[run_id] = current
         return current
 
@@ -6632,6 +6846,48 @@ class APIServerAdapter(BasePlatformAdapter):
             # so clients can observe delegate_task timeouts and failures.
 
         return _callback
+
+
+    async def _handle_owner_workspace_projects(
+        self, request: "web.Request",
+    ) -> "web.Response":
+        """GET receipt-backed owner Projects without opening a mutation path."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from gateway.run import _load_gateway_config
+
+            if not _owner_workspace_toolset_enabled(_load_gateway_config()):
+                return web.json_response(
+                    _openai_error(
+                        "Owner workspace is not enabled for this profile",
+                        code="owner_workspace_not_enabled",
+                    ),
+                    status=404,
+                )
+            from hermes_cli.owner_workspace import (
+                list_committed_projects,
+                resolve_owner_context,
+            )
+
+            projects = list_committed_projects(resolve_owner_context())
+        except Exception:
+            logger.exception("[api_server] owner-workspace Project projection failed")
+            return web.json_response(
+                _openai_error(
+                    "Owner workspace Project projection is unavailable",
+                    code="owner_workspace_unavailable",
+                ),
+                status=500,
+            )
+
+        return web.json_response({
+            "object": "hermes.owner_workspace.project_list",
+            "data": projects,
+        })
+
 
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
@@ -6810,19 +7066,38 @@ class APIServerAdapter(BasePlatformAdapter):
                         from gateway.run import _redact_approval_command
 
                         event["command"] = _redact_approval_command(event.get("command"))
+                    choices = _approval_event_choices(
+                        smart_denied=bool(event.get("smart_denied"))
+                        or bool(event.get("exact_operation")),
+                        allow_permanent=event.get("allow_permanent") is not False,
+                    )
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
+                        "choices": choices,
                     })
+                    pending_approval = {
+                        "approval_id": str(event.get("approval_id") or ""),
+                        "description": redact_sensitive_text(
+                            str(event.get("description") or "Approve this operation"),
+                            force=True,
+                        ),
+                        "choices": choices,
+                    }
+                    operation = str(event.get("operation") or "")
+                    if event.get("exact_operation") and operation in {
+                        "owner_workspace_bootstrap",
+                        "owner_task_graph_commit",
+                        "owner_task_move",
+                        "owner_task_comment",
+                    }:
+                        pending_approval["operation"] = operation
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
                         last_event="approval.request",
+                        pending_approval=pending_approval,
                     )
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, event)
@@ -7162,6 +7437,9 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        approval_id = body.get("approval_id")
+        if approval_id is not None:
+            approval_id = str(approval_id).strip() or None
         try:
             from tools.approval import resolve_gateway_approval
 
@@ -7169,6 +7447,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
+                approval_id=approval_id,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
@@ -7425,6 +7704,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 mw
                 for mw in (
                     self._make_profile_prefix_middleware(),
+                    self._make_route_allowlist_middleware(),
                     cors_middleware,
                     body_limit_middleware,
                     security_headers_middleware,

@@ -134,6 +134,117 @@ def test_discord_toolsets_do_not_leak_to_other_platforms():
     assert "discord_admin" not in enabled
 
 
+# ─── owner_workspace is kernel_gated: unlike discord/discord_admin (merely
+# platform-restricted), it must be unreachable via `platform_toolsets` on
+# EVERY platform — including api_server, whose only admitted path is the
+# dedicated gateway.api_server.owner_workspace.enabled union applied by
+# api_server.py AFTER _get_platform_tools() returns, not this function. ───────
+
+
+@pytest.mark.parametrize("platform", ["cli", "telegram", "cron", "discord", "api_server"])
+def test_owner_workspace_toolset_never_reachable_via_platform_toolsets(platform):
+    config = {"platform_toolsets": {platform: ["owner_workspace"]}}
+    enabled = _get_platform_tools(config, platform)
+    assert "owner_workspace" not in enabled
+
+
+@pytest.mark.parametrize("platform", ["cli", "telegram", "cron"])
+def test_owner_workspace_toolset_never_reachable_mixed_with_platform_default(platform):
+    """Naming owner_workspace alongside the platform's own composite must not
+    smuggle it in either — the explicit_passthrough leak this regression
+    guards against triggered regardless of what else was in the list."""
+    config = {"platform_toolsets": {platform: [f"hermes-{platform}", "owner_workspace"]}}
+    enabled = _get_platform_tools(config, platform)
+    assert "owner_workspace" not in enabled
+    assert "owner_workspace_bootstrap" not in enabled
+    assert "owner_task_move" not in enabled
+    assert "owner_task_comment" not in enabled
+
+
+_OWNER_TOOLS = {"owner_workspace_bootstrap", "owner_task_move", "owner_task_comment"}
+
+
+def _resolved_tools(enabled_toolsets) -> set:
+    """Expand resolved toolset NAMES into the tool names they actually grant.
+
+    The generic-alias leaks this section guards against never mention
+    ``owner_workspace`` by name, so a name-only assertion would pass while the
+    agent still received the tools. Assert on the tools."""
+    from toolsets import resolve_toolset
+
+    tools = set()
+    for ts in enabled_toolsets:
+        tools.update(resolve_toolset(ts))
+    return tools
+
+
+@pytest.mark.parametrize("alias", ["all", "*"])
+@pytest.mark.parametrize("platform", ["cli", "telegram", "cron", "discord", "api_server"])
+def test_wildcard_alias_never_exposes_kernel_gated_tools(alias, platform):
+    """``platform_toolsets: {<platform>: [all]}`` is the generic "give this
+    agent everything" escape hatch — it must still mean "everything ORDINARY".
+    The by-name strip cannot see this route (the config never says
+    ``owner_workspace``), so the wildcard expansion and the post-resolution
+    gate are what keep the owner mutation surface off generic platforms."""
+    config = {"platform_toolsets": {platform: [alias]}}
+    enabled = _get_platform_tools(config, platform)
+    tools = _resolved_tools(enabled)
+
+    assert "owner_workspace" not in enabled
+    assert not _OWNER_TOOLS & tools
+    # ...while the wildcard still delivers ordinary, non-gated capability.
+    assert {"web_search", "read_file", "terminal"} <= tools
+
+
+@pytest.mark.parametrize("alias", ["all", "*"])
+def test_wildcard_alias_still_grants_ordinary_toolsets(alias):
+    """Guard against over-correction: the post-resolution kernel gate drops
+    only toolsets that resolve ONTO gated tools, so the wildcard must keep
+    every ordinary toolset it has always granted."""
+    from toolsets import get_kernel_gated_toolsets, get_toolset_names
+
+    enabled = _get_platform_tools({"platform_toolsets": {"cli": [alias]}}, "cli")
+    tools = _resolved_tools(enabled)
+    gated = get_kernel_gated_toolsets()
+    for name in get_toolset_names():
+        if name in gated or name.startswith("hermes-"):
+            continue
+        from toolsets import resolve_toolset
+
+        assert set(resolve_toolset(name)) <= tools, f"wildcard dropped toolset {name!r}"
+
+
+@pytest.mark.parametrize("platform", ["cli", "telegram", "cron"])
+def test_registry_alias_onto_gated_tools_is_stripped_post_resolution(platform, monkeypatch):
+    """The by-name strip only matches the literal kernel-gated toolset name.
+    A registry/MCP toolset ALIAS resolves to gated tools while carrying a name
+    the strip never sees, and ``explicit_passthrough`` preserves exactly such
+    unknown names — so only a post-RESOLUTION gate closes this route."""
+    from tools.registry import ToolRegistry
+
+    reg = ToolRegistry()
+    for tool_name in sorted(_OWNER_TOOLS):
+        reg.register(
+            name=tool_name,
+            toolset="mcp-ownerbridge",
+            schema={"name": tool_name, "parameters": {"type": "object", "properties": {}}},
+            handler=lambda args, **kwargs: "{}",
+        )
+    reg.register_toolset_alias("ownerbridge", "mcp-ownerbridge")
+    monkeypatch.setattr("tools.registry.registry", reg)
+
+    # Sanity: the alias really does resolve onto the gated tools, so the
+    # assertions below are testing the gate and not a typo.
+    from toolsets import resolve_toolset
+
+    assert _OWNER_TOOLS <= set(resolve_toolset("ownerbridge"))
+
+    config = {"platform_toolsets": {platform: [f"hermes-{platform}", "ownerbridge"]}}
+    enabled = _get_platform_tools(config, platform)
+    assert "ownerbridge" not in enabled
+    assert not _OWNER_TOOLS & _resolved_tools(enabled)
+
+
 
 
 

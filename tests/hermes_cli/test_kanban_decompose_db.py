@@ -21,13 +21,16 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=None):
+def _create_triage(
+    conn, title="rough idea", body=None, assignee=None, tenant=None, project_id=None,
+):
     return kb.create_task(
         conn,
         title=title,
         body=body,
         assignee=assignee,
         tenant=tenant,
+        project_id=project_id,
         triage=True,
     )
 
@@ -77,6 +80,7 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
             root_assignee="orch",
             children=[{"title": "task A", "assignee": "researcher"}],
             author="alice",
+            event_metadata={"operation_digest": "sha256-test", "child_ids": ["forged"]},
         )
     assert child_ids is not None
 
@@ -85,7 +89,31 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
         events = kb.list_events(conn, tid)
 
     assert any("Decomposed into" in (c.body or "") for c in comments)
-    assert any(ev.kind == "decomposed" for ev in events)
+    event = next(ev for ev in events if ev.kind == "decomposed")
+    assert event.payload["operation_digest"] == "sha256-test"
+    assert event.payload["child_ids"] == child_ids
+
+
+def test_decompose_children_inherit_root_project_id(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        conn.execute("UPDATE tasks SET project_id = ? WHERE id = ?", ("p_owner", tid))
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orch",
+            children=[
+                {"title": "task A", "assignee": "researcher"},
+                {"title": "task B", "assignee": "engineer", "parents": [0]},
+            ],
+            author="alice",
+        )
+
+        assert child_ids is not None
+        assert [kb.get_task(conn, child_id).project_id for child_id in child_ids] == [
+            "p_owner",
+            "p_owner",
+        ]
 
 
 

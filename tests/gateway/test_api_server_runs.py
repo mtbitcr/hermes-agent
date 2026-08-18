@@ -269,6 +269,60 @@ class TestStartRun:
 class TestRunStatus:
 
     @pytest.mark.asyncio
+    async def test_status_exposes_redacted_approval_then_clears_it(self, adapter):
+        app = _create_runs_app(adapter)
+        approval_ready = threading.Event()
+        release = threading.Event()
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+
+                def _run_conversation(*_args, task_id=None, **_kwargs):
+                    with approval_mod._lock:
+                        notify = approval_mod._gateway_notify_cbs[task_id]
+                    notify({
+                        "approval_id": "approval-1",
+                        "description": "Create project with token sk-live-secret-value",
+                        "exact_operation": True,
+                        "operation": "owner_task_graph_commit",
+                    })
+                    approval_ready.set()
+                    release.wait(timeout=5)
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_create.return_value = mock_agent
+
+                start = await cli.post("/v1/runs", json={"input": "create it"})
+                run_id = (await start.json())["run_id"]
+                assert approval_ready.wait(timeout=3)
+
+                waiting_resp = await cli.get(f"/v1/runs/{run_id}")
+                waiting = await waiting_resp.json()
+                assert waiting_resp.status == 200
+                assert waiting["status"] == "waiting_for_approval"
+                assert waiting["pending_approval"]["approval_id"] == "approval-1"
+                assert waiting["pending_approval"]["choices"] == ["once", "deny"]
+                assert waiting["pending_approval"]["operation"] == "owner_task_graph_commit"
+                assert "sk-live-secret-value" not in waiting["pending_approval"]["description"]
+
+                release.set()
+                for _ in range(40):
+                    done_resp = await cli.get(f"/v1/runs/{run_id}")
+                    done = await done_resp.json()
+                    if done["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert done["status"] == "completed"
+                assert "pending_approval" not in done
+
+
+    @pytest.mark.asyncio
     async def test_status_reflects_explicit_session_id(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:

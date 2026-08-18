@@ -75,7 +75,10 @@ def _prepare_slash_worker_runtime() -> None:
         logger=logger,
         thread_name="slash-worker-mcp-discovery",
     )
-    wait_for_mcp_discovery()
+    # HermesCLI takes a single initial tool snapshot in this process. Use the
+    # existing one-shot bound so a healthy cold-starting MCP server is not
+    # silently omitted for the worker's entire lifetime.
+    wait_for_mcp_discovery(single_query=True)
 
 
 def _start_parent_death_watchdog(original_ppid) -> None:
