@@ -9,6 +9,7 @@ behaviour.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -98,7 +99,11 @@ class _BuggyTokenProvider(_OAuthOnly):
 
 
 @pytest.fixture(autouse=True)
-def _isolated_state():
+def _isolated_state(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     clear_providers()
     token_auth.clear_token_routes()
     yield
@@ -308,6 +313,8 @@ def test_is_token_route_true_only_for_exact_method_and_path():
     assert token_auth.is_token_route("/x", method="POST") is True
     assert token_auth.is_token_route("/x", method="GET") is False
     assert token_auth.is_token_route("/y", method="POST") is False
+    assert token_auth.is_token_route("/x%20", method="POST") is False
+    assert token_auth.is_token_route("/x ", method="POST") is False
 
 
 # --------------------------------------------------------------------------
@@ -400,3 +407,256 @@ def test_middleware_method_mismatch_is_not_token_authenticated_and_passes_throug
     assert calls["n"] == 1
     assert not hasattr(req.state, "token_authenticated")
 
+
+# --------------------------------------------------------------------------
+# Item 32G-A: path templates + the "optional" dual-mode route
+# --------------------------------------------------------------------------
+
+
+def test_register_token_route_template_requires_a_placeholder():
+    with pytest.raises(ValueError):
+        token_auth.register_token_route_template(
+            "/api/plugins/kanban/board", method="GET", required_scope="s"
+        )
+
+
+def test_register_token_route_template_matches_one_segment_only():
+    token_auth.register_token_route_template(
+        "/api/plugins/kanban/tasks/{task_id}", method="GET", required_scope="s"
+    )
+    assert token_auth.get_token_route_policy(
+        "GET", "/api/plugins/kanban/tasks/abc123"
+    ) is not None
+    # No trailing slash, no extra segment, no empty segment.
+    assert token_auth.get_token_route_policy(
+        "GET", "/api/plugins/kanban/tasks/abc123/"
+    ) is None
+    assert token_auth.get_token_route_policy(
+        "GET", "/api/plugins/kanban/tasks/abc123/attachments"
+    ) is None
+    assert token_auth.get_token_route_policy(
+        "GET", "/api/plugins/kanban/tasks/"
+    ) is None
+
+
+def test_register_token_route_template_does_not_shadow_a_literal_route():
+    # A literal route always wins over a template that would also match it.
+    token_auth.register_token_route(
+        "/api/plugins/kanban/tasks/special", method="GET", required_scope="literal-scope"
+    )
+    token_auth.register_token_route_template(
+        "/api/plugins/kanban/tasks/{task_id}", method="GET", required_scope="template-scope"
+    )
+    policy = token_auth.get_token_route_policy("GET", "/api/plugins/kanban/tasks/special")
+    assert policy.required_scope == "literal-scope"
+
+
+def test_register_token_route_template_conflicting_scope_rejected():
+    token_auth.register_token_route_template(
+        "/x/{id}", method="GET", required_scope="s"
+    )
+    with pytest.raises(ValueError):
+        token_auth.register_token_route_template(
+            "/x/{id}", method="GET", required_scope="other"
+        )
+
+
+def test_register_token_route_template_idempotent_reregistration():
+    token_auth.register_token_route_template("/x/{id}", method="GET", required_scope="s")
+    token_auth.register_token_route_template("/x/{id}", method="get", required_scope="s")
+    assert token_auth.get_token_route_policy("GET", "/x/123").required_scope == "s"
+
+
+@pytest.mark.parametrize("template", ["/x/pre{id}", "/x/{id}tail", "/x/{bad-name}"])
+def test_register_token_route_template_requires_a_whole_valid_segment(template):
+    with pytest.raises(ValueError):
+        token_auth.register_token_route_template(
+            template, method="GET", required_scope="s"
+        )
+
+
+def test_register_token_route_template_rejects_duplicate_shape():
+    token_auth.register_token_route_template(
+        "/x/{task_id}", method="GET", required_scope="s"
+    )
+    with pytest.raises(ValueError):
+        token_auth.register_token_route_template(
+            "/x/{other_name}", method="GET", required_scope="other"
+        )
+
+
+def test_clear_token_routes_clears_templates_too():
+    token_auth.register_token_route_template("/x/{id}", method="GET", required_scope="s")
+    token_auth.clear_token_routes()
+    assert token_auth.get_token_route_policy("GET", "/x/123") is None
+
+
+def _register_optional_machine_route():
+    token_auth.register_machine_token_family("svc1_", strict_audit=True)
+    token_auth.register_token_route(
+        "/api/plugins/kanban/board",
+        method="GET",
+        required_scope="kanban.read",
+        optional=True,
+        strict_audit=True,
+    )
+
+
+def test_optional_route_with_no_bearer_token_passes_through_unauthenticated():
+    """A dual-mode route with no Authorization header at all defers to the
+    ordinary interactive gates instead of 401ing — this is what lets an
+    existing session/cookie route also accept a machine credential."""
+    _register_optional_machine_route()
+    req = _FakeRequest(path="/api/plugins/kanban/board", headers={}, method="GET")
+    call_next, calls = _spy_call_next()
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    assert resp.status_code == 200
+    assert calls["n"] == 1
+    assert not hasattr(req.state, "token_authenticated")
+
+
+def test_optional_route_with_session_bearer_passes_to_interactive_auth_unchanged():
+    _register_optional_machine_route()
+    req = _FakeRequest(
+        path="/api/plugins/kanban/board",
+        headers={"authorization": "Bearer dashboard-session"},
+        method="GET",
+    )
+    call_next, calls = _spy_call_next()
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    assert resp.status_code == 200
+    assert calls["n"] == 1
+    assert not hasattr(req.state, "token_authenticated")
+
+
+def test_optional_route_with_valid_machine_token_sets_authenticated_state():
+    register_provider(_TokenProvider(secret="svc1_good", scopes=("kanban.read",)))
+    _register_optional_machine_route()
+    req = _FakeRequest(
+        path="/api/plugins/kanban/board",
+        headers={"authorization": "Bearer svc1_good"},
+        method="GET",
+    )
+    calls = {"n": 0}
+    async def call_next(request):
+        calls["n"] += 1
+        request.state.token_route_audited = True
+        return await _call_next_ok(request)
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    assert resp.status_code == 200
+    assert calls["n"] == 1
+    assert req.state.token_authenticated is True
+    assert req.state.token_audit_strict is True
+
+
+def test_strict_optional_machine_route_fails_closed_without_handler_audit():
+    register_provider(_TokenProvider(secret="svc1_good", scopes=("kanban.read",)))
+    _register_optional_machine_route()
+    req = _FakeRequest(
+        path="/api/plugins/kanban/board",
+        headers={"authorization": "Bearer svc1_good"},
+        method="GET",
+    )
+    call_next, calls = _spy_call_next()
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    assert resp.status_code == 503
+    assert calls["n"] == 1
+
+
+def test_optional_route_with_invalid_machine_token_401s_never_falls_through():
+    """A PRESENTED-but-wrong token on an optional route must not silently
+    fall back to session auth — it fails, exactly like a non-optional route."""
+    _register_optional_machine_route()
+    req = _FakeRequest(
+        path="/api/plugins/kanban/board",
+        headers={"authorization": "Bearer svc1_garbage"},
+        method="GET",
+    )
+    call_next, calls = _spy_call_next()
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    assert resp.status_code == 401
+    assert calls["n"] == 0
+
+
+def test_optional_route_wrong_scope_still_403s_never_falls_through():
+    register_provider(_TokenProvider(secret="svc1_good", scopes=("some-other-scope",)))
+    _register_optional_machine_route()
+    req = _FakeRequest(
+        path="/api/plugins/kanban/board",
+        headers={"authorization": "Bearer svc1_good"},
+        method="GET",
+    )
+    call_next, calls = _spy_call_next()
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    assert resp.status_code == 403
+    assert calls["n"] == 0
+
+
+@pytest.mark.parametrize("prefix", ["", "abc", "bad prefix", "a" * 33])
+def test_machine_token_family_rejects_invalid_prefix(prefix):
+    with pytest.raises(ValueError):
+        token_auth.register_machine_token_family(prefix)
+
+
+def test_machine_token_family_rejects_overlapping_prefixes():
+    token_auth.register_machine_token_family("svc1_")
+    with pytest.raises(ValueError):
+        token_auth.register_machine_token_family("svc1_child_")
+
+
+def test_reserved_machine_family_cannot_use_unregistered_method_or_path():
+    _register_optional_machine_route()
+    for method, path in (
+        ("POST", "/api/plugins/kanban/board"),
+        ("GET", "/api/plugins/kanban/not-registered"),
+    ):
+        req = _FakeRequest(
+            path=path,
+            headers={"authorization": "Bearer svc1_anything"},
+            method=method,
+        )
+        call_next, calls = _spy_call_next()
+        resp = _run(token_auth.token_auth_middleware(req, call_next))
+        assert resp.status_code == 403
+        assert calls["n"] == 0
+
+
+def test_reserved_machine_family_rejects_method_override_headers():
+    _register_optional_machine_route()
+    req = _FakeRequest(
+        path="/api/plugins/kanban/board",
+        headers={
+            "authorization": "Bearer svc1_anything",
+            "x-http-method-override": "POST",
+        },
+        method="GET",
+    )
+    call_next, calls = _spy_call_next()
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    assert resp.status_code == 400
+    assert calls["n"] == 0
+
+
+def test_transport_peer_ip_ignores_forwarded_headers():
+    req = _FakeRequest(headers={"x-forwarded-for": "203.0.113.9"})
+    assert token_auth.transport_peer_ip(req) == "1.2.3.4"
+
+
+def test_strict_machine_denial_returns_503_when_audit_fails(monkeypatch):
+    from hermes_cli.dashboard_auth.audit import AuditWriteError
+
+    _register_optional_machine_route()
+    monkeypatch.setattr(
+        token_auth,
+        "audit_log",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AuditWriteError("full")),
+    )
+    req = _FakeRequest(
+        path="/api/plugins/kanban/board",
+        headers={"authorization": "Bearer svc1_invalid"},
+        method="GET",
+    )
+    call_next, calls = _spy_call_next()
+    resp = _run(token_auth.token_auth_middleware(req, call_next))
+    assert resp.status_code == 503
+    assert calls["n"] == 0

@@ -37,21 +37,39 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime as dt
 import json
 import logging
+import os
+import re
 import sqlite3
+import stat
 import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
-from hermes_cli.dashboard_auth.token_auth import register_token_route
+from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+from hermes_cli.dashboard_auth.token_auth import (
+    register_machine_token_family,
+    register_token_route,
+    register_token_route_template,
+    transport_peer_ip,
+)
+from plugins.dashboard_auth.raphael_workspace import (
+    BOARD as WORKSPACE_BOARD,
+    GRANT as WORKSPACE_GRANT,
+    PRINCIPAL as WORKSPACE_PRINCIPAL,
+    PROJECT as WORKSPACE_PROJECT,
+    SCOPE as WORKSPACE_REQUIRED_SCOPE,
+    TOKEN_PREFIX as WORKSPACE_TOKEN_PREFIX,
+)
 from hermes_cli.web_models import (
     KanbanRecommendationItem,
     KanbanRecommendationItemV2,
@@ -83,6 +101,59 @@ register_token_route(
     method=RECOMMENDATIONS_ROUTE_METHOD,
     required_scope=RECOMMENDATIONS_REQUIRED_SCOPE,
 )
+
+# ITEM 32G-A: the exact nine-route, read-only "Raphael Workspace" machine
+# surface. Unlike the recommendations route above, these are EXISTING
+# interactive dashboard routes that must ALSO accept the workspace bearer
+# credential without changing a single byte of their session/cookie
+# behaviour for ordinary browser callers. That dual-use is why these are
+# registered ``optional=True``: absent a bearer token at all, the seam
+# defers entirely to the normal cookie/session gates (see
+# ``hermes_cli.dashboard_auth.token_auth`` docstring for the full
+# semantics) — a bearer token that IS presented still has to pass the full
+# accept/reject path with no fallback, exactly like every other token
+# route. Registered unconditionally, independent of whether the
+# ``raphael_workspace`` credential-provider plugin ever loads, so the
+# routes are always at least this scoped even if that plugin were disabled.
+WORKSPACE_ROUTE_METHOD = "GET"
+_WORKSPACE_API_PREFIX = "/api/plugins/kanban"
+_WORKSPACE_LITERAL_ROUTE_PATHS = (
+    f"{_WORKSPACE_API_PREFIX}/projects",
+    f"{_WORKSPACE_API_PREFIX}/boards",
+    f"{_WORKSPACE_API_PREFIX}/board",
+    f"{_WORKSPACE_API_PREFIX}/workers/active",
+    f"{_WORKSPACE_API_PREFIX}/assignees",
+)
+_WORKSPACE_TEMPLATE_ROUTE_PATHS = (
+    f"{_WORKSPACE_API_PREFIX}/tasks/{{task_id}}",
+    f"{_WORKSPACE_API_PREFIX}/tasks/{{task_id}}/attachments",
+    f"{_WORKSPACE_API_PREFIX}/attachments/{{attachment_id}}",
+    f"{_WORKSPACE_API_PREFIX}/runs/{{run_id}}",
+)
+
+
+def _register_workspace_machine_routes() -> None:
+    """Idempotently install the fixed Item 32G machine-auth contour."""
+    register_machine_token_family(WORKSPACE_TOKEN_PREFIX, strict_audit=True)
+    for path in _WORKSPACE_LITERAL_ROUTE_PATHS:
+        register_token_route(
+            path,
+            method=WORKSPACE_ROUTE_METHOD,
+            required_scope=WORKSPACE_REQUIRED_SCOPE,
+            optional=True,
+            strict_audit=True,
+        )
+    for path in _WORKSPACE_TEMPLATE_ROUTE_PATHS:
+        register_token_route_template(
+            path,
+            method=WORKSPACE_ROUTE_METHOD,
+            required_scope=WORKSPACE_REQUIRED_SCOPE,
+            optional=True,
+            strict_audit=True,
+        )
+
+
+_register_workspace_machine_routes()
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +479,7 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 
 @router.get("/board")
 def get_board(
+    request: Request,
     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
     include_archived: bool = Query(False),
     board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
@@ -427,6 +499,15 @@ def get_board(
     through to the active board (``HERMES_KANBAN_BOARD`` env → on-disk
     ``current`` pointer → ``default``).
     """
+    _workspace_response = _workspace_maybe_respond(
+        request,
+        require_board=True,
+        builder=_workspace_board_response,
+        object_kind="board",
+        object_id=WORKSPACE_BOARD,
+    )
+    if _workspace_response is not None:
+        return _workspace_response
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -548,6 +629,7 @@ def get_board(
 @router.get("/tasks/{task_id}")
 def get_task(
     task_id: str,
+    request: Request,
     board: Optional[str] = Query(None),
     run_state_type: Optional[str] = Query(
         None, description="With run_state_name: filter runs by column 'status' or 'outcome'",
@@ -556,6 +638,15 @@ def get_task(
         None, description="With run_state_type: exact value for that run column",
     ),
 ):
+    _workspace_response = _workspace_maybe_respond(
+        request,
+        require_board=True,
+        builder=lambda: _workspace_task_runs_response(task_id),
+        object_kind="task",
+        object_id=task_id,
+    )
+    if _workspace_response is not None:
+        return _workspace_response
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -725,7 +816,16 @@ from hermes_cli.kanban_db import (  # noqa: E402
 
 
 @router.get("/tasks/{task_id}/attachments")
-def list_task_attachments(task_id: str, board: Optional[str] = Query(None)):
+def list_task_attachments(task_id: str, request: Request, board: Optional[str] = Query(None)):
+    _workspace_response = _workspace_maybe_respond(
+        request,
+        require_board=True,
+        builder=lambda: _workspace_task_attachments_response(task_id),
+        object_kind="task",
+        object_id=task_id,
+    )
+    if _workspace_response is not None:
+        return _workspace_response
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -811,7 +911,27 @@ async def upload_task_attachment(
 
 
 @router.get("/attachments/{attachment_id}")
-def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
+def download_attachment(attachment_id: int, request: Request, board: Optional[str] = Query(None)):
+    _workspace_response = _workspace_maybe_respond(
+        request,
+        require_board=True,
+        builder=lambda: _workspace_attachment_bytes(attachment_id),
+        object_kind="attachment",
+        object_id=attachment_id,
+    )
+    if _workspace_response is not None:
+        att, data = _workspace_response
+        safe_name = _workspace_sanitize_filename(att.filename)
+        return Response(
+            content=data,
+            status_code=200,
+            headers={
+                "content-type": _workspace_validate_media_type(att.content_type),
+                "content-length": str(len(data)),
+                "content-disposition": f'attachment; filename="{safe_name}"',
+                "cache-control": "no-store",
+            },
+        )
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -1581,6 +1701,7 @@ except ImportError:
 
 @router.get("/workers/active")
 def list_active_workers(
+    request: Request,
     board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
 ):
     """Return every currently-running worker on the board.
@@ -1592,6 +1713,15 @@ def list_active_workers(
     worker entry carries enough context for the dashboard to link back to
     its task without a second round-trip.
     """
+    _workspace_response = _workspace_maybe_respond(
+        request,
+        require_board=True,
+        builder=_workspace_workers_response,
+        object_kind="board",
+        object_id=WORKSPACE_BOARD,
+    )
+    if _workspace_response is not None:
+        return _workspace_response
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -1643,6 +1773,7 @@ def list_active_workers(
 @router.get("/runs/{run_id}")
 def get_run_endpoint(
     run_id: int,
+    request: Request,
     board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
 ):
     """Direct lookup of a ``task_runs`` row by its integer id.
@@ -1651,6 +1782,15 @@ def get_run_endpoint(
     per-task run history embedded in ``GET /tasks/{task_id}``.
     404 when no such run exists.
     """
+    _workspace_response = _workspace_maybe_respond(
+        request,
+        require_board=True,
+        builder=lambda: _workspace_run_response(run_id),
+        object_kind="run",
+        object_id=run_id,
+    )
+    if _workspace_response is not None:
+        return _workspace_response
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -2249,7 +2389,7 @@ def get_stats(board: Optional[str] = Query(None)):
 
 
 @router.get("/assignees")
-def get_assignees(board: Optional[str] = Query(None)):
+def get_assignees(request: Request, board: Optional[str] = Query(None)):
     """Known profiles + per-profile task counts.
 
     Returns the union of ``~/.hermes/profiles/*`` on disk and every
@@ -2257,6 +2397,15 @@ def get_assignees(board: Optional[str] = Query(None)):
     this to populate its assignee dropdown so a freshly-created profile
     appears in the picker before it's been given any task.
     """
+    _workspace_response = _workspace_maybe_respond(
+        request,
+        require_board=True,
+        builder=_workspace_assignees_response,
+        object_kind="board",
+        object_id=WORKSPACE_BOARD,
+    )
+    if _workspace_response is not None:
+        return _workspace_response
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -2464,12 +2613,21 @@ def _default_workspace_kind(board: dict[str, Any]) -> str:
 
 
 @router.get("/projects")
-def list_kanban_projects():
+def list_kanban_projects(request: Request):
     """List first-class Hermes projects for board scoping.
 
     Returns ``{projects: [{id, slug, name, primary_path, icon, color}]}``.
     Archived projects are excluded — a board can only be scoped to a live one.
     """
+    _workspace_response = _workspace_maybe_respond(
+        request,
+        require_board=False,
+        builder=_workspace_projects_response,
+        object_kind="project",
+        object_id=WORKSPACE_PROJECT,
+    )
+    if _workspace_response is not None:
+        return _workspace_response
     try:
         from hermes_cli import projects_db as pdb
         with pdb.connect_closing() as pconn:
@@ -2492,8 +2650,17 @@ def list_kanban_projects():
 
 
 @router.get("/boards")
-def list_boards(include_archived: bool = Query(False)):
+def list_boards(request: Request, include_archived: bool = Query(False)):
     """Return every board on disk with task counts and the active slug."""
+    _workspace_response = _workspace_maybe_respond(
+        request,
+        require_board=False,
+        builder=_workspace_boards_response,
+        object_kind="board",
+        object_id=WORKSPACE_BOARD,
+    )
+    if _workspace_response is not None:
+        return _workspace_response
     boards = kanban_db.list_boards(include_archived=include_archived)
     current = kanban_db.get_current_board()
     proj_map = _projects_by_id()
@@ -2934,6 +3101,607 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
 # request that reaches this function has already presented a valid bearer
 # token; no further scope/claim check is layered on top here.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# ITEM 32G-A: Raphael Workspace read-only machine credential
+# ---------------------------------------------------------------------------
+#
+# A caller presenting a bearer token the ``raphael_workspace`` dashboard-auth
+# provider recognises reaches the same nine routes as the interactive
+# dashboard (see the ``optional=True`` registrations above), but:
+#   * only ever sees the fixed ``raphael-workspace`` project/board,
+#   * gets a narrow, fixed response projection — never the interactive one,
+#   * must pass exact query-parameter validation (no defaults, no extra
+#     params, no wildcards) before any board/task/attachment/run is read,
+#   * reads through a read-only (``PRAGMA query_only``) connection, so a bug
+#     here cannot mutate the board or emit ``task_events`` regardless.
+#
+# Every one of the nine handlers below calls ``_workspace_maybe_respond`` as
+# its very first statement and returns immediately when it returns non-None.
+# The interactive (session/cookie-authenticated) path is everything AFTER
+# that line and is completely unchanged — it never executes when a machine
+# credential is what authenticated the request, and it is the ONLY thing
+# that executes otherwise (``_workspace_maybe_respond`` returns ``None``
+# immediately for any non-machine call, before validating or auditing
+# anything).
+
+_WORKSPACE_MEDIA_TYPE_RE = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$")
+_WORKSPACE_UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._ -]")
+
+
+def _is_workspace_machine_call(request: Request) -> bool:
+    """True if the token seam already accepted this request under WORKSPACE_REQUIRED_SCOPE.
+
+    The seam enforces the scope match before the handler ever runs (see
+    ``token_auth_middleware``), and ``WORKSPACE_REQUIRED_SCOPE`` is unique to
+    this credential (mirroring how ``kanban:recommendations:read`` and
+    ``drain`` are each unique to theirs) — so ``token_authenticated`` being
+    set on one of these nine routes already implies the scope matched. The
+    explicit scope check below is defence in depth, not load-bearing.
+    """
+    if not getattr(request.state, "token_authenticated", False):
+        return False
+    principal = getattr(request.state, "token_principal", None)
+    return bool(
+        principal
+        and principal.provider == "raphael-workspace-token"
+        and principal.principal == WORKSPACE_PRINCIPAL
+        and principal.credential_id
+        and WORKSPACE_REQUIRED_SCOPE in principal.scopes
+    )
+
+
+def _workspace_audit_fields(
+    request: Request,
+    *,
+    decision: str,
+    status: int,
+    reason: Optional[str] = None,
+    object_kind: Optional[str] = None,
+    object_id: Optional[object] = None,
+) -> dict[str, Any]:
+    principal = request.state.token_principal
+    items = request.query_params.multi_items()
+    requested_board = (
+        WORKSPACE_BOARD
+        if len(items) == 1 and items[0] == ("board", WORKSPACE_BOARD)
+        else None
+    )
+    bounded_object_id = None
+    if object_id is not None:
+        candidate = str(object_id)
+        bounded_object_id = candidate if len(candidate) <= 128 else candidate[:128]
+    return {
+        "provider": principal.provider,
+        "principal": principal.principal,
+        "credential_id": principal.credential_id,
+        "grant": WORKSPACE_GRANT,
+        "project": WORKSPACE_PROJECT,
+        "board": WORKSPACE_BOARD,
+        "source": "raphael-workspace-machine",
+        "method": request.method,
+        "route_template": getattr(
+            request.state, "token_route_template", request.url.path
+        ),
+        "requested_board": requested_board,
+        "object_kind": object_kind,
+        "object_id": bounded_object_id,
+        "decision": decision,
+        "reason": reason,
+        "status": status,
+        "ip": transport_peer_ip(request),
+    }
+
+
+def _workspace_audit(
+    request: Request,
+    event: AuditEvent,
+    *,
+    decision: str,
+    status: int,
+    reason: Optional[str] = None,
+    object_kind: Optional[str] = None,
+    object_id: Optional[object] = None,
+) -> None:
+    """Durably audit a machine decision or fail closed with generic 503."""
+    try:
+        audit_log(
+            event,
+            strict=True,
+            **_workspace_audit_fields(
+                request,
+                decision=decision,
+                status=status,
+                reason=reason,
+                object_kind=object_kind,
+                object_id=object_id,
+            ),
+        )
+        request.state.token_route_audited = True
+    except Exception:
+        raise HTTPException(status_code=503, detail="Service Unavailable")
+
+
+def _workspace_audit_deny(
+    request: Request,
+    *,
+    reason: str,
+    status: int,
+    object_kind: Optional[str] = None,
+    object_id: Optional[object] = None,
+) -> None:
+    _workspace_audit(
+        request,
+        AuditEvent.TOKEN_AUTH_FAILURE,
+        decision="deny",
+        status=status,
+        reason=reason,
+        object_kind=object_kind,
+        object_id=object_id,
+    )
+
+
+def _workspace_require_no_query(request: Request) -> None:
+    """Routes 1-2 (``/projects``, ``/boards``): no query string admitted at all."""
+    if request.query_params.multi_items():
+        _workspace_audit_deny(request, reason="unexpected_query", status=400)
+        raise HTTPException(status_code=400, detail="Bad Request")
+
+
+def _workspace_require_board_only(request: Request) -> None:
+    """Routes 3-9: exactly one query param named 'board', value exactly the granted board.
+
+    A single check covers missing / duplicate / extra / wrong / wildcard /
+    malformed / encoded-alias board values: after FastAPI/Starlette's
+    standard single-pass percent-decoding, anything other than the one
+    literal granted board string fails a plain ``==`` comparison. No
+    special-casing is needed for any one of those shapes.
+    """
+    items = request.query_params.multi_items()
+    if len(items) != 1 or items[0][0] != "board" or items[0][1] != WORKSPACE_BOARD:
+        _workspace_audit_deny(request, reason="board_query_invalid", status=400)
+        raise HTTPException(status_code=400, detail="Bad Request")
+
+
+def _workspace_deny_not_found(
+    request: Request,
+    *,
+    reason: str,
+    object_kind: Optional[str] = None,
+    object_id: Optional[object] = None,
+) -> HTTPException:
+    """Cross-board / nonexistent task, attachment, or run: generic 404.
+
+    Never distinguishes "belongs to another board" from "does not exist at
+    all" — both look identical to the caller.
+    """
+    _workspace_audit_deny(
+        request,
+        reason=reason,
+        status=404,
+        object_kind=object_kind,
+        object_id=object_id,
+    )
+    return HTTPException(status_code=404, detail="Not Found")
+
+
+def _workspace_maybe_respond(
+    request: Request,
+    *,
+    require_board: bool,
+    builder,
+    not_found_reason: str = "not_found",
+    object_kind: Optional[str] = None,
+    object_id: Optional[object] = None,
+):
+    """The one call each of the nine handlers makes to opt into machine auth.
+
+    Returns ``None`` immediately (no validation, no audit, no query) for any
+    call that is not machine-authenticated under ``WORKSPACE_REQUIRED_SCOPE``
+    — the caller then falls through to its unmodified interactive body.
+
+    For a machine call: validates the query-parameter shape (400 on any
+    violation), confirms the fixed project/board binding still exists, then
+    calls ``builder()``. ``builder`` returns either
+    the JSON-able response dict, or ``None`` to mean "not found in the
+    granted board" (404). A successful decision is durably audited only
+    after the read completed and before its result is returned. Audit failure
+    therefore fails closed with 503 and never produces an unaudited response.
+    """
+    if not _is_workspace_machine_call(request):
+        return None
+    if require_board:
+        _workspace_require_board_only(request)
+    else:
+        _workspace_require_no_query(request)
+    if not _workspace_scope_is_active():
+        raise _workspace_deny_not_found(
+            request,
+            reason="scope_binding_unavailable",
+            object_kind=object_kind,
+            object_id=object_id,
+        )
+    try:
+        result = builder()
+    except (KeyError, OSError, TypeError, ValueError, sqlite3.Error):
+        _workspace_audit_deny(
+            request,
+            reason="read_unavailable",
+            status=503,
+            object_kind=object_kind,
+            object_id=object_id,
+        )
+        raise HTTPException(status_code=503, detail="Service Unavailable")
+    if result is None:
+        raise _workspace_deny_not_found(
+            request,
+            reason=not_found_reason,
+            object_kind=object_kind,
+            object_id=object_id,
+        )
+    _workspace_audit(
+        request,
+        AuditEvent.TOKEN_AUTH_SUCCESS,
+        decision="allow",
+        status=200,
+        object_kind=object_kind,
+        object_id=object_id,
+    )
+    return result
+
+
+def _workspace_ro_conn() -> Optional[sqlite3.Connection]:
+    """Open the granted board's kanban.db read-only, or None if absent yet.
+
+    Mirrors ``_recommendations_ro_conn`` exactly: ``mode=ro`` + ``PRAGMA
+    query_only=ON`` is belt-and-suspenders so even a bug in the SQL below
+    cannot write, and this never calls ``kanban_db.connect()``/``init_db()``
+    — those create the file and open it writable, neither of which a
+    read-only scoped credential may trigger as a side effect of a mere read.
+    Boards are separate SQLite files per ``kanban_db.kanban_db_path``, so
+    connecting here already confines every query below to this one board —
+    a task/attachment/run id from another board is a different physical
+    file and simply will not be found.
+    """
+    # Do not consult HERMES_KANBAN_DB here: that override is a
+    # dispatcher-to-worker handoff, while this credential is permanently
+    # bound to one named board.
+    path = kanban_db.board_dir(WORKSPACE_BOARD) / "kanban.db"
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+    except (OSError, sqlite3.Error):
+        return None
+
+
+def _workspace_projects_ro_conn() -> Optional[sqlite3.Connection]:
+    from hermes_cli import projects_db
+
+    path = projects_db.projects_db_path()
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+    except (OSError, sqlite3.Error):
+        return None
+
+
+def _workspace_scope_snapshot():
+    """Resolve the fixed project/board grant without writable helpers."""
+    from hermes_cli import projects_db
+
+    conn = _workspace_projects_ro_conn()
+    if conn is None:
+        return None
+    try:
+        try:
+            project = projects_db.get_project(conn, WORKSPACE_PROJECT)
+        except (KeyError, TypeError, ValueError, sqlite3.Error):
+            return None
+    finally:
+        conn.close()
+    if project is None or project.slug != WORKSPACE_PROJECT or project.archived:
+        return None
+    if not kanban_db.board_exists(WORKSPACE_BOARD):
+        return None
+    try:
+        meta = kanban_db.read_board_metadata(WORKSPACE_BOARD)
+    except (OSError, TypeError, ValueError):
+        return None
+    if (
+        meta.get("slug") != WORKSPACE_BOARD
+        or bool(meta.get("archived"))
+        or meta.get("project_id") != project.id
+    ):
+        return None
+    return project, meta
+
+
+def _workspace_scope_is_active() -> bool:
+    return _workspace_scope_snapshot() is not None
+
+
+def _workspace_iso_timestamp(value: Optional[int]) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(
+            int(value), tz=dt.timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
+def _workspace_sanitize_filename(name: str) -> str:
+    base = Path(name or "attachment").name
+    cleaned = _WORKSPACE_UNSAFE_FILENAME_RE.sub("_", base).strip() or "attachment"
+    return cleaned
+
+
+def _workspace_validate_media_type(content_type: Optional[str]) -> str:
+    ct = (content_type or "").strip()
+    if ct and _WORKSPACE_MEDIA_TYPE_RE.match(ct):
+        return ct
+    return "application/octet-stream"
+
+
+def _workspace_task_updated_at(
+    conn: sqlite3.Connection, task_ids: list[str]
+) -> dict[str, int]:
+    """Latest ``task_events.created_at`` per task id, batched.
+
+    Tasks have no ``updated_at`` column (see ``kanban_db.Task``) — this is
+    the same "derive freshness from task_events" approach the interactive
+    board/card views use for age metrics. Callers fall back to the task's
+    own ``created_at`` for a task with no events yet.
+    """
+    if not task_ids:
+        return {}
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"SELECT task_id, MAX(created_at) AS latest FROM task_events "
+        f"WHERE task_id IN ({placeholders}) GROUP BY task_id",
+        task_ids,
+    ).fetchall()
+    return {r["task_id"]: int(r["latest"]) for r in rows}
+
+
+def _workspace_projects_response() -> Optional[dict]:
+    snapshot = _workspace_scope_snapshot()
+    if snapshot is None:
+        return None
+    project, _ = snapshot
+    return {
+        "projects": [
+            {"id": project.id, "slug": project.slug, "name": project.name}
+        ]
+    }
+
+
+def _workspace_boards_response() -> Optional[dict]:
+    snapshot = _workspace_scope_snapshot()
+    if snapshot is None:
+        return None
+    _, meta = snapshot
+    counts = {name: 0 for name in (*BOARD_COLUMNS, "archived")}
+    conn = _workspace_ro_conn()
+    if conn is not None:
+        try:
+            for row in conn.execute(
+                "SELECT status, COUNT(*) AS n FROM tasks "
+                "WHERE task_kind = 'work' GROUP BY status"
+            ):
+                if row["status"] in counts:
+                    counts[row["status"]] = int(row["n"])
+        finally:
+            conn.close()
+    return {
+        "boards": [
+            {
+                "slug": meta["slug"],
+                "name": meta["name"],
+                "project_id": meta.get("project_id"),
+                "counts": counts,
+                "total": sum(counts[name] for name in BOARD_COLUMNS),
+            }
+        ]
+    }
+
+
+def _workspace_board_response() -> dict:
+    empty_columns = {"columns": [{"name": name, "tasks": []} for name in BOARD_COLUMNS]}
+    conn = _workspace_ro_conn()
+    if conn is None:
+        return empty_columns
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+        updated_map = _workspace_task_updated_at(conn, [t.id for t in tasks])
+        columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
+        for t in tasks:
+            col = t.status if t.status in columns else "todo"
+            columns[col].append(
+                {
+                    "id": t.id,
+                    "title": t.title,
+                    "assignee_name": t.assignee,
+                    "updated_at": _workspace_iso_timestamp(
+                        updated_map.get(t.id, t.created_at)
+                    ),
+                }
+            )
+        return {"columns": [{"name": name, "tasks": columns[name]} for name in columns]}
+    finally:
+        conn.close()
+
+
+def _workspace_workers_response() -> dict:
+    conn = _workspace_ro_conn()
+    if conn is None:
+        return {"workers": []}
+    try:
+        rows = conn.execute(
+            """
+            SELECT r.profile, t.title AS task_title, r.started_at
+            FROM task_runs r
+            JOIN tasks t ON t.id = r.task_id
+            WHERE r.ended_at IS NULL
+              AND r.worker_pid IS NOT NULL
+              AND r.profile IS NOT NULL
+              AND t.status = 'running'
+              AND t.task_kind = 'work'
+            ORDER BY r.started_at ASC
+            """
+        ).fetchall()
+        return {
+            "workers": [
+                {
+                    "profile": row["profile"],
+                    "task_title": row["task_title"],
+                    "started_at": int(row["started_at"]),
+                }
+                for row in rows
+            ]
+        }
+    finally:
+        conn.close()
+
+
+def _workspace_assignees_response() -> dict:
+    conn = _workspace_ro_conn()
+    if conn is None:
+        return {"assignees": []}
+    try:
+        return {"assignees": kanban_db.known_assignees(conn)}
+    finally:
+        conn.close()
+
+
+def _workspace_task_runs_response(task_id: str) -> Optional[dict]:
+    conn = _workspace_ro_conn()
+    if conn is None:
+        return None
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            return None
+        runs = kanban_db.list_runs(conn, task_id)
+        return {"runs": [r.id for r in runs]}
+    finally:
+        conn.close()
+
+
+def _workspace_task_attachments_response(task_id: str) -> Optional[dict]:
+    conn = _workspace_ro_conn()
+    if conn is None:
+        return None
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            return None
+        atts = kanban_db.list_attachments(conn, task_id)
+        return {
+            "attachments": [
+                {
+                    "id": a.id,
+                    "filename": a.filename,
+                    "media_type": a.content_type,
+                    "size": a.size,
+                    "created_at": _workspace_iso_timestamp(a.created_at),
+                }
+                for a in atts
+            ]
+        }
+    finally:
+        conn.close()
+
+
+def _workspace_attachment_bytes(attachment_id: int):
+    """Return bounded bytes for a regular granted-board attachment, or None."""
+    conn = _workspace_ro_conn()
+    if conn is None:
+        return None
+    try:
+        att = kanban_db.get_attachment(conn, attachment_id)
+        if att is None or kanban_db.get_task(conn, att.task_id) is None:
+            return None
+        # Same fixed-board rule as _workspace_ro_conn: an attachments-root
+        # override must not widen this credential to another directory.
+        root = (kanban_db.board_dir(WORKSPACE_BOARD) / "attachments").resolve()
+        try:
+            stored = Path(att.stored_path).resolve()
+            stored.relative_to(root)
+        except (ValueError, OSError):
+            return None
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(stored, flags)
+        except OSError:
+            return None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            size = int(info.st_size)
+            if size < 0 or size > KANBAN_ATTACHMENT_MAX_BYTES or size != int(att.size):
+                return None
+            chunks: list[bytes] = []
+            remaining = size
+            while remaining:
+                chunk = os.read(fd, min(remaining, 1024 * 1024))
+                if not chunk:
+                    return None
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(fd, 1):
+                return None
+            return att, b"".join(chunks)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+    finally:
+        conn.close()
+
+
+def _workspace_run_response(run_id: int) -> Optional[dict]:
+    conn = _workspace_ro_conn()
+    if conn is None:
+        return None
+    try:
+        # Explicit join on task_kind='work': belt-and-suspenders isolation
+        # from recommendation-lifecycle rows, mirroring the read-only
+        # connection's own "even a bug here cannot..." posture — the
+        # dispatcher never spawns/transitions a recommendation so this is
+        # not reachable in practice, but this credential's read path does
+        # not rely on that being true elsewhere.
+        row = conn.execute(
+            "SELECT r.* FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            "WHERE r.id = ? AND t.task_kind = 'work'",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        r = kanban_db.Run.from_row(row)
+        return {
+            "run": {
+                "id": r.id,
+                "status": r.status,
+                "started_at": _workspace_iso_timestamp(r.started_at),
+                "finished_at": _workspace_iso_timestamp(r.ended_at),
+                "worker_name": r.profile,
+            }
+        }
+    finally:
+        conn.close()
+
 
 _RECOMMENDATION_SCOPE_WILDCARDS = {"", "all", "*", "any"}
 _RECOMMENDATION_CURSOR_SEP = "\x1f"

@@ -1,5 +1,50 @@
 # Architecture Decision Records
 
+## 2026-08-18: Use a fixed, revocable machine credential for Raphael Workspace reads
+
+Status: Accepted
+
+Context:
+Raphael Workspace needs server-to-server access to a small part of the Kanban
+dashboard API. Reusing the browser's process-wide session bearer would give the
+Workspace every dashboard capability, could not be revoked independently, and
+would couple a service deployment to an interactive login. Creating a second
+Kanban API or database would duplicate authority and eventually drift from the
+native dashboard.
+
+Decision:
+- Keep the existing Kanban handlers as the only data authority. Nine existing
+  `GET` routes opt into the shared dashboard token middleware while retaining
+  their unchanged cookie/session behavior for interactive callers.
+- Reserve the `hrw1_` credential family for this contour. A token is bound to
+  the fixed `raphael-workspace` principal, `kanban.read` scope, project, board,
+  and grant version. Any other path, method, method-override header, query
+  shape, or cross-board object fails closed.
+- Store only token identifiers and SHA-256 digests under `HERMES_HOME`; bearer
+  plaintext is written once to an explicit owner-only file. Tokens have bounded
+  expiry, support independent rotation and immediate revocation, and are
+  verified from disk on every request.
+- Read project and board state through SQLite `mode=ro` plus `query_only`.
+  Machine responses expose only the fields consumed by Workspace, exclude
+  recommendation cards from ordinary work, and serve attachment bytes only
+  after board/task/path/type/size ownership checks.
+- Durably audit issuance, revocation, allowed reads, and denials using the
+  transport peer address. If the audit record cannot be written, the machine
+  operation returns a generic `503` instead of proceeding unaudited.
+
+Operations:
+```bash
+hermes kanban-workspace-token issue --out /owner-only/path/workspace.token --ttl-days 90
+hermes kanban-workspace-token list
+hermes kanban-workspace-token revoke <token_id>
+```
+
+For rotation, issue with `--replaces <active_token_id>`, deploy and verify the
+new credential, then revoke the old identifier. Issuance never revokes the old
+token automatically, so a failed cutover remains recoverable. This credential
+is not a general public API key and grants no write, recommendation-decision,
+profile-management, connector, pipeline, or deployment authority.
+
 ## 2026-07-13: Scope plugin manager state by Hermes home/profile (keyed cache)
 
 Status: Accepted
