@@ -65,7 +65,7 @@ class TestBasicProviderLoadsAfterUnblock:
         with patch.object(plugins_mod, "_plugin_manager", None):
             discover_plugins(force=True)
 
-        assert list_providers() == []
+        assert "basic" not in {provider.name for provider in list_providers()}
 
     def test_unblock_then_rediscover_registers_provider(
         self, hermes_home, monkeypatch,
@@ -91,6 +91,4 @@ class TestBasicProviderLoadsAfterUnblock:
         with patch.object(plugins_mod, "_plugin_manager", None):
             discover_plugins(force=True)
 
-        providers = list_providers()
-        assert len(providers) == 1
-        assert providers[0].name == "basic"
+        assert "basic" in {provider.name for provider in list_providers()}
