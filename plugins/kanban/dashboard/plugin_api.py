@@ -119,7 +119,7 @@ def _register_recommendations_machine_route() -> None:
 
 _register_recommendations_machine_route()
 
-# ITEM 32G-A: the exact nine-route, read-only "Raphael Workspace" machine
+# ITEM 32G-A: the exact read-only "Raphael Workspace" machine
 # surface. Unlike the recommendations route above, these are EXISTING
 # interactive dashboard routes that must ALSO accept the workspace bearer
 # credential without changing a single byte of their session/cookie
@@ -135,6 +135,7 @@ _register_recommendations_machine_route()
 WORKSPACE_ROUTE_METHOD = "GET"
 _WORKSPACE_API_PREFIX = "/api/plugins/kanban"
 _WORKSPACE_LITERAL_ROUTE_PATHS = (
+    f"{_WORKSPACE_API_PREFIX}/profiles",
     f"{_WORKSPACE_API_PREFIX}/projects",
     f"{_WORKSPACE_API_PREFIX}/boards",
     f"{_WORKSPACE_API_PREFIX}/board",
@@ -2842,7 +2843,7 @@ class DescribeAutoBody(BaseModel):
 
 
 @router.get("/profiles")
-def list_profile_roster():
+def list_profile_roster(request: Request):
     """Return every installed profile with its description.
 
     Consumed by the dashboard's settings panel (orchestrator picker)
@@ -2850,6 +2851,14 @@ def list_profile_roster():
     description still appear here — they're routable on name alone,
     just less precisely.
     """
+    _workspace_response = _workspace_maybe_respond(
+        request,
+        require_board=False,
+        builder=_workspace_profiles_response,
+        object_kind="profile_roster",
+    )
+    if _workspace_response is not None:
+        return _workspace_response
     try:
         from hermes_cli import profiles as profiles_mod
         profiles = profiles_mod.list_profiles()
@@ -3498,6 +3507,18 @@ def _workspace_projects_response() -> Optional[dict]:
     return {
         "projects": [
             {"id": project.id, "slug": project.slug, "name": project.name}
+        ]
+    }
+
+
+def _workspace_profiles_response() -> dict:
+    """Project only routing metadata needed by the owner-side planner."""
+    from hermes_cli import profiles as profiles_mod
+
+    return {
+        "profiles": [
+            {"name": profile.name, "description": profile.description or ""}
+            for profile in profiles_mod.list_profiles()
         ]
     }
 
