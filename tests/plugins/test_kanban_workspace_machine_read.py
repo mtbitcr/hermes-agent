@@ -194,6 +194,18 @@ def _get(surface, path: str, *, query: str = ""):
 
 def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_surface):
     s = workspace_surface
+    profiles = _get(s, "/api/plugins/kanban/profiles")
+    assert profiles.status_code == 200
+    assert set(profiles.json()) == {"profiles"}
+    coder_profile = next(
+        item for item in profiles.json()["profiles"] if item["name"] == "coder"
+    )
+    assert coder_profile == {"name": "coder", "description": ""}
+    assert all(
+        set(item) == {"name", "description"}
+        for item in profiles.json()["profiles"]
+    )
+
     project = _get(s, "/api/plugins/kanban/projects")
     assert project.status_code == 200
     assert project.json() == {
@@ -309,6 +321,7 @@ def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_su
 @pytest.mark.parametrize(
     ("path", "query"),
     [
+        ("/api/plugins/kanban/profiles", "?extra=1"),
         ("/api/plugins/kanban/projects", "?extra=1"),
         ("/api/plugins/kanban/boards", "?include_archived=false"),
         ("/api/plugins/kanban/board", ""),
