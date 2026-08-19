@@ -1,7 +1,8 @@
-"""On-disk registry for Raphael's managed dashboard read credentials.
+"""On-disk registry for Raphael's managed dashboard credentials.
 
-The Workspace and owner-recommendations surfaces share one lifecycle registry
-but use disjoint fixed token prefixes, principals, scopes, and grants. The CLI
+The Workspace, owner-recommendations, and Connections surfaces share one
+lifecycle registry but use disjoint fixed token prefixes, principals, scopes,
+and grants. The CLI
 can issue any number of bearer tokens, each individually revocable and
 independently expiring; recommendation tokens are hard-capped at eight hours.
 What is persisted here is auth METADATA ONLY — a per-token id, a SHA-256 digest
@@ -62,8 +63,16 @@ RECOMMENDATIONS_BOARD = "raphael-workspace"
 RECOMMENDATIONS_TOKEN_PREFIX = "hrr1_"
 RECOMMENDATIONS_GRANT = "raphael-workspace-recommendations-read-v1"
 
+CONNECTIONS_PRINCIPAL = "raphael-connections-manager"
+CONNECTIONS_SCOPE = "mcp.connections.manage"
+CONNECTIONS_PROJECT = "raphael-workspace"
+CONNECTIONS_BOARD = "raphael-workspace"
+CONNECTIONS_TOKEN_PREFIX = "hrc1_"
+CONNECTIONS_GRANT = "raphael-workspace-connections-manage-v1"
+
 WORKSPACE_SURFACE = "workspace"
 RECOMMENDATIONS_SURFACE = "recommendations"
+CONNECTIONS_SURFACE = "connections"
 
 
 @dataclass(frozen=True)
@@ -132,6 +141,18 @@ _FIXED_TOKEN_POLICIES = {
         provider="raphael-recommendations-token",
         default_ttl_seconds=RECOMMENDATIONS_DEFAULT_TTL_SECONDS,
         max_ttl_seconds=RECOMMENDATIONS_MAX_TTL_SECONDS,
+    ),
+    CONNECTIONS_SURFACE: FixedTokenPolicy(
+        surface=CONNECTIONS_SURFACE,
+        token_prefix=CONNECTIONS_TOKEN_PREFIX,
+        principal=CONNECTIONS_PRINCIPAL,
+        scope=CONNECTIONS_SCOPE,
+        project=CONNECTIONS_PROJECT,
+        board=CONNECTIONS_BOARD,
+        grant=CONNECTIONS_GRANT,
+        provider="raphael-connections-token",
+        default_ttl_seconds=DEFAULT_TTL_SECONDS,
+        max_ttl_seconds=MAX_TTL_SECONDS,
     ),
 }
 

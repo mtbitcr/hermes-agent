@@ -107,6 +107,26 @@ class TestProfileScopedEnv:
 
 class TestProfileScopedMcp:
 
+    def test_mcp_connection_status_reads_only_the_requested_profile(
+        self, client, isolated_profiles
+    ):
+        from tools.mcp_oauth import HermesTokenStorage
+
+        (isolated_profiles["worker_beta"] / "config.yaml").write_text(
+            "mcp_servers:\n  reports:\n    url: https://example.com/mcp\n    auth: oauth\n",
+            encoding="utf-8",
+        )
+        storage = HermesTokenStorage(
+            "reports", hermes_home=isolated_profiles["worker_beta"]
+        )
+        storage._tokens_path().parent.mkdir(parents=True, exist_ok=True)
+        storage._tokens_path().write_text("{}", encoding="utf-8")
+
+        response = client.get("/api/mcp/servers", params={"profile": "worker_beta"})
+
+        assert response.status_code == 200
+        assert response.json()["servers"][0]["connection_status"] == "connected"
+
     def test_mcp_bearer_secret_is_profile_scoped(self, client, isolated_profiles):
         secret = "worker-only-secret"
         response = client.post(

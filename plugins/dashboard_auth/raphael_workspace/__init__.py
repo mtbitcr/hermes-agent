@@ -1,26 +1,28 @@
 """Managed, revocable and expiring machine credentials for Raphael dashboards.
 
 The providers below share one audited metadata registry while retaining
-separate fixed token families and scopes for the Workspace work view and the
-owner-only recommendations inbox.
+separate fixed token families and scopes for the Workspace work view, the
+owner-only recommendations inbox, and the Connections Center.
 
 What they are
 -------------
-Two service-to-service providers verify
+Three service-to-service providers verify
 ``Authorization: Bearer <token_id>.<secret>`` against the same on-disk
 registry in :mod:`token_store`. ``hrw1_`` tokens carry only
 ``kanban.read`` for the fixed Workspace GET surface; ``hrr1_`` tokens carry
-only ``kanban:recommendations:read`` for the owner inbox. A token from one
-family is rejected by the other provider before route scope enforcement.
+only ``kanban:recommendations:read`` for the owner inbox; ``hrc1_`` tokens
+carry only ``mcp.connections.manage`` for the exact Connections API contour.
+A token from one family is rejected by the other providers before route scope
+enforcement.
 
 Lifecycle and isolation
 -----------------------
-Both managed families support issue/list/revoke, bounded expiry and immediate
+All managed families support issue/list/revoke, bounded expiry and immediate
 revocation through :mod:`token_store`. Every request verifies fresh against
 disk (no cache), so ``revoke`` takes effect on the next request. They share
 the existing ``supports_token`` / ``verify_token`` + ``token_auth``
 middleware seam and ``TokenPrincipal`` contract, while exact scopes keep the
-two surfaces mutually unusable.
+three surfaces mutually unusable.
 
 There is no login, cookie, session, or refresh: only the token capability is
 implemented.
@@ -28,14 +30,15 @@ implemented.
 Configuration
 -------------
 Nothing goes in ``.env`` or ``config.yaml`` — there is no operator-supplied
-secret to provision. Credentials are minted locally via either:
+secret to provision. Credentials are minted locally via:
 
     hermes kanban-workspace-token issue --surface workspace --out <path>
     hermes kanban-workspace-token issue --surface recommendations --ttl-hours 8 --out <path>
+    hermes kanban-workspace-token issue --surface connections --out <path>
 
 The token family, principal, scope, grant and lifetime ceiling are fixed
 constants (see :mod:`token_store`), never operator-editable configuration.
-Both providers always register: an empty or missing registry denies every
+All providers always register: an empty or missing registry denies every
 ``verify_token`` call (fail-closed), so there is no "unset env
 var" skip-and-record-a-reason path like the static-secret plugins have — the
 CLI is what actually brings the credential into existence.
@@ -75,6 +78,12 @@ RECOMMENDATIONS_PROJECT = token_store.RECOMMENDATIONS_PROJECT
 RECOMMENDATIONS_BOARD = token_store.RECOMMENDATIONS_BOARD
 RECOMMENDATIONS_TOKEN_PREFIX = token_store.RECOMMENDATIONS_TOKEN_PREFIX
 RECOMMENDATIONS_GRANT = token_store.RECOMMENDATIONS_GRANT
+CONNECTIONS_PRINCIPAL = token_store.CONNECTIONS_PRINCIPAL
+CONNECTIONS_SCOPE = token_store.CONNECTIONS_SCOPE
+CONNECTIONS_PROJECT = token_store.CONNECTIONS_PROJECT
+CONNECTIONS_BOARD = token_store.CONNECTIONS_BOARD
+CONNECTIONS_TOKEN_PREFIX = token_store.CONNECTIONS_TOKEN_PREFIX
+CONNECTIONS_GRANT = token_store.CONNECTIONS_GRANT
 
 __all__ = [
     "PRINCIPAL",
@@ -89,8 +98,15 @@ __all__ = [
     "RECOMMENDATIONS_BOARD",
     "RECOMMENDATIONS_TOKEN_PREFIX",
     "RECOMMENDATIONS_GRANT",
+    "CONNECTIONS_PRINCIPAL",
+    "CONNECTIONS_SCOPE",
+    "CONNECTIONS_PROJECT",
+    "CONNECTIONS_BOARD",
+    "CONNECTIONS_TOKEN_PREFIX",
+    "CONNECTIONS_GRANT",
     "WorkspaceReadTokenProvider",
     "RecommendationsReadTokenProvider",
+    "ConnectionsManageTokenProvider",
     "register",
 ]
 
@@ -176,6 +192,16 @@ class RecommendationsReadTokenProvider(WorkspaceReadTokenProvider):
     expected_scope = RECOMMENDATIONS_SCOPE
 
 
+class ConnectionsManageTokenProvider(WorkspaceReadTokenProvider):
+    """Managed credential for the fixed owner Connections API contour."""
+
+    name = "raphael-connections-token"
+    display_name = "Raphael Connections (managed service credential)"
+    token_prefix = CONNECTIONS_TOKEN_PREFIX
+    expected_principal = CONNECTIONS_PRINCIPAL
+    expected_scope = CONNECTIONS_SCOPE
+
+
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
@@ -186,12 +212,13 @@ def register(ctx) -> None:
 
     Always registers (see module docstring): there is no weak-secret gate to
     fail here because there is no operator-supplied secret at all. The route
-    registrations themselves live in the Kanban plugin API
-    (``plugin_api.py``), unconditionally, so the 9 routes stay token-only
-    even if this plugin were somehow disabled.
+    registrations live beside their native route owners (Kanban plugin API or
+    MCP router), unconditionally, so the fixed route contours stay scoped even
+    if this plugin were somehow disabled.
     """
     ctx.register_dashboard_auth_provider(WorkspaceReadTokenProvider())
     ctx.register_dashboard_auth_provider(RecommendationsReadTokenProvider())
+    ctx.register_dashboard_auth_provider(ConnectionsManageTokenProvider())
     ctx.register_cli_command(
         name="kanban-workspace-token",
         help="Issue/list/revoke managed Raphael dashboard credentials",
@@ -199,16 +226,18 @@ def register(ctx) -> None:
         handler_fn=workspace_token_command,
         description=(
             "Manage revocable, expiring machine credentials for the fixed "
-            "Raphael Workspace and owner recommendations read surfaces. "
+            "Raphael Workspace, owner recommendations, and Connections surfaces. "
             "Recommendations tokens are independently scoped and capped at "
             "8 hours. 'issue' writes a new bearer once to an explicit path; "
             "'list' exposes only metadata; 'revoke' disables one token_id."
         ),
     )
     logger.info(
-        "raphael managed tokens: registered providers %r/%r (scopes=%s/%s)",
+        "raphael managed tokens: registered providers %r/%r/%r (scopes=%s/%s/%s)",
         WorkspaceReadTokenProvider.name,
         RecommendationsReadTokenProvider.name,
+        ConnectionsManageTokenProvider.name,
         SCOPE,
         RECOMMENDATIONS_SCOPE,
+        CONNECTIONS_SCOPE,
     )

@@ -18,8 +18,16 @@ from typing import Any, Dict, Optional  # noqa: F401
 from fastapi import APIRouter, HTTPException, Request  # noqa: F401
 from fastapi.responses import HTMLResponse  # noqa: F401
 
+from hermes_cli.dashboard_auth.audit import AuditEvent, AuditWriteError, audit_log
+from hermes_cli.dashboard_auth.token_auth import (
+    register_machine_token_family,
+    register_token_route,
+    register_token_route_template,
+    transport_peer_ip,
+)
 from hermes_cli.web_deps import late, LateState
 from hermes_cli.web_models import (
+    MCPAuthStart,
     MCPCatalogInstall,
     MCPEnabledToggle,
     MCPServerCreate,
@@ -30,6 +38,82 @@ from hermes_cli.web_models import (
 _log = logging.getLogger("hermes_cli.web_server")
 
 router = APIRouter()
+
+
+# Raphael Workspace's Connections Center uses one managed credential that is
+# disjoint from the read-only Kanban and recommendations credentials. Only the
+# exact method+route pairs used by that UI are granted; the ordinary dashboard
+# session/cookie flow remains available on the same routes.
+from plugins.dashboard_auth.raphael_workspace import (  # noqa: E402
+    CONNECTIONS_GRANT,
+    CONNECTIONS_SCOPE,
+    CONNECTIONS_TOKEN_PREFIX,
+)
+
+_CONNECTIONS_LITERAL_ROUTES = (
+    ("GET", "/api/mcp/catalog"),
+    ("GET", "/api/mcp/servers"),
+    ("POST", "/api/mcp/catalog/install"),
+)
+_CONNECTIONS_TEMPLATE_ROUTES = (
+    ("POST", "/api/mcp/servers/{name}/auth"),
+    ("PUT", "/api/mcp/servers/{name}/enabled"),
+    ("DELETE", "/api/mcp/servers/{name}"),
+    ("GET", "/api/mcp/oauth/callback/{name}"),
+)
+
+
+def _register_connections_machine_routes() -> None:
+    register_machine_token_family(CONNECTIONS_TOKEN_PREFIX, strict_audit=True)
+    for method, path in _CONNECTIONS_LITERAL_ROUTES:
+        register_token_route(
+            path,
+            method=method,
+            required_scope=CONNECTIONS_SCOPE,
+            optional=True,
+            strict_audit=True,
+        )
+    for method, path in _CONNECTIONS_TEMPLATE_ROUTES:
+        register_token_route_template(
+            path,
+            method=method,
+            required_scope=CONNECTIONS_SCOPE,
+            optional=True,
+            strict_audit=True,
+        )
+
+
+_register_connections_machine_routes()
+
+
+def _audit_connections_machine_success(
+    request: Request, *, connection: Optional[str] = None
+) -> None:
+    """Durably audit successful machine use; interactive calls are unchanged."""
+    if not getattr(request.state, "token_authenticated", False):
+        return
+    principal = request.state.token_principal
+    try:
+        audit_log(
+            AuditEvent.TOKEN_AUTH_SUCCESS,
+            strict=True,
+            provider=principal.provider,
+            principal=principal.principal,
+            credential_id=principal.credential_id,
+            grant=CONNECTIONS_GRANT,
+            source="raphael-connections",
+            method=request.method,
+            route_template=getattr(
+                request.state, "token_route_template", request.url.path
+            ),
+            connection=connection,
+            decision="allow",
+            status=200,
+            ip=transport_peer_ip(request),
+        )
+        request.state.token_route_audited = True
+    except AuditWriteError as exc:
+        raise HTTPException(status_code=503, detail="Service Unavailable") from exc
 
 # Late-bound web_server helpers (resolved at call time; cycle-safe,
 # monkeypatch-transparent).
@@ -59,19 +143,19 @@ _CONFIG_MUTATION_LOCK = LateState("_CONFIG_MUTATION_LOCK")
 
 
 @router.get("/api/mcp/servers")
-async def list_mcp_servers(profile: Optional[str] = None):
+async def list_mcp_servers(request: Request, profile: Optional[str] = None):
     from hermes_cli.mcp_config import _get_mcp_servers
 
     def _read():
         with _profile_scope(profile):
-            return _get_mcp_servers()
+            return [
+                _mcp_server_summary(name, cfg)
+                for name, cfg in sorted(_get_mcp_servers().items())
+            ]
 
-    servers = await asyncio.to_thread(_read)
-    return {
-        "servers": [
-            _mcp_server_summary(name, cfg) for name, cfg in sorted(servers.items())
-        ]
-    }
+    result = {"servers": await asyncio.to_thread(_read)}
+    _audit_connections_machine_success(request)
+    return result
 
 
 @router.post("/api/mcp/servers")
@@ -105,16 +189,17 @@ async def add_mcp_server(body: MCPServerCreate, profile: Optional[str] = None):
                         status_code=400,
                         detail=f"Server '{name}' rejected: suspicious command/args configuration",
                     )
+            return _mcp_server_summary(name, server_config)
 
     try:
-        await asyncio.to_thread(_run)
+        summary = await asyncio.to_thread(_run)
     except HTTPException:
         raise
     except Exception as exc:
         _log.exception("POST /api/mcp/servers failed")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    return _mcp_server_summary(name, server_config)
+    return summary
 
 
 @router.put("/api/mcp/servers")
@@ -141,17 +226,27 @@ async def replace_mcp_servers(body: MCPServersReplace, profile: Optional[str] = 
 
 
 @router.delete("/api/mcp/servers/{name}")
-async def remove_mcp_server(name: str, profile: Optional[str] = None):
-    from hermes_cli.mcp_config import _remove_mcp_server
+async def remove_mcp_server(
+    name: str, request: Request, profile: Optional[str] = None
+):
+    from hermes_cli.mcp_config import _remove_mcp_server_and_credentials
 
     def _run():
         with _profile_scope(profile):
             with _CONFIG_MUTATION_LOCK:
-                return _remove_mcp_server(name)
+                return _remove_mcp_server_and_credentials(name)
 
-    removed = await asyncio.to_thread(_run)
+    try:
+        removed = await asyncio.to_thread(_run)
+    except Exception as exc:
+        _log.exception("DELETE /api/mcp/servers/%s failed", name)
+        raise HTTPException(
+            status_code=500,
+            detail="Connection could not be revoked. Nothing was reported as removed.",
+        ) from exc
     if not removed:
         raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
+    _audit_connections_machine_success(request, connection=name)
     return {"ok": True}
 
 
@@ -234,7 +329,12 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
 
 
 @router.post("/api/mcp/servers/{name}/auth")
-async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = None):
+async def auth_mcp_server(
+    name: str,
+    request: Request,
+    body: Optional[MCPAuthStart] = None,
+    profile: Optional[str] = None,
+):
     """Start MCP OAuth and hand the authorization URL to the dashboard browser."""
     from hermes_cli.mcp_config import _get_mcp_servers
     from tools.mcp_dashboard_oauth import DashboardOAuthFlow
@@ -259,13 +359,38 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
         raise HTTPException(status_code=400, detail="This server uses header/API-key auth, not OAuth")
     cfg["auth"] = "oauth"
 
+    requested_redirect_uri = body.redirect_uri if body is not None else None
+    if requested_redirect_uri is not None:
+        from urllib.parse import quote, urlsplit, urlunsplit
+
+        try:
+            parsed_redirect = urlsplit(requested_redirect_uri)
+            expected_path = f"/api/mcp/oauth/callback/{quote(name, safe='')}"
+            valid_redirect = (
+                requested_redirect_uri == requested_redirect_uri.strip()
+                and len(requested_redirect_uri) <= 2048
+                and parsed_redirect.scheme == "https"
+                and bool(parsed_redirect.hostname)
+                and parsed_redirect.username is None
+                and parsed_redirect.password is None
+                and parsed_redirect.path == expected_path
+                and parsed_redirect.query == ""
+                and parsed_redirect.fragment == ""
+                and requested_redirect_uri == urlunsplit(parsed_redirect)
+            )
+        except (TypeError, ValueError):
+            valid_redirect = False
+        if not valid_redirect:
+            raise HTTPException(status_code=400, detail="Invalid OAuth redirect URI")
+
     flow_id = secrets.token_urlsafe(24)
     flow = DashboardOAuthFlow(
         flow_id=flow_id,
         server_name=name,
         profile=profile,
         hermes_home=flow_home,
-        redirect_uri=(cfg.get("oauth") or {}).get("redirect_uri")
+        redirect_uri=requested_redirect_uri
+        or (cfg.get("oauth") or {}).get("redirect_uri")
         or _mcp_oauth_callback_url(request, name),
         reconnect_live=flow_home == process_home,
     )
@@ -300,7 +425,9 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
         await flow.wait_for_authorization_url(timeout=30)
     except Exception as exc:
         flow.mark_error(str(exc))
-    return flow.snapshot()
+    result = flow.snapshot()
+    _audit_connections_machine_success(request, connection=name)
+    return result
 
 
 @router.get("/api/mcp/oauth/flows/{flow_id}")
@@ -335,6 +462,7 @@ async def cancel_mcp_oauth_flow(flow_id: str, request: Request):
 @router.get("/api/mcp/oauth/callback/{server_name:path}")
 async def mcp_oauth_callback(
     server_name: str,
+    request: Request,
     code: Optional[str] = None,
     state: Optional[str] = None,
     error: Optional[str] = None,
@@ -371,12 +499,16 @@ async def mcp_oauth_callback(
         )
     if error:
         return HTMLResponse("<h1>Authorization failed</h1><p>Return to Hermes for details.</p>", status_code=400)
+    _audit_connections_machine_success(request, connection=server_name)
     return HTMLResponse("<h1>Authorization received</h1><p>You can close this tab and return to Hermes.</p>")
 
 
 @router.put("/api/mcp/servers/{name}/enabled")
 async def set_mcp_server_enabled(
-    name: str, body: MCPEnabledToggle, profile: Optional[str] = None
+    name: str,
+    body: MCPEnabledToggle,
+    request: Request,
+    profile: Optional[str] = None,
 ):
     """Enable or disable an MCP server (takes effect on next session/gateway).
 
@@ -397,11 +529,13 @@ async def set_mcp_server_enabled(
                 save_config(cfg)
         return {"ok": True, "name": name, "enabled": bool(body.enabled)}
 
-    return await asyncio.to_thread(_run)
+    result = await asyncio.to_thread(_run)
+    _audit_connections_machine_success(request, connection=name)
+    return result
 
 
 @router.get("/api/mcp/catalog")
-async def list_mcp_catalog(profile: Optional[str] = None):
+async def list_mcp_catalog(request: Request, profile: Optional[str] = None):
     """Browse the Nous-approved MCP catalog (the optional-mcps/ manifests).
 
     Each entry reports whether it's already installed and enabled so the UI
@@ -484,11 +618,17 @@ async def list_mcp_catalog(profile: Optional[str] = None):
     except Exception:
         pass
 
-    return {"entries": entries, "diagnostics": diagnostics}
+    result = {"entries": entries, "diagnostics": diagnostics}
+    _audit_connections_machine_success(request)
+    return result
 
 
 @router.post("/api/mcp/catalog/install")
-async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[str] = None):
+async def install_mcp_catalog_entry(
+    body: MCPCatalogInstall,
+    request: Request,
+    profile: Optional[str] = None,
+):
     """Install a catalog MCP into config.yaml.
 
     For HTTP/stdio entries with required env vars, those are written to .env
@@ -532,7 +672,9 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
             raise
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Install failed: {exc}")
-        return {"ok": True, "name": name, "background": True, "action": action}
+        result = {"ok": True, "name": name, "background": True, "action": action}
+        _audit_connections_machine_success(request, connection=name)
+        return result
 
     # No git step — install synchronously via the catalog API. install_entry
     # routes through load_config/save_config + save_env_value, all call-time
@@ -551,4 +693,6 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
     except Exception as exc:
         _log.exception("install_mcp_catalog_entry failed")
         raise HTTPException(status_code=400, detail=str(exc))
-    return {"ok": True, "name": name, "background": False}
+    result = {"ok": True, "name": name, "background": False}
+    _audit_connections_machine_success(request, connection=name)
+    return result

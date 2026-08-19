@@ -117,6 +117,57 @@ def _remove_mcp_server(name: str) -> bool:
     return True
 
 
+def _mcp_connection_status(name: str, server_config: dict) -> str:
+    """Return a strict, secret-free connection state for dashboard readers.
+
+    OAuth configuration alone is not a connection. Only an on-disk token is
+    reported as connected; storage failures stay explicit instead of becoming
+    a false green. Non-OAuth servers use their existing configuration contract.
+    """
+    if server_config.get("auth") != "oauth":
+        return "configured"
+    try:
+        from tools.mcp_oauth import HermesTokenStorage
+
+        return (
+            "connected"
+            if HermesTokenStorage(name).has_cached_tokens()
+            else "needs_authorization"
+        )
+    except Exception as exc:  # pragma: no cover - defensive filesystem seam
+        logger.warning("Could not read OAuth connection state for '%s': %s", name, exc)
+        return "unknown"
+
+
+def _remove_mcp_server_and_credentials(name: str) -> bool:
+    """Remove one MCP server and its OAuth state as one user-visible action.
+
+    Credentials are cleared before the config entry so a cleanup failure can
+    never be reported as a successful revoke. If the subsequent config save
+    fails, the captured OAuth state and any cached provider are restored.
+    """
+    if name not in _get_mcp_servers():
+        return False
+
+    from hermes_constants import get_hermes_home
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import get_manager
+
+    hermes_home = get_hermes_home().expanduser().resolve(strict=False)
+    storage = HermesTokenStorage(name, hermes_home=hermes_home)
+    snapshot = storage.snapshot()
+    manager = get_manager()
+    cached_entry = manager.remove(name, hermes_home=hermes_home)
+    try:
+        if not _remove_mcp_server(name):
+            raise RuntimeError("MCP server disappeared during removal")
+    except Exception:
+        storage.restore(snapshot, only_if_absent=True)
+        manager.restore_entry(name, cached_entry, hermes_home=hermes_home)
+        raise
+    return True
+
+
 def _replace_mcp_servers(servers: Dict[str, dict]) -> Tuple[bool, List[str]]:
     """Replace the WHOLE ``mcp_servers`` map in config.yaml.
 
@@ -658,18 +709,13 @@ def cmd_mcp_remove(args):
         _info("Cancelled.")
         return
 
-    _remove_mcp_server(name)
-    _success(f"Removed '{name}' from config")
-
-    # Clean up OAuth tokens if they exist — route through MCPOAuthManager so
-    # any provider instance cached in the current process (e.g. from an
-    # earlier `hermes mcp test` in the same session) is evicted too.
     try:
-        from tools.mcp_oauth_manager import get_manager
-        get_manager().remove(name)
-        _success("Cleaned up OAuth tokens")
-    except Exception:
-        pass
+        _remove_mcp_server_and_credentials(name)
+    except Exception as exc:
+        _error(f"Could not remove '{name}': {exc}")
+        return
+
+    _success(f"Removed '{name}' from config and cleaned up OAuth state")
 
 
 # ─── hermes mcp list ──────────────────────────────────────────────────────────

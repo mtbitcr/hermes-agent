@@ -1,4 +1,4 @@
-"""Managed Raphael Workspace and owner-recommendations read credentials.
+"""Managed Raphael Workspace, recommendations, and Connections credentials.
 
 Covers the on-disk token registry (issue/list/revoke/expiry/restart
 persistence, exclusive/no-follow/mode/path failures for the plaintext
@@ -34,6 +34,7 @@ from hermes_cli.dashboard_auth.base import ProviderError
 from plugins.dashboard_auth.raphael_workspace import cli, token_store
 from plugins.dashboard_auth import raphael_workspace
 from plugins.dashboard_auth.raphael_workspace import (
+    ConnectionsManageTokenProvider,
     RecommendationsReadTokenProvider,
     WorkspaceReadTokenProvider,
 )
@@ -221,6 +222,18 @@ class TestLifecycle:
             recommendations.token_id,
         }
 
+    def test_connections_token_is_fixed_and_disjoint(self, workspace_home):
+        connections, plaintext = _issue(
+            workspace_home,
+            surface=token_store.CONNECTIONS_SURFACE,
+        )
+        assert connections.token_id.startswith(token_store.CONNECTIONS_TOKEN_PREFIX)
+        assert connections.principal == token_store.CONNECTIONS_PRINCIPAL
+        assert connections.scope == token_store.CONNECTIONS_SCOPE
+        assert connections.grant == token_store.CONNECTIONS_GRANT
+        token_id, secret = plaintext.split(".", 1)
+        assert token_store.verify(token_id, secret) == connections
+
     def test_replacement_cannot_cross_surfaces(self, workspace_home):
         workspace, _ = _issue(workspace_home)
         with pytest.raises(token_store.TokenStoreError):
@@ -361,13 +374,14 @@ class TestProvider:
     def test_plugin_registers_provider_and_cli(self):
         ctx = MagicMock()
         raphael_workspace.register(ctx)
-        assert ctx.register_dashboard_auth_provider.call_count == 2
+        assert ctx.register_dashboard_auth_provider.call_count == 3
         providers = [
             call.args[0] for call in ctx.register_dashboard_auth_provider.call_args_list
         ]
         assert [type(provider) for provider in providers] == [
             WorkspaceReadTokenProvider,
             RecommendationsReadTokenProvider,
+            ConnectionsManageTokenProvider,
         ]
         assert ctx.register_cli_command.call_args.kwargs["name"] == (
             "kanban-workspace-token"
@@ -376,6 +390,7 @@ class TestProvider:
     def test_protocol_compliance(self):
         assert_protocol_compliance(WorkspaceReadTokenProvider)
         assert_protocol_compliance(RecommendationsReadTokenProvider)
+        assert_protocol_compliance(ConnectionsManageTokenProvider)
 
     def test_supports_token_only(self):
         p = WorkspaceReadTokenProvider()
@@ -398,11 +413,20 @@ class TestProvider:
             surface=token_store.RECOMMENDATIONS_SURFACE,
             ttl_seconds=8 * 3600,
         )
+        connections_record, connections_token = _issue(
+            workspace_home,
+            surface=token_store.CONNECTIONS_SURFACE,
+        )
         workspace_provider = WorkspaceReadTokenProvider()
         recommendations_provider = RecommendationsReadTokenProvider()
+        connections_provider = ConnectionsManageTokenProvider()
 
         assert workspace_provider.verify_token(token=recommendations_token) is None
+        assert workspace_provider.verify_token(token=connections_token) is None
         assert recommendations_provider.verify_token(token=workspace_token) is None
+        assert recommendations_provider.verify_token(token=connections_token) is None
+        assert connections_provider.verify_token(token=workspace_token) is None
+        assert connections_provider.verify_token(token=recommendations_token) is None
 
         principal = recommendations_provider.verify_token(
             token=recommendations_token
@@ -414,6 +438,12 @@ class TestProvider:
             credential_id=recommendations_record.token_id,
         )
         assert workspace_record.token_id != recommendations_record.token_id
+        assert connections_provider.verify_token(token=connections_token) == TokenPrincipal(
+            principal=token_store.CONNECTIONS_PRINCIPAL,
+            provider="raphael-connections-token",
+            scopes=(token_store.CONNECTIONS_SCOPE,),
+            credential_id=connections_record.token_id,
+        )
 
     @pytest.mark.parametrize("token", ["", "no-dot-at-all", ".", "a.", ".b", "unknown.secret"])
     def test_verify_token_rejects_malformed_or_unknown(self, workspace_home, token):
@@ -465,6 +495,23 @@ class TestProvider:
 
 
 class TestCli:
+    def test_issue_connections_uses_dedicated_surface(self, workspace_home, capsys):
+        output_dir = workspace_home / "cli-connections-output"
+        output_dir.mkdir(mode=0o700)
+        output_path = output_dir / "connections.token"
+        parser = argparse.ArgumentParser()
+        cli.register_cli(parser)
+        args = parser.parse_args(
+            ["issue", "--surface", "connections", "--out", str(output_path)]
+        )
+
+        assert cli.workspace_token_command(args) == 0
+        record = token_store.load_records()[0]
+        bearer = output_path.read_text(encoding="utf-8").strip()
+        assert record.token_id.startswith(token_store.CONNECTIONS_TOKEN_PREFIX)
+        assert record.scope == token_store.CONNECTIONS_SCOPE
+        assert bearer not in capsys.readouterr().out
+
     def test_issue_recommendations_uses_eight_hour_jit_default(
         self, workspace_home, capsys
     ):

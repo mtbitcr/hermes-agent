@@ -55,6 +55,60 @@ def test_hosted_auth_start_returns_public_authorization_url(monkeypatch):
     assert flow.redirect_uri == "https://agent.example/api/mcp/oauth/callback/reports"
 
 
+def test_hosted_auth_accepts_exact_https_service_callback(monkeypatch):
+    from hermes_cli import web_server
+
+    client = _client()
+    client.post(
+        "/api/mcp/servers",
+        json={"name": "reports", "url": "https://mcp.example/mcp", "auth": "oauth"},
+    )
+
+    def fake_worker(flow, cfg):
+        import asyncio
+
+        asyncio.run(flow.publish_authorization_url("https://idp.example/authorize?state=s1"))
+
+    monkeypatch.setattr(web_server, "_run_dashboard_mcp_oauth", fake_worker)
+    response = client.post(
+        "/api/mcp/servers/reports/auth",
+        json={
+            "redirect_uri": "https://workspace.example/api/mcp/oauth/callback/reports"
+        },
+    )
+
+    assert response.status_code == 200
+    flow = web_server._mcp_oauth_flows[response.json()["flow_id"]]
+    assert flow.redirect_uri == (
+        "https://workspace.example/api/mcp/oauth/callback/reports"
+    )
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "http://workspace.example/api/mcp/oauth/callback/reports",
+        "https://workspace.example/other/callback",
+        "https://user:pass@workspace.example/api/mcp/oauth/callback/reports",
+        "https://workspace.example/api/mcp/oauth/callback/reports?next=evil",
+    ],
+)
+def test_hosted_auth_rejects_untrusted_service_callback(redirect_uri):
+    client = _client()
+    client.post(
+        "/api/mcp/servers",
+        json={"name": "reports", "url": "https://mcp.example/mcp", "auth": "oauth"},
+    )
+
+    response = client.post(
+        "/api/mcp/servers/reports/auth",
+        json={"redirect_uri": redirect_uri},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid OAuth redirect URI"
+
+
 def test_hosted_callback_bypasses_gated_cookie_auth(monkeypatch):
     import asyncio
 
