@@ -11,7 +11,7 @@ Scope is deliberately narrow to the WRAPPER layer — the deep kernel
   - Schemas expose only the documented, narrow parameter surface — no
     author/profile/actor/session/path/scope field, and no broad execution
     capability.
-  - The registered tool surface is exactly the four documented tools.
+  - The registered tool surface is exactly the five documented tools.
 """
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ from toolsets import TOOLSETS, get_kernel_gated_toolsets, resolve_toolset
 
 TOOL_NAMES = (
     "owner_workspace_bootstrap", "owner_task_graph_commit",
+    "owner_project_plan_commit",
     "owner_task_move", "owner_task_comment",
 )
 
@@ -36,7 +37,7 @@ TOOL_NAMES = (
 
 
 class TestToolSurface:
-    def test_exactly_four_tools_registered_under_owner_workspace(self):
+    def test_exactly_five_tools_registered_under_owner_workspace(self):
         assert registry.get_tool_names_for_toolset("owner_workspace") == sorted(TOOL_NAMES)
 
     def test_toolset_definition_lists_exactly_these_tools(self):
@@ -44,15 +45,20 @@ class TestToolSurface:
 
     def test_no_other_toolset_exposes_owner_tools(self):
         for name, ts in TOOLSETS.items():
-            if name in {"owner_workspace", "owner_task_graph_commit"}:
+            if name in {"owner_workspace", "owner_task_graph_commit", "owner_project_plan_commit"}:
                 continue
             assert not set(ts.get("tools") or []) & set(TOOL_NAMES)
         assert TOOLSETS["owner_task_graph_commit"]["tools"] == [
             "owner_task_graph_commit"
         ]
+        assert TOOLSETS["owner_project_plan_commit"]["tools"] == [
+            "owner_project_plan_commit"
+        ]
 
     def test_owner_workspace_toolsets_are_kernel_gated(self):
-        assert {"owner_workspace", "owner_task_graph_commit"} <= get_kernel_gated_toolsets()
+        assert {
+            "owner_workspace", "owner_task_graph_commit", "owner_project_plan_commit",
+        } <= get_kernel_gated_toolsets()
 
     def test_resolve_toolset_returns_exactly_these_tools(self):
         assert set(resolve_toolset("owner_workspace", include_registry=False)) == set(TOOL_NAMES)
@@ -80,6 +86,7 @@ _ALLOWED_PARAM_NAMES = {
     "body", "mode", "project_name", "project_description", "project_id",
     "request_title", "specification", "current_milestone",
     "owner_visible_result", "root_assignee", "tasks", "later_milestones",
+    "anchor_task_id", "trigger", "summary", "changes",
 }
 
 
@@ -131,6 +138,22 @@ class TestSchemas:
             "idempotency_key", "task_id", "to_status",
             "expected_status", "expected_revision", "board",
         }
+
+    def test_project_plan_requires_bounded_exact_changes(self):
+        entry = registry.get_entry("owner_project_plan_commit")
+        params = entry.schema["parameters"]
+        assert params["additionalProperties"] is False
+        assert set(params["required"]) == {
+            "idempotency_key", "project_id", "anchor_task_id", "trigger",
+            "request_title", "summary", "specification", "current_milestone",
+            "owner_visible_result", "later_milestones", "changes",
+        }
+        assert params["properties"]["changes"]["maxItems"] == 12
+        assert len(params["properties"]["changes"]["items"]["oneOf"]) == 5
+
+        move_schema = params["properties"]["changes"]["items"]["oneOf"][3]
+        assert move_schema["properties"]["action"] == {"const": "move"}
+        assert move_schema["properties"]["to_status"]["enum"] == ["ready"]
 
     def test_task_comment_requires_task_id_and_body(self):
         entry = registry.get_entry("owner_task_comment")
@@ -221,6 +244,21 @@ class TestTrustedContextResolution:
             "actor": "attacker",
         })
 
+        ctx, kwargs = kernel.calls[0]
+        assert ctx is trusted_ctx
+        assert "actor" not in kwargs
+
+    def test_project_plan_uses_resolved_context_not_args(self, monkeypatch, trusted_ctx):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+        kernel = _RecordingKernel()
+        monkeypatch.setattr(owt._kernel, "commit_project_plan", kernel)
+        owt._handle_project_plan({
+            "idempotency_key": "p1", "project_id": "project", "anchor_task_id": "anchor",
+            "trigger": "owner_request", "request_title": "Adapt", "summary": "Summary",
+            "specification": "Spec", "current_milestone": "Now",
+            "owner_visible_result": "Visible", "later_milestones": [], "changes": [],
+            "actor": "attacker",
+        })
         ctx, kwargs = kernel.calls[0]
         assert ctx is trusted_ctx
         assert "actor" not in kwargs
@@ -331,6 +369,22 @@ class TestFieldDelegation:
             "idempotency_key": "k2", "task_id": "t1", "to_status": "done",
             "expected_status": "review", "expected_revision": 3, "board": "b1",
         }
+
+    def test_project_plan_passes_through_exact_fields(self, monkeypatch, trusted_ctx):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+        kernel = _RecordingKernel()
+        monkeypatch.setattr(owt._kernel, "commit_project_plan", kernel)
+        args = {
+            "idempotency_key": "p1", "project_id": "project", "anchor_task_id": "anchor",
+            "trigger": "owner_request", "request_title": "Adapt", "summary": "Summary",
+            "specification": "Spec", "current_milestone": "Now",
+            "owner_visible_result": "Visible", "later_milestones": [],
+            "changes": [{"action": "postpone"}],
+        }
+        owt._handle_project_plan(args)
+        ctx, kwargs = kernel.calls[0]
+        assert ctx is trusted_ctx
+        assert kwargs == args
 
     def test_task_comment_passes_through_exact_fields(self, monkeypatch, trusted_ctx):
         monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)

@@ -232,8 +232,17 @@ def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_su
         task for column in board.json()["columns"] for task in column["tasks"]
     ]
     assert {task["id"] for task in task_items} == {s["ready_id"], s["running_id"]}
-    assert all(set(task) == {"id", "title", "assignee_name", "updated_at"} for task in task_items)
+    assert all(
+        set(task) == {
+            "id", "title", "assignee_name", "updated_at", "event_revision",
+            "parent_ids", "child_ids",
+        }
+        for task in task_items
+    )
     assert all(task["updated_at"].endswith("Z") for task in task_items)
+    assert all(type(task["event_revision"]) is int and task["event_revision"] > 0 for task in task_items)
+    assert all(type(task["parent_ids"]) is list for task in task_items)
+    assert all(type(task["child_ids"]) is list for task in task_items)
 
     workers = _get(
         s, "/api/plugins/kanban/workers/active", query=f"?board={BOARD}"

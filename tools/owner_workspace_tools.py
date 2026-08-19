@@ -1,4 +1,4 @@
-"""Owner-workspace toolset — four thin model tools over the deep kernel in
+"""Owner-workspace toolset — five thin model tools over the deep kernel in
 ``hermes_cli.owner_workspace``.
 
 Default-off, API-server-only surface (see ``toolsets.py``'s ``owner_workspace``
@@ -71,6 +71,33 @@ def _handle_task_graph(args: dict, **kw) -> str:
     except Exception:
         logger.exception("owner_task_graph_commit failed")
         return tool_error("owner_task_graph_commit: internal error")
+
+
+def _handle_project_plan(args: dict, **kw) -> str:
+    try:
+        ctx = resolve_owner_context()
+        result = _kernel.commit_project_plan(
+            ctx,
+            idempotency_key=args.get("idempotency_key"),
+            project_id=args.get("project_id"),
+            anchor_task_id=args.get("anchor_task_id"),
+            trigger=args.get("trigger"),
+            request_title=args.get("request_title"),
+            summary=args.get("summary"),
+            specification=args.get("specification"),
+            current_milestone=args.get("current_milestone"),
+            owner_visible_result=args.get("owner_visible_result"),
+            later_milestones=args.get("later_milestones"),
+            changes=args.get("changes"),
+        )
+        return _ok(result)
+    except OwnerWorkspaceError as e:
+        return tool_error(f"owner_project_plan_commit: {e.message}")
+    except ValueError as e:
+        return tool_error(f"owner_project_plan_commit: {e}")
+    except Exception:
+        logger.exception("owner_project_plan_commit failed")
+        return tool_error("owner_project_plan_commit: internal error")
 
 
 def _handle_task_move(args: dict, **kw) -> str:
@@ -253,6 +280,176 @@ registry.register(
         },
     },
     handler=lambda args, **kw: _handle_task_graph(args, **kw),
+)
+
+
+_PROJECT_TASK_REF = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "task_id": {"type": "string"},
+        "expected_status": {"type": "string"},
+        "expected_revision": {"type": "integer", "minimum": 1},
+    },
+    "required": ["task_id", "expected_status", "expected_revision"],
+}
+
+_PROJECT_TASK_SPEC = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": {"type": "string"},
+        "body": {"type": "string"},
+        "assignee": {"type": "string"},
+    },
+    "required": ["title", "body", "assignee"],
+}
+
+_PROJECT_REPLACEMENT_SPEC = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        **_PROJECT_TASK_SPEC["properties"],
+        "parents": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 0},
+        },
+    },
+    "required": ["title", "body", "assignee", "parents"],
+}
+
+
+registry.register(
+    name="owner_project_plan_commit",
+    toolset="owner_workspace",
+    schema={
+        "name": "owner_project_plan_commit",
+        "description": (
+            "Atomically apply one owner-approved Project Steward plan to an "
+            "existing native Project board. Supports bounded add, split, merge, "
+            "move, postpone, and cancel changes. Every referenced task carries "
+            "the exact status and event revision last observed; any drift leaves "
+            "the whole plan unchanged. Running, completed, and archived tasks "
+            "cannot be rewritten. Merge or cancel must be approved alone."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "idempotency_key": {"type": "string"},
+                "project_id": {"type": "string"},
+                "anchor_task_id": {"type": "string"},
+                "trigger": {
+                    "type": "string",
+                    "enum": [
+                        "owner_request",
+                        "milestone_boundary",
+                        "persistent_blocker",
+                        "scheduled_review",
+                    ],
+                },
+                "request_title": {"type": "string"},
+                "summary": {"type": "string"},
+                "specification": {"type": "string"},
+                "current_milestone": {"type": "string"},
+                "owner_visible_result": {"type": "string"},
+                "later_milestones": {
+                    "type": "array",
+                    "maxItems": 12,
+                    "items": {"type": "string"},
+                },
+                "changes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 12,
+                    "items": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    **_PROJECT_TASK_SPEC["properties"],
+                                    "action": {"const": "add"},
+                                    "reason": {"type": "string"},
+                                    "existing_parents": {
+                                        "type": "array",
+                                        "items": _PROJECT_TASK_REF,
+                                    },
+                                    "new_parents": {
+                                        "type": "array",
+                                        "items": {"type": "integer", "minimum": 0},
+                                    },
+                                },
+                                "required": [
+                                    "action", "reason", "title", "body", "assignee",
+                                    "existing_parents", "new_parents",
+                                ],
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "action": {"const": "split"},
+                                    "reason": {"type": "string"},
+                                    "target": _PROJECT_TASK_REF,
+                                    "replacements": {
+                                        "type": "array",
+                                        "minItems": 2,
+                                        "maxItems": 6,
+                                        "items": _PROJECT_REPLACEMENT_SPEC,
+                                    },
+                                },
+                                "required": ["action", "reason", "target", "replacements"],
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "action": {"const": "merge"},
+                                    "reason": {"type": "string"},
+                                    "targets": {
+                                        "type": "array",
+                                        "minItems": 2,
+                                        "maxItems": 6,
+                                        "items": _PROJECT_TASK_REF,
+                                    },
+                                    "replacement": _PROJECT_TASK_SPEC,
+                                },
+                                "required": ["action", "reason", "targets", "replacement"],
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "action": {"const": "move"},
+                                    "reason": {"type": "string"},
+                                    "target": _PROJECT_TASK_REF,
+                                    "to_status": {"type": "string", "enum": ["ready"]},
+                                },
+                                "required": ["action", "reason", "target", "to_status"],
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "action": {"enum": ["postpone", "cancel"]},
+                                    "reason": {"type": "string"},
+                                    "target": _PROJECT_TASK_REF,
+                                },
+                                "required": ["action", "reason", "target"],
+                            },
+                        ],
+                    },
+                },
+            },
+            "required": [
+                "idempotency_key", "project_id", "anchor_task_id", "trigger",
+                "request_title", "summary", "specification", "current_milestone",
+                "owner_visible_result", "later_milestones", "changes",
+            ],
+        },
+    },
+    handler=lambda args, **kw: _handle_project_plan(args, **kw),
 )
 
 

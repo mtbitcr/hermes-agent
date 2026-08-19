@@ -269,7 +269,11 @@ class TestStartRun:
 class TestRunStatus:
 
     @pytest.mark.asyncio
-    async def test_status_exposes_redacted_approval_then_clears_it(self, adapter):
+    @pytest.mark.parametrize(
+        "operation",
+        ["owner_task_graph_commit", "owner_project_plan_commit"],
+    )
+    async def test_status_exposes_redacted_approval_then_clears_it(self, adapter, operation):
         app = _create_runs_app(adapter)
         approval_ready = threading.Event()
         release = threading.Event()
@@ -288,7 +292,7 @@ class TestRunStatus:
                         "approval_id": "approval-1",
                         "description": "Create project with token sk-live-secret-value",
                         "exact_operation": True,
-                        "operation": "owner_task_graph_commit",
+                        "operation": operation,
                     })
                     approval_ready.set()
                     release.wait(timeout=5)
@@ -307,7 +311,7 @@ class TestRunStatus:
                 assert waiting["status"] == "waiting_for_approval"
                 assert waiting["pending_approval"]["approval_id"] == "approval-1"
                 assert waiting["pending_approval"]["choices"] == ["once", "deny"]
-                assert waiting["pending_approval"]["operation"] == "owner_task_graph_commit"
+                assert waiting["pending_approval"]["operation"] == operation
                 assert "sk-live-secret-value" not in waiting["pending_approval"]["description"]
 
                 release.set()

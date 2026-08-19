@@ -1179,6 +1179,439 @@ def list_committed_projects(ctx: OwnerContext) -> list[dict]:
     finally:
         conn.close()
 
+# ---------------------------------------------------------------------------
+# owner_project_plan_commit
+# ---------------------------------------------------------------------------
+
+_MAX_PROJECT_PLAN_CHANGES = 12
+_MAX_PROJECT_PLAN_REPLACEMENTS = 6
+_PROJECT_PLAN_TRIGGERS = {
+    "owner_request", "milestone_boundary", "persistent_blocker", "scheduled_review",
+}
+_PROJECT_PLAN_MUTABLE_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "blocked", "review",
+}
+
+
+def _require_exact_keys(value: Any, field: str, keys: set[str]) -> dict:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise OwnerWorkspaceError(
+            "invalid_argument", f"{field} must contain exactly {sorted(keys)}",
+        )
+    return value
+
+
+def _normalize_project_task_ref(value: Any, field: str, *, mutating: bool) -> dict:
+    raw = _require_exact_keys(
+        value, field, {"task_id", "expected_status", "expected_revision"},
+    )
+    task_id = _bounded_text(raw["task_id"], f"{field}.task_id", limit=100)
+    status = _bounded_text(
+        raw["expected_status"], f"{field}.expected_status", limit=20,
+    )
+    if status not in kanban_db.VALID_STATUSES:
+        raise OwnerWorkspaceError("invalid_status", f"{field} has an invalid status")
+    if mutating and status not in _PROJECT_PLAN_MUTABLE_STATUSES:
+        raise OwnerWorkspaceError(
+            "unsafe_transition",
+            f"{field} cannot change a running, completed, or archived task",
+        )
+    revision = raw["expected_revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise OwnerWorkspaceError(
+            "invalid_argument", f"{field}.expected_revision must be a positive integer",
+        )
+    return {
+        "task_id": task_id,
+        "expected_status": status,
+        "expected_revision": revision,
+    }
+
+
+def _normalize_project_task_spec(
+    value: Any, field: str, *, parent_limit: Optional[int] = None,
+) -> dict:
+    keys = {"title", "body", "assignee", "parents"} if parent_limit is not None else {
+        "title", "body", "assignee",
+    }
+    raw = _require_exact_keys(value, field, keys)
+    from agent.redact import redact_sensitive_text
+
+    result = {
+        "title": redact_sensitive_text(
+            _bounded_text(raw["title"], f"{field}.title", limit=240), force=True,
+        ),
+        "body": redact_sensitive_text(
+            _bounded_text(raw["body"], f"{field}.body", limit=12_000), force=True,
+        ),
+        "assignee": _normalize_graph_assignee(raw["assignee"], f"{field}.assignee"),
+    }
+    if parent_limit is not None:
+        parents = raw["parents"]
+        if not isinstance(parents, list):
+            raise OwnerWorkspaceError("invalid_argument", f"{field}.parents must be a list")
+        normalized_parents: list[int] = []
+        for parent in parents:
+            if isinstance(parent, bool) or not isinstance(parent, int):
+                raise OwnerWorkspaceError(
+                    "invalid_argument", f"{field}.parents must contain only indices",
+                )
+            if parent < 0 or parent >= parent_limit or parent in normalized_parents:
+                raise OwnerWorkspaceError(
+                    "invalid_argument", f"{field}.parents may reference only earlier replacements",
+                )
+            normalized_parents.append(parent)
+        result["parents"] = normalized_parents
+    return result
+
+
+def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
+    if not isinstance(value, list) or not value or len(value) > _MAX_PROJECT_PLAN_CHANGES:
+        raise OwnerWorkspaceError(
+            "invalid_argument",
+            f"changes must contain 1-{_MAX_PROJECT_PLAN_CHANGES} items",
+        )
+    from agent.redact import redact_sensitive_text
+
+    normalized: list[dict] = []
+    created_count = 0
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise OwnerWorkspaceError("invalid_argument", f"changes[{index}] must be an object")
+        action = str(item.get("action") or "").strip().lower()
+        field = f"changes[{index}]"
+        reason = redact_sensitive_text(
+            _bounded_text(item.get("reason"), f"{field}.reason", limit=1_000),
+            force=True,
+        )
+
+        if action == "add":
+            raw = _require_exact_keys(
+                item, field,
+                {"action", "reason", "title", "body", "assignee", "existing_parents", "new_parents"},
+            )
+            existing = raw["existing_parents"]
+            new_parents = raw["new_parents"]
+            if not isinstance(existing, list) or not isinstance(new_parents, list):
+                raise OwnerWorkspaceError(
+                    "invalid_argument", f"{field} parent fields must be lists",
+                )
+            parent_indexes: list[int] = []
+            for parent in new_parents:
+                if (
+                    isinstance(parent, bool)
+                    or not isinstance(parent, int)
+                    or parent < 0
+                    or parent >= index
+                    or parent in parent_indexes
+                ):
+                    raise OwnerWorkspaceError(
+                        "invalid_argument", f"{field}.new_parents must name unique earlier add changes",
+                    )
+                parent_indexes.append(parent)
+            spec = _normalize_project_task_spec(
+                {key: raw[key] for key in ("title", "body", "assignee")},
+                field,
+                parent_limit=None,
+            )
+            normalized.append({
+                "action": action,
+                "reason": reason,
+                **spec,
+                "existing_parents": [
+                    _normalize_project_task_ref(ref, f"{field}.existing_parents[{ref_index}]", mutating=False)
+                    for ref_index, ref in enumerate(existing)
+                ],
+                "new_parents": parent_indexes,
+            })
+            created_count += 1
+            continue
+
+        if action == "split":
+            raw = _require_exact_keys(item, field, {"action", "reason", "target", "replacements"})
+            replacements = raw["replacements"]
+            if (
+                not isinstance(replacements, list)
+                or len(replacements) < 2
+                or len(replacements) > _MAX_PROJECT_PLAN_REPLACEMENTS
+            ):
+                raise OwnerWorkspaceError(
+                    "invalid_argument",
+                    f"{field}.replacements must contain 2-{_MAX_PROJECT_PLAN_REPLACEMENTS} tasks",
+                )
+            normalized.append({
+                "action": action,
+                "reason": reason,
+                "target": _normalize_project_task_ref(raw["target"], f"{field}.target", mutating=True),
+                "replacements": [
+                    _normalize_project_task_spec(
+                        replacement,
+                        f"{field}.replacements[{replacement_index}]",
+                        parent_limit=replacement_index,
+                    )
+                    for replacement_index, replacement in enumerate(replacements)
+                ],
+            })
+            created_count += len(replacements)
+            continue
+
+        if action == "merge":
+            raw = _require_exact_keys(item, field, {"action", "reason", "targets", "replacement"})
+            targets = raw["targets"]
+            if (
+                not isinstance(targets, list)
+                or len(targets) < 2
+                or len(targets) > _MAX_PROJECT_PLAN_REPLACEMENTS
+            ):
+                raise OwnerWorkspaceError(
+                    "invalid_argument", f"{field}.targets must contain 2-{_MAX_PROJECT_PLAN_REPLACEMENTS} tasks",
+                )
+            refs = [
+                _normalize_project_task_ref(ref, f"{field}.targets[{ref_index}]", mutating=True)
+                for ref_index, ref in enumerate(targets)
+            ]
+            if len({ref["task_id"] for ref in refs}) != len(refs):
+                raise OwnerWorkspaceError("invalid_argument", f"{field}.targets must be unique")
+            normalized.append({
+                "action": action,
+                "reason": reason,
+                "targets": refs,
+                "replacement": _normalize_project_task_spec(
+                    raw["replacement"], f"{field}.replacement", parent_limit=None,
+                ),
+            })
+            created_count += 1
+            continue
+
+        if action == "move":
+            raw = _require_exact_keys(item, field, {"action", "reason", "target", "to_status"})
+            target = _normalize_project_task_ref(raw["target"], f"{field}.target", mutating=True)
+            to_status = str(raw["to_status"] or "").strip()
+            if to_status != "ready" or to_status == target["expected_status"]:
+                raise OwnerWorkspaceError(
+                    "unsafe_transition", f"{field}.to_status must reactivate work into ready",
+                )
+            normalized.append({"action": action, "reason": reason, "target": target, "to_status": to_status})
+            continue
+
+        if action in {"postpone", "cancel"}:
+            raw = _require_exact_keys(item, field, {"action", "reason", "target"})
+            normalized.append({
+                "action": action,
+                "reason": reason,
+                "target": _normalize_project_task_ref(raw["target"], f"{field}.target", mutating=True),
+            })
+            continue
+
+        raise OwnerWorkspaceError(
+            "invalid_argument", f"{field}.action must be add, split, merge, move, postpone, or cancel",
+        )
+
+    for index, change in enumerate(normalized):
+        if change["action"] == "add":
+            for parent_index in change["new_parents"]:
+                if normalized[parent_index]["action"] != "add":
+                    raise OwnerWorkspaceError(
+                        "invalid_argument", f"changes[{index}].new_parents may reference only add changes",
+                    )
+    if created_count > _MAX_GRAPH_TASKS:
+        raise OwnerWorkspaceError(
+            "milestone_too_large", f"one plan may create at most {_MAX_GRAPH_TASKS} tasks",
+        )
+    if any(change["action"] in {"merge", "cancel"} for change in normalized) and len(normalized) != 1:
+        raise OwnerWorkspaceError(
+            "separate_owner_decision", "merge and cancel must be the only change in their owner approval",
+        )
+    return normalized, (
+        "significant_removal"
+        if normalized[0]["action"] in {"merge", "cancel"}
+        else "standard"
+    )
+
+
+def _resolve_existing_project_board(pconn: sqlite3.Connection, project_id: str):
+    project = projects_db.get_project(pconn, project_id)
+    if project is None or project.archived or not project.board_slug:
+        raise OwnerWorkspaceError("project_not_found", f"project {project_id!r} is unavailable")
+    if not kanban_db.board_exists(project.board_slug):
+        raise OwnerWorkspaceError("project_not_found", "the Project board is unavailable")
+    _assert_board_ownership(project.board_slug, project_id)
+    return project, project.board_slug
+
+
+def _committed_project_plan_result(
+    kconn: sqlite3.Connection, *, anchor_task_id: str, digest: str,
+    idempotency_key: str, ctx: OwnerContext,
+) -> Optional[dict]:
+    for event in reversed(kanban_db.list_events(kconn, anchor_task_id)):
+        payload = event.payload or {}
+        if (
+            event.kind == "owner_project_plan_applied"
+            and payload.get("request_digest") == digest
+            and payload.get("idempotency_key") == idempotency_key
+            and payload.get("actor") == ctx.actor
+            and payload.get("profile") == ctx.profile
+            and isinstance(payload.get("result"), dict)
+        ):
+            return payload["result"]
+    return None
+
+
+def commit_project_plan(
+    ctx: OwnerContext,
+    *,
+    idempotency_key: str,
+    project_id: str,
+    anchor_task_id: str,
+    trigger: str,
+    request_title: str,
+    summary: str,
+    specification: str,
+    current_milestone: str,
+    owner_visible_result: str,
+    later_milestones: Any,
+    changes: Any,
+) -> dict:
+    """Commit one approved Project Steward plan to the existing native board."""
+    from agent.redact import redact_sensitive_text
+
+    idempotency_key = _bounded_text(idempotency_key, "idempotency_key", limit=200)
+    project_id = _bounded_text(project_id, "project_id", limit=100)
+    anchor_task_id = _bounded_text(anchor_task_id, "anchor_task_id", limit=100)
+    trigger = str(trigger or "").strip()
+    if trigger not in _PROJECT_PLAN_TRIGGERS:
+        raise OwnerWorkspaceError("invalid_argument", "trigger is invalid")
+    request_title = redact_sensitive_text(
+        _bounded_text(request_title, "request_title", limit=240), force=True,
+    )
+    summary = redact_sensitive_text(_bounded_text(summary, "summary", limit=2_000), force=True)
+    specification = redact_sensitive_text(
+        _bounded_text(specification, "specification", limit=20_000), force=True,
+    )
+    current_milestone = redact_sensitive_text(
+        _bounded_text(current_milestone, "current_milestone", limit=1_000), force=True,
+    )
+    owner_visible_result = redact_sensitive_text(
+        _bounded_text(owner_visible_result, "owner_visible_result", limit=1_000), force=True,
+    )
+    normalized_later = _normalize_later_milestones(later_milestones)
+    normalized_changes, risk_level = _normalize_project_changes(changes)
+    plan_record = "\n\n".join(
+        [request_title, summary, specification, f"Owner-visible result\n{owner_visible_result}"]
+    )
+    payload = {
+        "project_id": project_id,
+        "anchor_task_id": anchor_task_id,
+        "trigger": trigger,
+        "request_title": request_title,
+        "summary": summary,
+        "specification": specification,
+        "current_milestone": current_milestone,
+        "owner_visible_result": owner_visible_result,
+        "later_milestones": normalized_later,
+        "risk_level": risk_level,
+        "changes": normalized_changes,
+    }
+    digest = _digest(payload)
+    operation = "owner_project_plan_commit"
+
+    pconn = projects_db.connect()
+    try:
+        _ensure_schema(pconn)
+        state, row, token = _acquire_or_replay(
+            pconn, ctx, idempotency_key, operation, digest,
+        )
+        if state == "terminal":
+            return json.loads(row["result_json"])
+        project, board_slug = _resolve_existing_project_board(pconn, project_id)
+        kconn = kanban_db.connect(board=board_slug)
+        try:
+            recovered = _committed_project_plan_result(
+                kconn,
+                anchor_task_id=anchor_task_id,
+                digest=digest,
+                idempotency_key=idempotency_key,
+                ctx=ctx,
+            )
+            if recovered is not None:
+                result = {
+                    "ok": True,
+                    "project_id": project_id,
+                    "project_slug": project.slug,
+                    "board": board_slug,
+                    "risk_level": risk_level,
+                    **recovered,
+                }
+                _finalize_receipt(
+                    pconn, ctx, idempotency_key, token, status="committed", result=result,
+                )
+                return result
+
+            approval = _confirm(
+                ctx,
+                operation=operation,
+                digest=digest,
+                description=(
+                    f"Apply {len(normalized_changes)} approved Project change(s) "
+                    f"to {project.name!r}"
+                ),
+            )
+            if not approval.get("approved"):
+                result = {"ok": False, "error": "confirmation_denied", "reason": approval.get("reason")}
+                _finalize_receipt(
+                    pconn, ctx, idempotency_key, token, status="denied", result=result,
+                )
+                return result
+
+            with write_txn(pconn):
+                _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                applied = kanban_db.apply_owner_project_plan(
+                    kconn,
+                    project_id=project_id,
+                    anchor_task_id=anchor_task_id,
+                    changes=normalized_changes,
+                    actor=ctx.actor,
+                    profile=ctx.profile,
+                    idempotency_key=idempotency_key,
+                    request_digest=digest,
+                    trigger=trigger,
+                    plan_summary=plan_record,
+                    current_milestone=current_milestone,
+                    later_milestones=normalized_later,
+                    board=board_slug,
+                )
+        finally:
+            kconn.close()
+
+        if not applied["applied"]:
+            result = {
+                "ok": False,
+                "error": "conflict",
+                "project_id": project_id,
+                "project_slug": project.slug,
+                "change_count": 0,
+            }
+        else:
+            result = {
+                "ok": True,
+                "project_id": project_id,
+                "project_slug": project.slug,
+                "board": board_slug,
+                "risk_level": risk_level,
+                **applied,
+            }
+        _update_progress(
+            pconn, ctx, idempotency_key, token,
+            project_id=project_id, board_slug=board_slug, task_id=anchor_task_id,
+        )
+        _finalize_receipt(
+            pconn, ctx, idempotency_key, token, status="committed", result=result,
+        )
+        return result
+    finally:
+        pconn.close()
+
+
 
 # ---------------------------------------------------------------------------
 # owner_task_move
