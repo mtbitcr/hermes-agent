@@ -325,6 +325,17 @@ TOOLSETS = {
         # platform_toolsets config naming, on any platform, no exceptions.
         "kernel_gated": True,
     },
+
+    # Narrow API-server capability used by control planes that may commit an
+    # owner-approved task graph but must never bootstrap projects, move tasks,
+    # or write comments. It shares the same dedicated owner-workspace gate as
+    # the full surface and cannot be admitted through generic platform config.
+    "owner_task_graph_commit": {
+        "description": "Commit one owner-approved task graph",
+        "tools": ["owner_task_graph_commit"],
+        "includes": [],
+        "kernel_gated": True,
+    },
     
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",

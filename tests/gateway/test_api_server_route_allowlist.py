@@ -19,9 +19,14 @@ from __future__ import annotations
 
 import yaml
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
+from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
+    APIServerAdapter,
     _owner_workspace_toolset_enabled,
+    _resolve_api_server_agent_toolsets,
     _resolve_api_server_allowed_routes,
     _route_matches_any,
     _ROUTES_ALLOWLIST,
@@ -318,3 +323,181 @@ class TestOwnerWorkspaceAdmissionBoundary:
         mode, patterns = _resolve_api_server_allowed_routes()
         assert mode == _ROUTES_ALLOWLIST
         assert patterns == ["/v1/models", "/health"]
+
+
+# ---------------------------------------------------------------------------
+# Exact method/template and tool-authority policies
+# ---------------------------------------------------------------------------
+
+
+class TestExactMethodRouteRules:
+    def test_method_route_rules_are_normalized(self):
+        _write_config({
+            "gateway": {
+                "api_server": {
+                    "allowed_routes": [
+                        " post   /v1/responses/ ",
+                        "GET /v1/responses/{response_id}",
+                    ],
+                },
+            },
+        })
+        assert _resolve_api_server_allowed_routes() == (
+            _ROUTES_ALLOWLIST,
+            ["POST /v1/responses", "GET /v1/responses/{response_id}"],
+        )
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "TRACE /v1/responses",
+            "POST relative/path",
+            "POST /v1/responses?x=1",
+            "POST /v1/responses fragment",
+        ],
+    )
+    def test_malformed_method_rule_denies_all(self, rule):
+        _write_config({"gateway": {"api_server": {"allowed_routes": [rule]}}})
+        assert _resolve_api_server_allowed_routes() == (_ROUTES_DENY_ALL, [])
+
+    def test_dynamic_template_requires_the_exact_method(self):
+        rules = ["GET /v1/responses/{response_id}"]
+        assert _route_matches_any(
+            "/v1/responses/resp_1",
+            rules,
+            method="GET",
+            route_template="/v1/responses/{response_id}",
+        )
+        assert not _route_matches_any(
+            "/v1/responses/resp_1",
+            rules,
+            method="DELETE",
+            route_template="/v1/responses/{response_id}",
+        )
+
+    @staticmethod
+    def _app() -> web.Application:
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        app = web.Application(middlewares=[adapter._make_route_allowlist_middleware()])
+
+        async def ok(_request):
+            return web.json_response({"ok": True})
+
+        app.router.add_post("/v1/responses", ok)
+        app.router.add_get("/v1/responses/{response_id}", ok)
+        app.router.add_delete("/v1/responses/{response_id}", ok)
+        app.router.add_post("/p/{profile}/v1/responses", ok)
+        app.router.add_post("/v1/runs", ok)
+        app.router.add_get("/v1/runs/{run_id}", ok)
+        app.router.add_get("/v1/runs/{run_id}/events", ok)
+        app.router.add_post("/v1/runs/{run_id}/approval", ok)
+        app.router.add_post("/v1/runs/{run_id}/steer", ok)
+        app.router.add_post("/v1/runs/{run_id}/stop", ok)
+        app.router.add_get("/v1/owner-workspace/projects", ok)
+        return app
+
+    @pytest.mark.asyncio
+    async def test_planner_allows_create_and_read_but_denies_delete(self):
+        _write_config({
+            "gateway": {
+                "api_server": {
+                    "allowed_routes": [
+                        "POST /v1/responses",
+                        "GET /v1/responses/{response_id}",
+                    ],
+                },
+            },
+        })
+        async with TestClient(TestServer(self._app())) as client:
+            assert (await client.post("/v1/responses")).status == 200
+            assert (await client.get("/v1/responses/resp_1")).status == 200
+            assert (await client.delete("/v1/responses/resp_1")).status == 403
+
+    @pytest.mark.asyncio
+    async def test_profile_prefix_uses_the_unprefixed_exact_template(self):
+        _write_config({
+            "gateway": {
+                "api_server": {"allowed_routes": ["POST /v1/responses"]},
+            },
+        })
+        async with TestClient(TestServer(self._app())) as client:
+            response = await client.post("/p/raphael-planner/v1/responses")
+            assert response.status == 200
+
+    @pytest.mark.asyncio
+    async def test_executor_denies_events_steer_and_stop(self):
+        _write_config({
+            "gateway": {
+                "api_server": {
+                    "allowed_routes": [
+                        "POST /v1/runs",
+                        "GET /v1/runs/{run_id}",
+                        "POST /v1/runs/{run_id}/approval",
+                        "GET /v1/owner-workspace/projects",
+                    ],
+                },
+            },
+        })
+        async with TestClient(TestServer(self._app())) as client:
+            assert (await client.post("/v1/runs")).status == 200
+            assert (await client.get("/v1/runs/run_1")).status == 200
+            assert (await client.post("/v1/runs/run_1/approval")).status == 200
+            assert (await client.get("/v1/owner-workspace/projects")).status == 200
+            assert (await client.get("/v1/runs/run_1/events")).status == 403
+            assert (await client.post("/v1/runs/run_1/steer")).status == 403
+            assert (await client.post("/v1/runs/run_1/stop")).status == 403
+
+
+class TestExactApiServerToolsets:
+    def test_explicit_empty_is_stable_zero_tools(self, monkeypatch):
+        import hermes_cli.tools_config as tools_config_mod
+
+        monkeypatch.setattr(
+            tools_config_mod,
+            "_get_platform_tools",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy resolver used")),
+        )
+        config = {
+            "gateway": {"api_server": {"allowed_toolsets": []}},
+            "platform_toolsets": {"api_server": ["all", "future-plugin", "future-mcp"]},
+        }
+        assert _resolve_api_server_agent_toolsets(config) == []
+
+    def test_narrow_owner_toolset_requires_the_owner_gate(self):
+        config = {
+            "gateway": {
+                "api_server": {
+                    "allowed_toolsets": ["owner_task_graph_commit"],
+                    "owner_workspace": {"enabled": False},
+                },
+            },
+        }
+        assert _resolve_api_server_agent_toolsets(config) == []
+
+    def test_executor_resolves_exactly_one_commit_tool(self):
+        from model_tools import get_tool_definitions
+
+        config = {
+            "gateway": {
+                "api_server": {
+                    "allowed_toolsets": ["owner_task_graph_commit"],
+                    "owner_workspace": {"enabled": True},
+                },
+            },
+            "platform_toolsets": {"api_server": ["all"]},
+        }
+        toolsets = _resolve_api_server_agent_toolsets(config)
+        definitions = get_tool_definitions(
+            toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        assert toolsets == ["owner_task_graph_commit"]
+        assert {item["function"]["name"] for item in definitions} == {
+            "owner_task_graph_commit",
+        }
+
+    @pytest.mark.parametrize("value", [None, False, {}, "", ["unknown-toolset"]])
+    def test_malformed_or_unknown_exact_policy_denies_all(self, value):
+        config = {"gateway": {"api_server": {"allowed_toolsets": value}}}
+        assert _resolve_api_server_agent_toolsets(config) == []

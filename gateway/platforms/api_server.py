@@ -90,6 +90,8 @@ _ROUTES_UNRESTRICTED = "unrestricted"
 _ROUTES_DENY_ALL = "deny_all"
 _ROUTES_ALLOWLIST = "allowlist"
 
+_HTTP_ROUTE_METHODS = frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"})
+
 # Always reachable regardless of ``allowed_routes`` — the liveness probe.
 _ALWAYS_ALLOWED_PATHS = ("/health",)
 
@@ -200,12 +202,18 @@ def _resolve_api_server_allowed_routes() -> "tuple[str, list[str]]":
         for entry in value:
             if not isinstance(entry, str) or not entry.strip():
                 return (_ROUTES_DENY_ALL, [])
-            patterns.append(entry.strip())
+            normalized = _normalize_api_route_rule(entry)
+            if normalized is None:
+                return (_ROUTES_DENY_ALL, [])
+            patterns.append(normalized)
         return (_ROUTES_ALLOWLIST, patterns)
     if isinstance(value, str):
         if value == "":
             return (_ROUTES_DENY_ALL, [])
-        return (_ROUTES_ALLOWLIST, [value])
+        normalized = _normalize_api_route_rule(value)
+        if normalized is None:
+            return (_ROUTES_DENY_ALL, [])
+        return (_ROUTES_ALLOWLIST, [normalized])
     # int (incl. 0), float, dict (incl. {}), or any other type: malformed.
     return (_ROUTES_DENY_ALL, [])
 
@@ -233,15 +241,101 @@ def _owner_workspace_toolset_enabled(user_config: dict) -> bool:
     return value is True
 
 
-def _route_matches_any(path: str, patterns: "list[str]") -> bool:
-    """Segment-aware prefix match: ``/v1/runs`` matches itself and
-    descendants (``/v1/runs/abc``) but never a sibling with a shared
-    string prefix (``/v1/runs-evil``)."""
+def _normalize_api_route_rule(value: str) -> "str | None":
+    """Normalize one legacy path prefix or exact METHOD route-template."""
+    rule = value.strip()
+    if not rule:
+        return None
+    if rule.startswith("/"):
+        return rule
+    parts = rule.split(None, 1)
+    if len(parts) != 2:
+        return None
+    method, template = parts[0].upper(), parts[1].strip()
+    if method not in _HTTP_ROUTE_METHODS:
+        return None
+    if not template.startswith("/") or any(ch.isspace() for ch in template):
+        return None
+    if "?" in template or "#" in template:
+        return None
+    normalized_template = template.rstrip("/") or "/"
+    return f"{method} {normalized_template}"
+
+
+def _route_matches_any(
+    path: str,
+    patterns: "list[str]",
+    *,
+    method: "str | None" = None,
+    route_template: "str | None" = None,
+) -> bool:
+    """Match legacy path prefixes or exact method + route-template rules."""
+    canonical = (route_template or path).rstrip("/") or "/"
     for pattern in patterns:
+        if not pattern.startswith("/"):
+            rule_method, rule_template = pattern.split(" ", 1)
+            if method and method.upper() == rule_method and canonical == rule_template:
+                return True
+            continue
         pat = pattern.rstrip("/") or "/"
         if path == pat or path.startswith(pat + "/"):
             return True
     return False
+
+
+def _resolve_api_server_allowed_toolsets(user_config: dict) -> "list[str] | None":
+    """Return an exact API-server toolset allowlist, or None for legacy mode.
+
+    A present malformed value denies all. An explicit empty list is therefore
+    a stable zero-tool policy: newly installed plugins or MCP servers cannot
+    widen an API profile behind the operator's back.
+    """
+    try:
+        gateway_cfg = user_config.get("gateway")
+        if not isinstance(gateway_cfg, dict):
+            return None if gateway_cfg is None else []
+        api_server_cfg = gateway_cfg.get("api_server")
+        if not isinstance(api_server_cfg, dict):
+            return None if api_server_cfg is None else []
+        if "allowed_toolsets" not in api_server_cfg:
+            return None
+        value = api_server_cfg["allowed_toolsets"]
+        if not isinstance(value, list):
+            return []
+
+        from toolsets import validate_toolset
+
+        result: list[str] = []
+        for entry in value:
+            if not isinstance(entry, str) or not entry.strip():
+                return []
+            name = entry.strip()
+            if not validate_toolset(name):
+                return []
+            if name not in result:
+                result.append(name)
+        return result
+    except Exception:
+        return []
+
+
+def _resolve_api_server_agent_toolsets(user_config: dict) -> list[str]:
+    """Resolve the exact tool authority for one API-server request profile."""
+    exact = _resolve_api_server_allowed_toolsets(user_config)
+    if exact is None:
+        from hermes_cli.tools_config import _get_platform_tools
+
+        enabled = set(_get_platform_tools(user_config, "api_server"))
+        if _owner_workspace_toolset_enabled(user_config):
+            enabled.add("owner_workspace")
+        return sorted(enabled)
+
+    from toolsets import get_kernel_gated_toolsets
+
+    enabled = set(exact)
+    if not _owner_workspace_toolset_enabled(user_config):
+        enabled -= get_kernel_gated_toolsets()
+    return sorted(enabled)
 
 
 try:
@@ -2236,13 +2330,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 stripped = path[len(f"/p/{prefix_profile}"):]
                 path = stripped or "/"
 
+            route = getattr(request.match_info, "route", None)
+            resource = getattr(route, "resource", None)
+            route_template = getattr(resource, "canonical", None)
+            if not isinstance(route_template, str) or not route_template.startswith("/"):
+                route_template = path
+            elif prefix_profile is not None:
+                template_prefix = "/p/{profile}"
+                if route_template.startswith(template_prefix):
+                    route_template = route_template[len(template_prefix):] or "/"
+
             if path in _ALWAYS_ALLOWED_PATHS:
                 return await handler(request)
 
             mode, patterns = _resolve_api_server_allowed_routes()
             if mode == _ROUTES_UNRESTRICTED:
                 return await handler(request)
-            if mode == _ROUTES_ALLOWLIST and _route_matches_any(path, patterns):
+            if mode == _ROUTES_ALLOWLIST and _route_matches_any(
+                path,
+                patterns,
+                method=request.method,
+                route_template=route_template,
+            ):
                 return await handler(request)
 
             return web.json_response(
@@ -3097,13 +3206,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._last_resolved_model["*"] = model
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
-        if _owner_workspace_toolset_enabled(user_config):
-            # The ONLY place the owner_workspace toolset is folded into an
-            # agent's schema — absent from _HERMES_CORE_TOOLS and every
-            # composite in toolsets.py, so no other platform can reach it
-            # even if a profile's generic `toolsets:` config names it.
-            enabled_toolsets = sorted(set(enabled_toolsets) | {"owner_workspace"})
+        enabled_toolsets = _resolve_api_server_agent_toolsets(user_config)
 
         max_iterations = _current_max_iterations()
 
