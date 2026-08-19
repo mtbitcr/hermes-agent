@@ -233,12 +233,15 @@ class TestToolsetConsistency:
         }
         assert not owner_tools & set(_HERMES_CORE_TOOLS)
         for name, ts in TOOLSETS.items():
-            if name == "owner_workspace":
+            if name in {"owner_workspace", "owner_task_graph_commit"}:
                 continue
             assert not owner_tools & set(ts.get("tools") or []), (
                 f"owner_workspace tools leaked into toolset {name!r}"
             )
-        assert "owner_workspace" in get_kernel_gated_toolsets()
+        assert TOOLSETS["owner_task_graph_commit"]["tools"] == [
+            "owner_task_graph_commit"
+        ]
+        assert {"owner_workspace", "owner_task_graph_commit"} <= get_kernel_gated_toolsets()
 
 
 class TestPluginToolsets:
