@@ -4937,35 +4937,49 @@ def set_reasoning_effort(
 # ---------------------------------------------------------------------------
 
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+    with write_txn(conn):
+        _link_tasks_in_txn(conn, parent_id, child_id)
+
+
+def _link_tasks_in_txn(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    """Link two tasks while the caller already owns the write transaction.
+
+    Returns ``True`` only when a new edge was inserted. Keeping the mutation
+    in one helper lets bounded graph builders compose several dependency
+    changes atomically without bypassing cycle checks, ready-state demotion,
+    audit events, or notification inheritance.
+    """
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
-    with write_txn(conn):
-        missing = _find_missing_parents(conn, [parent_id, child_id])
-        if missing:
-            raise ValueError(f"unknown task(s): {', '.join(missing)}")
-        if _would_cycle(conn, parent_id, child_id):
-            raise ValueError(
-                f"linking {parent_id} -> {child_id} would create a cycle"
-            )
+    missing = _find_missing_parents(conn, [parent_id, child_id])
+    if missing:
+        raise ValueError(f"unknown task(s): {', '.join(missing)}")
+    if _would_cycle(conn, parent_id, child_id):
+        raise ValueError(
+            f"linking {parent_id} -> {child_id} would create a cycle"
+        )
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+        (parent_id, child_id),
+    )
+    if cur.rowcount != 1:
+        return False
+    # If child was ready but parent is not yet done, demote child to todo.
+    parent_status = conn.execute(
+        "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'", (parent_id,)
+    ).fetchone()["status"]
+    if parent_status not in {"done", "archived"}:
         conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-            (parent_id, child_id),
+            "UPDATE tasks SET status = 'todo' "
+            "WHERE id = ? AND status = 'ready' AND task_kind = 'work'",
+            (child_id,),
         )
-        # If child was ready but parent is not yet done, demote child to todo.
-        parent_status = conn.execute(
-            "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'", (parent_id,)
-        ).fetchone()["status"]
-        if parent_status != "done":
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready' AND task_kind = 'work'",
-                (child_id,),
-            )
-        _append_event(
-            conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
-        )
-        _inherit_notify_subs(conn, child_id, (parent_id,))
+    _append_event(
+        conn, child_id, "linked",
+        {"parent": parent_id, "child": child_id},
+    )
+    _inherit_notify_subs(conn, child_id, (parent_id,))
+    return True
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -8782,44 +8796,396 @@ def cas_transition_task(
     ``ValueError`` only for an unknown task id.
     """
     with write_txn(conn):
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"unknown task {task_id}")
-        current_status = row["status"]
-        current_revision = task_event_revision(conn, task_id)
-        if current_status != expected_status or current_revision != expected_revision:
-            return {
-                "moved": False,
-                "status": current_status,
-                "revision": current_revision,
-            }
+        return _cas_transition_task_in_txn(
+            conn,
+            task_id,
+            expected_status=expected_status,
+            expected_revision=expected_revision,
+            to_status=to_status,
+            event_kind=event_kind,
+            event_payload=event_payload,
+        )
+
+
+def _cas_transition_task_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_status: str,
+    expected_revision: int,
+    to_status: str,
+    event_kind: str,
+    event_payload: Optional[dict],
+) -> dict:
+    """CAS helper for callers already holding the Kanban write transaction."""
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"unknown task {task_id}")
+    current_status = row["status"]
+    current_revision = task_event_revision(conn, task_id)
+    if current_status != expected_status or current_revision != expected_revision:
+        return {
+            "moved": False,
+            "status": current_status,
+            "revision": current_revision,
+        }
+    if to_status == "archived":
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL WHERE id = ? AND status = ?",
+            (to_status, task_id, expected_status),
+        )
+    else:
         cur = conn.execute(
             "UPDATE tasks SET status = ? WHERE id = ? AND status = ?",
             (to_status, task_id, expected_status),
         )
-        if cur.rowcount != 1:
-            # Cannot happen while holding the IMMEDIATE write lock for the
-            # whole block above, but never silently pretend success.
-            return {
-                "moved": False,
-                "status": conn.execute(
-                    "SELECT status FROM tasks WHERE id = ?", (task_id,),
-                ).fetchone()["status"],
-                "revision": task_event_revision(conn, task_id),
-            }
-        run_id = None
-        if to_status == "archived":
-            run_id = _end_run(
-                conn, task_id,
-                outcome="reclaimed", status="reclaimed",
-                summary=(event_payload or {}).get("summary")
-                or "task archived via cas_transition_task",
+    if cur.rowcount != 1:
+        return {
+            "moved": False,
+            "status": conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()["status"],
+            "revision": task_event_revision(conn, task_id),
+        }
+    run_id = None
+    if to_status == "archived":
+        run_id = _end_run(
+            conn, task_id,
+            outcome="reclaimed", status="reclaimed",
+            summary=(event_payload or {}).get("summary")
+            or "task archived via cas_transition_task",
+        )
+    _append_event(conn, task_id, event_kind, event_payload, run_id=run_id)
+    return {
+        "moved": True,
+        "status": to_status,
+        "revision": task_event_revision(conn, task_id),
+    }
+
+
+def _owner_plan_task_key(
+    *, actor: str, profile: str, idempotency_key: str, change_index: int,
+    replacement_index: int,
+) -> str:
+    raw = (
+        f"{actor}\0{profile}\0{idempotency_key}\0"
+        f"{change_index}\0{replacement_index}"
+    ).encode("utf-8")
+    return "owplan_" + hashlib.sha256(raw).hexdigest()[:40]
+
+
+def apply_owner_project_plan(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    anchor_task_id: str,
+    changes: list[dict],
+    actor: str,
+    profile: str,
+    idempotency_key: str,
+    request_digest: str,
+    trigger: str,
+    plan_summary: str,
+    current_milestone: str,
+    later_milestones: list[str],
+    board: Optional[str] = None,
+) -> dict:
+    """Atomically apply one bounded, already-normalized Project Steward plan.
+
+    This composition primitive is not a model tool. It verifies every
+    optimistic snapshot before the first write. Any drift returns a conflict
+    with zero changes. Replacements preserve source rows and old links, add
+    the new blocking edges, and archive superseded rows instead of deleting
+    history.
+    """
+    expected: dict[str, tuple[str, int]] = {}
+    mutation_targets: set[str] = set()
+
+    def remember(ref: dict, *, mutating: bool) -> None:
+        task_id = ref["task_id"]
+        snapshot = (ref["expected_status"], int(ref["expected_revision"]))
+        prior = expected.get(task_id)
+        if prior is not None and prior != snapshot:
+            raise ValueError(f"conflicting snapshots for task {task_id}")
+        expected[task_id] = snapshot
+        if mutating:
+            if task_id in mutation_targets:
+                raise ValueError(f"task {task_id} is changed more than once")
+            mutation_targets.add(task_id)
+
+    for change in changes:
+        action = change["action"]
+        if action == "add":
+            for ref in change["existing_parents"]:
+                remember(ref, mutating=False)
+        elif action == "merge":
+            for ref in change["targets"]:
+                remember(ref, mutating=True)
+        else:
+            remember(change["target"], mutating=True)
+
+    with write_txn(conn):
+        anchor = conn.execute(
+            "SELECT project_id, task_kind FROM tasks WHERE id = ?",
+            (anchor_task_id,),
+        ).fetchone()
+        if (
+            anchor is None
+            or anchor["task_kind"] != "work"
+            or anchor["project_id"] != project_id
+        ):
+            raise ValueError("project plan anchor is outside the bound Project")
+
+        conflicts: list[dict] = []
+        for task_id, (wanted_status, wanted_revision) in expected.items():
+            row = conn.execute(
+                "SELECT status, project_id, task_kind FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["task_kind"] != "work"
+                or row["project_id"] != project_id
+            ):
+                conflicts.append({"task_id": task_id, "status": None, "revision": None})
+                continue
+            revision = task_event_revision(conn, task_id)
+            if row["status"] != wanted_status or revision != wanted_revision:
+                conflicts.append(
+                    {"task_id": task_id, "status": row["status"], "revision": revision}
+                )
+        if conflicts:
+            return {"applied": False, "conflicts": conflicts}
+
+        created_task_ids: list[str] = []
+        archived_task_ids: list[str] = []
+        affected_task_ids: set[str] = set()
+        add_output_by_change: dict[int, str] = {}
+
+        def create_planned_task(
+            spec: dict,
+            *,
+            parent_task_ids: list[str],
+            change_index: int,
+            replacement_index: int,
+        ) -> str:
+            task_id = create_task(
+                conn,
+                title=spec["title"],
+                body=spec["body"],
+                assignee=spec["assignee"],
+                created_by=actor,
+                parents=parent_task_ids,
+                idempotency_key=_owner_plan_task_key(
+                    actor=actor,
+                    profile=profile,
+                    idempotency_key=idempotency_key,
+                    change_index=change_index,
+                    replacement_index=replacement_index,
+                ),
+                board=board,
+                project_id=project_id,
             )
-        _append_event(conn, task_id, event_kind, event_payload, run_id=run_id)
-        new_revision = task_event_revision(conn, task_id)
-    return {"moved": True, "status": to_status, "revision": new_revision}
+            created_task_ids.append(task_id)
+            affected_task_ids.add(task_id)
+            return task_id
+
+        for change_index, change in enumerate(changes):
+            action = change["action"]
+            reason = change["reason"]
+            event_base = {
+                "actor": actor,
+                "profile": profile,
+                "idempotency_key": idempotency_key,
+                "request_digest": request_digest,
+                "action": action,
+                "reason": reason,
+            }
+
+            if action == "add":
+                parent_task_ids = [
+                    ref["task_id"] for ref in change["existing_parents"]
+                ]
+                for parent_change_index in change["new_parents"]:
+                    try:
+                        parent_task_ids.append(add_output_by_change[parent_change_index])
+                    except KeyError as exc:
+                        raise ValueError(
+                            "new_parents may reference only an earlier add change"
+                        ) from exc
+                task_id = create_planned_task(
+                    change,
+                    parent_task_ids=parent_task_ids,
+                    change_index=change_index,
+                    replacement_index=0,
+                )
+                add_output_by_change[change_index] = task_id
+                continue
+
+            if action == "split":
+                source_id = change["target"]["task_id"]
+                source_parents = parent_ids(conn, source_id)
+                source_children = child_ids(conn, source_id)
+                replacement_ids: list[str] = []
+                referenced_replacements: set[int] = set()
+                for replacement_index, replacement in enumerate(change["replacements"]):
+                    internal_parents = replacement["parents"]
+                    referenced_replacements.update(internal_parents)
+                    replacement_parents = (
+                        [replacement_ids[index] for index in internal_parents]
+                        if internal_parents
+                        else source_parents
+                    )
+                    replacement_ids.append(
+                        create_planned_task(
+                            replacement,
+                            parent_task_ids=replacement_parents,
+                            change_index=change_index,
+                            replacement_index=replacement_index,
+                        )
+                    )
+                leaf_ids = [
+                    task_id
+                    for index, task_id in enumerate(replacement_ids)
+                    if index not in referenced_replacements
+                ]
+                for child_id in source_children:
+                    for leaf_id in leaf_ids:
+                        if _link_tasks_in_txn(conn, leaf_id, child_id):
+                            affected_task_ids.add(child_id)
+                snapshot = _cas_transition_task_in_txn(
+                    conn,
+                    source_id,
+                    expected_status=change["target"]["expected_status"],
+                    expected_revision=change["target"]["expected_revision"],
+                    to_status="archived",
+                    event_kind="owner_project_plan_change",
+                    event_payload={**event_base, "replacement_task_ids": replacement_ids},
+                )
+                if not snapshot["moved"]:
+                    raise RuntimeError("preflighted split target changed inside transaction")
+                affected_task_ids.add(source_id)
+                archived_task_ids.append(source_id)
+                continue
+
+            if action == "merge":
+                source_ids = [ref["task_id"] for ref in change["targets"]]
+                source_set = set(source_ids)
+                merged_parents = sorted(
+                    {
+                        parent_id
+                        for source_id in source_ids
+                        for parent_id in parent_ids(conn, source_id)
+                        if parent_id not in source_set
+                    }
+                )
+                merged_children = sorted(
+                    {
+                        child_id
+                        for source_id in source_ids
+                        for child_id in child_ids(conn, source_id)
+                        if child_id not in source_set
+                    }
+                )
+                replacement_id = create_planned_task(
+                    change["replacement"],
+                    parent_task_ids=merged_parents,
+                    change_index=change_index,
+                    replacement_index=0,
+                )
+                for child_id in merged_children:
+                    if _link_tasks_in_txn(conn, replacement_id, child_id):
+                        affected_task_ids.add(child_id)
+                for ref in change["targets"]:
+                    snapshot = _cas_transition_task_in_txn(
+                        conn,
+                        ref["task_id"],
+                        expected_status=ref["expected_status"],
+                        expected_revision=ref["expected_revision"],
+                        to_status="archived",
+                        event_kind="owner_project_plan_change",
+                        event_payload={**event_base, "replacement_task_id": replacement_id},
+                    )
+                    if not snapshot["moved"]:
+                        raise RuntimeError("preflighted merge target changed inside transaction")
+                    affected_task_ids.add(ref["task_id"])
+                    archived_task_ids.append(ref["task_id"])
+                continue
+
+            ref = change["target"]
+            if (
+                action == "move"
+                and change["to_status"] == "ready"
+                and not _parents_satisfied(conn, ref["task_id"])
+            ):
+                raise ValueError("cannot move a task to ready while a parent is unfinished")
+            to_status = (
+                change["to_status"]
+                if action == "move"
+                else "scheduled"
+                if action == "postpone"
+                else "archived"
+            )
+            snapshot = _cas_transition_task_in_txn(
+                conn,
+                ref["task_id"],
+                expected_status=ref["expected_status"],
+                expected_revision=ref["expected_revision"],
+                to_status=to_status,
+                event_kind="owner_project_plan_change",
+                event_payload=event_base,
+            )
+            if not snapshot["moved"]:
+                raise RuntimeError(
+                    "preflighted Project Steward target changed inside transaction"
+                )
+            affected_task_ids.add(ref["task_id"])
+            if to_status == "archived":
+                archived_task_ids.append(ref["task_id"])
+
+        executable_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks "
+            "WHERE project_id = ? AND task_kind = 'work' "
+            "AND status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'review')",
+            (project_id,),
+        ).fetchone()["n"]
+        if executable_count > 12:
+            raise ValueError(
+                "project plan would leave more than 12 executable tasks; "
+                "keep future work in Next/Later"
+            )
+
+        result = {
+            "applied": True,
+            "change_count": len(changes),
+            "created_task_ids": created_task_ids,
+            "affected_task_ids": sorted(affected_task_ids),
+            "executable_task_count": int(executable_count),
+        }
+        _append_event(
+            conn,
+            anchor_task_id,
+            "owner_project_plan_applied",
+            {
+                "actor": actor,
+                "profile": profile,
+                "idempotency_key": idempotency_key,
+                "request_digest": request_digest,
+                "trigger": trigger,
+                "plan_summary": plan_summary,
+                "current_milestone": current_milestone,
+                "later_milestones": later_milestones,
+                "result": result,
+            },
+        )
+
+    recompute_ready(conn)
+    for task_id in archived_task_ids:
+        _cleanup_workspace(conn, task_id)
+    return result
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:

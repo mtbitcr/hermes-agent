@@ -3478,10 +3478,10 @@ def _workspace_validate_media_type(content_type: Optional[str]) -> str:
     return "application/octet-stream"
 
 
-def _workspace_task_updated_at(
+def _workspace_task_event_state(
     conn: sqlite3.Connection, task_ids: list[str]
-) -> dict[str, int]:
-    """Latest ``task_events.created_at`` per task id, batched.
+) -> dict[str, dict[str, int]]:
+    """Latest event timestamp and exact event revision per task, batched.
 
     Tasks have no ``updated_at`` column (see ``kanban_db.Task``) — this is
     the same "derive freshness from task_events" approach the interactive
@@ -3492,11 +3492,17 @@ def _workspace_task_updated_at(
         return {}
     placeholders = ",".join("?" for _ in task_ids)
     rows = conn.execute(
-        f"SELECT task_id, MAX(created_at) AS latest FROM task_events "
+        f"SELECT task_id, MAX(created_at) AS latest, MAX(id) AS revision FROM task_events "
         f"WHERE task_id IN ({placeholders}) GROUP BY task_id",
         task_ids,
     ).fetchall()
-    return {r["task_id"]: int(r["latest"]) for r in rows}
+    return {
+        r["task_id"]: {
+            "latest": int(r["latest"]),
+            "revision": int(r["revision"]),
+        }
+        for r in rows
+    }
 
 
 def _workspace_projects_response() -> Optional[dict]:
@@ -3560,18 +3566,32 @@ def _workspace_board_response() -> dict:
         return empty_columns
     try:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
-        updated_map = _workspace_task_updated_at(conn, [t.id for t in tasks])
+        task_ids = [t.id for t in tasks]
+        event_state = _workspace_task_event_state(conn, task_ids)
+        visible = set(task_ids)
+        parent_map = {task_id: [] for task_id in task_ids}
+        child_map = {task_id: [] for task_id in task_ids}
+        for row in conn.execute(
+            "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
+        ):
+            if row["parent_id"] in visible and row["child_id"] in visible:
+                child_map[row["parent_id"]].append(row["child_id"])
+                parent_map[row["child_id"]].append(row["parent_id"])
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         for t in tasks:
             col = t.status if t.status in columns else "todo"
+            state = event_state.get(t.id)
             columns[col].append(
                 {
                     "id": t.id,
                     "title": t.title,
                     "assignee_name": t.assignee,
                     "updated_at": _workspace_iso_timestamp(
-                        updated_map.get(t.id, t.created_at)
+                        state["latest"] if state else t.created_at
                     ),
+                    "event_revision": state["revision"] if state else 0,
+                    "parent_ids": parent_map[t.id],
+                    "child_ids": child_map[t.id],
                 }
             )
         return {"columns": [{"name": name, "tasks": columns[name]} for name in columns]}

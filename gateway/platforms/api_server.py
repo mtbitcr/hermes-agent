@@ -7192,6 +7192,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     if event.get("exact_operation") and operation in {
                         "owner_workspace_bootstrap",
                         "owner_task_graph_commit",
+                        "owner_project_plan_commit",
                         "owner_task_move",
                         "owner_task_comment",
                     }:

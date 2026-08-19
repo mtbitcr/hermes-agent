@@ -277,6 +277,7 @@ class TestOwnerWorkspaceAdmissionBoundary:
         assert "owner_workspace" not in enabled
         assert "owner_workspace_bootstrap" not in enabled
         assert "owner_task_graph_commit" not in enabled
+        assert "owner_project_plan_commit" not in enabled
         assert "owner_task_move" not in enabled
         assert "owner_task_comment" not in enabled
 
@@ -463,24 +464,34 @@ class TestExactApiServerToolsets:
         }
         assert _resolve_api_server_agent_toolsets(config) == []
 
-    def test_narrow_owner_toolset_requires_the_owner_gate(self):
+    @pytest.mark.parametrize(
+        "toolset", ["owner_task_graph_commit", "owner_project_plan_commit"],
+    )
+    def test_narrow_owner_toolset_requires_the_owner_gate(self, toolset):
         config = {
             "gateway": {
                 "api_server": {
-                    "allowed_toolsets": ["owner_task_graph_commit"],
+                    "allowed_toolsets": [toolset],
                     "owner_workspace": {"enabled": False},
                 },
             },
         }
         assert _resolve_api_server_agent_toolsets(config) == []
 
-    def test_executor_resolves_exactly_one_commit_tool(self):
+    @pytest.mark.parametrize(
+        ("toolset", "tool"),
+        [
+            ("owner_task_graph_commit", "owner_task_graph_commit"),
+            ("owner_project_plan_commit", "owner_project_plan_commit"),
+        ],
+    )
+    def test_executor_resolves_exactly_one_commit_tool(self, toolset, tool):
         from model_tools import get_tool_definitions
 
         config = {
             "gateway": {
                 "api_server": {
-                    "allowed_toolsets": ["owner_task_graph_commit"],
+                    "allowed_toolsets": [toolset],
                     "owner_workspace": {"enabled": True},
                 },
             },
@@ -492,10 +503,8 @@ class TestExactApiServerToolsets:
             quiet_mode=True,
             skip_tool_search_assembly=True,
         )
-        assert toolsets == ["owner_task_graph_commit"]
-        assert {item["function"]["name"] for item in definitions} == {
-            "owner_task_graph_commit",
-        }
+        assert toolsets == [toolset]
+        assert {item["function"]["name"] for item in definitions} == {tool}
 
     @pytest.mark.parametrize("value", [None, False, {}, "", ["unknown-toolset"]])
     def test_malformed_or_unknown_exact_policy_denies_all(self, value):

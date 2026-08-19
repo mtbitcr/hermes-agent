@@ -310,13 +310,15 @@ TOOLSETS = {
     "owner_workspace": {
         "description": (
             "Owner-workspace mutation tools (bootstrap a Project + Kanban "
-            "board + initial task; commit an approved Task graph; move a task "
+            "board + initial task; commit an approved Task graph or Project "
+            "Steward plan; move a task "
             "via compare-and-swap; comment "
             "as the trusted caller). Opt-in, API-server-only — every "
             "mutation is idempotent and requires a fresh human confirmation."
         ),
         "tools": [
             "owner_workspace_bootstrap", "owner_task_graph_commit",
+            "owner_project_plan_commit",
             "owner_task_move", "owner_task_comment",
         ],
         "includes": [],
@@ -333,6 +335,17 @@ TOOLSETS = {
     "owner_task_graph_commit": {
         "description": "Commit one owner-approved task graph",
         "tools": ["owner_task_graph_commit"],
+        "includes": [],
+        "kernel_gated": True,
+    },
+
+    # Separate least-authority capability for the existing-Project steward.
+    # Keeping it distinct from graph creation lets an API profile receive only
+    # the one mutation it needs; admission still requires the dedicated owner
+    # workspace gate above.
+    "owner_project_plan_commit": {
+        "description": "Commit one owner-approved Project Steward plan",
+        "tools": ["owner_project_plan_commit"],
         "includes": [],
         "kernel_gated": True,
     },

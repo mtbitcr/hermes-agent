@@ -229,11 +229,12 @@ class TestToolsetConsistency:
 
         owner_tools = {
             "owner_workspace_bootstrap", "owner_task_graph_commit",
+            "owner_project_plan_commit",
             "owner_task_move", "owner_task_comment",
         }
         assert not owner_tools & set(_HERMES_CORE_TOOLS)
         for name, ts in TOOLSETS.items():
-            if name in {"owner_workspace", "owner_task_graph_commit"}:
+            if name in {"owner_workspace", "owner_task_graph_commit", "owner_project_plan_commit"}:
                 continue
             assert not owner_tools & set(ts.get("tools") or []), (
                 f"owner_workspace tools leaked into toolset {name!r}"
@@ -241,7 +242,12 @@ class TestToolsetConsistency:
         assert TOOLSETS["owner_task_graph_commit"]["tools"] == [
             "owner_task_graph_commit"
         ]
-        assert {"owner_workspace", "owner_task_graph_commit"} <= get_kernel_gated_toolsets()
+        assert TOOLSETS["owner_project_plan_commit"]["tools"] == [
+            "owner_project_plan_commit"
+        ]
+        assert {
+            "owner_workspace", "owner_task_graph_commit", "owner_project_plan_commit",
+        } <= get_kernel_gated_toolsets()
 
 
 class TestPluginToolsets:
@@ -380,4 +386,3 @@ class TestResolveToolsetMemo:
         second = resolve_toolset("hermes-cli", include_registry=False)
         assert first == second
         assert first  # non-empty sanity
-

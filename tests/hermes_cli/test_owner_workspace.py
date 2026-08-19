@@ -359,6 +359,349 @@ def _bootstrap_board(ctx):
     return result
 
 
+def _project_task_ref(conn, task_id: str) -> dict:
+    task = kanban_db.get_task(conn, task_id)
+    assert task is not None
+    return {
+        "task_id": task_id,
+        "expected_status": task.status,
+        "expected_revision": kanban_db.task_event_revision(conn, task_id),
+    }
+
+
+def _project_plan_args(setup: dict, changes: list[dict], **overrides) -> dict:
+    args = {
+        "idempotency_key": "steward-plan-1",
+        "project_id": setup["project_id"],
+        "anchor_task_id": setup["task_id"],
+        "trigger": "owner_request",
+        "request_title": "Adapt the current plan",
+        "summary": "Keep the active work small and current.",
+        "specification": "Apply only the approved changes and preserve history.",
+        "current_milestone": "Finish the revised milestone.",
+        "owner_visible_result": "The owner sees the revised work on the same board.",
+        "later_milestones": ["Reconsider the next milestone from live facts."],
+        "changes": changes,
+    }
+    args.update(overrides)
+    return args
+
+
+def test_project_plan_split_is_atomic_preserves_history_and_replays(ctx):
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        source_id = kanban_db.create_task(
+            conn, title="Broad task", assignee="default", project_id=setup["project_id"],
+        )
+        downstream_id = kanban_db.create_task(
+            conn,
+            title="Verify the outcome",
+            assignee="default",
+            parents=[source_id],
+            project_id=setup["project_id"],
+        )
+        source_ref = _project_task_ref(conn, source_id)
+
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "split",
+            "reason": "The current task is too broad to verify safely.",
+            "target": source_ref,
+            "replacements": [
+                {
+                    "title": "Build the bounded change",
+                    "body": "Produce one owner-visible outcome.",
+                    "assignee": "default",
+                    "parents": [],
+                },
+                {
+                    "title": "Check the bounded change",
+                    "body": "Verify the outcome before downstream work continues.",
+                    "assignee": "default",
+                    "parents": [0],
+                },
+            ],
+        }],
+    )
+    approver = _with_approver(ctx.session)
+    first = ow.commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert first["ok"] is True
+    assert first["change_count"] == 1
+    assert len(first["created_task_ids"]) == 2
+    first_id, leaf_id = first["created_task_ids"]
+
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert kanban_db.get_task(conn, source_id).status == "archived"
+        assert kanban_db.get_task(conn, source_id) is not None
+        assert kanban_db.parent_ids(conn, leaf_id) == [first_id]
+        assert leaf_id in kanban_db.parent_ids(conn, downstream_id)
+        before = conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?",
+            (setup["project_id"],),
+        ).fetchone()["n"]
+
+    approval.unregister_gateway_notify(ctx.session)
+    replay = ow.commit_project_plan(ctx, **args)
+    assert replay == first
+
+    with kanban_db.connect(board=setup["board"]) as conn:
+        after = conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?",
+            (setup["project_id"],),
+        ).fetchone()["n"]
+    assert after == before
+
+
+def test_project_plan_add_move_and_postpone_apply_together(ctx):
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        parent_ref = _project_task_ref(conn, setup["task_id"])
+        move_id = kanban_db.create_task(
+            conn, title="Move me", assignee="default", project_id=setup["project_id"],
+        )
+        move_revision = kanban_db.task_event_revision(conn, move_id)
+        moved = kanban_db.cas_transition_task(
+            conn,
+            move_id,
+            expected_status="ready",
+            expected_revision=move_revision,
+            to_status="blocked",
+            event_kind="test_block",
+        )
+        assert moved["moved"] is True
+        postpone_id = kanban_db.create_task(
+            conn, title="Postpone me", assignee="default", project_id=setup["project_id"],
+        )
+        move_ref = _project_task_ref(conn, move_id)
+        postpone_ref = _project_task_ref(conn, postpone_id)
+
+    args = _project_plan_args(
+        setup,
+        [
+            {
+                "action": "add",
+                "reason": "Create the first bounded deliverable.",
+                "title": "Prepare the deliverable",
+                "body": "Produce the owner-visible input.",
+                "assignee": "default",
+                "existing_parents": [parent_ref],
+                "new_parents": [],
+            },
+            {
+                "action": "add",
+                "reason": "Verify the new deliverable.",
+                "title": "Verify the deliverable",
+                "body": "Check the preceding result.",
+                "assignee": "default",
+                "existing_parents": [],
+                "new_parents": [0],
+            },
+            {
+                "action": "move",
+                "reason": "Return this work to the planned queue.",
+                "target": move_ref,
+                "to_status": "ready",
+            },
+            {
+                "action": "postpone",
+                "reason": "Keep future work outside the executable milestone.",
+                "target": postpone_ref,
+            },
+        ],
+        idempotency_key="steward-standard-actions",
+    )
+    approver = _with_approver(ctx.session)
+    result = ow.commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result["ok"] is True
+    assert result["change_count"] == 4
+    assert len(result["created_task_ids"]) == 2
+    first_id, second_id = result["created_task_ids"]
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert kanban_db.parent_ids(conn, first_id) == [setup["task_id"]]
+        assert kanban_db.parent_ids(conn, second_id) == [first_id]
+        assert kanban_db.get_task(conn, move_id).status == "ready"
+        assert kanban_db.get_task(conn, postpone_id).status == "scheduled"
+        assert any(
+            event.kind == "owner_project_plan_applied"
+            for event in kanban_db.list_events(conn, setup["task_id"])
+        )
+
+
+def test_project_plan_merge_archives_sources_and_preserves_links(ctx):
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        left_id = kanban_db.create_task(
+            conn, title="Left half", assignee="default", project_id=setup["project_id"],
+        )
+        right_id = kanban_db.create_task(
+            conn, title="Right half", assignee="default", project_id=setup["project_id"],
+        )
+        child_id = kanban_db.create_task(
+            conn,
+            title="Dependent work",
+            assignee="default",
+            parents=[left_id, right_id],
+            project_id=setup["project_id"],
+        )
+        left_ref = _project_task_ref(conn, left_id)
+        right_ref = _project_task_ref(conn, right_id)
+
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "merge",
+            "reason": "One coherent deliverable is easier to own and verify.",
+            "targets": [left_ref, right_ref],
+            "replacement": {
+                "title": "Combined deliverable",
+                "body": "Replace both overlapping work items without deleting history.",
+                "assignee": "default",
+            },
+        }],
+        idempotency_key="steward-merge",
+    )
+    approver = _with_approver(ctx.session)
+    result = ow.commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result["ok"] is True
+    assert result["risk_level"] == "significant_removal"
+    replacement_id = result["created_task_ids"][0]
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert kanban_db.get_task(conn, left_id).status == "archived"
+        assert kanban_db.get_task(conn, right_id).status == "archived"
+        assert set(kanban_db.parent_ids(conn, child_id)) == {
+            left_id,
+            right_id,
+            replacement_id,
+        }
+
+
+def test_project_plan_cancel_archives_instead_of_deleting(ctx):
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        target_id = kanban_db.create_task(
+            conn, title="Obsolete work", assignee="default", project_id=setup["project_id"],
+        )
+        target_ref = _project_task_ref(conn, target_id)
+
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "cancel",
+            "reason": "The owner explicitly removed this outcome.",
+            "target": target_ref,
+        }],
+        idempotency_key="steward-cancel",
+    )
+    approver = _with_approver(ctx.session)
+    result = ow.commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result["ok"] is True
+    assert result["risk_level"] == "significant_removal"
+    with kanban_db.connect(board=setup["board"]) as conn:
+        task = kanban_db.get_task(conn, target_id)
+        assert task is not None
+        assert task.status == "archived"
+
+
+def test_project_plan_stale_snapshot_changes_nothing(ctx):
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        target_id = kanban_db.create_task(
+            conn, title="Current task", assignee="default", project_id=setup["project_id"],
+        )
+        stale_ref = _project_task_ref(conn, target_id)
+        kanban_db.add_comment(conn, target_id, "default", "State changed after planning.")
+        before_events = conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"]
+
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "postpone",
+            "reason": "Wait for the owner-visible dependency.",
+            "target": stale_ref,
+        }],
+        idempotency_key="steward-stale",
+    )
+    approver = _with_approver(ctx.session)
+    result = ow.commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result == {
+        "ok": False,
+        "error": "conflict",
+        "project_id": setup["project_id"],
+        "project_slug": "board-setup",
+        "change_count": 0,
+    }
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert kanban_db.get_task(conn, target_id).status == "ready"
+        assert conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"] == before_events
+
+
+def test_project_plan_merge_or_cancel_requires_its_own_owner_decision(ctx):
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        target = _project_task_ref(conn, setup["task_id"])
+    args = _project_plan_args(
+        setup,
+        [
+            {"action": "cancel", "reason": "No longer useful.", "target": target},
+            {
+                "action": "add",
+                "reason": "Unrelated work.",
+                "title": "Another task",
+                "body": "This must be approved separately.",
+                "assignee": "default",
+                "existing_parents": [],
+                "new_parents": [],
+            },
+        ],
+        idempotency_key="steward-mixed-removal",
+    )
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.commit_project_plan(ctx, **args)
+    assert excinfo.value.code == "separate_owner_decision"
+
+
+def test_project_plan_rejects_ready_when_parent_is_unfinished_and_rolls_back(ctx):
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        child_id = kanban_db.create_task(
+            conn,
+            title="Waiting child",
+            assignee="default",
+            parents=[setup["task_id"]],
+            project_id=setup["project_id"],
+        )
+        child_ref = _project_task_ref(conn, child_id)
+        before_events = conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"]
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "move",
+            "reason": "Try to start early.",
+            "target": child_ref,
+            "to_status": "ready",
+        }],
+        idempotency_key="steward-parent-gate",
+    )
+    approver = _with_approver(ctx.session)
+    with pytest.raises(ValueError, match="parent is unfinished"):
+        ow.commit_project_plan(ctx, **args)
+    approver.join()
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert kanban_db.get_task(conn, child_id).status == "todo"
+        assert conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"] == before_events
+
+
 def test_move_task_cas_conflict_returns_snapshot_with_zero_changes(ctx):
     setup = _bootstrap_board(ctx)
     board = setup["board"]
