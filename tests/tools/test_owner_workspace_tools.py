@@ -44,12 +44,15 @@ class TestToolSurface:
 
     def test_no_other_toolset_exposes_owner_tools(self):
         for name, ts in TOOLSETS.items():
-            if name == "owner_workspace":
+            if name in {"owner_workspace", "owner_task_graph_commit"}:
                 continue
             assert not set(ts.get("tools") or []) & set(TOOL_NAMES)
+        assert TOOLSETS["owner_task_graph_commit"]["tools"] == [
+            "owner_task_graph_commit"
+        ]
 
-    def test_owner_workspace_toolset_is_kernel_gated(self):
-        assert "owner_workspace" in get_kernel_gated_toolsets()
+    def test_owner_workspace_toolsets_are_kernel_gated(self):
+        assert {"owner_workspace", "owner_task_graph_commit"} <= get_kernel_gated_toolsets()
 
     def test_resolve_toolset_returns_exactly_these_tools(self):
         assert set(resolve_toolset("owner_workspace", include_registry=False)) == set(TOOL_NAMES)
