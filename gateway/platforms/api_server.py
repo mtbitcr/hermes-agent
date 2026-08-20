@@ -249,7 +249,8 @@ def _resolve_owner_workspace_run_context(value: Any) -> "dict[str, str | None] |
     It is retained only with the in-memory Run status so the read-only
     Decisions inbox can route an active approval back to its originating
     owner surface. Existing Projects are resolved from receipt-backed native
-    state; a not-yet-created Project may carry only its bounded display name.
+    state, including archived Projects that need a restore approval; a
+    not-yet-created Project may carry only its bounded display name.
     """
     if value is None:
         return None
@@ -283,7 +284,7 @@ def _resolve_owner_workspace_run_context(value: Any) -> "dict[str, str | None] |
             raise ValueError("invalid owner Project slug")
         matches = [
             project for project in list_committed_projects(owner)
-            if project.get("slug") == project_slug and not project.get("archived")
+            if project.get("slug") == project_slug
         ]
         if len(matches) != 1:
             raise ValueError("owner Project is unavailable")
