@@ -90,6 +90,169 @@ class TestMcpEndpoints:
 
         assert _get_mcp_servers()["oauth-server"]["auth"] == "oauth"
 
+    def test_oauth_list_reports_strict_secret_free_connection_state(self):
+        from tools.mcp_oauth import HermesTokenStorage
+
+        response = self.client.post(
+            "/api/mcp/servers",
+            json={
+                "name": "owner-service",
+                "url": "https://example.com/mcp",
+                "auth": "oauth",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["connection_status"] == "needs_authorization"
+
+        storage = HermesTokenStorage("owner-service")
+        storage._tokens_path().parent.mkdir(parents=True, exist_ok=True)
+        storage._tokens_path().write_text("{}", encoding="utf-8")
+
+        summary = self.client.get("/api/mcp/servers").json()["servers"][0]
+        assert summary["connection_status"] == "connected"
+        assert "token" not in str(summary).lower()
+
+    def test_connections_machine_token_has_only_the_exact_mcp_contour(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        from starlette.testclient import TestClient
+
+        from hermes_constants import get_hermes_home
+        from hermes_cli import web_server
+        from hermes_cli.dashboard_auth import register_provider
+        from hermes_cli.dashboard_auth.registry import (
+            restore_registration,
+            snapshot_registration,
+        )
+        from hermes_cli.web_routers.mcp import _register_connections_machine_routes
+        from plugins.dashboard_auth.raphael_workspace import (
+            ConnectionsManageTokenProvider,
+        )
+        from plugins.dashboard_auth.raphael_workspace import token_store
+
+        _register_connections_machine_routes()
+        output_dir = get_hermes_home() / "connections-machine-test"
+        output_dir.mkdir(mode=0o700)
+        output_path = output_dir / "connections.token"
+        record = token_store.issue(
+            out_path=output_path,
+            surface=token_store.CONNECTIONS_SURFACE,
+        )
+        bearer = output_path.read_text(encoding="utf-8").strip()
+
+        provider = ConnectionsManageTokenProvider()
+        previous = snapshot_registration(provider.name)
+        if previous is None:
+            register_provider(provider)
+        else:
+            provider = previous
+
+        self.client.post(
+            "/api/mcp/servers",
+            json={
+                "name": "reports",
+                "url": "https://mcp.example/mcp",
+                "auth": "oauth",
+            },
+        )
+
+        def fake_worker(flow, _cfg):
+            asyncio.run(
+                flow.publish_authorization_url(
+                    "https://idp.example/authorize?state=synthetic"
+                )
+            )
+
+        monkeypatch.setattr(web_server, "_run_dashboard_mcp_oauth", fake_worker)
+        headers = {"Authorization": f"Bearer {bearer}"}
+        try:
+            with TestClient(web_server.app) as machine:
+                assert machine.get(
+                    "/api/mcp/servers", headers=headers
+                ).status_code == 200
+                response = machine.post(
+                    "/api/mcp/servers/reports/auth",
+                    headers=headers,
+                    json={
+                        "redirect_uri": (
+                            "https://workspace.example/api/mcp/oauth/callback/reports"
+                        )
+                    },
+                )
+                assert response.status_code == 200, response.text
+                assert machine.post(
+                    "/api/mcp/servers",
+                    headers=headers,
+                    json={
+                        "name": "forbidden",
+                        "url": "https://example.com/mcp",
+                    },
+                ).status_code == 403
+                token_store.revoke(record.token_id)
+                assert machine.get(
+                    "/api/mcp/servers", headers=headers
+                ).status_code == 401
+        finally:
+            if previous is None:
+                restore_registration(provider.name, provider, None)
+
+    def test_delete_revokes_config_and_all_oauth_state(self):
+        from hermes_cli.mcp_config import _get_mcp_servers
+        from tools.mcp_oauth import HermesTokenStorage
+
+        self.client.post(
+            "/api/mcp/servers",
+            json={
+                "name": "owner-service",
+                "url": "https://example.com/mcp",
+                "auth": "oauth",
+            },
+        )
+        storage = HermesTokenStorage("owner-service")
+        storage._tokens_path().parent.mkdir(parents=True, exist_ok=True)
+        for path in (
+            storage._tokens_path(),
+            storage._client_info_path(),
+            storage._meta_path(),
+        ):
+            path.write_text("{}", encoding="utf-8")
+
+        response = self.client.delete("/api/mcp/servers/owner-service")
+
+        assert response.status_code == 200
+        assert "owner-service" not in _get_mcp_servers()
+        assert not storage._tokens_path().exists()
+        assert not storage._client_info_path().exists()
+        assert not storage._meta_path().exists()
+
+    def test_delete_does_not_claim_success_when_oauth_cleanup_fails(self, monkeypatch):
+        from hermes_cli.mcp_config import _get_mcp_servers
+        from tools import mcp_oauth_manager
+
+        self.client.post(
+            "/api/mcp/servers",
+            json={
+                "name": "owner-service",
+                "url": "https://example.com/mcp",
+                "auth": "oauth",
+            },
+        )
+
+        class FailingManager:
+            def remove(self, *_args, **_kwargs):
+                raise OSError("synthetic cleanup failure")
+
+        monkeypatch.setattr(mcp_oauth_manager, "get_manager", lambda: FailingManager())
+        response = self.client.delete("/api/mcp/servers/owner-service")
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == (
+            "Connection could not be revoked. Nothing was reported as removed."
+        )
+        assert "owner-service" in _get_mcp_servers()
+
     @pytest.mark.parametrize(
         ("payload", "error"),
         [

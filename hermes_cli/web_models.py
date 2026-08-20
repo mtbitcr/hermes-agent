@@ -430,6 +430,12 @@ class MCPEnabledToggle(BaseModel):
     profile: Optional[str] = None
 
 
+class MCPAuthStart(BaseModel):
+    # Optional service-owned browser callback. Dashboard callers that omit it
+    # keep the existing request/config-derived behavior.
+    redirect_uri: Optional[str] = None
+
+
 # --- from web_server.py (originally lines 13622-13627) ---
 
 class MCPCatalogInstall(BaseModel):

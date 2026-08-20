@@ -1,4 +1,4 @@
-"""CLI for Raphael's managed Workspace and recommendations credentials.
+"""CLI for Raphael's managed Workspace, recommendations, and Connections credentials.
 
 Wires ``hermes kanban-workspace-token <subcommand>``:
   issue    — mint a new bearer token, write it once to an explicit path
@@ -29,11 +29,16 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     )
     issue_p.add_argument(
         "--surface",
-        choices=(token_store.WORKSPACE_SURFACE, token_store.RECOMMENDATIONS_SURFACE),
+        choices=(
+            token_store.WORKSPACE_SURFACE,
+            token_store.RECOMMENDATIONS_SURFACE,
+            token_store.CONNECTIONS_SURFACE,
+        ),
         default=token_store.WORKSPACE_SURFACE,
         help=(
             "Fixed credential surface to grant. Recommendations credentials "
-            "have a hard maximum lifetime of 8 hours."
+            "have a hard maximum lifetime of 8 hours; Connections receives "
+            "only its exact MCP management contour."
         ),
     )
     issue_p.add_argument(
@@ -67,7 +72,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         "--ttl-days",
         type=int,
         help=(
-            f"Expiry in days from now for the workspace surface (max "
+            f"Expiry in days from now for the workspace or connections surface (max "
             f"{token_store.MAX_TTL_SECONDS // 86400}); omitted values use "
             "that surface's fixed default."
         ),

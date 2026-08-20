@@ -615,6 +615,8 @@ def _require_token(request: Request) -> None:
       making plugin install/enable/disable and the other ``_require_token``
       endpoints permanently unreachable behind the gate. Defer to the gate.
     """
+    if getattr(request.state, "token_authenticated", False):
+        return
     if getattr(request.app.state, "auth_required", False):
         # Gate is authoritative. It attaches ``request.state.session`` on
         # success and 401s otherwise, so a request that reached us is already
@@ -13107,6 +13109,8 @@ def _redact_mcp_env(env: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _mcp_server_summary(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    from hermes_cli.mcp_config import _mcp_connection_status
+
     transport = "http" if cfg.get("url") else ("stdio" if cfg.get("command") else "unknown")
     auth = cfg.get("auth")
     headers = cfg.get("headers") or {}
@@ -13123,6 +13127,7 @@ def _mcp_server_summary(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         "env": _redact_mcp_env(cfg.get("env") or {}),
         "auth": auth,
         "enabled": cfg.get("enabled", True) is not False,
+        "connection_status": _mcp_connection_status(name, cfg),
         # Tool selection: list of enabled tool names, or None = all.
         "tools": cfg.get("tools"),
     }
