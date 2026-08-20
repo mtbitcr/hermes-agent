@@ -34,6 +34,7 @@ from gateway.platforms.api_server import (
     _derive_chat_session_id,
     _hermes_version,
     _redact_api_error_text,
+    _resolve_owner_workspace_run_context,
     _request_reasoning_config,
     _request_agent_overrides,
     check_api_server_requirements,
@@ -63,6 +64,43 @@ class TestRequestReasoningConfig:
 
     def test_ignores_unknown_effort(self):
         assert _request_reasoning_config({"reasoning_effort": "ultra"}) is None
+
+
+class TestOwnerWorkspaceRunContext:
+    def test_existing_context_accepts_receipt_backed_archived_project(self):
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        projects = [{
+            "project_id": "p_archived",
+            "slug": "archived-project",
+            "name": "Archived Project",
+            "description": "Retained owner project",
+            "board": "archived-project",
+            "archived": True,
+        }]
+
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch(
+                "hermes_cli.owner_workspace.resolve_owner_context",
+                return_value=types.SimpleNamespace(profile="default"),
+            ),
+            patch(
+                "hermes_cli.owner_workspace.list_committed_projects",
+                return_value=projects,
+            ),
+        ):
+            result = _resolve_owner_workspace_run_context({
+                "mode": "existing",
+                "project_slug": "archived-project",
+                "project_name": "ignored client name",
+            })
+
+        assert result == {
+            "mode": "existing",
+            "project_slug": "archived-project",
+            "project_name": "Archived Project",
+            "profile": "default",
+        }
 
 
 # ---------------------------------------------------------------------------
