@@ -72,6 +72,13 @@ jobs:
           fetch-tags: true
           sparse-checkout: scripts/sandbox/pick-release-tags.sh
           sparse-checkout-cone-mode: false
+      - name: Fetch parent release tags for forks
+        if: github.event.repository.fork
+        run: |
+          set -euo pipefail
+          git fetch --force \
+            "https://github.com/NousResearch/hermes-agent.git" \
+            "+refs/tags/v*:refs/tags/v*"
       - id: pick
         run: |
           set -euo pipefail
