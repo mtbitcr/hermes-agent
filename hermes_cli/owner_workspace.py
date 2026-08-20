@@ -671,6 +671,12 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
             raw.get("assignee"), f"tasks[{index}].assignee", limit=64,
         )
         try:
+            responsibility = kanban_db.normalize_responsibility(
+                raw.get("responsibility")
+            )
+        except ValueError as exc:
+            raise OwnerWorkspaceError("invalid_argument", str(exc)) from exc
+        try:
             assignee = normalize_profile_name(assignee_raw)
         except ValueError as exc:
             raise OwnerWorkspaceError("invalid_assignee", str(exc)) from exc
@@ -704,6 +710,7 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
             "title": redact_sensitive_text(title, force=True),
             "body": redact_sensitive_text(body, force=True),
             "assignee": assignee,
+            "responsibility": responsibility,
             "parents": clean_parents,
         })
 
@@ -1746,10 +1753,16 @@ def _normalize_project_task_ref(value: Any, field: str, *, mutating: bool) -> di
 def _normalize_project_task_spec(
     value: Any, field: str, *, parent_limit: Optional[int] = None,
 ) -> dict:
-    keys = {"title", "body", "assignee", "parents"} if parent_limit is not None else {
+    required = {"title", "body", "assignee", "parents"} if parent_limit is not None else {
         "title", "body", "assignee",
     }
-    raw = _require_exact_keys(value, field, keys)
+    allowed = required | {"responsibility"}
+    if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(allowed):
+        raise OwnerWorkspaceError(
+            "invalid_argument",
+            f"{field} must contain {sorted(required)} and only optional responsibility",
+        )
+    raw = value
     from agent.redact import redact_sensitive_text
 
     result = {
@@ -1761,6 +1774,12 @@ def _normalize_project_task_spec(
         ),
         "assignee": _normalize_graph_assignee(raw["assignee"], f"{field}.assignee"),
     }
+    try:
+        result["responsibility"] = kanban_db.normalize_responsibility(
+            raw.get("responsibility")
+        )
+    except ValueError as exc:
+        raise OwnerWorkspaceError("invalid_argument", str(exc)) from exc
     if parent_limit is not None:
         parents = raw["parents"]
         if not isinstance(parents, list):
@@ -1801,10 +1820,17 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
         )
 
         if action == "add":
-            raw = _require_exact_keys(
-                item, field,
-                {"action", "reason", "title", "body", "assignee", "existing_parents", "new_parents"},
-            )
+            required = {
+                "action", "reason", "title", "body", "assignee",
+                "existing_parents", "new_parents",
+            }
+            allowed = required | {"responsibility"}
+            if not required.issubset(item) or not set(item).issubset(allowed):
+                raise OwnerWorkspaceError(
+                    "invalid_argument",
+                    f"{field} must contain {sorted(required)} and only optional responsibility",
+                )
+            raw = item
             existing = raw["existing_parents"]
             new_parents = raw["new_parents"]
             if not isinstance(existing, list) or not isinstance(new_parents, list):
@@ -1825,7 +1851,7 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
                     )
                 parent_indexes.append(parent)
             spec = _normalize_project_task_spec(
-                {key: raw[key] for key in ("title", "body", "assignee")},
+                {**{key: raw[key] for key in ("title", "body", "assignee")}, "responsibility": raw.get("responsibility")},
                 field,
                 parent_limit=None,
             )

@@ -140,7 +140,7 @@ class TestSchemas:
         assert tasks["maxItems"] == 12
         assert tasks["items"]["additionalProperties"] is False
         assert set(tasks["items"]["required"]) == {
-            "title", "body", "assignee", "parents",
+            "title", "body", "assignee", "responsibility", "parents",
         }
 
     def test_task_move_requires_full_cas_precondition(self):

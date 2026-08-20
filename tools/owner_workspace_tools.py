@@ -321,13 +321,22 @@ registry.register(
                                 "type": "string",
                                 "description": "Existing Hermes profile; validated by the kernel.",
                             },
+                            "responsibility": {
+                                "type": "string",
+                                "description": (
+                                    "Stable logical responsibility selected by the trusted planner; "
+                                    "this is not the runtime profile."
+                                ),
+                            },
                             "parents": {
                                 "type": "array",
                                 "items": {"type": "integer", "minimum": 0},
                                 "description": "Indices of prerequisite tasks in this same array.",
                             },
                         },
-                        "required": ["title", "body", "assignee", "parents"],
+                        "required": [
+                            "title", "body", "assignee", "responsibility", "parents",
+                        ],
                     },
                 },
                 "later_milestones": {
@@ -371,8 +380,12 @@ _PROJECT_TASK_SPEC = {
         "title": {"type": "string"},
         "body": {"type": "string"},
         "assignee": {"type": "string"},
+        "responsibility": {
+            "type": "string",
+            "description": "Stable logical responsibility; separate from the runtime profile.",
+        },
     },
-    "required": ["title", "body", "assignee"],
+    "required": ["title", "body", "assignee", "responsibility"],
 }
 
 _PROJECT_REPLACEMENT_SPEC = {
@@ -385,7 +398,7 @@ _PROJECT_REPLACEMENT_SPEC = {
             "items": {"type": "integer", "minimum": 0},
         },
     },
-    "required": ["title", "body", "assignee", "parents"],
+    "required": ["title", "body", "assignee", "responsibility", "parents"],
 }
 
 
@@ -451,7 +464,7 @@ registry.register(
                                     },
                                 },
                                 "required": [
-                                    "action", "reason", "title", "body", "assignee",
+                                    "action", "reason", "title", "body", "assignee", "responsibility",
                                     "existing_parents", "new_parents",
                                 ],
                             },
