@@ -349,7 +349,74 @@ def test_committed_project_projection_is_receipt_backed_and_read_only(ctx):
         "name": "Listed Project",
         "description": "A plain-English owner project.",
         "board": result["board"],
+        "archived": False,
     }]
+
+
+def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
+    args = _task_graph_args(
+        idempotency_key="graph-lifecycle",
+        project_name="Lifecycle Project",
+    )
+    approver = _with_approver(ctx.session)
+    created = ow.commit_task_graph(ctx, **args)
+    approver.join()
+
+    archive_approver = _with_approver(ctx.session)
+    archived = ow.set_project_archived(
+        ctx,
+        idempotency_key="project-lifecycle-archive",
+        project_id=created["project_id"],
+        action="archive",
+    )
+    archive_approver.join()
+    assert archived == {
+        "ok": True,
+        "action": "archive",
+        "project_slug": created["project_slug"],
+        "archived": True,
+    }
+    assert ow.list_committed_projects(ctx)[0]["archived"] is True
+
+    approval.unregister_gateway_notify(ctx.session)
+    assert ow.set_project_archived(
+        ctx,
+        idempotency_key="project-lifecycle-archive",
+        project_id=created["project_id"],
+        action="archive",
+    ) == archived
+
+    restore_approver = _with_approver(ctx.session)
+    restored = ow.set_project_archived(
+        ctx,
+        idempotency_key="project-lifecycle-restore",
+        project_id=created["project_id"],
+        action="restore",
+    )
+    restore_approver.join()
+    assert restored == {
+        "ok": True,
+        "action": "restore",
+        "project_slug": created["project_slug"],
+        "archived": False,
+    }
+    assert ow.list_committed_projects(ctx)[0]["archived"] is False
+
+
+def test_project_lifecycle_rejects_project_without_owner_receipt(ctx):
+    with projects_db.connect_closing() as conn:
+        project_id = projects_db.create_project(conn, name="Foreign Project")
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.set_project_archived(
+            ctx,
+            idempotency_key="foreign-project-archive",
+            project_id=project_id,
+            action="archive",
+        )
+    assert excinfo.value.code == "project_not_owned"
+    with projects_db.connect_closing() as conn:
+        assert projects_db.get_project(conn, project_id).archived is False
 
 
 def _bootstrap_board(ctx):
@@ -467,6 +534,91 @@ def test_project_steward_snapshot_rejects_invalid_lookback(ctx, lookback_days):
             project_id=setup["project_id"], lookback_days=lookback_days
         )
     assert excinfo.value.code == "invalid_argument"
+
+
+def test_owner_decisions_projects_native_gates_without_writes_or_identifiers(ctx):
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        review_id = kanban_db.create_task(
+            conn,
+            title="Review the workshop outline",
+            project_id=setup["project_id"],
+        )
+        input_id = kanban_db.create_task(
+            conn,
+            title="Choose the workshop date",
+            project_id=setup["project_id"],
+        )
+        recommendation_id = kanban_db.create_recommendation(
+            conn,
+            project_id=setup["project_id"],
+            target_profile="raphael-planner",
+            recommendation_kind="skill",
+            recommendation_subject_id="workshop-research",
+            recommendation_label="Add workshop research support",
+            recommendation_rationale="The current milestone needs public-source research.",
+            recommendation_evidence={
+                "schema_version": 1,
+                "need": "The workshop outline needs current public evidence.",
+                "expected_benefit": "Keep the owner-facing advice current.",
+                "requested_scope": {
+                    flag: False for flag in kanban_db.RECOMMENDATION_SCOPE_FLAGS
+                },
+                "risks": "Low",
+                "cost": "No added cost",
+                "rollback": "Remove the staged skill configuration.",
+            },
+            provenance_authority="project-steward",
+            provenance_ref="private-native-reference",
+        )
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,)
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input' "
+                "WHERE id = ?",
+                (input_id,),
+            )
+
+    project_db = projects_db.projects_db_path()
+    board_db = kanban_db.board_dir(setup["board"]) / "kanban.db"
+    before = (project_db.stat().st_mtime_ns, board_db.stat().st_mtime_ns)
+
+    decisions = ow.list_owner_decisions(ctx)
+
+    assert (project_db.stat().st_mtime_ns, board_db.stat().st_mtime_ns) == before
+    assert {(item["authority"], item["kind"], item["title"]) for item in decisions} == {
+        ("task", "review", "Review the workshop outline"),
+        ("task", "owner_input", "Choose the workshop date"),
+        ("recommendation", "capability", "Add workshop research support"),
+    }
+    assert all(item["project_slug"] == setup["board"] for item in decisions)
+    assert all(item["project_name"] == "Board Setup" for item in decisions)
+    assert all(item["decision_ref"].startswith("decision_") for item in decisions)
+    assert len({item["decision_ref"] for item in decisions}) == 3
+
+    payload = json.dumps(decisions)
+    for forbidden in (
+        review_id,
+        input_id,
+        recommendation_id,
+        setup["project_id"],
+        "raphael-planner",
+        "private-native-reference",
+        "workshop-research",
+    ):
+        assert forbidden not in payload
+
+    archived_approver = _with_approver(ctx.session)
+    ow.set_project_archived(
+        ctx,
+        idempotency_key="decisions-archive-project",
+        project_id=setup["project_id"],
+        action="archive",
+    )
+    archived_approver.join()
+    assert ow.list_owner_decisions(ctx) == []
 
 
 def _project_task_ref(conn, task_id: str) -> dict:

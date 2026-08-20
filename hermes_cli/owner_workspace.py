@@ -1118,6 +1118,25 @@ def commit_task_graph(
         pconn.close()
 
 
+def _receipt_owns_project(
+    conn: sqlite3.Connection, ctx: OwnerContext, project_id: str,
+) -> bool:
+    """Return whether this trusted owner has a committed Project receipt."""
+    rows = conn.execute(
+        "SELECT result_json FROM owner_workspace_receipts "
+        "WHERE actor = ? AND profile = ? AND status = 'committed' "
+        "AND operation IN ('owner_workspace_bootstrap', 'owner_task_graph_commit')",
+        (ctx.actor, ctx.profile),
+    ).fetchall()
+    for row in rows:
+        try:
+            if json.loads(row["result_json"]).get("project_id") == project_id:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def list_committed_projects(ctx: OwnerContext) -> list[dict]:
     """Read-only projection of projects proven by committed owner receipts."""
     path = projects_db.projects_db_path()
@@ -1160,8 +1179,8 @@ def list_committed_projects(ctx: OwnerContext) -> list[dict]:
         projects: list[dict] = []
         for project_id in project_ids:
             row = conn.execute(
-                "SELECT id, slug, name, description, board_slug "
-                "FROM projects WHERE id = ? AND archived = 0",
+                "SELECT id, slug, name, description, board_slug, archived "
+                "FROM projects WHERE id = ?",
                 (project_id,),
             ).fetchone()
             if row is None or not row["board_slug"]:
@@ -1176,10 +1195,236 @@ def list_committed_projects(ctx: OwnerContext) -> list[dict]:
                 "name": row["name"],
                 "description": row["description"],
                 "board": row["board_slug"],
+                "archived": bool(row["archived"]),
             })
         return projects
     finally:
         conn.close()
+
+
+_OWNER_DECISIONS_LIMIT = 100
+
+
+def _owner_decision_ref(
+    ctx: OwnerContext, *, authority: str, native_id: str
+) -> str:
+    """Return an opaque presentation key, never a native authority id."""
+    canonical = "\x00".join((ctx.actor, ctx.profile, authority, native_id))
+    return "decision_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def _owner_decision_reason(value: Any, *, fallback: str) -> str:
+    """Bound and redact text already intended for owner review."""
+    from agent.redact import redact_sensitive_text
+
+    text = redact_sensitive_text(str(value or ""), force=True)
+    text = " ".join(text.split()).strip()
+    return text[:500] or fallback
+
+
+def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
+    """Project pending native gates into one owner-safe read-only inbox.
+
+    This is deliberately a projection, not a decision store or mutation
+    router. Work reviews and owner-input blocks stay native Tasks;
+    capability suggestions stay native recommendation rows. The caller gets
+    only an opaque presentation key plus enough Project scope to route the
+    owner back to the authority-specific surface. Native ids, assignees,
+    bodies, results, runs, provenance and private evidence never leave this
+    boundary.
+    """
+    decisions: list[dict] = []
+    projects = list_committed_projects(ctx)
+    for project in projects:
+        if project["archived"]:
+            continue
+
+        project_id = str(project["project_id"])
+        board_slug = str(project["board"])
+        if board_slug == kanban_db.DEFAULT_BOARD:
+            board_path = kanban_db.kanban_home() / "kanban.db"
+        else:
+            board_path = kanban_db.board_dir(board_slug) / "kanban.db"
+
+        conn = _open_read_only_sqlite(board_path, label="kanban.db")
+        try:
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+            }
+            required = {
+                "id", "title", "status", "created_at", "project_id",
+                "task_kind", "block_kind", "review_policy",
+                "recommendation_label", "recommendation_rationale",
+                "recommendation_decision",
+            }
+            if not required <= columns:
+                raise OwnerWorkspaceError(
+                    "snapshot_unavailable", "kanban.db schema is unavailable"
+                )
+            rows = conn.execute(
+                "SELECT id, title, status, created_at, task_kind, block_kind, "
+                "review_policy, recommendation_label, recommendation_rationale, "
+                "recommendation_decision FROM tasks WHERE project_id = ? AND ("
+                "(task_kind = 'work' AND status = 'review') OR "
+                "(task_kind = 'work' AND status = 'blocked' "
+                "AND block_kind = 'needs_input') OR "
+                "(task_kind = 'recommendation' AND status = 'review' "
+                "AND review_policy = 'owner' "
+                "AND COALESCE(recommendation_decision, 'pending') = 'pending')) "
+                "ORDER BY created_at DESC, id ASC LIMIT ?",
+                (project_id, _OWNER_DECISIONS_LIMIT + 1),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise OwnerWorkspaceError(
+                "snapshot_unavailable", "the Project decisions could not be read"
+            ) from exc
+        finally:
+            conn.close()
+
+        for row in rows:
+            task_kind = str(row["task_kind"])
+            if task_kind == "recommendation":
+                authority = "recommendation"
+                kind = "capability"
+                title = _owner_title(row["recommendation_label"])
+                reason = _owner_decision_reason(
+                    row["recommendation_rationale"],
+                    fallback="Raphael has suggested a capability change for your review.",
+                )
+            elif row["block_kind"] == "needs_input":
+                authority = "task"
+                kind = "owner_input"
+                title = _owner_title(row["title"])
+                reason = "Raphael needs your answer before this work can continue."
+            else:
+                authority = "task"
+                kind = "review"
+                title = _owner_title(row["title"])
+                reason = "This result is ready for your review."
+
+            decisions.append({
+                "decision_ref": _owner_decision_ref(
+                    ctx, authority=authority, native_id=str(row["id"])
+                ),
+                "authority": authority,
+                "kind": kind,
+                "project_slug": str(project["slug"]),
+                "project_name": _owner_title(project["name"]),
+                "title": title,
+                "reason": reason,
+                "created_at": _owner_timestamp(row["created_at"]),
+            })
+
+    authority_order = {"owner_input": 0, "review": 1, "capability": 2}
+    decisions.sort(
+        key=lambda item: (
+            authority_order.get(item["kind"], 9),
+            str(item["project_name"]).casefold(),
+            str(item["title"]).casefold(),
+            str(item["decision_ref"]),
+        )
+    )
+    return decisions[:_OWNER_DECISIONS_LIMIT]
+
+
+def set_project_archived(
+    ctx: OwnerContext,
+    *,
+    idempotency_key: str,
+    project_id: str,
+    action: str,
+) -> dict:
+    """Archive or restore one receipt-backed native Project.
+
+    Hard delete is intentionally absent.  The same receipt lease and
+    exact-operation approval used by every owner-workspace mutation fence the
+    native Project row, so retries cannot duplicate or drift the action.
+    """
+    idempotency_key = _bounded_text(
+        idempotency_key, "idempotency_key", limit=200,
+    )
+    project_id = _bounded_text(project_id, "project_id", limit=100)
+    action = str(action or "").strip().lower()
+    if action not in {"archive", "restore"}:
+        raise OwnerWorkspaceError(
+            "invalid_argument", "action must be 'archive' or 'restore'",
+        )
+    payload = {"project_id": project_id, "action": action}
+    digest = _digest(payload)
+    operation = "owner_project_lifecycle"
+    target_archived = action == "archive"
+
+    pconn = projects_db.connect()
+    try:
+        _ensure_schema(pconn)
+        if not _receipt_owns_project(pconn, ctx, project_id):
+            raise OwnerWorkspaceError(
+                "project_not_owned",
+                "the Project is not owned by this owner-workspace profile",
+            )
+        project = projects_db.get_project(pconn, project_id)
+        if project is None or not project.board_slug:
+            raise OwnerWorkspaceError(
+                "project_not_found", "the Project is unavailable",
+            )
+        _assert_board_ownership(project.board_slug, project_id)
+
+        state, row, token = _acquire_or_replay(
+            pconn, ctx, idempotency_key, operation, digest,
+        )
+        if state == "terminal":
+            return json.loads(row["result_json"])
+
+        approval = _confirm(
+            ctx,
+            operation=operation,
+            digest=digest,
+            description=f"{action.title()} Project {project.name!r}",
+        )
+        if not approval.get("approved"):
+            result = {
+                "ok": False,
+                "error": "confirmation_denied",
+                "reason": approval.get("reason"),
+            }
+            _finalize_receipt(
+                pconn, ctx, idempotency_key, token,
+                status="denied", result=result,
+            )
+            return result
+
+        with write_txn(pconn):
+            _assert_owns_lease(pconn, ctx, idempotency_key, token)
+            current = projects_db.get_project(pconn, project_id)
+            if current is None or not current.board_slug:
+                raise OwnerWorkspaceError(
+                    "project_not_found", "the Project is unavailable",
+                )
+            if bool(current.archived) == target_archived and row is None:
+                result = {
+                    "ok": False,
+                    "error": "conflict",
+                    "archived": bool(current.archived),
+                }
+            else:
+                pconn.execute(
+                    "UPDATE projects SET archived = ? WHERE id = ?",
+                    (int(target_archived), project_id),
+                )
+                result = {
+                    "ok": True,
+                    "action": action,
+                    "project_slug": current.slug,
+                    "archived": target_archived,
+                }
+
+        _finalize_receipt(
+            pconn, ctx, idempotency_key, token,
+            status="committed", result=result,
+        )
+        return result
+    finally:
+        pconn.close()
 
 
 # ---------------------------------------------------------------------------

@@ -126,9 +126,67 @@ class TestResponseStore:
         store.delete("resp_1")
         assert store.get_conversation("chat-a") is None
 
+    def test_owner_history_projects_only_final_structured_turns(self):
+        secret = "sk-ant-api03-" + "a" * 80
+        conversation = "raphael-owner-" + "a" * 32
+        store = ResponseStore(max_size=10)
+        final_proposal = json.dumps({
+            "schema_version": 1,
+            "kind": "proposal",
+            "mode": "new",
+            "project_name": f"Workshop pilot {secret}",
+        })
+        final_question = json.dumps({
+            "schema_version": 1,
+            "kind": "question",
+            "message": "Which week should it run?",
+        })
+        store.put("resp_owner_history", {
+            "response": {"id": "resp_owner_history"},
+            "conversation_history": [
+                {"role": "system", "content": "private instructions"},
+                {"role": "user", "content": "Plan a workshop."},
+                {"role": "assistant", "content": "private intermediate reasoning"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "private_tool"}}],
+                },
+                {"role": "tool", "content": "private tool output"},
+                {"role": "assistant", "content": final_proposal},
+                {"role": "user", "content": "Make it next month."},
+                {"role": "assistant", "content": final_question},
+            ],
+            "instructions": "private instructions",
+        })
+        store.set_conversation(conversation, "resp_owner_history")
+
+        history = store.owner_history(conversation)
+        assert [item["owner"] for item in history] == [
+            "Plan a workshop.", "Make it next month.",
+        ]
+        assert json.loads(history[0]["raphael"])["kind"] == "proposal"
+        assert json.loads(history[1]["raphael"])["kind"] == "question"
+        assert secret not in json.dumps(history)
+
+    def test_owner_history_missing_or_invalid_conversation_is_empty(self):
+        store = ResponseStore(max_size=10)
+        store.put("resp_invalid_history", {
+            "response": {"id": "resp_invalid_history"},
+            "conversation_history": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "unstructured private text"},
+            ],
+        })
+        store.set_conversation("invalid-history", "resp_invalid_history")
+
+        assert store.owner_history("missing-history") == []
+        assert store.owner_history("invalid-history") == []
+
 
 # ---------------------------------------------------------------------------
 # _IdempotencyCache
+        assert store.owner_history("raphael-owner-safe") == []
 # ---------------------------------------------------------------------------
 
 
@@ -325,10 +383,15 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_get("/v1/owner-workspace/projects", adapter._handle_owner_workspace_projects)
+    app.router.add_get("/v1/owner-workspace/decisions", adapter._handle_owner_workspace_decisions)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
+    app.router.add_get(
+        "/v1/responses/conversations/{conversation}",
+        adapter._handle_owner_conversation_history,
+    )
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
     app.router.add_post(
@@ -916,6 +979,7 @@ class TestOwnerWorkspaceProjectsEndpoint:
             "name": "Shoe shop",
             "description": "Owner project",
             "board": "shoe-shop",
+            "archived": False,
         }]
         app = _create_app(adapter)
         config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
@@ -941,6 +1005,75 @@ class TestOwnerWorkspaceProjectsEndpoint:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/v1/owner-workspace/projects")
 
+        assert resp.status == 401
+
+
+class TestOwnerWorkspaceDecisionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_enabled_surface_combines_durable_and_active_native_gates(self, adapter):
+        durable = [{
+            "decision_ref": "decision_task_safe",
+            "authority": "task",
+            "kind": "owner_input",
+            "project_slug": "workshop-pilot",
+            "project_name": "Workshop pilot",
+            "title": "Choose the workshop date",
+            "reason": "Raphael needs your answer before this work can continue.",
+            "created_at": "2026-08-20T12:00:00Z",
+        }]
+        adapter._run_statuses["run_private_native_id"] = {
+            "run_id": "run_private_native_id",
+            "status": "waiting_for_approval",
+            "created_at": 1_787_227_200,
+            "pending_approval": {
+                "approval_id": "approval_private_native_id",
+                "operation": "owner_project_plan_commit",
+                "description": "private internal operation detail",
+            },
+            "owner_workspace_context": {
+                "mode": "existing",
+                "project_slug": "workshop-pilot",
+                "project_name": "Workshop pilot",
+                "profile": "default",
+            },
+        }
+        app = _create_app(adapter)
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch(
+                "hermes_cli.owner_workspace.resolve_owner_context",
+                return_value=types.SimpleNamespace(profile="default"),
+            ),
+            patch("hermes_cli.owner_workspace.list_owner_decisions", return_value=durable),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/owner-workspace/decisions")
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["object"] == "hermes.owner_workspace.decision_list"
+        assert data["data"][0] == durable[0]
+        assert data["data"][1] == {
+            "decision_ref": data["data"][1]["decision_ref"],
+            "authority": "run",
+            "kind": "run_approval",
+            "project_slug": "workshop-pilot",
+            "project_name": "Workshop pilot",
+            "title": "Approve Project changes",
+            "reason": "Raphael is waiting for your confirmation before changing this Project.",
+            "created_at": "2026-08-20T12:00:00Z",
+        }
+        assert data["data"][1]["decision_ref"].startswith("decision_")
+        assert "run_private_native_id" not in json.dumps(data)
+        assert "approval_private_native_id" not in json.dumps(data)
+        assert "private internal operation detail" not in json.dumps(data)
+
+    @pytest.mark.asyncio
+    async def test_surface_requires_bearer_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/owner-workspace/decisions")
         assert resp.status == 401
 
 

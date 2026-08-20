@@ -15,6 +15,7 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - GET  /v1/owner-workspace/projects — list receipt-backed owner Projects
+- GET  /v1/owner-workspace/decisions — project pending native owner gates
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
@@ -239,6 +240,74 @@ def _owner_workspace_toolset_enabled(user_config: dict) -> bool:
     except Exception:
         return False
     return value is True
+
+
+def _resolve_owner_workspace_run_context(value: Any) -> "dict[str, str | None] | None":
+    """Validate optional owner routing metadata against native Project state.
+
+    The context never grants mutation authority and never accepts a native id.
+    It is retained only with the in-memory Run status so the read-only
+    Decisions inbox can route an active approval back to its originating
+    owner surface. Existing Projects are resolved from receipt-backed native
+    state; a not-yet-created Project may carry only its bounded display name.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "mode", "project_slug", "project_name",
+    }:
+        raise ValueError("invalid owner workspace context")
+
+    from gateway.run import _load_gateway_config
+
+    if not _owner_workspace_toolset_enabled(_load_gateway_config()):
+        raise ValueError("owner workspace is disabled")
+
+    mode = value.get("mode")
+    project_slug = value.get("project_slug")
+    project_name = value.get("project_name")
+    if mode not in {"new", "existing"}:
+        raise ValueError("invalid owner workspace mode")
+
+    from hermes_cli.owner_workspace import (
+        list_committed_projects,
+        resolve_owner_context,
+    )
+
+    owner = resolve_owner_context()
+    if mode == "existing":
+        if (
+            not isinstance(project_slug, str)
+            or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", project_slug) is None
+        ):
+            raise ValueError("invalid owner Project slug")
+        matches = [
+            project for project in list_committed_projects(owner)
+            if project.get("slug") == project_slug and not project.get("archived")
+        ]
+        if len(matches) != 1:
+            raise ValueError("owner Project is unavailable")
+        project_name = str(matches[0].get("name") or "").strip()
+    else:
+        if project_slug is not None:
+            raise ValueError("new Project cannot have a slug")
+        if not isinstance(project_name, str):
+            raise ValueError("new Project name is required")
+        project_name = " ".join(
+            redact_sensitive_text(project_name, force=True).split()
+        ).strip()
+
+    if not project_name or len(project_name) > 160:
+        raise ValueError("invalid owner Project name")
+    profile = str(getattr(owner, "profile", "") or "").strip()
+    if not profile:
+        raise ValueError("owner profile is unavailable")
+    return {
+        "mode": str(mode),
+        "project_slug": project_slug if mode == "existing" else None,
+        "project_name": project_name,
+        "profile": profile,
+    }
 
 
 def _normalize_api_route_rule(value: str) -> "str | None":
@@ -1222,6 +1291,85 @@ class ResponseStore:
             "SELECT response_id FROM conversations WHERE name = ?", (name,)
         ).fetchone()
         return row[0] if row else None
+
+    def owner_history(self, name: str) -> List[Dict[str, str]]:
+        """Project one conversation into bounded owner-visible turns.
+
+        The stored transcript remains the native Responses authority.  This
+        projection never returns system instructions, tools, intermediate
+        assistant text, response IDs, usage, sessions, or private reasoning.
+        Only a final structured Raphael reply is paired with its owner input.
+        """
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"raphael-owner-[a-f0-9]{32}", name) is None
+        ):
+            return []
+        row = self._conn.execute(
+            "SELECT r.data FROM conversations c "
+            "JOIN responses r ON r.response_id = c.response_id "
+            "WHERE c.name = ?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            return []
+        try:
+            stored = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return []
+        history = stored.get("conversation_history") if isinstance(stored, dict) else None
+        if not isinstance(history, list):
+            return []
+
+        from agent.redact import redact_sensitive_text
+
+        turns: List[Dict[str, str]] = []
+        owner_text: Optional[str] = None
+        raphael_text: Optional[str] = None
+
+        def _flush() -> None:
+            nonlocal owner_text, raphael_text
+            if owner_text is not None and raphael_text is not None:
+                turns.append({"owner": owner_text, "raphael": raphael_text})
+            owner_text = None
+            raphael_text = None
+
+        for message in history:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            text = content.strip()
+            if not text or len(text) > 12_000:
+                continue
+            if role == "user":
+                _flush()
+                owner_text = redact_sensitive_text(text, force=True)
+                continue
+            if role != "assistant" or owner_text is None:
+                continue
+            try:
+                candidate = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if (
+                not isinstance(candidate, dict)
+                or candidate.get("schema_version") not in {1, 2}
+                or candidate.get("kind")
+                not in {"question", "proposal", "project_change_proposal"}
+            ):
+                continue
+            # Last valid structured assistant message before the next owner
+            # turn is the authoritative final reply for that turn.
+            from hermes_cli.kanban_db import redact_review_value
+
+            raphael_text = json.dumps(
+                redact_review_value(candidate), ensure_ascii=False,
+            )
+        _flush()
+        return turns[-40:]
 
     def set_conversation(self, name: str, response_id: str) -> None:
         """Map a conversation name to its latest response_id."""
@@ -2391,6 +2539,10 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
+            (
+                "GET", "/v1/responses/conversations/{conversation}",
+                self._handle_owner_conversation_history,
+            ),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
             # Generic platform HTTP event callback ingress. Authenticated by
@@ -2406,6 +2558,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("GET", "/v1/owner-workspace/projects", self._handle_owner_workspace_projects),
+            ("GET", "/v1/owner-workspace/decisions", self._handle_owner_workspace_decisions),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -5926,6 +6079,20 @@ class APIServerAdapter(BasePlatformAdapter):
     # GET / DELETE response endpoints
     # ------------------------------------------------------------------
 
+    async def _handle_owner_conversation_history(
+        self, request: "web.Request",
+    ) -> "web.Response":
+        """Return the owner-safe projection of one stored conversation."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        conversation = request.match_info["conversation"]
+        return web.json_response({
+            "object": "hermes.response.owner_history",
+            "data": self._response_store.owner_history(conversation),
+        })
+
     async def _handle_get_response(self, request: "web.Request") -> "web.Response":
         """GET /v1/responses/{response_id} — retrieve a stored response."""
         auth_err = self._check_auth(request)
@@ -6992,6 +7159,94 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
 
+    async def _handle_owner_workspace_decisions(
+        self, request: "web.Request",
+    ) -> "web.Response":
+        """GET owner-safe pending gates without creating decision authority."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from gateway.run import _load_gateway_config
+
+            if not _owner_workspace_toolset_enabled(_load_gateway_config()):
+                return web.json_response(
+                    _openai_error(
+                        "Owner workspace is not enabled for this profile",
+                        code="owner_workspace_not_enabled",
+                    ),
+                    status=404,
+                )
+            from hermes_cli.owner_workspace import (
+                list_owner_decisions,
+                resolve_owner_context,
+            )
+
+            owner = resolve_owner_context()
+            decisions = list_owner_decisions(owner)
+            owner_profile = str(owner.profile)
+        except Exception:
+            logger.exception("[api_server] owner-workspace decision projection failed")
+            return web.json_response(
+                _openai_error(
+                    "Owner workspace decision projection is unavailable",
+                    code="owner_workspace_unavailable",
+                ),
+                status=500,
+            )
+
+        operation_titles = {
+            "owner_workspace_bootstrap": "Approve the new Project",
+            "owner_task_graph_commit": "Approve the first Project milestone",
+            "owner_project_plan_commit": "Approve Project changes",
+            "owner_task_move": "Approve a work-state change",
+            "owner_task_comment": "Approve an owner reply",
+            "owner_project_lifecycle": "Approve the Project lifecycle change",
+        }
+        for run_id, status in self._run_statuses.items():
+            context = status.get("owner_workspace_context")
+            pending = status.get("pending_approval")
+            if (
+                status.get("status") != "waiting_for_approval"
+                or not isinstance(context, dict)
+                or context.get("profile") != owner_profile
+                or not isinstance(pending, dict)
+            ):
+                continue
+            operation = str(pending.get("operation") or "")
+            title = operation_titles.get(operation)
+            if title is None:
+                continue
+            created_at = status.get("created_at")
+            try:
+                created_iso = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(created_at))
+                )
+            except (OSError, OverflowError, TypeError, ValueError):
+                created_iso = None
+            decisions.append({
+                "decision_ref": "decision_" + hashlib.sha256(
+                    f"{owner_profile}\x00run\x00{run_id}".encode("utf-8")
+                ).hexdigest()[:32],
+                "authority": "run",
+                "kind": "run_approval",
+                "project_slug": context.get("project_slug"),
+                "project_name": context.get("project_name"),
+                "title": title,
+                "reason": (
+                    "Raphael is waiting for your confirmation before "
+                    "changing this Project."
+                ),
+                "created_at": created_iso,
+            })
+
+        return web.json_response({
+            "object": "hermes.owner_workspace.decision_list",
+            "data": decisions[:100],
+        })
+
+
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
@@ -7010,6 +7265,15 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        try:
+            owner_workspace_context = _resolve_owner_workspace_run_context(
+                body.get("owner_workspace_context")
+            )
+        except ValueError:
+            return web.json_response(
+                _openai_error("Invalid 'owner_workspace_context' field"), status=400
+            )
 
         raw_input = body.get("input")
         if not raw_input:
@@ -7124,6 +7388,7 @@ class APIServerAdapter(BasePlatformAdapter):
             created_at=created_at,
             session_id=session_id,
             model=body.get("model", self._model_name),
+            owner_workspace_context=owner_workspace_context,
         )
 
         # Background task outlives the HTTP response (and thus the middleware
@@ -7194,7 +7459,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "owner_task_graph_commit",
                         "owner_project_plan_commit",
                         "owner_task_move",
-                        "owner_task_comment",
+                        "owner_task_comment", "owner_project_lifecycle",
                     }:
                         pending_approval["operation"] = operation
                     self._set_run_status(

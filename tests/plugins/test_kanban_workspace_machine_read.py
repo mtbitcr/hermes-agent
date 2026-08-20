@@ -289,8 +289,21 @@ def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_su
         s, f"/api/plugins/kanban/runs/{s['run_id']}", query=f"?board={BOARD}"
     )
     assert run.status_code == 200
-    assert set(run.json()["run"]) == {
-        "id", "status", "started_at", "finished_at", "worker_name"
+    assert set(run.json()["run"]) == {"started_at", "finished_at", "receipt"}
+    assert run.json()["run"]["receipt"] == {
+        "outcome": "running",
+        "summary": "Work is still in progress.",
+        "external_effect": {
+            "state": "unknown",
+            "summary": (
+                "This record does not confirm whether an external service changed."
+            ),
+        },
+        "cost": {
+            "state": "unknown",
+            "summary": "This record does not contain an authoritative cost.",
+        },
+        "evidence": {"state": "available", "kind": "project_activity"},
     }
     assert run.json()["run"]["started_at"].endswith("Z")
     assert run.json()["run"]["finished_at"] is None

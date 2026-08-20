@@ -311,7 +311,7 @@ TOOLSETS = {
         "description": (
             "Owner-workspace mutation tools (bootstrap a Project + Kanban "
             "board + initial task; commit an approved Task graph or Project "
-            "Steward plan; move a task "
+            "Steward plan; archive or restore a Project; move a task "
             "via compare-and-swap; comment "
             "as the trusted caller). Opt-in, API-server-only — every "
             "mutation is idempotent and requires a fresh human confirmation."
@@ -319,7 +319,7 @@ TOOLSETS = {
         "tools": [
             "owner_workspace_bootstrap", "owner_task_graph_commit",
             "owner_project_plan_commit",
-            "owner_task_move", "owner_task_comment",
+            "owner_task_move", "owner_task_comment", "owner_project_lifecycle",
         ],
         "includes": [],
         # See _get_platform_tools()'s explicit_passthrough filtering — a
@@ -346,6 +346,16 @@ TOOLSETS = {
     "owner_project_plan_commit": {
         "description": "Commit one owner-approved Project Steward plan",
         "tools": ["owner_project_plan_commit"],
+        "includes": [],
+        "kernel_gated": True,
+    },
+
+    # Separate least-authority capability for an explicit Project
+    # archive/restore confirmation. The executor receives no planning,
+    # Task, Connection, Automation, or generic owner mutation surface.
+    "owner_project_lifecycle": {
+        "description": "Archive or restore one owner-approved Project",
+        "tools": ["owner_project_lifecycle"],
         "includes": [],
         "kernel_gated": True,
     },

@@ -116,6 +116,25 @@ def _handle_project_plan(args: dict, **kw) -> str:
         return tool_error("owner_project_plan_commit: internal error")
 
 
+def _handle_project_lifecycle(args: dict, **kw) -> str:
+    try:
+        ctx = resolve_owner_context()
+        result = _kernel.set_project_archived(
+            ctx,
+            idempotency_key=args.get("idempotency_key"),
+            project_id=args.get("project_id"),
+            action=args.get("action"),
+        )
+        return _ok(result)
+    except OwnerWorkspaceError as e:
+        return tool_error(f"owner_project_lifecycle: {e.message}")
+    except ValueError as e:
+        return tool_error(f"owner_project_lifecycle: {e}")
+    except Exception:
+        logger.exception("owner_project_lifecycle failed")
+        return tool_error("owner_project_lifecycle: internal error")
+
+
 def _handle_task_move(args: dict, **kw) -> str:
     try:
         ctx = resolve_owner_context()
@@ -501,6 +520,39 @@ registry.register(
         },
     },
     handler=lambda args, **kw: _handle_project_plan(args, **kw),
+)
+
+
+registry.register(
+    name="owner_project_lifecycle",
+    toolset="owner_workspace",
+    schema={
+        "name": "owner_project_lifecycle",
+        "description": (
+            "Archive or restore one owner-workspace Project while retaining "
+            "its Tasks, history, documents and board. Hard delete is not "
+            "available. The Project must be backed by this trusted owner's "
+            "committed receipt. Idempotent and guarded by one exact human "
+            "confirmation."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Stable action key so a retry is safe.",
+                },
+                "project_id": {"type": "string"},
+                "action": {
+                    "type": "string",
+                    "enum": ["archive", "restore"],
+                },
+            },
+            "required": ["idempotency_key", "project_id", "action"],
+        },
+    },
+    handler=lambda args, **kw: _handle_project_lifecycle(args, **kw),
 )
 
 
