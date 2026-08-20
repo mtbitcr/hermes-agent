@@ -1,6 +1,6 @@
 """On-disk registry for Raphael's managed dashboard credentials.
 
-The Workspace, owner-recommendations, Connections, and Automations surfaces
+The Workspace, recommendations, Connections, Automations, and Models surfaces
 share one lifecycle registry but use disjoint fixed token prefixes,
 principals, scopes, and grants. The CLI
 can issue any number of bearer tokens, each individually revocable and
@@ -77,11 +77,19 @@ AUTOMATIONS_BOARD = "raphael-workspace"
 AUTOMATIONS_TOKEN_PREFIX = "hra1_"
 AUTOMATIONS_GRANT = "raphael-workspace-automations-manage-v1"
 
+MODELS_PRINCIPAL = "raphael-model-manager"
+MODELS_SCOPE = "models.manage"
+MODELS_PROJECT = "raphael-workspace"
+MODELS_BOARD = "raphael-workspace"
+MODELS_TOKEN_PREFIX = "hrm1_"
+MODELS_GRANT = "raphael-workspace-models-manage-v1"
+
 WORKSPACE_SURFACE = "workspace"
 RECOMMENDATIONS_SURFACE = "recommendations"
 CONNECTIONS_SURFACE = "connections"
 AUTOMATIONS_SURFACE = "automations"
 
+MODELS_SURFACE = "models"
 
 @dataclass(frozen=True)
 class FixedTokenPolicy:
@@ -171,6 +179,18 @@ _FIXED_TOKEN_POLICIES = {
         board=AUTOMATIONS_BOARD,
         grant=AUTOMATIONS_GRANT,
         provider="raphael-automations-token",
+        default_ttl_seconds=DEFAULT_TTL_SECONDS,
+        max_ttl_seconds=MAX_TTL_SECONDS,
+    ),
+    MODELS_SURFACE: FixedTokenPolicy(
+        surface=MODELS_SURFACE,
+        token_prefix=MODELS_TOKEN_PREFIX,
+        principal=MODELS_PRINCIPAL,
+        scope=MODELS_SCOPE,
+        project=MODELS_PROJECT,
+        board=MODELS_BOARD,
+        grant=MODELS_GRANT,
+        provider="raphael-models-token",
         default_ttl_seconds=DEFAULT_TTL_SECONDS,
         max_ttl_seconds=MAX_TTL_SECONDS,
     ),

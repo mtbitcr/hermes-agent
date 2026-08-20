@@ -3409,10 +3409,21 @@ class APIServerAdapter(BasePlatformAdapter):
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
+        resolved_effort = ""
+        if isinstance(reasoning_config, dict):
+            if reasoning_config.get("enabled") is False:
+                resolved_effort = "none"
+            else:
+                raw_effort = reasoning_config.get("effort")
+                if isinstance(raw_effort, str):
+                    resolved_effort = raw_effort.strip().lower()
+
         agent = AIAgent(**agent_kwargs)
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
+            "effort": resolved_effort,
+            "engine": "native-hermes",
             "route_source": (
                 "session_model_lock"
                 if confirmed_runtime_lock
@@ -7424,6 +7435,24 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                     )
                 self._active_run_agents[run_id] = agent
+                raw_runtime = dict(
+                    getattr(agent, "_hermes_api_runtime", {}) or {}
+                )
+                persisted_runtime = {
+                    "provider": self._clean_runtime_id(
+                        raw_runtime.get("provider"), max_len=80
+                    ),
+                    "model": self._clean_runtime_id(raw_runtime.get("model")),
+                    "effort": self._clean_runtime_id(
+                        raw_runtime.get("effort"), max_len=16
+                    ),
+                    "engine": self._clean_runtime_id(
+                        raw_runtime.get("engine"), max_len=32
+                    ),
+                }
+                self._set_run_status(
+                    run_id, "running", runtime=persisted_runtime
+                )
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})

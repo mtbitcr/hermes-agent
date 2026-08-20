@@ -27,7 +27,7 @@ from collections import OrderedDict
 from pathlib import Path  # noqa: F401
 from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
-from fastapi import APIRouter, HTTPException, Query  # noqa: F401
+from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
 
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
@@ -1095,23 +1095,56 @@ async def update_profile_description_endpoint(name: str, body: ProfileDescriptio
 
 
 @router.put("/api/profiles/{name}/model")
-async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
+async def update_profile_model_endpoint(
+    name: str, body: ProfileModelUpdate, request: Request
+):
     """Set the main model (``model.default`` + ``model.provider``) for a
     specific profile's config.yaml, without touching the dashboard's own
     active profile. Mirrors ``POST /api/model/set`` (main scope) but scoped
     to the named profile via the HERMES_HOME override.
     """
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        audit_models_machine_success,
+        model_machine_request,
+        validate_assignment,
+    )
+
     profile_dir = _resolve_profile_dir(name)
     provider = (body.provider or "").strip()
     model = (body.model or "").strip()
     if not provider or not model:
         raise HTTPException(status_code=400, detail="provider and model are required")
+    if model_machine_request(request):
+        try:
+            validate_assignment(
+                name,
+                provider,
+                model,
+                body.reasoning_effort or "",
+                disable_fallbacks=body.disable_fallbacks,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid model assignment") from exc
     try:
-        _write_profile_model(profile_dir, provider, model)
+        _write_profile_model(
+            profile_dir,
+            provider,
+            model,
+            reasoning_effort=body.reasoning_effort,
+            disable_fallbacks=body.disable_fallbacks,
+        )
     except Exception as e:
         _log.exception("PUT /api/profiles/%s/model failed", name)
         raise HTTPException(status_code=500, detail=str(e))
-    return {"ok": True, "provider": provider, "model": model}
+    audit_models_machine_success(
+        request, action="assign", profile=name, provider=provider
+    )
+    return {
+        "ok": True,
+        "provider": provider,
+        "model": model,
+        "reasoning_effort": (body.reasoning_effort or "").strip().lower(),
+    }
 
 
 @router.post("/api/profiles/{name}/describe-auto")

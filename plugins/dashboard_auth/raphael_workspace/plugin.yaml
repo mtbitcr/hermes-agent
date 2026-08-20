@@ -1,5 +1,5 @@
 name: raphael_workspace
 version: 1.0.0
-description: "Dashboard auth provider for two fixed, isolated Raphael read surfaces: the Workspace Kanban view (scope kanban.read) and the owner recommendations inbox (scope kanban:recommendations:read). Both token families use the existing CLI-managed audited registry; recommendation tokens are capped at eight hours. Only token ids, SHA-256 digests, fixed grants and lifecycle metadata are persisted. Plaintext bearer secrets are written once to explicit owner-only paths and never logged. Revocation and expiry are checked from disk on every request; an empty registry fails closed."
+description: "Managed, mutually isolated machine credentials for Raphael Workspace, recommendations, Connections, Automations, and Models. Each fixed token family has one least-privilege scope and exact route contour; only token ids, SHA-256 digests, fixed grants, and lifecycle metadata are persisted. Plaintext bearer secrets are written once to explicit owner-only paths and never logged. Revocation and expiry are checked from disk on every request; an empty registry fails closed."
 author: NousResearch
 kind: backend

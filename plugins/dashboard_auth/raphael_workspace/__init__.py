@@ -2,18 +2,19 @@
 
 The providers below share one audited metadata registry while retaining
 separate fixed token families and scopes for the Workspace work view, the
-owner-only recommendations inbox, the Connections Center, and Automations.
+owner-only recommendations inbox, Connections, Automations, and Models.
 
 What they are
 -------------
-Four service-to-service providers verify
+Five service-to-service providers verify
 ``Authorization: Bearer <token_id>.<secret>`` against the same on-disk
 registry in :mod:`token_store`. ``hrw1_`` tokens carry only
 ``kanban.read`` for the fixed Workspace GET surface; ``hrr1_`` tokens carry
 only ``kanban:recommendations:read`` for the owner inbox; ``hrc1_`` tokens
 carry only ``mcp.connections.manage`` for the exact Connections API contour.
 ``hra1_`` tokens carry only ``cron.automations.manage`` for list/history
-and reversible pause/resume.
+and reversible pause/resume; ``hrm1_`` tokens carry only
+``models.manage`` for the admitted native OAuth/model/profile contour.
 A token from one family is rejected by the other providers before route scope
 enforcement.
 
@@ -24,7 +25,7 @@ revocation through :mod:`token_store`. Every request verifies fresh against
 disk (no cache), so ``revoke`` takes effect on the next request. They share
 the existing ``supports_token`` / ``verify_token`` + ``token_auth``
 middleware seam and ``TokenPrincipal`` contract, while exact scopes keep the
-four surfaces mutually unusable.
+five surfaces mutually unusable.
 
 There is no login, cookie, session, or refresh: only the token capability is
 implemented.
@@ -38,6 +39,7 @@ secret to provision. Credentials are minted locally via:
     hermes kanban-workspace-token issue --surface recommendations --ttl-hours 8 --out <path>
     hermes kanban-workspace-token issue --surface connections --out <path>
     hermes kanban-workspace-token issue --surface automations --out <path>
+    hermes kanban-workspace-token issue --surface models --out <path>
 
 The token family, principal, scope, grant and lifetime ceiling are fixed
 constants (see :mod:`token_store`), never operator-editable configuration.
@@ -93,6 +95,12 @@ AUTOMATIONS_PROJECT = token_store.AUTOMATIONS_PROJECT
 AUTOMATIONS_BOARD = token_store.AUTOMATIONS_BOARD
 AUTOMATIONS_TOKEN_PREFIX = token_store.AUTOMATIONS_TOKEN_PREFIX
 AUTOMATIONS_GRANT = token_store.AUTOMATIONS_GRANT
+MODELS_PRINCIPAL = token_store.MODELS_PRINCIPAL
+MODELS_SCOPE = token_store.MODELS_SCOPE
+MODELS_PROJECT = token_store.MODELS_PROJECT
+MODELS_BOARD = token_store.MODELS_BOARD
+MODELS_TOKEN_PREFIX = token_store.MODELS_TOKEN_PREFIX
+MODELS_GRANT = token_store.MODELS_GRANT
 
 __all__ = [
     "PRINCIPAL",
@@ -119,10 +127,17 @@ __all__ = [
     "AUTOMATIONS_BOARD",
     "AUTOMATIONS_TOKEN_PREFIX",
     "AUTOMATIONS_GRANT",
+    "MODELS_PRINCIPAL",
+    "MODELS_SCOPE",
+    "MODELS_PROJECT",
+    "MODELS_BOARD",
+    "MODELS_TOKEN_PREFIX",
+    "MODELS_GRANT",
     "WorkspaceReadTokenProvider",
     "RecommendationsReadTokenProvider",
     "ConnectionsManageTokenProvider",
     "AutomationsManageTokenProvider",
+    "ModelsManageTokenProvider",
     "register",
 ]
 
@@ -228,6 +243,15 @@ class AutomationsManageTokenProvider(WorkspaceReadTokenProvider):
     expected_scope = AUTOMATIONS_SCOPE
 
 
+class ModelsManageTokenProvider(WorkspaceReadTokenProvider):
+    """Managed credential for Raphael's exact native model contour."""
+
+    name = "raphael-models-token"
+    display_name = "Raphael Models (managed service credential)"
+    token_prefix = MODELS_TOKEN_PREFIX
+    expected_principal = MODELS_PRINCIPAL
+    expected_scope = MODELS_SCOPE
+
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
@@ -237,15 +261,18 @@ def register(ctx) -> None:
     """Plugin entry — registers the provider and the CLI command tree.
 
     Always registers (see module docstring): there is no weak-secret gate to
-    fail here because there is no operator-supplied secret at all. The route
-    registrations live beside their native route owners (Kanban plugin API or
-    MCP router), unconditionally, so the fixed route contours stay scoped even
-    if this plugin were somehow disabled.
+    fail here because there is no operator-supplied secret at all.
     """
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        register_models_machine_routes,
+    )
+
+    register_models_machine_routes()
     ctx.register_dashboard_auth_provider(WorkspaceReadTokenProvider())
     ctx.register_dashboard_auth_provider(RecommendationsReadTokenProvider())
     ctx.register_dashboard_auth_provider(ConnectionsManageTokenProvider())
     ctx.register_dashboard_auth_provider(AutomationsManageTokenProvider())
+    ctx.register_dashboard_auth_provider(ModelsManageTokenProvider())
     ctx.register_cli_command(
         name="kanban-workspace-token",
         help="Issue/list/revoke managed Raphael dashboard credentials",
@@ -253,20 +280,22 @@ def register(ctx) -> None:
         handler_fn=workspace_token_command,
         description=(
             "Manage revocable, expiring machine credentials for the fixed "
-            "Raphael Workspace, owner recommendations, Connections, and Automations surfaces. "
+            "Raphael Workspace, recommendations, Connections, Automations, and Models surfaces. "
             "Recommendations tokens are independently scoped and capped at "
             "8 hours. 'issue' writes a new bearer once to an explicit path; "
             "'list' exposes only metadata; 'revoke' disables one token_id."
         ),
     )
     logger.info(
-        "raphael managed tokens: registered providers %r/%r/%r/%r (scopes=%s/%s/%s/%s)",
+        "raphael managed tokens: registered providers %r/%r/%r/%r/%r (scopes=%s/%s/%s/%s/%s)",
         WorkspaceReadTokenProvider.name,
         RecommendationsReadTokenProvider.name,
         ConnectionsManageTokenProvider.name,
         AutomationsManageTokenProvider.name,
+        ModelsManageTokenProvider.name,
         SCOPE,
         RECOMMENDATIONS_SCOPE,
         CONNECTIONS_SCOPE,
         AUTOMATIONS_SCOPE,
+        MODELS_SCOPE,
     )

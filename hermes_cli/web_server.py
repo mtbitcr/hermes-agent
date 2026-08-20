@@ -6745,6 +6745,7 @@ async def get_egress_status():
 _EMPTY_MODEL_INFO: dict = {
     "model": "",
     "provider": "",
+    "reasoning_effort": "",
     "auto_context_length": 0,
     "config_context_length": 0,
     "effective_context_length": 0,
@@ -6753,7 +6754,7 @@ _EMPTY_MODEL_INFO: dict = {
 
 
 @app.get("/api/model/info")
-def get_model_info(profile: Optional[str] = None):
+def get_model_info(request: Request, profile: Optional[str] = None):
     """Return resolved model metadata for the currently configured model.
 
     Calls the same context-length resolution chain the agent uses, so the
@@ -6761,9 +6762,24 @@ def get_model_info(profile: Optional[str] = None):
     Also returns model capabilities (vision, reasoning, tools) when available.
     """
     try:
-        with _profile_scope(profile):
+        from plugins.dashboard_auth.raphael_workspace.model_policy import (
+            audit_models_machine_success,
+            model_machine_request,
+            require_models_machine_profile,
+        )
+
+        scoped_profile = require_models_machine_profile(
+            request, profile, allowed=(None, "default", "raphael-planner")
+        )
+        with _profile_scope(scoped_profile):
             cfg = load_config()
         model_cfg = cfg.get("model", "")
+        agent_cfg = cfg.get("agent")
+        reasoning_effort = (
+            str(agent_cfg.get("reasoning_effort") or "").strip().lower()
+            if isinstance(agent_cfg, dict)
+            else ""
+        )
 
         # Extract model name and provider from the config
         if isinstance(model_cfg, dict):
@@ -6778,53 +6794,66 @@ def get_model_info(profile: Optional[str] = None):
             config_ctx = None
 
         if not model_name:
-            return dict(_EMPTY_MODEL_INFO, provider=provider)
-
-        # Resolve auto-detected context length (pass config_ctx=None to get
-        # purely auto-detected value, then separately report the override)
-        try:
-            from agent.model_metadata import get_model_context_length
-            auto_ctx = get_model_context_length(
-                model=model_name,
-                base_url=base_url,
+            result = dict(
+                _EMPTY_MODEL_INFO,
                 provider=provider,
-                config_context_length=None,  # ignore override — we want auto value
+                reasoning_effort=reasoning_effort,
             )
-        except Exception:
-            auto_ctx = 0
+        else:
+            # Resolve auto-detected context length (pass config_ctx=None to get
+            # purely auto-detected value, then separately report the override)
+            try:
+                from agent.model_metadata import get_model_context_length
+                auto_ctx = get_model_context_length(
+                    model=model_name,
+                    base_url=base_url,
+                    provider=provider,
+                    config_context_length=None,
+                )
+            except Exception:
+                auto_ctx = 0
 
-        config_ctx_int = 0
-        if isinstance(config_ctx, int) and config_ctx > 0:
-            config_ctx_int = config_ctx
+            config_ctx_int = 0
+            if isinstance(config_ctx, int) and config_ctx > 0:
+                config_ctx_int = config_ctx
+            effective_ctx = config_ctx_int if config_ctx_int > 0 else auto_ctx
 
-        # Effective is what the agent actually uses
-        effective_ctx = config_ctx_int if config_ctx_int > 0 else auto_ctx
+            caps = {}
+            try:
+                from agent.models_dev import get_model_capabilities
+                mc = get_model_capabilities(provider=provider, model=model_name)
+                if mc is not None:
+                    caps = {
+                        "supports_tools": mc.supports_tools,
+                        "supports_vision": mc.supports_vision,
+                        "supports_reasoning": mc.supports_reasoning,
+                        "context_window": mc.context_window,
+                        "max_output_tokens": mc.max_output_tokens,
+                        "model_family": mc.model_family,
+                    }
+            except Exception:
+                pass
 
-        # Try to get model capabilities from models.dev
-        caps = {}
-        try:
-            from agent.models_dev import get_model_capabilities
-            mc = get_model_capabilities(provider=provider, model=model_name)
-            if mc is not None:
-                caps = {
-                    "supports_tools": mc.supports_tools,
-                    "supports_vision": mc.supports_vision,
-                    "supports_reasoning": mc.supports_reasoning,
-                    "context_window": mc.context_window,
-                    "max_output_tokens": mc.max_output_tokens,
-                    "model_family": mc.model_family,
-                }
-        except Exception:
-            pass
+            result = {
+                "model": model_name,
+                "provider": provider,
+                "reasoning_effort": reasoning_effort,
+                "auto_context_length": auto_ctx,
+                "config_context_length": config_ctx_int,
+                "effective_context_length": effective_ctx,
+                "capabilities": caps,
+            }
 
-        return {
-            "model": model_name,
-            "provider": provider,
-            "auto_context_length": auto_ctx,
-            "config_context_length": config_ctx_int,
-            "effective_context_length": effective_ctx,
-            "capabilities": caps,
-        }
+        if model_machine_request(request):
+            result = {
+                "model": result["model"],
+                "provider": result["provider"],
+                "reasoning_effort": result["reasoning_effort"],
+            }
+        audit_models_machine_success(
+            request, action="info", profile=scoped_profile, provider=provider
+        )
+        return result
     except HTTPException:
         # Unknown/invalid profile must surface as 404, not degrade into a
         # 200 with empty model info (which would render as "no model set").
@@ -6859,6 +6888,7 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
 
 @app.get("/api/model/options")
 async def get_model_options(
+    request: Request,
     profile: Optional[str] = None,
     refresh: bool = False,
     include_unconfigured: bool = False,
@@ -6881,12 +6911,22 @@ async def get_model_options(
     """
     try:
         from hermes_cli.inventory import build_model_options_payload, load_picker_context
+        from plugins.dashboard_auth.raphael_workspace.model_policy import (
+            model_machine_request,
+            require_models_machine_profile,
+        )
+
+        scoped_profile = require_models_machine_profile(
+            request, profile, allowed=(None, "default", "raphael-planner")
+        )
+        if model_machine_request(request) and (include_unconfigured or explicit_only):
+            raise HTTPException(status_code=400, detail="Invalid model options")
 
         def _build_payload_scoped() -> dict:
             # Keep the profile override inside the worker thread so the full
             # sync picker build (config load, pricing, refresh probes) runs
             # off the event loop under the requested profile.
-            with _profile_scope(profile):
+            with _profile_scope(scoped_profile):
                 return build_model_options_payload(
                     load_picker_context(),
                     explicit_only=bool(explicit_only),
@@ -6894,7 +6934,18 @@ async def get_model_options(
                     refresh=bool(refresh),
                 )
 
-        return await run_in_threadpool(_build_payload_scoped)
+        result = await run_in_threadpool(_build_payload_scoped)
+        from plugins.dashboard_auth.raphael_workspace.model_policy import (
+            audit_models_machine_success,
+            project_options_payload,
+        )
+
+        if model_machine_request(request):
+            result = project_options_payload(result)
+        audit_models_machine_success(
+            request, action="options", profile=scoped_profile
+        )
+        return result
     except HTTPException:
         raise
     except Exception:
@@ -10570,7 +10621,9 @@ def _build_oauth_catalog() -> list[Dict[str, Any]]:
 
 
 @app.get("/api/providers/oauth")
-async def list_oauth_providers(profile: Optional[str] = None):
+async def list_oauth_providers(
+    request: Request, profile: Optional[str] = None
+):
     """Enumerate every OAuth-capable LLM provider with current status.
 
     Response shape (per provider):
@@ -10593,8 +10646,16 @@ async def list_oauth_providers(profile: Optional[str] = None):
     sync with the `hermes model` picker; _OAUTH_OVERRIDES supplies per-provider
     flow/status/cli metadata.
     """
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        require_models_machine_profile,
+    )
+
+    scoped_profile = require_models_machine_profile(
+        request, profile, allowed=(None, "default")
+    )
+
     def _run():
-        with _profile_scope(profile):
+        with _profile_scope(scoped_profile):
             providers = []
             for p in _build_oauth_catalog():
                 status = _resolve_provider_status(p["id"], p.get("status_fn"))
@@ -10612,7 +10673,17 @@ async def list_oauth_providers(profile: Optional[str] = None):
                 })
             return {"providers": providers}
 
-    return await asyncio.to_thread(_run)
+    result = await asyncio.to_thread(_run)
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        audit_models_machine_success,
+        model_machine_request,
+        project_oauth_payload,
+    )
+
+    if model_machine_request(request):
+        result = project_oauth_payload(result)
+    audit_models_machine_success(request, action="providers", profile=scoped_profile)
+    return result
 
 
 @app.delete("/api/providers/oauth/{provider_id}")
@@ -10623,9 +10694,16 @@ async def disconnect_oauth_provider(
 ):
     """Disconnect an OAuth provider. Token-protected (matches /env/reveal)."""
     _require_token(request)
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        require_models_machine_profile,
+    )
+
+    scoped_profile = require_models_machine_profile(
+        request, profile, allowed=(None, "default")
+    )
 
     def _run():
-        with _profile_scope(profile):
+        with _profile_scope(scoped_profile):
             catalog_by_id = {p["id"]: p for p in _build_oauth_catalog()}
             provider = catalog_by_id.get(provider_id)
             if provider is None:
@@ -10683,7 +10761,18 @@ async def disconnect_oauth_provider(
                 _log.exception("disconnect %s failed", provider_id)
                 raise HTTPException(status_code=500, detail=str(e))
 
-    return await asyncio.to_thread(_run)
+    result = await asyncio.to_thread(_run)
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        audit_models_machine_success,
+        model_machine_request,
+    )
+
+    audit_models_machine_success(
+        request, action="revoke", profile=scoped_profile, provider=provider_id
+    )
+    if model_machine_request(request):
+        return {"provider": provider_id}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -11594,7 +11683,13 @@ async def start_oauth_login(
     """Initiate an OAuth login flow. Token-protected."""
     _require_token(request)
     _gc_oauth_sessions()
-    _validate_oauth_profile(profile)
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        require_models_machine_profile,
+    )
+    scoped_profile = require_models_machine_profile(
+        request, profile, allowed=(None, "default")
+    )
+    _validate_oauth_profile(scoped_profile)
     valid = {p["id"] for p in _OAUTH_PROVIDER_CATALOG}
     if provider_id not in valid:
         raise HTTPException(status_code=400, detail=f"Unknown provider {provider_id}")
@@ -11612,15 +11707,28 @@ async def start_oauth_login(
         # change for MiniMax). New PKCE providers must add their own
         # start function and an explicit branch here.
         if catalog_entry["flow"] == "pkce" and provider_id == "anthropic":
-            return _start_anthropic_pkce(profile=profile)
-        if catalog_entry["flow"] == "device_code":
-            return await _start_device_code_flow(provider_id, profile=profile)
+            result = _start_anthropic_pkce(profile=scoped_profile)
+        elif catalog_entry["flow"] == "device_code":
+            result = await _start_device_code_flow(provider_id, profile=scoped_profile)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported flow")
     except HTTPException:
         raise
     except Exception as e:
         _log.exception("oauth/start %s failed", provider_id)
         raise HTTPException(status_code=500, detail=str(e))
-    raise HTTPException(status_code=400, detail="Unsupported flow")
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        audit_models_machine_success,
+        model_machine_request,
+        project_oauth_start,
+    )
+
+    audit_models_machine_success(
+        request, action="start", profile=scoped_profile, provider=provider_id
+    )
+    if model_machine_request(request):
+        return project_oauth_start(provider_id, result)
+    return result
 
 
 @app.post("/api/providers/oauth/{provider_id}/submit")
@@ -11632,17 +11740,37 @@ async def submit_oauth_code(
 ):
     """Submit the auth code for PKCE flows. Token-protected."""
     _require_token(request)
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        model_machine_request,
+        project_oauth_result,
+        require_models_machine_profile,
+    )
+    scoped_profile = require_models_machine_profile(
+        request, profile, allowed=(None, "default")
+    )
     if provider_id == "anthropic":
-        return await asyncio.get_running_loop().run_in_executor(
-            None, _submit_anthropic_pkce, body.session_id, body.code, profile,
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _submit_anthropic_pkce, body.session_id, body.code, scoped_profile,
         )
-    raise HTTPException(status_code=400, detail=f"submit not supported for {provider_id}")
+    else:
+        raise HTTPException(status_code=400, detail=f"submit not supported for {provider_id}")
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        audit_models_machine_success,
+    )
+
+    audit_models_machine_success(
+        request, action="complete", profile=scoped_profile, provider=provider_id
+    )
+    if model_machine_request(request):
+        return project_oauth_result(result)
+    return result
 
 
 @app.get("/api/providers/oauth/{provider_id}/poll/{session_id}")
 async def poll_oauth_session(
     provider_id: str,
     session_id: str,
+    request: Request,
     profile: Optional[str] = None,
 ):
     """Poll a session's status (no auth — read-only state).
@@ -11651,18 +11779,38 @@ async def poll_oauth_session(
     Each surfaces progress through the same background-worker-updated
     ``status`` field, so a single poll endpoint serves them all.
     """
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        model_machine_request,
+        project_oauth_poll,
+        require_models_machine_profile,
+    )
+    scoped_profile = require_models_machine_profile(
+        request, profile, allowed=(None, "default")
+    )
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found or expired")
     if sess["provider"] != provider_id:
         raise HTTPException(status_code=400, detail="Provider mismatch for session")
-    return {
+    if model_machine_request(request) and sess.get("profile") != scoped_profile:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    result = {
         "session_id": session_id,
         "status": sess["status"],
         "error_message": sess.get("error_message"),
         "expires_at": sess.get("expires_at"),
     }
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        audit_models_machine_success,
+    )
+
+    audit_models_machine_success(
+        request, action="poll", profile=scoped_profile, provider=provider_id
+    )
+    if model_machine_request(request):
+        return project_oauth_poll(result)
+    return result
 
 
 @app.delete("/api/providers/oauth/sessions/{session_id}")
@@ -14533,7 +14681,14 @@ def _profile_setup_command(name: str) -> str:
     return "hermes setup" if name == "default" else f"{name} setup"
 
 
-def _write_profile_model(profile_dir: Path, provider: str, model: str) -> None:
+def _write_profile_model(
+    profile_dir: Path,
+    provider: str,
+    model: str,
+    *,
+    reasoning_effort: Optional[str] = None,
+    disable_fallbacks: bool = False,
+) -> None:
     """Write the main model assignment into a specific profile's config.yaml.
 
     Scopes ``load_config``/``save_config`` to ``profile_dir`` via the
@@ -14549,6 +14704,20 @@ def _write_profile_model(profile_dir: Path, provider: str, model: str) -> None:
         provider, model = _normalize_main_model_assignment(provider, model)
         cfg = load_config()
         cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), provider, model)
+        if reasoning_effort is not None:
+            from hermes_constants import parse_reasoning_effort
+
+            parsed_effort = parse_reasoning_effort(reasoning_effort)
+            if not parsed_effort:
+                raise ValueError("invalid reasoning effort")
+            agent_cfg = cfg.get("agent")
+            if not isinstance(agent_cfg, dict):
+                agent_cfg = {}
+                cfg["agent"] = agent_cfg
+            agent_cfg["reasoning_effort"] = parsed_effort
+        if disable_fallbacks:
+            cfg["fallback_providers"] = []
+            cfg.pop("fallback_model", None)
         save_config(cfg)
     finally:
         reset_hermes_home_override(token)
