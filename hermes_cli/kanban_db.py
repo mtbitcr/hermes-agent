@@ -1140,6 +1140,7 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    responsibility: Optional[str] = None
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
@@ -1244,6 +1245,9 @@ class Task:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
+            responsibility=(
+                row["responsibility"] if "responsibility" in keys else None
+            ),
             result=row["result"] if "result" in keys else None,
             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
             consecutive_failures=(
@@ -1407,6 +1411,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     title                TEXT NOT NULL,
     body                 TEXT,
     assignee             TEXT,
+    -- Optional stable logical responsibility. This describes what the work is
+    -- for; assignee remains the runtime profile that executes it.
+    responsibility       TEXT,
     status               TEXT NOT NULL,
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
@@ -2704,6 +2711,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "current_step_key", "current_step_key TEXT"
         )
+    if "responsibility" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "responsibility", "responsibility TEXT"
+        )
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
@@ -3329,6 +3340,21 @@ def _claimer_id() -> str:
 # Task creation / mutation
 # ---------------------------------------------------------------------------
 
+_RESPONSIBILITY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
+
+
+def normalize_responsibility(value: Optional[str]) -> Optional[str]:
+    """Normalize an optional stable logical responsibility identifier."""
+    if value is None:
+        return None
+    responsibility = str(value).strip() or None
+    if responsibility is not None and not _RESPONSIBILITY_RE.fullmatch(responsibility):
+        raise ValueError(
+            "responsibility must be a 1-64 character stable identifier"
+        )
+    return responsibility
+
+
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
     if assignee is None:
@@ -3344,6 +3370,7 @@ def create_task(
     title: str,
     body: Optional[str] = None,
     assignee: Optional[str] = None,
+    responsibility: Optional[str] = None,
     created_by: Optional[str] = None,
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
@@ -3412,6 +3439,7 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    responsibility = normalize_responsibility(responsibility)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3675,20 +3703,21 @@ def create_task(
                 conn.execute(
                     """
                     INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
+                        id, title, body, assignee, responsibility, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
                         title.strip(),
                         body,
                         assignee,
+                        responsibility,
                         task_status,
                         priority,
                         created_by,
@@ -8634,6 +8663,7 @@ def decompose_triage_task(
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
+            responsibility = normalize_responsibility(child.get("responsibility"))
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -8657,14 +8687,15 @@ def decompose_triage_task(
                 child_ws_path = None
             conn.execute(
                 "INSERT INTO tasks "
-                "(id, title, body, assignee, status, workspace_kind, "
+                "(id, title, body, assignee, responsibility, status, workspace_kind, "
                 " workspace_path, tenant, project_id, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
                     body if isinstance(body, str) else None,
                     assignee,
+                    responsibility,
                     child_ws_kind,
                     child_ws_path,
                     tenant,
@@ -8977,6 +9008,7 @@ def apply_owner_project_plan(
                 title=spec["title"],
                 body=spec["body"],
                 assignee=spec["assignee"],
+                responsibility=spec["responsibility"],
                 created_by=actor,
                 parents=parent_task_ids,
                 idempotency_key=_owner_plan_task_key(

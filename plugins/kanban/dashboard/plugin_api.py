@@ -737,6 +737,7 @@ class CreateTaskBody(BaseModel):
     title: str
     body: Optional[str] = None
     assignee: Optional[str] = None
+    responsibility: Optional[str] = None
     tenant: Optional[str] = None
     priority: int = 0
     workspace_kind: str = "scratch"
@@ -768,6 +769,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             title=payload.title,
             body=payload.body,
             assignee=payload.assignee,
+            responsibility=payload.responsibility,
             created_by="dashboard",
             workspace_kind=payload.workspace_kind,
             workspace_path=payload.workspace_path,
@@ -3586,6 +3588,7 @@ def _workspace_board_response() -> dict:
                     "id": t.id,
                     "title": t.title,
                     "assignee_name": t.assignee,
+                    "responsibility": t.responsibility,
                     "updated_at": _workspace_iso_timestamp(
                         state["latest"] if state else t.created_at
                     ),

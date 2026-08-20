@@ -42,7 +42,11 @@ def workspace_surface(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     conn = kb.connect(board=BOARD)
     try:
         ready_id = kb.create_task(
-            conn, title="Ready work", assignee="coder", board=BOARD
+            conn,
+            title="Ready work",
+            assignee="coder",
+            responsibility="B03",
+            board=BOARD,
         )
         running_id = kb.create_task(
             conn, title="Running work", assignee="coder", board=BOARD
@@ -234,11 +238,13 @@ def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_su
     assert {task["id"] for task in task_items} == {s["ready_id"], s["running_id"]}
     assert all(
         set(task) == {
-            "id", "title", "assignee_name", "updated_at", "event_revision",
+            "id", "title", "assignee_name", "responsibility", "updated_at", "event_revision",
             "parent_ids", "child_ids",
         }
         for task in task_items
     )
+    assert next(task for task in task_items if task["id"] == s["ready_id"])["responsibility"] == "B03"
+    assert next(task for task in task_items if task["id"] == s["running_id"])["responsibility"] is None
     assert all(task["updated_at"].endswith("Z") for task in task_items)
     assert all(type(task["event_revision"]) is int and task["event_revision"] > 0 for task in task_items)
     assert all(type(task["parent_ids"]) is list for task in task_items)

@@ -190,12 +190,14 @@ def _task_graph_args(**overrides):
                 "title": "Prepare the release",
                 "body": "Create the smallest complete release.",
                 "assignee": "default",
+                "responsibility": "B03",
                 "parents": [],
             },
             {
                 "title": "Verify the release",
                 "body": "Check the owner-visible result.",
                 "assignee": "default",
+                "responsibility": "R12",
                 "parents": [0],
             },
         ],
@@ -242,8 +244,20 @@ def test_task_graph_commit_creates_native_project_and_atomic_graph(ctx):
     assert root.assignee == "default"
     assert "Later roadmap" in root.body
     assert first.project_id == result["project_id"]
+    assert first.responsibility == "B03"
     assert second.project_id == result["project_id"]
+    assert second.responsibility == "R12"
     assert first.id in second_parents
+
+
+def test_task_graph_rejects_invalid_responsibility_before_approval(ctx):
+    args = _task_graph_args()
+    args["tasks"][0]["responsibility"] = "role with spaces"
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.commit_task_graph(ctx, **args)
+
+    assert excinfo.value.code == "invalid_argument"
 
 
 def test_task_graph_commit_existing_project_reuses_exact_native_board(ctx):
@@ -675,12 +689,14 @@ def test_project_plan_split_is_atomic_preserves_history_and_replays(ctx):
                     "title": "Build the bounded change",
                     "body": "Produce one owner-visible outcome.",
                     "assignee": "default",
+                    "responsibility": "B04",
                     "parents": [],
                 },
                 {
                     "title": "Check the bounded change",
                     "body": "Verify the outcome before downstream work continues.",
                     "assignee": "default",
+                    "responsibility": "R12",
                     "parents": [0],
                 },
             ],
@@ -700,6 +716,8 @@ def test_project_plan_split_is_atomic_preserves_history_and_replays(ctx):
         assert kanban_db.get_task(conn, source_id) is not None
         assert kanban_db.parent_ids(conn, leaf_id) == [first_id]
         assert leaf_id in kanban_db.parent_ids(conn, downstream_id)
+        assert kanban_db.get_task(conn, first_id).responsibility == "B04"
+        assert kanban_db.get_task(conn, leaf_id).responsibility == "R12"
         before = conn.execute(
             "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?",
             (setup["project_id"],),
