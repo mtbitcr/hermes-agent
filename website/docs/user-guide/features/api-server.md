@@ -144,6 +144,27 @@ OpenAI Responses API format. Supports server-side conversation state via `previo
 
 Tool calls in the `output` array were already executed server-side by the Hermes agent — they are replayed with `"status": "completed"` for structured tool UI, never as pending calls for the client to execute.
 
+#### Background responses
+
+For long-running non-streaming work, send `"background": true` with
+`"store": true`. Hermes returns a stored response immediately with
+`"status": "queued"` and no output. Poll `GET /v1/responses/{id}`
+until the status becomes `completed`, `failed`, or `incomplete`:
+
+```json
+{
+  "input": "Prepare the project plan.",
+  "background": true,
+  "store": true
+}
+```
+
+Background mode cannot be combined with `"stream": true` or
+`"store": false`. Completed responses use the same output and usage
+schema as synchronous responses. If Hermes stops while work is in flight, the
+stored response becomes `incomplete`; clients can report that outcome and
+submit a fresh request instead of guessing whether the original work finished.
+
 **Inline image input:** `input[].content` can contain `input_text` and `input_image` parts. Both remote URLs and `data:image/...` URLs are supported:
 
 ```json

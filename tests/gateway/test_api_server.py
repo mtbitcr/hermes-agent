@@ -1833,6 +1833,143 @@ class TestResponsesEndpoint:
             assert "OPENAI_API_KEY=" in body
             assert data["output"][0]["content"][0]["text"] != f"provider auth failed OPENAI_API_KEY={raw_secret}"
 
+    @pytest.mark.asyncio
+    async def test_background_response_returns_immediately_and_can_be_polled(self, adapter):
+        """A long response must outlive the initiating HTTP request."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_run(**kwargs):
+            started.set()
+            await release.wait()
+            return (
+                {
+                    "final_response": "Milestone ready.",
+                    "messages": [],
+                    "api_calls": 1,
+                },
+                {"input_tokens": 12, "output_tokens": 4, "total_tokens": 16},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_slow_run) as mock_run:
+                post_task = asyncio.create_task(cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Plan the milestone",
+                        "conversation": "raphael-owner-" + "a" * 32,
+                        "background": True,
+                        "store": True,
+                    },
+                ))
+                await asyncio.wait_for(started.wait(), timeout=1)
+                try:
+                    resp = await asyncio.wait_for(
+                        asyncio.shield(post_task), timeout=0.2,
+                    )
+                finally:
+                    release.set()
+                    if not post_task.done():
+                        await post_task
+
+                assert resp.status == 200
+                queued = await resp.json()
+                assert queued["object"] == "response"
+                assert queued["status"] == "queued"
+                assert queued["background"] is True
+                assert queued["output"] == []
+
+                response_id = queued["id"]
+                completed = None
+                for _ in range(100):
+                    polled = await cli.get(f"/v1/responses/{response_id}")
+                    assert polled.status == 200
+                    completed = await polled.json()
+                    if completed["status"] == "completed":
+                        break
+                    assert completed["status"] in {"queued", "in_progress"}
+                    await asyncio.sleep(0.01)
+
+        assert completed is not None
+        assert completed["status"] == "completed"
+        assert completed["background"] is True
+        assert completed["usage"] == {
+            "input_tokens": 12,
+            "output_tokens": 4,
+            "total_tokens": 16,
+        }
+        assert completed["output"][0]["content"][0]["text"] == "Milestone ready."
+        assert adapter._response_store.get_conversation(
+            "raphael-owner-" + "a" * 32,
+        ) == queued["id"]
+        mock_run.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_background_failure_is_pollable_and_redacted(self, adapter):
+        raw_secret = "sk-background-leak-1234567890"
+
+        async def _failing_run(**kwargs):
+            await asyncio.sleep(0)
+            raise RuntimeError(f"provider failed OPENAI_API_KEY={raw_secret}")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_failing_run):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Plan the milestone",
+                        "background": True,
+                        "store": True,
+                    },
+                )
+                assert resp.status == 200
+                response_id = (await resp.json())["id"]
+
+                failed = None
+                for _ in range(100):
+                    polled = await cli.get(f"/v1/responses/{response_id}")
+                    assert polled.status == 200
+                    failed = await polled.json()
+                    if failed["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.01)
+
+        assert failed is not None
+        assert failed["status"] == "failed"
+        assert failed["background"] is True
+        assert failed["output"] == []
+        assert raw_secret not in json.dumps(failed)
+        assert "OPENAI_API_KEY=" in failed["error"]["message"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "unsupported",
+        [
+            {"store": False},
+            {"stream": True},
+        ],
+    )
+    async def test_background_requires_storage_and_non_streaming(self, adapter, unsupported):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                json={
+                    "model": "hermes-agent",
+                    "input": "Plan the milestone",
+                    "background": True,
+                    **unsupported,
+                },
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["type"] == "invalid_request_error"
+
 
 class TestResponsesStreaming:
 

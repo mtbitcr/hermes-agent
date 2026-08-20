@@ -5796,6 +5796,19 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
         store = _coerce_request_bool(body.get("store"), default=True)
+        background = _coerce_request_bool(body.get("background"), default=False)
+        stream = _coerce_request_bool(body.get("stream"), default=False)
+
+        if background and not store:
+            return web.json_response(
+                _openai_error("'background' requires 'store' to be true"),
+                status=400,
+            )
+        if background and stream:
+            return web.json_response(
+                _openai_error("'background' cannot be combined with 'stream'"),
+                status=400,
+            )
 
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
@@ -5878,7 +5891,6 @@ class APIServerAdapter(BasePlatformAdapter):
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
 
-        stream = _coerce_request_bool(body.get("stream"), default=False)
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(
             body,
@@ -5986,6 +5998,96 @@ class APIServerAdapter(BasePlatformAdapter):
                 route=route,
             )
 
+        if background:
+            response_id = f"resp_{uuid.uuid4().hex[:28]}"
+            created_at = int(time.time())
+            model_name = body.get("model", self._model_name)
+            queued_response = {
+                "id": response_id,
+                "object": "response",
+                "status": "queued",
+                "created_at": created_at,
+                "model": model_name,
+                "background": True,
+                "output": [],
+            }
+            pending_store_data = {
+                "response": queued_response,
+                "conversation_history": list(conversation_history),
+                "instructions": instructions,
+                "session_id": session_id,
+            }
+            self._response_store.put(response_id, pending_store_data)
+
+            async def _run_background_response() -> None:
+                in_progress = dict(queued_response)
+                in_progress["status"] = "in_progress"
+                self._response_store.put(response_id, {
+                    **pending_store_data,
+                    "response": in_progress,
+                })
+                try:
+                    result, usage = await _compute_response()
+                except asyncio.CancelledError:
+                    incomplete = dict(queued_response)
+                    incomplete.update({
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "cancelled"},
+                    })
+                    self._response_store.put(response_id, {
+                        **pending_store_data,
+                        "response": incomplete,
+                    })
+                    raise
+                except Exception as exc:
+                    safe_error = _redact_api_error_text(exc)
+                    logger.error(
+                        "Background response %s failed: %s",
+                        response_id,
+                        safe_error,
+                    )
+                    failed = dict(queued_response)
+                    failed.update({
+                        "status": "failed",
+                        "error": {
+                            "code": "server_error",
+                            "message": safe_error,
+                        },
+                    })
+                    self._response_store.put(response_id, {
+                        **pending_store_data,
+                        "response": failed,
+                    })
+                    return
+
+                response_data, full_history, effective_session_id = (
+                    self._finalize_response_result(
+                        response_id=response_id,
+                        created_at=created_at,
+                        model=model_name,
+                        conversation_history=conversation_history,
+                        user_message=user_message,
+                        session_id=session_id,
+                        result=result,
+                        usage=usage,
+                        background=True,
+                    )
+                )
+                self._response_store.put(response_id, {
+                    "response": response_data,
+                    "conversation_history": full_history,
+                    "instructions": instructions,
+                    "session_id": effective_session_id,
+                })
+                if conversation:
+                    self._response_store.set_conversation(conversation, response_id)
+
+            task = asyncio.create_task(_run_background_response())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            await asyncio.sleep(0)
+            return web.json_response(queued_response)
+
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
             fp = _make_request_fingerprint(
@@ -6019,55 +6121,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
-        if not final_response:
-            final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
-
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
-
-        # Build the full conversation history for storage
-        # (includes tool calls from the agent run)
-        full_history = self._build_response_conversation_history(
-            conversation_history,
-            user_message,
-            result,
-            final_response,
+        response_data, full_history, _effective_session_id = (
+            self._finalize_response_result(
+                response_id=response_id,
+                created_at=created_at,
+                model=body.get("model", self._model_name),
+                conversation_history=conversation_history,
+                user_message=user_message,
+                session_id=session_id,
+                result=result,
+                usage=usage,
+                background=False,
+            )
         )
-
-        # Persist the effective session ID surfaced by _run_agent so that
-        # compression-triggered session rotations propagate to the stored
-        # response and the X-Hermes-Session-Id header.  Without this,
-        # previous_response_id chaining keeps resuming the pre-rotation
-        # session and re-triggers compression on every subsequent request.
-        _effective_session_id = session_id
-        _result_sid = result.get("session_id") if isinstance(result, dict) else None
-        if isinstance(_result_sid, str) and _result_sid:
-            _effective_session_id = _result_sid
-
-        # Build output items from the current turn only.  AIAgent returns a
-        # full transcript in result["messages"], while older/mocked paths may
-        # return only the current turn suffix.
-        output_start_index = self._response_messages_turn_start_index(
-            conversation_history,
-            user_message,
-            result,
-        )
-        output_items = self._extract_output_items(result, start_index=output_start_index)
-
-        response_data = {
-            "id": response_id,
-            "object": "response",
-            "status": "completed",
-            "created_at": created_at,
-            "model": body.get("model", self._model_name),
-            "output": output_items,
-            "usage": {
-                "input_tokens": usage.get("input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
-        }
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
@@ -6696,6 +6764,66 @@ class APIServerAdapter(BasePlatformAdapter):
             ],
         })
         return items
+
+    def _finalize_response_result(
+        self,
+        *,
+        response_id: str,
+        created_at: int,
+        model: str,
+        conversation_history: List[Dict[str, Any]],
+        user_message: Any,
+        session_id: str,
+        result: Dict[str, Any],
+        usage: Dict[str, Any],
+        background: bool,
+    ) -> tuple[Dict[str, Any], List[Dict[str, Any]], str]:
+        """Build one completed Responses object and its durable transcript."""
+        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        if not final_response:
+            final_response = _redact_api_error_text(
+                result.get("error", "(No response generated)")
+            )
+
+        full_history = self._build_response_conversation_history(
+            conversation_history,
+            user_message,
+            result,
+            final_response,
+        )
+
+        effective_session_id = session_id
+        result_session_id = result.get("session_id")
+        if isinstance(result_session_id, str) and result_session_id:
+            effective_session_id = result_session_id
+
+        output_start_index = self._response_messages_turn_start_index(
+            conversation_history,
+            user_message,
+            result,
+        )
+        output_items = self._extract_output_items(
+            result,
+            start_index=output_start_index,
+        )
+
+        response_data = {
+            "id": response_id,
+            "object": "response",
+            "status": "completed",
+            "created_at": created_at,
+            "model": model,
+            "output": output_items,
+            "usage": {
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            },
+        }
+        if background:
+            response_data["background"] = True
+
+        return response_data, full_history, effective_session_id
 
     # ------------------------------------------------------------------
     # Agent execution
