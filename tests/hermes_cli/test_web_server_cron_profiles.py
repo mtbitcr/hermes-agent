@@ -1187,3 +1187,125 @@ async def test_create_cron_job_without_profile_defaults_when_unscoped(
 
     assert job["profile"] == "default"
     assert (isolated_profiles["default"] / "cron" / "jobs.json").exists()
+
+
+
+def test_automations_machine_token_has_exact_native_cron_contour(
+    isolated_profiles, monkeypatch, tmp_path
+):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from hermes_cli import web_server
+    from hermes_cli.dashboard_auth import register_provider
+    from hermes_cli.dashboard_auth.registry import (
+        restore_registration,
+        snapshot_registration,
+    )
+    from hermes_cli.dashboard_auth import token_auth
+    from hermes_cli.web_routers import cron as cron_routes
+    from plugins.dashboard_auth.raphael_workspace import (
+        AutomationsManageTokenProvider,
+        ConnectionsManageTokenProvider,
+    )
+    from plugins.dashboard_auth.raphael_workspace import token_store
+
+    monkeypatch.setenv("HERMES_HOME", str(isolated_profiles["default"]))
+    cron_routes._register_automations_machine_routes()
+    token_dir = tmp_path / "machine-tokens"
+    token_dir.mkdir(mode=0o700)
+    automation_path = token_dir / "automations.token"
+    connections_path = token_dir / "connections.token"
+    token_store.issue(
+        out_path=automation_path,
+        surface=token_store.AUTOMATIONS_SURFACE,
+    )
+    token_store.issue(
+        out_path=connections_path,
+        surface=token_store.CONNECTIONS_SURFACE,
+    )
+    automation_bearer = automation_path.read_text(encoding="utf-8").strip()
+    connections_bearer = connections_path.read_text(encoding="utf-8").strip()
+
+    providers = [AutomationsManageTokenProvider(), ConnectionsManageTokenProvider()]
+    previous = {
+        provider.name: snapshot_registration(provider.name) for provider in providers
+    }
+    for provider in providers:
+        if previous[provider.name] is None:
+            register_provider(provider)
+
+    job = web_server._call_cron_for_profile(
+        "default",
+        "create_job",
+        prompt="Summarize owner progress",
+        schedule="every 1h",
+        name="Owner summary",
+    )
+    job_id = job["id"]
+    from cron import executions
+
+    execution = executions.create_execution(job_id, source="internal-source")
+    executions.finish_execution(
+        execution["id"],
+        success=False,
+        error="sensitive internal failure",
+    )
+    app = FastAPI()
+    app.include_router(cron_routes.router)
+
+    @app.middleware("http")
+    async def machine_auth(request, call_next):
+        return await token_auth.token_auth_middleware(request, call_next)
+
+    headers = {"Authorization": f"Bearer {automation_bearer}"}
+    wrong_headers = {"Authorization": f"Bearer {connections_bearer}"}
+    try:
+        with TestClient(app) as client:
+            listed = client.get("/api/cron/jobs?profile=default", headers=headers)
+            assert listed.status_code == 200, listed.text
+            assert [item["id"] for item in listed.json()] == [job["id"]]
+
+            history = client.get(
+                "/api/cron/executions?profile=default", headers=headers
+            )
+            assert history.status_code == 200, history.text
+            history_body = history.json()
+            assert history_body["limit"] == 100
+            assert len(history_body["executions"]) == 1
+            owner_execution = history_body["executions"][0]
+            assert set(owner_execution) == {
+                "job_id",
+                "status",
+                "claimed_at",
+                "started_at",
+                "finished_at",
+            }
+            assert owner_execution["job_id"] == job_id
+            assert owner_execution["status"] == "failed"
+            assert "sensitive" not in history.text
+            assert execution["id"] not in history.text
+
+            paused = client.post(
+                f"/api/cron/jobs/{job_id}/pause?profile=default",
+                headers=headers,
+            )
+            assert paused.status_code == 200, paused.text
+            assert paused.json()["state"] == "paused"
+            resumed = client.post(
+                f"/api/cron/jobs/{job_id}/resume?profile=default",
+                headers=headers,
+            )
+            assert resumed.status_code == 200, resumed.text
+            assert resumed.json()["enabled"] is True
+
+            assert client.get(
+                "/api/cron/jobs?profile=default", headers=wrong_headers
+            ).status_code == 403
+            assert client.post(
+                "/api/cron/jobs", headers=headers, json={}
+            ).status_code == 403
+    finally:
+        for provider in providers:
+            if previous[provider.name] is None:
+                restore_registration(provider.name, provider, None)

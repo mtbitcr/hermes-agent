@@ -1,8 +1,8 @@
 """On-disk registry for Raphael's managed dashboard credentials.
 
-The Workspace, owner-recommendations, and Connections surfaces share one
-lifecycle registry but use disjoint fixed token prefixes, principals, scopes,
-and grants. The CLI
+The Workspace, owner-recommendations, Connections, and Automations surfaces
+share one lifecycle registry but use disjoint fixed token prefixes,
+principals, scopes, and grants. The CLI
 can issue any number of bearer tokens, each individually revocable and
 independently expiring; recommendation tokens are hard-capped at eight hours.
 What is persisted here is auth METADATA ONLY — a per-token id, a SHA-256 digest
@@ -70,9 +70,17 @@ CONNECTIONS_BOARD = "raphael-workspace"
 CONNECTIONS_TOKEN_PREFIX = "hrc1_"
 CONNECTIONS_GRANT = "raphael-workspace-connections-manage-v1"
 
+AUTOMATIONS_PRINCIPAL = "raphael-automations-manager"
+AUTOMATIONS_SCOPE = "cron.automations.manage"
+AUTOMATIONS_PROJECT = "raphael-workspace"
+AUTOMATIONS_BOARD = "raphael-workspace"
+AUTOMATIONS_TOKEN_PREFIX = "hra1_"
+AUTOMATIONS_GRANT = "raphael-workspace-automations-manage-v1"
+
 WORKSPACE_SURFACE = "workspace"
 RECOMMENDATIONS_SURFACE = "recommendations"
 CONNECTIONS_SURFACE = "connections"
+AUTOMATIONS_SURFACE = "automations"
 
 
 @dataclass(frozen=True)
@@ -151,6 +159,18 @@ _FIXED_TOKEN_POLICIES = {
         board=CONNECTIONS_BOARD,
         grant=CONNECTIONS_GRANT,
         provider="raphael-connections-token",
+        default_ttl_seconds=DEFAULT_TTL_SECONDS,
+        max_ttl_seconds=MAX_TTL_SECONDS,
+    ),
+    AUTOMATIONS_SURFACE: FixedTokenPolicy(
+        surface=AUTOMATIONS_SURFACE,
+        token_prefix=AUTOMATIONS_TOKEN_PREFIX,
+        principal=AUTOMATIONS_PRINCIPAL,
+        scope=AUTOMATIONS_SCOPE,
+        project=AUTOMATIONS_PROJECT,
+        board=AUTOMATIONS_BOARD,
+        grant=AUTOMATIONS_GRANT,
+        provider="raphael-automations-token",
         default_ttl_seconds=DEFAULT_TTL_SECONDS,
         max_ttl_seconds=MAX_TTL_SECONDS,
     ),
