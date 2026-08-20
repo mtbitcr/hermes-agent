@@ -278,6 +278,7 @@ class TestOwnerWorkspaceAdmissionBoundary:
         assert "owner_workspace_bootstrap" not in enabled
         assert "owner_task_graph_commit" not in enabled
         assert "owner_project_plan_commit" not in enabled
+        assert "owner_project_lifecycle" not in enabled
         assert "owner_task_move" not in enabled
         assert "owner_task_comment" not in enabled
 
@@ -386,6 +387,7 @@ class TestExactMethodRouteRules:
 
         app.router.add_post("/v1/responses", ok)
         app.router.add_get("/v1/responses/{response_id}", ok)
+        app.router.add_get("/v1/responses/conversations/{conversation}", ok)
         app.router.add_delete("/v1/responses/{response_id}", ok)
         app.router.add_post("/p/{profile}/v1/responses", ok)
         app.router.add_post("/v1/runs", ok)
@@ -395,6 +397,7 @@ class TestExactMethodRouteRules:
         app.router.add_post("/v1/runs/{run_id}/steer", ok)
         app.router.add_post("/v1/runs/{run_id}/stop", ok)
         app.router.add_get("/v1/owner-workspace/projects", ok)
+        app.router.add_get("/v1/owner-workspace/decisions", ok)
         return app
 
     @pytest.mark.asyncio
@@ -405,6 +408,7 @@ class TestExactMethodRouteRules:
                     "allowed_routes": [
                         "POST /v1/responses",
                         "GET /v1/responses/{response_id}",
+                        "GET /v1/responses/conversations/{conversation}",
                     ],
                 },
             },
@@ -412,6 +416,7 @@ class TestExactMethodRouteRules:
         async with TestClient(TestServer(self._app())) as client:
             assert (await client.post("/v1/responses")).status == 200
             assert (await client.get("/v1/responses/resp_1")).status == 200
+            assert (await client.get("/v1/responses/conversations/raphael-owner-1")).status == 200
             assert (await client.delete("/v1/responses/resp_1")).status == 403
 
     @pytest.mark.asyncio
@@ -435,6 +440,7 @@ class TestExactMethodRouteRules:
                         "GET /v1/runs/{run_id}",
                         "POST /v1/runs/{run_id}/approval",
                         "GET /v1/owner-workspace/projects",
+                        "GET /v1/owner-workspace/decisions",
                     ],
                 },
             },
@@ -444,6 +450,7 @@ class TestExactMethodRouteRules:
             assert (await client.get("/v1/runs/run_1")).status == 200
             assert (await client.post("/v1/runs/run_1/approval")).status == 200
             assert (await client.get("/v1/owner-workspace/projects")).status == 200
+            assert (await client.get("/v1/owner-workspace/decisions")).status == 200
             assert (await client.get("/v1/runs/run_1/events")).status == 403
             assert (await client.post("/v1/runs/run_1/steer")).status == 403
             assert (await client.post("/v1/runs/run_1/stop")).status == 403
@@ -465,7 +472,7 @@ class TestExactApiServerToolsets:
         assert _resolve_api_server_agent_toolsets(config) == []
 
     @pytest.mark.parametrize(
-        "toolset", ["owner_task_graph_commit", "owner_project_plan_commit"],
+        "toolset", ["owner_task_graph_commit", "owner_project_plan_commit", "owner_project_lifecycle"],
     )
     def test_narrow_owner_toolset_requires_the_owner_gate(self, toolset):
         config = {
@@ -483,6 +490,7 @@ class TestExactApiServerToolsets:
         [
             ("owner_task_graph_commit", "owner_task_graph_commit"),
             ("owner_project_plan_commit", "owner_project_plan_commit"),
+            ("owner_project_lifecycle", "owner_project_lifecycle"),
         ],
     )
     def test_executor_resolves_exactly_one_commit_tool(self, toolset, tool):

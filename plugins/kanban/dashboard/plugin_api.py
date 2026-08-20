@@ -3756,13 +3756,60 @@ def _workspace_run_response(run_id: int) -> Optional[dict]:
         if row is None:
             return None
         r = kanban_db.Run.from_row(row)
+        outcome = (r.outcome or r.status or "").strip().lower()
+        if r.status == "running":
+            owner_outcome = "running"
+            summary = "Work is still in progress."
+        elif outcome in {"completed", "done"}:
+            owner_outcome = "completed"
+            summary = "Work finished."
+        elif outcome == "review_requested":
+            owner_outcome = "completed"
+            summary = "Work finished and is awaiting review."
+        elif outcome == "scheduled":
+            owner_outcome = "unknown"
+            summary = "Work is scheduled for later."
+        elif outcome in {
+            "blocked",
+            "changes_requested",
+            "crashed",
+            "gave_up",
+            "rate_limited",
+            "reclaimed",
+            "spawn_failed",
+            "stale",
+            "timed_out",
+        }:
+            owner_outcome = "attention"
+            summary = "Work stopped and needs attention."
+        else:
+            owner_outcome = "unknown"
+            summary = "The final outcome could not be confirmed."
         return {
             "run": {
-                "id": r.id,
-                "status": r.status,
                 "started_at": _workspace_iso_timestamp(r.started_at),
                 "finished_at": _workspace_iso_timestamp(r.ended_at),
-                "worker_name": r.profile,
+                "receipt": {
+                    "outcome": owner_outcome,
+                    "summary": summary,
+                    "external_effect": {
+                        "state": "unknown",
+                        "summary": (
+                            "This record does not confirm whether an external "
+                            "service changed."
+                        ),
+                    },
+                    "cost": {
+                        "state": "unknown",
+                        "summary": (
+                            "This record does not contain an authoritative cost."
+                        ),
+                    },
+                    "evidence": {
+                        "state": "available",
+                        "kind": "project_activity",
+                    },
+                },
             }
         }
     finally:
