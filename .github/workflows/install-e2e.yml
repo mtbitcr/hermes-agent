@@ -77,7 +77,7 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --force \
-            "https://github.com/${{ github.event.repository.parent.full_name }}.git" \
+            "https://github.com/NousResearch/hermes-agent.git" \
             "+refs/tags/v*:refs/tags/v*"
       - id: pick
         run: |
