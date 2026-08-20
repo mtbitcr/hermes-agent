@@ -632,6 +632,8 @@ class ProfileDescriptionUpdate(BaseModel):
 class ProfileModelUpdate(BaseModel):
     provider: str
     model: str
+    reasoning_effort: Optional[str] = None
+    disable_fallbacks: bool = False
 
 
 class ProfileDescribeAuto(BaseModel):
