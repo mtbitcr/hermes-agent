@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import json
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,7 @@ from cron.jobs import (
     get_due_jobs,
     save_job_output,
     _hermes_now,
+    JobIdempotencyConflict,
 )
 
 
@@ -224,6 +226,49 @@ class TestJobCRUD:
         fetched = get_job(job["id"])
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
+
+    def test_idempotent_create_returns_one_native_job(self, tmp_cron_dir):
+        key = "automation-" + "a" * 64
+        first = create_job(
+            prompt="Send the weekly owner summary",
+            schedule="0 9 * * 1",
+            name="Weekly owner summary",
+            deliver="telegram",
+            enabled_toolsets=["project_steward", "web", "no_mcp"],
+            max_turns=12,
+            idempotency_key=key,
+        )
+        replay = create_job(
+            prompt="Send the weekly owner summary",
+            schedule="0 9 * * 1",
+            name="Weekly owner summary",
+            deliver="telegram",
+            enabled_toolsets=["project_steward", "web", "no_mcp"],
+            max_turns=12,
+            idempotency_key=key,
+        )
+
+        assert replay["id"] == first["id"]
+        assert len(load_jobs()) == 1
+        persisted = load_jobs()[0]
+        assert persisted["idempotency"]["key_hash"] != key
+        assert set(persisted["idempotency"]) == {"key_hash", "request_hash"}
+        assert key not in json.dumps(persisted)
+
+    def test_idempotent_create_rejects_same_key_for_changed_job(self, tmp_cron_dir):
+        key = "automation-" + "b" * 64
+        create_job(prompt="Send a summary", schedule="0 9 * * 1", idempotency_key=key)
+
+        with pytest.raises(JobIdempotencyConflict):
+            create_job(prompt="Send a summary", schedule="0 10 * * 1", idempotency_key=key)
+
+        assert len(load_jobs()) == 1
+
+    def test_idempotent_create_rejects_malformed_key(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="idempotency_key"):
+            create_job(prompt="Send a summary", schedule="every 1h", idempotency_key="short")
+
+        assert load_jobs() == []
 
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")

@@ -41,7 +41,11 @@ from plugins.dashboard_auth.raphael_workspace import (  # noqa: E402
     AUTOMATIONS_TOKEN_PREFIX,
 )
 
-_AUTOMATIONS_LITERAL_ROUTES = (("GET", "/api/cron/jobs"), ("GET", "/api/cron/executions"))
+_AUTOMATIONS_LITERAL_ROUTES = (
+    ("GET", "/api/cron/jobs"),
+    ("GET", "/api/cron/executions"),
+    ("POST", "/api/cron/jobs"),
+)
 _AUTOMATIONS_TEMPLATE_ROUTES = (
     ("POST", "/api/cron/jobs/{job_id}/pause"),
     ("POST", "/api/cron/jobs/{job_id}/resume"),
@@ -165,9 +169,16 @@ async def list_cron_job_runs(job_id: str, profile: Optional[str] = None, limit: 
     return await _run_cron_dashboard_io(_list_cron_job_runs_sync, job_id, profile, limit)
 
 
+async def create_cron_job(body: CronJobCreate, profile: Optional[str] = None, idempotency_key: Optional[str] = None):
+    return await _run_cron_dashboard_io(_create_cron_job_sync, body, profile, idempotency_key)
+
+
 @router.post("/api/cron/jobs")
-async def create_cron_job(body: CronJobCreate, profile: Optional[str] = None):
-    return await _run_cron_dashboard_io(_create_cron_job_sync, body, profile)
+async def create_cron_job_route(request: Request, body: CronJobCreate, profile: Optional[str] = None):
+    idempotency_key = request.headers.get("idempotency-key")
+    result = await create_cron_job(body, profile, idempotency_key)
+    _audit_automations_machine_success(request, action="create", job_id=result.get("id"))
+    return result
 
 
 @router.get("/api/cron/delivery-targets")

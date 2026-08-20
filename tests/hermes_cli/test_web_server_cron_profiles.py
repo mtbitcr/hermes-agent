@@ -1307,6 +1307,33 @@ def test_automations_machine_token_has_exact_native_cron_contour(
             assert owner_execution["status"] == "failed"
             assert "sensitive" not in history.text
             assert execution["id"] not in history.text
+            idempotency_key = "automation-" + "c" * 64
+            create_headers = {**headers, "Idempotency-Key": idempotency_key}
+            create_payload = {
+                "prompt": "Send the weekly owner summary",
+                "schedule": "0 9 * * 1",
+                "name": "Weekly owner summary",
+                "deliver": "telegram",
+                "enabled_toolsets": ["project_steward", "web", "no_mcp"],
+                "max_turns": 12,
+            }
+            created = client.post(
+                "/api/cron/jobs?profile=default", headers=create_headers, json=create_payload
+            )
+            assert created.status_code == 200, created.text
+            replayed = client.post(
+                "/api/cron/jobs?profile=default", headers=create_headers, json=create_payload
+            )
+            assert replayed.status_code == 200, replayed.text
+            assert replayed.json()["id"] == created.json()["id"]
+            changed = {**create_payload, "schedule": "0 10 * * 1"}
+            conflict = client.post(
+                "/api/cron/jobs?profile=default", headers=create_headers, json=changed
+            )
+            assert conflict.status_code == 409, conflict.text
+            jobs_after = client.get("/api/cron/jobs?profile=default", headers=headers)
+            assert len(jobs_after.json()) == 2
+
 
             paused = client.post(
                 f"/api/cron/jobs/{job_id}/pause?profile=default",
@@ -1325,7 +1352,7 @@ def test_automations_machine_token_has_exact_native_cron_contour(
                 "/api/cron/jobs?profile=default", headers=wrong_headers
             ).status_code == 403
             assert client.post(
-                "/api/cron/jobs", headers=headers, json={}
+                "/api/cron/jobs", headers=wrong_headers, json={}
             ).status_code == 403
     finally:
         for provider in providers:

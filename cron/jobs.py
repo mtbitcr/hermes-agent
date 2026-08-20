@@ -9,6 +9,7 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import shutil
@@ -459,6 +460,34 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 # into output writes/deletes.
 _IMMUTABLE_JOB_FIELDS = frozenset({"id"})
 MAX_JOB_TURNS = 500
+_JOB_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$")
+
+
+class JobIdempotencyConflict(ValueError):
+    """An idempotency key was already used for a different cron job."""
+
+
+def _normalize_job_idempotency_key(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _JOB_IDEMPOTENCY_KEY_RE.fullmatch(value):
+        raise ValueError(
+            "idempotency_key must be 16-128 ASCII letters, digits, '.', '_', ':', or '-'"
+        )
+    return value
+
+
+def _idempotency_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _job_creation_request_hash(value: Dict[str, Any]) -> str:
+    try:
+        canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("idempotent cron job input must be JSON serializable") from exc
+    return _idempotency_digest(canonical)
+
 
 
 def _normalize_job_max_turns(value: Any) -> Optional[int]:
@@ -1810,6 +1839,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1870,11 +1900,16 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+        idempotency_key: Optional caller-generated replay key. Repeating the
+                same key with the same normalized request returns the original
+                job; reusing it for a different request raises
+                ``JobIdempotencyConflict``.
 
     Returns:
         The created job dict
     """
     parsed_schedule = parse_schedule(schedule)
+    normalized_idempotency_key = _normalize_job_idempotency_key(idempotency_key)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
     if repeat is not None and repeat <= 0:
@@ -1961,6 +1996,36 @@ def create_job(
             f"Requested one-shot time {run_at} is more than "
             f"{ONESHOT_GRACE_SECONDS}s in the past and cannot be scheduled."
         )
+    idempotency_metadata = None
+    if normalized_idempotency_key is not None:
+        request_hash = _job_creation_request_hash(
+            {
+                "prompt": prompt_text,
+                "name": name or label_source[:50].strip(),
+                "schedule": parsed_schedule,
+                "repeat": repeat,
+                "deliver": deliver,
+                "origin": origin,
+                "skills": normalized_skills,
+                "model": normalized_model,
+                "provider": normalized_provider,
+                "base_url": normalized_base_url,
+                "script": normalized_script,
+                "context_from": context_from,
+                "enabled_toolsets": normalized_toolsets,
+                "max_turns": normalized_max_turns,
+                "workdir": normalized_workdir,
+                "no_agent": normalized_no_agent,
+                "attach_to_session": normalized_attach,
+                "monitor_script": normalized_monitor_script,
+                "monitor_url": normalized_monitor_url,
+            }
+        )
+        idempotency_metadata = {
+            "key_hash": _idempotency_digest(normalized_idempotency_key),
+            "request_hash": request_hash,
+        }
+
 
     job = {
         "id": job_id,
@@ -2013,9 +2078,23 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if idempotency_metadata is not None:
+        job["idempotency"] = idempotency_metadata
 
     with _jobs_lock():
         jobs = load_jobs()
+        if idempotency_metadata is not None:
+            for existing in jobs:
+                existing_metadata = existing.get("idempotency")
+                if not isinstance(existing_metadata, dict):
+                    continue
+                if existing_metadata.get("key_hash") != idempotency_metadata["key_hash"]:
+                    continue
+                if existing_metadata.get("request_hash") != idempotency_metadata["request_hash"]:
+                    raise JobIdempotencyConflict(
+                        "idempotency_key was already used for a different cron job"
+                    )
+                return _normalize_job_record(copy.deepcopy(existing))
         jobs.append(job)
         save_jobs(jobs)
 
