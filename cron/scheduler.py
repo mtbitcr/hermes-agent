@@ -4460,6 +4460,20 @@ class _BoundedCronSessionDB:
         return _bounded
 
 
+def _resolve_cron_max_iterations(job: dict, config: dict) -> int:
+    """Resolve the per-run turn budget, preferring an explicit job limit."""
+    from cron.jobs import _normalize_job_max_turns
+
+    job_limit = job.get("max_turns")
+    if job_limit is not None:
+        return _normalize_job_max_turns(job_limit)
+
+    agent_config = config.get("agent")
+    if not isinstance(agent_config, dict):
+        agent_config = {}
+    return agent_config.get("max_turns") or config.get("max_turns") or 500
+
+
 def run_job(
     job: dict,
     *,
@@ -5103,7 +5117,7 @@ def run_job(
                     prefill_messages = None
 
         # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        max_iterations = _resolve_cron_max_iterations(job, _cfg)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}

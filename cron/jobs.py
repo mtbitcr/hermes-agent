@@ -458,6 +458,18 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
 _IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+MAX_JOB_TURNS = 500
+
+
+def _normalize_job_max_turns(value: Any) -> Optional[int]:
+    """Validate an optional per-job agent turn budget."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("max_turns must be an integer")
+    if not 1 <= value <= MAX_JOB_TURNS:
+        raise ValueError(f"max_turns must be between 1 and {MAX_JOB_TURNS}")
+    return value
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1792,6 +1804,7 @@ def create_job(
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
+    max_turns: Optional[int] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
@@ -1828,6 +1841,9 @@ def create_job(
                           When set, only tools from these toolsets are loaded, reducing
                           token overhead. When omitted, all default tools are loaded.
                           Ignored when ``no_agent=True``.
+        max_turns: Optional per-run agent turn limit. Must be between 1 and
+                   ``MAX_JOB_TURNS``. When omitted, the scheduler uses the
+                   profile/global default.
         workdir: Optional absolute path.  When set, the job runs as if launched
                 from that directory: AGENTS.md / CLAUDE.md / .cursorrules from
                 that directory are injected into the system prompt, and the
@@ -1883,6 +1899,7 @@ def create_job(
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
+    normalized_max_turns = _normalize_job_max_turns(max_turns)
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
@@ -1988,6 +2005,7 @@ def create_job(
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
+        "max_turns": normalized_max_turns,
         "workdir": normalized_workdir,
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
@@ -2092,6 +2110,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "max_turns" in updates:
+                updates["max_turns"] = _normalize_job_max_turns(
+                    updates["max_turns"]
+                )
 
             # Normalize monitor fields the same way create_job does (empty
             # string clears the field).

@@ -359,6 +359,116 @@ def _bootstrap_board(ctx):
     return result
 
 
+def test_project_steward_snapshot_is_bounded_owner_safe_and_read_only(ctx):
+    setup = _bootstrap_board(ctx)
+    now = int(time.time())
+    with kanban_db.connect(board=setup["board"]) as conn:
+        done_id = kanban_db.create_task(
+            conn,
+            title="B03 — Publish the weekly owner summary",
+            assignee="raphael-claude-worker",
+            project_id=setup["project_id"],
+        )
+        review_id = kanban_db.create_task(
+            conn,
+            title="B04 — Confirm the owner-visible result",
+            assignee="raphael-verifier",
+            project_id=setup["project_id"],
+        )
+        stale_id = kanban_db.create_task(
+            conn,
+            title="B05 — Prepare the next useful milestone",
+            assignee="raphael-planner",
+            project_id=setup["project_id"],
+        )
+        blocked_id = kanban_db.create_task(
+            conn,
+            title="B06 — Confirm the missing owner input",
+            assignee="raphael-planner",
+            project_id=setup["project_id"],
+        )
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                (now - 60, done_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,)
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', created_at = ? WHERE id = ?",
+                (now - 9 * 86_400, stale_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input' "
+                "WHERE id = ?",
+                (blocked_id,),
+            )
+
+    project_db = projects_db.projects_db_path()
+    board_db = kanban_db.board_dir(setup["board"]) / "kanban.db"
+    before = (project_db.stat().st_mtime_ns, board_db.stat().st_mtime_ns)
+
+    snapshot = ow.project_steward_snapshot(
+        project_id=setup["project_id"], lookback_days=7
+    )
+
+    after = (project_db.stat().st_mtime_ns, board_db.stat().st_mtime_ns)
+    assert after == before
+    assert snapshot["project"] == {"name": "Board Setup"}
+    assert snapshot["progress"][0]["title"] == "Publish the weekly owner summary"
+    assert snapshot["decisions_needed"][0]["title"] == "Confirm the owner-visible result"
+    assert any(
+        item["title"] == "Prepare the next useful milestone"
+        for item in snapshot["stale_candidates"]
+    )
+    assert any(
+        item == {
+            "title": "Confirm the missing owner input",
+            "state": "Blocked",
+            "reason": "Waiting for owner input",
+        }
+        for item in snapshot["needs_attention"]
+    )
+
+    payload = json.dumps(snapshot)
+    for forbidden_value in (
+        done_id,
+        review_id,
+        stale_id,
+        blocked_id,
+        "raphael-claude-worker",
+        "raphael-verifier",
+        "raphael-planner",
+    ):
+        assert forbidden_value not in payload
+
+    forbidden_keys = {
+        "task_id", "assignee", "body", "result", "error", "file_path",
+    }
+
+    def assert_safe_shape(value):
+        if isinstance(value, dict):
+            assert not (set(value) & forbidden_keys)
+            for item in value.values():
+                assert_safe_shape(item)
+        elif isinstance(value, list):
+            for item in value:
+                assert_safe_shape(item)
+
+    assert_safe_shape(snapshot)
+
+
+@pytest.mark.parametrize("lookback_days", [True, 0, 31, "7"])
+def test_project_steward_snapshot_rejects_invalid_lookback(ctx, lookback_days):
+    setup = _bootstrap_board(ctx)
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.project_steward_snapshot(
+            project_id=setup["project_id"], lookback_days=lookback_days
+        )
+    assert excinfo.value.code == "invalid_argument"
+
+
 def _project_task_ref(conn, task_id: str) -> dict:
     task = kanban_db.get_task(conn, task_id)
     assert task is not None

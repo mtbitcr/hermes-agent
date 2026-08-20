@@ -407,6 +407,14 @@ class TestAgentCannotSetModelPin:
         assert "provider" not in props
         assert "base_url" not in props
 
+    def test_schema_exposes_bounded_per_run_turn_limit(self):
+        from tools.cronjob_tools import CRONJOB_SCHEMA
+
+        max_turns = CRONJOB_SCHEMA["parameters"]["properties"]["max_turns"]
+        assert max_turns["type"] == "integer"
+        assert max_turns["minimum"] == 1
+        assert max_turns["maximum"] == 500
+
 
     def test_handler_update_leaves_user_pin_untouched(self):
         """An update through the agent handler must not clear or change a

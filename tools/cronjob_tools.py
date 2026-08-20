@@ -656,6 +656,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["no_agent"] = True
     if job.get("enabled_toolsets"):
         result["enabled_toolsets"] = job["enabled_toolsets"]
+    if job.get("max_turns") is not None:
+        result["max_turns"] = job["max_turns"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
     stored_refs = job.get("context_from") or []
@@ -1195,6 +1197,7 @@ def cronjob(
     context_from: Optional[Union[str, List[str]]] = None,
     continuity: Optional[bool] = None,
     enabled_toolsets: Optional[List[str]] = None,
+    max_turns: Optional[int] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
@@ -1295,6 +1298,7 @@ def cronjob(
                     script=_normalize_optional_job_value(script),
                     context_from=context_from,
                     enabled_toolsets=enabled_toolsets or None,
+                    max_turns=max_turns,
                     workdir=_normalize_optional_job_value(workdir),
                     no_agent=_no_agent,
                     attach_to_session=attach_to_session,
@@ -1564,6 +1568,8 @@ def cronjob(
                 updates["context_from"] = refs or None
             if enabled_toolsets is not None:
                 updates["enabled_toolsets"] = enabled_toolsets or None
+            if max_turns is not None:
+                updates["max_turns"] = max_turns
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
             if workdir is not None:
@@ -1728,6 +1734,12 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                 "items": {"type": "string"},
                 "description": "Optional list of toolset names to restrict the job's agent to (e.g. [\"web\", \"terminal\", \"file\", \"delegation\"]). When set, only tools from these toolsets are loaded, significantly reducing input token overhead. When omitted, all default tools are loaded. Infer from the job's prompt — e.g. use \"web\" if it calls web_search, \"terminal\" if it runs scripts, \"file\" if it reads files, \"delegation\" if it calls delegate_task. On update, pass an empty array to clear."
             },
+            "max_turns": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "description": "Optional hard limit on agent turns per run. Use the smallest budget that can safely complete the job; omit to inherit the profile default."
+            },
             "workdir": {
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
@@ -1792,6 +1804,7 @@ registry.register(
         context_from=args.get("context_from"),
         continuity=args.get("continuity"),
         enabled_toolsets=args.get("enabled_toolsets"),
+        max_turns=args.get("max_turns"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
         monitor_script=args.get("monitor_script"),

@@ -55,7 +55,15 @@ hermes cron create "every 1h" "Use both skills and combine the result" \
   --skill blogwatcher \
   --skill maps \
   --name "Skill combo"
+hermes cron create "0 9 * * 1" "Prepare the weekly project review" \
+  --max-turns 4
 ```
+
+Use `--max-turns 1..500` to place a hard agent-turn limit on one job. The
+job-level value wins over profile and global defaults; omit it to inherit the
+existing default. Prefer the smallest limit that can safely finish the task,
+especially for unattended recurring work. Replace it later with
+`hermes cron edit <job_id> --max-turns <n>`.
 
 ### Through natural conversation
 

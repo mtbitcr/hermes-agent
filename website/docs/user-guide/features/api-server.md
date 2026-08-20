@@ -415,7 +415,7 @@ List all scheduled jobs.
 
 ### POST /api/jobs
 
-Create a new scheduled job. Body accepts the same shape as `hermes cron` — prompt, schedule, skills, provider override, delivery target.
+Create a new scheduled job. Body accepts the same shape as `hermes cron` — prompt, schedule, skills, provider override, delivery target, and an optional `max_turns` hard limit from 1 to 500.
 
 ### GET /api/jobs/\{job_id\}
 

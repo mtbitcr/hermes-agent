@@ -167,6 +167,28 @@ def test_dashboard_create_reports_saved_but_unregistered(
     assert "private callback URL and token" not in str(exc_info.value.detail)
 
 
+def test_dashboard_create_persists_per_job_max_turns(
+    isolated_profiles,
+):
+    from hermes_cli import web_server
+
+    created = web_server._create_cron_job_sync(
+        web_server.CronJobCreate(
+            prompt="bounded project review",
+            schedule="every 1h",
+            name="bounded-review",
+            max_turns=4,
+        ),
+        profile="worker_alpha",
+    )
+
+    assert created["max_turns"] == 4
+    stored = web_server._call_cron_for_profile(
+        "worker_alpha", "get_job", created["id"]
+    )
+    assert stored["max_turns"] == 4
+
+
 def test_notify_cron_provider_scopes_store_and_runtime_home_together(
     isolated_profiles,
     monkeypatch,

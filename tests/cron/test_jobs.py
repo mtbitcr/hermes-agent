@@ -839,6 +839,25 @@ class TestEnabledToolsets:
         assert job["enabled_toolsets"] == ["web", "terminal"]
 
 
+class TestMaxTurns:
+    def test_create_update_and_clear(self, tmp_cron_dir):
+        job = create_job(
+            prompt="bounded review", schedule="every 1h", max_turns=4
+        )
+        assert job["max_turns"] == 4
+        assert get_job(job["id"])["max_turns"] == 4
+
+        assert update_job(job["id"], {"max_turns": 7})["max_turns"] == 7
+        assert update_job(job["id"], {"max_turns": None})["max_turns"] is None
+
+    @pytest.mark.parametrize("value", [True, False, 0, 501, 1.5, "4"])
+    def test_invalid_values_fail_closed(self, tmp_cron_dir, value):
+        with pytest.raises(ValueError, match="max_turns"):
+            create_job(
+                prompt="bounded review", schedule="every 1h", max_turns=value
+            )
+
+
 class TestMarkJobRunConcurrency:
     """Regression tests for concurrent parallel job state writes.
 
