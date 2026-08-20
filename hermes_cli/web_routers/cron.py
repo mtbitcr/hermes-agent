@@ -1,10 +1,10 @@
-"""Cron dashboard routes (extracted verbatim from web_server.py).
+"""Cron dashboard routes and the narrow owner-Automations API adapter.
 
-Handler bodies are byte-identical.  The ``*_sync`` workers, profile resolution
-and the threadpool wrapper (``_run_cron_dashboard_io``) still live in
-web_server — reached via the late-binding seam in :mod:`hermes_cli.web_deps`
-so ``monkeypatch.setattr(web_server, ...)`` keeps working (several cron tests
-rely on exactly that).
+Legacy handler bodies remain on their established helpers. The ``*_sync``
+workers, profile resolution and threadpool wrapper
+(``_run_cron_dashboard_io``) still live in web_server — reached via the
+late-binding seam in :mod:`hermes_cli.web_deps` so
+``monkeypatch.setattr(web_server, ...)`` keeps working.
 """
 
 import asyncio  # noqa: F401 — used by handlers
@@ -14,6 +14,14 @@ from typing import Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Request  # noqa: F401
 from fastapi.responses import JSONResponse  # noqa: F401
+
+from hermes_cli.dashboard_auth.audit import AuditEvent, AuditWriteError, audit_log
+from hermes_cli.dashboard_auth.token_auth import (
+    register_machine_token_family,
+    register_token_route,
+    register_token_route_template,
+    transport_peer_ip,
+)
 
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
@@ -27,6 +35,70 @@ _log = logging.getLogger("hermes_cli.web_server")
 
 router = APIRouter()
 
+from plugins.dashboard_auth.raphael_workspace import (  # noqa: E402
+    AUTOMATIONS_GRANT,
+    AUTOMATIONS_SCOPE,
+    AUTOMATIONS_TOKEN_PREFIX,
+)
+
+_AUTOMATIONS_LITERAL_ROUTES = (("GET", "/api/cron/jobs"), ("GET", "/api/cron/executions"))
+_AUTOMATIONS_TEMPLATE_ROUTES = (
+    ("POST", "/api/cron/jobs/{job_id}/pause"),
+    ("POST", "/api/cron/jobs/{job_id}/resume"),
+)
+
+def _register_automations_machine_routes() -> None:
+    register_machine_token_family(AUTOMATIONS_TOKEN_PREFIX, strict_audit=True)
+    for method, path in _AUTOMATIONS_LITERAL_ROUTES:
+        register_token_route(
+            path,
+            method=method,
+            required_scope=AUTOMATIONS_SCOPE,
+            optional=True,
+            strict_audit=True,
+        )
+    for method, path in _AUTOMATIONS_TEMPLATE_ROUTES:
+        register_token_route_template(
+            path,
+            method=method,
+            required_scope=AUTOMATIONS_SCOPE,
+            optional=True,
+            strict_audit=True,
+        )
+
+
+_register_automations_machine_routes()
+
+
+def _audit_automations_machine_success(
+    request: Request, *, action: str, job_id: Optional[str] = None
+) -> None:
+    if not getattr(request.state, "token_authenticated", False):
+        return
+    principal = request.state.token_principal
+    try:
+        audit_log(
+            AuditEvent.TOKEN_AUTH_SUCCESS,
+            strict=True,
+            provider=principal.provider,
+            principal=principal.principal,
+            credential_id=principal.credential_id,
+            grant=AUTOMATIONS_GRANT,
+            source="raphael-automations",
+            method=request.method,
+            route_template=getattr(
+                request.state, "token_route_template", request.url.path
+            ),
+            action=action,
+            job_id=job_id,
+            decision="allow",
+            status=200,
+            ip=transport_peer_ip(request),
+        )
+        request.state.token_route_audited = True
+    except AuditWriteError as exc:
+        raise HTTPException(status_code=503, detail="Service Unavailable") from exc
+
 # Late-bound web_server helpers (resolved at call time; cycle-safe,
 # monkeypatch-transparent — includes config readers so existing
 # ``monkeypatch.setattr(web_server, "load_config", ...)`` idioms behave
@@ -35,6 +107,7 @@ _run_cron_dashboard_io = late("_run_cron_dashboard_io")
 _list_cron_jobs_sync = late("_list_cron_jobs_sync")
 _get_cron_job_sync = late("_get_cron_job_sync")
 _list_cron_job_runs_sync = late("_list_cron_job_runs_sync")
+_list_cron_executions_sync = late("_list_cron_executions_sync")
 _create_cron_job_sync = late("_create_cron_job_sync")
 _update_cron_job_sync = late("_update_cron_job_sync")
 _pause_cron_job_sync = late("_pause_cron_job_sync")
@@ -60,9 +133,26 @@ cfg_get = late("cfg_get")
 _CRON_FIRE_RETRY_AFTER_SECONDS = 60
 
 
-@router.get("/api/cron/jobs")
 async def list_cron_jobs(profile: str = "all"):
     return await _run_cron_dashboard_io(_list_cron_jobs_sync, profile)
+
+
+@router.get("/api/cron/jobs")
+async def list_cron_jobs_route(request: Request, profile: str = "all"):
+    result = await list_cron_jobs(profile)
+    _audit_automations_machine_success(request, action="list")
+    return result
+
+
+@router.get("/api/cron/executions")
+async def list_cron_executions_route(
+    request: Request, profile: str = "all", limit: int = 100
+):
+    result = await _run_cron_dashboard_io(
+        _list_cron_executions_sync, profile, limit
+    )
+    _audit_automations_machine_success(request, action="history")
+    return result
 
 
 @router.get("/api/cron/jobs/{job_id}")
@@ -113,14 +203,30 @@ async def update_cron_job(job_id: str, body: CronJobUpdate, profile: Optional[st
     return await _run_cron_dashboard_io(_update_cron_job_sync, job_id, body, profile)
 
 
-@router.post("/api/cron/jobs/{job_id}/pause")
 async def pause_cron_job(job_id: str, profile: Optional[str] = None):
     return await _run_cron_dashboard_io(_pause_cron_job_sync, job_id, profile)
 
 
-@router.post("/api/cron/jobs/{job_id}/resume")
+@router.post("/api/cron/jobs/{job_id}/pause")
+async def pause_cron_job_route(
+    request: Request, job_id: str, profile: Optional[str] = None
+):
+    result = await pause_cron_job(job_id, profile)
+    _audit_automations_machine_success(request, action="pause", job_id=job_id)
+    return result
+
+
 async def resume_cron_job(job_id: str, profile: Optional[str] = None):
     return await _run_cron_dashboard_io(_resume_cron_job_sync, job_id, profile)
+
+
+@router.post("/api/cron/jobs/{job_id}/resume")
+async def resume_cron_job_route(
+    request: Request, job_id: str, profile: Optional[str] = None
+):
+    result = await resume_cron_job(job_id, profile)
+    _audit_automations_machine_success(request, action="resume", job_id=job_id)
+    return result
 
 
 @router.post("/api/cron/jobs/{job_id}/trigger")

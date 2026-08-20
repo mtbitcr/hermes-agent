@@ -35,6 +35,7 @@ from plugins.dashboard_auth.raphael_workspace import cli, token_store
 from plugins.dashboard_auth import raphael_workspace
 from plugins.dashboard_auth.raphael_workspace import (
     ConnectionsManageTokenProvider,
+    AutomationsManageTokenProvider,
     RecommendationsReadTokenProvider,
     WorkspaceReadTokenProvider,
 )
@@ -234,6 +235,18 @@ class TestLifecycle:
         token_id, secret = plaintext.split(".", 1)
         assert token_store.verify(token_id, secret) == connections
 
+    def test_automations_token_is_fixed_and_disjoint(self, workspace_home):
+        automations, plaintext = _issue(
+            workspace_home,
+            surface=token_store.AUTOMATIONS_SURFACE,
+        )
+        assert automations.token_id.startswith(token_store.AUTOMATIONS_TOKEN_PREFIX)
+        assert automations.principal == token_store.AUTOMATIONS_PRINCIPAL
+        assert automations.scope == token_store.AUTOMATIONS_SCOPE
+        assert automations.grant == token_store.AUTOMATIONS_GRANT
+        token_id, secret = plaintext.split(".", 1)
+        assert token_store.verify(token_id, secret) == automations
+
     def test_replacement_cannot_cross_surfaces(self, workspace_home):
         workspace, _ = _issue(workspace_home)
         with pytest.raises(token_store.TokenStoreError):
@@ -374,7 +387,7 @@ class TestProvider:
     def test_plugin_registers_provider_and_cli(self):
         ctx = MagicMock()
         raphael_workspace.register(ctx)
-        assert ctx.register_dashboard_auth_provider.call_count == 3
+        assert ctx.register_dashboard_auth_provider.call_count == 4
         providers = [
             call.args[0] for call in ctx.register_dashboard_auth_provider.call_args_list
         ]
@@ -382,6 +395,7 @@ class TestProvider:
             WorkspaceReadTokenProvider,
             RecommendationsReadTokenProvider,
             ConnectionsManageTokenProvider,
+            AutomationsManageTokenProvider,
         ]
         assert ctx.register_cli_command.call_args.kwargs["name"] == (
             "kanban-workspace-token"
@@ -391,6 +405,7 @@ class TestProvider:
         assert_protocol_compliance(WorkspaceReadTokenProvider)
         assert_protocol_compliance(RecommendationsReadTokenProvider)
         assert_protocol_compliance(ConnectionsManageTokenProvider)
+        assert_protocol_compliance(AutomationsManageTokenProvider)
 
     def test_supports_token_only(self):
         p = WorkspaceReadTokenProvider()
@@ -417,16 +432,27 @@ class TestProvider:
             workspace_home,
             surface=token_store.CONNECTIONS_SURFACE,
         )
+        automations_record, automations_token = _issue(
+            workspace_home,
+            surface=token_store.AUTOMATIONS_SURFACE,
+        )
         workspace_provider = WorkspaceReadTokenProvider()
         recommendations_provider = RecommendationsReadTokenProvider()
         connections_provider = ConnectionsManageTokenProvider()
+        automations_provider = AutomationsManageTokenProvider()
 
         assert workspace_provider.verify_token(token=recommendations_token) is None
         assert workspace_provider.verify_token(token=connections_token) is None
+        assert workspace_provider.verify_token(token=automations_token) is None
         assert recommendations_provider.verify_token(token=workspace_token) is None
         assert recommendations_provider.verify_token(token=connections_token) is None
+        assert recommendations_provider.verify_token(token=automations_token) is None
         assert connections_provider.verify_token(token=workspace_token) is None
         assert connections_provider.verify_token(token=recommendations_token) is None
+        assert connections_provider.verify_token(token=automations_token) is None
+        assert automations_provider.verify_token(token=workspace_token) is None
+        assert automations_provider.verify_token(token=recommendations_token) is None
+        assert automations_provider.verify_token(token=connections_token) is None
 
         principal = recommendations_provider.verify_token(
             token=recommendations_token
@@ -443,6 +469,12 @@ class TestProvider:
             provider="raphael-connections-token",
             scopes=(token_store.CONNECTIONS_SCOPE,),
             credential_id=connections_record.token_id,
+        )
+        assert automations_provider.verify_token(token=automations_token) == TokenPrincipal(
+            principal=token_store.AUTOMATIONS_PRINCIPAL,
+            provider="raphael-automations-token",
+            scopes=(token_store.AUTOMATIONS_SCOPE,),
+            credential_id=automations_record.token_id,
         )
 
     @pytest.mark.parametrize("token", ["", "no-dot-at-all", ".", "a.", ".b", "unknown.secret"])

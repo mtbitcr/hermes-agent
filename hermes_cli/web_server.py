@@ -12519,6 +12519,55 @@ def _list_cron_jobs_sync(profile: str = "all"):
     return jobs
 
 
+def _list_cron_executions_for_profile(profile: str, limit: int) -> List[Dict[str, Any]]:
+    _profile_name, home = _cron_profile_home(profile)
+    from cron.executions import list_executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(home))
+    try:
+        rows = list_executions(limit=limit)
+    finally:
+        reset_hermes_home_override(token)
+    return [
+        {
+            "job_id": str(row.get("job_id") or ""),
+            "status": str(row.get("status") or ""),
+            "claimed_at": row.get("claimed_at"),
+            "started_at": row.get("started_at"),
+            "finished_at": row.get("finished_at"),
+        }
+        for row in rows
+    ]
+
+
+def _list_cron_executions_sync(profile: str = "all", limit: int = 100):
+    try:
+        limit_n = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        limit_n = 100
+    requested = (profile or "all").strip()
+    if requested.lower() != "all":
+        return {
+            "executions": _list_cron_executions_for_profile(requested, limit_n),
+            "limit": limit_n,
+        }
+
+    rows: List[Dict[str, Any]] = []
+    for item in _cron_profile_dicts():
+        name = str(item.get("name") or "")
+        if name:
+            rows.extend(_list_cron_executions_for_profile(name, limit_n))
+    rows.sort(
+        key=lambda row: (
+            str(row.get("claimed_at") or ""),
+            str(row.get("job_id") or ""),
+        ),
+        reverse=True,
+    )
+    return {"executions": rows[:limit_n], "limit": limit_n}
+
+
 async def _run_cron_dashboard_io(func, *args, **kwargs):
     """Run cron dashboard profile/job I/O outside the FastAPI event loop."""
     if inspect.iscoroutinefunction(func):

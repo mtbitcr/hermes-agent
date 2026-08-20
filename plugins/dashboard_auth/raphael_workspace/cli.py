@@ -33,12 +33,13 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
             token_store.WORKSPACE_SURFACE,
             token_store.RECOMMENDATIONS_SURFACE,
             token_store.CONNECTIONS_SURFACE,
+            token_store.AUTOMATIONS_SURFACE,
         ),
         default=token_store.WORKSPACE_SURFACE,
         help=(
             "Fixed credential surface to grant. Recommendations credentials "
-            "have a hard maximum lifetime of 8 hours; Connections receives "
-            "only its exact MCP management contour."
+            "have a hard maximum lifetime of 8 hours; Connections and "
+            "Automations receive only their exact management contours."
         ),
     )
     issue_p.add_argument(
@@ -72,7 +73,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         "--ttl-days",
         type=int,
         help=(
-            f"Expiry in days from now for the workspace or connections surface (max "
+            f"Expiry in days from now for workspace, connections, or automations (max "
             f"{token_store.MAX_TTL_SECONDS // 86400}); omitted values use "
             "that surface's fixed default."
         ),
