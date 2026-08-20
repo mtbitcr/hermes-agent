@@ -383,6 +383,7 @@ def cron_create(args):
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
+        max_turns=getattr(args, "max_turns", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", False) or None,
@@ -411,6 +412,8 @@ def cron_create(args):
         print("  Continuity: on (each run sees the previous run's output)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
+    if job_data.get("max_turns") is not None:
+        print(f"  Max turns: {job_data['max_turns']}")
     print(f"  Next run: {result['next_run_at']}")
     _warn_if_gateway_not_running()
     return 0
@@ -457,6 +460,7 @@ def cron_edit(args):
         skills=final_skills,
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
+        max_turns=getattr(args, "max_turns", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", None),

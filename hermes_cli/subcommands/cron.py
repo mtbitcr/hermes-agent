@@ -93,6 +93,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )
     cron_create.add_argument(
+        "--max-turns",
+        type=int,
+        help="Hard per-run agent turn limit (1-500). Omit to inherit the profile default.",
+    )
+    cron_create.add_argument(
         "--model",
         help=(
             "Pin this job to a specific inference model (user-owned; the "
@@ -217,6 +222,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument(
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--max-turns",
+        type=int,
+        help="Replace the hard per-run agent turn limit (1-500).",
     )
     cron_edit.add_argument(
         "--model",

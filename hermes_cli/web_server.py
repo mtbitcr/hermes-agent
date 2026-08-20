@@ -12698,6 +12698,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             script=script,
             context_from=context_from,
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
+            max_turns=body.max_turns,
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
         )

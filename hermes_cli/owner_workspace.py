@@ -71,11 +71,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from hermes_cli import kanban_db, projects_db
@@ -1178,6 +1180,274 @@ def list_committed_projects(ctx: OwnerContext) -> list[dict]:
         return projects
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# project_steward_snapshot (read-only)
+# ---------------------------------------------------------------------------
+
+_PROJECT_STEWARD_LIMIT = 12
+_INTERNAL_TITLE_PREFIX = re.compile(
+    r"^[A-Za-z]{1,4}\d{1,4}[A-Za-z]?\s*(?:[—–:-])\s*"
+)
+_OWNER_STATE_LABELS = {
+    "triage": "Needs attention",
+    "todo": "Planned",
+    "scheduled": "Scheduled",
+    "ready": "Ready",
+    "running": "In progress",
+    "blocked": "Blocked",
+    "review": "Awaiting review",
+    "done": "Completed",
+}
+_OWNER_BLOCK_REASONS = {
+    "needs_input": "Waiting for owner input",
+    "dependency": "Waiting for another piece of work",
+    "capability": "A required capability is not available",
+    "transient": "A temporary problem needs another attempt",
+}
+
+
+def _owner_timestamp(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        )
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+
+
+def _owner_title(value: Any) -> str:
+    from agent.redact import redact_sensitive_text
+
+    text = redact_sensitive_text(str(value or ""), force=True)
+    text = " ".join(text.split())
+    text = _INTERNAL_TITLE_PREFIX.sub("", text).strip()
+    return text[:240] or "Untitled work item"
+
+
+def _open_read_only_sqlite(path, *, label: str) -> sqlite3.Connection:
+    if not path.is_file():
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", f"{label} is unavailable"
+        )
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+    except (OSError, sqlite3.Error) as exc:
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", f"{label} could not be opened read-only"
+        ) from exc
+
+
+def project_steward_snapshot(
+    *, project_id: str, lookback_days: int = 7
+) -> dict:
+    """Return one bounded, owner-safe Project health snapshot without writes.
+
+    The Project binding is resolved from the active profile's projects.db and
+    checked against the shared board's ownership metadata. Only task titles,
+    owner-friendly states, and timestamps are projected: bodies, results,
+    errors, assignees, paths, branches, task/run IDs, and raw events never
+    cross this boundary.
+    """
+    project_id = _bounded_text(project_id, "project_id", limit=100)
+    if (
+        isinstance(lookback_days, bool)
+        or not isinstance(lookback_days, int)
+        or not 1 <= lookback_days <= 30
+    ):
+        raise OwnerWorkspaceError(
+            "invalid_argument", "lookback_days must be an integer from 1 to 30"
+        )
+
+    pconn = _open_read_only_sqlite(
+        projects_db.projects_db_path(), label="projects.db"
+    )
+    try:
+        project_columns = {
+            row["name"] for row in pconn.execute("PRAGMA table_info(projects)")
+        }
+        required_project_columns = {
+            "id", "name", "board_slug", "archived",
+        }
+        if not required_project_columns <= project_columns:
+            raise OwnerWorkspaceError(
+                "snapshot_unavailable", "projects.db schema is unavailable"
+            )
+        project = pconn.execute(
+            "SELECT id, name, board_slug, archived FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", "the Project could not be read"
+        ) from exc
+    finally:
+        pconn.close()
+
+    if (
+        project is None
+        or bool(project["archived"])
+        or not project["board_slug"]
+    ):
+        raise OwnerWorkspaceError(
+            "project_not_found", "the Project is unavailable"
+        )
+
+    board_slug = str(project["board_slug"])
+    if not kanban_db.board_exists(board_slug):
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", "the Project board is unavailable"
+        )
+    try:
+        _assert_board_ownership(board_slug, project_id)
+    except OwnerWorkspaceError as exc:
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable",
+            "the Project board ownership could not be verified",
+        ) from exc
+    if board_slug == kanban_db.DEFAULT_BOARD:
+        board_path = kanban_db.kanban_home() / "kanban.db"
+    else:
+        board_path = kanban_db.board_dir(board_slug) / "kanban.db"
+
+    kconn = _open_read_only_sqlite(board_path, label="kanban.db")
+    try:
+        task_columns = {
+            row["name"] for row in kconn.execute("PRAGMA table_info(tasks)")
+        }
+        required_task_columns = {
+            "title", "status", "created_at", "started_at", "completed_at",
+            "project_id", "task_kind", "block_kind",
+        }
+        if not required_task_columns <= task_columns:
+            raise OwnerWorkspaceError(
+                "snapshot_unavailable", "kanban.db schema is unavailable"
+            )
+        rows = kconn.execute(
+            "SELECT title, status, created_at, started_at, completed_at, block_kind "
+            "FROM tasks WHERE project_id = ? AND task_kind = 'work' "
+            "AND status != 'archived' ORDER BY created_at ASC",
+            (project_id,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", "the Project board could not be read"
+        ) from exc
+    finally:
+        kconn.close()
+
+    now = _now()
+    cutoff = now - lookback_days * 86_400
+    items = [
+        {
+            "title": _owner_title(row["title"]),
+            "status": str(row["status"]),
+            "created_at": int(row["created_at"]),
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"],
+            "block_kind": row["block_kind"],
+        }
+        for row in rows
+    ]
+
+    progress_rows = sorted(
+        (
+            item for item in items
+            if item["status"] == "done"
+            and item["completed_at"] is not None
+            and int(item["completed_at"]) >= cutoff
+        ),
+        key=lambda item: int(item["completed_at"]),
+        reverse=True,
+    )
+    attention_rows = [
+        item for item in items if item["status"] in {"blocked", "triage"}
+    ]
+    review_rows = [item for item in items if item["status"] == "review"]
+    active_rows = [
+        item for item in items
+        if item["status"] in {"todo", "scheduled", "ready", "running"}
+    ]
+    stale_rows = sorted(
+        (
+            item for item in items
+            if item["status"] not in {"done"}
+            and int(item["started_at"] or item["created_at"]) < cutoff
+        ),
+        key=lambda item: int(item["started_at"] or item["created_at"]),
+    )
+
+    def _bounded(values):
+        return values[:_PROJECT_STEWARD_LIMIT]
+
+    progress = [
+        {
+            "title": item["title"],
+            "completed_at": _owner_timestamp(item["completed_at"]),
+        }
+        for item in _bounded(progress_rows)
+    ]
+    needs_attention = [
+        {
+            "title": item["title"],
+            "state": _OWNER_STATE_LABELS[item["status"]],
+            "reason": _OWNER_BLOCK_REASONS.get(
+                str(item["block_kind"] or ""), "Reason not recorded"
+            ),
+        }
+        for item in _bounded(attention_rows)
+    ]
+    decisions_needed = [
+        {"title": item["title"], "state": _OWNER_STATE_LABELS["review"]}
+        for item in _bounded(review_rows)
+    ]
+    active_work = [
+        {"title": item["title"], "state": _OWNER_STATE_LABELS[item["status"]]}
+        for item in _bounded(active_rows)
+    ]
+    stale_candidates = [
+        {
+            "title": item["title"],
+            "state": _OWNER_STATE_LABELS.get(item["status"], "Needs attention"),
+            "age_days": max(
+                0, (now - int(item["started_at"] or item["created_at"])) // 86_400
+            ),
+        }
+        for item in _bounded(stale_rows)
+    ]
+
+    open_count = sum(item["status"] != "done" for item in items)
+    return {
+        "schema_version": 1,
+        "project": {"name": _owner_title(project["name"])},
+        "generated_at": _owner_timestamp(now),
+        "lookback_days": lookback_days,
+        "counts": {
+            "open": open_count,
+            "completed_in_window": len(progress_rows),
+            "needs_attention": len(attention_rows),
+            "awaiting_review": len(review_rows),
+        },
+        "progress": progress,
+        "needs_attention": needs_attention,
+        "decisions_needed": decisions_needed,
+        "active_work": active_work,
+        "stale_candidates": stale_candidates,
+        "truncated": {
+            "progress": len(progress_rows) > _PROJECT_STEWARD_LIMIT,
+            "needs_attention": len(attention_rows) > _PROJECT_STEWARD_LIMIT,
+            "decisions_needed": len(review_rows) > _PROJECT_STEWARD_LIMIT,
+            "active_work": len(active_rows) > _PROJECT_STEWARD_LIMIT,
+            "stale_candidates": len(stale_rows) > _PROJECT_STEWARD_LIMIT,
+        },
+    }
+
 
 # ---------------------------------------------------------------------------
 # owner_project_plan_commit

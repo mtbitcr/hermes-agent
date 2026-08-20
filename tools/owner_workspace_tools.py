@@ -1,5 +1,4 @@
-"""Owner-workspace toolset — five thin model tools over the deep kernel in
-``hermes_cli.owner_workspace``.
+"""Owner-workspace tools over the deep kernel in ``hermes_cli.owner_workspace``.
 
 Default-off, API-server-only surface (see ``toolsets.py``'s ``owner_workspace``
 toolset — absent from ``_HERMES_CORE_TOOLS`` and every composite — and
@@ -10,6 +9,9 @@ folds it into ``enabled_toolsets``, gated on
 Every tool schema is deliberately narrow: no author/profile/actor/session/
 path/scope field is accepted from the model. Identity is resolved from
 trusted request context (``resolve_owner_context``) inside the kernel.
+
+The separate ``project_steward`` toolset exposes one read-only, owner-safe
+snapshot without granting any owner-workspace mutation authority.
 """
 from __future__ import annotations
 
@@ -42,6 +44,20 @@ def _handle_bootstrap(args: dict, **kw) -> str:
     except Exception:
         logger.exception("owner_workspace_bootstrap failed")
         return tool_error("owner_workspace_bootstrap: internal error")
+
+
+def _handle_project_steward_snapshot(args: dict, **kw) -> str:
+    try:
+        result = _kernel.project_steward_snapshot(
+            project_id=args.get("project_id"),
+            lookback_days=args.get("lookback_days", 7),
+        )
+        return _ok(result)
+    except OwnerWorkspaceError as e:
+        return tool_error(f"project_steward_snapshot: {e.message}")
+    except Exception:
+        logger.exception("project_steward_snapshot failed")
+        return tool_error("project_steward_snapshot: internal error")
 
 
 
@@ -176,6 +192,41 @@ registry.register(
         },
     },
     handler=lambda args, **kw: _handle_bootstrap(args, **kw),
+)
+
+
+registry.register(
+    name="project_steward_snapshot",
+    toolset="project_steward",
+    schema={
+        "name": "project_steward_snapshot",
+        "description": (
+            "Read one bounded, owner-safe health snapshot for an existing "
+            "Project. Returns recent progress, work needing attention, items "
+            "awaiting review, active work, and stale candidates. It never "
+            "returns task IDs, agent names, file paths, raw bodies, results, "
+            "errors, or events, and it cannot mutate Project state."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "Exact Project identifier to inspect.",
+                },
+                "lookback_days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 30,
+                    "default": 7,
+                    "description": "Recent-progress window in days.",
+                },
+            },
+            "required": ["project_id"],
+        },
+    },
+    handler=lambda args, **kw: _handle_project_steward_snapshot(args, **kw),
 )
 
 

@@ -15,6 +15,7 @@ from cron.scheduler import (
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
     _resolve_cron_enabled_toolsets,
+    _resolve_cron_max_iterations,
     _resolve_delivery_target,
     _resolve_origin,
     _send_media_via_adapter,
@@ -117,6 +118,23 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+
+class TestPerJobMaxTurns:
+    def test_explicit_job_limit_wins(self):
+        assert _resolve_cron_max_iterations(
+            {"max_turns": 4}, {"agent": {"max_turns": 99}, "max_turns": 88}
+        ) == 4
+
+    def test_profile_then_root_then_default(self):
+        assert _resolve_cron_max_iterations({}, {"agent": {"max_turns": 8}}) == 8
+        assert _resolve_cron_max_iterations({}, {"max_turns": 9}) == 9
+        assert _resolve_cron_max_iterations({}, {}) == 500
+
+    @pytest.mark.parametrize("value", [True, 0, 501, "4"])
+    def test_malformed_persisted_limit_fails_closed(self, value):
+        with pytest.raises(ValueError, match="max_turns"):
+            _resolve_cron_max_iterations({"max_turns": value}, {})
 
 
 class TestResolveOrigin:

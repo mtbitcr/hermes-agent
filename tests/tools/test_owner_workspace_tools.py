@@ -63,6 +63,18 @@ class TestToolSurface:
     def test_resolve_toolset_returns_exactly_these_tools(self):
         assert set(resolve_toolset("owner_workspace", include_registry=False)) == set(TOOL_NAMES)
 
+    def test_project_steward_is_one_separate_read_only_tool(self):
+        assert registry.get_tool_names_for_toolset("project_steward") == [
+            "project_steward_snapshot"
+        ]
+        assert TOOLSETS["project_steward"]["tools"] == [
+            "project_steward_snapshot"
+        ]
+        assert resolve_toolset("project_steward", include_registry=False) == [
+            "project_steward_snapshot"
+        ]
+        assert "project_steward" not in get_kernel_gated_toolsets()
+
     @pytest.mark.parametrize("name", TOOL_NAMES)
     def test_each_tool_is_registered_with_a_handler(self, name):
         entry = registry.get_entry(name)
@@ -300,6 +312,22 @@ class TestTrustedContextResolution:
 
 
 class TestFieldDelegation:
+    def test_project_steward_passes_only_bounded_read_fields(self, monkeypatch):
+        calls = []
+
+        def kernel(**kwargs):
+            calls.append(kwargs)
+            return {"schema_version": 1}
+
+        monkeypatch.setattr(owt._kernel, "project_steward_snapshot", kernel)
+
+        out = owt._handle_project_steward_snapshot({
+            "project_id": "p1", "lookback_days": 7, "path": "/secret",
+        })
+
+        assert json.loads(out) == {"schema_version": 1}
+        assert calls == [{"project_id": "p1", "lookback_days": 7}]
+
     def test_bootstrap_passes_through_exact_fields(self, monkeypatch, trusted_ctx):
         monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
         kernel = _RecordingKernel()
@@ -419,6 +447,17 @@ class TestFieldDelegation:
 
 
 class TestErrorHandling:
+    def test_project_steward_error_does_not_leak_internal_details(self, monkeypatch):
+        def _raise(**kwargs):
+            raise RuntimeError("sqlite file /secret/path/kanban.db is locked")
+
+        monkeypatch.setattr(owt._kernel, "project_steward_snapshot", _raise)
+        payload = json.loads(
+            owt._handle_project_steward_snapshot({"project_id": "p1"})
+        )
+        assert "internal error" in payload["error"]
+        assert "/secret/path" not in payload["error"]
+
     def test_bootstrap_owner_workspace_error_message_is_surfaced(self, monkeypatch, trusted_ctx):
         monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
 

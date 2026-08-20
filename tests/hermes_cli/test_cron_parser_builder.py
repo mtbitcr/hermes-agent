@@ -41,6 +41,16 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
 
 
+def test_cron_max_turns_on_create_and_edit():
+    parser = _build()
+    assert parser.parse_args(
+        ["cron", "create", "30m", "Review", "--max-turns", "4"]
+    ).max_turns == 4
+    assert parser.parse_args(
+        ["cron", "edit", "j", "--max-turns", "7"]
+    ).max_turns == 7
+
+
 def test_cron_accept_hooks_flag_on_run_and_tick():
     parser = _build()
     # --accept-hooks is suppressed-default; present only when passed.

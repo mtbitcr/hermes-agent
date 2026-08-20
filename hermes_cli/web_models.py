@@ -386,6 +386,7 @@ class CronJobCreate(BaseModel):
     script: Optional[str] = None
     context_from: Optional[Any] = None
     enabled_toolsets: Optional[List[str]] = None
+    max_turns: Optional[int] = None
     workdir: Optional[str] = None
     no_agent: bool = False
 

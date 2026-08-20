@@ -349,6 +349,15 @@ TOOLSETS = {
         "includes": [],
         "kernel_gated": True,
     },
+
+    # Default-off, read-only surface for unattended Project Steward reviews.
+    # It is intentionally separate from owner_workspace: cron jobs that only
+    # need a bounded Project snapshot must never receive mutation tools.
+    "project_steward": {
+        "description": "Read one bounded, owner-safe Project health snapshot",
+        "tools": ["project_steward_snapshot"],
+        "includes": [],
+    },
     
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
