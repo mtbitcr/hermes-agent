@@ -12586,6 +12586,10 @@ def _raise_if_cron_registration_error(e: Exception) -> None:
     drift between copies. The lazy import keeps cron out of module import.
     """
     from cron.scheduler import CronSchedulerRegistrationError
+    from cron.jobs import JobIdempotencyConflict
+
+    if isinstance(e, JobIdempotencyConflict):
+        raise HTTPException(status_code=409, detail=str(e)) from e
 
     if isinstance(e, CronSchedulerRegistrationError):
         raise HTTPException(status_code=424, detail=e.to_dict()) from e
@@ -12670,7 +12674,7 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
 
 
 
-def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
+def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None, idempotency_key: Optional[str] = None):
     try:
         profile_name, profile_home = _cron_profile_home(profile)
         script = _normalize_dashboard_cron_script(body.script, profile_home)
@@ -12701,6 +12705,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             max_turns=body.max_turns,
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            idempotency_key=idempotency_key,
         )
     except HTTPException:
         raise
