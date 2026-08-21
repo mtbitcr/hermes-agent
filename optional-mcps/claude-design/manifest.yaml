@@ -1,0 +1,22 @@
+# Maintained-fork admission of Anthropic's official hosted endpoint.
+# Upstream admission is tracked separately; no third-party package is run.
+manifest_version: 1
+
+name: claude-design
+description: >-
+  Official Claude Design workspace for governed product design review,
+  proposals, and prototypes.
+source: https://support.claude.com/en/articles/14604416-get-started-with-claude-design
+
+transport:
+  type: http
+  url: https://api.anthropic.com/v1/design/mcp
+
+auth:
+  type: oauth
+
+post_install: |
+  Sign in on Anthropic's own consent page. Claude Design uses the same
+  plan limits as Claude and may read or write Claude Design data covered by
+  that consent. Keep this connection on the governed Designer profile; it is
+  not a source-code, merge, or deployment authority.

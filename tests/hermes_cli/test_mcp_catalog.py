@@ -599,6 +599,23 @@ class TestToolsConfigIncludeMode:
 
 
 class TestShippedCatalog:
+    def test_claude_design_uses_the_official_hosted_oauth_server(self, monkeypatch):
+        monkeypatch.delenv("HERMES_OPTIONAL_MCPS", raising=False)
+        from hermes_cli.mcp_catalog import _catalog_root, _parse_manifest
+
+        entry = _parse_manifest(_catalog_root() / "claude-design" / "manifest.yaml")
+
+        assert entry.name == "claude-design"
+        assert entry.source == (
+            "https://support.claude.com/en/articles/14604416-get-started-with-claude-design"
+        )
+        assert entry.transport.type == "http"
+        assert entry.transport.url == "https://api.anthropic.com/v1/design/mcp"
+        assert entry.auth.type == "oauth"
+        assert entry.auth.env == []
+        assert entry.install is None
+        assert entry.suggest is None
+
     def test_all_shipped_manifests_parse(self, monkeypatch):
         """Every manifest in optional-mcps/ must parse cleanly.
 

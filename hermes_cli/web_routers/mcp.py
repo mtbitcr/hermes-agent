@@ -46,9 +46,13 @@ router = APIRouter()
 # session/cookie flow remains available on the same routes.
 from plugins.dashboard_auth.raphael_workspace import (  # noqa: E402
     CONNECTIONS_GRANT,
+    CONNECTIONS_PRINCIPAL,
     CONNECTIONS_SCOPE,
     CONNECTIONS_TOKEN_PREFIX,
 )
+
+_CLAUDE_DESIGN_CONNECTION = "claude-design"
+_DESIGNER_PROFILE = "raphael-designer"
 
 _CONNECTIONS_LITERAL_ROUTES = (
     ("GET", "/api/mcp/catalog"),
@@ -84,6 +88,36 @@ def _register_connections_machine_routes() -> None:
 
 
 _register_connections_machine_routes()
+
+
+def _enforce_connections_machine_profile(
+    request: Request,
+    *,
+    name: Optional[str] = None,
+    profile: Optional[str] = None,
+) -> None:
+    """Keep the service credential's design access in one non-execution profile.
+
+    Interactive dashboard sessions retain the normal multi-profile admin API.
+    Raphael Workspace's machine credential may read the default or Designer
+    connection views, but only Claude Design may be mutated in the Designer
+    profile and it may never be installed in the default execution profile.
+    """
+    if not getattr(request.state, "token_authenticated", False):
+        return
+    principal = getattr(request.state, "token_principal", None)
+    if getattr(principal, "principal", None) != CONNECTIONS_PRINCIPAL:
+        return
+    if profile not in {None, _DESIGNER_PROFILE}:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if name is None:
+        return
+    if name == _CLAUDE_DESIGN_CONNECTION:
+        if profile != _DESIGNER_PROFILE:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return
+    if profile is not None:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 
 def _audit_connections_machine_success(
@@ -145,6 +179,8 @@ _CONFIG_MUTATION_LOCK = LateState("_CONFIG_MUTATION_LOCK")
 @router.get("/api/mcp/servers")
 async def list_mcp_servers(request: Request, profile: Optional[str] = None):
     from hermes_cli.mcp_config import _get_mcp_servers
+
+    _enforce_connections_machine_profile(request, profile=profile)
 
     def _read():
         with _profile_scope(profile):
@@ -230,6 +266,8 @@ async def remove_mcp_server(
     name: str, request: Request, profile: Optional[str] = None
 ):
     from hermes_cli.mcp_config import _remove_mcp_server_and_credentials
+
+    _enforce_connections_machine_profile(request, name=name, profile=profile)
 
     def _run():
         with _profile_scope(profile):
@@ -338,6 +376,8 @@ async def auth_mcp_server(
     """Start MCP OAuth and hand the authorization URL to the dashboard browser."""
     from hermes_cli.mcp_config import _get_mcp_servers
     from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+    _enforce_connections_machine_profile(request, name=name, profile=profile)
 
     _require_token(request)
     _gc_mcp_oauth_flows()
@@ -516,8 +556,13 @@ async def set_mcp_server_enabled(
     flag the agent reads at startup.  Disabled servers stay in config so they
     can be re-enabled without re-entering their settings.
     """
+    effective_profile = body.profile or profile
+    _enforce_connections_machine_profile(
+        request, name=name, profile=effective_profile
+    )
+
     def _run():
-        with _profile_scope(body.profile or profile):
+        with _profile_scope(effective_profile):
             with _CONFIG_MUTATION_LOCK:
                 cfg = load_config()
                 servers = cfg.get("mcp_servers")
@@ -544,6 +589,8 @@ async def list_mcp_catalog(request: Request, profile: Optional[str] = None):
     the installed/enabled annotations (the catalog itself is repo-shipped
     and identical for every profile).
     """
+    _enforce_connections_machine_profile(request, profile=profile)
+
     try:
         from hermes_cli import mcp_catalog
     except Exception as exc:
@@ -646,6 +693,9 @@ async def install_mcp_catalog_entry(
     # Persist any supplied env vars first (catalog entries declare which names
     # they need; we only write the ones the user provided).
     effective_profile = body.profile or profile
+    _enforce_connections_machine_profile(
+        request, name=name, profile=effective_profile
+    )
     if body.env:
         def _write_env():
             with _profile_scope(effective_profile):
