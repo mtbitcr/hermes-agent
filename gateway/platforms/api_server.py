@@ -1147,6 +1147,11 @@ def check_api_server_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
+# Keep the owner-history projection aligned with the Workspace conversation contract.
+_OWNER_HISTORY_OWNER_MAX_CHARS = 12_000
+_OWNER_HISTORY_RAPHAEL_MAX_CHARS = 50_000
+
+
 class ResponseStore:
     """
     SQLite-backed LRU store for Responses API state.
@@ -1347,13 +1352,17 @@ class ResponseStore:
             if not isinstance(content, str):
                 continue
             text = content.strip()
-            if not text or len(text) > 12_000:
+            if not text:
                 continue
             if role == "user":
                 _flush()
+                if len(text) > _OWNER_HISTORY_OWNER_MAX_CHARS:
+                    continue
                 owner_text = redact_sensitive_text(text, force=True)
                 continue
             if role != "assistant" or owner_text is None:
+                continue
+            if len(text) > _OWNER_HISTORY_RAPHAEL_MAX_CHARS:
                 continue
             try:
                 candidate = json.loads(text)
@@ -1370,9 +1379,12 @@ class ResponseStore:
             # turn is the authoritative final reply for that turn.
             from hermes_cli.kanban_db import redact_review_value
 
-            raphael_text = json.dumps(
+            projected_text = json.dumps(
                 redact_review_value(candidate), ensure_ascii=False,
             )
+            if len(projected_text) > _OWNER_HISTORY_RAPHAEL_MAX_CHARS:
+                continue
+            raphael_text = projected_text
         _flush()
         data = turns[-40:]
         return {
