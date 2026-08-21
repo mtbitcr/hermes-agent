@@ -27,6 +27,7 @@ from hermes_cli.dashboard_auth.token_auth import (
 )
 from hermes_cli.web_deps import late, LateState
 from hermes_cli.web_models import (
+    MCPAuthCodeSubmit,
     MCPAuthStart,
     MCPCatalogInstall,
     MCPEnabledToggle,
@@ -61,6 +62,8 @@ _CONNECTIONS_LITERAL_ROUTES = (
 )
 _CONNECTIONS_TEMPLATE_ROUTES = (
     ("POST", "/api/mcp/servers/{name}/auth"),
+    ("GET", "/api/mcp/oauth/flows/{flow_id}"),
+    ("POST", "/api/mcp/oauth/flows/{flow_id}/submit"),
     ("PUT", "/api/mcp/servers/{name}/enabled"),
     ("DELETE", "/api/mcp/servers/{name}"),
     ("GET", "/api/mcp/oauth/callback/{name}"),
@@ -399,8 +402,27 @@ async def auth_mcp_server(
         raise HTTPException(status_code=400, detail="This server uses header/API-key auth, not OAuth")
     cfg["auth"] = "oauth"
 
-    requested_redirect_uri = body.redirect_uri if body is not None else None
-    if requested_redirect_uri is not None:
+    from tools.claude_design_oauth import (
+        CLAUDE_DESIGN_AUTHORIZE_URL,
+        CLAUDE_DESIGN_FLOW_TTL_SECONDS,
+        CLAUDE_DESIGN_MCP_URL,
+        CLAUDE_DESIGN_REDIRECT_URI,
+    )
+
+    is_claude_design = name == _CLAUDE_DESIGN_CONNECTION
+    if is_claude_design:
+        if cfg.get("url") != CLAUDE_DESIGN_MCP_URL:
+            raise HTTPException(status_code=400, detail="Invalid Claude Design endpoint")
+        if body is not None and body.redirect_uri is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Claude Design uses its official manual callback",
+            )
+        requested_redirect_uri = CLAUDE_DESIGN_REDIRECT_URI
+    else:
+        requested_redirect_uri = body.redirect_uri if body is not None else None
+
+    if requested_redirect_uri is not None and not is_claude_design:
         from urllib.parse import quote, urlsplit, urlunsplit
 
         try:
@@ -435,25 +457,38 @@ async def auth_mcp_server(
         reconnect_live=flow_home == process_home,
     )
     with _mcp_oauth_flows_lock:
-        pending = sum(
-            not flow.worker_done
-            for flow in _mcp_oauth_flows.values()
-        )
-        if pending >= _MAX_PENDING_MCP_OAUTH_FLOWS:
-            raise HTTPException(
-                status_code=429,
-                detail="Too many MCP OAuth flows are already in progress",
+        active = [
+            current
+            for current in _mcp_oauth_flows.values()
+            if not current.worker_done
+        ]
+        matching = [
+            current
+            for current in active
+            if current.server_name == name and current.hermes_home == flow_home
+        ]
+        replaceable = (
+            is_claude_design
+            and all(
+                current.snapshot()["status"] == "authorization_required"
+                for current in matching
             )
-        if any(
-            flow.server_name == name
-            and flow.hermes_home == flow_home
-            and not flow.worker_done
-            for flow in _mcp_oauth_flows.values()
-        ):
+        )
+        if matching and not replaceable:
             raise HTTPException(
                 status_code=409,
                 detail=f"MCP OAuth for '{name}' is already in progress",
             )
+        projected = len(active) - (len(matching) if replaceable else 0) + 1
+        if projected > _MAX_PENDING_MCP_OAUTH_FLOWS:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many MCP OAuth flows are already in progress",
+            )
+        if is_claude_design:
+            _audit_connections_machine_success(request, connection=name)
+        for current in (matching if replaceable else ()):
+            current.mark_error("A newer Claude Design sign-in was started")
         _mcp_oauth_flows[flow_id] = flow
     threading.Thread(
         target=_run_dashboard_mcp_oauth,
@@ -466,7 +501,29 @@ async def auth_mcp_server(
     except Exception as exc:
         flow.mark_error(str(exc))
     result = flow.snapshot()
-    _audit_connections_machine_success(request, connection=name)
+    if is_claude_design:
+        try:
+            from urllib.parse import urlsplit
+
+            authorization = urlsplit(str(result.get("authorization_url") or ""))
+            valid_authorization = (
+                authorization.scheme == "https"
+                and authorization.netloc == "claude.com"
+                and authorization.path == "/cai/oauth/authorize"
+                and not authorization.fragment
+                and str(result["authorization_url"]).startswith(
+                    f"{CLAUDE_DESIGN_AUTHORIZE_URL}?"
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            valid_authorization = False
+        if not valid_authorization:
+            flow.mark_error("Claude Design returned an invalid authorization URL")
+            result = flow.snapshot()
+        result["flow"] = "browser_code"
+        result["expires_in"] = CLAUDE_DESIGN_FLOW_TTL_SECONDS
+    else:
+        _audit_connections_machine_success(request, connection=name)
     return result
 
 
@@ -477,9 +534,74 @@ async def mcp_oauth_flow_status(flow_id: str, request: Request):
     flow = _mcp_oauth_flows.get(flow_id)
     if flow is None:
         raise HTTPException(status_code=404, detail="OAuth flow not found or expired")
+    _enforce_connections_machine_profile(
+        request,
+        name=flow.server_name,
+        profile=flow.profile,
+    )
     snapshot = flow.snapshot()
     snapshot["tools"] = flow.tools
+    _audit_connections_machine_success(request, connection=flow.server_name)
     return snapshot
+
+
+@router.post("/api/mcp/oauth/flows/{flow_id}/submit")
+async def submit_mcp_oauth_code(
+    flow_id: str,
+    body: MCPAuthCodeSubmit,
+    request: Request,
+):
+    """Deliver one state-bound Claude Design code to native MCP OAuth."""
+    _require_token(request)
+    _gc_mcp_oauth_flows()
+    flow = _mcp_oauth_flows.get(flow_id)
+
+    from tools.claude_design_oauth import CLAUDE_DESIGN_REDIRECT_URI
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+    if (
+        not isinstance(flow, DashboardOAuthFlow)
+        or flow.server_name != _CLAUDE_DESIGN_CONNECTION
+        or flow.redirect_uri != CLAUDE_DESIGN_REDIRECT_URI
+    ):
+        raise HTTPException(status_code=404, detail="OAuth flow not found or expired")
+    _enforce_connections_machine_profile(
+        request,
+        name=_CLAUDE_DESIGN_CONNECTION,
+        profile=flow.profile,
+    )
+
+    code_input = body.code.strip()
+    if (
+        not code_input
+        or len(code_input) > 8192
+        or any(ord(char) < 32 or ord(char) == 127 for char in code_input)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid authorization code")
+    code, separator, state = code_input.partition("#")
+    if not separator or not code or not state:
+        raise HTTPException(status_code=400, detail="Incomplete authorization code")
+    if (
+        flow.status != "authorization_required"
+        or flow.expected_state is None
+        or not secrets.compare_digest(flow.expected_state, state)
+    ):
+        status_code = 409 if flow.status != "authorization_required" else 400
+        raise HTTPException(status_code=status_code, detail="Authorization code was rejected")
+
+    _audit_connections_machine_success(
+        request,
+        connection=_CLAUDE_DESIGN_CONNECTION,
+    )
+    try:
+        flow.deliver_callback(code=code, state=state, error=None)
+    except ValueError as exc:
+        status_code = 409 if "already received" in str(exc) else 400
+        raise HTTPException(
+            status_code=status_code,
+            detail="Authorization code was rejected",
+        ) from None
+    return {"ok": True, "status": "verifying"}
 
 
 @router.delete("/api/mcp/oauth/flows/{flow_id}")
@@ -507,6 +629,8 @@ async def mcp_oauth_callback(
     state: Optional[str] = None,
     error: Optional[str] = None,
 ):
+    from tools.claude_design_oauth import CLAUDE_DESIGN_REDIRECT_URI
+
     _gc_mcp_oauth_flows()
     with _mcp_oauth_flows_lock:
         candidates = [
@@ -514,6 +638,8 @@ async def mcp_oauth_callback(
             for flow in _mcp_oauth_flows.values()
             if flow.server_name == server_name
             and flow.status == "authorization_required"
+            and hasattr(flow, "deliver_callback")
+            and flow.redirect_uri != CLAUDE_DESIGN_REDIRECT_URI
         ]
     flow = next(
         (

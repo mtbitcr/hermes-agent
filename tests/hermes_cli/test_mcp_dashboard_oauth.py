@@ -55,6 +55,268 @@ def test_hosted_auth_start_returns_public_authorization_url(monkeypatch):
     assert flow.redirect_uri == "https://agent.example/api/mcp/oauth/callback/reports"
 
 
+def test_claude_design_uses_manual_first_party_code_flow(monkeypatch):
+    import asyncio
+
+    from hermes_constants import get_hermes_home
+    from hermes_cli import web_server
+    from tools.claude_design_oauth import CLAUDE_DESIGN_MCP_URL
+
+    profile_home = get_hermes_home() / "profiles" / "raphael-designer"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    response = _client().post(
+        "/api/mcp/catalog/install",
+        json={"name": "claude-design", "profile": "raphael-designer"},
+    )
+    assert response.status_code == 200, response.text
+
+    def fake_worker(flow, cfg):
+        assert cfg["url"] == CLAUDE_DESIGN_MCP_URL
+        asyncio.run(
+            flow.publish_authorization_url(
+                "https://claude.com/cai/oauth/authorize?state=design-state"
+            )
+        )
+        flow.mark_worker_done()
+
+    monkeypatch.setattr(web_server, "_run_dashboard_mcp_oauth", fake_worker)
+    response = _client().post(
+        "/api/mcp/servers/claude-design/auth?profile=raphael-designer",
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "authorization_required"
+    assert body["flow"] == "browser_code"
+    assert body["expires_in"] == 900
+    parsed = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(
+        body["authorization_url"]
+    )
+    assert (parsed.scheme, parsed.netloc, parsed.path) == (
+        "https",
+        "claude.com",
+        "/cai/oauth/authorize",
+    )
+    flow = web_server._mcp_oauth_flows[body["flow_id"]]
+    assert flow.profile == "raphael-designer"
+    assert flow.redirect_uri == "https://platform.claude.com/oauth/code/callback"
+
+
+def test_claude_design_does_not_accept_the_generic_callback(monkeypatch):
+    import asyncio
+
+    from hermes_constants import get_hermes_home
+    from hermes_cli import web_server
+
+    profile_home = get_hermes_home() / "profiles" / "raphael-designer"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    client = _client()
+    assert client.post(
+        "/api/mcp/catalog/install",
+        json={"name": "claude-design", "profile": "raphael-designer"},
+    ).status_code == 200
+
+    def fake_worker(flow, _cfg):
+        asyncio.run(
+            flow.publish_authorization_url(
+                "https://claude.com/cai/oauth/authorize?state=design-state"
+            )
+        )
+        flow._callback_ready.wait(2)
+        flow.mark_worker_done()
+
+    monkeypatch.setattr(web_server, "_run_dashboard_mcp_oauth", fake_worker)
+    start = client.post(
+        "/api/mcp/servers/claude-design/auth?profile=raphael-designer",
+    ).json()
+    flow = web_server._mcp_oauth_flows[start["flow_id"]]
+
+    response = client.get(
+        "/api/mcp/oauth/callback/claude-design",
+        params={"code": "must-not-be-consumed", "state": flow.expected_state},
+    )
+
+    assert response.status_code == 404
+    assert flow.status == "authorization_required"
+    flow.mark_error("test cleanup")
+
+
+def test_claude_design_replaces_only_a_waiting_flow(monkeypatch):
+    import asyncio
+    import threading
+
+    from hermes_constants import get_hermes_home
+    from hermes_cli import web_server
+
+    profile_home = get_hermes_home() / "profiles" / "raphael-designer"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    client = _client()
+    assert client.post(
+        "/api/mcp/catalog/install",
+        json={"name": "claude-design", "profile": "raphael-designer"},
+    ).status_code == 200
+
+    exchange_started = threading.Event()
+    release_exchange = threading.Event()
+
+    def fake_worker(flow, _cfg):
+        asyncio.run(
+            flow.publish_authorization_url(
+                f"https://claude.com/cai/oauth/authorize?state=state-{flow.flow_id}"
+            )
+        )
+        try:
+            asyncio.run(flow.wait_for_callback(timeout=2))
+            exchange_started.set()
+            release_exchange.wait(2)
+            flow.mark_approved()
+        except Exception as exc:
+            flow.mark_error(str(exc))
+        finally:
+            flow.mark_worker_done()
+
+    monkeypatch.setattr(web_server, "_run_dashboard_mcp_oauth", fake_worker)
+
+    first = client.post(
+        "/api/mcp/servers/claude-design/auth?profile=raphael-designer",
+    ).json()
+    first_flow = web_server._mcp_oauth_flows[first["flow_id"]]
+    second_response = client.post(
+        "/api/mcp/servers/claude-design/auth?profile=raphael-designer",
+    )
+    assert second_response.status_code == 200
+    assert first_flow.status == "error"
+
+    second_flow = web_server._mcp_oauth_flows[second_response.json()["flow_id"]]
+    submit = client.post(
+        f"/api/mcp/oauth/flows/{second_flow.flow_id}/submit",
+        json={"code": f"approved-code#{second_flow.expected_state}"},
+    )
+    assert submit.status_code == 200
+    assert submit.json() == {"ok": True, "status": "verifying"}
+    assert exchange_started.wait(1)
+    third_response = client.post(
+        "/api/mcp/servers/claude-design/auth?profile=raphael-designer",
+    )
+    assert third_response.status_code == 409
+    assert second_flow.status == "exchanging"
+    release_exchange.set()
+
+
+def test_claude_design_manual_code_completes_and_probes_exact_profile(monkeypatch):
+    import asyncio
+    import time
+
+    from hermes_constants import get_hermes_home
+    from hermes_cli import web_server
+
+    profile_home = get_hermes_home() / "profiles" / "raphael-designer"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    client = _client()
+    assert client.post(
+        "/api/mcp/catalog/install",
+        json={"name": "claude-design", "profile": "raphael-designer"},
+    ).status_code == 200
+
+    def fake_worker(flow, config):
+        assert config["url"] == "https://api.anthropic.com/v1/design/mcp"
+        assert flow.hermes_home == str(profile_home)
+        asyncio.run(
+            flow.publish_authorization_url(
+                "https://claude.com/cai/oauth/authorize?state=expected-state"
+            )
+        )
+        try:
+            code, state = asyncio.run(flow.wait_for_callback(timeout=2))
+            assert (code, state) == ("approved-code", "expected-state")
+            flow.tools = [
+                {"name": "design_review", "description": "Review a design"}
+            ]
+            flow.mark_approved()
+        except Exception as exc:
+            flow.mark_error(str(exc))
+        finally:
+            flow.mark_worker_done()
+
+    monkeypatch.setattr(web_server, "_run_dashboard_mcp_oauth", fake_worker)
+    start = client.post(
+        "/api/mcp/servers/claude-design/auth?profile=raphael-designer",
+    ).json()
+    flow = web_server._mcp_oauth_flows[start["flow_id"]]
+    response = client.post(
+        f"/api/mcp/oauth/flows/{start['flow_id']}/submit",
+        json={"code": f"approved-code#{flow.expected_state}"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True, "status": "verifying"}
+    deadline = time.monotonic() + 1
+    status = {}
+    while time.monotonic() < deadline:
+        status_response = client.get(f"/api/mcp/oauth/flows/{flow.flow_id}")
+        assert status_response.status_code == 200
+        status = status_response.json()
+        if status["status"] == "approved":
+            break
+        time.sleep(0.01)
+    assert status["status"] == "approved"
+    assert status["tools"] == [
+        {"name": "design_review", "description": "Review a design"}
+    ]
+
+
+def test_claude_design_rejects_mismatched_or_reused_manual_code(monkeypatch):
+    import asyncio
+
+    from hermes_constants import get_hermes_home
+    from hermes_cli import web_server
+
+    profile_home = get_hermes_home() / "profiles" / "raphael-designer"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    client = _client()
+    assert client.post(
+        "/api/mcp/catalog/install",
+        json={"name": "claude-design", "profile": "raphael-designer"},
+    ).status_code == 200
+
+    def fake_worker(flow, _cfg):
+        asyncio.run(
+            flow.publish_authorization_url(
+                "https://claude.com/cai/oauth/authorize?state=expected-state"
+            )
+        )
+        flow._callback_ready.wait(2)
+        flow.mark_worker_done()
+
+    monkeypatch.setattr(web_server, "_run_dashboard_mcp_oauth", fake_worker)
+    start = client.post(
+        "/api/mcp/servers/claude-design/auth?profile=raphael-designer",
+    ).json()
+    flow = web_server._mcp_oauth_flows[start["flow_id"]]
+
+    mismatch = client.post(
+        f"/api/mcp/oauth/flows/{flow.flow_id}/submit",
+        json={"code": "approved-code#wrong-state"},
+    )
+    accepted = client.post(
+        f"/api/mcp/oauth/flows/{flow.flow_id}/submit",
+        json={"code": f"approved-code#{flow.expected_state}"},
+    )
+    reused = client.post(
+        f"/api/mcp/oauth/flows/{flow.flow_id}/submit",
+        json={"code": f"second-code#{flow.expected_state}"},
+    )
+
+    assert mismatch.status_code == 400
+    assert accepted.status_code == 200
+    assert reused.status_code == 409
+
+
 def test_hosted_auth_accepts_exact_https_service_callback(monkeypatch):
     from hermes_cli import web_server
 

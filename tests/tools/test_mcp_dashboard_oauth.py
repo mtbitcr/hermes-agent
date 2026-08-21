@@ -27,6 +27,7 @@ def test_dashboard_flow_exposes_authorization_url_and_accepts_callback():
     }
 
     flow.deliver_callback(code="code-1", state="s1", error=None)
+    assert flow.snapshot()["status"] == "exchanging"
     assert asyncio.run(flow.wait_for_callback()) == ("code-1", "s1")
 
 

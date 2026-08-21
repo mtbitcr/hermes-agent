@@ -437,6 +437,12 @@ class MCPAuthStart(BaseModel):
     redirect_uri: Optional[str] = None
 
 
+class MCPAuthCodeSubmit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+
+
 # --- from web_server.py (originally lines 13622-13627) ---
 
 class MCPCatalogInstall(BaseModel):
