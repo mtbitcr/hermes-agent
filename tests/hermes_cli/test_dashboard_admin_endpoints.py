@@ -198,6 +198,74 @@ class TestMcpEndpoints:
             if previous is None:
                 restore_registration(provider.name, provider, None)
 
+    def test_connections_machine_token_enforces_the_designer_profile_boundary(self):
+        from starlette.testclient import TestClient
+
+        from hermes_constants import get_hermes_home
+        from hermes_cli import web_server
+        from hermes_cli.dashboard_auth import register_provider
+        from hermes_cli.dashboard_auth.registry import (
+            restore_registration,
+            snapshot_registration,
+        )
+        from hermes_cli.web_routers.mcp import _register_connections_machine_routes
+        from plugins.dashboard_auth.raphael_workspace import (
+            ConnectionsManageTokenProvider,
+        )
+        from plugins.dashboard_auth.raphael_workspace import token_store
+
+        _register_connections_machine_routes()
+        hermes_home = get_hermes_home()
+        for name in ("raphael-designer", "raphael-verifier"):
+            profile_home = hermes_home / "profiles" / name
+            profile_home.mkdir(parents=True)
+            (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+        output_dir = hermes_home / "connections-designer-boundary-test"
+        output_dir.mkdir(mode=0o700)
+        output_path = output_dir / "connections.token"
+        token_store.issue(
+            out_path=output_path,
+            surface=token_store.CONNECTIONS_SURFACE,
+        )
+        bearer = output_path.read_text(encoding="utf-8").strip()
+
+        provider = ConnectionsManageTokenProvider()
+        previous = snapshot_registration(provider.name)
+        if previous is None:
+            register_provider(provider)
+
+        headers = {"Authorization": f"Bearer {bearer}"}
+        try:
+            with TestClient(web_server.app) as machine:
+                allowed = machine.post(
+                    "/api/mcp/catalog/install",
+                    headers=headers,
+                    json={
+                        "name": "claude-design",
+                        "profile": "raphael-designer",
+                    },
+                )
+                assert allowed.status_code == 200, allowed.text
+                assert machine.post(
+                    "/api/mcp/catalog/install",
+                    headers=headers,
+                    json={"name": "claude-design"},
+                ).status_code == 403
+                assert machine.post(
+                    "/api/mcp/catalog/install",
+                    headers=headers,
+                    json={"name": "asana", "profile": "raphael-designer"},
+                ).status_code == 403
+                assert machine.get(
+                    "/api/mcp/servers",
+                    headers=headers,
+                    params={"profile": "raphael-verifier"},
+                ).status_code == 403
+        finally:
+            if previous is None:
+                restore_registration(provider.name, provider, None)
+
     def test_delete_revokes_config_and_all_oauth_state(self):
         from hermes_cli.mcp_config import _get_mcp_servers
         from tools.mcp_oauth import HermesTokenStorage
