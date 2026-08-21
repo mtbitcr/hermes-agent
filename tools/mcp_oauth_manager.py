@@ -632,6 +632,16 @@ class MCPOAuthManager:
         apply_oauth_provider_defaults(
             cfg, server_name=server_name, server_url=entry.server_url
         )
+        from tools.claude_design_oauth import (
+            apply_claude_design_oauth_defaults,
+            seed_claude_design_oauth_metadata,
+        )
+
+        is_claude_design = apply_claude_design_oauth_defaults(
+            cfg,
+            server_name=server_name,
+            server_url=entry.server_url,
+        )
         storage = HermesTokenStorage(server_name)
 
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
@@ -652,6 +662,11 @@ class MCPOAuthManager:
         _configure_callback_port(cfg, storage)
         client_metadata = _build_client_metadata(cfg)
         _maybe_preregister_client(storage, cfg, client_metadata)
+        # Pre-registration may invalidate stale tokens and metadata when an
+        # old client ID is replaced. Seed after that migration so the native
+        # SDK never falls back to Anthropic's retired discovery endpoint.
+        if is_claude_design:
+            seed_claude_design_oauth_metadata(storage)
 
         resolved_port = cfg.get("_resolved_port", 0)
         redirect_handler = _make_redirect_handler(resolved_port)

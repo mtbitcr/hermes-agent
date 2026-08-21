@@ -79,6 +79,7 @@ class DashboardOAuthFlow:
                 self._callback_error = error
             elif code:
                 self._callback = (code, state)
+                self.status = "exchanging"
             else:
                 self._callback_error = "OAuth callback did not include code or error"
             self._callback_ready.set()

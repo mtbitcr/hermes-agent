@@ -199,6 +199,8 @@ class TestMcpEndpoints:
                 restore_registration(provider.name, provider, None)
 
     def test_connections_machine_token_enforces_the_designer_profile_boundary(self):
+        import asyncio
+
         from starlette.testclient import TestClient
 
         from hermes_constants import get_hermes_home
@@ -213,6 +215,8 @@ class TestMcpEndpoints:
             ConnectionsManageTokenProvider,
         )
         from plugins.dashboard_auth.raphael_workspace import token_store
+        from tools.claude_design_oauth import CLAUDE_DESIGN_REDIRECT_URI
+        from tools.mcp_dashboard_oauth import DashboardOAuthFlow
 
         _register_connections_machine_routes()
         hermes_home = get_hermes_home()
@@ -262,6 +266,29 @@ class TestMcpEndpoints:
                     headers=headers,
                     params={"profile": "raphael-verifier"},
                 ).status_code == 403
+
+                wrong_profile_flow = DashboardOAuthFlow(
+                    flow_id="wrong-profile-flow",
+                    server_name="claude-design",
+                    profile=None,
+                    hermes_home=str(hermes_home),
+                    redirect_uri=CLAUDE_DESIGN_REDIRECT_URI,
+                )
+                asyncio.run(
+                    wrong_profile_flow.publish_authorization_url(
+                        "https://claude.com/cai/oauth/authorize?state=wrong-profile-state"
+                    )
+                )
+                web_server._mcp_oauth_flows[wrong_profile_flow.flow_id] = (
+                    wrong_profile_flow
+                )
+                rejected = machine.post(
+                    f"/api/mcp/oauth/flows/{wrong_profile_flow.flow_id}/submit",
+                    headers=headers,
+                    json={"code": "code#wrong-profile-state"},
+                )
+                assert rejected.status_code == 403
+                assert wrong_profile_flow.status == "authorization_required"
         finally:
             if previous is None:
                 restore_registration(provider.name, provider, None)
