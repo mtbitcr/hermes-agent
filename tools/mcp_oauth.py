@@ -384,8 +384,27 @@ def _read_json(path: Path) -> dict | None:
         return None
 
 
+@contextmanager
+def _dashboard_oauth_persistence_guard(*, rollback: bool = False):
+    """Serialize dashboard OAuth cancellation against persistent state writes."""
+    from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+
+    flow = get_dashboard_oauth_flow()
+    if flow is None:
+        yield
+        return
+    with flow.persistence_guard(rollback=rollback):
+        yield
+
+
 def _write_json(path: Path, data: dict) -> None:
-    """Write a dict as JSON with restricted permissions (0o600).
+    """Write a dict as JSON with restricted permissions (0o600)."""
+    with _dashboard_oauth_persistence_guard():
+        _write_json_unchecked(path, data)
+
+
+def _write_json_unchecked(path: Path, data: dict) -> None:
+    """Perform the atomic write while the caller holds any flow barrier.
 
     Uses ``os.open`` with ``O_EXCL`` and an explicit mode so the file is
     created atomically at 0o600. The previous ``write_text`` + post-write
@@ -597,6 +616,12 @@ class HermesTokenStorage:
 
     def restore(self, snapshot: dict[str, bytes], *, only_if_absent: bool = False) -> None:
         """Revert to a snapshot without overwriting a concurrent successful write."""
+        with _dashboard_oauth_persistence_guard(rollback=True):
+            self._restore_snapshot(snapshot, only_if_absent=only_if_absent)
+
+    def _restore_snapshot(
+        self, snapshot: dict[str, bytes], *, only_if_absent: bool
+    ) -> None:
         if only_if_absent and any(
             path.exists()
             for path in (self._tokens_path(), self._client_info_path(), self._meta_path())

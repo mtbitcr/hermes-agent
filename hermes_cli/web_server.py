@@ -13414,6 +13414,7 @@ def _mcp_oauth_transaction(flow) -> threading.Lock:
 def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
     """Run the normal MCP probe with dashboard redirect/callback handlers."""
     from hermes_cli.mcp_config import (
+        _get_mcp_servers,
         _oauth_tokens_present,
         _probe_single_server,
         _save_mcp_server,
@@ -13434,6 +13435,8 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
         try:
             transaction = _mcp_oauth_transaction(flow)
             with transaction, force_interactive_oauth(), dashboard_oauth_flow(flow):
+                if flow.server_name not in _get_mcp_servers():
+                    raise RuntimeError("Connection was revoked before OAuth completed")
                 manager = get_manager()
                 storage = HermesTokenStorage(flow.server_name)
                 backup = storage.snapshot()
@@ -13453,8 +13456,11 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
                             "The server responded, but no OAuth token was obtained — "
                             "this provider may require a manually-registered OAuth client."
                         )
-                    _save_mcp_server(flow.server_name, cfg)
-                    flow.tools = [{"name": t, "description": d} for t, d in tools]
+                    with flow.persistence_guard():
+                        _save_mcp_server(flow.server_name, cfg)
+                        flow.tools = [
+                            {"name": t, "description": d} for t, d in tools
+                        ]
                     flow.mark_approved()
                     if flow.reconnect_live:
                         from tools.mcp_tool import reconnect_mcp_server

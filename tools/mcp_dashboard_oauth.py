@@ -37,7 +37,9 @@ class DashboardOAuthFlow:
     _authorization_ready: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _callback_ready: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _worker_done: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _cancelled: bool = field(default=False, init=False, repr=False)
+    _discard_persisted_state: bool = field(default=False, init=False, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     async def publish_authorization_url(self, url: str) -> None:
         state = parse_qs(urlparse(url).query).get("state", [None])[0]
@@ -103,12 +105,36 @@ class DashboardOAuthFlow:
 
     def mark_error(self, error: str) -> None:
         with self._lock:
-            if self.status == "approved":
+            if self.status == "approved" or self._cancelled:
                 return
             self.status = "error"
             self.error = error
             self._authorization_ready.set()
             self._callback_ready.set()
+
+    def cancel(self, error: str, *, discard_persisted_state: bool = False) -> None:
+        """Stop the flow and serialize cancellation against OAuth state writes."""
+        with self._lock:
+            if self.status == "approved" and not discard_persisted_state:
+                return
+            self._cancelled = True
+            self._discard_persisted_state = (
+                self._discard_persisted_state or discard_persisted_state
+            )
+            self.status = "error"
+            self.error = error
+            self._authorization_ready.set()
+            self._callback_ready.set()
+
+    @contextmanager
+    def persistence_guard(self, *, rollback: bool = False) -> Iterator[None]:
+        """Prevent a cancelled flow from recreating OAuth or config state."""
+        with self._lock:
+            if self._cancelled and (
+                not rollback or self._discard_persisted_state
+            ):
+                raise RuntimeError(self.error or "OAuth flow was cancelled")
+            yield
 
     def snapshot(self) -> dict:
         with self._lock:
