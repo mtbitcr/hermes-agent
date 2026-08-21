@@ -20,7 +20,7 @@ import sys
 import time
 import types
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -442,6 +442,14 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_get("/v1/owner-workspace/projects", adapter._handle_owner_workspace_projects)
+    app.router.add_get(
+        "/v1/owner-workspace/projects/{project_slug}/snapshot",
+        adapter._handle_owner_workspace_project_snapshot,
+    )
+    app.router.add_get(
+        "/v1/owner-workspace/projects/{project_slug}/attachments/{attachment_id}",
+        adapter._handle_owner_workspace_project_attachment,
+    )
     app.router.add_get("/v1/owner-workspace/decisions", adapter._handle_owner_workspace_decisions)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
@@ -1059,12 +1067,107 @@ class TestOwnerWorkspaceProjectsEndpoint:
         listed.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_surface_requires_bearer_auth(self, auth_adapter):
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/v1/owner-workspace/projects",
+            "/v1/owner-workspace/projects/shoe-shop/snapshot",
+            "/v1/owner-workspace/projects/shoe-shop/attachments/7",
+        ],
+    )
+    async def test_surface_requires_bearer_auth(self, auth_adapter, path):
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.get("/v1/owner-workspace/projects")
+            resp = await cli.get(path)
 
         assert resp.status == 401
+
+
+class TestOwnerWorkspaceProjectSnapshotEndpoint:
+    @pytest.mark.asyncio
+    async def test_enabled_surface_returns_only_exact_kernel_projection(self, adapter):
+        expected = {
+            "project": {
+                "id": "p_1", "slug": "shoe-shop", "name": "Shoe shop",
+                "description": "Owner project", "board": "shoe-shop", "archived": False,
+            },
+            "board": {
+                "slug": "shoe-shop", "name": "Shoe shop", "project_id": "p_1",
+                "counts": {"ready": 1}, "total": 1,
+            },
+            "columns": [{"name": "ready", "tasks": []}],
+            "workers": [], "attachments": [], "runs": [],
+            "truncated": {"tasks": False, "workers": False, "attachments": False, "runs": False},
+        }
+        app = _create_app(adapter)
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch("hermes_cli.owner_workspace.resolve_owner_context", return_value=object()),
+            patch("hermes_cli.owner_workspace.read_project_snapshot", return_value=expected) as read,
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/owner-workspace/projects/shoe-shop/snapshot")
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {
+            "object": "hermes.owner_workspace.project_snapshot",
+            "data": expected,
+        }
+        read.assert_called_once_with(ANY, "shoe-shop")
+
+    @pytest.mark.asyncio
+    async def test_non_receipt_project_is_indistinguishable_from_missing(self, adapter):
+        from hermes_cli.owner_workspace import OwnerWorkspaceError
+
+        app = _create_app(adapter)
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch("hermes_cli.owner_workspace.resolve_owner_context", return_value=object()),
+            patch(
+                "hermes_cli.owner_workspace.read_project_snapshot",
+                side_effect=OwnerWorkspaceError("project_not_found", "private detail"),
+            ),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/owner-workspace/projects/not-owned/snapshot")
+                data = await resp.json()
+
+        assert resp.status == 404
+        assert data["error"]["code"] == "project_not_found"
+        assert "private detail" not in str(data)
+
+    @pytest.mark.asyncio
+    async def test_attachment_stream_is_exact_and_non_cacheable(self, adapter):
+        expected = {
+            "id": "7",
+            "filename": "owner-note.txt",
+            "media_type": "text/plain",
+            "size": 16,
+            "created_at": "2026-08-21T00:00:00Z",
+            "body": b"safe owner bytes",
+        }
+        app = _create_app(adapter)
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch("hermes_cli.owner_workspace.resolve_owner_context", return_value=object()),
+            patch("hermes_cli.owner_workspace.read_project_attachment", return_value=expected) as read,
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    "/v1/owner-workspace/projects/shoe-shop/attachments/7"
+                )
+                body = await resp.read()
+
+        assert resp.status == 200
+        assert body == b"safe owner bytes"
+        assert resp.headers["Content-Type"].startswith("text/plain")
+        assert resp.headers["Content-Disposition"] == 'attachment; filename="owner-note.txt"'
+        assert resp.headers["Cache-Control"] == "no-store"
+        read.assert_called_once_with(ANY, "shoe-shop", "7")
 
 
 class TestOwnerWorkspaceDecisionsEndpoint:
