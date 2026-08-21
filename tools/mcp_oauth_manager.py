@@ -134,11 +134,17 @@ def _make_hermes_provider_class() -> Optional[type]:
             *args: Any,
             server_name: str = "",
             preregistered: bool = False,
+            claude_design: bool = False,
+            callback_state: Optional[dict[str, str | None]] = None,
             **kwargs: Any,
         ):
             super().__init__(*args, **kwargs)
             self._hermes_server_name = server_name
             self._hermes_home = ""
+            self._hermes_claude_design = claude_design
+            self._hermes_callback_state = (
+                callback_state if callback_state is not None else {}
+            )
             # When the client_id comes from config.yaml (pre-registered), an
             # invalid_client rejection means the *config* is wrong — deleting
             # client.json would just be re-seeded from config and re-running
@@ -171,11 +177,62 @@ def _make_hermes_provider_class() -> Optional[type]:
 
         async def _exchange_token_authorization_code(self, *args: Any, **kwargs: Any):
             self._coerce_client_secret_post()
-            return await super()._exchange_token_authorization_code(*args, **kwargs)
+            request = await super()._exchange_token_authorization_code(*args, **kwargs)
+            if not self._hermes_claude_design:
+                return request
+
+            from mcp.client.auth.exceptions import OAuthFlowError
+            from tools.claude_design_oauth import (
+                CLAUDE_DESIGN_CLIENT_ID,
+                CLAUDE_DESIGN_REDIRECT_URI,
+                CLAUDE_DESIGN_TOKEN_URL,
+            )
+
+            state = self._hermes_callback_state.pop("state", None)
+            if not state:
+                raise OAuthFlowError("Claude Design callback state was not retained")
+            auth_code = args[0] if args else kwargs.get("auth_code")
+            code_verifier = args[1] if len(args) > 1 else kwargs.get("code_verifier")
+            payload = {
+                "grant_type": "authorization_code",
+                "code": auth_code,
+                "redirect_uri": CLAUDE_DESIGN_REDIRECT_URI,
+                "client_id": CLAUDE_DESIGN_CLIENT_ID,
+                "code_verifier": code_verifier,
+                "state": state,
+            }
+            return request.__class__(
+                "POST",
+                CLAUDE_DESIGN_TOKEN_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
 
         async def _refresh_token(self):
             self._coerce_client_secret_post()
-            return await super()._refresh_token()
+            request = await super()._refresh_token()
+            if not self._hermes_claude_design:
+                return request
+
+            from tools.claude_design_oauth import (
+                CLAUDE_DESIGN_CLIENT_ID,
+                CLAUDE_DESIGN_SCOPES,
+                CLAUDE_DESIGN_TOKEN_URL,
+            )
+
+            refresh_token = getattr(self.context.current_tokens, "refresh_token")
+            payload = {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": CLAUDE_DESIGN_CLIENT_ID,
+                "scope": CLAUDE_DESIGN_SCOPES,
+            }
+            return request.__class__(
+                "POST",
+                CLAUDE_DESIGN_TOKEN_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
 
         async def _handle_token_response(self, response):
             """Accept any 2xx token response and avoid leaking token bodies in errors."""
@@ -673,13 +730,26 @@ class MCPOAuthManager:
         # mcp 2.0 removed OAuthClientProvider's `timeout` argument, so the
         # configured `oauth.timeout` now bounds the callback waiter's own poll
         # loop instead — that is where the browser round-trip is awaited.
-        callback_handler = _make_callback_waiter(
+        base_callback_handler = _make_callback_waiter(
             resolved_port, timeout=float(cfg.get("timeout", 300))
         )
+        callback_state: dict[str, str | None] | None = None
+        if is_claude_design:
+            callback_state = {}
+
+            async def callback_handler():
+                result = await base_callback_handler()
+                state = result[1] if isinstance(result, tuple) else result.state
+                callback_state["state"] = state
+                return result
+        else:
+            callback_handler = base_callback_handler
 
         return _HERMES_PROVIDER_CLS(
             server_name=server_name,
             preregistered=bool(cfg.get("client_id")),
+            claude_design=is_claude_design,
+            callback_state=callback_state,
             server_url=entry.server_url,
             client_metadata=client_metadata,
             storage=storage,

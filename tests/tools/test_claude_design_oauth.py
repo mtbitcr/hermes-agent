@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import stat
 
 
@@ -112,3 +113,114 @@ def test_native_manager_owns_client_registration_and_metadata(tmp_path, monkeypa
     ]
     assert metadata is not None
     assert str(metadata.token_endpoint) == CLAUDE_DESIGN_TOKEN_URL
+
+
+def test_native_manager_matches_claude_code_token_exchange(tmp_path, monkeypatch):
+    from tools.claude_design_oauth import (
+        CLAUDE_DESIGN_CLIENT_ID,
+        CLAUDE_DESIGN_MCP_URL,
+        CLAUDE_DESIGN_REDIRECT_URI,
+        CLAUDE_DESIGN_TOKEN_URL,
+    )
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow, dashboard_oauth_flow
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    flow = DashboardOAuthFlow(
+        flow_id="design-exchange",
+        server_name="claude-design",
+        profile="raphael-designer",
+        hermes_home=str(tmp_path),
+        redirect_uri=CLAUDE_DESIGN_REDIRECT_URI,
+    )
+    manager = MCPOAuthManager()
+    with dashboard_oauth_flow(flow):
+        provider = manager.get_or_build_provider(
+            "claude-design",
+            CLAUDE_DESIGN_MCP_URL,
+            None,
+        )
+        assert provider is not None
+        storage = HermesTokenStorage("claude-design")
+        provider.context.oauth_metadata = storage.load_oauth_metadata()
+        provider.context.client_info = asyncio.run(storage.get_client_info())
+        assert provider.context.oauth_metadata is not None
+        assert provider.context.client_info is not None
+
+        async def _complete_flow():
+            pending = asyncio.create_task(provider._perform_authorization())
+            await flow.wait_for_authorization_url()
+            assert flow.expected_state is not None
+            flow.deliver_callback(
+                code="one-time-code",
+                state=flow.expected_state,
+                error=None,
+            )
+            return await pending, flow.expected_state
+
+        request, state = asyncio.run(_complete_flow())
+
+    payload = json.loads(request.content)
+    assert str(request.url) == CLAUDE_DESIGN_TOKEN_URL
+    assert request.headers["content-type"] == "application/json"
+    assert payload == {
+        "grant_type": "authorization_code",
+        "code": "one-time-code",
+        "redirect_uri": CLAUDE_DESIGN_REDIRECT_URI,
+        "client_id": CLAUDE_DESIGN_CLIENT_ID,
+        "code_verifier": payload["code_verifier"],
+        "state": state,
+    }
+    assert len(payload["code_verifier"]) == 128
+
+
+def test_native_manager_matches_claude_code_refresh(tmp_path, monkeypatch):
+    from mcp.shared.auth import OAuthToken
+    from tools.claude_design_oauth import (
+        CLAUDE_DESIGN_CLIENT_ID,
+        CLAUDE_DESIGN_MCP_URL,
+        CLAUDE_DESIGN_REDIRECT_URI,
+        CLAUDE_DESIGN_SCOPES,
+        CLAUDE_DESIGN_TOKEN_URL,
+    )
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow, dashboard_oauth_flow
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    flow = DashboardOAuthFlow(
+        flow_id="design-refresh",
+        server_name="claude-design",
+        profile="raphael-designer",
+        hermes_home=str(tmp_path),
+        redirect_uri=CLAUDE_DESIGN_REDIRECT_URI,
+    )
+    with dashboard_oauth_flow(flow):
+        provider = MCPOAuthManager().get_or_build_provider(
+            "claude-design",
+            CLAUDE_DESIGN_MCP_URL,
+            None,
+        )
+    assert provider is not None
+    storage = HermesTokenStorage("claude-design")
+    provider.context.oauth_metadata = storage.load_oauth_metadata()
+    provider.context.client_info = asyncio.run(storage.get_client_info())
+    assert provider.context.oauth_metadata is not None
+    assert provider.context.client_info is not None
+    provider.context.current_tokens = OAuthToken(
+        access_token="expired-access",
+        refresh_token="refresh-token",
+        token_type="Bearer",
+    )
+
+    request = asyncio.run(provider._refresh_token())
+
+    assert str(request.url) == CLAUDE_DESIGN_TOKEN_URL
+    assert request.headers["content-type"] == "application/json"
+    assert json.loads(request.content) == {
+        "grant_type": "refresh_token",
+        "refresh_token": "refresh-token",
+        "client_id": CLAUDE_DESIGN_CLIENT_ID,
+        "scope": CLAUDE_DESIGN_SCOPES,
+    }
