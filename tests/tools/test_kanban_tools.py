@@ -595,6 +595,10 @@ def test_kanban_guidance_keeps_owner_attachments_plain_language():
             "it merely to bypass the owner-safe text check."
         ),
     }
+    assert KANBAN_ATTACH_SCHEMA["parameters"]["properties"]["content_text"][
+        "type"
+    ] == "string"
+    assert KANBAN_ATTACH_SCHEMA["parameters"]["required"] == ["filename"]
     assert "technical_artifact" in (
         KANBAN_ATTACH_URL_SCHEMA["parameters"]["properties"]
     )
@@ -1017,6 +1021,16 @@ def _inline_attachment_payload(text: str, **overrides):
     return payload
 
 
+def _inline_text_attachment_payload(text: str, **overrides):
+    payload = {
+        "filename": "owner-summary.md",
+        "content_text": text,
+        "content_type": "text/markdown",
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_attach_rejects_internal_refs_before_persist(worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
@@ -1027,6 +1041,59 @@ def test_attach_rejects_internal_refs_before_persist(worker_env):
     result = json.loads(out)
     assert "owner-visible text attachments" in result["error"]
     assert "t_deadbeef" not in out
+
+    text_out = kt._handle_attach(
+        _inline_text_attachment_payload(
+            "Owner copy cites t_deadbeef and /workspace/private/note.md."
+        )
+    )
+    text_result = json.loads(text_out)
+    assert "owner-visible text attachments" in text_result["error"]
+    assert "t_deadbeef" not in text_out
+
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_accepts_utf8_text_without_base64(worker_env):
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    text = "# Owner brief\n\nRésumé of the first milestone."
+    out = kt._handle_attach(_inline_text_attachment_payload(text))
+    result = json.loads(out)
+    assert result.get("ok") is True, out
+    assert result["size"] == len(text.encode("utf-8"))
+
+    conn = kb.connect()
+    try:
+        attachments = kb.list_attachments(conn, worker_env)
+        assert [item.filename for item in attachments] == ["owner-summary.md"]
+        stored = Path(attachments[0].stored_path).read_bytes()
+        assert stored == text.encode("utf-8")
+    finally:
+        conn.close()
+
+
+def test_attach_requires_exactly_one_inline_content_source(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    missing = kt._handle_attach({"filename": "owner-summary.md"})
+    both = kt._handle_attach(
+        _inline_attachment_payload(
+            "Owner-safe base64 text.", content_text="Owner-safe direct text."
+        )
+    )
+    for out in (missing, both):
+        assert json.loads(out)["error"] == (
+            "provide exactly one of content_base64 or content_text"
+        )
 
     conn = kb.connect()
     try:

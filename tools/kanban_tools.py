@@ -1233,7 +1233,7 @@ def _owner_text_attachment_guard(
 
 
 def _handle_attach(args: dict, **kw) -> str:
-    """Attach an inline (base64) file to a task.
+    """Attach inline base64 bytes or UTF-8 text to a task.
 
     Mirrors the dashboard's upload endpoint for the agent surface: decode
     the payload, enforce the shared size cap, write it under the per-task
@@ -1257,14 +1257,24 @@ def _handle_attach(args: dict, **kw) -> str:
     if not filename or not str(filename).strip():
         return tool_error("filename is required")
     content_b64 = args.get("content_base64")
-    if not content_b64 or not str(content_b64).strip():
-        return tool_error("content_base64 is required")
-    import base64
-    import binascii
-    try:
-        data = base64.b64decode(str(content_b64), validate=True)
-    except (binascii.Error, ValueError) as e:
-        return tool_error(f"content_base64 is not valid base64: {e}")
+    content_text = args.get("content_text")
+    has_base64 = bool(content_b64 and str(content_b64).strip())
+    text_value = content_text if isinstance(content_text, str) and content_text else None
+    has_text = text_value is not None
+    if has_base64 == has_text:
+        return tool_error(
+            "provide exactly one of content_base64 or content_text"
+        )
+    if text_value is not None:
+        data = text_value.encode("utf-8")
+    else:
+        import base64
+        import binascii
+
+        try:
+            data = base64.b64decode(str(content_b64), validate=True)
+        except (binascii.Error, ValueError) as e:
+            return tool_error(f"content_base64 is not valid base64: {e}")
     content_type = args.get("content_type")
     guard_error = _owner_text_attachment_guard(
         filename,
@@ -2265,7 +2275,9 @@ KANBAN_COMMENT_SCHEMA = {
 KANBAN_ATTACH_SCHEMA = {
     "name": "kanban_attach",
     "description": (
-        "Attach a file to a task by passing its bytes inline (base64). "
+        "Attach a file to a task by passing either UTF-8 text or bytes "
+        "inline as base64. Use content_text for text and Markdown; use "
+        "content_base64 for binary files. Provide exactly one. "
         "Use for genuine file artifacts the next worker or a human should "
         "be able to download — generated reports, images, exports. The "
         "file is stored as a real attachment (not a comment link) under "
@@ -2290,6 +2302,13 @@ KANBAN_ATTACH_SCHEMA = {
                 "type": "string",
                 "description": "The file contents, base64-encoded. Max 25 MB decoded.",
             },
+            "content_text": {
+                "type": "string",
+                "description": (
+                    "The complete UTF-8 text contents. Use this instead of "
+                    "base64 for text or Markdown attachments. Max 25 MB encoded."
+                ),
+            },
             "content_type": {
                 "type": "string",
                 "description": "Optional MIME type (e.g. 'application/pdf').",
@@ -2305,7 +2324,7 @@ KANBAN_ATTACH_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["filename", "content_base64"],
+        "required": ["filename"],
     },
 }
 
