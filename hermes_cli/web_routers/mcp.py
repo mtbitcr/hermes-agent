@@ -179,6 +179,19 @@ _MAX_PENDING_MCP_OAUTH_FLOWS = LateState("_MAX_PENDING_MCP_OAUTH_FLOWS")
 _CONFIG_MUTATION_LOCK = LateState("_CONFIG_MUTATION_LOCK")
 
 
+def _cancel_connection_oauth_flows_locked(name: str, hermes_home: str) -> None:
+    """Cancel exact-scope workers while the caller holds the flow registry lock."""
+    matching = [
+        flow
+        for flow in _mcp_oauth_flows.values()
+        if flow.server_name == name
+        and flow.hermes_home == hermes_home
+        and not flow.worker_done
+    ]
+    for flow in matching:
+        flow.cancel("Connection was revoked", discard_persisted_state=True)
+
+
 @router.get("/api/mcp/servers")
 async def list_mcp_servers(request: Request, profile: Optional[str] = None):
     from hermes_cli.mcp_config import _get_mcp_servers
@@ -273,9 +286,14 @@ async def remove_mcp_server(
     _enforce_connections_machine_profile(request, name=name, profile=profile)
 
     def _run():
+        from hermes_constants import get_hermes_home
+
         with _profile_scope(profile):
-            with _CONFIG_MUTATION_LOCK:
-                return _remove_mcp_server_and_credentials(name)
+            flow_home = str(get_hermes_home().expanduser().resolve(strict=False))
+            with _mcp_oauth_flows_lock:
+                _cancel_connection_oauth_flows_locked(name, flow_home)
+                with _CONFIG_MUTATION_LOCK:
+                    return _remove_mcp_server_and_credentials(name)
 
     try:
         removed = await asyncio.to_thread(_run)
@@ -488,7 +506,7 @@ async def auth_mcp_server(
         if is_claude_design:
             _audit_connections_machine_success(request, connection=name)
         for current in (matching if replaceable else ()):
-            current.mark_error("A newer Claude Design sign-in was started")
+            current.cancel("A newer Claude Design sign-in was started")
         _mcp_oauth_flows[flow_id] = flow
     threading.Thread(
         target=_run_dashboard_mcp_oauth,
@@ -607,7 +625,7 @@ async def submit_mcp_oauth_code(
 @router.delete("/api/mcp/oauth/flows/{flow_id}")
 async def cancel_mcp_oauth_flow(flow_id: str, request: Request):
     """Cancel an in-flight MCP OAuth flow (the desktop's inline-card/pill
-    cancel). mark_error unblocks both worker waits, so the worker exits and
+    cancel). cancel unblocks both worker waits, so the worker exits and
     frees the per-server "already in progress" slot — without this, a renderer
     that stops polling leaves the flow squatting until its 300s callback
     timeout and every retry 409s. Idempotent: an already-settled flow is left
@@ -617,7 +635,7 @@ async def cancel_mcp_oauth_flow(flow_id: str, request: Request):
     if flow is None:
         # Expired/GC'd is the goal state of a cancel — not an error.
         return {"ok": True, "status": "expired"}
-    flow.mark_error("Cancelled by user")
+    flow.cancel("Cancelled by user")
     return {"ok": True, "status": flow.snapshot()["status"]}
 
 

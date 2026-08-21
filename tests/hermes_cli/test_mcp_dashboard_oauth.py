@@ -431,6 +431,104 @@ def test_hosted_auth_allows_same_server_name_in_different_profiles(tmp_path, mon
     assert response.status_code != 409
 
 
+def test_delete_revokes_inflight_oauth_without_late_state_resurrection(monkeypatch):
+    import asyncio
+    import threading
+
+    from hermes_cli import web_server
+    from hermes_cli.mcp_config import _get_mcp_servers
+    from tools.mcp_dashboard_oauth import dashboard_oauth_flow
+    from tools.mcp_oauth import HermesTokenStorage
+
+    client = _client()
+    assert client.post(
+        "/api/mcp/servers",
+        json={"name": "reports", "url": "https://mcp.example/mcp", "auth": "oauth"},
+    ).status_code == 200
+
+    release_late_write = threading.Event()
+
+    class LateClientInfo:
+        def model_dump(self, **_kwargs):
+            return {"client_id": "late-client"}
+
+    def fake_worker(flow, _cfg):
+        storage = HermesTokenStorage("reports", hermes_home=flow.hermes_home)
+        with dashboard_oauth_flow(flow):
+            asyncio.run(
+                flow.publish_authorization_url(
+                    "https://idp.example/authorize?state=late-write"
+                )
+            )
+            release_late_write.wait(2)
+            try:
+                asyncio.run(storage.set_client_info(LateClientInfo()))
+            except RuntimeError:
+                pass
+            finally:
+                flow.mark_worker_done()
+
+    monkeypatch.setattr(web_server, "_run_dashboard_mcp_oauth", fake_worker)
+    started = client.post("/api/mcp/servers/reports/auth")
+    assert started.status_code == 200
+    flow = web_server._mcp_oauth_flows[started.json()["flow_id"]]
+    storage = HermesTokenStorage("reports", hermes_home=flow.hermes_home)
+
+    removed = client.delete("/api/mcp/servers/reports")
+    release_late_write.set()
+    assert flow._worker_done.wait(2)
+
+    assert removed.status_code == 200
+    assert flow.snapshot()["status"] == "error"
+    assert "reports" not in _get_mcp_servers()
+    assert not storage._client_info_path().exists()
+
+
+def test_oauth_start_cannot_resurrect_connection_removed_before_registration(
+    monkeypatch,
+):
+    import threading
+
+    from hermes_cli.mcp_config import _get_mcp_servers
+    from tools import mcp_dashboard_oauth
+    from tools.mcp_oauth import HermesTokenStorage
+
+    client = _client()
+    assert client.post(
+        "/api/mcp/servers",
+        json={"name": "reports", "url": "https://mcp.example/mcp", "auth": "oauth"},
+    ).status_code == 200
+
+    flow_constructed = threading.Event()
+    release_registration = threading.Event()
+    auth_result = {}
+    flow_class = mcp_dashboard_oauth.DashboardOAuthFlow
+
+    def blocking_flow(*args, **kwargs):
+        flow = flow_class(*args, **kwargs)
+        flow_constructed.set()
+        assert release_registration.wait(2)
+        return flow
+
+    monkeypatch.setattr(mcp_dashboard_oauth, "DashboardOAuthFlow", blocking_flow)
+
+    def start_auth():
+        auth_result["response"] = _client().post("/api/mcp/servers/reports/auth")
+
+    auth_thread = threading.Thread(target=start_auth)
+    auth_thread.start()
+    assert flow_constructed.wait(2)
+
+    removed = client.delete("/api/mcp/servers/reports")
+    release_registration.set()
+    auth_thread.join(2)
+
+    assert not auth_thread.is_alive()
+    assert removed.status_code == 200
+    assert auth_result["response"].status_code == 200
+    assert auth_result["response"].json()["status"] == "error"
+    assert "reports" not in _get_mcp_servers()
+    assert not HermesTokenStorage("reports")._client_info_path().exists()
 
 
 def test_flow_status_does_not_expose_authorization_code():
