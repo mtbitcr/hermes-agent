@@ -14714,7 +14714,7 @@ def _write_profile_model(
             if not isinstance(agent_cfg, dict):
                 agent_cfg = {}
                 cfg["agent"] = agent_cfg
-            agent_cfg["reasoning_effort"] = parsed_effort
+            agent_cfg["reasoning_effort"] = parsed_effort.get("effort", "none")
         if disable_fallbacks:
             cfg["fallback_providers"] = []
             cfg.pop("fallback_model", None)
