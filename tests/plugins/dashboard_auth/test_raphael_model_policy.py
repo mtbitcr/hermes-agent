@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
+from hermes_cli import web_server
 from hermes_cli.web_models import ProfileModelUpdate
 from hermes_cli.web_routers import profiles as profile_routes
 from plugins.dashboard_auth.raphael_workspace import model_policy
@@ -87,6 +88,35 @@ def test_machine_request_is_bound_to_the_models_provider():
     assert model_machine_request(allowed) is True
     assert model_machine_request(interactive) is False
     assert model_machine_request(wrong_machine) is False
+
+
+def test_profile_model_write_persists_canonical_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    saved = []
+    monkeypatch.setattr(
+        web_server,
+        "load_config",
+        lambda: {
+            "model": {"default": "gpt-5.6-sol", "provider": "openai-codex"},
+            "agent": {"reasoning_effort": "high"},
+            "fallback_model": "legacy-fallback",
+            "fallback_providers": ["legacy-provider"],
+        },
+    )
+    monkeypatch.setattr(web_server, "save_config", saved.append)
+
+    web_server._write_profile_model(
+        tmp_path,
+        "anthropic",
+        "claude-opus-5",
+        reasoning_effort=" MAX ",
+        disable_fallbacks=True,
+    )
+
+    assert saved[0]["agent"]["reasoning_effort"] == "max"
+    assert saved[0]["fallback_providers"] == []
+    assert "fallback_model" not in saved[0]
 
 
 def test_machine_profile_scope_is_exact_and_interactive_callers_are_unchanged():
