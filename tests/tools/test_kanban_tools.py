@@ -582,9 +582,22 @@ def test_kanban_guidance_orchestrator_decision_ownership():
 def test_kanban_guidance_keeps_owner_attachments_plain_language():
     """Ordinary attachments must not leak the execution substrate by default."""
     from agent.prompt_builder import KANBAN_GUIDANCE
+    from tools.kanban_tools import KANBAN_ATTACH_SCHEMA, KANBAN_ATTACH_URL_SCHEMA
 
     assert "Attachments are owner-visible by default" in KANBAN_GUIDANCE
     assert "omit internal task/run IDs" in KANBAN_GUIDANCE
+    assert "attachment tools reject these references" in KANBAN_GUIDANCE
+    assert KANBAN_ATTACH_SCHEMA["parameters"]["properties"]["technical_artifact"] == {
+        "type": "boolean",
+        "description": (
+            "Set true only when the task explicitly requires a technical or "
+            "operator artifact that must retain internal references. Never use "
+            "it merely to bypass the owner-safe text check."
+        ),
+    }
+    assert "technical_artifact" in (
+        KANBAN_ATTACH_URL_SCHEMA["parameters"]["properties"]
+    )
     assert (
         "Keep operational evidence in the structured handoff instead"
         in KANBAN_GUIDANCE
@@ -992,6 +1005,62 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 # ---------------------------------------------------------------------------
 
 
+def _inline_attachment_payload(text: str, **overrides):
+    import base64
+
+    payload = {
+        "filename": "owner-summary.md",
+        "content_base64": base64.b64encode(text.encode()).decode(),
+        "content_type": "text/markdown",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_attach_rejects_internal_refs_before_persist(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_attach(_inline_attachment_payload(
+        "Owner copy cites t_deadbeef and /workspace/private/note.md."
+    ))
+    result = json.loads(out)
+    assert "owner-visible text attachments" in result["error"]
+    assert "t_deadbeef" not in out
+
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_accepts_clean_text_and_explicit_technical_artifact(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    clean = kt._handle_attach(_inline_attachment_payload(
+        "# Owner summary\n\nThe first milestone is ready for review."
+    ))
+    assert json.loads(clean).get("ok") is True
+
+    technical = kt._handle_attach(_inline_attachment_payload(
+        "Operator evidence for run_deadbeef and commit " + "a" * 40,
+        filename="operator-note.md",
+        technical_artifact=True,
+    ))
+    assert json.loads(technical).get("ok") is True
+
+    conn = kb.connect()
+    try:
+        assert [a.filename for a in kb.list_attachments(conn, worker_env)] == [
+            "owner-summary.md",
+            "operator-note.md",
+        ]
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def allow_private_urls(monkeypatch):
     """Opt the SSRF guard into private/loopback targets for local fixtures.
@@ -1144,6 +1213,37 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert [a.filename for a in atts] == ["spec.pdf"]
         assert atts[0].content_type == "application/pdf"
         assert Path(atts[0].stored_path).read_bytes() == payload
+    finally:
+        conn.close()
+
+
+def test_attach_url_rejects_internal_refs_before_persist(
+    worker_env, default_url_guard, monkeypatch
+):
+    import httpx
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _fake_public_dns(monkeypatch, {"files.example.com": "93.184.216.34"})
+
+    def fake_stream(method, url, **kwargs):
+        return _FakeStreamResponse(
+            status_code=200,
+            headers={"content-type": "text/markdown"},
+            body=b"Owner copy cites t_deadbeef.",
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    out = kt._handle_attach_url({
+        "url": "http://files.example.com/docs/owner-summary.md"
+    })
+    result = json.loads(out)
+    assert "owner-visible text attachments" in result["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
     finally:
         conn.close()
 

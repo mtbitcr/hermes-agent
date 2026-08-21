@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Optional
 
@@ -40,6 +41,38 @@ from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
+
+_OWNER_TEXT_ATTACHMENT_SUFFIXES = {
+    ".csv",
+    ".htm",
+    ".html",
+    ".json",
+    ".markdown",
+    ".md",
+    ".rst",
+    ".toml",
+    ".tsv",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+_OWNER_TEXT_ATTACHMENT_TYPES = {
+    "application/json",
+    "application/toml",
+    "application/x-yaml",
+    "application/xml",
+    "application/yaml",
+}
+_OWNER_INTERNAL_REFERENCE_PATTERNS = (
+    re.compile(r"\b(?:t_[0-9a-f]{8}|run_[0-9a-f]{8,})\b", re.IGNORECASE),
+    re.compile(r"(?:/home/deploy(?:/|\b)|/workspace(?:/|\b)|HERMES_KANBAN_TASK)", re.IGNORECASE),
+    re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE),
+    re.compile(
+        r"\braphael-(?:designer|executor|planner|steward|verifier|worker)\b",
+        re.IGNORECASE,
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1165,6 +1198,40 @@ def _handle_comment(args: dict, **kw) -> str:
         return tool_error(f"kanban_comment: {e}")
 
 
+def _owner_text_attachment_guard(
+    filename: object,
+    data: bytes,
+    content_type: object,
+    *,
+    technical_artifact: bool,
+) -> Optional[str]:
+    """Reject internal references in ordinary owner-visible text artifacts."""
+    if technical_artifact:
+        return None
+    suffix = os.path.splitext(str(filename))[1].lower()
+    media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    is_text = (
+        media_type.startswith("text/")
+        or media_type in _OWNER_TEXT_ATTACHMENT_TYPES
+        or suffix in _OWNER_TEXT_ATTACHMENT_SUFFIXES
+    )
+    if not is_text:
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not any(pattern.search(text) for pattern in _OWNER_INTERNAL_REFERENCE_PATTERNS):
+        return None
+    return tool_error(
+        "owner-visible text attachments cannot contain internal task/run "
+        "identifiers, agent/profile names, workspace/storage paths, or commit "
+        "SHAs; replace them with descriptive plain-language labels. Set "
+        "technical_artifact=true only when this task explicitly requires a "
+        "technical/operator artifact that must retain those references"
+    )
+
+
 def _handle_attach(args: dict, **kw) -> str:
     """Attach an inline (base64) file to a task.
 
@@ -1199,6 +1266,14 @@ def _handle_attach(args: dict, **kw) -> str:
     except (binascii.Error, ValueError) as e:
         return tool_error(f"content_base64 is not valid base64: {e}")
     content_type = args.get("content_type")
+    guard_error = _owner_text_attachment_guard(
+        filename,
+        data,
+        content_type,
+        technical_artifact=args.get("technical_artifact") is True,
+    )
+    if guard_error:
+        return guard_error
     board = args.get("board")
     try:
         _, conn = _connect(board=board)
@@ -1327,6 +1402,15 @@ def _handle_attach_url(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_attach_url download failed")
         return tool_error(f"kanban_attach_url: failed to fetch {url}: {e}")
+    effective_content_type = content_type or fetched_ct
+    guard_error = _owner_text_attachment_guard(
+        filename,
+        data,
+        effective_content_type,
+        technical_artifact=args.get("technical_artifact") is True,
+    )
+    if guard_error:
+        return guard_error
     try:
         _, conn = _connect(board=board)
         try:
@@ -1335,7 +1419,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
                 tid,
                 str(filename),
                 data,
-                content_type=content_type or fetched_ct,
+                content_type=effective_content_type,
                 uploaded_by="agent",
                 board=board,
             )
@@ -2210,6 +2294,15 @@ KANBAN_ATTACH_SCHEMA = {
                 "type": "string",
                 "description": "Optional MIME type (e.g. 'application/pdf').",
             },
+            "technical_artifact": {
+                "type": "boolean",
+                "description": (
+                    "Set true only when the task explicitly requires a "
+                    "technical or operator artifact that must retain internal "
+                    "references. Never use it merely to bypass the owner-safe "
+                    "text check."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": ["filename", "content_base64"],
@@ -2247,6 +2340,15 @@ KANBAN_ATTACH_URL_SCHEMA = {
                 "description": (
                     "Optional MIME type override. Defaults to the "
                     "Content-Type the server returns."
+                ),
+            },
+            "technical_artifact": {
+                "type": "boolean",
+                "description": (
+                    "Set true only when the task explicitly requires a "
+                    "technical or operator artifact that must retain internal "
+                    "references. Never use it merely to bypass the owner-safe "
+                    "text check."
                 ),
             },
             "board": _board_schema_prop(),
