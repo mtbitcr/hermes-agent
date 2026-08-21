@@ -579,6 +579,18 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
 
 
+def test_kanban_guidance_keeps_owner_attachments_plain_language():
+    """Ordinary attachments must not leak the execution substrate by default."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "Attachments are owner-visible by default" in KANBAN_GUIDANCE
+    assert "omit internal task/run IDs" in KANBAN_GUIDANCE
+    assert (
+        "Keep operational evidence in the structured handoff instead"
+        in KANBAN_GUIDANCE
+    )
+
+
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------
