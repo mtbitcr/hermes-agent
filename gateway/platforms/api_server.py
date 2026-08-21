@@ -15,6 +15,8 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - GET  /v1/owner-workspace/projects — list receipt-backed owner Projects
+- GET  /v1/owner-workspace/projects/{project_slug}/snapshot — exact read-only Project surface
+- GET  /v1/owner-workspace/projects/{project_slug}/attachments/{attachment_id} — exact owner attachment
 - GET  /v1/owner-workspace/decisions — project pending native owner gates
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
@@ -2569,6 +2571,16 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("GET", "/v1/owner-workspace/projects", self._handle_owner_workspace_projects),
+            (
+                "GET",
+                "/v1/owner-workspace/projects/{project_slug}/snapshot",
+                self._handle_owner_workspace_project_snapshot,
+            ),
+            (
+                "GET",
+                "/v1/owner-workspace/projects/{project_slug}/attachments/{attachment_id}",
+                self._handle_owner_workspace_project_attachment,
+            ),
             ("GET", "/v1/owner-workspace/decisions", self._handle_owner_workspace_decisions),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
@@ -7308,8 +7320,135 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "hermes.owner_workspace.project_list",
             "data": projects,
         })
+    async def _handle_owner_workspace_project_snapshot(
+        self, request: "web.Request",
+    ) -> "web.Response":
+        """GET one exact receipt-backed Project through the executor boundary."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from hermes_cli.owner_workspace import OwnerWorkspaceError
 
+        try:
+            from gateway.run import _load_gateway_config
 
+            if not _owner_workspace_toolset_enabled(_load_gateway_config()):
+                return web.json_response(
+                    _openai_error(
+                        "Owner workspace is not enabled for this profile",
+                        code="owner_workspace_not_enabled",
+                    ),
+                    status=404,
+                )
+            from hermes_cli.owner_workspace import (
+                read_project_snapshot,
+                resolve_owner_context,
+            )
+
+            snapshot = read_project_snapshot(
+                resolve_owner_context(), request.match_info.get("project_slug", "")
+            )
+        except OwnerWorkspaceError as exc:
+            if exc.code == "project_not_found":
+                return web.json_response(
+                    _openai_error(
+                        "Owner workspace Project was not found",
+                        code="project_not_found",
+                    ),
+                    status=404,
+                )
+            logger.warning(
+                "[api_server] owner-workspace Project snapshot unavailable (%s)",
+                exc.code,
+            )
+            return web.json_response(
+                _openai_error(
+                    "Owner workspace Project snapshot is unavailable",
+                    code="owner_workspace_unavailable",
+                ),
+                status=503,
+            )
+        except Exception:
+            logger.exception("[api_server] owner-workspace Project snapshot failed")
+            return web.json_response(
+                _openai_error(
+                    "Owner workspace Project snapshot is unavailable",
+                    code="owner_workspace_unavailable",
+                ),
+                status=500,
+            )
+
+        return web.json_response({
+            "object": "hermes.owner_workspace.project_snapshot",
+            "data": snapshot,
+        })
+    async def _handle_owner_workspace_project_attachment(
+        self, request: "web.Request",
+    ) -> "web.Response":
+        """GET one bounded attachment from one exact receipt-backed Project."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from hermes_cli.owner_workspace import OwnerWorkspaceError
+
+        try:
+            from gateway.run import _load_gateway_config
+
+            if not _owner_workspace_toolset_enabled(_load_gateway_config()):
+                return web.json_response(
+                    _openai_error(
+                        "Owner workspace is not enabled for this profile",
+                        code="owner_workspace_not_enabled",
+                    ),
+                    status=404,
+                )
+            from hermes_cli.owner_workspace import (
+                read_project_attachment,
+                resolve_owner_context,
+            )
+
+            attachment = read_project_attachment(
+                resolve_owner_context(),
+                request.match_info.get("project_slug", ""),
+                request.match_info.get("attachment_id", ""),
+            )
+        except OwnerWorkspaceError as exc:
+            if exc.code in {"attachment_not_found", "project_not_found"}:
+                return web.json_response(
+                    _openai_error(
+                        "Owner workspace attachment was not found",
+                        code="attachment_not_found",
+                    ),
+                    status=404,
+                )
+            logger.warning(
+                "[api_server] owner-workspace attachment unavailable (%s)", exc.code
+            )
+            return web.json_response(
+                _openai_error(
+                    "Owner workspace attachment is unavailable",
+                    code="owner_workspace_unavailable",
+                ),
+                status=503,
+            )
+        except Exception:
+            logger.exception("[api_server] owner-workspace attachment failed")
+            return web.json_response(
+                _openai_error(
+                    "Owner workspace attachment is unavailable",
+                    code="owner_workspace_unavailable",
+                ),
+                status=500,
+            )
+
+        return web.Response(
+            body=attachment["body"],
+            content_type=attachment["media_type"],
+            headers={
+                "Content-Disposition": f'attachment; filename="{attachment["filename"]}"',
+                "Cache-Control": "no-store",
+            },
+        )
     async def _handle_owner_workspace_decisions(
         self, request: "web.Request",
     ) -> "web.Response":

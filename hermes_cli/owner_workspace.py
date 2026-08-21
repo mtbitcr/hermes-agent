@@ -71,13 +71,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
 import sqlite3
+import stat
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db, projects_db
@@ -1207,6 +1210,346 @@ def list_committed_projects(ctx: OwnerContext) -> list[dict]:
         return projects
     finally:
         conn.close()
+
+
+_OWNER_PROJECT_COLUMNS = (
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+)
+_OWNER_PROJECT_MAX_TASKS = 200
+_OWNER_PROJECT_MAX_ATTACHMENTS = 200
+_OWNER_PROJECT_MAX_RUNS = 50
+_OWNER_PROJECT_MAX_WORKERS = 100
+_OWNER_PROJECT_MEDIA_TYPE_RE = re.compile(
+    r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$"
+)
+
+
+def _owner_project_attachment_projection(row: sqlite3.Row) -> dict:
+    filename = re.sub(
+        r"[^A-Za-z0-9._ -]", "_", Path(str(row["filename"] or "attachment")).name
+    ).strip() or "attachment"
+    media_type = str(row["content_type"] or "").strip()
+    if not _OWNER_PROJECT_MEDIA_TYPE_RE.fullmatch(media_type):
+        media_type = "application/octet-stream"
+    return {
+        "id": str(row["id"]),
+        "filename": filename,
+        "media_type": media_type,
+        "size": int(row["size"] or 0),
+        "created_at": _owner_timestamp(row["created_at"]),
+    }
+
+
+def _owner_project_run_projection(run: kanban_db.Run) -> dict:
+    outcome = (run.outcome or run.status or "").strip().lower()
+    if run.status == "running":
+        owner_outcome, summary = "running", "Work is still in progress."
+    elif outcome in {"completed", "done"}:
+        owner_outcome, summary = "completed", "Work finished."
+    elif outcome == "review_requested":
+        owner_outcome, summary = "completed", "Work finished and is awaiting review."
+    elif outcome == "scheduled":
+        owner_outcome, summary = "unknown", "Work is scheduled for later."
+    elif outcome in {
+        "blocked", "changes_requested", "crashed", "gave_up", "rate_limited",
+        "reclaimed", "spawn_failed", "stale", "timed_out",
+    }:
+        owner_outcome, summary = "attention", "Work stopped and needs attention."
+    else:
+        owner_outcome, summary = "unknown", "The final outcome could not be confirmed."
+    return {
+        "started_at": _owner_timestamp(run.started_at),
+        "finished_at": _owner_timestamp(run.ended_at),
+        "receipt": {
+            "outcome": owner_outcome,
+            "summary": summary,
+            "external_effect": {
+                "state": "unknown",
+                "summary": "This record does not confirm whether an external service changed.",
+            },
+            "cost": {
+                "state": "unknown",
+                "summary": "This record does not contain an authoritative cost.",
+            },
+            "evidence": {"state": "available", "kind": "project_activity"},
+        },
+    }
+
+
+def read_project_snapshot(ctx: OwnerContext, project_slug: str) -> dict:
+    """Return one bounded read-only surface for an exact receipt-owned Project.
+
+    The caller cannot select a board independently.  The Project slug must be
+    present in this owner/profile's committed receipts, and its persisted board
+    binding must still pass the shared-board ownership check.  Only fields
+    already used by the owner Workspace cross this boundary: task bodies,
+    results, paths, branches, logs, comments, raw events and model metadata do
+    not.
+    """
+    try:
+        project_slug = projects_db.normalize_slug(project_slug) or ""
+    except ValueError as exc:
+        raise OwnerWorkspaceError("project_not_found", "the Project is unavailable") from exc
+
+    project = next(
+        (item for item in list_committed_projects(ctx) if item["slug"] == project_slug),
+        None,
+    )
+    if project is None or project["archived"]:
+        raise OwnerWorkspaceError("project_not_found", "the Project is unavailable")
+
+    project_id = str(project["project_id"])
+    board_slug = str(project["board"])
+    try:
+        _assert_board_ownership(board_slug, project_id)
+        metadata = kanban_db.read_board_metadata(board_slug)
+    except (OSError, TypeError, ValueError, OwnerWorkspaceError) as exc:
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", "the Project board ownership could not be verified"
+        ) from exc
+    if bool(metadata.get("archived")):
+        raise OwnerWorkspaceError("project_not_found", "the Project is unavailable")
+
+    board_path = (
+        kanban_db.kanban_home() / "kanban.db"
+        if board_slug == kanban_db.DEFAULT_BOARD
+        else kanban_db.board_dir(board_slug) / "kanban.db"
+    )
+    conn = _open_read_only_sqlite(board_path, label="kanban.db")
+    try:
+        task_rows = conn.execute(
+            "SELECT * FROM tasks WHERE project_id = ? AND task_kind = 'work' "
+            "AND status != 'archived' ORDER BY priority DESC, created_at ASC, id ASC LIMIT ?",
+            (project_id, _OWNER_PROJECT_MAX_TASKS + 1),
+        ).fetchall()
+        tasks = [kanban_db.Task.from_row(row) for row in task_rows[:_OWNER_PROJECT_MAX_TASKS]]
+        task_ids = [task.id for task in tasks]
+        visible = set(task_ids)
+
+        counts = {status: 0 for status in (*_OWNER_PROJECT_COLUMNS, "archived")}
+        for row in conn.execute(
+            "SELECT status, COUNT(*) AS n FROM tasks "
+            "WHERE project_id = ? AND task_kind = 'work' GROUP BY status",
+            (project_id,),
+        ):
+            status = str(row["status"])
+            if status not in counts:
+                raise OwnerWorkspaceError("snapshot_unavailable", "kanban.db contains an unknown status")
+            counts[status] = int(row["n"])
+
+        event_state: dict[str, dict[str, int]] = {}
+        if task_ids:
+            placeholders = ",".join("?" for _ in task_ids)
+            for row in conn.execute(
+                f"SELECT task_id, MAX(created_at) AS latest, MAX(id) AS revision "
+                f"FROM task_events WHERE task_id IN ({placeholders}) GROUP BY task_id",
+                task_ids,
+            ):
+                event_state[str(row["task_id"])] = {
+                    "latest": int(row["latest"]), "revision": int(row["revision"]),
+                }
+
+        parent_map = {task_id: [] for task_id in task_ids}
+        child_map = {task_id: [] for task_id in task_ids}
+        if task_ids:
+            placeholders = ",".join("?" for _ in task_ids)
+            for row in conn.execute(
+                f"SELECT parent_id, child_id FROM task_links "
+                f"WHERE parent_id IN ({placeholders}) OR child_id IN ({placeholders}) "
+                "ORDER BY parent_id, child_id",
+                (*task_ids, *task_ids),
+            ):
+                parent_id, child_id = str(row["parent_id"]), str(row["child_id"])
+                if parent_id in visible and child_id in visible:
+                    child_map[parent_id].append(child_id)
+                    parent_map[child_id].append(parent_id)
+
+        columns = {status: [] for status in _OWNER_PROJECT_COLUMNS}
+        for task in tasks:
+            if task.status not in columns:
+                raise OwnerWorkspaceError("snapshot_unavailable", "kanban.db contains an unknown status")
+            state = event_state.get(task.id)
+            columns[task.status].append({
+                "id": task.id,
+                "title": _owner_title(task.title),
+                "assignee_name": task.assignee,
+                "responsibility": task.responsibility,
+                "updated_at": _owner_timestamp(state["latest"] if state else task.created_at),
+                "event_revision": state["revision"] if state else 0,
+                "parent_ids": parent_map[task.id],
+                "child_ids": child_map[task.id],
+            })
+
+        worker_rows = conn.execute(
+            "SELECT r.profile, t.title AS task_title, r.started_at "
+            "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            "WHERE t.project_id = ? AND t.task_kind = 'work' "
+            "AND r.ended_at IS NULL AND r.worker_pid IS NOT NULL "
+            "AND r.profile IS NOT NULL AND t.status = 'running' "
+            "ORDER BY r.started_at ASC LIMIT ?",
+            (project_id, _OWNER_PROJECT_MAX_WORKERS + 1),
+        ).fetchall()
+
+        attachment_rows = conn.execute(
+            "SELECT a.id, a.filename, a.content_type, a.size, a.created_at "
+            "FROM task_attachments a JOIN tasks t ON t.id = a.task_id "
+            "WHERE t.project_id = ? AND t.task_kind = 'work' "
+            "ORDER BY a.created_at ASC, a.id ASC LIMIT ?",
+            (project_id, _OWNER_PROJECT_MAX_ATTACHMENTS + 1),
+        ).fetchall()
+        attachments = [
+            _owner_project_attachment_projection(row)
+            for row in attachment_rows[:_OWNER_PROJECT_MAX_ATTACHMENTS]
+        ]
+
+        run_rows = conn.execute(
+            "SELECT r.* FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            "WHERE t.project_id = ? AND t.task_kind = 'work' "
+            "ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
+            (project_id, _OWNER_PROJECT_MAX_RUNS + 1),
+        ).fetchall()
+        runs = [
+            _owner_project_run_projection(kanban_db.Run.from_row(row))
+            for row in run_rows[:_OWNER_PROJECT_MAX_RUNS]
+        ]
+    except OwnerWorkspaceError:
+        raise
+    except (KeyError, TypeError, ValueError, sqlite3.Error) as exc:
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", "the Project snapshot could not be read"
+        ) from exc
+    finally:
+        conn.close()
+
+    return {
+        "project": {
+            "id": project_id,
+            "slug": project_slug,
+            "name": str(project["name"]),
+            "description": project["description"],
+            "board": board_slug,
+            "archived": False,
+        },
+        "board": {
+            "slug": board_slug,
+            "name": str(metadata.get("name") or project["name"]),
+            "project_id": project_id,
+            "counts": counts,
+            "total": sum(counts[status] for status in _OWNER_PROJECT_COLUMNS),
+        },
+        "columns": [{"name": status, "tasks": columns[status]} for status in _OWNER_PROJECT_COLUMNS],
+        "workers": [{
+            "profile": str(row["profile"]),
+            "task_title": _owner_title(row["task_title"]),
+            "started_at": int(row["started_at"]),
+        } for row in worker_rows[:_OWNER_PROJECT_MAX_WORKERS]],
+        "attachments": attachments,
+        "runs": runs,
+        "truncated": {
+            "tasks": len(task_rows) > _OWNER_PROJECT_MAX_TASKS,
+            "workers": len(worker_rows) > _OWNER_PROJECT_MAX_WORKERS,
+            "attachments": len(attachment_rows) > _OWNER_PROJECT_MAX_ATTACHMENTS,
+            "runs": len(run_rows) > _OWNER_PROJECT_MAX_RUNS,
+        },
+    }
+
+
+def read_project_attachment(
+    ctx: OwnerContext, project_slug: str, attachment_id: str,
+) -> dict:
+    """Read one regular attachment from one exact receipt-owned Project."""
+    try:
+        project_slug = projects_db.normalize_slug(project_slug) or ""
+        if not re.fullmatch(r"[0-9]{1,20}", str(attachment_id)):
+            raise ValueError("invalid attachment id")
+        native_id = int(attachment_id)
+    except (TypeError, ValueError) as exc:
+        raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable") from exc
+
+    project = next(
+        (item for item in list_committed_projects(ctx) if item["slug"] == project_slug),
+        None,
+    )
+    if project is None or project["archived"]:
+        raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable")
+    project_id = str(project["project_id"])
+    board_slug = str(project["board"])
+    try:
+        _assert_board_ownership(board_slug, project_id)
+    except OwnerWorkspaceError as exc:
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", "the Project board ownership could not be verified"
+        ) from exc
+
+    board_path = (
+        kanban_db.kanban_home() / "kanban.db"
+        if board_slug == kanban_db.DEFAULT_BOARD
+        else kanban_db.board_dir(board_slug) / "kanban.db"
+    )
+    conn = _open_read_only_sqlite(board_path, label="kanban.db")
+    try:
+        row = conn.execute(
+            "SELECT a.* FROM task_attachments a JOIN tasks t ON t.id = a.task_id "
+            "WHERE a.id = ? AND t.project_id = ? AND t.task_kind = 'work'",
+            (native_id, project_id),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", "the Project attachment could not be read"
+        ) from exc
+    finally:
+        conn.close()
+    if row is None:
+        raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable")
+
+    root = (
+        kanban_db.kanban_home() / "kanban" / "attachments"
+        if board_slug == kanban_db.DEFAULT_BOARD
+        else kanban_db.board_dir(board_slug) / "attachments"
+    ).resolve()
+    try:
+        stored = Path(str(row["stored_path"])).resolve()
+        stored.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable") from exc
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(stored, flags)
+    except OSError as exc:
+        raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable") from exc
+    try:
+        info = os.fstat(fd)
+        size = int(info.st_size)
+        expected_size = int(row["size"] or 0)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or size < 0
+            or size > kanban_db.KANBAN_ATTACHMENT_MAX_BYTES
+            or size != expected_size
+        ):
+            raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable")
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            chunk = os.read(fd, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable")
+    except OSError as exc:
+        raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable") from exc
+    finally:
+        os.close(fd)
+
+    return {
+        **_owner_project_attachment_projection(row),
+        "body": b"".join(chunks),
+    }
 
 
 _OWNER_DECISIONS_LIMIT = 100

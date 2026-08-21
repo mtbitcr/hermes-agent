@@ -367,6 +367,99 @@ def test_committed_project_projection_is_receipt_backed_and_read_only(ctx):
     }]
 
 
+def test_project_snapshot_is_exact_receipt_backed_and_read_only(ctx):
+    args = _task_graph_args(
+        idempotency_key="graph-snapshot",
+        project_name="Snapshot Project",
+    )
+    approver = _with_approver(ctx.session)
+    result = ow.commit_task_graph(ctx, **args)
+    approver.join()
+
+    project_db = projects_db.projects_db_path()
+    board_db = kanban_db.board_dir(result["board"]) / "kanban.db"
+    before = (project_db.stat().st_mtime_ns, board_db.stat().st_mtime_ns)
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+
+    after = (project_db.stat().st_mtime_ns, board_db.stat().st_mtime_ns)
+    assert before == after
+    assert snapshot["project"] == {
+        "id": result["project_id"],
+        "slug": result["project_slug"],
+        "name": "Snapshot Project",
+        "description": "A plain-English owner project.",
+        "board": result["board"],
+        "archived": False,
+    }
+    assert snapshot["board"]["slug"] == result["board"]
+    assert snapshot["board"]["project_id"] == result["project_id"]
+    assert snapshot["board"]["total"] == 3
+    assert snapshot["board"]["counts"]["ready"] == 1
+    assert snapshot["board"]["counts"]["todo"] == 2
+    tasks = [task for column in snapshot["columns"] for task in column["tasks"]]
+    assert len(tasks) == 3
+    assert all(set(task) == {
+        "id", "title", "assignee_name", "responsibility", "updated_at",
+        "event_revision", "parent_ids", "child_ids",
+    } for task in tasks)
+    assert snapshot["workers"] == []
+    assert snapshot["attachments"] == []
+    assert snapshot["runs"] == []
+
+
+def test_project_snapshot_hides_projects_without_owner_receipt(ctx):
+    with projects_db.connect_closing() as conn:
+        project_id = projects_db.create_project(conn, name="Foreign Snapshot")
+        project = projects_db.get_project(conn, project_id)
+        assert project is not None
+        kanban_db.create_board(project.slug, name=project.name, project_id=project_id)
+        projects_db.update_project(conn, project_id, board_slug=project.slug)
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.read_project_snapshot(ctx, project.slug)
+
+    assert excinfo.value.code == "project_not_found"
+
+
+def test_project_attachment_is_exact_receipt_bound_and_bounded(ctx):
+    approver = _with_approver(ctx.session)
+    result = ow.commit_task_graph(
+        ctx,
+        **_task_graph_args(
+            idempotency_key="graph-attachment",
+            project_name="Attachment Project",
+        ),
+    )
+    approver.join()
+    with kanban_db.connect(board=result["board"]) as conn:
+        attachment_id = kanban_db.store_attachment_bytes(
+            conn,
+            result["task_ids"][0],
+            "../owner\"note.txt",
+            b"safe owner bytes",
+            content_type="text/plain\r\nX-Evil: yes",
+            board=result["board"],
+        )
+
+    attachment = ow.read_project_attachment(
+        ctx, result["project_slug"], str(attachment_id)
+    )
+
+    assert attachment == {
+        "id": str(attachment_id),
+        "filename": "owner_note.txt",
+        "media_type": "application/octet-stream",
+        "size": 16,
+        "created_at": attachment["created_at"],
+        "body": b"safe owner bytes",
+    }
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.read_project_attachment(ctx, result["project_slug"], "../1")
+    assert excinfo.value.code == "attachment_not_found"
+
+
 def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
     args = _task_graph_args(
         idempotency_key="graph-lifecycle",
