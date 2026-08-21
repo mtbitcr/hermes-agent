@@ -223,6 +223,50 @@ class TestResponseStore:
         }
         assert "resp_owner_history" not in json.dumps(snapshot["data"])
 
+    def test_owner_history_keeps_reply_within_native_response_limit(self):
+        conversation = "raphael-owner-" + "b" * 32
+        store = ResponseStore(max_size=10)
+        proposal = {
+            "schema_version": 3,
+            "kind": "project_change_proposal",
+            "mode": "existing",
+            "request_title": "Add the next private milestone",
+            "summary": "Prepare the next owner-visible milestone for review.",
+            "project_size": "large",
+            "specification": "Readable milestone detail. " * 500,
+            "current_milestone": "Prepare the next private milestone.",
+            "owner_visible_result": "The owner can review one complete proposal.",
+            "impact": ["Keeps the current project history intact."],
+            "later_milestones": [],
+            "changes": [],
+        }
+        structured_reply = json.dumps(proposal)
+        assert 12_000 < len(structured_reply) < 50_000
+        store.put(
+            "resp_large_owner_history",
+            {
+                "response": {"id": "resp_large_owner_history"},
+                "conversation_history": [
+                    {
+                        "role": "user",
+                        "content": "Add the next private milestone.",
+                    },
+                    {"role": "assistant", "content": structured_reply},
+                ],
+            },
+        )
+        store.set_conversation(conversation, "resp_large_owner_history")
+
+        snapshot = store.owner_history_snapshot(conversation)
+
+        assert snapshot["latest_response_id"] == "resp_large_owner_history"
+        assert snapshot["data"] == [
+            {
+                "owner": "Add the next private milestone.",
+                "raphael": structured_reply,
+            }
+        ]
+
     def test_owner_history_missing_or_invalid_conversation_is_empty(self):
         store = ResponseStore(max_size=10)
         store.put("resp_invalid_history", {
