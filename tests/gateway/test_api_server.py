@@ -179,6 +179,12 @@ class TestResponseStore:
             "kind": "question",
             "message": "Which week should it run?",
         })
+        final_change = json.dumps({
+            "schema_version": 3,
+            "kind": "project_change_proposal",
+            "mode": "existing",
+            "request_title": "Add a weekly summary",
+        })
         store.put("resp_owner_history", {
             "response": {"id": "resp_owner_history"},
             "conversation_history": [
@@ -194,6 +200,8 @@ class TestResponseStore:
                 {"role": "assistant", "content": final_proposal},
                 {"role": "user", "content": "Make it next month."},
                 {"role": "assistant", "content": final_question},
+                {"role": "user", "content": "Add a weekly summary."},
+                {"role": "assistant", "content": final_change},
             ],
             "instructions": "private instructions",
         })
@@ -201,10 +209,11 @@ class TestResponseStore:
 
         history = store.owner_history(conversation)
         assert [item["owner"] for item in history] == [
-            "Plan a workshop.", "Make it next month.",
+            "Plan a workshop.", "Make it next month.", "Add a weekly summary.",
         ]
         assert json.loads(history[0]["raphael"])["kind"] == "proposal"
         assert json.loads(history[1]["raphael"])["kind"] == "question"
+        assert json.loads(history[2]["raphael"])["kind"] == "project_change_proposal"
         assert secret not in json.dumps(history)
 
     def test_owner_history_missing_or_invalid_conversation_is_empty(self):
@@ -3239,4 +3248,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-
