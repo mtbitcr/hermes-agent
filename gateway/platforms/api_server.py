@@ -1357,7 +1357,7 @@ class ResponseStore:
                 continue
             if (
                 not isinstance(candidate, dict)
-                or candidate.get("schema_version") not in {1, 2}
+                or candidate.get("schema_version") not in {1, 2, 3}
                 or candidate.get("kind")
                 not in {"question", "proposal", "project_change_proposal"}
             ):
