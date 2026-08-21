@@ -1293,34 +1293,36 @@ class ResponseStore:
         ).fetchone()
         return row[0] if row else None
 
-    def owner_history(self, name: str) -> List[Dict[str, str]]:
-        """Project one conversation into bounded owner-visible turns.
+    def owner_history_snapshot(self, name: str) -> Dict[str, Any]:
+        """Project one conversation into owner-safe turns and its recovery handle.
 
         The stored transcript remains the native Responses authority.  This
         projection never returns system instructions, tools, intermediate
-        assistant text, response IDs, usage, sessions, or private reasoning.
-        Only a final structured Raphael reply is paired with its owner input.
+        assistant text, usage, sessions, or private reasoning.  The opaque
+        handle stays service-to-service so callers can re-read and validate
+        the stored response before granting any approval authority.
         """
+        empty: Dict[str, Any] = {"latest_response_id": None, "data": []}
         if (
             not isinstance(name, str)
             or re.fullmatch(r"raphael-owner-[a-f0-9]{32}", name) is None
         ):
-            return []
+            return empty
         row = self._conn.execute(
-            "SELECT r.data FROM conversations c "
+            "SELECT c.response_id, r.data FROM conversations c "
             "JOIN responses r ON r.response_id = c.response_id "
             "WHERE c.name = ?",
             (name,),
         ).fetchone()
         if row is None:
-            return []
+            return empty
         try:
-            stored = json.loads(row[0])
+            stored = json.loads(row[1])
         except (json.JSONDecodeError, TypeError):
-            return []
+            return empty
         history = stored.get("conversation_history") if isinstance(stored, dict) else None
         if not isinstance(history, list):
-            return []
+            return empty
 
         from agent.redact import redact_sensitive_text
 
@@ -1370,7 +1372,15 @@ class ResponseStore:
                 redact_review_value(candidate), ensure_ascii=False,
             )
         _flush()
-        return turns[-40:]
+        data = turns[-40:]
+        return {
+            "latest_response_id": row[0] if data else None,
+            "data": data,
+        }
+
+    def owner_history(self, name: str) -> List[Dict[str, str]]:
+        """Return the backward-compatible owner-safe turn list."""
+        return self.owner_history_snapshot(name)["data"]
 
     def set_conversation(self, name: str, response_id: str) -> None:
         """Map a conversation name to its latest response_id."""
@@ -6168,9 +6178,10 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         conversation = request.match_info["conversation"]
+        snapshot = self._response_store.owner_history_snapshot(conversation)
         return web.json_response({
             "object": "hermes.response.owner_history",
-            "data": self._response_store.owner_history(conversation),
+            **snapshot,
         })
 
     async def _handle_get_response(self, request: "web.Request") -> "web.Response":

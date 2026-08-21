@@ -216,6 +216,13 @@ class TestResponseStore:
         assert json.loads(history[2]["raphael"])["kind"] == "project_change_proposal"
         assert secret not in json.dumps(history)
 
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot == {
+            "latest_response_id": "resp_owner_history",
+            "data": history,
+        }
+        assert "resp_owner_history" not in json.dumps(snapshot["data"])
+
     def test_owner_history_missing_or_invalid_conversation_is_empty(self):
         store = ResponseStore(max_size=10)
         store.put("resp_invalid_history", {
@@ -229,6 +236,11 @@ class TestResponseStore:
 
         assert store.owner_history("missing-history") == []
         assert store.owner_history("invalid-history") == []
+
+        assert store.owner_history_snapshot("missing-history") == {
+            "latest_response_id": None,
+            "data": [],
+        }
 
 
 # ---------------------------------------------------------------------------
