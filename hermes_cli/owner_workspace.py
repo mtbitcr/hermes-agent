@@ -183,6 +183,22 @@ def _get_receipt(conn: sqlite3.Connection, ctx: OwnerContext, key: str) -> Optio
     ).fetchone()
 
 
+def _is_retryable_confirmation_timeout(row: sqlite3.Row) -> bool:
+    """Return whether a terminal receipt records silence, not an owner denial."""
+    if row["status"] != "denied" or not row["result_json"]:
+        return False
+    try:
+        result = json.loads(row["result_json"])
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(result, dict)
+        and result.get("ok") is False
+        and result.get("error") == "confirmation_denied"
+        and result.get("reason") == "timeout"
+    )
+
+
 def _claim_or_wait(
     conn: sqlite3.Connection, ctx: OwnerContext, key: str, operation: str, digest: str,
 ) -> tuple:
@@ -226,6 +242,18 @@ def _claim_or_wait(
                 "idempotency_key_conflict",
                 f"idempotency_key {key!r} is already in use for a different operation",
             )
+        if _is_retryable_confirmation_timeout(row):
+            conn.execute(
+                "UPDATE owner_workspace_receipts SET status = 'in_progress', "
+                "lock_token = ?, lock_expires = ?, project_id = NULL, "
+                "board_slug = NULL, task_id = NULL, result_json = NULL, updated_at = ? "
+                "WHERE actor = ? AND profile = ? AND idempotency_key = ? AND status = 'denied'",
+                (
+                    token, now + _LOCK_TTL_SECONDS, now,
+                    ctx.actor, ctx.profile, key,
+                ),
+            )
+            return ("own", None, token)
         if row["status"] in ("committed", "denied"):
             return ("terminal", row, None)
         # status == "in_progress": a live claim blocks us; a dead one (lock

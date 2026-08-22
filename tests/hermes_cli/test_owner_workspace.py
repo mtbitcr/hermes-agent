@@ -756,6 +756,59 @@ def _project_plan_args(setup: dict, changes: list[dict], **overrides) -> dict:
     return args
 
 
+def test_project_plan_timeout_can_retry_but_still_requires_approval(ctx):
+    setup = _bootstrap_board(ctx)
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "add",
+            "reason": "Create one bounded owner-approved task.",
+            "title": "Prepare the approved deliverable",
+            "body": "Produce the owner-visible result.",
+            "assignee": "default",
+            "existing_parents": [],
+            "new_parents": [],
+        }],
+        idempotency_key="steward-timeout-retry",
+    )
+
+    with _temporarily_patch(
+        ow,
+        "_confirm",
+        lambda *args, **kwargs: {"approved": False, "reason": "timeout"},
+    ):
+        timed_out = ow.commit_project_plan(ctx, **args)
+
+    assert timed_out == {
+        "ok": False,
+        "error": "confirmation_denied",
+        "reason": "timeout",
+    }
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert all(
+            task.title != "Prepare the approved deliverable"
+            for task in kanban_db.list_tasks(conn)
+            if task.project_id == setup["project_id"]
+        )
+
+    with _temporarily_patch(
+        ow,
+        "_confirm",
+        lambda *args, **kwargs: {"approved": True, "choice": "once"},
+    ):
+        retried = ow.commit_project_plan(ctx, **args)
+
+    assert retried["ok"] is True
+    assert retried["change_count"] == 1
+    with kanban_db.connect(board=setup["board"]) as conn:
+        matching = [
+            task for task in kanban_db.list_tasks(conn)
+            if task.project_id == setup["project_id"]
+            and task.title == "Prepare the approved deliverable"
+        ]
+    assert len(matching) == 1
+
+
 def test_project_plan_split_is_atomic_preserves_history_and_replays(ctx):
     setup = _bootstrap_board(ctx)
     with kanban_db.connect(board=setup["board"]) as conn:
