@@ -468,6 +468,42 @@ def _oauth_tokens_present(name: str) -> bool:
         return True
 
 
+def _authorize_oauth_server(
+    name: str,
+    config: dict,
+    *,
+    connect_timeout: float,
+) -> None:
+    """Run an explicit OAuth flow, even when MCP discovery is anonymous."""
+    from tools.mcp_oauth_manager import get_manager
+    from tools.mcp_tool import (
+        _ensure_mcp_loop,
+        _run_on_mcp_loop,
+        _stop_mcp_loop_if_idle,
+    )
+
+    resolved = _resolve_mcp_server_config(config)
+    url = resolved.get("url")
+    if not url:
+        raise ValueError(f"Server '{name}' has no URL")
+
+    manager = get_manager()
+    _ensure_mcp_loop()
+    try:
+        _run_on_mcp_loop(
+            manager.authorize_interactively(name, url, resolved.get("oauth")),
+            timeout=connect_timeout + 10,
+        )
+    except BaseException as exc:
+        raise _unwrap_exception_group(exc) from None
+    finally:
+        # The provider's asyncio locks were exercised on the temporary MCP
+        # loop. Rebuild it for the subsequent discovery/runtime connection,
+        # loading the newly persisted token from disk.
+        manager.evict(name)
+        _stop_mcp_loop_if_idle()
+
+
 def _unwrap_exception_group(exc: BaseException) -> Exception:
     """Extract the root-cause exception from anyio TaskGroup wrappers.
 
@@ -881,7 +917,9 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
     print()
     _info(f"Starting OAuth flow for '{name}'...")
 
-    # Probe triggers the OAuth flow (browser redirect + callback capture).
+    # Run OAuth explicitly before discovery. A discovery probe alone is not
+    # sufficient because some servers expose initialize/tools-list
+    # anonymously and therefore never return the SDK's OAuth-triggering 401.
     # Honor the server's configured connect_timeout so a human has enough
     # time to complete the browser sign-in; the 30s default is too tight for
     # an interactive OAuth round-trip. Floor at 315s — the OAuth callback
@@ -902,17 +940,16 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
             _login_connect_timeout = 0.0
         _login_connect_timeout = max(_login_connect_timeout, 315.0)
         with force_interactive_oauth():
+            _authorize_oauth_server(
+                name,
+                server_config,
+                connect_timeout=_login_connect_timeout,
+            )
             tools = _probe_single_server(
                 name, server_config, connect_timeout=_login_connect_timeout
             )
-        # A clean probe is NOT proof of authentication. Some MCP servers
-        # (notably Google's official Drive server) serve initialize +
-        # tools/list WITHOUT auth, so the probe lists tools even when the
-        # OAuth flow never completed — e.g. dynamic client registration
-        # 400'd because the provider doesn't support RFC 7591. Reporting
-        # "Authenticated — N tools" in that case is a false success: every
-        # real tool call later hangs until timeout because there's no token.
-        # Verify a token actually landed on disk before claiming success.
+        # Token persistence, not an anonymous tools/list response, is the
+        # proof that authorization completed.
         if not _oauth_tokens_present(name):
             _warning(
                 "Server responded, but no OAuth token was obtained — "

@@ -84,6 +84,90 @@ def test_hermes_provider_subclass_exists():
 
 
 @pytest.mark.asyncio
+async def test_force_authorization_uses_synthetic_challenge_without_calling_mcp(
+    tmp_path, monkeypatch
+):
+    """Explicit re-auth must work when initialize/tools-list are anonymous.
+
+    The original MCP request is never sent. Hermes feeds the OAuth provider a
+    synthetic 401, sends only the provider's metadata/token requests, then
+    finishes the provider's retry with a synthetic success response.
+    """
+    from tools.mcp_oauth_manager import MCPOAuthManager
+    from tools.mcp_tool import sdk_httpx
+
+    httpx = sdk_httpx()
+    assert httpx is not None
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    sent_urls: list[str] = []
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def send(self, request):
+            sent_urls.append(str(request.url))
+            return httpx.Response(200, request=request)
+
+    class FakeProvider:
+        completed = False
+
+        async def async_auth_flow(self, request):
+            response = yield request
+            assert response.status_code == 401
+
+            metadata_request = httpx.Request(
+                "GET", "https://auth.example/.well-known/oauth-authorization-server"
+            )
+            response = yield metadata_request
+            assert response.status_code == 200
+
+            token_request = httpx.Request("POST", "https://auth.example/token")
+            response = yield token_request
+            assert response.status_code == 200
+            self.completed = True
+
+            response = yield request
+            assert response.status_code == 200
+
+    provider = FakeProvider()
+    manager = MCPOAuthManager()
+    monkeypatch.setattr(
+        manager,
+        "get_or_build_provider",
+        lambda *_args, **_kwargs: provider,
+    )
+    monkeypatch.setattr(
+        "tools.mcp_tool.sdk_httpx",
+        lambda: type(
+            "FakeHttpx",
+            (),
+            {
+                "Request": httpx.Request,
+                "Response": httpx.Response,
+                "AsyncClient": lambda **_kwargs: FakeClient(),
+            },
+        ),
+    )
+
+    await manager.authorize_interactively(
+        "drive",
+        "https://drivemcp.googleapis.com/mcp/v1",
+        {"scope": "drive.readonly drive.file"},
+    )
+
+    assert provider.completed is True
+    assert sent_urls == [
+        "https://auth.example/.well-known/oauth-authorization-server",
+        "https://auth.example/token",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_disk_watch_invalidates_on_mtime_change(tmp_path, monkeypatch):
     """When the tokens file mtime changes, provider._initialized flips False.
 

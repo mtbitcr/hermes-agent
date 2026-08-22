@@ -553,3 +553,74 @@ def test_flow_status_does_not_expose_authorization_code():
     assert body["status"] == "approved"
     assert "secret-code" not in response.text
     assert "secret-state" not in response.text
+
+
+def test_dashboard_reauth_authorizes_before_anonymous_discovery(tmp_path, monkeypatch):
+    """Hosted re-auth must explicitly authorize before probing Drive-like MCPs."""
+    from hermes_cli import web_server
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+    flow = DashboardOAuthFlow(
+        flow_id="flow-anonymous-discovery",
+        server_name="drive",
+        profile=None,
+        hermes_home=str(tmp_path),
+        redirect_uri="https://agent.example/api/mcp/oauth/callback/drive",
+    )
+    cfg = {
+        "url": "https://drivemcp.googleapis.com/mcp/v1",
+        "auth": "oauth",
+    }
+    calls = []
+    authorized = {"value": False}
+
+    class FakeManager:
+        def remove(self, *_args, **_kwargs):
+            calls.append("remove")
+            return None
+
+        def restore_entry(self, *_args, **_kwargs):
+            raise AssertionError("successful authorization must not roll back")
+
+    def fake_authorize(name, config, *, connect_timeout):
+        assert name == "drive"
+        assert config is cfg
+        assert connect_timeout >= 315
+        calls.append("authorize")
+        authorized["value"] = True
+
+    def fake_probe(name, config, connect_timeout):
+        assert authorized["value"] is True
+        calls.append("probe")
+        return [("search_files", "Search Drive")]
+
+    monkeypatch.setattr(
+        "hermes_cli.mcp_config._get_mcp_servers",
+        lambda: {"drive": cfg},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.mcp_config._authorize_oauth_server",
+        fake_authorize,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.mcp_config._probe_single_server",
+        fake_probe,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.mcp_config._oauth_tokens_present",
+        lambda _name: authorized["value"],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.mcp_config._save_mcp_server",
+        lambda *_args: calls.append("save") or True,
+    )
+    monkeypatch.setattr(
+        "tools.mcp_oauth_manager.get_manager",
+        lambda: FakeManager(),
+    )
+
+    web_server._run_dashboard_mcp_oauth(flow, cfg)
+
+    assert flow.status == "approved"
+    assert flow.tools == [{"name": "search_files", "description": "Search Drive"}]
+    assert calls == ["remove", "authorize", "probe", "save"]
