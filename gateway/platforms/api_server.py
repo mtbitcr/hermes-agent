@@ -50,6 +50,7 @@ import hashlib
 import hmac
 import itertools
 import json
+import math
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from functools import wraps
@@ -1150,6 +1151,10 @@ def check_api_server_requirements() -> bool:
 # Keep the owner-history projection aligned with the Workspace conversation contract.
 _OWNER_HISTORY_OWNER_MAX_CHARS = 12_000
 _OWNER_HISTORY_RAPHAEL_MAX_CHARS = 50_000
+_OWNER_CONVERSATION_RE = re.compile(
+    r"raphael-owner-[a-f0-9]{32}(?:-[a-f0-9]{32})?"
+)
+_OWNER_SESSION_INDEX_LIMIT = 100
 
 
 class ResponseStore:
@@ -1197,6 +1202,14 @@ class ResponseStore:
                 response_id TEXT NOT NULL
             )"""
         )
+        conversation_columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(conversations)")
+        }
+        if "consumed_response_id" not in conversation_columns:
+            self._conn.execute(
+                "ALTER TABLE conversations ADD COLUMN consumed_response_id TEXT"
+            )
         self._conn.commit()
         # response_store.db contains conversation history (tool payloads,
         # prompts, results). Tighten to owner-only after creation so other
@@ -1309,14 +1322,18 @@ class ResponseStore:
         handle stays service-to-service so callers can re-read and validate
         the stored response before granting any approval authority.
         """
-        empty: Dict[str, Any] = {"latest_response_id": None, "data": []}
+        empty: Dict[str, Any] = {
+            "latest_response_id": None,
+            "proposal_consumed": False,
+            "data": [],
+        }
         if (
             not isinstance(name, str)
-            or re.fullmatch(r"raphael-owner-[a-f0-9]{32}", name) is None
+            or _OWNER_CONVERSATION_RE.fullmatch(name) is None
         ):
             return empty
         row = self._conn.execute(
-            "SELECT c.response_id, r.data FROM conversations c "
+            "SELECT c.response_id, c.consumed_response_id, r.data FROM conversations c "
             "JOIN responses r ON r.response_id = c.response_id "
             "WHERE c.name = ?",
             (name,),
@@ -1324,7 +1341,7 @@ class ResponseStore:
         if row is None:
             return empty
         try:
-            stored = json.loads(row[1])
+            stored = json.loads(row[2])
         except (json.JSONDecodeError, TypeError):
             return empty
         history = stored.get("conversation_history") if isinstance(stored, dict) else None
@@ -1389,8 +1406,89 @@ class ResponseStore:
         data = turns[-40:]
         return {
             "latest_response_id": row[0] if data else None,
+            "proposal_consumed": row[1] == row[0],
             "data": data,
         }
+
+    def mark_owner_proposal_consumed(
+        self, name: str, response_id: str,
+    ) -> bool:
+        """Durably prevent one applied proposal from regaining approval authority."""
+        if (
+            not isinstance(name, str)
+            or _OWNER_CONVERSATION_RE.fullmatch(name) is None
+            or not isinstance(response_id, str)
+            or re.fullmatch(r"resp_[A-Za-z0-9_-]{8,128}", response_id) is None
+        ):
+            return False
+        cursor = self._conn.execute(
+            "UPDATE conversations SET consumed_response_id = ? "
+            "WHERE name = ? AND response_id = ?",
+            (response_id, name, response_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def owner_session_index(self, group: str) -> Dict[str, Any]:
+        """List owner-safe change-session metadata for one conversation group.
+
+        Conversation transcripts remain the native authority.  This bounded
+        projection exposes no response handles, system prompts, tool output,
+        internal reasoning, or sibling project history.
+        """
+        if (
+            not isinstance(group, str)
+            or re.fullmatch(r"raphael-owner-[a-f0-9]{32}", group) is None
+        ):
+            return {"data": [], "truncated": False}
+
+        rows = self._conn.execute(
+            "SELECT c.name, r.data, r.accessed_at "
+            "FROM conversations c "
+            "JOIN responses r ON r.response_id = c.response_id "
+            "WHERE c.name = ? OR c.name LIKE ? "
+            "ORDER BY r.accessed_at DESC LIMIT ?",
+            (group, f"{group}-%", _OWNER_SESSION_INDEX_LIMIT + 1),
+        ).fetchall()
+        truncated = len(rows) > _OWNER_SESSION_INDEX_LIMIT
+        sessions: List[Dict[str, Any]] = []
+        expected = re.compile(re.escape(group) + r"(?:-[a-f0-9]{32})?")
+        for name, raw, _accessed_at in rows[:_OWNER_SESSION_INDEX_LIMIT]:
+            if not isinstance(name, str) or expected.fullmatch(name) is None:
+                continue
+            try:
+                stored = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            response = stored.get("response") if isinstance(stored, dict) else None
+            updated_at = response.get("created_at") if isinstance(response, dict) else None
+            if (
+                isinstance(updated_at, bool)
+                or not isinstance(updated_at, (int, float))
+                or not math.isfinite(updated_at)
+                or updated_at < 0
+            ):
+                continue
+            snapshot = self.owner_history_snapshot(name)
+            history = snapshot["data"]
+            if not history:
+                continue
+            owner = history[0]["owner"]
+            preview = owner
+            if len(preview) > 180:
+                preview = preview[:177].rstrip() + "..."
+            sessions.append({
+                "session_id": "legacy" if name == group else name.removeprefix(f"{group}-"),
+                "updated_at": int(updated_at),
+                "preview": preview,
+                "visible_turn_count": len(history),
+            })
+
+        sessions.sort(
+            key=lambda item: (item["updated_at"], item["session_id"]),
+            reverse=True,
+        )
+        return {"data": sessions, "truncated": truncated}
 
     def owner_history(self, name: str) -> List[Dict[str, str]]:
         """Return the backward-compatible owner-safe turn list."""
@@ -1399,7 +1497,13 @@ class ResponseStore:
     def set_conversation(self, name: str, response_id: str) -> None:
         """Map a conversation name to its latest response_id."""
         self._conn.execute(
-            "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
+            "INSERT INTO conversations (name, response_id, consumed_response_id) "
+            "VALUES (?, ?, NULL) "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "response_id = excluded.response_id, "
+            "consumed_response_id = CASE "
+            "WHEN conversations.response_id = excluded.response_id "
+            "THEN conversations.consumed_response_id ELSE NULL END",
             (name, response_id),
         )
         self._conn.commit()
@@ -2567,6 +2671,10 @@ class APIServerAdapter(BasePlatformAdapter):
             (
                 "GET", "/v1/responses/conversations/{conversation}",
                 self._handle_owner_conversation_history,
+            ),
+            (
+                "POST", "/v1/responses/conversations/{conversation}/consume",
+                self._handle_consume_owner_proposal,
             ),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -6202,10 +6310,62 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         conversation = request.match_info["conversation"]
+        view = request.query.get("view")
+        if request.query:
+            if len(request.query) != 1 or view != "sessions":
+                return web.json_response(
+                    _openai_error("Invalid owner conversation view"),
+                    status=400,
+                )
+            if re.fullmatch(r"raphael-owner-[a-f0-9]{32}", conversation) is None:
+                return web.json_response(
+                    _openai_error("Invalid owner conversation group"),
+                    status=400,
+                )
+            index = self._response_store.owner_session_index(conversation)
+            return web.json_response({
+                "object": "hermes.response.owner_sessions",
+                **index,
+            })
+
         snapshot = self._response_store.owner_history_snapshot(conversation)
         return web.json_response({
             "object": "hermes.response.owner_history",
             **snapshot,
+        })
+
+    async def _handle_consume_owner_proposal(
+        self, request: "web.Request",
+    ) -> "web.Response":
+        """Mark the exact applied proposal so it cannot regain approval authority."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if (
+            not isinstance(body, dict)
+            or set(body) != {"response_id"}
+            or not isinstance(body["response_id"], str)
+        ):
+            return web.json_response(
+                _openai_error("Invalid owner proposal consumption request"),
+                status=400,
+            )
+        consumed = self._response_store.mark_owner_proposal_consumed(
+            request.match_info["conversation"],
+            body["response_id"],
+        )
+        if not consumed:
+            return web.json_response(
+                _openai_error("Owner proposal is not current"),
+                status=409,
+            )
+        return web.json_response({
+            "object": "hermes.response.owner_proposal_consumption",
+            "consumed": True,
         })
 
     async def _handle_get_response(self, request: "web.Request") -> "web.Response":
