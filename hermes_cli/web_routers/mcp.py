@@ -474,6 +474,7 @@ async def auth_mcp_server(
         or _mcp_oauth_callback_url(request, name),
         reconnect_live=flow_home == process_home,
     )
+    reused_flow = None
     with _mcp_oauth_flows_lock:
         active = [
             current
@@ -485,6 +486,12 @@ async def auth_mcp_server(
             for current in active
             if current.server_name == name and current.hermes_home == flow_home
         ]
+        reusable = (
+            not is_claude_design
+            and len(matching) == 1
+            and matching[0].snapshot()["status"]
+            in {"starting", "authorization_required"}
+        )
         replaceable = (
             is_claude_design
             and all(
@@ -492,22 +499,32 @@ async def auth_mcp_server(
                 for current in matching
             )
         )
-        if matching and not replaceable:
+        if reusable:
+            reused_flow = matching[0]
+        elif matching and not replaceable:
             raise HTTPException(
                 status_code=409,
                 detail=f"MCP OAuth for '{name}' is already in progress",
             )
-        projected = len(active) - (len(matching) if replaceable else 0) + 1
-        if projected > _MAX_PENDING_MCP_OAUTH_FLOWS:
-            raise HTTPException(
-                status_code=429,
-                detail="Too many MCP OAuth flows are already in progress",
-            )
-        if is_claude_design:
-            _audit_connections_machine_success(request, connection=name)
-        for current in (matching if replaceable else ()):
-            current.cancel("A newer Claude Design sign-in was started")
-        _mcp_oauth_flows[flow_id] = flow
+        if reused_flow is None:
+            projected = len(active) - (len(matching) if replaceable else 0) + 1
+            if projected > _MAX_PENDING_MCP_OAUTH_FLOWS:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many MCP OAuth flows are already in progress",
+                )
+            if is_claude_design:
+                _audit_connections_machine_success(request, connection=name)
+            for current in (matching if replaceable else ()):
+                current.cancel("A newer Claude Design sign-in was started")
+            _mcp_oauth_flows[flow_id] = flow
+    if reused_flow is not None:
+        try:
+            await reused_flow.wait_for_authorization_url(timeout=30)
+        except Exception as exc:
+            reused_flow.mark_error(str(exc))
+        _audit_connections_machine_success(request, connection=name)
+        return reused_flow.snapshot()
     threading.Thread(
         target=_run_dashboard_mcp_oauth,
         args=(flow, cfg),

@@ -55,6 +55,40 @@ def test_hosted_auth_start_returns_public_authorization_url(monkeypatch):
     assert flow.redirect_uri == "https://agent.example/api/mcp/oauth/callback/reports"
 
 
+def test_hosted_auth_retry_reuses_the_waiting_flow(monkeypatch):
+    import asyncio
+    import threading
+
+    from hermes_cli import web_server
+
+    client = _client()
+    client.post(
+        "/api/mcp/servers",
+        json={"name": "reports", "url": "https://mcp.example/mcp", "auth": "oauth"},
+    )
+    release = threading.Event()
+    worker_calls = 0
+
+    def fake_worker(flow, _cfg):
+        nonlocal worker_calls
+        worker_calls += 1
+        asyncio.run(flow.publish_authorization_url("https://idp.example/authorize?state=s1"))
+        release.wait(2)
+        flow.mark_worker_done()
+
+    monkeypatch.setattr(web_server, "_run_dashboard_mcp_oauth", fake_worker)
+    first = client.post("/api/mcp/servers/reports/auth")
+    second = client.post("/api/mcp/servers/reports/auth")
+    release.set()
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["flow_id"] == first.json()["flow_id"]
+    assert second.json()["authorization_url"] == first.json()["authorization_url"]
+    assert worker_calls == 1
+    assert len(web_server._mcp_oauth_flows) == 1
+
+
 def test_claude_design_uses_manual_first_party_code_flow(monkeypatch):
     import asyncio
 
