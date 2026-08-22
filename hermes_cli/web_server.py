@@ -13412,8 +13412,9 @@ def _mcp_oauth_transaction(flow) -> threading.Lock:
 
 
 def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
-    """Run the normal MCP probe with dashboard redirect/callback handlers."""
+    """Run explicit OAuth, then probe with dashboard callback handlers."""
     from hermes_cli.mcp_config import (
+        _authorize_oauth_server,
         _get_mcp_servers,
         _oauth_tokens_present,
         _probe_single_server,
@@ -13446,10 +13447,19 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
                         flow.server_name,
                         hermes_home=flow.hermes_home,
                     )
+                    connect_timeout = max(
+                        float(cfg.get("connect_timeout", 0) or 0),
+                        315,
+                    )
+                    _authorize_oauth_server(
+                        flow.server_name,
+                        cfg,
+                        connect_timeout=connect_timeout,
+                    )
                     tools = _probe_single_server(
                         flow.server_name,
                         cfg,
-                        connect_timeout=max(float(cfg.get("connect_timeout", 0) or 0), 315),
+                        connect_timeout=connect_timeout,
                     )
                     if not _oauth_tokens_present(flow.server_name):
                         raise RuntimeError(

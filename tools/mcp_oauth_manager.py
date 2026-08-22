@@ -568,6 +568,11 @@ def _make_hermes_provider_class() -> Optional[type]:
                 # 401 branch so a subsequent cold-load skips discovery.
                 self._persist_oauth_metadata_if_changed()
                 return
+            finally:
+                # If the outer flow is cancelled/closed while the SDK is
+                # waiting on discovery or callback I/O, close the inner
+                # generator in the same task that owns its anyio lock.
+                await inner.aclose()
 
     return HermesMCPOAuthProvider
 
@@ -756,6 +761,69 @@ class MCPOAuthManager:
             redirect_handler=redirect_handler,
             callback_handler=callback_handler,
         )
+
+    async def authorize_interactively(
+        self,
+        server_name: str,
+        server_url: str,
+        oauth_config: Optional[dict],
+    ) -> None:
+        """Run a fresh OAuth flow without invoking an MCP tool.
+
+        Some servers, including Google's official Drive MCP, expose
+        initialize and tools/list without authentication. A normal
+        discovery probe therefore never receives the 401 that the MCP SDK
+        uses to start OAuth. Explicit login/re-auth must not call an arbitrary
+        real tool merely to manufacture that challenge.
+
+        Drive the SDK's native auth-flow generator directly instead: feed its
+        first MCP request a synthetic 401, send only the OAuth
+        metadata/registration/token requests it subsequently yields, then
+        finish the authenticated MCP retry with a synthetic success response.
+        The original MCP request is never sent, so this path cannot mutate the
+        connected service.
+        """
+        provider = self.get_or_build_provider(
+            server_name, server_url, oauth_config
+        )
+        if provider is None:
+            raise RuntimeError("MCP OAuth provider is unavailable")
+
+        from tools.mcp_tool import sdk_httpx
+
+        httpx = sdk_httpx()
+        if httpx is None:
+            raise RuntimeError("MCP HTTP client is unavailable")
+
+        original_request = httpx.Request("GET", server_url)
+        auth_flow = provider.async_auth_flow(original_request)
+        try:
+            first_request = await auth_flow.__anext__()
+            if first_request is not original_request:
+                raise RuntimeError(
+                    "Fresh OAuth flow yielded an unexpected initial request"
+                )
+
+            response = httpx.Response(
+                401,
+                request=first_request,
+                headers={"www-authenticate": "Bearer"},
+            )
+            async with httpx.AsyncClient(
+                timeout=30.0,
+                follow_redirects=True,
+            ) as client:
+                while True:
+                    try:
+                        request = await auth_flow.asend(response)
+                    except StopAsyncIteration:
+                        break
+                    if request is original_request:
+                        response = httpx.Response(200, request=request)
+                    else:
+                        response = await client.send(request)
+        finally:
+            await auth_flow.aclose()
 
     def remove(
         self,
