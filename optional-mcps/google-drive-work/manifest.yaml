@@ -1,0 +1,30 @@
+# Maintained-fork admission of Google's official hosted Drive MCP.
+# No third-party package or local process is involved.
+manifest_version: 1
+
+name: google-drive-work
+description: >-
+  Files and folders from your Google Drive through Google's official hosted
+  connection.
+source: https://developers.google.com/workspace/drive/api/reference/mcp
+
+transport:
+  type: http
+  url: https://drivemcp.googleapis.com/mcp/v1
+
+auth:
+  type: oauth
+
+tools:
+  default_enabled:
+    - create_file
+    - download_file_content
+    - get_file_metadata
+    - get_file_permissions
+    - list_recent_files
+    - read_file_content
+    - search_files
+
+post_install: |
+  Sign in on Google's consent page. Raphael requests only the selected Drive
+  file access and never asks you to paste a key or token.

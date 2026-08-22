@@ -123,6 +123,32 @@ class TestManifestParsing:
         assert e.install is None
         assert e.suggest is None
 
+    def test_shipped_google_drive_entry_matches_official_hosted_connection(self):
+        from hermes_cli.mcp_catalog import _parse_manifest
+
+        manifest = (
+            Path(__file__).parents[2]
+            / "optional-mcps"
+            / "google-drive-work"
+            / "manifest.yaml"
+        )
+        entry = _parse_manifest(manifest)
+
+        assert entry.name == "google-drive-work"
+        assert entry.source == "https://developers.google.com/workspace/drive/api/reference/mcp"
+        assert entry.transport.type == "http"
+        assert entry.transport.url == "https://drivemcp.googleapis.com/mcp/v1"
+        assert entry.auth.type == "oauth"
+        assert entry.tools.default_enabled == [
+            "create_file",
+            "download_file_content",
+            "get_file_metadata",
+            "get_file_permissions",
+            "list_recent_files",
+            "read_file_content",
+            "search_files",
+        ]
+
     def test_suggest_block_parsed_and_normalized(self, catalog_dir):
         _write_manifest(
             catalog_dir,
