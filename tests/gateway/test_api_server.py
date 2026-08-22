@@ -219,6 +219,7 @@ class TestResponseStore:
         snapshot = store.owner_history_snapshot(conversation)
         assert snapshot == {
             "latest_response_id": "resp_owner_history",
+            "proposal_consumed": False,
             "data": history,
         }
         assert "resp_owner_history" not in json.dumps(snapshot["data"])
@@ -267,6 +268,163 @@ class TestResponseStore:
             }
         ]
 
+    def test_owner_history_accepts_a_scoped_change_session(self):
+        group = "raphael-owner-" + "c" * 32
+        conversation = group + "-" + "d" * 32
+        store = ResponseStore(max_size=10)
+        reply = json.dumps({
+            "schema_version": 3,
+            "kind": "project_change_proposal",
+            "mode": "existing",
+            "request_title": "Add owner summaries",
+        })
+        store.put("resp_scoped_history", {
+            "response": {"id": "resp_scoped_history", "created_at": 200},
+            "conversation_history": [
+                {"role": "user", "content": "Add a weekly summary."},
+                {"role": "assistant", "content": reply},
+            ],
+        })
+        store.set_conversation(conversation, "resp_scoped_history")
+
+        assert store.owner_history_snapshot(conversation)["data"] == [{
+            "owner": "Add a weekly summary.",
+            "raphael": reply,
+        }]
+
+    def test_owner_session_index_lists_only_safe_group_history(self):
+        group = "raphael-owner-" + "e" * 32
+        older = "1" * 32
+        newer = "2" * 32
+        store = ResponseStore(max_size=20)
+
+        def add_session(name, response_id, created_at, owner, reply):
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": created_at},
+                "conversation_history": [
+                    {"role": "system", "content": "private instructions"},
+                    {"role": "user", "content": owner},
+                    {"role": "assistant", "content": reply},
+                ],
+            })
+            store.set_conversation(name, response_id)
+
+        add_session(
+            group,
+            "resp_legacy_session",
+            100,
+            "Plan the first change.",
+            json.dumps({
+                "schema_version": 3,
+                "kind": "project_change_proposal",
+                "mode": "existing",
+                "request_title": "First change",
+            }),
+        )
+        add_session(
+            f"{group}-{older}",
+            "resp_older_session",
+            200,
+            "Add the owner summary.",
+            json.dumps({
+                "schema_version": 3,
+                "kind": "project_change_proposal",
+                "mode": "existing",
+                "request_title": "Owner summary",
+            }),
+        )
+        add_session(
+            f"{group}-{newer}",
+            "resp_newer_session",
+            300,
+            "Improve the mobile review flow.",
+            json.dumps({
+                "schema_version": 1,
+                "kind": "question",
+                "message": "Should the history stay collapsed?",
+            }),
+        )
+        add_session(
+            "raphael-owner-" + "f" * 32,
+            "resp_other_group",
+            400,
+            "Do not leak this project.",
+            json.dumps({
+                "schema_version": 1,
+                "kind": "question",
+                "message": "Different project",
+            }),
+        )
+        add_session(
+            f"{group}-{'3' * 32}",
+            "resp_unstructured_session",
+            500,
+            "This turn has no safe final reply.",
+            "private intermediate reasoning",
+        )
+
+        index = store.owner_session_index(group)
+
+        assert index == {
+            "data": [
+                {
+                    "session_id": newer,
+                    "updated_at": 300,
+                    "preview": "Improve the mobile review flow.",
+                    "visible_turn_count": 1,
+                },
+                {
+                    "session_id": older,
+                    "updated_at": 200,
+                    "preview": "Add the owner summary.",
+                    "visible_turn_count": 1,
+                },
+                {
+                    "session_id": "legacy",
+                    "updated_at": 100,
+                    "preview": "Plan the first change.",
+                    "visible_turn_count": 1,
+                },
+            ],
+            "truncated": False,
+        }
+        serialized = json.dumps(index)
+        assert "resp_" not in serialized
+        assert "private instructions" not in serialized
+        assert "Different project" not in serialized
+
+    def test_owner_proposal_consumption_is_durable_and_exact(self, tmp_path):
+        db_path = str(tmp_path / "response-store.db")
+        group = "raphael-owner-" + "6" * 32
+        response_id = "resp_consumed_proposal"
+        store = ResponseStore(max_size=10, db_path=db_path)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 600},
+            "conversation_history": [],
+        })
+        store.set_conversation(group, response_id)
+
+        assert store.owner_history_snapshot(group)["proposal_consumed"] is False
+        assert store.mark_owner_proposal_consumed(
+            group, "resp_wrong_proposal",
+        ) is False
+        assert store.mark_owner_proposal_consumed(group, response_id) is True
+        assert store.owner_history_snapshot(group)["proposal_consumed"] is True
+
+        store.set_conversation(group, response_id)
+        assert store.owner_history_snapshot(group)["proposal_consumed"] is True
+        store.close()
+
+        reopened = ResponseStore(max_size=10, db_path=db_path)
+        assert reopened.owner_history_snapshot(group)["proposal_consumed"] is True
+        reopened.put("resp_newer_proposal", {
+            "response": {"id": "resp_newer_proposal", "created_at": 700},
+            "conversation_history": [],
+        })
+        reopened.set_conversation(group, "resp_newer_proposal")
+        assert reopened.owner_history_snapshot(group)["proposal_consumed"] is False
+        reopened.close()
+
     def test_owner_history_missing_or_invalid_conversation_is_empty(self):
         store = ResponseStore(max_size=10)
         store.put("resp_invalid_history", {
@@ -283,6 +441,7 @@ class TestResponseStore:
 
         assert store.owner_history_snapshot("missing-history") == {
             "latest_response_id": None,
+            "proposal_consumed": False,
             "data": [],
         }
 
@@ -502,6 +661,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get(
         "/v1/responses/conversations/{conversation}",
         adapter._handle_owner_conversation_history,
+    )
+    app.router.add_post(
+        "/v1/responses/conversations/{conversation}/consume",
+        adapter._handle_consume_owner_proposal,
     )
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
@@ -1723,6 +1886,79 @@ class TestDeriveChatSessionId:
 
 class TestResponsesEndpoint:
 
+
+    @pytest.mark.asyncio
+    async def test_owner_session_index_and_consumption_routes(self, adapter):
+        group = "raphael-owner-" + "7" * 32
+        session_id = "8" * 32
+        conversation = f"{group}-{session_id}"
+        response_id = "resp_route_proposal"
+        reply = json.dumps({
+            "schema_version": 3,
+            "kind": "project_change_proposal",
+            "mode": "existing",
+            "request_title": "Finish the owner flow",
+        })
+        adapter._response_store.put(response_id, {
+            "response": {"id": response_id, "created_at": 800},
+            "conversation_history": [
+                {"role": "user", "content": "Finish the owner flow."},
+                {"role": "assistant", "content": reply},
+            ],
+        })
+        adapter._response_store.set_conversation(conversation, response_id)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            index_response = await cli.get(
+                f"/v1/responses/conversations/{group}?view=sessions",
+            )
+            assert index_response.status == 200
+            assert await index_response.json() == {
+                "object": "hermes.response.owner_sessions",
+                "data": [{
+                    "session_id": session_id,
+                    "updated_at": 800,
+                    "preview": "Finish the owner flow.",
+                    "visible_turn_count": 1,
+                }],
+                "truncated": False,
+            }
+
+            consumed_response = await cli.post(
+                f"/v1/responses/conversations/{conversation}/consume",
+                json={"response_id": response_id},
+            )
+            assert consumed_response.status == 200
+            assert await consumed_response.json() == {
+                "object": "hermes.response.owner_proposal_consumption",
+                "consumed": True,
+            }
+
+            history_response = await cli.get(
+                f"/v1/responses/conversations/{conversation}",
+            )
+            assert history_response.status == 200
+            history = await history_response.json()
+            assert history["proposal_consumed"] is True
+            assert history["latest_response_id"] == response_id
+
+    @pytest.mark.asyncio
+    async def test_owner_session_routes_reject_invalid_shapes(self, adapter):
+        group = "raphael-owner-" + "9" * 32
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            assert (
+                await cli.get(
+                    f"/v1/responses/conversations/{group}?view=private",
+                )
+            ).status == 400
+            assert (
+                await cli.post(
+                    f"/v1/responses/conversations/{group}/consume",
+                    json={"response_id": "resp_safe_value", "extra": True},
+                )
+            ).status == 400
 
     @pytest.mark.asyncio
     async def test_successful_response_with_string_input(self, adapter):
