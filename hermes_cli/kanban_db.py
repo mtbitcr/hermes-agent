@@ -6986,6 +6986,8 @@ def complete_task(
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
+    patch_attachment_id: Optional[int] = None,
+    merge_parent_heads: bool = False,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
@@ -7014,6 +7016,16 @@ def complete_task(
     ``completion_blocked_hallucination`` event is emitted so the rejected
     attempt is auditable. When all ids verify, they are recorded on the
     ``completed`` event payload.
+
+    ``patch_attachment_id`` is the narrow handoff for a remote sandbox that
+    cannot see the host worktree. The trusted kanban kernel validates an
+    agent-uploaded ``.patch`` from the task's current run, applies it inside
+    the already-scoped worktree, checks declared path ownership, and commits
+    it before deriving the normal execution receipt. ``merge_parent_heads``
+    asks the same kernel to merge every exact mutating parent receipt first;
+    it is accepted only for a task declared with
+    ``integrates_parent_heads=true``. Neither option grants the worker host
+    filesystem or shell access.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
@@ -7063,9 +7075,23 @@ def complete_task(
     # Exact git evidence is derived by the kernel, never trusted from worker
     # prose/metadata. Legacy tasks (owned_paths=NULL) retain their historical
     # completion behaviour; explicitly scoped tasks fail closed.
+    materialization_receipt: Optional[dict[str, Any]] = None
+    materialization_start: Optional[str] = None
     try:
+        if patch_attachment_id is not None or merge_parent_heads:
+            materialization_receipt, materialization_start = (
+                _materialize_remote_worktree_handoff(
+                    conn,
+                    task_id,
+                    patch_attachment_id=patch_attachment_id,
+                    merge_parent_heads=merge_parent_heads,
+                    expected_run_id=expected_run_id,
+                )
+            )
         execution_receipt = _verify_scoped_worktree_completion(conn, task_id)
     except WorktreeScopeError as exc:
+        if materialization_start is not None:
+            _rollback_worktree_materialization(conn, task_id, materialization_start)
         with write_txn(conn):
             _append_event(
                 conn,
@@ -7077,6 +7103,9 @@ def complete_task(
     if execution_receipt is not None:
         metadata = dict(metadata or {})
         metadata["execution_receipt"] = execution_receipt
+    if materialization_receipt is not None:
+        metadata = dict(metadata or {})
+        metadata["worktree_materialization"] = materialization_receipt
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
@@ -7086,6 +7115,10 @@ def complete_task(
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
         if not _parents_satisfied(conn, task_id):
+            if materialization_start is not None:
+                _rollback_worktree_materialization(
+                    conn, task_id, materialization_start
+                )
             return False
         prior = conn.execute(
             "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'",
@@ -7143,6 +7176,10 @@ def complete_task(
                 ),
             )
         if cur.rowcount != 1:
+            if materialization_start is not None:
+                _rollback_worktree_materialization(
+                    conn, task_id, materialization_start
+                )
             return False
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
@@ -10110,6 +10147,330 @@ def _git_output(path: Path, *args: str, binary: bool = False) -> str | bytes:
             f"git evidence command failed ({' '.join(args)}): {str(detail).strip()[:300]}"
         )
     return result.stdout
+
+
+def _git_mutation(path: Path, *args: str) -> str:
+    """Run one bounded kernel-owned git mutation or fail closed."""
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "-c",
+            "user.name=Hermes Kanban",
+            "-c",
+            "user.email=kanban@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise WorktreeScopeError(
+            f"git materialization command failed ({' '.join(args[:3])}): "
+            f"{detail[:500]}"
+        )
+    return result.stdout
+
+
+def _rollback_worktree_materialization(
+    conn: sqlite3.Connection, task_id: str, original_head: str
+) -> None:
+    """Restore only the isolated task worktree changed by this kernel call."""
+    task = get_task(conn, task_id)
+    if task is None or not task.workspace_path:
+        raise WorktreeScopeError("cannot restore an unavailable task worktree")
+    workspace = Path(task.workspace_path).expanduser()
+    try:
+        subprocess.run(
+            ["git", "-C", str(workspace), "merge", "--abort"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        _git_mutation(workspace, "reset", "--hard", original_head)
+        dirty = _git_output(
+            workspace, "status", "--porcelain=v1", "-z", binary=True
+        )
+        if dirty:
+            raise WorktreeScopeError(
+                "isolated worktree remained dirty after kernel rollback"
+            )
+    except WorktreeScopeError:
+        raise
+    except Exception as exc:
+        raise WorktreeScopeError(
+            f"could not restore isolated worktree after failed handoff: {exc}"
+        ) from exc
+
+
+def _materialize_remote_worktree_handoff(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    patch_attachment_id: Optional[int],
+    merge_parent_heads: bool,
+    expected_run_id: Optional[int],
+) -> tuple[dict[str, Any], str]:
+    """Materialize a sandbox artifact without exposing the host worktree.
+
+    The attachment row and file are untrusted input. Only a bounded
+    agent-uploaded patch from the current run is eligible. Git owns parsing;
+    the kernel checks the staged path manifest before committing. Parent heads
+    come from durable task receipts, never worker prose.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        raise WorktreeScopeError(f"unknown task {task_id}")
+    if not isinstance(merge_parent_heads, bool):
+        raise WorktreeScopeError("merge_parent_heads must be a boolean")
+    if task.status != "running" or task.current_run_id is None:
+        raise WorktreeScopeError(
+            "remote worktree handoff requires an active dispatcher run"
+        )
+    if expected_run_id is not None and int(expected_run_id) != int(task.current_run_id):
+        raise WorktreeScopeError("remote worktree handoff run id is stale")
+    if task.workspace_kind != "worktree" or not task.workspace_path:
+        raise WorktreeScopeError(
+            "remote worktree handoff requires an isolated git worktree"
+        )
+    if not task.base_commit or task.owned_paths is None:
+        raise WorktreeScopeError(
+            "remote worktree handoff requires a persisted base and owned_paths"
+        )
+    if merge_parent_heads and not task.integrates_parent_heads:
+        raise WorktreeScopeError(
+            "merge_parent_heads requires integrates_parent_heads=true"
+        )
+
+    workspace = Path(task.workspace_path).expanduser()
+    if not workspace.is_absolute() or not workspace.is_dir():
+        raise WorktreeScopeError("scoped worktree path is unavailable")
+    actual_branch = str(_git_output(workspace, "branch", "--show-current")).strip()
+    if not actual_branch or actual_branch != (task.branch_name or "").strip():
+        raise WorktreeScopeError("worktree branch does not match the task branch")
+    if _git_output(workspace, "status", "--porcelain=v1", "-z", binary=True):
+        raise WorktreeScopeError(
+            "worktree is dirty before remote handoff; refusing to overwrite it"
+        )
+    original_head = str(
+        _git_output(workspace, "rev-parse", "--verify", "HEAD")
+    ).strip()
+
+    attachment: Optional[Attachment] = None
+    patch_path: Optional[Path] = None
+    patch_sha256: Optional[str] = None
+    if patch_attachment_id is not None:
+        if isinstance(patch_attachment_id, bool):
+            raise WorktreeScopeError("patch_attachment_id must be an integer")
+        try:
+            attachment_id = int(patch_attachment_id)
+        except (TypeError, ValueError) as exc:
+            raise WorktreeScopeError("patch_attachment_id must be an integer") from exc
+        attachment = get_attachment(conn, attachment_id)
+        if attachment is None or attachment.task_id != task_id:
+            raise WorktreeScopeError(
+                "patch attachment does not belong to the completing task"
+            )
+        if attachment.uploaded_by != "agent":
+            raise WorktreeScopeError(
+                "patch attachment must be uploaded by the active agent"
+            )
+        if not attachment.filename.lower().endswith(".patch"):
+            raise WorktreeScopeError("remote code handoff must be a .patch attachment")
+        run = conn.execute(
+            "SELECT started_at, status, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (int(task.current_run_id), task_id),
+        ).fetchone()
+        if (
+            run is None
+            or run["status"] != "running"
+            or run["ended_at"] is not None
+            or int(attachment.created_at) < int(run["started_at"])
+        ):
+            raise WorktreeScopeError(
+                "patch attachment was not produced by the current active run"
+            )
+        raw_path = Path(attachment.stored_path).expanduser()
+        if raw_path.is_symlink():
+            raise WorktreeScopeError("patch attachment cannot be a symlink")
+        try:
+            patch_path = raw_path.resolve(strict=True)
+        except OSError as exc:
+            raise WorktreeScopeError("patch attachment file is unavailable") from exc
+        if (
+            not patch_path.is_file()
+            or patch_path.parent.name != task_id
+            or patch_path.name != attachment.filename
+        ):
+            raise WorktreeScopeError("patch attachment storage path is invalid")
+        patch_size = patch_path.stat().st_size
+        if (
+            patch_size <= 0
+            or patch_size != int(attachment.size)
+            or patch_size > KANBAN_ATTACHMENT_MAX_BYTES
+        ):
+            raise WorktreeScopeError("patch attachment size does not match its receipt")
+        patch_sha256 = hashlib.sha256(patch_path.read_bytes()).hexdigest()
+
+    merged_parent_heads: list[dict[str, str]] = []
+    parent_heads_already_integrated = False
+    patch_already_materialized = False
+    try:
+        if merge_parent_heads:
+            if not task.project_id:
+                raise WorktreeScopeError(
+                    "parent-head integration requires a Project-linked task"
+                )
+            rows = conn.execute(
+                "SELECT p.id, p.head_commit, p.owned_paths FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? AND p.project_id = ? "
+                "AND p.task_kind = 'work' ORDER BY p.id",
+                (task_id, task.project_id),
+            ).fetchall()
+            mutating_rows = [
+                row for row in rows if _decode_owned_paths(row["owned_paths"]) != []
+            ]
+            if not mutating_rows:
+                raise WorktreeScopeError(
+                    "parent-head integration requires at least one parent git receipt"
+                )
+            merged_any = False
+            for row in mutating_rows:
+                parent_head = str(row["head_commit"] or "").strip()
+                if not re.fullmatch(r"[0-9a-fA-F]{40,64}", parent_head):
+                    raise WorktreeScopeError(
+                        f"mutating parent {row['id']} is missing a valid git head receipt"
+                    )
+                _git_output(workspace, "cat-file", "-e", f"{parent_head}^{{commit}}")
+                contains = subprocess.run(
+                    [
+                        "git", "-C", str(workspace), "merge-base", "--is-ancestor",
+                        parent_head, "HEAD",
+                    ],
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+                if contains.returncode != 0:
+                    _git_mutation(
+                        workspace, "merge", "--no-ff", "--no-edit", parent_head
+                    )
+                    merged_any = True
+                merged_parent_heads.append(
+                    {"task_id": str(row["id"]), "head_commit": parent_head}
+                )
+            parent_heads_already_integrated = (
+                not merged_any and original_head != task.base_commit
+            )
+
+        if attachment is not None and patch_path is not None and patch_sha256 is not None:
+            prior_messages = str(
+                _git_output(
+                    workspace,
+                    "log",
+                    "--format=%B",
+                    f"{task.base_commit}..HEAD",
+                )
+            )
+            attachment_marker = f"Hermes-Patch-Attachment: {attachment.id}"
+            hash_marker = f"Hermes-Patch-SHA256: {patch_sha256}"
+            patch_already_materialized = (
+                attachment_marker in prior_messages and hash_marker in prior_messages
+            )
+            if not patch_already_materialized:
+                _git_output(
+                    workspace,
+                    "apply",
+                    "--check",
+                    "--index",
+                    "--whitespace=error-all",
+                    str(patch_path),
+                )
+                _git_mutation(
+                    workspace,
+                    "apply",
+                    "--index",
+                    "--whitespace=error-all",
+                    str(patch_path),
+                )
+                raw_staged = _git_output(
+                    workspace,
+                    "diff",
+                    "--cached",
+                    "--name-only",
+                    "--no-renames",
+                    "-z",
+                    binary=True,
+                )
+                assert isinstance(raw_staged, bytes)
+                staged_paths = [
+                    item.decode("utf-8", errors="backslashreplace")
+                    for item in raw_staged.split(b"\0")
+                    if item
+                ]
+                if not staged_paths:
+                    raise WorktreeScopeError("patch attachment produced no staged changes")
+                outside = [
+                    path
+                    for path in staged_paths
+                    if not _path_is_owned(path, task.owned_paths)
+                ]
+                if outside:
+                    preview = ", ".join(outside[:8])
+                    raise WorktreeScopeError(
+                        f"patch changes paths outside declared ownership: {preview}"
+                    )
+                message = (
+                    f"kanban: materialize remote artifact for {task_id}\n\n"
+                    f"Hermes-Kanban-Task: {task_id}\n"
+                    f"Hermes-Patch-Attachment: {attachment.id}\n"
+                    f"Hermes-Patch-SHA256: {patch_sha256}"
+                )
+                _git_mutation(workspace, "commit", "--no-gpg-sign", "-m", message)
+
+        materialized_head = str(
+            _git_output(workspace, "rev-parse", "--verify", "HEAD")
+        ).strip()
+        if (
+            materialized_head == original_head
+            and not patch_already_materialized
+            and not parent_heads_already_integrated
+        ):
+            raise WorktreeScopeError("remote worktree handoff produced no new commit")
+        receipt: dict[str, Any] = {
+            "kind": "kernel_worktree_materialization_v1",
+            "materialized_head": materialized_head,
+            "merged_parent_heads": merged_parent_heads,
+        }
+        if attachment is not None and patch_sha256 is not None:
+            receipt.update(
+                {
+                    "patch_attachment_id": attachment.id,
+                    "patch_filename": attachment.filename,
+                    "patch_sha256": patch_sha256,
+                }
+            )
+        return receipt, original_head
+    except Exception as exc:
+        try:
+            _rollback_worktree_materialization(conn, task_id, original_head)
+        except WorktreeScopeError as rollback_exc:
+            raise WorktreeScopeError(
+                f"{exc}; rollback also failed: {rollback_exc}"
+            ) from exc
+        if isinstance(exc, WorktreeScopeError):
+            raise
+        raise WorktreeScopeError(f"remote worktree handoff failed: {exc}") from exc
 
 
 def record_worktree_base(

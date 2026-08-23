@@ -762,6 +762,21 @@ def test_kanban_guidance_keeps_owner_attachments_plain_language():
     )
 
 
+def test_complete_schema_exposes_only_bounded_remote_patch_handoff():
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    from tools.kanban_tools import KANBAN_COMPLETE_SCHEMA
+
+    properties = KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]
+    assert properties["patch_attachment_id"]["type"] == "integer"
+    assert properties["merge_parent_heads"]["type"] == "boolean"
+    assert "host" in properties["patch_attachment_id"]["description"]
+    assert "exact current mutating parent head" in properties[
+        "merge_parent_heads"
+    ]["description"]
+    assert "Remote sandbox" in KANBAN_GUIDANCE
+    assert "patch_attachment_id" in KANBAN_GUIDANCE
+
+
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------
