@@ -70,7 +70,10 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
-        "parents": [<int>, ...]
+        "parents": [<int>, ...],
+        "workspace_kind": "<optional: worktree for repository work>",
+        "owned_paths": ["<optional literal repository-relative path>", ...],
+        "integrates_parent_heads": <optional boolean, default false>
       },
       ...
     ]
@@ -78,10 +81,15 @@ Output a single JSON object with this exact shape:
 
 Rules:
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
-    expressing actual data dependencies. Tasks with no parents run in
-    PARALLEL. Tasks with parents wait until every parent completes.
-  - Prefer parallelism. If two tasks can be done independently, give
-    them no parents so the dispatcher fans them out at once.
+    expressing actual data dependencies. Tasks with no parents become
+    concurrently eligible; capacity and conflict guards decide actual overlap.
+  - Prefer only safe parallelism. Repository-mutating children may be
+    independent only when each uses workspace_kind="worktree" and literal,
+    disjoint owned_paths. Use owned_paths=[] for repository-read-only work and
+    owned_paths=["."] for exclusive whole-repository work. Serialize overlap
+    with parents. After parallel builders, add one exclusive integration child
+    with integrates_parent_heads=true and every builder as a parent, followed
+    by a fresh read-only verification child.
   - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
     cram everything into 1 task.
   - Pick assignees from the roster by matching the task to the profile's
@@ -422,11 +430,31 @@ def decompose_task(
             parents = []
         # Clean parent indices: drop non-int and out-of-range.
         clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
+        workspace_kind = entry.get("workspace_kind")
+        if workspace_kind is not None and workspace_kind not in kb.VALID_WORKSPACE_KINDS:
+            return DecomposeOutcome(
+                task_id, False, f"tasks[{idx}].workspace_kind is invalid",
+            )
+        owned_paths = entry.get("owned_paths")
+        try:
+            normalized_owned_paths = kb.normalize_owned_paths(owned_paths)
+        except ValueError as exc:
+            return DecomposeOutcome(
+                task_id, False, f"tasks[{idx}].owned_paths is invalid: {exc}",
+            )
+        integrates_parent_heads = entry.get("integrates_parent_heads", False)
+        if not isinstance(integrates_parent_heads, bool):
+            return DecomposeOutcome(
+                task_id, False, f"tasks[{idx}].integrates_parent_heads must be a boolean",
+            )
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),
             "assignee": chosen,
             "parents": clean_parents,
+            "workspace_kind": workspace_kind,
+            "owned_paths": normalized_owned_paths,
+            "integrates_parent_heads": integrates_parent_heads,
         })
 
     try:

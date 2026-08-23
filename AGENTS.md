@@ -1182,6 +1182,11 @@ kanban task.
   stale claims, promotes ready tasks, atomically claims, and spawns
   assigned profiles. Runs **inside the gateway** by default via
   `kanban.dispatch_in_gateway: true`.
+- **Bounded repository parallelism:** mutating worktree tasks declare literal
+  `owned_paths`; the claim transaction serializes overlap while allowing
+  disjoint scopes. The kernel records exact base/head commits, rejects dirty
+  or out-of-scope completion, and makes an `integrates_parent_heads` task prove
+  that its completed head contains every current mutating parent head.
 - **Plugin assets:** `plugins/kanban/dashboard/` (web UI) +
   `plugins/kanban/systemd/` (`hermes-kanban-dispatcher.service` for
   standalone dispatcher deployment).

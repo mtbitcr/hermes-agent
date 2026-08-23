@@ -93,11 +93,13 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     migration adds those columns, or boards predating the column fail to
     open before migration can run.
 
-    Covers all four indexes that sit on additive columns:
+    Covers the additive-column indexes, including the Project/status lookup
+    used by bounded repository ownership:
     - ``tasks.session_id``       -> ``idx_tasks_session_id``    (#28447)
     - ``tasks.tenant``           -> ``idx_tasks_tenant``        (#16081)
     - ``tasks.idempotency_key``  -> ``idx_tasks_idempotency``   (#17805)
     - ``task_events.run_id``     -> ``idx_events_run``          (#17805)
+    - ``tasks.project_id/status`` -> ``idx_tasks_project_status``
     """
     db_path = tmp_path / "legacy-kanban.db"
     conn = sqlite3.connect(str(db_path))
@@ -159,11 +161,16 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
     assert "responsibility" in task_columns
+    assert "owned_paths" in task_columns
+    assert "integrates_parent_heads" in task_columns
+    assert "base_commit" in task_columns
+    assert "head_commit" in task_columns
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
+    assert "idx_tasks_project_status" in indexes
     assert "idx_events_run" in indexes
 
 

@@ -82,11 +82,26 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     llm_payload = jsonlib.dumps({
         "fanout": True,
         "rationale": "test split",
-        "tasks": [
-            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
-            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
-        ],
-    })
+            "tasks": [
+                {
+                    "title": "research",
+                    "body": "look it up",
+                    "assignee": "researcher",
+                    "parents": [],
+                    "workspace_kind": "worktree",
+                    "owned_paths": ["src/research"],
+                },
+                {
+                    "title": "build",
+                    "body": "code it",
+                    "assignee": "engineer",
+                    "parents": [0],
+                    "workspace_kind": "worktree",
+                    "owned_paths": ["."],
+                    "integrates_parent_heads": True,
+                },
+            ],
+        })
 
     patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
     for p in patches:
@@ -111,6 +126,11 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.status == "todo"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
+    assert c0.workspace_kind == "worktree"
+    assert c0.owned_paths == ["src/research"]
+    assert c1.workspace_kind == "worktree"
+    assert c1.owned_paths == ["."]
+    assert c1.integrates_parent_heads is True
 
 
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
@@ -159,5 +179,4 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
             p.stop()
     assert outcome.ok is False
     assert "not in triage" in outcome.reason
-
 

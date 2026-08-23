@@ -69,6 +69,10 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
         "project_id": t.project_id,
+        "owned_paths": t.owned_paths,
+        "integrates_parent_heads": t.integrates_parent_heads,
+        "base_commit": t.base_commit,
+        "head_commit": t.head_commit,
         "created_by": t.created_by,
         "created_at": t.created_at,
         "started_at": t.started_at,
@@ -342,6 +346,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
                                "deterministic branch. See `hermes project list`.")
+    p_create.add_argument("--owns", action="append", default=[], dest="owned_paths",
+                          help="Repository-relative file/subtree owned by this task "
+                               "(repeatable). Use --owns . for exclusive whole-repo "
+                               "work. Pass --read-only instead for no repository writes.")
+    p_create.add_argument("--read-only", action="store_true",
+                          help="Declare that this task makes no repository changes. "
+                               "Mutually exclusive with --owns.")
+    p_create.add_argument("--integrates-parent-heads", action="store_true",
+                          help="Require this task's completed HEAD to contain every "
+                               "same-Project parent git HEAD.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
@@ -1610,6 +1624,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if branch_name and ws_kind != "worktree":
         print("kanban: --branch is only valid with --workspace worktree", file=sys.stderr)
         return 2
+    owned_paths = list(getattr(args, "owned_paths", None) or [])
+    if getattr(args, "read_only", False):
+        if owned_paths:
+            print("kanban: --read-only cannot be combined with --owns", file=sys.stderr)
+            return 2
+        declared_owned_paths: Optional[list[str]] = []
+    else:
+        declared_owned_paths = owned_paths or None
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
@@ -1623,32 +1645,40 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
-            title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
-            branch_name=branch_name,
-            project_id=getattr(args, "project", None),
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
-            triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-            model_override=getattr(args, "model_override", None),
-            provider_override=getattr(args, "provider_override", None),
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
-        )
-        task = kb.get_task(conn, task_id)
+    try:
+        with kb.connect_closing() as conn:
+            task_id = kb.create_task(
+                conn,
+                title=args.title,
+                body=args.body,
+                assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind,
+                workspace_path=ws_path,
+                branch_name=branch_name,
+                project_id=getattr(args, "project", None),
+                owned_paths=declared_owned_paths,
+                integrates_parent_heads=getattr(
+                    args, "integrates_parent_heads", False
+                ),
+                tenant=args.tenant,
+                priority=args.priority,
+                parents=tuple(args.parent or ()),
+                triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime,
+                skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries,
+                model_override=getattr(args, "model_override", None),
+                provider_override=getattr(args, "provider_override", None),
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                initial_status=getattr(args, "initial_status", "running"),
+            )
+            task = kb.get_task(conn, task_id)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -2233,8 +2263,21 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        workspace = kb.resolve_workspace(task)
+        resolved_branch_name = None
+        if task.workspace_kind == "worktree":
+            workspace, resolved_branch_name = kb._resolve_worktree_workspace(task)
+        else:
+            workspace = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, task.id, str(workspace))
+        if task.workspace_kind == "worktree":
+            kb.set_branch_name(
+                conn,
+                task.id,
+                resolved_branch_name
+                or (task.branch_name or "").strip()
+                or f"wt/{task.id}",
+            )
+            kb.record_worktree_base(conn, task.id, workspace)
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
     return 0
@@ -2821,6 +2864,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_file_scope_conflict": [
+                {"task_id": tid, "blocking_task_ids": blockers}
+                for (tid, blockers) in res.skipped_file_scope_conflict
+            ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2853,6 +2900,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         for tid, who, current in res.skipped_per_profile_capped:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
+            )
+    if res.skipped_file_scope_conflict:
+        for tid, blockers in res.skipped_file_scope_conflict:
+            print(
+                f"Deferred (repository scope held by {', '.join(blockers)}): {tid}"
             )
     if res.skipped_nonspawnable:
         print(

@@ -76,6 +76,10 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "task" in d
     assert d["task"]["id"] == worker_env
     assert d["task"]["status"] == "running"
+    assert d["task"]["owned_paths"] is None
+    assert d["task"]["integrates_parent_heads"] is False
+    assert d["task"]["base_commit"] is None
+    assert d["task"]["head_commit"] is None
     assert "worker_context" in d
     assert "runs" in d
 
@@ -468,6 +472,8 @@ def test_create_happy_path(worker_env):
         "title": "child task",
         "assignee": "peer",
         "parents": [worker_env],
+        "workspace_kind": "worktree",
+        "owned_paths": ["src/child", "tests/child"],
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -479,6 +485,62 @@ def test_create_happy_path(worker_env):
         child = kb.get_task(conn, d["task_id"])
         assert child.title == "child task"
         assert child.assignee == "peer"
+        assert child.workspace_kind == "worktree"
+        assert child.owned_paths == ["src/child", "tests/child"]
+        assert d["owned_paths"] == ["src/child", "tests/child"]
+    finally:
+        conn.close()
+
+
+def test_create_explicit_worktree_inherits_current_project(worker_env, tmp_path):
+    """Scoped parallel children stay linked to the parent's Project."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn,
+            name="Parallel project",
+            primary_path=str(repo),
+        )
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET project_id = ? WHERE id = ?",
+            (project_id, worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = json.loads(
+        kt._handle_create(
+            {
+                "title": "scoped child",
+                "assignee": "peer",
+                "parents": [worker_env],
+                "workspace_kind": "worktree",
+                "owned_paths": ["src/child"],
+                "integrates_parent_heads": True,
+            }
+        )
+    )
+    assert out["ok"] is True
+    assert out["project_id"] == project_id
+    assert out["workspace_kind"] == "worktree"
+    assert out["owned_paths"] == ["src/child"]
+    assert out["integrates_parent_heads"] is True
+
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, out["task_id"])
+        assert child is not None
+        assert child.project_id == project_id
+        assert child.integrates_parent_heads is True
+        assert child.workspace_path == str(repo / ".worktrees" / child.id)
     finally:
         conn.close()
 
@@ -644,6 +706,31 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert KANBAN_GUIDANCE.count("Decision ownership.") == 1
     assert "Never let two subtree cards decide the same question" in KANBAN_GUIDANCE
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
+
+
+def test_kanban_guidance_requires_safe_parallel_repository_topology():
+    """Parallel code fan-out must carry scopes, integration, and fresh QA."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+
+    assert "Parallel repository work." in KANBAN_GUIDANCE
+    assert "explicit literal `owned_paths`" in KANBAN_GUIDANCE
+    assert "serialize them with `parents`" in KANBAN_GUIDANCE
+    assert "exact kernel-provided git receipts" in KANBAN_GUIDANCE
+    assert "`integrates_parent_heads=true`" in KANBAN_GUIDANCE
+    assert "fresh read-only verification child" in KANBAN_GUIDANCE
+    assert KANBAN_CREATE_SCHEMA["parameters"]["properties"]["owned_paths"] == {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": (
+            "Repository write ownership for safe parallel work. Use [] "
+            "for a read-only task, ['.'] for exclusive whole-repository "
+            "work, or canonical relative files/directories such as "
+            "['src/billing', 'tests/billing'] for a disjoint code slice. "
+            "No globs, absolute paths, '..', or .git paths. Omit only "
+            "for legacy conservative whole-repository serialization."
+        ),
+    }
 
 
 def test_kanban_guidance_keeps_owner_attachments_plain_language():

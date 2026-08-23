@@ -59,7 +59,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
-- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation), and an optional repository-ownership contract for bounded parallel work.
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
@@ -555,6 +555,24 @@ The orchestrator guidance ships in the worker's system prompt automatically — 
 
 **Decide before you fan out.** Design decisions belong to the orchestrator, not to the workers. If two parallel cards would each have to pick the same thing — a naming scheme, a schema, a file format, an API shape — the orchestrator decides it once and stamps the decision into **both** card bodies. Workers cannot see sibling cards, so every child card body must carry every decision it depends on. Example: for the parallel cards "build the exporter" and "build the importer", don't let each worker invent its own file format — pick one up front (say, newline-delimited JSON with a `version` field) and write it into both bodies, or the two halves will never round-trip.
 
+### Bounded parallel repository work
+
+Repository fan-out is opt-in and fail-closed. Every mutating child uses an
+isolated `worktree` plus literal `owned_paths`; `[]` means read-only and `['.']`
+means exclusive ownership of the whole repository. Globs, absolute paths,
+parent traversal, `.git`, and platform-ambiguous paths are rejected. Tasks in
+the same repository overlap only when their declared file/subtree prefixes are
+disjoint. Legacy or malformed repository scopes serialize conservatively;
+task-specific scratch workspaces remain independently parallel.
+
+After parallel builders, create one integration child with every builder as a
+parent, `owned_paths=['.']`, and `integrates_parent_heads=true`. Hermes records
+each worktree's exact base and completed head itself, rejects dirty or
+out-of-scope completion, and requires the integrator's head to contain every
+current parent head. A fresh read-only verifier should then inspect that exact
+combined head. These branch, path, and commit receipts are internal evidence;
+owner-facing summaries should describe outcomes in plain language.
+
 For best results, pair it with a profile whose toolsets are restricted to board operations (`kanban`, `gateway`, `memory`) so the orchestrator literally cannot execute implementation tasks even if it tries.
 
 ## Dashboard (GUI)
@@ -722,6 +740,8 @@ This is the surface **you** (or scripts, cron, the dashboard) use to drive the b
 ```
 hermes kanban init                                     # create kanban.db + print daemon hint
 hermes kanban create "<title>" [--body ...] [--assignee <profile>]
+                     [--workspace worktree] [--owns <path> ... | --read-only]
+                     [--integrates-parent-heads]
                                 [--parent <id>]... [--tenant <name>]
                                 [--workspace scratch|worktree|worktree:<path>|dir:<path>]
                                 [--branch <name>]
