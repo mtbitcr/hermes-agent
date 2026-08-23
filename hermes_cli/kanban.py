@@ -666,6 +666,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--patch-attachment-id",
+        type=int,
+        default=None,
+        help=(
+            "Apply one agent-uploaded .patch from the active run inside the "
+            "scoped worktree before completion"
+        ),
+    )
+    p_complete.add_argument(
+        "--merge-parent-heads",
+        action="store_true",
+        help=(
+            "For integrates_parent_heads tasks, merge exact current parent "
+            "git receipts through the trusted kernel before completion"
+        ),
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -2433,9 +2450,15 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
-    if len(ids) > 1 and (summary or raw_meta):
+    if len(ids) > 1 and (
+        summary
+        or raw_meta
+        or getattr(args, "patch_attachment_id", None) is not None
+        or getattr(args, "merge_parent_heads", False)
+    ):
         print(
-            "kanban: --summary / --metadata are per-task and can't be used "
+            "kanban: structured handoff and worktree materialization flags "
+            "are per-task and can't be used "
             "with multiple ids (would apply the same handoff to every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
             file=sys.stderr,
@@ -2475,6 +2498,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
+                patch_attachment_id=getattr(args, "patch_attachment_id", None),
+                merge_parent_heads=getattr(args, "merge_parent_heads", False),
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)

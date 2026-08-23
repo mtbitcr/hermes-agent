@@ -854,6 +854,21 @@ def _handle_complete(args: dict, **kw) -> str:
             pass
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
+    patch_attachment_id = args.get("patch_attachment_id")
+    if patch_attachment_id is not None:
+        if isinstance(patch_attachment_id, bool):
+            return tool_error("patch_attachment_id must be a positive integer")
+        try:
+            patch_attachment_id = int(patch_attachment_id)
+        except (TypeError, ValueError):
+            return tool_error("patch_attachment_id must be a positive integer")
+        if patch_attachment_id <= 0:
+            return tool_error("patch_attachment_id must be a positive integer")
+    merge_parent_heads, merge_bool_error = _parse_bool_arg(
+        args, "merge_parent_heads"
+    )
+    if merge_bool_error:
+        return tool_error(merge_bool_error)
     if created_cards is not None:
         if isinstance(created_cards, str):
             # Accept a single id as a string for convenience.
@@ -943,6 +958,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
+                    patch_attachment_id=patch_attachment_id,
+                    merge_parent_heads=merge_parent_heads,
                     expected_run_id=_worker_run_id(tid),
                 )
             except kb.ArtifactPreservationError as artifact_err:
@@ -971,6 +988,13 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.WorktreeScopeError as scope_err:
+                return tool_error(
+                    f"kanban_complete could not safely materialize or verify "
+                    f"the scoped worktree: {scope_err}. Your task is still "
+                    f"in-flight. Correct the patch, scope, or parent receipt "
+                    f"and retry; do not work around the kernel check."
                 )
             if not ok:
                 return tool_error(
@@ -2126,7 +2150,10 @@ KANBAN_COMPLETE_SCHEMA = {
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. A remote "
+        "sandbox that cannot access its host worktree may attach one "
+        "technical .patch and pass its id as patch_attachment_id; the "
+        "trusted kernel applies, scope-checks, and commits it."
     ),
     "parameters": {
         "type": "object",
@@ -2196,6 +2223,27 @@ KANBAN_COMPLETE_SCHEMA = {
                     "workspace are copied to durable task attachments before "
                     "cleanup; a missing declared scratch artifact keeps the "
                     "task in-flight so you can fix the path and retry."
+                ),
+            },
+            "patch_attachment_id": {
+                "type": "integer",
+                "description": (
+                    "Optional id returned by kanban_attach for one technical "
+                    ".patch produced during this active run. Use only when "
+                    "your remote sandbox cannot access the isolated host "
+                    "worktree. The kernel validates ownership, run freshness, "
+                    "hash, declared owned_paths, and git state before it "
+                    "commits anything; failure leaves the task in-flight."
+                ),
+            },
+            "merge_parent_heads": {
+                "type": "boolean",
+                "description": (
+                    "For an integration task declared with "
+                    "integrates_parent_heads=true, ask the trusted kernel to "
+                    "merge every exact current mutating parent head before "
+                    "applying the optional patch. Parent ids or commits are "
+                    "never accepted from worker prose."
                 ),
             },
             "board": _board_schema_prop(),

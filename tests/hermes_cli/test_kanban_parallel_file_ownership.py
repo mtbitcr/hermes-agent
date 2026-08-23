@@ -234,6 +234,32 @@ def _materialize(conn, task_id: str) -> Path:
     return workspace
 
 
+def _new_file_patch(path: str, content: str) -> bytes:
+    lines = content.splitlines(keepends=True)
+    body = "".join(f"+{line}" for line in lines)
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "new file mode 100644\n"
+        "index 0000000..e69de29\n"
+        "--- /dev/null\n"
+        f"+++ b/{path}\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n"
+        f"{body}"
+    ).encode("utf-8")
+
+
+def _attach_patch(conn, task_id: str, root: Path, path: str, content: str) -> int:
+    root.mkdir(parents=True, exist_ok=True)
+    return kb.store_attachment_bytes(
+        conn,
+        task_id,
+        "sandbox-result.patch",
+        _new_file_patch(path, content),
+        content_type="text/x-diff",
+        uploaded_by="agent",
+    )
+
+
 def test_cross_profile_child_inherits_project_repo_without_sharing_worktree(tmp_path):
     repo = _repo(tmp_path)
     conn = kb.connect(tmp_path / "kanban.db")
@@ -274,6 +300,223 @@ def test_cross_profile_child_inherits_project_repo_without_sharing_worktree(tmp_
         assert child.workspace_path == str(repo / ".worktrees" / child_id)
         assert child.workspace_path != str(parent_path)
         assert child.branch_name.startswith(f"project-one/{child_id}")
+    finally:
+        conn.close()
+
+
+def test_kernel_materializes_current_run_patch_inside_owned_scope(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path)
+    attachment_root = tmp_path / "attachments"
+    monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(attachment_root))
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="remote sandbox author",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="feature/remote-patch",
+            owned_paths=["src/owned"],
+        )
+        _materialize(conn, task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        attachment_id = _attach_patch(
+            conn,
+            task_id,
+            attachment_root,
+            "src/owned/remote.py",
+            "remote = True\n",
+        )
+
+        # Simulate a process/DB interruption after the kernel commit but
+        # before task completion. Retrying the same active-run handoff must
+        # recognize its exact attachment/hash trailers instead of applying it
+        # twice or leaving the task stuck.
+        first_receipt, _ = kb._materialize_remote_worktree_handoff(
+            conn,
+            task_id,
+            patch_attachment_id=attachment_id,
+            merge_parent_heads=False,
+            expected_run_id=task.current_run_id,
+        )
+        assert first_receipt["patch_attachment_id"] == attachment_id
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="Sandbox patch materialized",
+            patch_attachment_id=attachment_id,
+            expected_run_id=task.current_run_id,
+        )
+        completed = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+        assert completed is not None and completed.head_commit
+        assert _git(
+            repo, "show", f"{completed.head_commit}:src/owned/remote.py"
+        ) == "remote = True"
+        assert run is not None
+        assert run.metadata["execution_receipt"]["changed_paths"] == [
+            "src/owned/remote.py"
+        ]
+        receipt = run.metadata["worktree_materialization"]
+        assert receipt["patch_attachment_id"] == attachment_id
+        assert receipt["materialized_head"] == completed.head_commit
+        assert len(receipt["patch_sha256"]) == 64
+        assert f"Hermes-Patch-Attachment: {attachment_id}" in _git(
+            repo, "log", "-1", "--format=%B", completed.head_commit
+        )
+    finally:
+        conn.close()
+
+
+def test_kernel_rejects_out_of_scope_patch_and_restores_worktree(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path)
+    attachment_root = tmp_path / "attachments"
+    monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(attachment_root))
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="bounded remote sandbox",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="feature/reject-remote-patch",
+            owned_paths=["src/owned"],
+        )
+        workspace = _materialize(conn, task_id)
+        original_head = _git(workspace, "rev-parse", "HEAD")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        attachment_id = _attach_patch(
+            conn,
+            task_id,
+            attachment_root,
+            "src/outside.py",
+            "outside = True\n",
+        )
+
+        with pytest.raises(kb.WorktreeScopeError, match="outside declared ownership"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="Must fail closed",
+                patch_attachment_id=attachment_id,
+                expected_run_id=task.current_run_id,
+            )
+        landed = kb.get_task(conn, task_id)
+        assert landed is not None and landed.status == "running"
+        assert _git(workspace, "rev-parse", "HEAD") == original_head
+        assert _git(workspace, "status", "--porcelain") == ""
+        assert not (workspace / "src" / "outside.py").exists()
+        assert kb.list_events(conn, task_id)[-1].kind == (
+            "completion_blocked_file_scope"
+        )
+    finally:
+        conn.close()
+
+
+def test_kernel_merges_exact_parent_heads_before_integration_patch(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path)
+    attachment_root = tmp_path / "attachments"
+    monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(attachment_root))
+    conn = kb.connect(tmp_path / "kanban.db")
+
+    def create_scoped(title, branch, owned_paths, parents=(), *, integrates=False):
+        task_id = kb.create_task(
+            conn,
+            title=title,
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name=branch,
+            owned_paths=owned_paths,
+            integrates_parent_heads=integrates,
+            parents=parents,
+        )
+        conn.execute(
+            "UPDATE tasks SET project_id = 'project-remote' WHERE id = ?",
+            (task_id,),
+        )
+        conn.commit()
+        return task_id
+
+    try:
+        parents = []
+        for name in ("left", "right"):
+            parent = create_scoped(
+                name, f"feature/remote-{name}", [f"src/{name}"]
+            )
+            workspace = _materialize(conn, parent)
+            target = workspace / "src" / name / "feature.py"
+            target.parent.mkdir(parents=True)
+            target.write_text(f"name = {name!r}\n", encoding="utf-8")
+            _git(workspace, "add", f"src/{name}/feature.py")
+            _git(workspace, "commit", "-m", f"feat: {name}")
+            assert kb.complete_task(conn, parent, summary=f"{name} complete")
+            parents.append(parent)
+
+        integration = create_scoped(
+            "remote integration",
+            "feature/remote-integration",
+            ["."],
+            parents=parents,
+            integrates=True,
+        )
+        _materialize(conn, integration)
+        task = kb.get_task(conn, integration)
+        assert task is not None and task.current_run_id is not None
+        attachment_id = _attach_patch(
+            conn,
+            integration,
+            attachment_root,
+            "integration-receipt.md",
+            "# Integrated\n",
+        )
+
+        assert kb.complete_task(
+            conn,
+            integration,
+            summary="Exact heads integrated",
+            patch_attachment_id=attachment_id,
+            merge_parent_heads=True,
+            expected_run_id=task.current_run_id,
+        )
+        run = kb.latest_run(conn, integration)
+        assert run is not None
+        expected_heads = sorted(
+            [
+                {
+                    "task_id": parent,
+                    "head_commit": kb.get_task(conn, parent).head_commit,
+                }
+                for parent in parents
+            ],
+            key=lambda item: item["task_id"],
+        )
+        assert run.metadata["execution_receipt"]["parent_heads"] == expected_heads
+        assert run.metadata["worktree_materialization"][
+            "merged_parent_heads"
+        ] == expected_heads
+        completed = kb.get_task(conn, integration)
+        assert completed is not None and completed.head_commit
+        assert _git(
+            repo, "show", f"{completed.head_commit}:src/left/feature.py"
+        ) == "name = 'left'"
+        assert _git(
+            repo, "show", f"{completed.head_commit}:src/right/feature.py"
+        ) == "name = 'right'"
+        assert _git(
+            repo, "show", f"{completed.head_commit}:integration-receipt.md"
+        ) == "# Integrated"
     finally:
         conn.close()
 
