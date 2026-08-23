@@ -406,6 +406,9 @@ def test_project_snapshot_is_exact_receipt_backed_and_read_only(ctx):
     assert snapshot["workers"] == []
     assert snapshot["attachments"] == []
     assert snapshot["runs"] == []
+    assert snapshot["steward"]["schema_version"] == 2
+    assert snapshot["steward"]["execution"]["state"] == "working"
+    assert snapshot["steward"]["execution"]["paused"] is False
 
 
 def test_project_snapshot_hides_projects_without_owner_receipt(ctx):
@@ -468,6 +471,9 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
     approver = _with_approver(ctx.session)
     created = ow.commit_task_graph(ctx, **args)
     approver.join()
+    assert kanban_db.board_dispatch_allowed(
+        kanban_db.read_board_metadata(created["board"])
+    ) is True
 
     archive_approver = _with_approver(ctx.session)
     archived = ow.set_project_archived(
@@ -482,6 +488,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
         "action": "archive",
         "project_slug": created["project_slug"],
         "archived": True,
+        "execution_paused": True,
     }
     assert ow.list_committed_projects(ctx)[0]["archived"] is True
 
@@ -506,8 +513,38 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
         "action": "restore",
         "project_slug": created["project_slug"],
         "archived": False,
+        "execution_paused": True,
     }
     assert ow.list_committed_projects(ctx)[0]["archived"] is False
+    restored_meta = kanban_db.read_board_metadata(created["board"])
+    assert restored_meta["dispatch_enabled"] is False
+    assert restored_meta["dispatch_paused_by_owner"] is True
+
+    resume_approver = _with_approver(ctx.session)
+    resumed = ow.set_project_archived(
+        ctx,
+        idempotency_key="project-lifecycle-resume",
+        project_id=created["project_id"],
+        action="resume",
+    )
+    resume_approver.join()
+    assert resumed["execution_paused"] is False
+    assert kanban_db.board_dispatch_allowed(
+        kanban_db.read_board_metadata(created["board"])
+    ) is True
+
+    pause_approver = _with_approver(ctx.session)
+    paused = ow.set_project_archived(
+        ctx,
+        idempotency_key="project-lifecycle-pause",
+        project_id=created["project_id"],
+        action="pause",
+    )
+    pause_approver.join()
+    assert paused["execution_paused"] is True
+    assert kanban_db.board_dispatch_allowed(
+        kanban_db.read_board_metadata(created["board"])
+    ) is False
 
 
 def test_project_lifecycle_rejects_project_without_owner_receipt(ctx):
@@ -578,6 +615,9 @@ def test_project_steward_snapshot_is_bounded_owner_safe_and_read_only(ctx):
                 "WHERE id = ?",
                 (blocked_id,),
             )
+    kanban_db.write_board_dispatch_state(
+        setup["board"], dispatch_enabled=True,
+    )
 
     project_db = projects_db.projects_db_path()
     board_db = kanban_db.board_dir(setup["board"]) / "kanban.db"
@@ -591,17 +631,29 @@ def test_project_steward_snapshot_is_bounded_owner_safe_and_read_only(ctx):
     assert after == before
     assert snapshot["project"] == {"name": "Board Setup"}
     assert snapshot["progress"][0]["title"] == "Publish the weekly owner summary"
-    assert snapshot["decisions_needed"][0]["title"] == "Confirm the owner-visible result"
+    assert snapshot["schema_version"] == 2
+    assert snapshot["execution"] == {
+        "state": "waiting_for_you",
+        "summary": "Raphael needs your answer before the plan can continue.",
+        "paused": False,
+    }
+    assert snapshot["decisions_needed"] == [{
+        "title": "Confirm the missing owner input",
+        "state": "Waiting for your answer",
+    }]
+    assert any(
+        item == {
+            "title": "Confirm the owner-visible result",
+            "state": "Being checked",
+        }
+        for item in snapshot["active_work"]
+    )
     assert any(
         item["title"] == "Prepare the next useful milestone"
         for item in snapshot["stale_candidates"]
     )
-    assert any(
-        item == {
-            "title": "Confirm the missing owner input",
-            "state": "Blocked",
-            "reason": "Waiting for owner input",
-        }
+    assert all(
+        item["title"] != "Confirm the missing owner input"
         for item in snapshot["needs_attention"]
     )
 
@@ -616,6 +668,24 @@ def test_project_steward_snapshot_is_bounded_owner_safe_and_read_only(ctx):
         "raphael-planner",
     ):
         assert forbidden_value not in payload
+
+
+def test_project_steward_does_not_offer_resume_for_an_unapproved_board(ctx):
+    approver = _with_approver(ctx.session)
+    setup = ow.bootstrap(
+        ctx,
+        idempotency_key="steward-unapproved-board",
+        name="Unapproved Project",
+    )
+    approver.join()
+
+    snapshot = ow.project_steward_snapshot(project_id=setup["project_id"])
+
+    assert snapshot["execution"] == {
+        "state": "waiting_for_approval",
+        "summary": "Raphael is waiting for an approved milestone before starting work.",
+        "paused": False,
+    }
 
     forbidden_keys = {
         "task_id", "assignee", "body", "result", "error", "file_path",
@@ -696,14 +766,13 @@ def test_owner_decisions_projects_native_gates_without_writes_or_identifiers(ctx
 
     assert (project_db.stat().st_mtime_ns, board_db.stat().st_mtime_ns) == before
     assert {(item["authority"], item["kind"], item["title"]) for item in decisions} == {
-        ("task", "review", "Review the workshop outline"),
         ("task", "owner_input", "Choose the workshop date"),
         ("recommendation", "capability", "Add workshop research support"),
     }
     assert all(item["project_slug"] == setup["board"] for item in decisions)
     assert all(item["project_name"] == "Board Setup" for item in decisions)
     assert all(item["decision_ref"].startswith("decision_") for item in decisions)
-    assert len({item["decision_ref"] for item in decisions}) == 3
+    assert len({item["decision_ref"] for item in decisions}) == 2
 
     payload = json.dumps(decisions)
     for forbidden in (
@@ -946,11 +1015,18 @@ def test_project_plan_add_move_and_postpone_apply_together(ctx):
     assert result["ok"] is True
     assert result["change_count"] == 4
     assert len(result["created_task_ids"]) == 2
+    assert kanban_db.board_dispatch_allowed(
+        kanban_db.read_board_metadata(setup["board"])
+    ) is True
     first_id, second_id = result["created_task_ids"]
     with kanban_db.connect(board=setup["board"]) as conn:
         assert kanban_db.parent_ids(conn, first_id) == [setup["task_id"]]
         assert kanban_db.parent_ids(conn, second_id) == [first_id]
         assert kanban_db.get_task(conn, move_id).status == "ready"
+        assert any(
+            comment.body == "Return this work to the planned queue."
+            for comment in kanban_db.list_comments(conn, move_id)
+        )
         assert kanban_db.get_task(conn, postpone_id).status == "scheduled"
         assert any(
             event.kind == "owner_project_plan_applied"

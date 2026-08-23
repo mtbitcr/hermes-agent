@@ -1229,6 +1229,19 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
 
+        require_board_activation = (
+            kanban_cfg.get("dispatch_require_board_activation") is True
+        )
+
+        def _board_is_dispatchable(metadata: object) -> bool:
+            return (
+                not require_board_activation
+                or (
+                    isinstance(metadata, dict)
+                    and _kb.board_dispatch_allowed(metadata)
+                )
+            )
+
         # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
         # new profile gateway (or a same-profile restart race) can silently
         # start a second dispatcher; concurrent dispatchers double reclaim
@@ -1481,6 +1494,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    require_board_activation=require_board_activation,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1532,6 +1546,8 @@ class GatewayKanbanWatchersMixin:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
+                if not _board_is_dispatchable(b):
+                    continue
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 out.append((slug, _tick_once_for_board(slug)))
             return out
@@ -1560,6 +1576,8 @@ class GatewayKanbanWatchersMixin:
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
+                if not _board_is_dispatchable(b):
+                    continue
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
                 try:
@@ -1616,6 +1634,8 @@ class GatewayKanbanWatchersMixin:
             attempted = 0
             successes = 0
             for b in boards:
+                if not _board_is_dispatchable(b):
+                    continue
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break

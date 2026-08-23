@@ -382,6 +382,8 @@ def _fire_dispatch_tick_hook(
         outcome = "ok"
         if result.skipped_locked:
             outcome = "skipped_locked"
+        elif result.skipped_inactive:
+            outcome = "skipped_inactive"
         elif not any((
             result.spawned,
             result.reclaimed,
@@ -903,6 +905,11 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         # primary repo) and ``default_workdir`` mirrors the project's primary
         # path so the persistent-workspace inheritance path keeps working.
         "project_id": None,
+        # Owner-approved project execution is opt-in. Upstream/manual boards
+        # keep their historical behavior unless the dispatcher is explicitly
+        # configured to require this admission bit.
+        "dispatch_enabled": False,
+        "dispatch_paused_by_owner": False,
         "created_at": None,
         "archived": False,
     }
@@ -931,6 +938,8 @@ def write_board_metadata(
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    dispatch_enabled: Optional[bool] = None,
+    dispatch_paused_by_owner: Optional[bool] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -961,6 +970,10 @@ def write_board_metadata(
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
     if project_id is not None:
         meta["project_id"] = str(project_id) if project_id else None
+    if dispatch_enabled is not None:
+        meta["dispatch_enabled"] = bool(dispatch_enabled)
+    if dispatch_paused_by_owner is not None:
+        meta["dispatch_paused_by_owner"] = bool(dispatch_paused_by_owner)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -968,6 +981,44 @@ def write_board_metadata(
     _atomic_write_text(path, json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
+
+
+def board_dispatch_allowed(metadata: Mapping[str, Any]) -> bool:
+    """Return whether strict owner-project dispatch may claim this board."""
+    return (
+        metadata.get("dispatch_enabled") is True
+        and metadata.get("dispatch_paused_by_owner") is not True
+        and metadata.get("archived") is not True
+    )
+
+
+def write_board_dispatch_state(
+    board: Optional[str],
+    *,
+    dispatch_enabled: Optional[bool] = None,
+    dispatch_paused_by_owner: Optional[bool] = None,
+    wait_seconds: float = 5.0,
+) -> dict:
+    """Atomically publish owner execution state against the dispatch lock.
+
+    Once a pause returns, every earlier dispatcher tick has left its critical
+    section and every later tick must observe the new metadata before it may
+    claim work. Running workers are deliberately untouched.
+    """
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    db_path = kanban_db_path(board=slug)
+    with _dispatch_tick_lock(
+        db_path,
+        wait_seconds=wait_seconds,
+        fail_open=False,
+    ) as held:
+        if not held:
+            raise TimeoutError("board dispatch state lock is busy")
+        return write_board_metadata(
+            slug,
+            dispatch_enabled=dispatch_enabled,
+            dispatch_paused_by_owner=dispatch_paused_by_owner,
+        )
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -1782,8 +1833,13 @@ def _cross_process_init_lock(path: Path):
 
 
 @contextlib.contextmanager
-def _dispatch_tick_lock(db_path: Path):
-    """Non-blocking single-writer guard around one dispatcher tick.
+def _dispatch_tick_lock(
+    db_path: Path,
+    *,
+    wait_seconds: float = 0.0,
+    fail_open: bool = True,
+):
+    """Bounded single-writer guard around one dispatcher tick or state change.
 
     Yields ``True`` when this process holds the board's dispatch lock and
     may proceed with the tick, or ``False`` when another process already
@@ -1801,10 +1857,10 @@ def _dispatch_tick_lock(db_path: Path):
     that prevents two dispatchers from ever writing concurrently
     *regardless of how the second one got there*.
 
-    The lock is **non-blocking** on purpose: the gateway's async watcher
-    must never stall on a held lock. A losing dispatcher simply skips its
-    tick (the winner is making progress on the same board), and tries
-    again next interval.
+    Dispatcher calls keep the default non-blocking behavior: the gateway's
+    async watcher never stalls on a held lock. Owner pause/resume calls may
+    provide a small ``wait_seconds`` bound and ``fail_open=False`` so the
+    metadata change is serialized with the final in-flight dispatch claim.
 
     Board-scoped: the lock file is a ``.dispatch.lock`` sibling of the
     board's ``kanban.db``, so unrelated boards tick independently. On
@@ -1812,6 +1868,8 @@ def _dispatch_tick_lock(db_path: Path):
     (yields ``True``) — single-writer enforcement is best-effort and the
     orphan-dispatcher scenario is specific to POSIX service managers.
     """
+    wait_seconds = max(float(wait_seconds or 0.0), 0.0)
+    deadline = time.monotonic() + wait_seconds
     lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
     handle = None
     acquired = False
@@ -1826,22 +1884,38 @@ def _dispatch_tick_lock(db_path: Path):
                 locking = getattr(msvcrt, "locking")
                 # LK_NBLCK = non-blocking exclusive byte-range lock.
                 nb_lock = getattr(msvcrt, "LK_NBLCK")
-                locking(handle.fileno(), nb_lock, 1)
-                acquired = True
-            except (OSError, AttributeError):
+                while True:
+                    try:
+                        handle.seek(0)
+                        locking(handle.fileno(), nb_lock, 1)
+                        acquired = True
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(_INIT_LOCK_POLL_SECONDS)
+            except AttributeError:
                 acquired = False
         else:
             try:
                 import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-            except (BlockingIOError, OSError):
-                acquired = False
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        break
+                    except (BlockingIOError, OSError):
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(_INIT_LOCK_POLL_SECONDS)
+            except ImportError:  # pragma: no cover - non-POSIX fallback
+                acquired = fail_open
     except OSError:
-        # Could not even open the lock file (permissions, read-only FS).
-        # Degrade to a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        # Dispatch preserves the historical fail-open fallback. An owner
+        # state mutation fails closed because returning "paused" without a
+        # lock would race a claim and lie to the owner.
+        acquired = fail_open
         handle = None
     try:
         yield acquired
@@ -9174,6 +9248,19 @@ def apply_owner_project_plan(
                 raise RuntimeError(
                     "preflighted Project Steward target changed inside transaction"
                 )
+            if action == "move" and to_status == "ready":
+                # A needs-input worker receives task comments, not raw plan
+                # events. Persist the approved owner answer as an idempotent
+                # comment so the resumed specialist can actually use it.
+                add_comment(
+                    conn,
+                    ref["task_id"],
+                    actor,
+                    reason,
+                    operation_key=(
+                        f"owner-plan:{idempotency_key}:change:{change_index}:resume"
+                    ),
+                )
             affected_task_ids.add(ref["task_id"])
             if to_status == "archived":
                 archived_task_ids.append(ref["task_id"])
@@ -9790,6 +9877,9 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    skipped_inactive: bool = False
+    """True when strict owner-project admission is enabled and this board is
+    not active. No reclaim, promotion, claim, or spawn write occurred."""
     memory_pressure: Optional[str] = None
     """System memory pressure observed at spawn time when the memory guard
     restricted this tick (OOF-30/OOF-77): ``"critical"`` — no new workers
@@ -11536,6 +11626,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    require_board_activation: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -11555,6 +11646,10 @@ def dispatch_once(
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
+        if require_board_activation:
+            result = DispatchResult(skipped_inactive=True)
+            _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+            return result
         # Path resolution should never fail, but if it somehow does we
         # must not lose the tick — fall through to an unguarded dispatch
         # rather than dropping work.
@@ -11577,6 +11672,10 @@ def dispatch_once(
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             result = DispatchResult(skipped_locked=True)
+        elif require_board_activation and not board_dispatch_allowed(
+            read_board_metadata(board)
+        ):
+            result = DispatchResult(skipped_inactive=True)
         else:
             result = _dispatch_once_locked(
                 conn,

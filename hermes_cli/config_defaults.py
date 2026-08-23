@@ -2503,6 +2503,11 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # When true, the embedded dispatcher touches only boards carrying an
+        # explicit owner-approved dispatch admission bit in board.json. False
+        # preserves upstream/manual-board behavior. Raphael enables this on
+        # its shared gateway so old or operator-managed boards stay inert.
+        "dispatch_require_board_activation": False,
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
