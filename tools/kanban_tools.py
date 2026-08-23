@@ -657,7 +657,12 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
+        "branch_name": task.branch_name,
         "project_id": task.project_id,
+        "owned_paths": task.owned_paths,
+        "integrates_parent_heads": task.integrates_parent_heads,
+        "base_commit": task.base_commit,
+        "head_commit": task.head_commit,
         "created_by": task.created_by,
         "created_at": task.created_at,
         "started_at": task.started_at,
@@ -704,6 +709,12 @@ def _handle_show(args: dict, **kw) -> str:
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
+                    "branch_name": t.branch_name,
+                    "project_id": t.project_id,
+                    "owned_paths": t.owned_paths,
+                    "integrates_parent_heads": t.integrates_parent_heads,
+                    "base_commit": t.base_commit,
+                    "head_commit": t.head_commit,
                     "created_by": t.created_by, "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
@@ -1611,7 +1622,10 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
-    _inherit_project = workspace_kind is None and workspace_path is None
+    # An explicit worktree is still safe to inherit from the current Project:
+    # project inheritance creates a fresh task-id-keyed checkout, never shares
+    # the parent's literal path. Explicit dir/scratch requests remain isolated.
+    _inherit_project = workspace_path is None and workspace_kind in {None, "worktree"}
     if workspace_kind is None:
         workspace_kind = "scratch"
     triage, bool_error = _parse_bool_arg(args, "triage")
@@ -1632,6 +1646,16 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    owned_paths = args.get("owned_paths")
+    if owned_paths is not None and not isinstance(owned_paths, (list, tuple)):
+        return tool_error(
+            f"owned_paths must be a list of repository-relative paths, got {type(owned_paths).__name__}"
+        )
+    integrates_parent_heads, integration_bool_error = _parse_bool_arg(
+        args, "integrates_parent_heads"
+    )
+    if integration_bool_error:
+        return tool_error(integration_bool_error)
     model_override = args.get("model")
     provider_override = args.get("provider")
     if provider_override and not model_override:
@@ -1668,6 +1692,8 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=workspace_path,
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,
+                owned_paths=owned_paths,
+                integrates_parent_heads=integrates_parent_heads,
                 triage=triage,
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(
@@ -1693,6 +1719,10 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
+                owned_paths=new_task.owned_paths if new_task else None,
+                integrates_parent_heads=(
+                    new_task.integrates_parent_heads if new_task else False
+                ),
                 subscribed=subscribed,
             )
         finally:
@@ -2556,6 +2586,26 @@ KANBAN_CREATE_SCHEMA = {
                     "set, the task becomes a git worktree under the project's "
                     "primary repo with a deterministic branch (project slug + "
                     "task id), instead of a random branch."
+                ),
+            },
+            "owned_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Repository write ownership for safe parallel work. Use [] "
+                    "for a read-only task, ['.'] for exclusive whole-repository "
+                    "work, or canonical relative files/directories such as "
+                    "['src/billing', 'tests/billing'] for a disjoint code slice. "
+                    "No globs, absolute paths, '..', or .git paths. Omit only "
+                    "for legacy conservative whole-repository serialization."
+                ),
+            },
+            "integrates_parent_heads": {
+                "type": "boolean",
+                "description": (
+                    "Set true only for the integration task that must contain "
+                    "the exact kernel-recorded git head of every same-Project "
+                    "parent before it can complete. Requires mutating owned_paths."
                 ),
             },
             "triage": {

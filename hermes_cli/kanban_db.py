@@ -84,9 +84,10 @@ import sys
 import threading
 import logging
 import time
+import unicodedata
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -397,6 +398,7 @@ def _fire_dispatch_tick_hook(
             result.auto_assigned_default,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
+            result.skipped_file_scope_conflict,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
         )):
@@ -1194,6 +1196,19 @@ class Task:
     responsibility: Optional[str] = None
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    # Declared repository write ownership for this task. ``None`` means a
+    # legacy/unscoped task and is treated as exclusive access to the whole
+    # Project. ``[]`` is explicitly read-only. Relative POSIX paths own that
+    # file or subtree; ``["."]`` is explicit whole-repository ownership.
+    owned_paths: Optional[list[str]] = None
+    # Explicit integration contract: when true, completion must prove that
+    # every same-Project parent git head is an ancestor of this task's head.
+    integrates_parent_heads: bool = False
+    # Exact git revision receipts for project worktrees. ``base_commit`` is
+    # captured before the worker starts and never rewritten; ``head_commit``
+    # is derived by the kernel only after a clean, in-scope completion.
+    base_commit: Optional[str] = None
+    head_commit: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Unified non-success counter. Incremented on any of:
@@ -1278,6 +1293,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        owned_paths_value: Optional[list[str]] = None
+        if "owned_paths" in keys and row["owned_paths"] is not None:
+            try:
+                parsed = json.loads(row["owned_paths"])
+                if isinstance(parsed, list):
+                    owned_paths_value = normalize_owned_paths(parsed)
+            except Exception:
+                owned_paths_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1293,6 +1316,18 @@ class Task:
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
             project_id=row["project_id"] if "project_id" in keys else None,
+            owned_paths=owned_paths_value,
+            integrates_parent_heads=(
+                bool(row["integrates_parent_heads"])
+                if "integrates_parent_heads" in keys
+                else False
+            ),
+            base_commit=(
+                row["base_commit"] if "base_commit" in keys and row["base_commit"] else None
+            ),
+            head_commit=(
+                row["head_commit"] if "head_commit" in keys and row["head_commit"] else None
+            ),
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
@@ -1478,6 +1513,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
     project_id           TEXT,
+    -- Repository write ownership used by bounded parallel execution. NULL is
+    -- legacy fail-closed whole-repo ownership; [] is explicitly read-only;
+    -- relative POSIX paths own one file/subtree; ["."] owns the whole repo.
+    owned_paths          TEXT,
+    integrates_parent_heads INTEGER NOT NULL DEFAULT 0,
+    -- Kernel-derived exact git revision receipts for worktree execution.
+    base_commit          TEXT,
+    head_commit          TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -2717,6 +2760,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
+    if "owned_paths" not in cols:
+        _add_column_if_missing(conn, "tasks", "owned_paths", "owned_paths TEXT")
+    if "integrates_parent_heads" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "integrates_parent_heads",
+            "integrates_parent_heads INTEGER NOT NULL DEFAULT 0",
+        )
+    if "base_commit" not in cols:
+        _add_column_if_missing(conn, "tasks", "base_commit", "base_commit TEXT")
+    if "head_commit" not in cols:
+        _add_column_if_missing(conn, "tasks", "head_commit", "head_commit TEXT")
     if "idempotency_key" not in cols:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
@@ -2935,6 +2991,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    if {"project_id", "status"}.issubset(cols):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_project_status "
+            "ON tasks(project_id, status)"
+        )
     # Matches the recommendation GET's exact equality-filter + order shape.
     if {"status", "created_at", "id"}.issubset(cols):
         conn.execute(
@@ -3415,6 +3476,10 @@ def _claimer_id() -> str:
 # ---------------------------------------------------------------------------
 
 _RESPONSIBILITY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
+_OWNED_PATH_FORBIDDEN_RE = re.compile(r"[\\:*?\[\]\x00-\x1f\x7f]")
+_MAX_OWNED_PATHS = 64
+_MAX_OWNED_PATH_LENGTH = 512
+_MAX_RECEIPT_CHANGED_PATHS = 256
 
 
 def normalize_responsibility(value: Optional[str]) -> Optional[str]:
@@ -3427,6 +3492,66 @@ def normalize_responsibility(value: Optional[str]) -> Optional[str]:
             "responsibility must be a 1-64 character stable identifier"
         )
     return responsibility
+
+
+def normalize_owned_paths(value: Optional[Iterable[str]]) -> Optional[list[str]]:
+    """Canonicalise a task's declared repository ownership.
+
+    ``None`` is a legacy/unscoped task and therefore exclusive. ``[]`` is
+    explicitly read-only, ``["."]`` owns the whole repository, and every
+    other value is one exact relative POSIX file/subtree prefix. Globs are
+    deliberately unsupported so ownership cannot silently change as files
+    are added to the repository.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        raise ValueError("owned_paths must be a list of repository-relative paths")
+    try:
+        raw_paths = list(value)
+    except TypeError as exc:
+        raise ValueError(
+            "owned_paths must be a list of repository-relative paths"
+        ) from exc
+    if len(raw_paths) > _MAX_OWNED_PATHS:
+        raise ValueError(f"owned_paths may contain at most {_MAX_OWNED_PATHS} paths")
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(raw_paths):
+        if not isinstance(raw, str):
+            raise ValueError(f"owned_paths[{index}] must be a string")
+        path = raw.strip()
+        if not path:
+            raise ValueError(f"owned_paths[{index}] must not be blank")
+        if len(path) > _MAX_OWNED_PATH_LENGTH:
+            raise ValueError(
+                f"owned_paths[{index}] must be at most {_MAX_OWNED_PATH_LENGTH} characters"
+            )
+        if path == ".":
+            canonical = path
+        else:
+            if path.startswith("/") or _OWNED_PATH_FORBIDDEN_RE.search(path):
+                raise ValueError(
+                    f"owned_paths[{index}] must be a literal relative POSIX path"
+                )
+            candidate = PurePosixPath(path)
+            if any(part in {"", ".", ".."} for part in candidate.parts):
+                raise ValueError(
+                    f"owned_paths[{index}] must not contain '.', '..', or empty segments"
+                )
+            canonical = candidate.as_posix()
+            if canonical != path or canonical == ".git" or canonical.startswith(".git/"):
+                raise ValueError(
+                    f"owned_paths[{index}] must be a canonical repository path"
+                )
+        if canonical not in seen:
+            seen.add(canonical)
+            cleaned.append(canonical)
+
+    if "." in seen and len(cleaned) != 1:
+        raise ValueError("owned_paths '.' cannot be combined with narrower paths")
+    return cleaned
 
 
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
@@ -3467,6 +3592,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    owned_paths: Optional[Iterable[str]] = None,
+    integrates_parent_heads: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3506,6 +3633,13 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``owned_paths`` declares repository write ownership for bounded parallel
+    execution: ``None`` is legacy fail-closed whole-repository ownership,
+    ``[]`` is read-only, ``["."]`` is explicit whole-repository ownership, and
+    other entries are canonical relative file/subtree prefixes. An integration
+    task sets ``integrates_parent_heads`` so completion must contain the exact
+    current git receipt of every mutating same-Project parent.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3514,6 +3648,13 @@ def create_task(
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
     responsibility = normalize_responsibility(responsibility)
+    owned_paths_list = normalize_owned_paths(owned_paths)
+    if not isinstance(integrates_parent_heads, bool):
+        raise ValueError("integrates_parent_heads must be a boolean")
+    if integrates_parent_heads and not owned_paths_list:
+        raise ValueError(
+            "integrates_parent_heads requires a mutating owned_paths scope"
+        )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3630,6 +3771,15 @@ def create_task(
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
+
+    if owned_paths_list and workspace_kind != "worktree":
+        raise ValueError(
+            "mutating owned_paths require workspace_kind='worktree'"
+        )
+    if owned_paths_list == [] and workspace_kind == "dir":
+        raise ValueError(
+            "read-only owned_paths require an isolated scratch or worktree workspace"
+        )
 
     parents = tuple(p for p in parents if p)
 
@@ -3779,12 +3929,13 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, responsibility, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, owned_paths, integrates_parent_heads,
+                        tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3800,6 +3951,8 @@ def create_task(
                         workspace_path,
                         branch_name,
                         project_id,
+                        json.dumps(owned_paths_list) if owned_paths_list is not None else None,
+                        1 if integrates_parent_heads else 0,
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -3835,6 +3988,8 @@ def create_task(
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
                         "project_id": project_id,
+                        "owned_paths": owned_paths_list,
+                        "integrates_parent_heads": integrates_parent_heads or None,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
@@ -5927,6 +6082,146 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _decode_owned_paths(raw: Any) -> Optional[list[str]]:
+    """Decode a durable ownership value; malformed data fails closed."""
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(value, list):
+            return None
+        return normalize_owned_paths(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _owned_path_scopes_overlap(
+    left: Optional[list[str]], right: Optional[list[str]]
+) -> bool:
+    """Return whether two normalized write scopes can touch the same path."""
+    # NULL is legacy/unknown, therefore whole-repository and exclusive.
+    if left is None or right is None:
+        return True
+    # Explicitly read-only tasks never contend for repository writes.
+    if not left or not right:
+        return False
+    if "." in left or "." in right:
+        return True
+    # Git paths are case-sensitive, but the checkout may not be (the common
+    # macOS/Windows case). Treat Unicode/case-equivalent prefixes as colliding
+    # everywhere. This can serialize two genuinely distinct Linux paths, but
+    # it can never let two workers race on one physical path.
+    left_keys = [unicodedata.normalize("NFC", path).casefold() for path in left]
+    right_keys = [unicodedata.normalize("NFC", path).casefold() for path in right]
+    return any(
+        a == b or a.startswith(f"{b}/") or b.startswith(f"{a}/")
+        for a in left_keys
+        for b in right_keys
+    )
+
+
+def _project_repository_key(row: sqlite3.Row) -> Optional[str]:
+    """Return a proven canonical Project repo identity from a task row."""
+    if row["workspace_kind"] != "worktree" or not row["project_id"]:
+        return None
+    raw_path = str(row["workspace_path"] or "").strip()
+    if not raw_path:
+        return None
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute() or path.parent.name != ".worktrees":
+        return None
+    repository = path.parent.parent.resolve(strict=False).as_posix()
+    return unicodedata.normalize("NFC", repository).casefold()
+
+
+def file_scope_conflicts(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Return running tasks that prevent ``task_id`` from claiming.
+
+    Scratch tasks are already isolated in task-specific ephemeral directories
+    and do not participate in repository locking. Otherwise, only explicit
+    read-only work may run beside a non-worktree mutator. Two mutating tasks may
+    run together only when both use isolated worktrees and their explicit
+    ownership prefixes are disjoint. This deliberately treats every
+    legacy/unparseable repository scope as whole-repository ownership. Known,
+    different Projects are independent; an unlinked repository task serializes
+    with all mutators because it carries no repository-identity proof.
+    """
+    candidate = conn.execute(
+        "SELECT id, project_id, workspace_kind, workspace_path, owned_paths FROM tasks "
+        "WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
+    ).fetchone()
+    if candidate is None:
+        return []
+    if candidate["workspace_kind"] == "scratch":
+        return []
+    candidate_paths = _decode_owned_paths(candidate["owned_paths"])
+    if candidate_paths == [] and candidate["workspace_kind"] == "worktree":
+        return []
+
+    conflicts: list[str] = []
+    running_rows = conn.execute(
+        "SELECT id, project_id, workspace_kind, workspace_path, owned_paths FROM tasks "
+        "WHERE id != ? AND status = 'running' AND task_kind = 'work' "
+        "ORDER BY started_at, id",
+        (task_id,),
+    ).fetchall()
+    for running in running_rows:
+        if running["workspace_kind"] == "scratch":
+            continue
+        running_paths = _decode_owned_paths(running["owned_paths"])
+        if running_paths == [] and running["workspace_kind"] == "worktree":
+            continue
+        # Explicitly different Projects have separate primary repositories by
+        # default. When both rows carry canonical Project worktree paths, use
+        # the repository itself as stronger evidence: deliberately duplicated
+        # Projects pointing at one repo must still contend. An unlinked task
+        # has no such proof, so it serializes with every mutator instead of
+        # becoming an escape hatch after the global cap rises above one.
+        candidate_project = str(candidate["project_id"] or "").strip()
+        running_project = str(running["project_id"] or "").strip()
+        if candidate_project and running_project and candidate_project != running_project:
+            candidate_repo = _project_repository_key(candidate)
+            running_repo = _project_repository_key(running)
+            if not candidate_repo or not running_repo or candidate_repo != running_repo:
+                continue
+        if not candidate_project or not running_project:
+            conflicts.append(str(running["id"]))
+            continue
+        isolated = (
+            candidate["workspace_kind"] == "worktree"
+            and running["workspace_kind"] == "worktree"
+        )
+        if not isolated or _owned_path_scopes_overlap(candidate_paths, running_paths):
+            conflicts.append(str(running["id"]))
+    return conflicts
+
+
+def _record_file_scope_deferral(
+    conn: sqlite3.Connection, task_id: str, conflicts: list[str], *, now: int
+) -> None:
+    """Emit at most one identical scope-deferral event per minute."""
+    latest = conn.execute(
+        "SELECT created_at, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'claim_deferred_file_scope' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is not None and int(latest["created_at"] or 0) >= now - 60:
+        try:
+            payload = json.loads(latest["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if payload.get("blocking_task_ids") == conflicts:
+            return
+    _append_event(
+        conn,
+        task_id,
+        "claim_deferred_file_scope",
+        {"blocking_task_ids": conflicts},
+    )
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5968,6 +6263,10 @@ def claim_task(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
             )
+            return None
+        conflicts = file_scope_conflicts(conn, task_id)
+        if conflicts:
+            _record_file_scope_deferral(conn, task_id, conflicts, now=now)
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
@@ -6091,6 +6390,10 @@ def claim_review_task(
                         "source_status": "review",
                     },
                 )
+            return None
+        conflicts = file_scope_conflicts(conn, task_id)
+        if conflicts:
+            _record_file_scope_deferral(conn, task_id, conflicts, now=now)
             return None
         cur = conn.execute(
             """
@@ -6671,6 +6974,10 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class WorktreeScopeError(ValueError):
+    """Raised when scoped git work cannot be proven clean and in-bounds."""
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6747,6 +7054,24 @@ def complete_task(
     else:
         verified_cards = []
 
+    # Exact git evidence is derived by the kernel, never trusted from worker
+    # prose/metadata. Legacy tasks (owned_paths=NULL) retain their historical
+    # completion behaviour; explicitly scoped tasks fail closed.
+    try:
+        execution_receipt = _verify_scoped_worktree_completion(conn, task_id)
+    except WorktreeScopeError as exc:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_file_scope",
+                {"reason": str(exc)[:800]},
+            )
+        raise
+    if execution_receipt is not None:
+        metadata = dict(metadata or {})
+        metadata["execution_receipt"] = execution_receipt
+
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -6772,12 +7097,18 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       head_commit   = COALESCE(?, head_commit)
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND task_kind = 'work'
                 """,
-                (result, now, task_id),
+                (
+                    result,
+                    now,
+                    execution_receipt.get("head_commit") if execution_receipt else None,
+                    task_id,
+                ),
             )
         else:
             cur = conn.execute(
@@ -6790,13 +7121,20 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       head_commit   = COALESCE(?, head_commit)
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
                    AND task_kind = 'work'
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (
+                    result,
+                    now,
+                    execution_receipt.get("head_commit") if execution_receipt else None,
+                    task_id,
+                    int(expected_run_id),
+                ),
             )
         if cur.rowcount != 1:
             return False
@@ -8676,6 +9014,15 @@ def decompose_triage_task(
                 )
             if p == idx:
                 raise ValueError(f"child[{idx}] cannot list itself as a parent")
+        normalize_owned_paths(child.get("owned_paths"))
+        if not isinstance(child.get("integrates_parent_heads", False), bool):
+            raise ValueError(f"child[{idx}].integrates_parent_heads must be a boolean")
+        if child.get("integrates_parent_heads") and not normalize_owned_paths(
+            child.get("owned_paths")
+        ):
+            raise ValueError(
+                f"child[{idx}].integrates_parent_heads requires mutating owned_paths"
+            )
 
     # Detect cycles in the sibling parent graph (Kahn's topological sort).
     # link_tasks() calls _would_cycle() for every new edge; here we check
@@ -8738,23 +9085,41 @@ def decompose_triage_task(
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
             responsibility = normalize_responsibility(child.get("responsibility"))
+            owned_paths = normalize_owned_paths(child.get("owned_paths"))
+            integrates_parent_heads = child.get("integrates_parent_heads", False)
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
             # child can't accidentally point a 'dir' at the root's
             # worktree path or vice versa).
             child_ws_kind = child.get("workspace_kind") or root_ws_kind
+            if owned_paths and child_ws_kind != "worktree":
+                raise ValueError(
+                    f"child[{idx}] mutating owned_paths require workspace_kind='worktree'"
+                )
+            if owned_paths == [] and child_ws_kind == "dir":
+                raise ValueError(
+                    f"child[{idx}] read-only owned_paths require an isolated "
+                    "scratch or worktree workspace"
+                )
             if child.get("workspace_path"):
                 child_ws_path = child.get("workspace_path")
             elif child_ws_kind == "worktree":
-                # Never share one worktree checkout between siblings: the
-                # root's literal path would put every child in the same
-                # directory on the first-dispatched sibling's branch, with
-                # no lock — siblings can be promoted and dispatched
-                # concurrently. Leave the path unset so dispatch
-                # materializes a fresh <repo>/.worktrees/<child-id> per
-                # child from the board anchor.
-                child_ws_path = None
+                # A canonical Project task lives at
+                # ``<project-repo>/.worktrees/<root-id>``. Preserve that
+                # repository identity while still giving every sibling its
+                # own checkout. Falling back to ``None`` is safe for legacy
+                # roots whose path does not prove this convention; dispatch
+                # then uses the board anchor as before.
+                root_path = Path(root_ws_path) if root_ws_path else None
+                if (
+                    root_path is not None
+                    and root_path.name == task_id
+                    and root_path.parent.name == ".worktrees"
+                ):
+                    child_ws_path = str(root_path.parent / new_id)
+                else:
+                    child_ws_path = None
             elif child_ws_kind == root_ws_kind:
                 child_ws_path = root_ws_path
             else:
@@ -8762,8 +9127,9 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, responsibility, status, workspace_kind, "
-                " workspace_path, tenant, project_id, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, project_id, owned_paths, "
+                " integrates_parent_heads, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -8774,13 +9140,20 @@ def decompose_triage_task(
                     child_ws_path,
                     tenant,
                     project_id,
+                    json.dumps(owned_paths) if owned_paths is not None else None,
+                    1 if integrates_parent_heads else 0,
                     now,
                     (author or "decomposer"),
                 ),
             )
             _append_event(
                 conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {
+                    "by": author or "decomposer",
+                    "from_decompose_of": task_id,
+                    "owned_paths": owned_paths,
+                    "integrates_parent_heads": integrates_parent_heads or None,
+                },
             )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)
@@ -9712,6 +10085,215 @@ def set_branch_name(
         )
 
 
+def _git_output(path: Path, *args: str, binary: bool = False) -> str | bytes:
+    """Run one bounded read-only git command or raise a scope error."""
+    result = subprocess.run(
+        ["git", "-C", str(path), *args],
+        capture_output=True,
+        text=not binary,
+        encoding=None if binary else "utf-8",
+        errors=None if binary else "replace",
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr if binary else (result.stderr or result.stdout or "")
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", errors="replace")
+        raise WorktreeScopeError(
+            f"git evidence command failed ({' '.join(args)}): {str(detail).strip()[:300]}"
+        )
+    return result.stdout
+
+
+def record_worktree_base(
+    conn: sqlite3.Connection, task_id: str, workspace_path: Path | str
+) -> str:
+    """Capture the exact pre-worker HEAD once and persist it durably."""
+    workspace = Path(workspace_path).expanduser()
+    head = str(_git_output(workspace, "rev-parse", "--verify", "HEAD")).strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
+        raise WorktreeScopeError("worktree HEAD is not an exact git commit")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT base_commit FROM tasks WHERE id = ? AND task_kind = 'work'",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise WorktreeScopeError(f"unknown task {task_id}")
+        existing = str(row["base_commit"] or "").strip()
+        if existing:
+            return existing
+        cur = conn.execute(
+            "UPDATE tasks SET base_commit = ? "
+            "WHERE id = ? AND base_commit IS NULL AND task_kind = 'work'",
+            (head, task_id),
+        )
+        if cur.rowcount == 1:
+            _append_event(conn, task_id, "worktree_base_recorded", {"base_commit": head})
+            return head
+        row = conn.execute(
+            "SELECT base_commit FROM tasks WHERE id = ? AND task_kind = 'work'",
+            (task_id,),
+        ).fetchone()
+        existing = str(row["base_commit"] or "").strip() if row else ""
+        if not existing:
+            raise WorktreeScopeError("could not persist the worktree base commit")
+        return existing
+
+
+def _path_is_owned(path: str, owned_paths: list[str]) -> bool:
+    if "." in owned_paths:
+        return True
+    return any(path == owner or path.startswith(f"{owner}/") for owner in owned_paths)
+
+
+def _verify_scoped_worktree_completion(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    """Derive an exact completion receipt for an explicitly scoped task."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise WorktreeScopeError(f"unknown task {task_id}")
+    owned_paths = task.owned_paths
+    if owned_paths is None:
+        return None
+    if task.workspace_kind != "worktree":
+        if owned_paths == []:
+            return None
+        raise WorktreeScopeError(
+            "mutating owned_paths require an isolated git worktree"
+        )
+    if not task.workspace_path or not task.base_commit:
+        raise WorktreeScopeError(
+            "scoped worktree is missing its persisted workspace/base commit"
+        )
+    workspace = Path(task.workspace_path).expanduser()
+    if not workspace.is_absolute() or not workspace.is_dir():
+        raise WorktreeScopeError("scoped worktree path is unavailable")
+
+    actual_branch = str(_git_output(workspace, "branch", "--show-current")).strip()
+    if not actual_branch or actual_branch != (task.branch_name or "").strip():
+        raise WorktreeScopeError("worktree branch does not match the task branch")
+    dirty = _git_output(workspace, "status", "--porcelain=v1", "-z", binary=True)
+    if dirty:
+        raise WorktreeScopeError(
+            "worktree is dirty; commit or remove every change before completion"
+        )
+    head = str(_git_output(workspace, "rev-parse", "--verify", "HEAD")).strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
+        raise WorktreeScopeError("worktree HEAD is not an exact git commit")
+    ancestor = subprocess.run(
+        ["git", "-C", str(workspace), "merge-base", "--is-ancestor", task.base_commit, head],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if ancestor.returncode != 0:
+        raise WorktreeScopeError("task base commit is not an ancestor of worktree HEAD")
+    raw_names = _git_output(
+        workspace,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        f"{task.base_commit}..{head}",
+        binary=True,
+    )
+    assert isinstance(raw_names, bytes)
+    changed_paths = [
+        item.decode("utf-8", errors="backslashreplace")
+        for item in raw_names.split(b"\0")
+        if item
+    ]
+    outside = [path for path in changed_paths if not _path_is_owned(path, owned_paths)]
+    if outside:
+        preview = ", ".join(outside[:8])
+        suffix = " …" if len(outside) > 8 else ""
+        raise WorktreeScopeError(
+            f"commit changes paths outside declared ownership: {preview}{suffix}"
+        )
+
+    # A mutating downstream task in the same Project must actually contain
+    # every exact code head it depends on. This turns the parent handoff from
+    # advisory prose into a kernel-checked integration invariant. Read-only
+    # verification tasks are intentionally excluded: they inspect the exact
+    # parent head without incorporating it into their own checkout.
+    parent_heads: list[dict[str, str]] = []
+    if task.integrates_parent_heads:
+        if not task.project_id:
+            raise WorktreeScopeError(
+                "parent-head integration requires a Project-linked task"
+            )
+        rows = conn.execute(
+            "SELECT p.id, p.head_commit, p.owned_paths FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.project_id = ? "
+            "AND p.task_kind = 'work' "
+            "ORDER BY p.id",
+            (task_id, task.project_id),
+        ).fetchall()
+        receipt_rows = []
+        for row in rows:
+            parent_scope = _decode_owned_paths(row["owned_paths"])
+            if parent_scope == []:
+                continue
+            parent_head = str(row["head_commit"] or "").strip()
+            if not parent_head:
+                raise WorktreeScopeError(
+                    f"mutating parent {row['id']} is missing its git head receipt"
+                )
+            receipt_rows.append(row)
+        if not receipt_rows:
+            raise WorktreeScopeError(
+                "parent-head integration requires at least one parent git receipt"
+            )
+        for row in receipt_rows:
+            parent_head = str(row["head_commit"] or "").strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{40,64}", parent_head):
+                raise WorktreeScopeError(
+                    f"parent {row['id']} has an invalid git head receipt"
+                )
+            contains_parent = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "merge-base",
+                    "--is-ancestor",
+                    parent_head,
+                    head,
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if contains_parent.returncode != 0:
+                raise WorktreeScopeError(
+                    f"completed head does not contain parent head from {row['id']}"
+                )
+            parent_heads.append({"task_id": str(row["id"]), "head_commit": parent_head})
+    receipt_changed_paths = changed_paths[:_MAX_RECEIPT_CHANGED_PATHS]
+    receipt: dict[str, Any] = {
+        "kind": "scoped_worktree_v1",
+        "base_commit": task.base_commit,
+        "head_commit": head,
+        "branch": actual_branch,
+        "owned_paths": list(owned_paths),
+        "changed_paths": receipt_changed_paths,
+        "parent_heads": parent_heads,
+    }
+    if len(changed_paths) > _MAX_RECEIPT_CHANGED_PATHS:
+        receipt.update(
+            {
+                "changed_path_count": len(changed_paths),
+                "changed_paths_truncated": True,
+                "changed_paths_sha256": hashlib.sha256(raw_names).hexdigest(),
+            }
+        )
+    return receipt
+
+
 # ---------------------------------------------------------------------------
 def schedule_task(
     conn: sqlite3.Connection,
@@ -9851,6 +10433,11 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_file_scope_conflict: list[tuple[str, list[str]]] = field(default_factory=list)
+    """Tasks deferred because a running task in the same Project owns an
+    overlapping repository path (or either task lacks an explicit safe
+    scope). Each entry is ``(task_id, blocking_task_ids)``. Deferred work is
+    preserved in its lane and retries automatically after the lock clears."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -11358,9 +11945,9 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL AND task_kind = 'work'"
+        "    AND claim_lock IS NULL AND task_kind = 'work' ORDER BY id"
     ).fetchall()
     if not rows:
         return False
@@ -11370,7 +11957,9 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if profile_exists(row["assignee"]) and not file_scope_conflicts(
+            conn, row["id"]
+        ):
             return True
     return False
 
@@ -11384,9 +11973,9 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     should have spawned a review agent.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL AND task_kind = 'work'"
+        "    AND claim_lock IS NULL AND task_kind = 'work' ORDER BY id"
     ).fetchall()
     if not rows:
         return False
@@ -11395,7 +11984,9 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     except Exception:
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if profile_exists(row["assignee"]) and not file_scope_conflicts(
+            conn, row["id"]
+        ):
             return True
     return False
 
@@ -12010,6 +12601,15 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        scope_conflicts = file_scope_conflicts(conn, row["id"])
+        if scope_conflicts:
+            result.skipped_file_scope_conflict.append((row["id"], scope_conflicts))
+            if not dry_run:
+                with write_txn(conn):
+                    _record_file_scope_deferral(
+                        conn, row["id"], scope_conflicts, now=int(time.time())
+                    )
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -12064,6 +12664,16 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            try:
+                record_worktree_base(conn, claimed.id, workspace)
+            except Exception as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, f"worktree base: {exc}",
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -12152,6 +12762,15 @@ def _dispatch_once_locked(
                     (row["id"], row["assignee"], current)
                 )
                 continue
+        scope_conflicts = file_scope_conflicts(conn, row["id"])
+        if scope_conflicts:
+            result.skipped_file_scope_conflict.append((row["id"], scope_conflicts))
+            if not dry_run:
+                with write_txn(conn):
+                    _record_file_scope_deferral(
+                        conn, row["id"], scope_conflicts, now=int(time.time())
+                    )
+            continue
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
@@ -12191,6 +12810,16 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            try:
+                record_worktree_base(conn, claimed.id, workspace)
+            except Exception as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, f"worktree base: {exc}",
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
@@ -12877,6 +13506,16 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    if task.owned_paths is None:
+        lines.append("Repository ownership: legacy exclusive whole repository")
+    elif not task.owned_paths:
+        lines.append("Repository ownership: read-only (no repository changes allowed)")
+    else:
+        lines.append("Repository ownership: " + ", ".join(task.owned_paths))
+    if task.integrates_parent_heads:
+        lines.append("Integration contract: include every same-Project parent git head")
+    if task.base_commit:
+        lines.append(f"Base commit: {task.base_commit}")
     lines.append("")
 
     if task.body and task.body.strip():
@@ -12984,6 +13623,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 done_ts = pt.completed_at
             age = _relative_age(done_ts, _now)
             lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
+            if pt.base_commit or pt.head_commit:
+                lines.append(
+                    "_git receipt_: "
+                    f"base={pt.base_commit or '(missing)'}; "
+                    f"head={pt.head_commit or '(missing)'}; "
+                    f"branch={pt.branch_name or '(missing)'}"
+                )
 
             body_lines: list[str] = []
             if run is not None and run.summary and run.summary.strip():
