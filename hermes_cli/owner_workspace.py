@@ -1145,6 +1145,11 @@ def commit_task_graph(
         finally:
             kconn.close()
 
+        # One milestone approval is the execution authority. Activation is
+        # idempotent and preserves an explicit owner pause, so a crash/retry
+        # cannot silently resume a Project the owner stopped.
+        _set_project_dispatch_state(board_slug, enabled=True)
+
         _update_progress(
             pconn, ctx, idempotency_key, token, task_id=root_task_id,
         )
@@ -1173,6 +1178,26 @@ def _receipt_owns_project(
         except Exception:
             continue
     return False
+
+
+def _set_project_dispatch_state(
+    board_slug: str,
+    *,
+    enabled: Optional[bool] = None,
+    paused_by_owner: Optional[bool] = None,
+) -> dict:
+    """Serialize owner execution state with the board's dispatch claim."""
+    try:
+        return kanban_db.write_board_dispatch_state(
+            board_slug,
+            dispatch_enabled=enabled,
+            dispatch_paused_by_owner=paused_by_owner,
+        )
+    except (OSError, TimeoutError) as exc:
+        raise OwnerWorkspaceError(
+            "execution_state_busy",
+            "the Project execution state could not be changed just now",
+        ) from exc
 
 
 def list_committed_projects(ctx: OwnerContext) -> list[dict]:
@@ -1449,6 +1474,8 @@ def read_project_snapshot(ctx: OwnerContext, project_slug: str) -> dict:
     finally:
         conn.close()
 
+    steward = project_steward_snapshot(project_id=project_id, lookback_days=7)
+
     return {
         "project": {
             "id": project_id,
@@ -1473,6 +1500,7 @@ def read_project_snapshot(ctx: OwnerContext, project_slug: str) -> dict:
         } for row in worker_rows[:_OWNER_PROJECT_MAX_WORKERS]],
         "attachments": attachments,
         "runs": runs,
+        "steward": steward,
         "truncated": {
             "tasks": len(task_rows) > _OWNER_PROJECT_MAX_TASKS,
             "workers": len(worker_rows) > _OWNER_PROJECT_MAX_WORKERS,
@@ -1606,7 +1634,8 @@ def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
     This is deliberately a projection, not a decision store or mutation
     router. Work reviews and owner-input blocks stay native Tasks;
     capability suggestions stay native recommendation rows. The caller gets
-    only an opaque presentation key plus enough Project scope to route the
+    Internal work in the native review column is Raphael's responsibility,
+    not an owner decision. The caller gets only an opaque presentation key plus enough Project scope to route the
     owner back to the authority-specific surface. Native ids, assignees,
     bodies, results, runs, provenance and private evidence never leave this
     boundary.
@@ -1643,7 +1672,6 @@ def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
                 "SELECT id, title, status, created_at, task_kind, block_kind, "
                 "review_policy, recommendation_label, recommendation_rationale, "
                 "recommendation_decision FROM tasks WHERE project_id = ? AND ("
-                "(task_kind = 'work' AND status = 'review') OR "
                 "(task_kind = 'work' AND status = 'blocked' "
                 "AND block_kind = 'needs_input') OR "
                 "(task_kind = 'recommendation' AND status = 'review' "
@@ -1674,12 +1702,6 @@ def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
                 kind = "owner_input"
                 title = _owner_title(row["title"])
                 reason = "Raphael needs your answer before this work can continue."
-            else:
-                authority = "task"
-                kind = "review"
-                title = _owner_title(row["title"])
-                reason = "This result is ready for your review."
-
             decisions.append({
                 "decision_ref": _owner_decision_ref(
                     ctx, authority=authority, native_id=str(row["id"])
@@ -1693,7 +1715,7 @@ def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
                 "created_at": _owner_timestamp(row["created_at"]),
             })
 
-    authority_order = {"owner_input": 0, "review": 1, "capability": 2}
+    authority_order = {"owner_input": 0, "capability": 1}
     decisions.sort(
         key=lambda item: (
             authority_order.get(item["kind"], 9),
@@ -1712,20 +1734,21 @@ def set_project_archived(
     project_id: str,
     action: str,
 ) -> dict:
-    """Archive or restore one receipt-backed native Project.
+    """Apply one receipt-backed Project lifecycle or execution change.
 
-    Hard delete is intentionally absent.  The same receipt lease and
-    exact-operation approval used by every owner-workspace mutation fence the
-    native Project row, so retries cannot duplicate or drift the action.
+    Hard delete and worker termination are intentionally absent. Pause blocks
+    future claims after the current dispatch critical section; work already
+    running may finish. Restore is deliberately paused until the owner resumes.
     """
     idempotency_key = _bounded_text(
         idempotency_key, "idempotency_key", limit=200,
     )
     project_id = _bounded_text(project_id, "project_id", limit=100)
     action = str(action or "").strip().lower()
-    if action not in {"archive", "restore"}:
+    if action not in {"archive", "restore", "pause", "resume"}:
         raise OwnerWorkspaceError(
-            "invalid_argument", "action must be 'archive' or 'restore'",
+            "invalid_argument",
+            "action must be 'archive', 'restore', 'pause', or 'resume'",
         )
     payload = {"project_id": project_id, "action": action}
     digest = _digest(payload)
@@ -1778,22 +1801,77 @@ def set_project_archived(
                 raise OwnerWorkspaceError(
                     "project_not_found", "the Project is unavailable",
                 )
-            if bool(current.archived) == target_archived and row is None:
+            metadata = kanban_db.read_board_metadata(current.board_slug)
+            if action in {"pause", "resume"} and current.archived:
+                result = {
+                    "ok": False,
+                    "error": "conflict",
+                    "archived": True,
+                    "execution_paused": True,
+                }
+            elif action in {"archive", "restore"} and (
+                bool(current.archived) == target_archived and row is None
+            ):
                 result = {
                     "ok": False,
                     "error": "conflict",
                     "archived": bool(current.archived),
+                    "execution_paused": bool(
+                        metadata.get("dispatch_paused_by_owner")
+                    ),
+                }
+            elif action == "pause" and (
+                metadata.get("dispatch_paused_by_owner") is True and row is None
+            ):
+                result = {
+                    "ok": False,
+                    "error": "conflict",
+                    "archived": False,
+                    "execution_paused": True,
+                }
+            elif action == "resume" and (
+                kanban_db.board_dispatch_allowed(metadata) and row is None
+            ):
+                result = {
+                    "ok": False,
+                    "error": "conflict",
+                    "archived": False,
+                    "execution_paused": False,
                 }
             else:
-                pconn.execute(
-                    "UPDATE projects SET archived = ? WHERE id = ?",
-                    (int(target_archived), project_id),
-                )
+                if action in {"archive", "restore"}:
+                    _set_project_dispatch_state(
+                        current.board_slug,
+                        enabled=False,
+                        paused_by_owner=True,
+                    )
+                    pconn.execute(
+                        "UPDATE projects SET archived = ? WHERE id = ?",
+                        (int(target_archived), project_id),
+                    )
+                    resulting_archived = target_archived
+                    execution_paused = True
+                elif action == "pause":
+                    _set_project_dispatch_state(
+                        current.board_slug,
+                        paused_by_owner=True,
+                    )
+                    resulting_archived = False
+                    execution_paused = True
+                else:
+                    _set_project_dispatch_state(
+                        current.board_slug,
+                        enabled=True,
+                        paused_by_owner=False,
+                    )
+                    resulting_archived = False
+                    execution_paused = False
                 result = {
                     "ok": True,
                     "action": action,
                     "project_slug": current.slug,
-                    "archived": target_archived,
+                    "archived": resulting_archived,
+                    "execution_paused": execution_paused,
                 }
 
         _finalize_receipt(
@@ -1820,7 +1898,7 @@ _OWNER_STATE_LABELS = {
     "ready": "Ready",
     "running": "In progress",
     "blocked": "Blocked",
-    "review": "Awaiting review",
+    "review": "Being checked",
     "done": "Completed",
 }
 _OWNER_BLOCK_REASONS = {
@@ -1934,6 +2012,7 @@ def project_steward_snapshot(
             "snapshot_unavailable",
             "the Project board ownership could not be verified",
         ) from exc
+    metadata = kanban_db.read_board_metadata(board_slug)
     if board_slug == kanban_db.DEFAULT_BOARD:
         board_path = kanban_db.kanban_home() / "kanban.db"
     else:
@@ -1990,12 +2069,20 @@ def project_steward_snapshot(
         reverse=True,
     )
     attention_rows = [
-        item for item in items if item["status"] in {"blocked", "triage"}
+        item for item in items
+        if item["status"] == "triage"
+        or (
+            item["status"] == "blocked"
+            and item["block_kind"] != "needs_input"
+        )
     ]
-    review_rows = [item for item in items if item["status"] == "review"]
+    decision_rows = [
+        item for item in items
+        if item["status"] == "blocked" and item["block_kind"] == "needs_input"
+    ]
     active_rows = [
         item for item in items
-        if item["status"] in {"todo", "scheduled", "ready", "running"}
+        if item["status"] in {"todo", "scheduled", "ready", "running", "review"}
     ]
     stale_rows = sorted(
         (
@@ -2027,8 +2114,11 @@ def project_steward_snapshot(
         for item in _bounded(attention_rows)
     ]
     decisions_needed = [
-        {"title": item["title"], "state": _OWNER_STATE_LABELS["review"]}
-        for item in _bounded(review_rows)
+        {
+            "title": item["title"],
+            "state": "Waiting for your answer",
+        }
+        for item in _bounded(decision_rows)
     ]
     active_work = [
         {"title": item["title"], "state": _OWNER_STATE_LABELS[item["status"]]}
@@ -2046,16 +2136,55 @@ def project_steward_snapshot(
     ]
 
     open_count = sum(item["status"] != "done" for item in items)
+    dispatch_allowed = kanban_db.board_dispatch_allowed(metadata)
+    paused_by_owner = metadata.get("dispatch_paused_by_owner") is True
+    running_now = any(item["status"] == "running" for item in items)
+    if not active_rows and not decision_rows and not attention_rows:
+        execution_state = "complete"
+        execution_summary = "The approved work is complete."
+    elif not dispatch_allowed:
+        if paused_by_owner and running_now:
+            execution_state = "paused"
+            execution_summary = (
+                "Raphael is finishing work already underway, then will stay paused."
+            )
+        elif paused_by_owner:
+            execution_state = "paused"
+            execution_summary = "Raphael is paused and will not start new work."
+        else:
+            execution_state = "waiting_for_approval"
+            execution_summary = (
+                "Raphael is waiting for an approved milestone before starting work."
+            )
+    elif decision_rows:
+        execution_state = "waiting_for_you"
+        execution_summary = "Raphael needs your answer before the plan can continue."
+    elif attention_rows:
+        execution_state = "needs_attention"
+        execution_summary = "Raphael found a problem and is preparing the safest next step."
+    elif active_rows:
+        execution_state = "working"
+        execution_summary = "Raphael is coordinating the approved milestone."
+    else:  # pragma: no cover - exhaustive state partition
+        execution_state = "complete"
+        execution_summary = "The approved work is complete."
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "project": {"name": _owner_title(project["name"])},
         "generated_at": _owner_timestamp(now),
         "lookback_days": lookback_days,
+        "execution": {
+            "state": execution_state,
+            "summary": execution_summary,
+            "paused": execution_state == "paused",
+        },
         "counts": {
             "open": open_count,
             "completed_in_window": len(progress_rows),
             "needs_attention": len(attention_rows),
-            "awaiting_review": len(review_rows),
+            "awaiting_review": sum(
+                item["status"] == "review" for item in items
+            ),
         },
         "progress": progress,
         "needs_attention": needs_attention,
@@ -2065,7 +2194,7 @@ def project_steward_snapshot(
         "truncated": {
             "progress": len(progress_rows) > _PROJECT_STEWARD_LIMIT,
             "needs_attention": len(attention_rows) > _PROJECT_STEWARD_LIMIT,
-            "decisions_needed": len(review_rows) > _PROJECT_STEWARD_LIMIT,
+            "decisions_needed": len(decision_rows) > _PROJECT_STEWARD_LIMIT,
             "active_work": len(active_rows) > _PROJECT_STEWARD_LIMIT,
             "stale_candidates": len(stale_rows) > _PROJECT_STEWARD_LIMIT,
         },
@@ -2446,6 +2575,7 @@ def commit_project_plan(
                 ctx=ctx,
             )
             if recovered is not None:
+                _set_project_dispatch_state(board_slug, enabled=True)
                 result = {
                     "ok": True,
                     "project_id": project_id,
@@ -2504,6 +2634,7 @@ def commit_project_plan(
                 "change_count": 0,
             }
         else:
+            _set_project_dispatch_state(board_slug, enabled=True)
             result = {
                 "ok": True,
                 "project_id": project_id,

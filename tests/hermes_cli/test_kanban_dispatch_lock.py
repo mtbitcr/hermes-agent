@@ -77,3 +77,55 @@ def test_lock_is_board_scoped(conn):
             assert held_b is True, "a lock on a different board must be independent"
 
 
+def test_strict_board_activation_fails_closed_then_dispatches(conn):
+    task_id = kb.create_task(conn, title="owner-approved work", assignee="default")
+    spawn_calls: list[str] = []
+
+    def spy_spawn(task, workspace_path, board=None):
+        spawn_calls.append(task.id)
+        return 999999
+
+    inactive = kb.dispatch_once(
+        conn,
+        spawn_fn=spy_spawn,
+        require_board_activation=True,
+    )
+    assert inactive.skipped_inactive is True
+    assert spawn_calls == []
+    assert kb.get_task(conn, task_id).status == "ready"
+
+    kb.write_board_dispatch_state("default", dispatch_enabled=True)
+    active = kb.dispatch_once(
+        conn,
+        spawn_fn=spy_spawn,
+        require_board_activation=True,
+    )
+    assert active.skipped_inactive is False
+    assert spawn_calls == [task_id]
+
+
+def test_owner_pause_waits_for_dispatch_lock_and_blocks_later_ticks(conn):
+    import threading
+    import time
+
+    kb.write_board_dispatch_state("default", dispatch_enabled=True)
+    db_path = kb.kanban_db_path(board="default")
+    finished = threading.Event()
+
+    def pause():
+        kb.write_board_dispatch_state(
+            "default",
+            dispatch_paused_by_owner=True,
+            wait_seconds=1.0,
+        )
+        finished.set()
+
+    with kb._dispatch_tick_lock(db_path) as held:
+        assert held is True
+        worker = threading.Thread(target=pause)
+        worker.start()
+        time.sleep(0.1)
+        assert finished.is_set() is False
+    worker.join(timeout=2)
+    assert finished.is_set() is True
+    assert kb.board_dispatch_allowed(kb.read_board_metadata("default")) is False

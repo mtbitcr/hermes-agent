@@ -542,11 +542,12 @@ registry.register(
     schema={
         "name": "owner_project_lifecycle",
         "description": (
-            "Archive or restore one owner-workspace Project while retaining "
-            "its Tasks, history, documents and board. Hard delete is not "
-            "available. The Project must be backed by this trusted owner's "
-            "committed receipt. Idempotent and guarded by one exact human "
-            "confirmation."
+            "Archive, restore, pause, or resume one owner-workspace Project "
+            "while retaining its Tasks, history, documents and board. Pause "
+            "blocks new work but does not terminate work already running; "
+            "restore stays paused until resume. Hard delete is unavailable. "
+            "The Project must be backed by this trusted owner's committed "
+            "receipt. Idempotent and guarded by one exact human confirmation."
         ),
         "parameters": {
             "type": "object",
@@ -559,7 +560,7 @@ registry.register(
                 "project_id": {"type": "string"},
                 "action": {
                     "type": "string",
-                    "enum": ["archive", "restore"],
+                    "enum": ["archive", "restore", "pause", "resume"],
                 },
             },
             "required": ["idempotency_key", "project_id", "action"],
