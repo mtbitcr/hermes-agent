@@ -132,6 +132,73 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_worker_runtime_receipt_uses_persisted_dominant_route(
+    monkeypatch, worker_env, tmp_path
+):
+    from hermes_state import SessionDB
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    profile_dir = tmp_path / "runtime-profile"
+    profile_dir.mkdir()
+    session_id = "runtime-session-123"
+    db = SessionDB(db_path=profile_dir / "state.db")
+    try:
+        db.create_session(
+            session_id,
+            source="kanban",
+            model="requested-model",
+            model_config={"reasoning_config": {"effort": "high"}},
+            profile_name="test-worker",
+        )
+        db.update_token_counts(
+            session_id,
+            input_tokens=10,
+            output_tokens=4,
+            model="served-model",
+            billing_provider="served-provider",
+            api_call_count=1,
+        )
+    finally:
+        db.close()
+
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
+    monkeypatch.setenv("HERMES_SESSION_ID", session_id)
+    stamped = kt._stamp_worker_session_metadata(
+        worker_env,
+        {"runtime_receipt": {"model": "worker-invented"}},
+    )
+    assert stamped == {
+        "worker_session_id": session_id,
+        "runtime_receipt": {
+            "schema_version": 1,
+            "engine": "hermes",
+            "profile": "test-worker",
+            "provider": "served-provider",
+            "model": "served-model",
+            "reasoning_effort": "high",
+            "route_evidence": "dominant-session-usage",
+        },
+    }
+
+
+def test_worker_runtime_receipt_never_trusts_worker_claim(
+    monkeypatch, worker_env
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "missing-session")
+    monkeypatch.setattr(kt, "_worker_runtime_receipt", lambda _session_id: None)
+    stamped = kt._stamp_worker_session_metadata(
+        worker_env,
+        {"runtime_receipt": {"model": "worker-invented"}, "kept": True},
+    )
+    assert stamped == {
+        "worker_session_id": "missing-session",
+        "kept": True,
+    }
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the

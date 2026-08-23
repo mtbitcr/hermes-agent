@@ -219,10 +219,84 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+_RUNTIME_RECEIPT_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+
+
+def _runtime_receipt_value(value: Any) -> Optional[str]:
+    """Return one bounded, non-secret runtime identity value."""
+    if not isinstance(value, str):
+        return None
+    clean = value.strip()
+    if not _RUNTIME_RECEIPT_VALUE.fullmatch(clean):
+        return None
+    return clean
+
+
+def _worker_runtime_receipt(session_id: str) -> Optional[dict]:
+    """Read the worker's actual persisted model route from its profile DB.
+
+    The receipt is derived from Hermes-owned session accounting rather than
+    model-supplied handoff metadata.  It is observation-only and best-effort:
+    a session-store outage must not turn a successful task handoff into a
+    failed task transition.
+    """
+    profile = _runtime_receipt_value(os.environ.get("HERMES_PROFILE") or "default")
+    if not profile:
+        return None
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_state import SessionDB
+
+        db_path = get_profile_dir(profile) / "state.db"
+        if not db_path.is_file():
+            return None
+        with SessionDB(db_path=db_path, read_only=True) as db:
+            session = db.get_session(session_id)
+            if not session:
+                return None
+            dominant = db.get_dominant_session_model_route(session_id) or {}
+    except Exception:
+        logger.warning(
+            "could not read trusted runtime receipt for worker session",
+            exc_info=True,
+        )
+        return None
+
+    model = _runtime_receipt_value(dominant.get("model") or session.get("model"))
+    provider = _runtime_receipt_value(
+        dominant.get("billing_provider") or session.get("billing_provider")
+    )
+    model_config = session.get("model_config")
+    if isinstance(model_config, str):
+        try:
+            model_config = json.loads(model_config)
+        except (TypeError, ValueError):
+            model_config = {}
+    reasoning = None
+    if isinstance(model_config, dict):
+        reasoning_config = model_config.get("reasoning_config")
+        if isinstance(reasoning_config, dict):
+            reasoning = _runtime_receipt_value(reasoning_config.get("effort"))
+
+    if not model or not provider:
+        return None
+    return {
+        "schema_version": 1,
+        "engine": "hermes",
+        "profile": profile,
+        "provider": provider,
+        "model": model,
+        "reasoning_effort": reasoning or "provider-default",
+        "route_evidence": (
+            "dominant-session-usage" if dominant else "session-row"
+        ),
+    }
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
-    """Add trusted worker session id metadata for this worker's own task."""
+    """Add trusted session and actual runtime metadata for this worker."""
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return metadata
     session_id = os.environ.get("HERMES_SESSION_ID")
@@ -230,6 +304,11 @@ def _stamp_worker_session_metadata(
         return metadata
     stamped = dict(metadata or {})
     stamped["worker_session_id"] = session_id
+    # Never preserve a model-supplied claim under the trusted receipt key.
+    stamped.pop("runtime_receipt", None)
+    receipt = _worker_runtime_receipt(session_id)
+    if receipt is not None:
+        stamped["runtime_receipt"] = receipt
     return stamped
 
 
