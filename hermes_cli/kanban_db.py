@@ -7022,6 +7022,12 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    # Preserve the mutator isolation contract: recommendation rows and unknown
+    # ids are not completable work tasks.  Check this before deriving scoped
+    # git evidence so those ids retain the historical ``False`` result instead
+    # of being upgraded into a worktree-scope error.
+    if get_task(conn, task_id) is None:
+        return False
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
