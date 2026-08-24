@@ -1259,7 +1259,7 @@ def list_committed_projects(ctx: OwnerContext) -> list[dict]:
             projects.append({
                 "project_id": row["id"],
                 "slug": row["slug"],
-                "name": row["name"],
+                "name": owner_project_name(row["name"]),
                 "description": row["description"],
                 "board": row["board_slug"],
                 "archived": bool(row["archived"]),
@@ -1630,14 +1630,16 @@ def read_project_snapshot(
         "project": {
             "id": project_id,
             "slug": project_slug,
-            "name": str(project["name"]),
+            "name": owner_project_name(project["name"]),
             "description": project["description"],
             "board": board_slug,
             "archived": False,
         },
         "board": {
             "slug": board_slug,
-            "name": str(metadata.get("name") or project["name"]),
+            # Falls back to the Project name, so it is the same owner-facing
+            # display slot and gets the same projection.
+            "name": owner_project_name(metadata.get("name") or project["name"]),
             "project_id": project_id,
             "counts": counts,
             "total": sum(counts[status] for status in _OWNER_PROJECT_COLUMNS),
@@ -1859,7 +1861,7 @@ def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
                 "authority": authority,
                 "kind": kind,
                 "project_slug": str(project["slug"]),
-                "project_name": owner_title(project["name"]),
+                "project_name": owner_project_name(project["name"]),
                 "title": title,
                 "reason": reason,
                 "created_at": _owner_timestamp(row["created_at"]),
@@ -2041,6 +2043,8 @@ _PROJECT_STEWARD_LIMIT = 12
 _INTERNAL_TITLE_PREFIX = re.compile(
     r"^[A-Za-z]{1,4}\d{1,4}[A-Za-z]?\s*(?:[—–:-])\s*"
 )
+_OWNER_TITLE_LIMIT = 240
+_OWNER_PROJECT_NAME_LIMIT = 160
 _OWNER_STATE_LABELS = {
     "triage": "Needs attention",
     "todo": "Planned",
@@ -2070,10 +2074,12 @@ def _owner_timestamp(value: Any) -> Optional[str]:
         return None
 
 
-def owner_title(value: Any) -> str:
-    """Return the canonical owner-safe, single-line work-item title.
+def _owner_display_text(
+    value: Any, *, limit: int, strip_internal_prefix: bool = False
+) -> str:
+    """Sanitize, redact, normalize and bound one owner-visible string.
 
-    This is an owner-facing NON-navigation egress boundary: no title
+    This is an owner-facing NON-navigation egress boundary: nothing
     projected here is ever followed as a link, so redaction runs in the
     strict URL-credential mode. Credential-named query parameters,
     pre-signed signatures and ``user:password@`` userinfo are masked instead
@@ -2083,13 +2089,14 @@ def owner_title(value: Any) -> str:
     repository's own sanitizers rather than a private character list:
     ``tools.ansi_strip`` for NUL/C0/C1/DEL, ESC sequences and the invisible
     plane-14 tag characters, and ``tools.threat_patterns.INVISIBLE_CHARS``
-    for zero-width characters and bidi overrides/isolates. Doing it before
-    redaction means a credential cannot survive by splitting its own token
-    across an invisible character, and doing it at all means a title cannot
-    reorder or hide what the owner is shown. Safe human Unicode is left
-    exactly as written. Whitespace collapse (which also folds U+2028/U+2029),
-    the internal-prefix strip, and the 240 Unicode code point bound then
-    apply to already-sanitized, already-redacted text.
+    for zero-width characters, bidi overrides/isolates and the interlinear
+    annotation frame. Doing it before redaction means a credential cannot
+    survive by splitting its own token across an invisible character, and
+    doing it at all means the text cannot reorder or hide what the owner is
+    shown. Safe human Unicode is left exactly as written. Whitespace collapse
+    (which also folds U+2028/U+2029), the optional internal-prefix strip, and
+    the ``limit`` Unicode code point bound then apply to already-sanitized,
+    already-redacted text.
 
     ``strip_unicode_tags`` runs once more AFTER that bound, and the order
     matters: the first pass preserves the three pinned RGI subdivision flags
@@ -2108,8 +2115,41 @@ def owner_title(value: Any) -> str:
     text = "".join(char for char in text if char not in INVISIBLE_CHARS)
     text = redact_sensitive_text(text, force=True, redact_url_credentials=True)
     text = " ".join(text.split())
-    text = _INTERNAL_TITLE_PREFIX.sub("", text).strip()
-    return strip_unicode_tags(text[:240]) or "Untitled work item"
+    if strip_internal_prefix:
+        text = _INTERNAL_TITLE_PREFIX.sub("", text).strip()
+    return strip_unicode_tags(text[:limit])
+
+
+def owner_title(value: Any) -> str:
+    """Return the canonical owner-safe, single-line work-item title.
+
+    See :func:`_owner_display_text` for the egress contract. A work-item
+    title additionally loses the internal ``B03 — ``-style dispatcher prefix,
+    which is Raphael's own bookkeeping and means nothing to the owner.
+    """
+    return _owner_display_text(
+        value, limit=_OWNER_TITLE_LIMIT, strip_internal_prefix=True
+    ) or "Untitled work item"
+
+
+def owner_project_name(value: Any) -> str:
+    """Return the canonical owner-safe, single-line Project display name.
+
+    Same egress contract as :func:`owner_title` — see
+    :func:`_owner_display_text` — with two deliberate differences. The bound
+    is 160 code points, matching the bound ``commit_task_graph`` accepts when
+    a Project name is first written, so a name that was storable is never cut
+    on the way back out. And no internal-prefix strip runs: a Project name is
+    owner-authored text, not an internally-labelled work item, so a name that
+    happens to start like a dispatcher prefix must survive intact.
+
+    Every owner-facing surface that shows a Project name projects it through
+    here, so the name an owner reads in a Project list, a snapshot, a steward
+    report or a decision cannot disagree between surfaces.
+    """
+    return _owner_display_text(
+        value, limit=_OWNER_PROJECT_NAME_LIMIT
+    ) or "Untitled Project"
 
 
 def _open_read_only_sqlite(path, *, label: str) -> sqlite3.Connection:
@@ -2353,7 +2393,7 @@ def project_steward_snapshot(
         execution_summary = "The approved work is complete."
     return {
         "schema_version": 2,
-        "project": {"name": owner_title(project["name"])},
+        "project": {"name": owner_project_name(project["name"])},
         "generated_at": _owner_timestamp(now),
         "lookback_days": lookback_days,
         "execution": {

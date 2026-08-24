@@ -351,6 +351,46 @@ def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_su
     assert all("secret" not in json.dumps(entry).lower() for entry in request_entries)
 
 
+def test_native_project_response_projects_an_unsafe_project_name(workspace_surface):
+    """This builder only ever serves the owner reader, so it always projects.
+
+    Unlike the board/worker titles, the native Project response has no
+    interactive caller to preserve a raw shape for — a browser falls through
+    to the ordinary handler — so the name is sanitized, credential-masked and
+    bounded at 160 code points unconditionally, with no capability to ask for.
+    """
+    s = workspace_surface
+    zero_width, annotation_anchor = chr(0x200B), chr(0xFFF9)
+    unsafe = (
+        f"Rap{zero_width}hael\x00 \x1b[31mWorkspace{annotation_anchor}"
+        " https://deploy:hunter2verylongpassword@git.example.com/repo.git"
+    )
+    with pdb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE projects SET name = ? WHERE id = ?", (unsafe, s["project_id"])
+        )
+        conn.commit()
+
+    project = _get(s, "/api/plugins/kanban/projects")
+
+    assert project.status_code == 200
+    assert project.json() == {
+        "projects": [{
+            "id": s["project_id"],
+            "slug": PROJECT,
+            "name": "Raphael Workspace https://deploy:***@git.example.com/repo.git",
+        }]
+    }
+    name = project.json()["projects"][0]["name"]
+    assert name == ow.owner_project_name(unsafe)
+    # Asserted on the string, not on serialized JSON, which would render a
+    # NUL as an escape and pass whether or not the control survived.
+    for forbidden in (
+        "hunter2verylongpassword", "\x00", "\x1b", zero_width, annotation_anchor,
+    ):
+        assert forbidden not in name
+
+
 def test_owner_title_capability_projects_board_and_worker_titles(workspace_surface):
     s = workspace_surface
     raw_ready = "B03 — db.password=hunter2verylongpassword"

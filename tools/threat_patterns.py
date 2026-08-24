@@ -142,6 +142,12 @@ _PATTERNS: List[Tuple[str, str, str]] = [
 # (U+206A-U+206F) close the gaps in that original set: every one of them is
 # invisible, and every one can reorder or disguise what a reader is shown.
 #
+# The interlinear annotation controls (U+FFF9-U+FFFB) and the object
+# replacement character (U+FFFC) close the last gap: each renders as nothing
+# in a terminal and in every chat/web UI, and the annotation frame in
+# particular lets a payload sit between an ANCHOR and a TERMINATOR where a
+# reader sees only the annotated base text.
+#
 # This set is also the canonical DISPLAY-hardening list, not just a scanner
 # input: ``hermes_cli.owner_workspace.owner_title`` filters every character in
 # it out of an owner-visible title, which deliberately includes U+200D ZWJ.
@@ -178,6 +184,10 @@ INVISIBLE_CHARS = frozenset({
     '\u206d',  # activate arabic form shaping (deprecated)
     '\u206e',  # national digit shapes (deprecated)
     '\u206f',  # nominal digit shapes (deprecated)
+    '\ufff9',  # interlinear annotation anchor
+    '\ufffa',  # interlinear annotation separator
+    '\ufffb',  # interlinear annotation terminator
+    '\ufffc',  # object replacement character
 })
 
 

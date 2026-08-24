@@ -102,6 +102,97 @@ class TestOwnerWorkspaceRunContext:
             "profile": "default",
         }
 
+    def test_retained_name_goes_through_the_canonical_project_projection(self):
+        """The name kept for the Decisions inbox is owner-facing display text.
+
+        It is the same string ``/v1`` hands back on an approval, so it must
+        leave here already sanitized and credential-masked, not merely
+        length-checked. Both modes are covered: a client-supplied new name
+        and a stored name read back off the receipt-backed Project list.
+
+        Projecting is not the same as accepting: a *new* name over the
+        160-code-point bound ``commit_task_graph`` enforces is still rejected
+        fail-fast rather than truncated into a name the client never asked
+        for.
+        """
+        from hermes_cli.owner_workspace import owner_project_name
+
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        zero_width, annotation_anchor = chr(0x200B), chr(0xFFF9)
+        unsafe = (
+            f"Wo{zero_width}rkshop\x00 \x1b[31mpilot{annotation_anchor}"
+            " https://deploy:hunter2verylongpassword@git.example.com/repo.git"
+        )
+        projected = (
+            "Workshop pilot https://deploy:***@git.example.com/repo.git"
+        )
+        assert owner_project_name(unsafe) == projected
+
+        projects = [{
+            "project_id": "p_unsafe",
+            "slug": "stored-project",
+            "name": unsafe,
+            "description": "",
+            "board": "stored-project",
+            "archived": False,
+        }]
+
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch(
+                "hermes_cli.owner_workspace.resolve_owner_context",
+                return_value=types.SimpleNamespace(profile="default"),
+            ),
+            patch(
+                "hermes_cli.owner_workspace.list_committed_projects",
+                return_value=projects,
+            ),
+        ):
+            new = _resolve_owner_workspace_run_context({
+                "mode": "new",
+                "project_slug": None,
+                "project_name": unsafe,
+            })
+            existing = _resolve_owner_workspace_run_context({
+                "mode": "existing",
+                "project_slug": "stored-project",
+                "project_name": None,
+            })
+            at_bound = _resolve_owner_workspace_run_context({
+                "mode": "new",
+                "project_slug": None,
+                "project_name": "n" * 160,
+            })
+            with pytest.raises(ValueError):
+                _resolve_owner_workspace_run_context({
+                    "mode": "new",
+                    "project_slug": None,
+                    "project_name": "n" * 161,
+                })
+
+        assert new["project_name"] == projected
+        assert existing["project_name"] == projected
+        assert at_bound["project_name"] == "n" * 160
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+    def test_new_mode_still_requires_a_name(self, blank):
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch(
+                "hermes_cli.owner_workspace.resolve_owner_context",
+                return_value=types.SimpleNamespace(profile="default"),
+            ),
+            patch(
+                "hermes_cli.owner_workspace.list_committed_projects",
+                return_value=[],
+            ),
+            pytest.raises(ValueError),
+        ):
+            _resolve_owner_workspace_run_context({
+                "mode": "new", "project_slug": None, "project_name": blank,
+            })
+
 
 # ---------------------------------------------------------------------------
 # _redact_api_error_text — guards every outward error site (envelopes, SSE

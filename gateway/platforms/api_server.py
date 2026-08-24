@@ -276,6 +276,9 @@ def _owner_workspace_capability_requested(
     return capability in {token.strip() for token in raw.split(",")}
 
 
+_OWNER_PROJECT_NAME_MAX_LENGTH = 160
+
+
 def _resolve_owner_workspace_run_context(value: Any) -> "dict[str, str | None] | None":
     """Validate optional owner routing metadata against native Project state.
 
@@ -306,6 +309,7 @@ def _resolve_owner_workspace_run_context(value: Any) -> "dict[str, str | None] |
 
     from hermes_cli.owner_workspace import (
         list_committed_projects,
+        owner_project_name,
         resolve_owner_context,
     )
 
@@ -322,18 +326,29 @@ def _resolve_owner_workspace_run_context(value: Any) -> "dict[str, str | None] |
         ]
         if len(matches) != 1:
             raise ValueError("owner Project is unavailable")
-        project_name = str(matches[0].get("name") or "").strip()
+        project_name = matches[0].get("name")
     else:
         if project_slug is not None:
             raise ValueError("new Project cannot have a slug")
         if not isinstance(project_name, str):
             raise ValueError("new Project name is required")
-        project_name = " ".join(
-            redact_sensitive_text(project_name, force=True).split()
-        ).strip()
+        # A client-supplied new name is still rejected fail-fast at the same
+        # 160-code-point bound ``commit_task_graph`` enforces when the Project
+        # is first written. Letting the projection below shorten it instead
+        # would admit a request the create path refuses and route the approval
+        # under a name the client never asked for. Only a *new* name is a
+        # client claim about a Project that does not exist yet; an existing
+        # name resolved from receipt-backed state was already storable, so it
+        # only ever needs projecting on read.
+        candidate = project_name.strip()
+        if not candidate or len(candidate) > _OWNER_PROJECT_NAME_MAX_LENGTH:
+            raise ValueError("invalid owner Project name")
 
-    if not project_name or len(project_name) > 160:
-        raise ValueError("invalid owner Project name")
+    # The retained name is owner-facing display text on the Decisions inbox,
+    # so it leaves here through the one canonical Project-name projection —
+    # which sanitizes and redacts URL credentials — rather than through a
+    # sanitizer this boundary maintains itself.
+    project_name = owner_project_name(project_name)
     profile = str(getattr(owner, "profile", "") or "").strip()
     if not profile:
         raise ValueError("owner profile is unavailable")

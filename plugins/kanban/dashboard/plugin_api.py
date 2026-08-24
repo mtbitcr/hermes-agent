@@ -3577,9 +3577,17 @@ def _workspace_projects_response() -> Optional[dict]:
     if snapshot is None:
         return None
     project, _ = snapshot
+    # This builder only ever serves the machine-authenticated owner reader
+    # (the interactive dashboard falls through to its own handler), so the
+    # name is projected unconditionally — unlike the board/worker titles,
+    # which stay raw for the browser and are gated on the owner capability.
     return {
         "projects": [
-            {"id": project.id, "slug": project.slug, "name": project.name}
+            {
+                "id": project.id,
+                "slug": project.slug,
+                "name": owner_workspace.owner_project_name(project.name),
+            }
         ]
     }
 
