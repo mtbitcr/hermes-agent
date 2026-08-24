@@ -134,6 +134,7 @@ _register_recommendations_machine_route()
 # routes are always at least this scoped even if that plugin were disabled.
 WORKSPACE_ROUTE_METHOD = "GET"
 _WORKSPACE_API_PREFIX = "/api/plugins/kanban"
+WORKSPACE_OWNER_TITLES_CAPABILITY = "owner_titles_v1"
 _WORKSPACE_LITERAL_ROUTE_PATHS = (
     f"{_WORKSPACE_API_PREFIX}/profiles",
     f"{_WORKSPACE_API_PREFIX}/projects",
@@ -520,9 +521,13 @@ def get_board(
     _workspace_response = _workspace_maybe_respond(
         request,
         require_board=True,
-        builder=_workspace_board_response,
+        builder=lambda: _workspace_board_response(
+            owner_titles=request.query_params.get("capabilities")
+            == WORKSPACE_OWNER_TITLES_CAPABILITY
+        ),
         object_kind="board",
         object_id=WORKSPACE_BOARD,
+        allowed_capability=WORKSPACE_OWNER_TITLES_CAPABILITY,
     )
     if _workspace_response is not None:
         return _workspace_response
@@ -1740,9 +1745,13 @@ def list_active_workers(
     _workspace_response = _workspace_maybe_respond(
         request,
         require_board=True,
-        builder=_workspace_workers_response,
+        builder=lambda: _workspace_workers_response(
+            owner_titles=request.query_params.get("capabilities")
+            == WORKSPACE_OWNER_TITLES_CAPABILITY
+        ),
         object_kind="board",
         object_id=WORKSPACE_BOARD,
+        allowed_capability=WORKSPACE_OWNER_TITLES_CAPABILITY,
     )
     if _workspace_response is not None:
         return _workspace_response
@@ -3280,17 +3289,36 @@ def _workspace_require_no_query(request: Request) -> None:
         raise HTTPException(status_code=400, detail="Bad Request")
 
 
-def _workspace_require_board_only(request: Request) -> None:
-    """Routes 3-9: exactly one query param named 'board', value exactly the granted board.
+def _workspace_require_board_only(
+    request: Request, *, allowed_capability: Optional[str] = None
+) -> None:
+    """Routes 3-9: the granted board and, when allowed, one exact capability.
 
-    A single check covers missing / duplicate / extra / wrong / wildcard /
-    malformed / encoded-alias board values: after FastAPI/Starlette's
-    standard single-pass percent-decoding, anything other than the one
-    literal granted board string fails a plain ``==`` comparison. No
-    special-casing is needed for any one of those shapes.
+    Missing, duplicate, extra, wrong, wildcard, malformed, or encoded-alias
+    values all fail closed after Starlette's standard single-pass decoding.
+    Capabilities are route-specific: a caller cannot use an admitted option
+    on a sibling route whose response contract does not implement it.
     """
     items = request.query_params.multi_items()
-    if len(items) != 1 or items[0][0] != "board" or items[0][1] != WORKSPACE_BOARD:
+    values: dict[str, str] = {}
+    invalid = False
+    for key, value in items:
+        if key in values:
+            invalid = True
+            break
+        values[key] = value
+    expected_keys = {"board"}
+    if allowed_capability is not None:
+        expected_keys.add("capabilities")
+    if (
+        invalid
+        or set(values) not in ({"board"}, expected_keys)
+        or values.get("board") != WORKSPACE_BOARD
+        or (
+            "capabilities" in values
+            and values["capabilities"] != allowed_capability
+        )
+    ):
         _workspace_audit_deny(request, reason="board_query_invalid", status=400)
         raise HTTPException(status_code=400, detail="Bad Request")
 
@@ -3325,6 +3353,7 @@ def _workspace_maybe_respond(
     not_found_reason: str = "not_found",
     object_kind: Optional[str] = None,
     object_id: Optional[object] = None,
+    allowed_capability: Optional[str] = None,
 ):
     """The one call each of the nine handlers makes to opt into machine auth.
 
@@ -3343,7 +3372,9 @@ def _workspace_maybe_respond(
     if not _is_workspace_machine_call(request):
         return None
     if require_board:
-        _workspace_require_board_only(request)
+        _workspace_require_board_only(
+            request, allowed_capability=allowed_capability
+        )
     else:
         _workspace_require_no_query(request)
     if not _workspace_scope_is_active():
@@ -3565,7 +3596,7 @@ def _workspace_boards_response() -> Optional[dict]:
     }
 
 
-def _workspace_board_response() -> dict:
+def _workspace_board_response(*, owner_titles: bool = False) -> dict:
     empty_columns = {"columns": [{"name": name, "tasks": []} for name in BOARD_COLUMNS]}
     conn = _workspace_ro_conn()
     if conn is None:
@@ -3590,7 +3621,11 @@ def _workspace_board_response() -> dict:
             columns[col].append(
                 {
                     "id": t.id,
-                    "title": t.title,
+                    "title": (
+                        owner_workspace.owner_title(t.title)
+                        if owner_titles
+                        else t.title
+                    ),
                     "assignee_name": t.assignee,
                     "responsibility": t.responsibility,
                     "updated_at": _workspace_iso_timestamp(
@@ -3606,7 +3641,7 @@ def _workspace_board_response() -> dict:
         conn.close()
 
 
-def _workspace_workers_response() -> dict:
+def _workspace_workers_response(*, owner_titles: bool = False) -> dict:
     conn = _workspace_ro_conn()
     if conn is None:
         return {"workers": []}
@@ -3628,7 +3663,11 @@ def _workspace_workers_response() -> dict:
             "workers": [
                 {
                     "profile": row["profile"],
-                    "task_title": row["task_title"],
+                    "task_title": (
+                        owner_workspace.owner_title(row["task_title"])
+                        if owner_titles
+                        else row["task_title"]
+                    ),
                     "started_at": int(row["started_at"]),
                 }
                 for row in rows

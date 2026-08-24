@@ -1322,7 +1322,47 @@ class TestOwnerWorkspaceProjectSnapshotEndpoint:
             "object": "hermes.owner_workspace.project_snapshot",
             "data": expected,
         }
-        read.assert_called_once_with(ANY, "shoe-shop")
+        read.assert_called_once_with(ANY, "shoe-shop", run_context=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query,expected_run_context",
+        [
+            ("", False),
+            ("?capabilities=", False),
+            ("?capabilities=something_else", False),
+            ("?capabilities=run_task_context", True),
+            ("?capabilities=something_else,run_task_context", True),
+            ("?capabilities=run_task_context_extra", False),
+            ("?capabilities=" + "x" * 300 + ",run_task_context", False),
+        ],
+    )
+    async def test_run_context_is_served_only_to_a_reader_that_asks_for_it(
+        self, adapter, query, expected_run_context,
+    ):
+        """The /v1 run shape stays what its oldest reader validates.
+
+        A reader that predates the added run keys never sends
+        ``capabilities``, so deploying this Hermes first cannot hand that
+        reader a snapshot its closed schema rejects. An oversized parameter
+        grants nothing rather than being parsed.
+        """
+        app = _create_app(adapter)
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch("hermes_cli.owner_workspace.resolve_owner_context", return_value=object()),
+            patch("hermes_cli.owner_workspace.read_project_snapshot", return_value={}) as read,
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    f"/v1/owner-workspace/projects/shoe-shop/snapshot{query}"
+                )
+
+        assert resp.status == 200
+        read.assert_called_once_with(
+            ANY, "shoe-shop", run_context=expected_run_context
+        )
 
     @pytest.mark.asyncio
     async def test_non_receipt_project_is_indistinguishable_from_missing(self, adapter):

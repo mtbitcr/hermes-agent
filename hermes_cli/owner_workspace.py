@@ -1276,6 +1276,16 @@ _OWNER_PROJECT_MAX_TASKS = 200
 _OWNER_PROJECT_MAX_ATTACHMENTS = 200
 _OWNER_PROJECT_MAX_RUNS = 50
 _OWNER_PROJECT_MAX_WORKERS = 100
+
+# The named response capability a snapshot reader opts into to receive a run's
+# own sanitized task title and its per-exact-task-id retry fact.
+#
+# The default projection stays the three-key run shape the first owner
+# Workspace release validates as a closed schema, so deploying this Hermes
+# ahead of the Workspace that understands the added keys cannot make a
+# snapshot unreadable. Only a client that asks for this capability by name
+# receives the wider run shape.
+OWNER_PROJECT_RUN_CONTEXT_CAPABILITY = "run_task_context"
 _OWNER_PROJECT_MEDIA_TYPE_RE = re.compile(
     r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$"
 )
@@ -1417,7 +1427,7 @@ def _owner_project_run_receipt(run: kanban_db.Run) -> dict:
 
 
 def _owner_project_run_projection(
-    run: kanban_db.Run, task_title: Any, *, has_newer_run: bool,
+    run: kanban_db.Run, task_title: Any, *, has_newer_run: bool, run_context: bool,
 ) -> dict:
     """Project one run for the owner, carrying its retry fact but never its id.
 
@@ -1426,17 +1436,29 @@ def _owner_project_run_projection(
     which two genuinely distinct tasks may legitimately sanitize to. The id
     itself never crosses this boundary, so this boolean is the only way a
     consumer can know a later attempt at the same work exists.
+
+    Both of those keys are withheld unless ``run_context`` is set: they are
+    served only to a reader that named
+    ``OWNER_PROJECT_RUN_CONTEXT_CAPABILITY``, so an older reader keeps the
+    exact run shape it validates as a closed schema.
     """
-    return {
-        "task_title": _owner_title(task_title),
+    projection = {
         "started_at": _owner_timestamp(run.started_at),
         "finished_at": _owner_timestamp(run.ended_at),
-        "has_newer_run": bool(has_newer_run),
         "receipt": _owner_project_run_receipt(run),
+    }
+    if not run_context:
+        return projection
+    return {
+        "task_title": owner_title(task_title),
+        "has_newer_run": bool(has_newer_run),
+        **projection,
     }
 
 
-def read_project_snapshot(ctx: OwnerContext, project_slug: str) -> dict:
+def read_project_snapshot(
+    ctx: OwnerContext, project_slug: str, *, run_context: bool = False,
+) -> dict:
     """Return one bounded read-only surface for an exact receipt-owned Project.
 
     The caller cannot select a board independently.  The Project slug must be
@@ -1445,6 +1467,11 @@ def read_project_snapshot(ctx: OwnerContext, project_slug: str) -> dict:
     already used by the owner Workspace cross this boundary: task bodies,
     results, paths, branches, logs, comments, raw events and model metadata do
     not.
+
+    ``run_context`` adds each run's own sanitized task title and retry fact.
+    It defaults off so the shape stays exactly what the oldest owner
+    Workspace release accepts; see
+    ``OWNER_PROJECT_RUN_CONTEXT_CAPABILITY``.
     """
     try:
         project_slug = projects_db.normalize_slug(project_slug) or ""
@@ -1531,7 +1558,7 @@ def read_project_snapshot(ctx: OwnerContext, project_slug: str) -> dict:
             state = event_state.get(task.id)
             columns[task.status].append({
                 "id": task.id,
-                "title": _owner_title(task.title),
+                "title": owner_title(task.title),
                 "assignee_name": task.assignee,
                 "responsibility": task.responsibility,
                 "updated_at": _owner_timestamp(state["latest"] if state else task.created_at),
@@ -1584,6 +1611,7 @@ def read_project_snapshot(ctx: OwnerContext, project_slug: str) -> dict:
                     run,
                     row["task_title"],
                     has_newer_run=run_task_id in task_ids_with_newer_run,
+                    run_context=run_context,
                 )
             )
             task_ids_with_newer_run.add(run_task_id)
@@ -1617,7 +1645,7 @@ def read_project_snapshot(ctx: OwnerContext, project_slug: str) -> dict:
         "columns": [{"name": status, "tasks": columns[status]} for status in _OWNER_PROJECT_COLUMNS],
         "workers": [{
             "profile": str(row["profile"]),
-            "task_title": _owner_title(row["task_title"]),
+            "task_title": owner_title(row["task_title"]),
             "started_at": int(row["started_at"]),
         } for row in worker_rows[:_OWNER_PROJECT_MAX_WORKERS]],
         "attachments": attachments,
@@ -1814,7 +1842,7 @@ def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
             if task_kind == "recommendation":
                 authority = "recommendation"
                 kind = "capability"
-                title = _owner_title(row["recommendation_label"])
+                title = owner_title(row["recommendation_label"])
                 reason = _owner_decision_reason(
                     row["recommendation_rationale"],
                     fallback="Raphael has suggested a capability change for your review.",
@@ -1822,7 +1850,7 @@ def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
             elif row["block_kind"] == "needs_input":
                 authority = "task"
                 kind = "owner_input"
-                title = _owner_title(row["title"])
+                title = owner_title(row["title"])
                 reason = "Raphael needs your answer before this work can continue."
             decisions.append({
                 "decision_ref": _owner_decision_ref(
@@ -1831,7 +1859,7 @@ def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
                 "authority": authority,
                 "kind": kind,
                 "project_slug": str(project["slug"]),
-                "project_name": _owner_title(project["name"]),
+                "project_name": owner_title(project["name"]),
                 "title": title,
                 "reason": reason,
                 "created_at": _owner_timestamp(row["created_at"]),
@@ -2042,7 +2070,8 @@ def _owner_timestamp(value: Any) -> Optional[str]:
         return None
 
 
-def _owner_title(value: Any) -> str:
+def owner_title(value: Any) -> str:
+    """Return the canonical owner-safe, single-line work-item title."""
     from agent.redact import redact_sensitive_text
 
     text = redact_sensitive_text(str(value or ""), force=True)
@@ -2170,7 +2199,7 @@ def project_steward_snapshot(
     cutoff = now - lookback_days * 86_400
     items = [
         {
-            "title": _owner_title(row["title"]),
+            "title": owner_title(row["title"]),
             "status": str(row["status"]),
             "created_at": int(row["created_at"]),
             "started_at": row["started_at"],
@@ -2292,7 +2321,7 @@ def project_steward_snapshot(
         execution_summary = "The approved work is complete."
     return {
         "schema_version": 2,
-        "project": {"name": _owner_title(project["name"])},
+        "project": {"name": owner_title(project["name"])},
         "generated_at": _owner_timestamp(now),
         "lookback_days": lookback_days,
         "execution": {

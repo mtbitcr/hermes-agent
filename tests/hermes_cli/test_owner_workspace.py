@@ -411,6 +411,43 @@ def test_project_snapshot_is_exact_receipt_backed_and_read_only(ctx):
     assert snapshot["steward"]["execution"]["paused"] is False
 
 
+def test_owner_title_projection_vectors_are_shared_with_the_owner_workspace():
+    """Pinned outputs the owner Workspace's own title projection must match.
+
+    Both the receipt snapshot and the capability-gated native machine read
+    call this public helper, so their owner-visible titles cannot drift.
+    """
+    assert ow.owner_title("B03 — Ship the thing") == "Ship the thing"
+    assert ow.owner_title("R07: Fix the outage") == "Fix the outage"
+    assert ow.owner_title("R7-Fix the outage") == "Fix the outage"
+    assert ow.owner_title("R07:   Fix   the\n  outage  ") == "Fix the outage"
+    assert ow.owner_title("Rotate the shop key") == "Rotate the shop key"
+    assert ow.owner_title("Version 12 of the plan") == "Version 12 of the plan"
+    assert (
+        ow.owner_title("Rotate ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 before Friday")
+        == "Rotate ghp_AB...6789 before Friday"
+    )
+    assert ow.owner_title("Key sk-ABCDEFGHIJ rotated") == "Key *** rotated"
+    assert (
+        ow.owner_title("B03 — eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvd25lciJ9")
+        == "eyJhbG...ciJ9"
+    )
+    assert ow.owner_title("   ") == "Untitled work item"
+    assert ow.owner_title("B03 —") == "Untitled work item"
+    assert ow.owner_title(None) == "Untitled work item"
+    # The cap counts Unicode code points, so an astral title keeps 240 of them.
+    assert ow.owner_title("🚀" * 240) == "🚀" * 240
+    assert ow.owner_title("🚀" * 241) == "🚀" * 240
+    # The prefixed-and-redacted vector the Workspace parity test reads through
+    # both a native board and a receipt snapshot.
+    assert (
+        ow.owner_title(
+            "B03 —  Rotate ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789   before Friday"
+        )
+        == "Rotate ghp_AB...6789 before Friday"
+    )
+
+
 def test_owner_run_projection_uses_only_native_runtime_and_cost_receipt():
     run = kanban_db.Run(
         id=1,
@@ -449,7 +486,7 @@ def test_owner_run_projection_uses_only_native_runtime_and_cost_receipt():
     )
 
     projection = ow._owner_project_run_projection(
-        run, "B03 — Ship the thing", has_newer_run=False,
+        run, "B03 — Ship the thing", has_newer_run=False, run_context=True,
     )
     assert projection["task_title"] == "Ship the thing"
     assert projection["has_newer_run"] is False
@@ -472,10 +509,17 @@ def test_owner_run_projection_uses_only_native_runtime_and_cost_receipt():
 
     run.metadata["runtime_receipt"]["model"] = "unadmitted-model"
     rejected = ow._owner_project_run_projection(
-        run, "B03 — Ship the thing", has_newer_run=True,
+        run, "B03 — Ship the thing", has_newer_run=True, run_context=True,
     )["receipt"]
     assert rejected["runtime"] == ow._OWNER_UNKNOWN_RUNTIME
     assert rejected["cost"] == ow._OWNER_UNKNOWN_COST
+
+    # Without the capability the same run projects to exactly the three keys
+    # the first owner Workspace release accepts, so a Hermes-first rollout
+    # cannot make a snapshot unreadable.
+    assert set(ow._owner_project_run_projection(
+        run, "B03 — Ship the thing", has_newer_run=True, run_context=False,
+    )) == {"started_at", "finished_at", "receipt"}
 
 
 def test_project_snapshot_run_projection_has_sanitized_task_title(ctx):
@@ -503,7 +547,9 @@ def test_project_snapshot_run_projection_has_sanitized_task_title(ctx):
                 (task_id, "default", "done", now - 60, now, "completed"),
             )
 
-    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+    snapshot = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )
 
     assert len(snapshot["runs"]) == 1
     run = snapshot["runs"][0]
@@ -517,6 +563,22 @@ def test_project_snapshot_run_projection_has_sanitized_task_title(ctx):
     # board task list); only the run projection/receipt must not leak it.
     run_payload = json.dumps(run)
     assert task_id not in run_payload
+
+    # Same Project, same runs, no capability asked for: the default read is
+    # exactly the shape a Workspace release that predates these keys accepts,
+    # and it still carries the sanitized run facts that shape allows.
+    default_read = ow.read_project_snapshot(ctx, result["project_slug"])
+    assert len(default_read["runs"]) == 1
+    assert set(default_read["runs"][0]) == {"started_at", "finished_at", "receipt"}
+    assert default_read["runs"][0]["receipt"] == run["receipt"]
+    assert default_read["runs"][0]["started_at"] == run["started_at"]
+    # Every other key of the snapshot is unaffected by the capability, so the
+    # two reads differ only in the run shape. The steward block is excluded
+    # because it stamps its own read time.
+    skipped = {"runs", "steward"}
+    assert {k: v for k, v in default_read.items() if k not in skipped} == {
+        k: v for k, v in snapshot.items() if k not in skipped
+    }
 
 
 def test_project_snapshot_run_retry_is_decided_per_exact_task_id(ctx):
@@ -561,7 +623,9 @@ def test_project_snapshot_run_retry_is_decided_per_exact_task_id(ctx):
                     (task_id, "default", "done", started, ended, "completed"),
                 )
 
-    runs = ow.read_project_snapshot(ctx, result["project_slug"])["runs"]
+    runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
 
     assert all(
         set(run) == {
@@ -579,6 +643,17 @@ def test_project_snapshot_run_retry_is_decided_per_exact_task_id(ctx):
     payload = json.dumps(runs)
     assert retried_id not in payload
     assert namesake_id not in payload
+
+    # A reader that did not ask for the capability gets no retry fact at all,
+    # rather than a fact it would reject or misread: the three runs keep the
+    # legacy shape and stay in the same newest-first order.
+    default_runs = ow.read_project_snapshot(ctx, result["project_slug"])["runs"]
+    assert [set(run) for run in default_runs] == [
+        {"started_at", "finished_at", "receipt"}
+    ] * 3
+    assert [run["started_at"] for run in default_runs] == [
+        run["started_at"] for run in runs
+    ]
 
 
 def test_project_snapshot_hides_projects_without_owner_receipt(ctx):

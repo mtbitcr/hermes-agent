@@ -245,6 +245,30 @@ def _owner_workspace_toolset_enabled(user_config: dict) -> bool:
     return value is True
 
 
+_OWNER_WORKSPACE_CAPABILITIES_MAX_LENGTH = 256
+
+
+def _owner_workspace_capability_requested(
+    request: "web.Request", capability: str,
+) -> bool:
+    """Whether this reader explicitly asked for one named response capability.
+
+    The ``/v1`` owner-workspace surface keeps serving the exact response
+    shape its oldest reader validates as a closed schema, so an added field
+    is opt-in: a reader that understands one names it in
+    ``?capabilities=a,b``. That keeps either side of a rolling deployment
+    readable by the other, because an older Hermes ignores the parameter and
+    an older reader never sends it.
+
+    Anything else grants nothing: a missing, oversized, or unknown value is
+    the same as not asking.
+    """
+    raw = request.query.get("capabilities", "")
+    if len(raw) > _OWNER_WORKSPACE_CAPABILITIES_MAX_LENGTH:
+        return False
+    return capability in {token.strip() for token in raw.split(",")}
+
+
 def _resolve_owner_workspace_run_context(value: Any) -> "dict[str, str | None] | None":
     """Validate optional owner routing metadata against native Project state.
 
@@ -7513,12 +7537,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
             from hermes_cli.owner_workspace import (
+                OWNER_PROJECT_RUN_CONTEXT_CAPABILITY,
                 read_project_snapshot,
                 resolve_owner_context,
             )
 
             snapshot = read_project_snapshot(
-                resolve_owner_context(), request.match_info.get("project_slug", "")
+                resolve_owner_context(),
+                request.match_info.get("project_slug", ""),
+                run_context=_owner_workspace_capability_requested(
+                    request, OWNER_PROJECT_RUN_CONTEXT_CAPABILITY
+                ),
             )
         except OwnerWorkspaceError as exc:
             if exc.code == "project_not_found":

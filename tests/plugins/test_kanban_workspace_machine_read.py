@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import owner_workspace as ow
 from hermes_cli import projects_db as pdb
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth import token_auth
@@ -350,6 +351,64 @@ def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_su
     assert all("secret" not in json.dumps(entry).lower() for entry in request_entries)
 
 
+def test_owner_title_capability_projects_board_and_worker_titles(workspace_surface):
+    s = workspace_surface
+    raw_ready = "B03 — db.password=hunter2verylongpassword"
+    raw_running = (
+        'R07: curl -H "Authorization: Bearer sk-abcdef1234567890"'
+    )
+    conn = kb.connect(board=BOARD)
+    try:
+        conn.execute(
+            "UPDATE tasks SET title = ? WHERE id = ?", (raw_ready, s["ready_id"])
+        )
+        conn.execute(
+            "UPDATE tasks SET title = ? WHERE id = ?",
+            (raw_running, s["running_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    query = (
+        f"?board={BOARD}&capabilities="
+        f"{plugin_api.WORKSPACE_OWNER_TITLES_CAPABILITY}"
+    )
+    board = _get(s, "/api/plugins/kanban/board", query=query)
+    workers = _get(s, "/api/plugins/kanban/workers/active", query=query)
+
+    assert board.status_code == 200
+    assert workers.status_code == 200
+    task_titles = {
+        task["id"]: task["title"]
+        for column in board.json()["columns"]
+        for task in column["tasks"]
+    }
+    assert task_titles == {
+        s["ready_id"]: ow.owner_title(raw_ready),
+        s["running_id"]: ow.owner_title(raw_running),
+    }
+    assert workers.json()["workers"][0]["task_title"] == ow.owner_title(
+        raw_running
+    )
+    serialized = json.dumps({"board": board.json(), "workers": workers.json()})
+    assert "hunter2verylongpassword" not in serialized
+    assert "sk-abcdef1234567890" not in serialized
+    assert all(not title.startswith("B03") for title in task_titles.values())
+    assert all(not title.startswith("R07") for title in task_titles.values())
+
+    # No capability means the legacy response shape and semantics remain
+    # unchanged for an older Workspace during a Hermes-first rollout.
+    legacy = _get(s, "/api/plugins/kanban/board", query=f"?board={BOARD}")
+    legacy_titles = {
+        task["id"]: task["title"]
+        for column in legacy.json()["columns"]
+        for task in column["tasks"]
+    }
+    assert legacy_titles[s["ready_id"]] == raw_ready
+    assert legacy_titles[s["running_id"]] == raw_running
+
+
 @pytest.mark.parametrize(
     ("path", "query"),
     [
@@ -360,6 +419,12 @@ def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_su
         ("/api/plugins/kanban/board", "?board=other-board"),
         ("/api/plugins/kanban/board", f"?board={BOARD}&extra=1"),
         ("/api/plugins/kanban/board", f"?board={BOARD}&board={BOARD}"),
+        ("/api/plugins/kanban/board", f"?board={BOARD}&capabilities=unknown"),
+        (
+            "/api/plugins/kanban/assignees",
+            f"?board={BOARD}&capabilities="
+            f"{plugin_api.WORKSPACE_OWNER_TITLES_CAPABILITY}",
+        ),
     ],
 )
 def test_query_contract_fails_closed(workspace_surface, path, query):
