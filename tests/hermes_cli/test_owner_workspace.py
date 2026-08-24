@@ -614,6 +614,57 @@ def test_owner_title_keeps_only_the_three_pinned_rgi_tag_flags():
     assert ow.owner_title(f"Ship {unterminated}") == "Ship \U0001F3F4"
 
 
+def test_owner_title_never_projects_a_tag_flag_cut_by_the_240_bound():
+    """The 240 code point slice can land inside a preserved pinned flag.
+
+    The pinned flags are preserved WHOLE before the bound is applied, so the
+    slice itself is what can cut one — leaving the visible U+1F3F4 base
+    trailed by dangling invisible plane-14 tag characters, which is the
+    smuggling frame the boundary exists to remove and which the Workspace
+    correctly rejects. Re-running ``strip_unicode_tags`` on the bounded text
+    keeps an intact flag intact and reduces a cut one to its visible base.
+
+    Each flag is 7 code points (U+1F3F4 base + 5 tag letters + U+E007F), so
+    240 - 7 = 233 is the last start offset that fits whole.
+    """
+    def _tag_flag(code: str) -> str:
+        return (
+            "\U0001F3F4"
+            + "".join(chr(0xE0000 + ord(c)) for c in code)
+            + chr(0xE007F)
+        )
+
+    def _has_tag_char(text: str) -> bool:
+        return any(0xE0000 <= ord(char) <= 0xE007F for char in text)
+
+    for code in ("gbeng", "gbsct", "gbwls"):
+        flag = _tag_flag(code)
+        assert len(flag) == 7
+
+        # Wholly before the bound: unchanged, flag and all.
+        assert ow.owner_title("a" * 100 + flag) == "a" * 100 + flag
+        # Ending exactly ON the bound: still whole, still preserved.
+        assert ow.owner_title("a" * 233 + flag) == "a" * 233 + flag
+
+        # Cut by the bound — the CANCEL TAG, then the tag letters, then the
+        # base itself fall outside 240. Every one keeps the visible base (or
+        # nothing) and never a dangling tag character.
+        for start, expected in (
+            (234, "a" * 234 + "\U0001F3F4"),   # loses U+E007F only
+            (238, "a" * 238 + "\U0001F3F4"),   # reviewer counterexample
+            (239, "a" * 239 + "\U0001F3F4"),   # base is the 240th code point
+        ):
+            projected = ow.owner_title("a" * start + flag)
+            assert projected == expected
+            assert not _has_tag_char(projected)
+            assert len(projected) <= 240
+
+        # Wholly after the bound: the flag never reaches the owner at all.
+        assert ow.owner_title("a" * 240 + flag) == "a" * 240
+        assert ow.owner_title("a" * 300 + flag) == "a" * 240
+        assert not _has_tag_char(ow.owner_title("a" * 300 + flag))
+
+
 def test_owner_run_projection_uses_only_native_runtime_and_cost_receipt():
     run = kanban_db.Run(
         id=1,

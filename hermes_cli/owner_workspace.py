@@ -2090,6 +2090,15 @@ def owner_title(value: Any) -> str:
     exactly as written. Whitespace collapse (which also folds U+2028/U+2029),
     the internal-prefix strip, and the 240 Unicode code point bound then
     apply to already-sanitized, already-redacted text.
+
+    ``strip_unicode_tags`` runs once more AFTER that bound, and the order
+    matters: the first pass preserves the three pinned RGI subdivision flags
+    whole, so the code point slice can land inside one and leave dangling
+    invisible tag characters behind a visible U+1F3F4 base — exactly the
+    smuggling frame the boundary exists to remove, and what the Workspace
+    correctly rejects. Re-running the same pinned sanitizer on the bounded
+    text keeps an intact flag intact and reduces a cut one to its visible
+    black-flag base, with no grapheme parsing of our own.
     """
     from agent.redact import redact_sensitive_text
     from tools.ansi_strip import sanitize_display_text, strip_unicode_tags
@@ -2100,7 +2109,7 @@ def owner_title(value: Any) -> str:
     text = redact_sensitive_text(text, force=True, redact_url_credentials=True)
     text = " ".join(text.split())
     text = _INTERNAL_TITLE_PREFIX.sub("", text).strip()
-    return text[:240] or "Untitled work item"
+    return strip_unicode_tags(text[:240]) or "Untitled work item"
 
 
 def _open_read_only_sqlite(path, *, label: str) -> sqlite3.Connection:
