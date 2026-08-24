@@ -6775,7 +6775,7 @@ def get_model_info(request: Request, profile: Optional[str] = None):
         )
         with _profile_scope(scoped_profile):
             cfg = load_config()
-        fallback_providers = cfg.get("fallback_providers", [])
+        fallback_providers = cfg.get("fallback_providers")
         fallback_model = cfg.get("fallback_model")
         fallback_disabled = (
             isinstance(fallback_providers, list)

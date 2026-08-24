@@ -2980,6 +2980,25 @@ class TestModelInfoEndpoint:
         assert resp.json()["fallback_disabled"] is False
 
 
+    def test_model_info_does_not_infer_disabled_fallbacks_when_key_is_missing(
+        self, monkeypatch
+    ):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(
+            ws,
+            "load_config",
+            lambda: {
+                "model": {"default": "claude-sonnet-5", "provider": "anthropic"},
+            },
+        )
+
+        resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        assert resp.json()["fallback_disabled"] is False
+
+
     def test_model_info_models_machine_projection_includes_authoritative_fallback_state(
         self, monkeypatch
     ):
