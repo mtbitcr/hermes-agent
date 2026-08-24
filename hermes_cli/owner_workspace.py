@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -85,6 +86,9 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db, projects_db
 from hermes_cli.sqlite_util import write_txn
+from plugins.dashboard_auth.raphael_workspace.model_policy import (
+    validate_assignment as validate_raphael_model_assignment,
+)
 
 # fcntl is Unix-only; on Windows msvcrt provides the equivalent kernel file
 # lock. Both are stdlib and both are enforced by the OS across processes —
@@ -1275,6 +1279,15 @@ _OWNER_PROJECT_MAX_WORKERS = 100
 _OWNER_PROJECT_MEDIA_TYPE_RE = re.compile(
     r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$"
 )
+_OWNER_RUNTIME_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_OWNER_UNKNOWN_RUNTIME = {
+    "state": "unknown",
+    "summary": "This record does not contain an authoritative model route.",
+}
+_OWNER_UNKNOWN_COST = {
+    "state": "unknown",
+    "summary": "This record does not contain an authoritative cost.",
+}
 
 
 def _owner_project_attachment_projection(row: sqlite3.Row) -> dict:
@@ -1293,7 +1306,86 @@ def _owner_project_attachment_projection(row: sqlite3.Row) -> dict:
     }
 
 
-def _owner_project_run_projection(run: kanban_db.Run) -> dict:
+def _owner_runtime_value(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    clean = value.strip()
+    return clean if _OWNER_RUNTIME_VALUE_RE.fullmatch(clean) else None
+
+
+def _owner_project_runtime_and_cost(run: kanban_db.Run) -> tuple[dict, dict]:
+    metadata = run.metadata if isinstance(run.metadata, dict) else {}
+    raw = metadata.get("runtime_receipt")
+    if not isinstance(raw, dict) or raw.get("schema_version") != 2:
+        return dict(_OWNER_UNKNOWN_RUNTIME), dict(_OWNER_UNKNOWN_COST)
+
+    engine = _owner_runtime_value(raw.get("engine"))
+    profile = _owner_runtime_value(raw.get("profile"))
+    provider = _owner_runtime_value(raw.get("provider"))
+    model = _owner_runtime_value(raw.get("model"))
+    effort = _owner_runtime_value(raw.get("reasoning_effort"))
+    evidence = _owner_runtime_value(raw.get("route_evidence"))
+    if (
+        engine != "hermes"
+        or profile != run.profile
+        or not provider
+        or not model
+        or not effort
+        or evidence not in {"dominant-session-usage", "session-row"}
+    ):
+        return dict(_OWNER_UNKNOWN_RUNTIME), dict(_OWNER_UNKNOWN_COST)
+    try:
+        validate_raphael_model_assignment(
+            profile,
+            provider,
+            model,
+            effort,
+            disable_fallbacks=True,
+        )
+    except ValueError:
+        return dict(_OWNER_UNKNOWN_RUNTIME), dict(_OWNER_UNKNOWN_COST)
+
+    runtime = {
+        "state": "known",
+        "engine": engine,
+        "profile": profile,
+        "provider": provider,
+        "model": model,
+        "reasoning_effort": effort,
+    }
+    cost = raw.get("cost")
+    if not isinstance(cost, dict):
+        return runtime, dict(_OWNER_UNKNOWN_COST)
+    state = _owner_runtime_value(cost.get("state"))
+    currency = _owner_runtime_value(cost.get("currency"))
+    scope = _owner_runtime_value(cost.get("scope"))
+    amount = cost.get("amount")
+    if (
+        state not in {"estimated", "exact", "reported", "included"}
+        or currency != "USD"
+        or scope != "dominant-main-route"
+        or isinstance(amount, bool)
+        or not isinstance(amount, (int, float))
+        or not math.isfinite(float(amount))
+        or float(amount) < 0
+        or float(amount) > 1_000_000
+    ):
+        return runtime, dict(_OWNER_UNKNOWN_COST)
+    summary = {
+        "estimated": "Estimated model usage for this recorded route.",
+        "exact": "Recorded model usage cost for this route.",
+        "reported": "Provider-reported model usage cost for this route.",
+        "included": "Included in the connected provider plan.",
+    }[state]
+    return runtime, {
+        "state": state,
+        "currency": "USD",
+        "amount": round(float(amount), 8),
+        "summary": summary,
+    }
+
+
+def _owner_project_run_receipt(run: kanban_db.Run) -> dict:
     outcome = (run.outcome or run.status or "").strip().lower()
     if run.status == "running":
         owner_outcome, summary = "running", "Work is still in progress."
@@ -1310,22 +1402,25 @@ def _owner_project_run_projection(run: kanban_db.Run) -> dict:
         owner_outcome, summary = "attention", "Work stopped and needs attention."
     else:
         owner_outcome, summary = "unknown", "The final outcome could not be confirmed."
+    runtime, cost = _owner_project_runtime_and_cost(run)
+    return {
+        "outcome": owner_outcome,
+        "summary": summary,
+        "external_effect": {
+            "state": "unknown",
+            "summary": "This record does not confirm whether an external service changed.",
+        },
+        "runtime": runtime,
+        "cost": cost,
+        "evidence": {"state": "available", "kind": "project_activity"},
+    }
+
+
+def _owner_project_run_projection(run: kanban_db.Run) -> dict:
     return {
         "started_at": _owner_timestamp(run.started_at),
         "finished_at": _owner_timestamp(run.ended_at),
-        "receipt": {
-            "outcome": owner_outcome,
-            "summary": summary,
-            "external_effect": {
-                "state": "unknown",
-                "summary": "This record does not confirm whether an external service changed.",
-            },
-            "cost": {
-                "state": "unknown",
-                "summary": "This record does not contain an authoritative cost.",
-            },
-            "evidence": {"state": "available", "kind": "project_activity"},
-        },
+        "receipt": _owner_project_run_receipt(run),
     }
 
 
