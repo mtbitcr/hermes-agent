@@ -196,6 +196,17 @@ class TestInvisibleUnicode:
         assert any(f.startswith("invisible_unicode_U+200B") for f in findings)
 
 
+    def test_bidi_marks_and_deprecated_format_controls_are_detected(self):
+        # The bidi marks (U+061C, U+200E, U+200F), the remaining invisible
+        # math operator (U+2061) and the deprecated format characters
+        # (U+206A-U+206F) round out the set. Each is invisible, so each is
+        # reported with its own code point for the caller to log.
+        for codepoint in (0x061C, 0x200E, 0x200F, 0x2061, *range(0x206A, 0x2070)):
+            assert chr(codepoint) in INVISIBLE_CHARS
+            findings = scan_for_threats(f"normal text{chr(codepoint)}", scope="all")
+            assert f"invisible_unicode_U+{codepoint:04X}" in findings
+
+
     def test_invisible_chars_set_is_frozenset(self):
         # Pin: should be immutable so callers can't accidentally mutate the
         # shared set.
