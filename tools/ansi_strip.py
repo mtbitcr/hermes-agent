@@ -48,14 +48,26 @@ _HAS_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 # channel (hide `\u{E0069}\u{E0067}\u{E006E}...` = invisible instructions
 # inside otherwise benign tool output).  Ported from block/goose#10746.
 #
-# The ONLY legitimate modern use is emoji tag sequences (Unicode TR51):
-# a U+1F3F4 black-flag base followed by tag spec characters and the
-# U+E007F CANCEL TAG terminator (e.g. the flags of Scotland/Wales/England).
-# goose strips those too; we preserve them — same rationale as keeping ZWJ
-# inside emoji sequences.
+# The ONLY legitimate modern use is the three emoji tag sequences Unicode
+# actually defines as RGI (TR51): the subdivision flags of England, Scotland
+# and Wales — a U+1F3F4 black-flag base, the exact lowercase subdivision code
+# as tag characters, and the U+E007F CANCEL TAG terminator.  goose strips
+# those too; we preserve exactly those three sequences and nothing else.
+#
+# Pinning the sequences rather than the SHAPE is the whole point: a U+1F3F4
+# followed by an arbitrary tag payload and a CANCEL TAG is not a flag, it is a
+# well-formed smuggling frame.  Preserving the shape would leave the entire
+# channel open to anything an attacker parks behind one visible black flag.
+_TAG_FLAG_BASE = "\U0001F3F4"
+_TAG_CANCEL = "\U000E007F"
+_PINNED_TAG_FLAGS = tuple(
+    _TAG_FLAG_BASE + "".join(chr(0xE0000 + ord(ch)) for ch in code) + _TAG_CANCEL
+    for code in ("gbeng", "gbsct", "gbwls")
+)
+
 _UNICODE_TAG_SUB_RE = re.compile(
-    r"(\U0001F3F4[\U000E0020-\U000E007E]+\U000E007F)"  # valid emoji tag seq (kept)
-    r"|[\U000E0000-\U000E007F]"                        # any other tag char (stripped)
+    "(" + "|".join(_PINNED_TAG_FLAGS) + ")"  # the three pinned flags (kept)
+    + r"|[\U000E0000-\U000E007F]"            # every other tag char (stripped)
 )
 
 # Fast-path check — plane-14 tag chars only.
@@ -103,9 +115,19 @@ def strip_unicode_tags(text: str) -> str:
 
     Tag characters are invisible in terminals and chat UIs but fully visible
     to LLM tokenizers, making them a prompt-injection smuggling channel for
-    untrusted tool output (MCP servers, web content).  Valid emoji tag
-    sequences (U+1F3F4 base + tag spec + U+E007F CANCEL TAG — regional
-    flags like Scotland/Wales) are preserved.
+    untrusted tool output (MCP servers, web content).  The only sequences
+    preserved are the three pinned RGI subdivision flags — England
+    (``gbeng``), Scotland (``gbsct``) and Wales (``gbwls``), each a U+1F3F4
+    base + those exact lowercase tag letters + U+E007F CANCEL TAG.  Every
+    other tag character is stripped, including a payload wrapped in the same
+    base/CANCEL frame, an orphan tag with no base, and an unterminated
+    sequence (whose visible U+1F3F4 base survives on its own).
+
+    Plane 14 is the entire scope: ZWJ (U+200D) and the other invisible/bidi
+    characters are deliberately left untouched here, because they carry
+    meaning inside legitimate emoji and RTL text.  A caller that needs full
+    display hardening filters ``tools.threat_patterns.INVISIBLE_CHARS`` on
+    top of this — see ``hermes_cli.owner_workspace.owner_title``.
 
     Returns the input unchanged (fast path) when no plane-14 tag characters
     are present.  Ported from block/goose#10746.

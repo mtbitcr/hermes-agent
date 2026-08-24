@@ -135,14 +135,30 @@ _PATTERNS: List[Tuple[str, str, str]] = [
 ]
 
 # Invisible / bidirectional unicode characters used in injection attacks.
-# Aligned with skills_guard.py INVISIBLE_CHARS — directional isolates
-# (U+2066-U+2069) and invisible math operators (U+2062-U+2064) are real
-# attack tools.
+# Originally aligned with skills_guard.py INVISIBLE_CHARS — directional
+# isolates (U+2066-U+2069) and invisible math operators (U+2062-U+2064) are
+# real attack tools.  The bidi marks (U+061C, U+200E, U+200F), the remaining
+# invisible math operator (U+2061) and the deprecated format characters
+# (U+206A-U+206F) close the gaps in that original set: every one of them is
+# invisible, and every one can reorder or disguise what a reader is shown.
+#
+# This set is also the canonical DISPLAY-hardening list, not just a scanner
+# input: ``hermes_cli.owner_workspace.owner_title`` filters every character in
+# it out of an owner-visible title, which deliberately includes U+200D ZWJ.
+# That does not contradict ``tools.ansi_strip.strip_unicode_tags`` leaving ZWJ
+# untouched — that function's scope is plane-14 tag characters, where ZWJ has
+# no part.  At the owner boundary a title is a short label, never an emoji
+# composition surface, so joining an unrelated glyph pair into one rendered
+# image is exactly the display control that boundary has to remove.
 INVISIBLE_CHARS = frozenset({
+    '\u061c',  # arabic letter mark
     '\u200b',  # zero-width space
     '\u200c',  # zero-width non-joiner
     '\u200d',  # zero-width joiner
+    '\u200e',  # left-to-right mark
+    '\u200f',  # right-to-left mark
     '\u2060',  # word joiner
+    '\u2061',  # function application
     '\u2062',  # invisible times
     '\u2063',  # invisible separator
     '\u2064',  # invisible plus
@@ -156,6 +172,12 @@ INVISIBLE_CHARS = frozenset({
     '\u2067',  # right-to-left isolate
     '\u2068',  # first strong isolate
     '\u2069',  # pop directional isolate
+    '\u206a',  # inhibit symmetric swapping (deprecated)
+    '\u206b',  # activate symmetric swapping (deprecated)
+    '\u206c',  # inhibit arabic form shaping (deprecated)
+    '\u206d',  # activate arabic form shaping (deprecated)
+    '\u206e',  # national digit shapes (deprecated)
+    '\u206f',  # nominal digit shapes (deprecated)
 })
 
 
@@ -228,9 +250,9 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
 
     content = content[:MAX_SCAN_CHARS]
 
-    # Invisible unicode — single pass through the content set, not 17
-    # ``in`` lookups.  Run this on the RAW content before NFKC normalisation,
-    # since normalisation can strip some of these codepoints.
+    # Invisible unicode — single pass through the content set, not one ``in``
+    # lookup per entry.  Run this on the RAW content before NFKC
+    # normalisation, since normalisation can strip some of these codepoints.
     char_set = set(content)
     invisible_hits = char_set & INVISIBLE_CHARS
     for ch in invisible_hits:
