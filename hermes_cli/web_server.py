@@ -6746,6 +6746,7 @@ _EMPTY_MODEL_INFO: dict = {
     "model": "",
     "provider": "",
     "reasoning_effort": "",
+    "fallback_disabled": False,
     "auto_context_length": 0,
     "config_context_length": 0,
     "effective_context_length": 0,
@@ -6774,6 +6775,16 @@ def get_model_info(request: Request, profile: Optional[str] = None):
         )
         with _profile_scope(scoped_profile):
             cfg = load_config()
+        fallback_providers = cfg.get("fallback_providers", [])
+        fallback_model = cfg.get("fallback_model")
+        fallback_disabled = (
+            isinstance(fallback_providers, list)
+            and not fallback_providers
+            and (
+                fallback_model is None
+                or (isinstance(fallback_model, str) and not fallback_model.strip())
+            )
+        )
         model_cfg = cfg.get("model", "")
         agent_cfg = cfg.get("agent")
         reasoning_effort = (
@@ -6799,6 +6810,7 @@ def get_model_info(request: Request, profile: Optional[str] = None):
                 _EMPTY_MODEL_INFO,
                 provider=provider,
                 reasoning_effort=reasoning_effort,
+                fallback_disabled=fallback_disabled,
             )
         else:
             # Resolve auto-detected context length (pass config_ctx=None to get
@@ -6839,6 +6851,7 @@ def get_model_info(request: Request, profile: Optional[str] = None):
                 "model": model_name,
                 "provider": provider,
                 "reasoning_effort": reasoning_effort,
+                "fallback_disabled": fallback_disabled,
                 "auto_context_length": auto_ctx,
                 "config_context_length": config_ctx_int,
                 "effective_context_length": effective_ctx,
@@ -6850,6 +6863,7 @@ def get_model_info(request: Request, profile: Optional[str] = None):
                 "model": result["model"],
                 "provider": result["provider"],
                 "reasoning_effort": result["reasoning_effort"],
+                "fallback_disabled": result["fallback_disabled"],
             }
         audit_models_machine_success(
             request, action="info", profile=scoped_profile, provider=provider

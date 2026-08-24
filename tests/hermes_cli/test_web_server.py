@@ -2941,7 +2941,8 @@ class TestModelInfoEndpoint:
                 "default": "anthropic/claude-opus-4.6",
                 "provider": "openrouter",
                 "context_length": 100000,
-            }
+            },
+            "fallback_providers": [],
         })
 
         with patch("agent.model_metadata.get_model_context_length", return_value=200000):
@@ -2953,6 +2954,64 @@ class TestModelInfoEndpoint:
         assert data["auto_context_length"] == 200000
         assert data["config_context_length"] == 100000
         assert data["effective_context_length"] == 100000  # override wins
+        assert data["fallback_disabled"] is True
+
+
+    @pytest.mark.parametrize(
+        ("fallback_providers", "fallback_model"),
+        [(["openrouter"], None), ([], "legacy-model"), (None, None)],
+    )
+    def test_model_info_reports_configured_or_malformed_fallbacks(
+        self, monkeypatch, fallback_providers, fallback_model
+    ):
+        import hermes_cli.web_server as ws
+
+        config = {
+            "model": {"default": "claude-sonnet-5", "provider": "anthropic"},
+            "fallback_providers": fallback_providers,
+        }
+        if fallback_model is not None:
+            config["fallback_model"] = fallback_model
+        monkeypatch.setattr(ws, "load_config", lambda: config)
+
+        resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        assert resp.json()["fallback_disabled"] is False
+
+
+    def test_model_info_models_machine_projection_includes_authoritative_fallback_state(
+        self, monkeypatch
+    ):
+        import hermes_cli.web_server as ws
+        from plugins.dashboard_auth.raphael_workspace import model_policy
+
+        monkeypatch.setattr(
+            ws,
+            "load_config",
+            lambda: {
+                "model": {"default": "claude-sonnet-5", "provider": "anthropic"},
+                "agent": {"reasoning_effort": "max"},
+                "fallback_providers": [],
+            },
+        )
+        monkeypatch.setattr(
+            model_policy,
+            "require_models_machine_profile",
+            lambda request, profile, allowed: profile,
+        )
+        monkeypatch.setattr(model_policy, "model_machine_request", lambda request: True)
+        monkeypatch.setattr(model_policy, "audit_models_machine_success", lambda *args, **kwargs: None)
+
+        resp = self.client.get("/api/model/info")
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "model": "claude-sonnet-5",
+            "provider": "anthropic",
+            "reasoning_effort": "max",
+            "fallback_disabled": True,
+        }
 
 
     def test_model_info_graceful_on_metadata_error(self, monkeypatch):
