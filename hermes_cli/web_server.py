@@ -6763,13 +6763,14 @@ def get_model_info(request: Request, profile: Optional[str] = None):
     """
     try:
         from plugins.dashboard_auth.raphael_workspace.model_policy import (
+            admitted_profile_ids,
             audit_models_machine_success,
             model_machine_request,
             require_models_machine_profile,
         )
 
         scoped_profile = require_models_machine_profile(
-            request, profile, allowed=(None, "default", "raphael-planner")
+            request, profile, allowed=(None, *admitted_profile_ids())
         )
         with _profile_scope(scoped_profile):
             cfg = load_config()
@@ -6912,12 +6913,13 @@ async def get_model_options(
     try:
         from hermes_cli.inventory import build_model_options_payload, load_picker_context
         from plugins.dashboard_auth.raphael_workspace.model_policy import (
+            admitted_profile_ids,
             model_machine_request,
             require_models_machine_profile,
         )
 
         scoped_profile = require_models_machine_profile(
-            request, profile, allowed=(None, "default", "raphael-planner")
+            request, profile, allowed=(None, *admitted_profile_ids())
         )
         if model_machine_request(request) and (include_unconfigured or explicit_only):
             raise HTTPException(status_code=400, detail="Invalid model options")

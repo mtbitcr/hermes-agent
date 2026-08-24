@@ -26,8 +26,16 @@ from plugins.dashboard_auth.raphael_workspace.model_policy import (
     [
         ("raphael-planner", "anthropic", "claude-sonnet-", "max"),
         ("default", "anthropic", "claude-opus-", "max"),
-        ("raphael-planner", "openai-codex", "gpt-5.6-sol", "high"),
-        ("default", "openai-codex", "gpt-5.6-sol", "xhigh"),
+        ("raphael-business", "anthropic", "claude-sonnet-", "high"),
+        ("raphael-designer", "anthropic", "claude-opus-", "max"),
+        ("raphael-claude-worker", "anthropic", "claude-sonnet-", "max"),
+        ("raphael-builder", "anthropic", "claude-sonnet-", "max"),
+        ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max"),
+        ("raphael-planner", "openai-codex", "gpt-5.6-sol", "max"),
+        ("default", "openai-codex", "gpt-5.6-sol", "max"),
+        ("raphael-business", "openai-codex", "gpt-5.6-terra", "max"),
+        ("raphael-builder", "openai-codex", "gpt-5.6-terra", "max"),
+        ("raphael-verifier", "anthropic", "claude-opus-", "max"),
     ],
 )
 def test_admitted_assignment_is_role_bound(profile, provider, family, effort):
@@ -52,7 +60,7 @@ def test_admitted_assignment_is_role_bound(profile, provider, family, effort):
         ("raphael-planner", "anthropic", "claude-opus-5", "max", True),
         ("default", "anthropic", "claude-sonnet-5", "max", True),
         ("default", "openai-codex", "gpt-5.6-terra", "xhigh", True),
-        ("default", "openai-codex", "gpt-5.6-sol", "max", True),
+        ("default", "openai-codex", "gpt-5.6-sol", "xhigh", True),
         ("default", "openai-codex", "gpt-5.6-sol", "xhigh", False),
         ("other-profile", "anthropic", "claude-opus-5", "max", True),
     ],

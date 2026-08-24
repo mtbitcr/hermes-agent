@@ -3,7 +3,7 @@
 The native Hermes profile config remains the only runtime model authority.
 This module adds no registry, router, credential store, or fallback engine: it
 only narrows the existing OAuth/model/profile endpoints for Raphael's dedicated
-machine credential and validates the four admitted role assignments.
+machine credential and validates the admitted profile assignments.
 """
 
 from __future__ import annotations
@@ -31,6 +31,17 @@ class ModelAssignment:
     reasoning_effort: str
 
 
+_PROFILE_IDS = (
+    "default",
+    "raphael-planner",
+    "raphael-business",
+    "raphael-designer",
+    "raphael-claude-worker",
+    "raphael-builder",
+    "raphael-verifier",
+)
+
+
 _ASSIGNMENTS = {
     ("raphael-planner", "anthropic"): ModelAssignment(
         "raphael-planner", "anthropic", "claude-sonnet-5", "max"
@@ -39,10 +50,34 @@ _ASSIGNMENTS = {
         "default", "anthropic", "claude-opus-5", "max"
     ),
     ("raphael-planner", "openai-codex"): ModelAssignment(
-        "raphael-planner", "openai-codex", "gpt-5.6-sol", "high"
+        "raphael-planner", "openai-codex", "gpt-5.6-sol", "max"
     ),
     ("default", "openai-codex"): ModelAssignment(
-        "default", "openai-codex", "gpt-5.6-sol", "xhigh"
+        "default", "openai-codex", "gpt-5.6-sol", "max"
+    ),
+    ("raphael-business", "anthropic"): ModelAssignment(
+        "raphael-business", "anthropic", "claude-sonnet-5", "high"
+    ),
+    ("raphael-business", "openai-codex"): ModelAssignment(
+        "raphael-business", "openai-codex", "gpt-5.6-terra", "max"
+    ),
+    ("raphael-designer", "anthropic"): ModelAssignment(
+        "raphael-designer", "anthropic", "claude-opus-5", "max"
+    ),
+    ("raphael-claude-worker", "anthropic"): ModelAssignment(
+        "raphael-claude-worker", "anthropic", "claude-sonnet-5", "max"
+    ),
+    ("raphael-builder", "anthropic"): ModelAssignment(
+        "raphael-builder", "anthropic", "claude-sonnet-5", "max"
+    ),
+    ("raphael-builder", "openai-codex"): ModelAssignment(
+        "raphael-builder", "openai-codex", "gpt-5.6-terra", "max"
+    ),
+    ("raphael-verifier", "openai-codex"): ModelAssignment(
+        "raphael-verifier", "openai-codex", "gpt-5.6-sol", "max"
+    ),
+    ("raphael-verifier", "anthropic"): ModelAssignment(
+        "raphael-verifier", "anthropic", "claude-opus-5", "max"
     ),
 }
 
@@ -77,6 +112,11 @@ def validate_assignment(
 
 def admitted_provider_ids() -> tuple[str, ...]:
     return ("anthropic", "openai-codex")
+
+
+def admitted_profile_ids() -> tuple[str, ...]:
+    """Return the exact native profiles visible in Advanced settings."""
+    return _PROFILE_IDS
 
 
 def model_machine_request(request: Any) -> bool:
@@ -215,6 +255,11 @@ _LITERAL_ROUTES = (
     ("GET", "/api/model/info"),
     ("PUT", "/api/profiles/raphael-planner/model"),
     ("PUT", "/api/profiles/default/model"),
+    ("PUT", "/api/profiles/raphael-business/model"),
+    ("PUT", "/api/profiles/raphael-designer/model"),
+    ("PUT", "/api/profiles/raphael-claude-worker/model"),
+    ("PUT", "/api/profiles/raphael-builder/model"),
+    ("PUT", "/api/profiles/raphael-verifier/model"),
 )
 _TEMPLATE_ROUTES = (("GET", "/api/providers/oauth/openai-codex/poll/{session_id}"),)
 

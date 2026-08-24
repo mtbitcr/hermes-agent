@@ -7920,7 +7920,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             row = conn.execute(
                 """SELECT model, billing_provider, billing_base_url, billing_mode,
-                          api_call_count
+                          api_call_count, estimated_cost_usd, actual_cost_usd,
+                          cost_status, cost_source
                      FROM session_model_usage
                     WHERE session_id = ?
                       AND task = ''

@@ -305,6 +305,10 @@ def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_su
                 "This record does not confirm whether an external service changed."
             ),
         },
+        "runtime": {
+            "state": "unknown",
+            "summary": "This record does not contain an authoritative model route.",
+        },
         "cost": {
             "state": "unknown",
             "summary": "This record does not contain an authoritative cost.",

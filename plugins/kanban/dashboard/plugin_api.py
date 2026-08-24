@@ -53,7 +53,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Upload
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from hermes_cli import kanban_db
+from hermes_cli import kanban_db, owner_workspace
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.token_auth import (
@@ -3763,60 +3763,11 @@ def _workspace_run_response(run_id: int) -> Optional[dict]:
         if row is None:
             return None
         r = kanban_db.Run.from_row(row)
-        outcome = (r.outcome or r.status or "").strip().lower()
-        if r.status == "running":
-            owner_outcome = "running"
-            summary = "Work is still in progress."
-        elif outcome in {"completed", "done"}:
-            owner_outcome = "completed"
-            summary = "Work finished."
-        elif outcome == "review_requested":
-            owner_outcome = "completed"
-            summary = "Work finished and is awaiting review."
-        elif outcome == "scheduled":
-            owner_outcome = "unknown"
-            summary = "Work is scheduled for later."
-        elif outcome in {
-            "blocked",
-            "changes_requested",
-            "crashed",
-            "gave_up",
-            "rate_limited",
-            "reclaimed",
-            "spawn_failed",
-            "stale",
-            "timed_out",
-        }:
-            owner_outcome = "attention"
-            summary = "Work stopped and needs attention."
-        else:
-            owner_outcome = "unknown"
-            summary = "The final outcome could not be confirmed."
         return {
             "run": {
                 "started_at": _workspace_iso_timestamp(r.started_at),
                 "finished_at": _workspace_iso_timestamp(r.ended_at),
-                "receipt": {
-                    "outcome": owner_outcome,
-                    "summary": summary,
-                    "external_effect": {
-                        "state": "unknown",
-                        "summary": (
-                            "This record does not confirm whether an external "
-                            "service changed."
-                        ),
-                    },
-                    "cost": {
-                        "state": "unknown",
-                        "summary": (
-                            "This record does not contain an authoritative cost."
-                        ),
-                    },
-                    "evidence": {
-                        "state": "available",
-                        "kind": "project_activity",
-                    },
-                },
+                "receipt": owner_workspace._owner_project_run_receipt(r),
             }
         }
     finally:

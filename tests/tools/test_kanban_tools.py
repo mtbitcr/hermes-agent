@@ -161,6 +161,9 @@ def test_worker_runtime_receipt_uses_persisted_dominant_route(
             output_tokens=4,
             model="served-model",
             billing_provider="served-provider",
+            estimated_cost_usd=0.0123,
+            cost_status="estimated",
+            cost_source="official_docs_snapshot",
             api_call_count=1,
         )
     finally:
@@ -175,13 +178,20 @@ def test_worker_runtime_receipt_uses_persisted_dominant_route(
     assert stamped == {
         "worker_session_id": session_id,
         "runtime_receipt": {
-            "schema_version": 1,
+            "schema_version": 2,
             "engine": "hermes",
             "profile": "test-worker",
             "provider": "served-provider",
             "model": "served-model",
             "reasoning_effort": "high",
             "route_evidence": "dominant-session-usage",
+            "cost": {
+                "state": "estimated",
+                "currency": "USD",
+                "amount": 0.0123,
+                "source": "official_docs_snapshot",
+                "scope": "dominant-main-route",
+            },
         },
     }
 
@@ -200,6 +210,33 @@ def test_worker_runtime_receipt_never_trusts_worker_claim(
     assert stamped == {
         "worker_session_id": "missing-session",
         "kept": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_state"),
+    [
+        ("provider_cost_api", "reported"),
+        ("custom_contract", "exact"),
+    ],
+)
+def test_runtime_receipt_maps_native_actual_cost_without_overclaiming(
+    source, expected_state
+):
+    from tools import kanban_tools as kt
+
+    assert kt._runtime_receipt_cost(
+        {
+            "cost_status": "actual",
+            "actual_cost_usd": 0.045,
+            "cost_source": source,
+        }
+    ) == {
+        "state": expected_state,
+        "currency": "USD",
+        "amount": 0.045,
+        "source": source,
+        "scope": "dominant-main-route",
     }
 
 

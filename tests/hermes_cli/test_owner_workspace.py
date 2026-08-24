@@ -411,6 +411,66 @@ def test_project_snapshot_is_exact_receipt_backed_and_read_only(ctx):
     assert snapshot["steward"]["execution"]["paused"] is False
 
 
+def test_owner_run_projection_uses_only_native_runtime_and_cost_receipt():
+    run = kanban_db.Run(
+        id=1,
+        task_id="task-1",
+        profile="raphael-verifier",
+        step_key=None,
+        status="done",
+        claim_lock=None,
+        claim_expires=None,
+        worker_pid=None,
+        max_runtime_seconds=None,
+        last_heartbeat_at=None,
+        started_at=1_700_000_000,
+        ended_at=1_700_000_100,
+        outcome="completed",
+        summary="ignored raw summary",
+        metadata={
+            "runtime_receipt": {
+                "schema_version": 2,
+                "engine": "hermes",
+                "profile": "raphael-verifier",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "max",
+                "route_evidence": "dominant-session-usage",
+                "cost": {
+                    "state": "estimated",
+                    "currency": "USD",
+                    "amount": 0.0123,
+                    "source": "official_docs_snapshot",
+                    "scope": "dominant-main-route",
+                },
+            }
+        },
+        error=None,
+    )
+
+    receipt = ow._owner_project_run_projection(run)["receipt"]
+
+    assert receipt["runtime"] == {
+        "state": "known",
+        "engine": "hermes",
+        "profile": "raphael-verifier",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "max",
+    }
+    assert receipt["cost"] == {
+        "state": "estimated",
+        "currency": "USD",
+        "amount": 0.0123,
+        "summary": "Estimated model usage for this recorded route.",
+    }
+
+    run.metadata["runtime_receipt"]["model"] = "unadmitted-model"
+    rejected = ow._owner_project_run_projection(run)["receipt"]
+    assert rejected["runtime"] == ow._OWNER_UNKNOWN_RUNTIME
+    assert rejected["cost"] == ow._OWNER_UNKNOWN_COST
+
+
 def test_project_snapshot_hides_projects_without_owner_receipt(ctx):
     with projects_db.connect_closing() as conn:
         project_id = projects_db.create_project(conn, name="Foreign Snapshot")

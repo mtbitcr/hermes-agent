@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -232,6 +233,43 @@ def _runtime_receipt_value(value: Any) -> Optional[str]:
     return clean
 
 
+def _runtime_receipt_cost(route: dict) -> dict:
+    """Project one bounded cost fact from trusted per-route accounting."""
+    native_status = _runtime_receipt_value(route.get("cost_status")) or "unknown"
+    native_status = native_status.lower()
+    if native_status not in {"actual", "estimated", "included"}:
+        return {"state": "unknown", "scope": "dominant-main-route"}
+
+    raw_amount = (
+        route.get("actual_cost_usd")
+        if native_status == "actual"
+        else route.get("estimated_cost_usd")
+    )
+    try:
+        amount = float(raw_amount)
+    except (TypeError, ValueError):
+        return {"state": "unknown", "scope": "dominant-main-route"}
+    if not math.isfinite(amount) or amount < 0 or amount > 1_000_000:
+        return {"state": "unknown", "scope": "dominant-main-route"}
+
+    source = _runtime_receipt_value(route.get("cost_source")) or "none"
+    if native_status == "actual":
+        owner_state = (
+            "reported"
+            if source in {"provider_cost_api", "provider_generation_api"}
+            else "exact"
+        )
+    else:
+        owner_state = native_status
+    return {
+        "state": owner_state,
+        "currency": "USD",
+        "amount": round(amount, 8),
+        "source": source,
+        "scope": "dominant-main-route",
+    }
+
+
 def _worker_runtime_receipt(session_id: str) -> Optional[dict]:
     """Read the worker's actual persisted model route from its profile DB.
 
@@ -281,7 +319,7 @@ def _worker_runtime_receipt(session_id: str) -> Optional[dict]:
     if not model or not provider:
         return None
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "engine": "hermes",
         "profile": profile,
         "provider": provider,
@@ -290,6 +328,7 @@ def _worker_runtime_receipt(session_id: str) -> Optional[dict]:
         "route_evidence": (
             "dominant-session-usage" if dominant else "session-row"
         ),
+        "cost": _runtime_receipt_cost(dominant),
     }
 
 
