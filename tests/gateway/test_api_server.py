@@ -1335,6 +1335,15 @@ class TestOwnerWorkspaceProjectSnapshotEndpoint:
             ("?capabilities=something_else,run_task_context", True),
             ("?capabilities=run_task_context_extra", False),
             ("?capabilities=" + "x" * 300 + ",run_task_context", False),
+            # A repeated key has no single negotiated answer, so BOTH orders
+            # fail closed to the legacy shape rather than granting whichever
+            # occurrence happens to be read first.
+            ("?capabilities=run_task_context&capabilities=something_else", False),
+            ("?capabilities=something_else&capabilities=run_task_context", False),
+            ("?capabilities=run_task_context&capabilities=run_task_context", False),
+            # The native board/workers capability is a different contract on a
+            # different surface; naming it here grants nothing.
+            ("?capabilities=owner_titles_v1", False),
         ],
     )
     async def test_run_context_is_served_only_to_a_reader_that_asks_for_it(
@@ -1344,8 +1353,8 @@ class TestOwnerWorkspaceProjectSnapshotEndpoint:
 
         A reader that predates the added run keys never sends
         ``capabilities``, so deploying this Hermes first cannot hand that
-        reader a snapshot its closed schema rejects. An oversized parameter
-        grants nothing rather than being parsed.
+        reader a snapshot its closed schema rejects. An oversized, repeated,
+        or foreign-surface parameter grants nothing rather than being parsed.
         """
         app = _create_app(adapter)
         config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}

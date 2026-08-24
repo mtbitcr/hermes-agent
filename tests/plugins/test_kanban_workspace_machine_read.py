@@ -409,6 +409,77 @@ def test_owner_title_capability_projects_board_and_worker_titles(workspace_surfa
     assert legacy_titles[s["running_id"]] == raw_running
 
 
+def _machine_audit_entries(surface) -> list[dict]:
+    log = surface["home"] / "logs" / "dashboard-auth.log"
+    if not log.exists():
+        return []
+    return [
+        entry
+        for entry in (
+            json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()
+        )
+        if entry.get("source") == "raphael-workspace-machine"
+    ]
+
+
+def test_capability_read_is_audited_from_the_validated_query(workspace_surface):
+    """The audit records the granted board and a fixed capability marker.
+
+    The capability parameter is part of an admitted query, not a reason to
+    stop recording which board was asked for, and what gets recorded is this
+    module's own constant — never a value echoed back out of the query.
+    """
+    s = workspace_surface
+    capability = plugin_api.WORKSPACE_OWNER_TITLES_CAPABILITY
+
+    before = len(_machine_audit_entries(s))
+    assert _get(
+        s,
+        "/api/plugins/kanban/board",
+        query=f"?board={BOARD}&capabilities={capability}",
+    ).status_code == 200
+    granted = _machine_audit_entries(s)[before:]
+    assert granted and all(
+        entry["decision"] == "allow"
+        and entry["requested_board"] == BOARD
+        and entry["applied_capability"] == capability
+        for entry in granted
+    )
+
+    # A legacy call names no capability, so none is recorded — the board it
+    # asked for still is.
+    before = len(_machine_audit_entries(s))
+    assert _get(
+        s, "/api/plugins/kanban/board", query=f"?board={BOARD}"
+    ).status_code == 200
+    legacy = _machine_audit_entries(s)[before:]
+    assert legacy and all(
+        entry["decision"] == "allow"
+        and entry["requested_board"] == BOARD
+        and entry["applied_capability"] is None
+        for entry in legacy
+    )
+
+    # A rejected capability is admitted nowhere: not into the response, not
+    # into the audit record, and not as a board this caller asked for.
+    before = len(_machine_audit_entries(s))
+    assert _get(
+        s,
+        "/api/plugins/kanban/board",
+        query=f"?board={BOARD}&capabilities={capability},run_task_context",
+    ).status_code == 400
+    denied = _machine_audit_entries(s)[before:]
+    assert denied and all(
+        entry["decision"] == "deny"
+        and entry["requested_board"] is None
+        and entry["applied_capability"] is None
+        for entry in denied
+    )
+    assert all(
+        "run_task_context" not in json.dumps(entry) for entry in _machine_audit_entries(s)
+    )
+
+
 @pytest.mark.parametrize(
     ("path", "query"),
     [
@@ -420,6 +491,21 @@ def test_owner_title_capability_projects_board_and_worker_titles(workspace_surfa
         ("/api/plugins/kanban/board", f"?board={BOARD}&extra=1"),
         ("/api/plugins/kanban/board", f"?board={BOARD}&board={BOARD}"),
         ("/api/plugins/kanban/board", f"?board={BOARD}&capabilities=unknown"),
+        # The /v1 receipt-snapshot capability is a different contract on a
+        # different surface and is never admitted here.
+        ("/api/plugins/kanban/board", f"?board={BOARD}&capabilities=run_task_context"),
+        # A repeated capability has no single admitted value, in either order.
+        (
+            "/api/plugins/kanban/board",
+            f"?board={BOARD}"
+            f"&capabilities={plugin_api.WORKSPACE_OWNER_TITLES_CAPABILITY}"
+            "&capabilities=unknown",
+        ),
+        (
+            "/api/plugins/kanban/board",
+            f"?board={BOARD}&capabilities=unknown"
+            f"&capabilities={plugin_api.WORKSPACE_OWNER_TITLES_CAPABILITY}",
+        ),
         (
             "/api/plugins/kanban/assignees",
             f"?board={BOARD}&capabilities="

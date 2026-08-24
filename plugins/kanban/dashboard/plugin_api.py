@@ -134,6 +134,12 @@ _register_recommendations_machine_route()
 # routes are always at least this scoped even if that plugin were disabled.
 WORKSPACE_ROUTE_METHOD = "GET"
 _WORKSPACE_API_PREFIX = "/api/plugins/kanban"
+# The named response capability a machine reader opts into to receive
+# owner-safe task titles from the native board/workers reads. Deliberately
+# NOT the same name as the ``/v1`` receipt-snapshot run capability
+# (``owner_workspace.OWNER_PROJECT_RUN_CONTEXT_CAPABILITY``): the two gate
+# different response contracts on different surfaces, so each must be asked
+# for by its own name and neither is admitted on the other's routes.
 WORKSPACE_OWNER_TITLES_CAPABILITY = "owner_titles_v1"
 _WORKSPACE_LITERAL_ROUTE_PATHS = (
     f"{_WORKSPACE_API_PREFIX}/profiles",
@@ -522,7 +528,7 @@ def get_board(
         request,
         require_board=True,
         builder=lambda: _workspace_board_response(
-            owner_titles=request.query_params.get("capabilities")
+            owner_titles=_workspace_applied_capability(request)
             == WORKSPACE_OWNER_TITLES_CAPABILITY
         ),
         object_kind="board",
@@ -1746,7 +1752,7 @@ def list_active_workers(
         request,
         require_board=True,
         builder=lambda: _workspace_workers_response(
-            owner_titles=request.query_params.get("capabilities")
+            owner_titles=_workspace_applied_capability(request)
             == WORKSPACE_OWNER_TITLES_CAPABILITY
         ),
         object_kind="board",
@@ -3202,11 +3208,14 @@ def _workspace_audit_fields(
     object_id: Optional[object] = None,
 ) -> dict[str, Any]:
     principal = request.state.token_principal
-    items = request.query_params.multi_items()
-    requested_board = (
-        WORKSPACE_BOARD
-        if len(items) == 1 and items[0] == ("board", WORKSPACE_BOARD)
-        else None
+    # Both facts come from the ALREADY-VALIDATED query structure recorded by
+    # ``_workspace_require_board_only`` — never from re-reading the raw query
+    # here. A call whose query has not passed that check (routes 1-2, or a
+    # denial raised from inside it) records neither.
+    granted = getattr(request.state, "workspace_board_granted", False)
+    requested_board = WORKSPACE_BOARD if granted else None
+    applied_capability = (
+        _workspace_applied_capability(request) if granted else None
     )
     bounded_object_id = None
     if object_id is not None:
@@ -3225,6 +3234,7 @@ def _workspace_audit_fields(
             request.state, "token_route_template", request.url.path
         ),
         "requested_board": requested_board,
+        "applied_capability": applied_capability,
         "object_kind": object_kind,
         "object_id": bounded_object_id,
         "decision": decision,
@@ -3289,6 +3299,18 @@ def _workspace_require_no_query(request: Request) -> None:
         raise HTTPException(status_code=400, detail="Bad Request")
 
 
+def _workspace_applied_capability(request: Request) -> Optional[str]:
+    """The exact capability marker this call's validated query admitted.
+
+    ``None`` for a legacy call that named none, and for any call whose query
+    has not passed :func:`_workspace_require_board_only`. The value is always
+    one of this module's own constants — the raw query value is compared for
+    equality by the validator and then discarded — so neither the response
+    projection nor the audit record can be steered by caller-supplied text.
+    """
+    return getattr(request.state, "workspace_applied_capability", None)
+
+
 def _workspace_require_board_only(
     request: Request, *, allowed_capability: Optional[str] = None
 ) -> None:
@@ -3298,6 +3320,10 @@ def _workspace_require_board_only(
     values all fail closed after Starlette's standard single-pass decoding.
     Capabilities are route-specific: a caller cannot use an admitted option
     on a sibling route whose response contract does not implement it.
+
+    On success — and only on success — the admitted structure is recorded on
+    the request so the response projection and the audit record read THIS
+    decision instead of re-deriving one from the raw query.
     """
     items = request.query_params.multi_items()
     values: dict[str, str] = {}
@@ -3321,6 +3347,10 @@ def _workspace_require_board_only(
     ):
         _workspace_audit_deny(request, reason="board_query_invalid", status=400)
         raise HTTPException(status_code=400, detail="Bad Request")
+    request.state.workspace_board_granted = True
+    request.state.workspace_applied_capability = (
+        allowed_capability if "capabilities" in values else None
+    )
 
 
 def _workspace_deny_not_found(

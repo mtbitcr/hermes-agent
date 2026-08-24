@@ -260,10 +260,17 @@ def _owner_workspace_capability_requested(
     readable by the other, because an older Hermes ignores the parameter and
     an older reader never sends it.
 
-    Anything else grants nothing: a missing, oversized, or unknown value is
-    the same as not asking.
+    Anything else grants nothing: a missing, repeated, oversized, or unknown
+    value is the same as not asking. The key must occur EXACTLY once — a
+    request that sends it twice has no single negotiated answer, and reading
+    one of the two (``query.get`` returns the first) would make the grant
+    depend on the order a caller happened to write them in. Both orders
+    therefore fail closed to the legacy shape.
     """
-    raw = request.query.get("capabilities", "")
+    raw_values = request.query.getall("capabilities", [])
+    if len(raw_values) != 1:
+        return False
+    raw = raw_values[0]
     if len(raw) > _OWNER_WORKSPACE_CAPABILITIES_MAX_LENGTH:
         return False
     return capability in {token.strip() for token in raw.split(",")}

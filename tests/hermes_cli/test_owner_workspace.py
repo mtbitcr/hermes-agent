@@ -448,6 +448,76 @@ def test_owner_title_projection_vectors_are_shared_with_the_owner_workspace():
     )
 
 
+def test_owner_title_masks_url_credentials_at_a_non_navigation_egress():
+    """A title is never followed as a link, so URL credentials are masked.
+
+    Ordinary display redaction deliberately leaves OAuth callback codes,
+    magic links and pre-signed URLs actionable. An owner-visible title is the
+    opposite kind of boundary: the strict URL-credential mode has to strip
+    credential-named query parameters, pre-signed signatures and
+    ``user:password@`` userinfo before the title is projected.
+    """
+    assert (
+        ow.owner_title("Retry https://api.example.com/v1/sync?token=OPAQUESECRET123&page=2")
+        == "Retry https://api.example.com/v1/sync?token=***&page=2"
+    )
+    assert (
+        ow.owner_title(
+            "Upload https://bucket.s3.example.com/report.pdf"
+            "?X-Amz-Expires=900&X-Amz-Signature=abcdef0123456789abcdef"
+        )
+        == "Upload https://bucket.s3.example.com/report.pdf"
+        "?X-Amz-Expires=900&X-Amz-Signature=***"
+    )
+    assert (
+        ow.owner_title("Mirror https://deploy:hunter2verylongpassword@git.example.com/repo.git")
+        == "Mirror https://deploy:***@git.example.com/repo.git"
+    )
+    # A public parameter that merely resembles a credential name is not a
+    # credential and must survive intact.
+    assert (
+        ow.owner_title("Open https://api.example.com/jobs?token_count=17&session_id=public")
+        == "Open https://api.example.com/jobs?token_count=17&session_id=public"
+    )
+
+
+def test_owner_title_removes_unsafe_control_and_display_characters():
+    """Control/display characters are removed before anything else runs.
+
+    A title reaches the owner through UIs that honour escape sequences and
+    bidirectional formatting, so NUL, ESC sequences, 8-bit C1 controls,
+    zero-width characters, bidi overrides/isolates and invisible plane-14 tag
+    characters cannot be allowed to survive. Sanitizing FIRST is what stops a
+    credential from hiding behind an invisible character that would otherwise
+    split its token past the redactor.
+    """
+    zero_width, rl_override, pop_isolate = chr(0x200B), chr(0x202E), chr(0x2069)
+
+    assert ow.owner_title("Ship\x00 the\x1b[31m thing\x9b1m") == "Ship the thing"
+    assert (
+        ow.owner_title(f"Sh{zero_width}ip the {rl_override}thing{pop_isolate}")
+        == "Ship the thing"
+    )
+    assert (
+        ow.owner_title("Ship the thing\U000e0041\U000e0042") == "Ship the thing"
+    )
+    assert ow.owner_title(f"\x00{zero_width}{rl_override}") == "Untitled work item"
+    # Safe human Unicode is not what this removes.
+    assert ow.owner_title("Café naïve 日本語 \U0001f680") == (
+        "Café naïve 日本語 \U0001f680"
+    )
+    # A credential split by an invisible character is still a credential.
+    assert (
+        ow.owner_title(
+            f"Rotate ghp_ABCDEF{zero_width}GHIJKLMNOPQRSTUVWXYZ0123456789 before Friday"
+        )
+        == "Rotate ghp_AB...6789 before Friday"
+    )
+    # The 240 code point bound is applied to already-sanitized text, so
+    # padding a title with invisible characters cannot shorten what it says.
+    assert ow.owner_title(f"a{zero_width}" * 300) == "a" * 240
+
+
 def test_owner_run_projection_uses_only_native_runtime_and_cost_receipt():
     run = kanban_db.Run(
         id=1,

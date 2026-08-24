@@ -2071,10 +2071,33 @@ def _owner_timestamp(value: Any) -> Optional[str]:
 
 
 def owner_title(value: Any) -> str:
-    """Return the canonical owner-safe, single-line work-item title."""
-    from agent.redact import redact_sensitive_text
+    """Return the canonical owner-safe, single-line work-item title.
 
-    text = redact_sensitive_text(str(value or ""), force=True)
+    This is an owner-facing NON-navigation egress boundary: no title
+    projected here is ever followed as a link, so redaction runs in the
+    strict URL-credential mode. Credential-named query parameters,
+    pre-signed signatures and ``user:password@`` userinfo are masked instead
+    of being left actionable the way an ordinary tool flow needs them.
+
+    Unsafe control/display characters are removed FIRST, reusing the
+    repository's own sanitizers rather than a private character list:
+    ``tools.ansi_strip`` for NUL/C0/C1/DEL, ESC sequences and the invisible
+    plane-14 tag characters, and ``tools.threat_patterns.INVISIBLE_CHARS``
+    for zero-width characters and bidi overrides/isolates. Doing it before
+    redaction means a credential cannot survive by splitting its own token
+    across an invisible character, and doing it at all means a title cannot
+    reorder or hide what the owner is shown. Safe human Unicode is left
+    exactly as written. Whitespace collapse (which also folds U+2028/U+2029),
+    the internal-prefix strip, and the 240 Unicode code point bound then
+    apply to already-sanitized, already-redacted text.
+    """
+    from agent.redact import redact_sensitive_text
+    from tools.ansi_strip import sanitize_display_text, strip_unicode_tags
+    from tools.threat_patterns import INVISIBLE_CHARS
+
+    text = strip_unicode_tags(sanitize_display_text(str(value or "")))
+    text = "".join(char for char in text if char not in INVISIBLE_CHARS)
+    text = redact_sensitive_text(text, force=True, redact_url_credentials=True)
     text = " ".join(text.split())
     text = _INTERNAL_TITLE_PREFIX.sub("", text).strip()
     return text[:240] or "Untitled work item"

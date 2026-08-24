@@ -502,6 +502,14 @@ class TestStrictUrlCredentialRedaction:
                 "NET_SECRET",
                 "//user:***@x.test/path",
             ),
+            # A hyphenated vendor name has to match its own canonical
+            # (``-`` folded to ``_``) spelling, or a pre-signed URL's
+            # signature survives verbatim.
+            (
+                "https://b.s3.x.test/o?X-Amz-Expires=900&X-Amz-Signature=PRESIGN_SECRET",
+                "PRESIGN_SECRET",
+                "https://b.s3.x.test/o?X-Amz-Expires=900&X-Amz-Signature=***",
+            ),
         ],
     )
     def test_masks_all_url_reference_forms_only_when_opted_in(

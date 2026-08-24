@@ -659,6 +659,16 @@ def _redact_url_userinfo(text: str) -> str:
     )
 
 
+# The canonical form folds ``-`` to ``_`` so ``client-secret`` matches
+# ``client_secret``. Fold the configured names the same way, or a name that is
+# spelled with hyphens (``x-amz-signature``) could never match its own
+# canonical spelling and a pre-signed URL's signature would survive strict
+# redaction verbatim.
+_CANONICAL_SENSITIVE_QUERY_PARAMS = frozenset(
+    name.replace("-", "_") for name in _SENSITIVE_QUERY_PARAMS
+)
+
+
 def _canonical_url_param_name(name: str) -> str:
     """Decode a URL parameter name for bounded, case-insensitive matching."""
     decoded = name
@@ -679,7 +689,10 @@ def _redact_strict_url_credentials(text: str) -> str:
     values and URL userinfo.
     """
     def _redact_param(match: re.Match) -> str:
-        if _canonical_url_param_name(match.group(2)) not in _SENSITIVE_QUERY_PARAMS:
+        if (
+            _canonical_url_param_name(match.group(2))
+            not in _CANONICAL_SENSITIVE_QUERY_PARAMS
+        ):
             return match.group(0)
         return f"{match.group(1)}{match.group(2)}=***"
 
