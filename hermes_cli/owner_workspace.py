@@ -1416,10 +1416,22 @@ def _owner_project_run_receipt(run: kanban_db.Run) -> dict:
     }
 
 
-def _owner_project_run_projection(run: kanban_db.Run) -> dict:
+def _owner_project_run_projection(
+    run: kanban_db.Run, task_title: Any, *, has_newer_run: bool,
+) -> dict:
+    """Project one run for the owner, carrying its retry fact but never its id.
+
+    ``has_newer_run`` is decided by the caller from the exact native task id
+    while it walks the newest-first run list — never from ``task_title``,
+    which two genuinely distinct tasks may legitimately sanitize to. The id
+    itself never crosses this boundary, so this boolean is the only way a
+    consumer can know a later attempt at the same work exists.
+    """
     return {
+        "task_title": _owner_title(task_title),
         "started_at": _owner_timestamp(run.started_at),
         "finished_at": _owner_timestamp(run.ended_at),
+        "has_newer_run": bool(has_newer_run),
         "receipt": _owner_project_run_receipt(run),
     }
 
@@ -1551,15 +1563,30 @@ def read_project_snapshot(ctx: OwnerContext, project_slug: str) -> dict:
         ]
 
         run_rows = conn.execute(
-            "SELECT r.* FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            "SELECT r.*, t.title AS task_title FROM task_runs r JOIN tasks t ON t.id = r.task_id "
             "WHERE t.project_id = ? AND t.task_kind = 'work' "
             "ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
             (project_id, _OWNER_PROJECT_MAX_RUNS + 1),
         ).fetchall()
-        runs = [
-            _owner_project_run_projection(kanban_db.Run.from_row(row))
-            for row in run_rows[:_OWNER_PROJECT_MAX_RUNS]
-        ]
+        # The list is globally newest-first, so the first row carrying a given
+        # exact task id is that task's newest run and every later row for the
+        # SAME id is an older attempt at the same work. Decided here, from the
+        # native id, because a title cannot tell two distinct tasks apart —
+        # and because a task absent from the visible columns (archived, or
+        # past the task bound) leaves a reader nothing to disambiguate with.
+        runs: list[dict] = []
+        task_ids_with_newer_run: set[str] = set()
+        for row in run_rows[:_OWNER_PROJECT_MAX_RUNS]:
+            run = kanban_db.Run.from_row(row)
+            run_task_id = str(run.task_id)
+            runs.append(
+                _owner_project_run_projection(
+                    run,
+                    row["task_title"],
+                    has_newer_run=run_task_id in task_ids_with_newer_run,
+                )
+            )
+            task_ids_with_newer_run.add(run_task_id)
     except OwnerWorkspaceError:
         raise
     except (KeyError, TypeError, ValueError, sqlite3.Error) as exc:

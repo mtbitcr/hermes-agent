@@ -448,7 +448,12 @@ def test_owner_run_projection_uses_only_native_runtime_and_cost_receipt():
         error=None,
     )
 
-    receipt = ow._owner_project_run_projection(run)["receipt"]
+    projection = ow._owner_project_run_projection(
+        run, "B03 — Ship the thing", has_newer_run=False,
+    )
+    assert projection["task_title"] == "Ship the thing"
+    assert projection["has_newer_run"] is False
+    receipt = projection["receipt"]
 
     assert receipt["runtime"] == {
         "state": "known",
@@ -466,9 +471,114 @@ def test_owner_run_projection_uses_only_native_runtime_and_cost_receipt():
     }
 
     run.metadata["runtime_receipt"]["model"] = "unadmitted-model"
-    rejected = ow._owner_project_run_projection(run)["receipt"]
+    rejected = ow._owner_project_run_projection(
+        run, "B03 — Ship the thing", has_newer_run=True,
+    )["receipt"]
     assert rejected["runtime"] == ow._OWNER_UNKNOWN_RUNTIME
     assert rejected["cost"] == ow._OWNER_UNKNOWN_COST
+
+
+def test_project_snapshot_run_projection_has_sanitized_task_title(ctx):
+    args = _task_graph_args(
+        idempotency_key="graph-run-title",
+        project_name="Run Title Project",
+    )
+    approver = _with_approver(ctx.session)
+    result = ow.commit_task_graph(ctx, **args)
+    approver.join()
+
+    now = int(time.time())
+    with kanban_db.connect(board=result["board"]) as conn:
+        task_id = kanban_db.create_task(
+            conn,
+            title="B03 — Ship the thing",
+            assignee="default",
+            project_id=result["project_id"],
+        )
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, "default", "done", now - 60, now, "completed"),
+            )
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+
+    assert len(snapshot["runs"]) == 1
+    run = snapshot["runs"][0]
+    assert set(run) == {
+        "task_title", "started_at", "finished_at", "has_newer_run", "receipt",
+    }
+    assert run["task_title"] == "Ship the thing"
+    assert run["has_newer_run"] is False
+
+    # The task id is legitimately present elsewhere in the snapshot (the
+    # board task list); only the run projection/receipt must not leak it.
+    run_payload = json.dumps(run)
+    assert task_id not in run_payload
+
+
+def test_project_snapshot_run_retry_is_decided_per_exact_task_id(ctx):
+    """Two tasks whose titles sanitize identically must not read as retries.
+
+    Only a second run of the SAME exact task id is an older attempt at the
+    same work; the run projection carries that as a boolean because the id
+    itself never crosses the owner boundary.
+    """
+    args = _task_graph_args(
+        idempotency_key="graph-run-retry",
+        project_name="Run Retry Project",
+    )
+    approver = _with_approver(ctx.session)
+    result = ow.commit_task_graph(ctx, **args)
+    approver.join()
+
+    now = int(time.time())
+    with kanban_db.connect(board=result["board"]) as conn:
+        retried_id = kanban_db.create_task(
+            conn,
+            title="B03 — Ship the thing",
+            assignee="default",
+            project_id=result["project_id"],
+        )
+        namesake_id = kanban_db.create_task(
+            conn,
+            title="B04 — Ship the thing",
+            assignee="default",
+            project_id=result["project_id"],
+        )
+        with kanban_db.write_txn(conn):
+            for task_id, started, ended in (
+                (retried_id, now - 300, now - 240),
+                (retried_id, now - 120, now - 60),
+                (namesake_id, now - 30, now),
+            ):
+                conn.execute(
+                    "INSERT INTO task_runs "
+                    "(task_id, profile, status, started_at, ended_at, outcome) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (task_id, "default", "done", started, ended, "completed"),
+                )
+
+    runs = ow.read_project_snapshot(ctx, result["project_slug"])["runs"]
+
+    assert all(
+        set(run) == {
+            "task_title", "started_at", "finished_at", "has_newer_run", "receipt",
+        }
+        for run in runs
+    )
+    # All three runs sanitize to one display title, so the title alone could
+    # never separate them.
+    assert [run["task_title"] for run in runs] == ["Ship the thing"] * 3
+    # Newest first: the namesake task's only run, then the retried task's
+    # newest run, then its older attempt — only the last has a newer run.
+    assert [run["has_newer_run"] for run in runs] == [False, False, True]
+
+    payload = json.dumps(runs)
+    assert retried_id not in payload
+    assert namesake_id not in payload
 
 
 def test_project_snapshot_hides_projects_without_owner_receipt(ctx):
