@@ -1508,11 +1508,24 @@ def _project_lifecycle_revision(
     earlier schema where every terminal denial was initially marked as a
     generation.
     """
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(owner_workspace_receipts)")
+    }
+    if "terminal_generation" in columns:
+        generation_filter = "AND terminal_generation > 0"
+    else:
+        # A read-only Workspace request can be the first request after an
+        # upgrade, before any mutation has opened projects.db for migration.
+        # Mirror _ensure_schema() by treating legacy terminal lifecycle rows as
+        # generations while keeping this projection read-only. The first later
+        # mutation will add the durable marker normally.
+        generation_filter = "AND status IN ('committed', 'denied')"
     rows = conn.execute(
         "SELECT * FROM owner_workspace_receipts "
         "WHERE actor = ? AND profile = ? AND project_id = ? "
         "AND operation = 'owner_project_lifecycle' "
-        "AND terminal_generation > 0",
+        f"{generation_filter}",
         (ctx.actor, ctx.profile, project_id),
     ).fetchall()
     return sum(1 for row in rows if not _is_retryable_confirmation_timeout(row))

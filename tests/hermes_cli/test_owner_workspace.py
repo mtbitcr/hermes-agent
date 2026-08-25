@@ -1487,6 +1487,83 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
     )[0]["lifecycle_revision"] == 5
 
 
+def test_project_lifecycle_projection_reads_pre_migration_receipts(ctx):
+    approver = _with_approver(ctx.session)
+    created = _commit_task_graph(
+        ctx,
+        **_task_graph_args(
+            idempotency_key="graph-lifecycle-legacy-schema",
+            project_name="Legacy Lifecycle Project",
+        ),
+    )
+    approver.join()
+
+    with projects_db.connect_closing() as conn:
+        conn.execute(
+            "ALTER TABLE owner_workspace_receipts "
+            "RENAME TO owner_workspace_receipts_current"
+        )
+        conn.execute(
+            """CREATE TABLE owner_workspace_receipts (
+                actor            TEXT NOT NULL,
+                profile          TEXT NOT NULL,
+                idempotency_key  TEXT NOT NULL,
+                operation        TEXT NOT NULL,
+                request_digest   TEXT NOT NULL,
+                status           TEXT NOT NULL,
+                lock_token       TEXT,
+                lock_expires     INTEGER,
+                project_id       TEXT,
+                board_slug       TEXT,
+                task_id          TEXT,
+                result_json      TEXT,
+                created_at       INTEGER NOT NULL,
+                updated_at       INTEGER NOT NULL,
+                PRIMARY KEY (actor, profile, idempotency_key)
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO owner_workspace_receipts "
+            "(actor, profile, idempotency_key, operation, request_digest, "
+            "status, lock_token, lock_expires, project_id, board_slug, task_id, "
+            "result_json, created_at, updated_at) "
+            "SELECT actor, profile, idempotency_key, operation, request_digest, "
+            "status, lock_token, lock_expires, project_id, board_slug, task_id, "
+            "result_json, created_at, updated_at "
+            "FROM owner_workspace_receipts_current"
+        )
+        conn.execute(
+            "INSERT INTO owner_workspace_receipts "
+            "(actor, profile, idempotency_key, operation, request_digest, "
+            "status, project_id, result_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'owner_project_lifecycle', ?, 'committed', ?, ?, ?, ?)",
+            (
+                ctx.actor,
+                ctx.profile,
+                "legacy-lifecycle-receipt",
+                "legacy-lifecycle-digest",
+                created["project_id"],
+                json.dumps({"ok": True, "action": "archive"}),
+                1,
+                1,
+            ),
+        )
+        conn.execute("DROP TABLE owner_workspace_receipts_current")
+        conn.commit()
+
+    project = ow.list_committed_projects(ctx, lifecycle_revision=True)[0]
+    assert project["project_id"] == created["project_id"]
+    assert project["lifecycle_revision"] == 1
+    with projects_db.connect_closing() as conn:
+        columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(owner_workspace_receipts)"
+            )
+        }
+    assert "terminal_generation" not in columns
+
+
 def test_project_lifecycle_requires_exact_authenticated_run_authority(ctx):
     approver = _with_approver(ctx.session)
     created = _commit_task_graph(
