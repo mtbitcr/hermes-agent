@@ -1303,6 +1303,17 @@ _OWNER_EXISTING_PROPOSAL_KEYS = frozenset({
 })
 
 
+def _response_store_locked(method):
+    """Serialize runtime access to ResponseStore's shared SQLite connection."""
+
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._conversation_lock:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
 def _active_owner_profile() -> str:
     """Resolve the request-selected profile without accepting caller data."""
     profile = _api_request_profile.get()
@@ -1698,6 +1709,7 @@ class ResponseStore:
             raise ValueError("invalid profile scope")
         return selected
 
+    @_response_store_locked
     def get(
         self, response_id: str, *, profile: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
@@ -1728,6 +1740,7 @@ class ResponseStore:
             self._conn.commit()
             return None
 
+    @_response_store_locked
     def put(
         self, response_id: str, data: Dict[str, Any], *, profile: Optional[str] = None,
     ) -> None:
@@ -1784,6 +1797,7 @@ class ResponseStore:
                 )
         self._conn.commit()
 
+    @_response_store_locked
     def delete(self, response_id: str, *, profile: Optional[str] = None) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
         profile = self._profile(profile)
@@ -1804,6 +1818,7 @@ class ResponseStore:
         self._conn.commit()
         return cursor.rowcount > 0
 
+    @_response_store_locked
     def owner_response_is_current(
         self, response_id: str, *, profile: Optional[str] = None,
     ) -> bool:
@@ -1819,6 +1834,7 @@ class ResponseStore:
             for row in rows
         )
 
+    @_response_store_locked
     def get_conversation(
         self, name: str, *, profile: Optional[str] = None,
     ) -> Optional[str]:
@@ -1830,6 +1846,7 @@ class ResponseStore:
         ).fetchone()
         return row[0] if row else None
 
+    @_response_store_locked
     def owner_history_snapshot(
         self, name: str, *, profile: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -1969,6 +1986,7 @@ class ResponseStore:
             "data": data,
         }
 
+    @_response_store_locked
     def mark_owner_proposal_consumed(
         self, profile: str, name: str, response_id: str,
     ) -> bool:
@@ -2201,6 +2219,7 @@ class ResponseStore:
                 self._conn.rollback()
                 raise
 
+    @_response_store_locked
     def owner_claim_is_completed(
         self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
     ) -> bool:
@@ -2218,6 +2237,7 @@ class ResponseStore:
         ).fetchone()
         return row is not None
 
+    @_response_store_locked
     def owner_claim_is_released(
         self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
     ) -> bool:
@@ -2257,6 +2277,7 @@ class ResponseStore:
             self._conn.commit()
             return cursor.rowcount == 1
 
+    @_response_store_locked
     def owner_proposal_record(
         self, profile: str, name: str, response_id: str,
     ) -> "tuple[dict[str, Any], str] | None":
@@ -2285,6 +2306,7 @@ class ResponseStore:
             return None
         return candidate, digest
 
+    @_response_store_locked
     def owner_run_is_attached(
         self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
     ) -> bool:
@@ -2420,6 +2442,7 @@ class ResponseStore:
                 self._conn.rollback()
                 raise
 
+    @_response_store_locked
     def owner_session_index(
         self, profile: str, group: str,
     ) -> Dict[str, Any]:
@@ -2726,6 +2749,7 @@ class ResponseStore:
                 self._conn.rollback()
                 raise
 
+    @_response_store_locked
     def lookup_run_idempotency(
         self,
         profile: str,
@@ -2747,6 +2771,7 @@ class ResponseStore:
             else ("conflict", None)
         )
 
+    @_response_store_locked
     def run_idempotency_created_at(
         self,
         profile: str,
@@ -2875,6 +2900,7 @@ class ResponseStore:
                 raise
         return terminal
 
+    @_response_store_locked
     def owner_run_completion(
         self, profile: str, run_id: str,
     ) -> "Dict[str, Any] | None":
@@ -2919,6 +2945,7 @@ class ResponseStore:
             return None
         return value
 
+    @_response_store_locked
     def _bound_owner_run_completion(
         self, run_id: str,
     ) -> "Dict[str, Any] | None":
@@ -3087,6 +3114,7 @@ class ResponseStore:
                 self._conn.rollback()
                 raise
 
+    @_response_store_locked
     def close(self) -> None:
         """Close the database connection."""
         try:
@@ -3094,6 +3122,7 @@ class ResponseStore:
         except Exception:
             pass
 
+    @_response_store_locked
     def __len__(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
         return row[0] if row else 0

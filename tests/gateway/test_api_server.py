@@ -292,6 +292,34 @@ class TestResponseStore:
         store = ResponseStore(max_size=10)
         assert store.get("resp_missing") is None
 
+    def test_get_waits_for_the_shared_response_store_transaction_lock(self):
+        store = ResponseStore(max_size=10)
+        store.put("resp_locked", {"output": "safe"})
+        started = threading.Event()
+        finished = threading.Event()
+        result = []
+
+        def read_response():
+            started.set()
+            try:
+                result.append(store.get("resp_locked"))
+            finally:
+                finished.set()
+
+        reader = threading.Thread(target=read_response, daemon=True)
+        with store._conversation_lock:
+            reader.start()
+            assert started.wait(1)
+            blocked_while_transaction_lock_is_held = not finished.wait(0.1)
+
+        reader.join(timeout=1)
+        try:
+            assert blocked_while_transaction_lock_is_held is True
+            assert finished.is_set()
+            assert result == [{"output": "safe"}]
+        finally:
+            store.close()
+
     def test_lru_eviction(self):
         store = ResponseStore(max_size=3)
         store.put("resp_1", {"output": "one"})
