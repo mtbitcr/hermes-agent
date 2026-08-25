@@ -428,6 +428,7 @@ class TestFieldDelegation:
         owt._handle_project_lifecycle({
             "idempotency_key": "lifecycle-1",
             "project_id": "p1",
+            "expected_revision": 4,
             "action": "archive",
         })
 
@@ -436,6 +437,7 @@ class TestFieldDelegation:
         assert kwargs == {
             "idempotency_key": "lifecycle-1",
             "project_id": "p1",
+            "expected_revision": 4,
             "action": "archive",
         }
 

@@ -1416,6 +1416,19 @@ def _set_project_dispatch_state(
 OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY = "lifecycle_revision"
 
 
+def _project_lifecycle_revision(
+    conn: sqlite3.Connection, ctx: OwnerContext, project_id: str,
+) -> int:
+    """Return the monotonic terminal lifecycle generation for one Project."""
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM owner_workspace_receipts "
+        "WHERE actor = ? AND profile = ? AND project_id = ? "
+        "AND operation = 'owner_project_lifecycle' "
+        "AND terminal_generation > 0",
+        (ctx.actor, ctx.profile, project_id),
+    ).fetchone()[0])
+
+
 def list_committed_projects(
     ctx: OwnerContext, *, lifecycle_revision: bool = False,
 ) -> list[dict]:
@@ -1479,18 +1492,13 @@ def list_committed_projects(
                 "archived": bool(row["archived"]),
             }
             if lifecycle_revision:
-                revision = conn.execute(
-                    "SELECT COUNT(*) FROM owner_workspace_receipts "
-                    "WHERE actor = ? AND profile = ? AND project_id = ? "
-                    "AND operation = 'owner_project_lifecycle' "
-                    "AND terminal_generation > 0",
-                    (ctx.actor, ctx.profile, project_id),
-                ).fetchone()[0]
                 # Opt-in keeps the legacy closed projection stable during a
                 # rolling deploy. The durable marker never disappears when a
                 # timed-out receipt is retried, so this generation cannot move
                 # backwards while another owner decision is pending.
-                projection["lifecycle_revision"] = int(revision)
+                projection["lifecycle_revision"] = _project_lifecycle_revision(
+                    conn, ctx, project_id,
+                )
             projects.append(projection)
         return projects
     finally:
@@ -2112,6 +2120,7 @@ def set_project_archived(
     *,
     idempotency_key: str,
     project_id: str,
+    expected_revision: Any,
     action: str,
 ) -> dict:
     """Apply one receipt-backed Project lifecycle or execution change.
@@ -2124,13 +2133,21 @@ def set_project_archived(
         idempotency_key, "idempotency_key", limit=200,
     )
     project_id = _bounded_text(project_id, "project_id", limit=100)
+    if type(expected_revision) is not int or expected_revision < 0:
+        raise OwnerWorkspaceError(
+            "invalid_argument", "expected_revision must be a non-negative integer",
+        )
     action = str(action or "").strip().lower()
     if action not in {"archive", "restore", "pause", "resume"}:
         raise OwnerWorkspaceError(
             "invalid_argument",
             "action must be 'archive', 'restore', 'pause', or 'resume'",
         )
-    payload = {"project_id": project_id, "action": action}
+    payload = {
+        "project_id": project_id,
+        "expected_revision": expected_revision,
+        "action": action,
+    }
     digest = _digest(payload)
     operation = "owner_project_lifecycle"
     target_archived = action == "archive"
@@ -2154,6 +2171,11 @@ def set_project_archived(
                 "project_not_found", "the Project is unavailable",
             )
         _assert_board_ownership(project.board_slug, project_id)
+        if _project_lifecycle_revision(pconn, ctx, project_id) != expected_revision:
+            raise OwnerWorkspaceError(
+                "stale_revision",
+                "the Project changed after it was shown; refresh before trying again",
+            )
 
         state, row, token = _acquire_or_replay(
             pconn, ctx, idempotency_key, operation, digest,
@@ -2188,90 +2210,107 @@ def set_project_archived(
             )
             return result
 
-        with write_txn(pconn):
-            _assert_owns_lease(pconn, ctx, idempotency_key, token)
-            current = projects_db.get_project(pconn, project_id)
-            if current is None or not current.board_slug:
-                raise OwnerWorkspaceError(
-                    "project_not_found", "the Project is unavailable",
+        # Serialize every lifecycle writer on the Project's actual board from
+        # the final compare-and-swap through durable receipt finalization. A
+        # second approved action may already be waiting here, but it cannot
+        # observe the old revision after the first mutation has landed.
+        with _global_board_guard(project.board_slug):
+            with write_txn(pconn):
+                _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                current = projects_db.get_project(pconn, project_id)
+                if current is None or not current.board_slug:
+                    raise OwnerWorkspaceError(
+                        "project_not_found", "the Project is unavailable",
+                    )
+                metadata = kanban_db.read_board_metadata(current.board_slug)
+                current_revision = _project_lifecycle_revision(
+                    pconn, ctx, project_id,
                 )
-            metadata = kanban_db.read_board_metadata(current.board_slug)
-            if action in {"pause", "resume"} and current.archived:
-                result = {
-                    "ok": False,
-                    "error": "conflict",
-                    "archived": True,
-                    "execution_paused": True,
-                }
-            elif action in {"archive", "restore"} and (
-                bool(current.archived) == target_archived and row is None
-            ):
-                result = {
-                    "ok": False,
-                    "error": "conflict",
-                    "archived": bool(current.archived),
-                    "execution_paused": bool(
-                        metadata.get("dispatch_paused_by_owner")
-                    ),
-                }
-            elif action == "pause" and (
-                metadata.get("dispatch_paused_by_owner") is True and row is None
-            ):
-                result = {
-                    "ok": False,
-                    "error": "conflict",
-                    "archived": False,
-                    "execution_paused": True,
-                }
-            elif action == "resume" and (
-                kanban_db.board_dispatch_allowed(metadata) and row is None
-            ):
-                result = {
-                    "ok": False,
-                    "error": "conflict",
-                    "archived": False,
-                    "execution_paused": False,
-                }
-            else:
-                if action in {"archive", "restore"}:
-                    _set_project_dispatch_state(
-                        current.board_slug,
-                        enabled=False,
-                        paused_by_owner=True,
-                    )
-                    pconn.execute(
-                        "UPDATE projects SET archived = ? WHERE id = ?",
-                        (int(target_archived), project_id),
-                    )
-                    resulting_archived = target_archived
-                    execution_paused = True
-                elif action == "pause":
-                    _set_project_dispatch_state(
-                        current.board_slug,
-                        paused_by_owner=True,
-                    )
-                    resulting_archived = False
-                    execution_paused = True
+                if current_revision != expected_revision:
+                    result = {
+                        "ok": False,
+                        "error": "conflict",
+                        "archived": bool(current.archived),
+                        "execution_paused": bool(
+                            metadata.get("dispatch_paused_by_owner")
+                        ),
+                    }
+                elif action in {"pause", "resume"} and current.archived:
+                    result = {
+                        "ok": False,
+                        "error": "conflict",
+                        "archived": True,
+                        "execution_paused": True,
+                    }
+                elif action in {"archive", "restore"} and (
+                    bool(current.archived) == target_archived and row is None
+                ):
+                    result = {
+                        "ok": False,
+                        "error": "conflict",
+                        "archived": bool(current.archived),
+                        "execution_paused": bool(
+                            metadata.get("dispatch_paused_by_owner")
+                        ),
+                    }
+                elif action == "pause" and (
+                    metadata.get("dispatch_paused_by_owner") is True and row is None
+                ):
+                    result = {
+                        "ok": False,
+                        "error": "conflict",
+                        "archived": False,
+                        "execution_paused": True,
+                    }
+                elif action == "resume" and (
+                    kanban_db.board_dispatch_allowed(metadata) and row is None
+                ):
+                    result = {
+                        "ok": False,
+                        "error": "conflict",
+                        "archived": False,
+                        "execution_paused": False,
+                    }
                 else:
-                    _set_project_dispatch_state(
-                        current.board_slug,
-                        enabled=True,
-                        paused_by_owner=False,
-                    )
-                    resulting_archived = False
-                    execution_paused = False
-                result = {
-                    "ok": True,
-                    "action": action,
-                    "project_slug": current.slug,
-                    "archived": resulting_archived,
-                    "execution_paused": execution_paused,
-                }
+                    if action in {"archive", "restore"}:
+                        _set_project_dispatch_state(
+                            current.board_slug,
+                            enabled=False,
+                            paused_by_owner=True,
+                        )
+                        pconn.execute(
+                            "UPDATE projects SET archived = ? WHERE id = ?",
+                            (int(target_archived), project_id),
+                        )
+                        resulting_archived = target_archived
+                        execution_paused = True
+                    elif action == "pause":
+                        _set_project_dispatch_state(
+                            current.board_slug,
+                            paused_by_owner=True,
+                        )
+                        resulting_archived = False
+                        execution_paused = True
+                    else:
+                        _set_project_dispatch_state(
+                            current.board_slug,
+                            enabled=True,
+                            paused_by_owner=False,
+                        )
+                        resulting_archived = False
+                        execution_paused = False
+                    result = {
+                        "ok": True,
+                        "action": action,
+                        "project_slug": current.slug,
+                        "archived": resulting_archived,
+                        "execution_paused": execution_paused,
+                    }
 
-        _finalize_receipt(
-            pconn, ctx, idempotency_key, token,
-            status="committed", result=result,
-        )
+            _finalize_receipt(
+                pconn, ctx, idempotency_key, token,
+                status="committed", result=result,
+            )
         return result
     finally:
         pconn.close()

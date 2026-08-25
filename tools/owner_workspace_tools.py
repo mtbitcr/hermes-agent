@@ -123,6 +123,7 @@ def _handle_project_lifecycle(args: dict, **kw) -> str:
             ctx,
             idempotency_key=args.get("idempotency_key"),
             project_id=args.get("project_id"),
+            expected_revision=args.get("expected_revision"),
             action=args.get("action"),
         )
         return _ok(result)
@@ -558,12 +559,21 @@ registry.register(
                     "description": "Stable action key so a retry is safe.",
                 },
                 "project_id": {"type": "string"},
+                "expected_revision": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Exact lifecycle revision from the latest owner Project read."
+                    ),
+                },
                 "action": {
                     "type": "string",
                     "enum": ["archive", "restore", "pause", "resume"],
                 },
             },
-            "required": ["idempotency_key", "project_id", "action"],
+            "required": [
+                "idempotency_key", "project_id", "expected_revision", "action",
+            ],
         },
     },
     handler=lambda args, **kw: _handle_project_lifecycle(args, **kw),

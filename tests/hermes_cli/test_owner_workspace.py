@@ -1360,6 +1360,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
         ctx,
         idempotency_key="project-lifecycle-archive",
         project_id=created["project_id"],
+        expected_revision=0,
         action="archive",
     )
     archive_approver.join()
@@ -1380,6 +1381,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
         ctx,
         idempotency_key="project-lifecycle-archive",
         project_id=created["project_id"],
+        expected_revision=0,
         action="archive",
     ) == archived
 
@@ -1388,6 +1390,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
         ctx,
         idempotency_key="project-lifecycle-restore",
         project_id=created["project_id"],
+        expected_revision=1,
         action="restore",
     )
     restore_approver.join()
@@ -1411,6 +1414,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
         ctx,
         idempotency_key="project-lifecycle-resume",
         project_id=created["project_id"],
+        expected_revision=2,
         action="resume",
     )
     resume_approver.join()
@@ -1424,6 +1428,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
         ctx,
         idempotency_key="project-lifecycle-pause",
         project_id=created["project_id"],
+        expected_revision=3,
         action="pause",
     )
     pause_approver.join()
@@ -1442,6 +1447,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
         ctx,
         idempotency_key="project-lifecycle-archive-again",
         project_id=created["project_id"],
+        expected_revision=4,
         action="archive",
     )
     second_archive_approver.join()
@@ -1450,6 +1456,85 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
     assert ow.list_committed_projects(
         ctx, lifecycle_revision=True,
     )[0]["lifecycle_revision"] == 5
+
+
+def test_project_lifecycle_rejects_a_stale_owner_revision_before_approval(ctx):
+    approver = _with_approver(ctx.session)
+    created = _commit_task_graph(
+        ctx,
+        **_task_graph_args(
+            idempotency_key="graph-lifecycle-stale",
+            project_name="Stale Lifecycle Project",
+        ),
+    )
+    approver.join()
+
+    approver = _with_approver(ctx.session)
+    archived = ow.set_project_archived(
+        ctx,
+        idempotency_key="project-lifecycle-stale-archive",
+        project_id=created["project_id"],
+        expected_revision=0,
+        action="archive",
+    )
+    approver.join()
+    assert archived["ok"] is True
+
+    approval.unregister_gateway_notify(ctx.session)
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.set_project_archived(
+            ctx,
+            idempotency_key="project-lifecycle-stale-restore",
+            project_id=created["project_id"],
+            expected_revision=0,
+            action="restore",
+        )
+
+    assert excinfo.value.code == "stale_revision"
+    assert ow.list_committed_projects(ctx)[0]["archived"] is True
+    assert ow.list_committed_projects(
+        ctx, lifecycle_revision=True,
+    )[0]["lifecycle_revision"] == 1
+
+
+def test_project_lifecycle_rechecks_revision_after_approval(ctx, monkeypatch):
+    approver = _with_approver(ctx.session)
+    created = _commit_task_graph(
+        ctx,
+        **_task_graph_args(
+            idempotency_key="graph-lifecycle-race",
+            project_name="Lifecycle Race Project",
+        ),
+    )
+    approver.join()
+
+    revisions = iter((0, 1))
+    monkeypatch.setattr(
+        ow,
+        "_project_lifecycle_revision",
+        lambda _conn, _ctx, _project_id: next(revisions),
+    )
+    approver = _with_approver(ctx.session)
+    result = ow.set_project_archived(
+        ctx,
+        idempotency_key="project-lifecycle-race-archive",
+        project_id=created["project_id"],
+        expected_revision=0,
+        action="archive",
+    )
+    approver.join()
+
+    assert result == {
+        "ok": False,
+        "error": "conflict",
+        "archived": False,
+        "execution_paused": False,
+    }
+    with projects_db.connect_closing() as conn:
+        assert projects_db.get_project(conn, created["project_id"]).archived is False
+    assert kanban_db.board_dispatch_allowed(
+        kanban_db.read_board_metadata(created["board"])
+    ) is True
 
 
 def test_project_lifecycle_rejects_project_without_owner_receipt(ctx):
@@ -1461,6 +1546,7 @@ def test_project_lifecycle_rejects_project_without_owner_receipt(ctx):
             ctx,
             idempotency_key="foreign-project-archive",
             project_id=project_id,
+            expected_revision=0,
             action="archive",
         )
     assert excinfo.value.code == "project_not_owned"
@@ -1696,6 +1782,7 @@ def test_owner_decisions_projects_native_gates_without_writes_or_identifiers(ctx
         ctx,
         idempotency_key="decisions-archive-project",
         project_id=setup["project_id"],
+        expected_revision=0,
         action="archive",
     )
     archived_approver.join()
@@ -1857,6 +1944,7 @@ def test_owner_approval_descriptions_project_every_project_name(ctx):
             ctx,
             idempotency_key="approval-archive",
             project_id=boot["project_id"],
+            expected_revision=0,
             action="archive",
         )
         approver.join()
