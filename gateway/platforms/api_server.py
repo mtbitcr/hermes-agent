@@ -1287,6 +1287,8 @@ _OWNER_RUN_RE = re.compile(r"run_[a-f0-9]{32}")
 _OWNER_PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _OWNER_SESSION_INDEX_LIMIT = 100
 _OWNER_CLAIM_LEASE_SECONDS = 300
+_OWNER_CONVERSATION_RESERVATION_LEASE_SECONDS = 300
+_OWNER_CONVERSATION_RESERVATION_RENEW_SECONDS = 60
 _OWNER_PROPOSAL_MAX_MUTATIONS = 12
 _OWNER_NEW_PROPOSAL_KEYS = frozenset({
     "schema_version", "kind", "mode", "project_name",
@@ -1438,9 +1440,25 @@ class ResponseStore:
                 name TEXT NOT NULL,
                 response_id TEXT NOT NULL,
                 created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
                 PRIMARY KEY (profile, name)
             )"""
         )
+        reservation_columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(owner_conversation_reservations)"
+            )
+        }
+        if "expires_at" not in reservation_columns:
+            self._conn.execute(
+                "ALTER TABLE owner_conversation_reservations ADD COLUMN expires_at REAL"
+            )
+            self._conn.execute(
+                "UPDATE owner_conversation_reservations SET expires_at = created_at + ? "
+                "WHERE expires_at IS NULL",
+                (_OWNER_CONVERSATION_RESERVATION_LEASE_SECONDS,),
+            )
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS run_idempotency (
                 profile TEXT NOT NULL,
@@ -1828,6 +1846,7 @@ class ResponseStore:
             "proposal_consumed": False,
             "proposal_claimed": False,
             "active_run_id": None,
+            "completed_run_id": None,
             "conversation_closed": False,
             "data": [],
         }
@@ -1927,11 +1946,25 @@ class ResponseStore:
             and row[3] == proposal_response_id
             and row[5] == "claimed"
         )
+        completed_run_id = None
+        if (
+            proposal_consumed
+            and row[5] == "completed"
+            and isinstance(row[4], str)
+            and _OWNER_RUN_RE.fullmatch(row[4]) is not None
+            # The opaque run handle is useful only while its exact terminal
+            # receipt still exists. This is what lets another browser tab
+            # recover the same founder-safe completion without trusting a
+            # browser cookie or replaying the mutation.
+            and self._bound_owner_run_completion(row[4]) is not None
+        ):
+            completed_run_id = row[4]
         return {
             "latest_response_id": proposal_response_id if data else None,
             "proposal_consumed": proposal_consumed,
             "proposal_claimed": proposal_claimed,
             "active_run_id": row[4] if proposal_claimed else None,
+            "completed_run_id": completed_run_id,
             "conversation_closed": bool(row[6]),
             "data": data,
         }
@@ -1986,6 +2019,28 @@ class ResponseStore:
             )
         )
 
+    def _active_owner_conversation_reservation_locked(
+        self, profile: str, name: str,
+    ) -> "sqlite3.Row | None":
+        """Return one live reservation and discard crash-left expired rows.
+
+        Callers hold ``_conversation_lock`` and an active ``BEGIN IMMEDIATE``
+        transaction, so expiry and the following authority decision are one
+        atomic fence.
+        """
+        now = time.time()
+        self._conn.execute(
+            "DELETE FROM owner_conversation_reservations "
+            "WHERE profile = ? AND name = ? "
+            "AND (expires_at IS NULL OR expires_at <= ?)",
+            (profile, name, now),
+        )
+        return self._conn.execute(
+            "SELECT response_id, expires_at FROM owner_conversation_reservations "
+            "WHERE profile = ? AND name = ? AND expires_at > ?",
+            (profile, name, now),
+        ).fetchone()
+
     def claim_owner_proposal(
         self, profile: str, name: str, response_id: str, claim_id: str,
     ) -> bool:
@@ -2002,11 +2057,9 @@ class ResponseStore:
                     "FROM conversations WHERE profile = ? AND name = ?",
                     (profile, name),
                 ).fetchone()
-                reserved = self._conn.execute(
-                    "SELECT 1 FROM owner_conversation_reservations "
-                    "WHERE profile = ? AND name = ?",
-                    (profile, name),
-                ).fetchone()
+                reserved = self._active_owner_conversation_reservation_locked(
+                    profile, name,
+                )
                 if (
                     row is None
                     or row[0] != response_id
@@ -2109,11 +2162,9 @@ class ResponseStore:
                     "FROM conversations WHERE profile = ? AND name = ?",
                     (profile, name),
                 ).fetchone()
-                reserved = self._conn.execute(
-                    "SELECT 1 FROM owner_conversation_reservations "
-                    "WHERE profile = ? AND name = ?",
-                    (profile, name),
-                ).fetchone()
+                reserved = self._active_owner_conversation_reservation_locked(
+                    profile, name,
+                )
                 if (
                     row is None
                     or row[0] != response_id
@@ -2184,6 +2235,27 @@ class ResponseStore:
             (profile, name, response_id, response_id, response_id, claim_id, run_id),
         ).fetchone()
         return row is not None
+
+    def abandon_unattached_owner_claim(
+        self, profile: str, name: str, response_id: str, claim_id: str,
+    ) -> bool:
+        """Release only the exact legacy claim that never acquired a run."""
+        profile = self._profile(profile)
+        if not self._valid_owner_authority_ids(
+            profile, name, response_id, claim_id,
+        ):
+            return False
+        with self._conversation_lock:
+            cursor = self._conn.execute(
+                "UPDATE conversations SET claim_state = 'released', "
+                "claim_expires_at = NULL WHERE profile = ? AND name = ? "
+                "AND proposal_response_id = ? AND consumed_response_id IS NOT ? "
+                "AND claimed_response_id = ? AND claim_id = ? "
+                "AND owner_run_id IS NULL AND claim_state IN ('claimed', 'released')",
+                (profile, name, response_id, response_id, response_id, claim_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def owner_proposal_record(
         self, profile: str, name: str, response_id: str,
@@ -2293,11 +2365,9 @@ class ResponseStore:
         with self._conversation_lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                if self._conn.execute(
-                    "SELECT 1 FROM owner_conversation_reservations "
-                    "WHERE profile = ? AND name = ?",
-                    (profile, name),
-                ).fetchone() is not None:
+                if self._active_owner_conversation_reservation_locked(
+                    profile, name,
+                ) is not None:
                     self._conn.rollback()
                     return False
                 row = self._conn.execute(
@@ -2454,18 +2524,34 @@ class ResponseStore:
                 ):
                     self._conn.rollback()
                     return False
-                existing = self._conn.execute(
-                    "SELECT response_id FROM owner_conversation_reservations "
-                    "WHERE profile = ? AND name = ?",
-                    (profile, name),
-                ).fetchone()
+                existing = self._active_owner_conversation_reservation_locked(
+                    profile, name,
+                )
                 if existing is not None:
+                    if existing[0] == response_id:
+                        self._conn.execute(
+                            "UPDATE owner_conversation_reservations "
+                            "SET expires_at = ? WHERE profile = ? AND name = ? "
+                            "AND response_id = ?",
+                            (
+                                time.time()
+                                + _OWNER_CONVERSATION_RESERVATION_LEASE_SECONDS,
+                                profile, name, response_id,
+                            ),
+                        )
+                        self._conn.commit()
+                        return True
                     self._conn.rollback()
-                    return existing[0] == response_id
+                    return False
+                now = time.time()
                 self._conn.execute(
                     "INSERT INTO owner_conversation_reservations "
-                    "(profile, name, response_id, created_at) VALUES (?, ?, ?, ?)",
-                    (profile, name, response_id, time.time()),
+                    "(profile, name, response_id, created_at, expires_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        profile, name, response_id, now,
+                        now + _OWNER_CONVERSATION_RESERVATION_LEASE_SECONDS,
+                    ),
                 )
                 self._conn.commit()
                 return True
@@ -2484,6 +2570,27 @@ class ResponseStore:
                 (profile, name, response_id),
             )
             self._conn.commit()
+
+    def renew_owner_conversation_reservation(
+        self, profile: str, name: str, response_id: str,
+    ) -> bool:
+        """Extend one still-live exact reservation without reviving a lost one."""
+        profile = self._profile(profile)
+        if not self._valid_owner_authority_ids(profile, name, response_id):
+            return False
+        now = time.time()
+        with self._conversation_lock:
+            cursor = self._conn.execute(
+                "UPDATE owner_conversation_reservations SET expires_at = ? "
+                "WHERE profile = ? AND name = ? AND response_id = ? "
+                "AND expires_at > ?",
+                (
+                    now + _OWNER_CONVERSATION_RESERVATION_LEASE_SECONDS,
+                    profile, name, response_id, now,
+                ),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def reserve_run_idempotency(
         self,
@@ -2522,11 +2629,9 @@ class ResponseStore:
                             "FROM conversations WHERE profile = ? AND name = ?",
                             (owner_profile, owner["conversation"]),
                         ).fetchone()
-                        reserved = self._conn.execute(
-                            "SELECT 1 FROM owner_conversation_reservations "
-                            "WHERE profile = ? AND name = ?",
-                            (owner_profile, owner["conversation"]),
-                        ).fetchone()
+                        reserved = self._active_owner_conversation_reservation_locked(
+                            owner_profile, owner["conversation"],
+                        )
                         if (
                             row is not None
                             and row[0] == owner["response_id"]
@@ -2571,11 +2676,9 @@ class ResponseStore:
                         "FROM conversations WHERE profile = ? AND name = ?",
                         (owner_profile, owner["conversation"]),
                     ).fetchone()
-                    reserved = self._conn.execute(
-                        "SELECT 1 FROM owner_conversation_reservations "
-                        "WHERE profile = ? AND name = ?",
-                        (owner_profile, owner["conversation"]),
-                    ).fetchone()
+                    reserved = self._active_owner_conversation_reservation_locked(
+                        owner_profile, owner["conversation"],
+                    )
                     if (
                         row is None
                         or row[0] != owner["response_id"]
@@ -2643,6 +2746,30 @@ class ResponseStore:
             if row[0] == fingerprint
             else ("conflict", None)
         )
+
+    def run_idempotency_created_at(
+        self,
+        profile: str,
+        session_scope: str,
+        idempotency_key: str,
+        run_id: str,
+    ) -> "float | None":
+        """Read the immutable creation time for one exact persisted run."""
+        profile = self._profile(profile)
+        row = self._conn.execute(
+            "SELECT created_at FROM run_idempotency "
+            "WHERE profile = ? AND session_scope = ? "
+            "AND idempotency_key = ? AND run_id = ?",
+            (profile, session_scope, idempotency_key, run_id),
+        ).fetchone()
+        if (
+            row is None
+            or isinstance(row[0], bool)
+            or not isinstance(row[0], (int, float))
+            or not math.isfinite(float(row[0]))
+        ):
+            return None
+        return float(row[0])
 
     def persist_owner_run_completion(
         self,
@@ -2792,6 +2919,28 @@ class ResponseStore:
             return None
         return value
 
+    def _bound_owner_run_completion(
+        self, run_id: str,
+    ) -> "Dict[str, Any] | None":
+        """Read the one terminal receipt bound by a conversation's opaque run id.
+
+        Owner conversations live under the planner profile while their approved
+        mutations execute under the executor profile. The conversation already
+        supplies the unguessable bound run id; this lookup additionally requires
+        that exactly one profile owns it, then delegates every receipt-shape check
+        to the canonical reader above.
+        """
+        if not isinstance(run_id, str) or _OWNER_RUN_RE.fullmatch(run_id) is None:
+            return None
+        rows = self._conn.execute(
+            "SELECT profile FROM run_idempotency "
+            "WHERE run_id = ? AND terminal_json IS NOT NULL LIMIT 2",
+            (run_id,),
+        ).fetchall()
+        if len(rows) != 1 or not isinstance(rows[0][0], str):
+            return None
+        return self.owner_run_completion(rows[0][0], run_id)
+
     def purge_run_idempotency(self, older_than: float) -> None:
         with self._conversation_lock:
             self._conn.execute(
@@ -2829,12 +2978,18 @@ class ResponseStore:
                     self._conn.rollback()
                     return False
                 if is_owner:
-                    reservation = self._conn.execute(
-                        "SELECT response_id FROM owner_conversation_reservations "
-                        "WHERE profile = ? AND name = ?",
-                        (profile, name),
-                    ).fetchone()
-                    if reservation is not None and reservation[0] != reservation_id:
+                    reservation = self._active_owner_conversation_reservation_locked(
+                        profile, name,
+                    )
+                    if (
+                        reservation_id is not None
+                        and (
+                            reservation is None
+                            or reservation[0] != reservation_id
+                        )
+                    ) or (
+                        reservation_id is None and reservation is not None
+                    ):
                         self._conn.rollback()
                         return False
                 row = self._conn.execute(
@@ -7538,6 +7693,65 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=409,
                 )
             conversation_reservation_id = response_id
+        conversation_agent_ref: list[Any] = [None]
+        conversation_reservation_lost = threading.Event()
+        reservation_heartbeat_task: "asyncio.Task[Any] | None" = None
+
+        async def _renew_owner_conversation_reservation() -> None:
+            try:
+                while conversation_reservation_id is not None:
+                    await asyncio.sleep(
+                        _OWNER_CONVERSATION_RESERVATION_RENEW_SECONDS
+                    )
+                    if not self._response_store.renew_owner_conversation_reservation(
+                        response_profile,
+                        str(conversation),
+                        conversation_reservation_id,
+                    ):
+                        conversation_reservation_lost.set()
+                        agent = conversation_agent_ref[0]
+                        if agent is not None:
+                            request_hard_interrupt(
+                                agent, "Owner conversation reservation was lost",
+                            )
+                        return
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                conversation_reservation_lost.set()
+                agent = conversation_agent_ref[0]
+                if agent is not None:
+                    try:
+                        request_hard_interrupt(
+                            agent, "Owner conversation reservation was lost",
+                        )
+                    except Exception:
+                        pass
+                logger.exception(
+                    "[api_server] owner conversation reservation renewal failed"
+                )
+
+        def _release_owner_conversation_reservation() -> None:
+            nonlocal reservation_heartbeat_task
+            heartbeat = reservation_heartbeat_task
+            reservation_heartbeat_task = None
+            if heartbeat is not None and not heartbeat.done():
+                heartbeat.cancel()
+            if conversation_reservation_id is not None:
+                self._response_store.release_owner_conversation_reservation(
+                    response_profile,
+                    str(conversation),
+                    conversation_reservation_id,
+                )
+
+        if conversation_reservation_id is not None:
+            reservation_heartbeat_task = asyncio.create_task(
+                _renew_owner_conversation_reservation()
+            )
+            self._background_tasks.add(reservation_heartbeat_task)
+            reservation_heartbeat_task.add_done_callback(
+                self._background_tasks.discard
+            )
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
@@ -7579,7 +7793,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "result": function_result,
                 }))
 
-            agent_ref = [None]
+            agent_ref = conversation_agent_ref
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
@@ -7590,6 +7804,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
+                abort_event=conversation_reservation_lost,
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
@@ -7621,23 +7836,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_reservation_id=conversation_reservation_id,
                 )
             finally:
-                if conversation_reservation_id is not None:
-                    self._response_store.release_owner_conversation_reservation(
-                        response_profile,
-                        str(conversation),
-                        conversation_reservation_id,
-                    )
+                _release_owner_conversation_reservation()
 
         async def _compute_response():
-            return await self._run_agent(
+            result = await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                agent_ref=conversation_agent_ref,
+                abort_event=conversation_reservation_lost,
                 **agent_overrides,
                 route=route,
             )
+            if conversation_reservation_lost.is_set():
+                raise RuntimeError("owner conversation reservation changed")
+            return result
 
         if background:
             created_at = int(time.time())
@@ -7680,12 +7895,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         **pending_store_data,
                         "response": incomplete,
                     }, profile=response_profile)
-                    if conversation_reservation_id is not None:
-                        self._response_store.release_owner_conversation_reservation(
-                            response_profile,
-                            str(conversation),
-                            conversation_reservation_id,
-                        )
+                    _release_owner_conversation_reservation()
                     raise
                 except Exception as exc:
                     safe_error = _redact_api_error_text(exc)
@@ -7706,12 +7916,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         **pending_store_data,
                         "response": failed,
                     }, profile=response_profile)
-                    if conversation_reservation_id is not None:
-                        self._response_store.release_owner_conversation_reservation(
-                            response_profile,
-                            str(conversation),
-                            conversation_reservation_id,
-                        )
+                    _release_owner_conversation_reservation()
                     return
 
                 response_data, full_history, effective_session_id = (
@@ -7757,23 +7962,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         "instructions": instructions,
                         "session_id": effective_session_id,
                     }, profile=response_profile)
-                    if conversation_reservation_id is not None:
-                        self._response_store.release_owner_conversation_reservation(
-                            response_profile,
-                            str(conversation),
-                            conversation_reservation_id,
-                        )
+                    _release_owner_conversation_reservation()
 
             task = asyncio.create_task(_run_background_response())
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
             if conversation_reservation_id is not None:
                 task.add_done_callback(
-                    lambda _task: self._response_store.release_owner_conversation_reservation(
-                        response_profile,
-                        str(conversation),
-                        conversation_reservation_id,
-                    )
+                    lambda _task: _release_owner_conversation_reservation()
                 )
             await asyncio.sleep(0)
             return web.json_response(queued_response)
@@ -7797,12 +7993,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
-                if conversation_reservation_id is not None:
-                    self._response_store.release_owner_conversation_reservation(
-                        response_profile,
-                        str(conversation),
-                        conversation_reservation_id,
-                    )
+                _release_owner_conversation_reservation()
                 return web.json_response(
                     _openai_error(f"Internal server error: {e}", err_type="server_error"),
                     status=500,
@@ -7812,12 +8003,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 result, usage = await _compute_response()
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
-                if conversation_reservation_id is not None:
-                    self._response_store.release_owner_conversation_reservation(
-                        response_profile,
-                        str(conversation),
-                        conversation_reservation_id,
-                    )
+                _release_owner_conversation_reservation()
                 return web.json_response(
                     _openai_error(f"Internal server error: {e}", err_type="server_error"),
                     status=500,
@@ -7839,12 +8025,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             )
         except Exception as exc:
-            if conversation_reservation_id is not None:
-                self._response_store.release_owner_conversation_reservation(
-                    response_profile,
-                    str(conversation),
-                    conversation_reservation_id,
-                )
+            _release_owner_conversation_reservation()
             logger.error(
                 "Error finalizing response: %s",
                 _redact_api_error_text(exc),
@@ -7874,12 +8055,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 profile=response_profile,
                 reservation_id=conversation_reservation_id,
             ):
-                if conversation_reservation_id is not None:
-                    self._response_store.release_owner_conversation_reservation(
-                        response_profile,
-                        str(conversation),
-                        conversation_reservation_id,
-                    )
+                _release_owner_conversation_reservation()
                 return web.json_response(
                     _openai_error(
                         "Owner conversation changed before this response completed",
@@ -7891,6 +8067,7 @@ class APIServerAdapter(BasePlatformAdapter):
         response_headers = {"X-Hermes-Session-Id": _effective_session_id}
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
+        _release_owner_conversation_reservation()
         return web.json_response(response_data, headers=response_headers)
 
     # ------------------------------------------------------------------
@@ -7989,6 +8166,7 @@ class APIServerAdapter(BasePlatformAdapter):
         action = body["action"]
         expected_keys = {
             "claim": {"action", "response_id", "claim_id"},
+            "abandon": {"action", "response_id", "claim_id"},
             "attach": {"action", "response_id", "claim_id", "run_id"},
             "complete": {"action", "response_id", "claim_id", "run_id"},
             "release": {"action", "response_id", "claim_id", "run_id"},
@@ -8006,6 +8184,10 @@ class APIServerAdapter(BasePlatformAdapter):
         profile = _active_owner_profile()
         if action == "claim":
             applied = self._response_store.claim_owner_proposal(
+                profile, conversation, response_id, body.get("claim_id"),
+            )
+        elif action == "abandon":
+            applied = self._response_store.abandon_unattached_owner_claim(
                 profile, conversation, response_id, body.get("claim_id"),
             )
         elif action == "attach":
@@ -8802,6 +8984,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
+        abort_event: Optional[threading.Event] = None,
         active_run_id: Optional[str] = None,
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
@@ -8878,6 +9061,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         agent_ref[0] = agent
                     if active_run_id:
                         self._active_run_agents[active_run_id] = agent
+                    if abort_event is not None and abort_event.is_set():
+                        request_hard_interrupt(
+                            agent, "Owner conversation reservation was lost",
+                        )
+                        raise RuntimeError("owner conversation reservation changed")
                     effective_task_id = session_id or str(uuid.uuid4())
                     # Baseline for selective background-process reaping on
                     # SSE client disconnect — mirrors gateway/run.py's
@@ -9467,6 +9655,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 or context.get("project_slug") is not None
             ):
                 raise ValueError("stored proposal does not authorize this operation")
+            from hermes_cli.owner_workspace import (
+                OwnerWorkspaceError,
+                _native_owner_project_name,
+                owner_project_name,
+            )
+
+            try:
+                stored_project_name = owner_project_name(
+                    _native_owner_project_name(
+                        clean(candidate.get("project_name")), "project_name",
+                    )
+                )
+            except OwnerWorkspaceError as exc:
+                raise ValueError("stored proposal Project name is invalid") from exc
+            if context.get("project_name") != stored_project_name:
+                raise ValueError("owner Project context does not match the stored proposal")
             from hermes_cli.profiles import list_profiles
 
             profiles = [str(item.name) for item in list_profiles()]
@@ -9698,6 +9902,70 @@ class APIServerAdapter(BasePlatformAdapter):
             ).hexdigest(),
         }
 
+    def _owner_authority_digest_for_recovery(
+        self, authority: "dict[str, Any]",
+    ) -> str:
+        """Rebuild the exact digest the validated run bound to its tool call."""
+        payload = self._owner_authority_clean(authority["payload"])
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _recover_native_owner_completion(
+        self,
+        *,
+        profile: str,
+        session_scope: str,
+        run_id: str,
+        authority: "dict[str, Any]",
+        owner: "dict[str, str] | None",
+    ) -> "Dict[str, Any] | None":
+        """Close the cross-database crash window from a bound native receipt."""
+        try:
+            from hermes_cli.owner_workspace import read_committed_owner_run_receipt
+
+            authority_digest = self._owner_authority_digest_for_recovery(authority)
+            receipt = read_committed_owner_run_receipt(
+                profile=profile,
+                idempotency_key=authority["idempotency_key"],
+                operation=authority["operation"],
+                authority_digest=authority_digest,
+            )
+            if receipt is None:
+                return None
+            minimal_receipt = self._owner_mutation_receipt(
+                authority["operation"], receipt,
+            )
+            if minimal_receipt is None:
+                return None
+            created_at = self._response_store.run_idempotency_created_at(
+                profile,
+                session_scope,
+                authority["idempotency_key"],
+                run_id,
+            )
+            if created_at is None:
+                return None
+            completion_owner = dict(owner) if owner is not None else None
+            if completion_owner is not None:
+                completion_owner["payload_digest"] = authority_digest
+            return self._response_store.persist_owner_run_completion(
+                profile,
+                session_scope,
+                authority["idempotency_key"],
+                run_id,
+                minimal_receipt,
+                created_at=created_at,
+                owner=completion_owner,
+            )
+        except Exception:
+            logger.exception(
+                "[api_server] native owner completion recovery failed for run=%s",
+                run_id,
+            )
+            return None
+
     @staticmethod
     def _owner_mutation_receipt(
         operation: str, result: Any,
@@ -9851,22 +10119,38 @@ class APIServerAdapter(BasePlatformAdapter):
                         retry_fingerprint,
                     )
                 )
-                retry_status = self._run_statuses.get(retry_run_id or "") or (
+                retry_status = (
                     self._response_store.owner_run_completion(
                         request_owner_profile, retry_run_id,
                     )
                     if retry_run_id is not None else None
-                ) or {}
-                retry_snapshot = self._response_store.owner_history_snapshot(
-                    owner_proposal_authority["conversation"],
-                    profile=owner_proposal_authority["proposal_profile"],
-                )
+                ) or self._run_statuses.get(retry_run_id or "") or {}
                 if (
                     retry_state == "existing"
                     and retry_run_id is not None
-                    and retry_snapshot.get("latest_response_id")
-                    == owner_proposal_authority["response_id"]
-                    and retry_snapshot.get("proposal_consumed") is True
+                    and not (
+                        retry_status.get("status") == "completed"
+                        and retry_status.get("owner_mutation_committed") is True
+                    )
+                ):
+                    retry_status = self._recover_native_owner_completion(
+                        profile=request_owner_profile,
+                        session_scope=retry_scope,
+                        run_id=retry_run_id,
+                        authority=owner_proposal_authority,
+                        owner={
+                            "proposal_profile": owner_proposal_authority[
+                                "proposal_profile"
+                            ],
+                            "conversation": owner_proposal_authority["conversation"],
+                            "response_id": owner_proposal_authority["response_id"],
+                            "claim_id": owner_proposal_authority["claim_id"],
+                            "operation": owner_proposal_authority["operation"],
+                        },
+                    ) or retry_status
+                if (
+                    retry_state == "existing"
+                    and retry_run_id is not None
                     and retry_status.get("status") == "completed"
                     and retry_status.get("owner_mutation_committed") is True
                 ):
@@ -9915,12 +10199,27 @@ class APIServerAdapter(BasePlatformAdapter):
                         retry_fingerprint,
                     )
                 )
-                retry_status = self._run_statuses.get(retry_run_id or "") or (
+                retry_status = (
                     self._response_store.owner_run_completion(
                         request_owner_profile, retry_run_id,
                     )
                     if retry_run_id is not None else None
-                ) or {}
+                ) or self._run_statuses.get(retry_run_id or "") or {}
+                if (
+                    retry_state == "existing"
+                    and retry_run_id is not None
+                    and not (
+                        retry_status.get("status") == "completed"
+                        and retry_status.get("owner_mutation_committed") is True
+                    )
+                ):
+                    retry_status = self._recover_native_owner_completion(
+                        profile=request_owner_profile,
+                        session_scope=retry_scope,
+                        run_id=retry_run_id,
+                        authority=owner_lifecycle_authority,
+                        owner=None,
+                    ) or retry_status
                 if (
                     retry_state == "existing"
                     and retry_run_id is not None
@@ -10298,13 +10597,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 if owner_authority_finalized[0] and not owner_authority_completed[0]:
                     return False
                 try:
+                    persisted_created_at = (
+                        self._response_store.run_idempotency_created_at(
+                            request_owner_profile,
+                            idempotency_session_scope,
+                            idempotency_key,
+                            run_id,
+                        )
+                    )
+                    if persisted_created_at is None:
+                        return False
                     terminal = self._response_store.persist_owner_run_completion(
                         request_owner_profile,
                         idempotency_session_scope,
                         idempotency_key,
                         run_id,
                         receipt,
-                        created_at=created_at,
+                        created_at=persisted_created_at,
                         owner=owner_proposal_authority,
                     )
                 except Exception:
@@ -10786,11 +11095,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
-        if status is None:
-            status = self._response_store.owner_run_completion(
-                _active_owner_profile(), run_id,
-            )
+        # A durable owner completion outranks in-memory transport state. A
+        # restart recovery can close the cross-database receipt window while a
+        # stale running/failed cache entry still exists for the same run.
+        status = self._response_store.owner_run_completion(
+            _active_owner_profile(), run_id,
+        ) or self._run_statuses.get(run_id)
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),

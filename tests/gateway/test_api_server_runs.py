@@ -308,6 +308,16 @@ class TestStartRun:
             )
 
             async with TestClient(TestServer(app)) as cli:
+                mismatched_context_body = json.loads(json.dumps(body))
+                mismatched_context_body["owner_workspace_context"][
+                    "project_name"
+                ] = "Different workshop"
+                mismatched_context = await cli.post(
+                    "/v1/runs",
+                    json=mismatched_context_body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                assert mismatched_context.status == 409
                 mismatched_body = json.loads(json.dumps(body))
                 mismatched_body["owner_proposal_authority"]["payload"][
                     "request_title"
@@ -348,6 +358,7 @@ class TestStartRun:
         )
         assert snapshot["proposal_consumed"] is True
         assert snapshot["proposal_claimed"] is False
+        assert snapshot["completed_run_id"] == first_run_id
         assert status["owner_mutation_committed"] is True
         assert json.loads(status["output"]) == {
             "ok": True,
@@ -373,6 +384,7 @@ class TestStartRun:
             )
             assert restarted_snapshot["proposal_consumed"] is True
             assert restarted_snapshot["proposal_claimed"] is False
+            assert restarted_snapshot["completed_run_id"] == first_run_id
             adapter._response_store = restarted_store
             adapter._run_statuses.clear()
             restarted_app = _create_runs_app(adapter)
@@ -389,13 +401,38 @@ class TestStartRun:
                         headers={"Idempotency-Key": idempotency_key},
                     )
                     replay_data = await replay.json()
+                    next_response_id = "resp_owner_follow_up"
+                    restarted_store.put(next_response_id, {
+                        "response": {"id": next_response_id, "created_at": 2},
+                        "conversation_history": [{
+                            "role": "assistant",
+                            "content": json.dumps({
+                                "schema_version": 1,
+                                "kind": "question",
+                            }),
+                        }],
+                    }, profile="raphael-planner")
+                    assert restarted_store.set_conversation(
+                        conversation,
+                        next_response_id,
+                        profile="raphael-planner",
+                    ) is True
+                    replay_after_follow_up = await cli.post(
+                        "/v1/runs",
+                        json=body,
+                        headers={"Idempotency-Key": idempotency_key},
+                    )
+                    replay_after_follow_up_data = await replay_after_follow_up.json()
             assert restored.status == 200
             assert restored_status["run_id"] == first_run_id
             assert restored_status["status"] == "completed"
             assert restored_status["owner_mutation_committed"] is True
             assert restored_status["output"] == status["output"]
+            assert restored_status["created_at"] == status["created_at"]
             assert replay.status == 202, replay_data
             assert replay_data["run_id"] == first_run_id
+            assert replay_after_follow_up.status == 202, replay_after_follow_up_data
+            assert replay_after_follow_up_data["run_id"] == first_run_id
             restarted_create.assert_not_called()
         finally:
             restarted_store.close()
@@ -592,29 +629,49 @@ class TestStartRun:
 
         db_path = adapter._response_store._db_path
         assert db_path is not None
+        adapter._response_store._conn.execute(
+            "UPDATE run_idempotency SET terminal_json = NULL "
+            "WHERE idempotency_key = ?",
+            (idempotency_key,),
+        )
+        adapter._response_store._conn.commit()
         adapter._response_store.close()
         restarted_store = ResponseStore(db_path=db_path, default_profile="default")
         try:
             adapter._response_store = restarted_store
-            adapter._run_statuses.clear()
+            adapter._run_statuses[first_run_id] = {
+                "run_id": first_run_id,
+                "status": "failed",
+                "updated_at": time.time(),
+                "error": "stale transport state",
+            }
             restarted_app = _create_runs_app(adapter)
             with (
                 patch("gateway.run._load_gateway_config", return_value=config),
                 patch.object(adapter, "_create_agent") as restarted_create,
             ):
                 async with TestClient(TestServer(restarted_app)) as cli:
-                    restored = await cli.get(f"/v1/runs/{first_run_id}")
-                    restored_status = await restored.json()
+                    missing_before_recovery = await cli.get(
+                        f"/v1/runs/{first_run_id}"
+                    )
+                    missing_before_recovery_status = (
+                        await missing_before_recovery.json()
+                    )
                     replay = await cli.post(
                         "/v1/runs",
                         json=body,
                         headers={"Idempotency-Key": idempotency_key},
                     )
                     replay_data = await replay.json()
+                    restored = await cli.get(f"/v1/runs/{first_run_id}")
+                    restored_status = await restored.json()
+            assert missing_before_recovery.status == 200
+            assert missing_before_recovery_status["status"] == "failed"
             assert restored.status == 200
             assert restored_status["status"] == "completed"
             assert restored_status["owner_mutation_committed"] is True
             assert restored_status["output"] == status["output"]
+            assert restored_status["created_at"] == status["created_at"]
             assert replay.status == 202, replay_data
             assert replay_data["run_id"] == first_run_id
             restarted_create.assert_not_called()

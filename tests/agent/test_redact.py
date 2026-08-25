@@ -563,6 +563,49 @@ class TestStrictUrlCredentialRedaction:
             "/callback?to%E2%80%8Bken=***&state=public"
         )
 
+    def test_literal_invisible_cannot_split_a_sensitive_key(self):
+        text = f"/callback?to{chr(0x200B)}ken=opaque-value&state=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            f"/callback?to{chr(0x200B)}ken=***&state=public"
+        )
+
+    @pytest.mark.parametrize(
+        "separator", ["\x00", "\t", "\n", "\r", "\x1b", "\x85", "\u2028"]
+    )
+    def test_literal_nonprinting_character_cannot_split_a_sensitive_key(
+        self, separator
+    ):
+        text = f"/callback?to{separator}ken=opaque-value&state=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            f"/callback?to{separator}ken=***&state=public"
+        )
+
+    @pytest.mark.parametrize("separator", ["%00", "%1B", "%C2%85", "%E2%80%A8"])
+    def test_encoded_nonprinting_character_cannot_split_a_sensitive_key(
+        self, separator
+    ):
+        text = f"/callback?to{separator}ken=opaque-value&state=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            f"/callback?to{separator}ken=***&state=public"
+        )
+
+    def test_malformed_query_and_fragment_routes_still_redact_credentials(self):
+        assert redact_sensitive_text(
+            "/callback?route?token=opaque-value&state=public",
+            redact_url_credentials=True,
+        ) == "/callback?route?token=***&state=public"
+        assert redact_sensitive_text(
+            "https://app.example/#/callback?x-amz-signature=opaque-value&x=1",
+            redact_url_credentials=True,
+        ) == "https://app.example/#/callback?x-amz-signature=***&x=1"
+
+    def test_long_invisible_sensitive_key_is_not_skipped(self):
+        hidden = chr(0x200B) * 513
+        text = f"/callback?to{hidden}ken=opaque-value&state=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            f"/callback?to{hidden}ken=***&state=public"
+        )
+
     def test_nested_percent_encoding_cannot_hide_a_sensitive_key(self):
         text = "/callback?to%252525E2%25252580%2525258Bken=opaque-value&state=public"
         assert redact_sensitive_text(text, redact_url_credentials=True) == (

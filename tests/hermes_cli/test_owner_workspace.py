@@ -3167,6 +3167,8 @@ def test_comment_crash_before_finalize_replay_creates_no_duplicate(ctx):
         t.join()
 
     _expire_lock(ctx, key)
+    with projects_db.connect_closing() as pconn:
+        assert projects_db.archive_project(pconn, setup["project_id"]) is True
 
     t2 = _with_approver(ctx.session)
     result = ow.comment_task(ctx, idempotency_key=key, task_id=task_id, body="hello", project_id=setup["project_id"])
@@ -3208,8 +3210,9 @@ def test_comment_replay_conflicting_payload_fails_closed_at_board_layer(ctx):
 
 
 @pytest.mark.parametrize("to_status", ["done", "archived"])
+@pytest.mark.parametrize("archive_before_replay", [False, True])
 def test_move_task_crash_before_recompute_ready_replay_repairs_child_readiness(
-    ctx, to_status,
+    ctx, to_status, archive_before_replay,
 ):
     setup = _bootstrap_board(ctx)
     board = setup["board"]
@@ -3246,6 +3249,10 @@ def test_move_task_crash_before_recompute_ready_replay_repairs_child_readiness(
         assert kanban_db.get_task(kconn, parent_id).status == to_status
     finally:
         kconn.close()
+
+    if archive_before_replay:
+        with projects_db.connect_closing() as pconn:
+            assert projects_db.archive_project(pconn, setup["project_id"]) is True
 
     t2 = _with_approver(ctx.session)
     result = ow.move_task(
@@ -3351,6 +3358,8 @@ def test_move_task_exact_replay_recognizes_own_committed_event_by_full_identity(
         kconn.close()
     assert committed_task.status == "blocked"
 
+    with projects_db.connect_closing() as pconn:
+        assert projects_db.archive_project(pconn, setup["project_id"]) is True
     _expire_lock(ctx, key)
     t2 = _with_approver(ctx.session)
     result = ow.move_task(

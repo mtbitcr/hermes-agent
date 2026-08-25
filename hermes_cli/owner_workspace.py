@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS owner_workspace_receipts (
     board_slug       TEXT,
     task_id          TEXT,
     result_json      TEXT,
+    authority_digest TEXT,
     terminal_generation INTEGER NOT NULL DEFAULT 0,
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL,
@@ -208,6 +209,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             "PRAGMA table_info(owner_workspace_receipts)"
         )
     }
+    migrated = False
     if "terminal_generation" not in columns:
         conn.execute(
             "ALTER TABLE owner_workspace_receipts "
@@ -222,6 +224,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             "WHERE operation = 'owner_project_lifecycle' "
             "AND status IN ('committed', 'denied')"
         )
+        migrated = True
+    if "authority_digest" not in columns:
+        conn.execute(
+            "ALTER TABLE owner_workspace_receipts ADD COLUMN authority_digest TEXT"
+        )
+        migrated = True
+    if migrated:
         conn.commit()
 
 
@@ -283,6 +292,24 @@ def _get_receipt(conn: sqlite3.Connection, ctx: OwnerContext, key: str) -> Optio
     ).fetchone()
 
 
+def _receipt_authority_digest(
+    ctx: OwnerContext, key: str, operation: str,
+) -> Optional[str]:
+    """Return the exact run authority bound to this native mutation."""
+    authority = ctx.authority
+    if (
+        authority is not None
+        and authority.actor == ctx.actor
+        and authority.profile == ctx.profile
+        and authority.session == ctx.session
+        and authority.idempotency_key == key
+        and authority.operation == operation
+        and re.fullmatch(r"[a-f0-9]{64}", authority.payload_digest) is not None
+    ):
+        return authority.payload_digest
+    return None
+
+
 def _terminal_replay(
     conn: sqlite3.Connection,
     ctx: OwnerContext,
@@ -314,6 +341,50 @@ def _terminal_replay(
             "receipt_invalid", "the durable terminal receipt is unreadable",
         )
     return result
+
+
+def read_committed_owner_run_receipt(
+    *, profile: str, idempotency_key: str, operation: str, authority_digest: str,
+) -> Optional[dict]:
+    """Recover one successful native receipt after a gateway crash.
+
+    The gateway may die after the native database commits but before its own
+    run terminal is stored. Recovery is allowed only when the trusted profile,
+    idempotency key, operation, and authority digest all match the receipt
+    written by that exact run.
+    """
+    if (
+        not isinstance(profile, str)
+        or not profile.strip()
+        or not isinstance(idempotency_key, str)
+        or not idempotency_key
+        or not isinstance(operation, str)
+        or not operation
+        or re.fullmatch(r"[a-f0-9]{64}", authority_digest) is None
+    ):
+        return None
+    conn = projects_db.connect()
+    try:
+        _ensure_schema(conn)
+        rows = conn.execute(
+            "SELECT result_json FROM owner_workspace_receipts "
+            "WHERE actor = ? AND profile = ? AND idempotency_key = ? "
+            "AND operation = ? AND authority_digest = ? AND status = 'committed' "
+            "LIMIT 2",
+            (
+                profile.strip(), profile.strip(), idempotency_key,
+                operation, authority_digest,
+            ),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        try:
+            result = json.loads(rows[0]["result_json"])
+        except (TypeError, ValueError):
+            return None
+        return result if isinstance(result, dict) and result.get("ok") is True else None
+    finally:
+        conn.close()
 
 
 def _is_retryable_confirmation_timeout(row: sqlite3.Row) -> bool:
@@ -354,15 +425,19 @@ def _claim_or_wait(
     """
     token = secrets.token_hex(16)
     now = _now()
+    authority_digest = _receipt_authority_digest(ctx, key, operation)
     with write_txn(conn):
         row = _get_receipt(conn, ctx, key)
         if row is None:
             conn.execute(
                 "INSERT INTO owner_workspace_receipts "
                 "(actor, profile, idempotency_key, operation, request_digest, status, "
-                " lock_token, lock_expires, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?)",
-                (ctx.actor, ctx.profile, key, operation, digest, token, now + _receipt_lease_seconds(), now, now),
+                " lock_token, lock_expires, authority_digest, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?)",
+                (
+                    ctx.actor, ctx.profile, key, operation, digest, token,
+                    now + _receipt_lease_seconds(), authority_digest, now, now,
+                ),
             )
             return ("own", None, token)
         if row["request_digest"] != digest:
@@ -380,10 +455,10 @@ def _claim_or_wait(
                 "UPDATE owner_workspace_receipts SET status = 'in_progress', "
                 "lock_token = ?, lock_expires = ?, project_id = NULL, "
                 "board_slug = NULL, task_id = NULL, result_json = NULL, "
-                "terminal_generation = 0, updated_at = ? "
+                "terminal_generation = 0, authority_digest = ?, updated_at = ? "
                 "WHERE actor = ? AND profile = ? AND idempotency_key = ? AND status = 'denied'",
                 (
-                    token, now + _receipt_lease_seconds(), now,
+                    token, now + _receipt_lease_seconds(), authority_digest, now,
                     ctx.actor, ctx.profile, key,
                 ),
             )
@@ -396,9 +471,13 @@ def _claim_or_wait(
         if row["lock_expires"] is not None and now < row["lock_expires"]:
             return ("wait", row, None)
         conn.execute(
-            "UPDATE owner_workspace_receipts SET lock_token = ?, lock_expires = ?, updated_at = ? "
+            "UPDATE owner_workspace_receipts SET lock_token = ?, lock_expires = ?, "
+            "authority_digest = COALESCE(authority_digest, ?), updated_at = ? "
             "WHERE actor = ? AND profile = ? AND idempotency_key = ?",
-            (token, now + _receipt_lease_seconds(), now, ctx.actor, ctx.profile, key),
+            (
+                token, now + _receipt_lease_seconds(), authority_digest, now,
+                ctx.actor, ctx.profile, key,
+            ),
         )
         return ("own", row, token)
 
@@ -3133,9 +3212,15 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
     )
 
 
-def _resolve_existing_project_board(pconn: sqlite3.Connection, project_id: str):
+def _resolve_existing_project_board(
+    pconn: sqlite3.Connection, project_id: str, *, allow_archived: bool = False,
+):
     project = projects_db.get_project(pconn, project_id)
-    if project is None or project.archived or not project.board_slug:
+    if (
+        project is None
+        or (project.archived and not allow_archived)
+        or not project.board_slug
+    ):
         raise OwnerWorkspaceError("project_not_found", f"project {project_id!r} is unavailable")
     if not kanban_db.board_exists(project.board_slug):
         raise OwnerWorkspaceError("project_not_found", "the Project board is unavailable")
@@ -3374,13 +3459,17 @@ def _resolve_receipt_owned_task(
     ctx: OwnerContext,
     project_id: str,
     task_id: str,
+    *,
+    allow_archived: bool = False,
 ):
     if not _receipt_owns_project(pconn, ctx, project_id):
         raise OwnerWorkspaceError(
             "project_not_owned",
             "the Project is not owned by this trusted owner receipt",
         )
-    project, board_slug = _resolve_existing_project_board(pconn, project_id)
+    project, board_slug = _resolve_existing_project_board(
+        pconn, project_id, allow_archived=allow_archived,
+    )
     kconn = kanban_db.connect(board=board_slug)
     try:
         task = kanban_db.get_task(kconn, task_id)
@@ -3467,8 +3556,16 @@ def move_task(
         )
         if replay is not None:
             return replay
+        pending = _get_receipt(pconn, ctx, idempotency_key)
+        recovery_pending = bool(
+            pending is not None
+            and pending["status"] == "in_progress"
+            and pending["operation"] == operation
+            and pending["request_digest"] == digest
+        )
         _project, board_slug, task = _resolve_receipt_owned_task(
             pconn, ctx, project_id, task_id,
+            allow_archived=recovery_pending,
         )
         state, row, token = _acquire_or_replay(pconn, ctx, idempotency_key, operation, digest)
         if state == "terminal":
@@ -3505,19 +3602,41 @@ def move_task(
                         )
                     current_project = projects_db.get_project(pconn, project_id)
                     current_task = kanban_db.get_task(kconn, task_id)
+                    snapshot = None
+                    if row is not None and current_task is not None:
+                        # Adopting a dead claim: recognize only the exact
+                        # event identity this receipt could have emitted.
+                        already = kanban_db.get_next_event_after(
+                            kconn, task_id, expected_revision,
+                        )
+                        if (
+                            already is not None
+                            and already.kind == "owner_move"
+                            and (already.payload or {}).get("idempotency_key") == idempotency_key
+                            and (already.payload or {}).get("actor") == ctx.actor
+                            and (already.payload or {}).get("profile") == ctx.profile
+                            and (already.payload or {}).get("to_status") == to_status
+                            and (already.payload or {}).get("expected_status") == expected_status
+                        ):
+                            snapshot = {
+                                "moved": True,
+                                "status": to_status,
+                                "revision": already.id,
+                            }
                     if (
                         current_project is None
                         or current_project.archived
                         or current_project.board_slug != board_slug
                     ):
-                        snapshot = {
-                            "moved": False,
-                            "status": current_task.status if current_task else task.status,
-                            "revision": (
-                                kanban_db.task_event_revision(kconn, task_id)
-                                if current_task else expected_revision
-                            ),
-                        }
+                        if snapshot is None:
+                            snapshot = {
+                                "moved": False,
+                                "status": current_task.status if current_task else task.status,
+                                "revision": (
+                                    kanban_db.task_event_revision(kconn, task_id)
+                                    if current_task else expected_revision
+                                ),
+                            }
                     else:
                         _assert_board_ownership(board_slug, project_id)
                         if current_task is None or current_task.project_id != project_id:
@@ -3525,28 +3644,6 @@ def move_task(
                                 "task_not_found",
                                 "the task is no longer part of this receipt-owned Project",
                             )
-
-                        snapshot = None
-                        if row is not None:
-                            # Adopting a dead claim: recognize only the exact
-                            # event identity this receipt could have emitted.
-                            already = kanban_db.get_next_event_after(
-                                kconn, task_id, expected_revision,
-                            )
-                            if (
-                                already is not None
-                                and already.kind == "owner_move"
-                                and (already.payload or {}).get("idempotency_key") == idempotency_key
-                                and (already.payload or {}).get("actor") == ctx.actor
-                                and (already.payload or {}).get("profile") == ctx.profile
-                                and (already.payload or {}).get("to_status") == to_status
-                                and (already.payload or {}).get("expected_status") == expected_status
-                            ):
-                                snapshot = {
-                                    "moved": True,
-                                    "status": to_status,
-                                    "revision": already.id,
-                                }
 
                         if snapshot is None:
                             snapshot = kanban_db.cas_transition_task(
@@ -3562,8 +3659,13 @@ def move_task(
                                     "expected_status": expected_status,
                                 },
                             )
-                        if snapshot["moved"] and to_status in ("done", "archived"):
-                            kanban_db.recompute_ready(kconn)
+                    if snapshot["moved"] and to_status in ("done", "archived"):
+                        # Also repair readiness when an exact crash recovery is
+                        # replayed after the Project was archived. The status
+                        # event committed before the archive, and restore must
+                        # not revive the stale dependency state left by that
+                        # interrupted write.
+                        kanban_db.recompute_ready(kconn)
 
                 if snapshot["moved"]:
                     result = {
@@ -3638,8 +3740,16 @@ def comment_task(
         )
         if replay is not None:
             return replay
+        pending = _get_receipt(pconn, ctx, idempotency_key)
+        recovery_pending = bool(
+            pending is not None
+            and pending["status"] == "in_progress"
+            and pending["operation"] == operation
+            and pending["request_digest"] == digest
+        )
         _project, board_slug, task = _resolve_receipt_owned_task(
             pconn, ctx, project_id, task_id,
+            allow_archived=recovery_pending,
         )
         state, row, token = _acquire_or_replay(pconn, ctx, idempotency_key, operation, digest)
         if state == "terminal":
@@ -3672,7 +3782,27 @@ def comment_task(
                         or current_project.archived
                         or current_project.board_slug != board_slug
                     ):
-                        comment_id = None
+                        existing_comment = (
+                            kconn.execute(
+                                "SELECT id, author, body FROM task_comments "
+                                "WHERE task_id = ? AND operation_key = ?",
+                                (task_id, operation_key),
+                            ).fetchone()
+                            if row is not None and current_task is not None
+                            else None
+                        )
+                        if existing_comment is not None and (
+                            existing_comment["author"] != ctx.actor
+                            or existing_comment["body"] != body
+                        ):
+                            raise OwnerWorkspaceError(
+                                "crash_recovery_failed",
+                                "the committed comment does not match this receipt",
+                            )
+                        comment_id = (
+                            int(existing_comment["id"])
+                            if existing_comment is not None else None
+                        )
                         revision = (
                             kanban_db.task_event_revision(kconn, task_id)
                             if current_task else 0

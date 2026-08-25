@@ -432,7 +432,7 @@ _URL_USERINFO_RE = re.compile(
 # the key is decoded separately for classification. Values stop at query or
 # fragment pair separators; both ``&`` and ``;`` are valid in deployed URLs.
 _STRICT_URL_PARAM_RE = re.compile(
-    r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]*)"
+    r"([?#&;])([^?#&;=\x20\"'<>]+)=([^#&;\s\"'<>]*)"
 )
 
 # Match userinfo in both absolute (``scheme://user:pass@host``) and
@@ -701,7 +701,14 @@ def _canonical_url_param_name(name: str) -> str | None:
     else:
         if unquote_plus(decoded) != decoded:
             return None
-    return strip_default_ignorables(decoded).casefold().replace("-", "_")
+    # Percent decoding can reveal control/separator characters that split a
+    # sensitive ASCII key without being visible in the egress text. Remove
+    # every non-printing code point after the maintained Unicode-ignorable
+    # pass, then classify the key. The original spelling is still preserved in
+    # output; only the value is masked.
+    decoded = strip_default_ignorables(decoded)
+    decoded = "".join(char for char in decoded if char.isprintable())
+    return decoded.casefold().replace("-", "_")
 
 
 def _redact_strict_url_credentials(text: str) -> str:

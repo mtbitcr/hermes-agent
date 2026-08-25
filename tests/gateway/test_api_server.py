@@ -18,6 +18,7 @@ import os
 import sqlite3
 import stat
 import sys
+import threading
 import time
 import types
 import uuid
@@ -432,6 +433,7 @@ class TestResponseStore:
             "proposal_consumed": False,
             "proposal_claimed": False,
             "active_run_id": None,
+            "completed_run_id": None,
             "conversation_closed": False,
             "data": history,
         }
@@ -686,6 +688,44 @@ class TestResponseStore:
         assert reopened.owner_history_snapshot(conversation)["proposal_consumed"] is True
         reopened.close()
 
+    def test_unattached_owner_claim_can_be_abandoned_without_releasing_a_run(self):
+        conversation = "raphael-owner-" + "9" * 32
+        response_id = "resp_unattached_claim"
+        claim_id = "claim_" + "8" * 32
+        run_id = "run_" + "7" * 32
+        store = ResponseStore(max_size=10)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 950},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, claim_id,
+        ) is True
+        assert store.abandon_unattached_owner_claim(
+            "default", conversation, response_id, claim_id,
+        ) is True
+        assert store.owner_history_snapshot(conversation)["proposal_claimed"] is False
+
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, claim_id,
+        ) is True
+        assert store.attach_owner_run(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
+        assert store.abandon_unattached_owner_claim(
+            "default", conversation, response_id, claim_id,
+        ) is False
+        assert store.owner_run_is_attached(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
+        store.close()
+
     def test_owner_proposal_release_and_close_fence_new_responses(self):
         conversation = "raphael-owner-" + "1" * 32
         response_id = "resp_releasable_proposal"
@@ -876,6 +916,52 @@ class TestResponseStore:
             "default", conversation, response_id, "claim_" + "6" * 32,
         ) is False
 
+    def test_expired_owner_turn_reservation_is_reclaimed_after_restart(
+        self, tmp_path,
+    ):
+        conversation = "raphael-owner-" + "e" * 32
+        db_path = tmp_path / "response-store.db"
+        first = ResponseStore(db_path=db_path, max_size=10)
+        assert first.reserve_owner_conversation(
+            "default", conversation, "resp_crash_left_turn",
+        ) is True
+        assert first.renew_owner_conversation_reservation(
+            "default", conversation, "resp_crash_left_turn",
+        ) is True
+        first._conn.execute(
+            "UPDATE owner_conversation_reservations SET expires_at = ? "
+            "WHERE profile = ? AND name = ?",
+            (time.time() - 1, "default", conversation),
+        )
+        first._conn.commit()
+        first.close()
+
+        restarted = ResponseStore(db_path=db_path, max_size=10)
+        try:
+            assert restarted.reserve_owner_conversation(
+                "default", conversation, "resp_recovered_turn",
+            ) is True
+            assert restarted.reserve_owner_conversation(
+                "default", conversation, "resp_competing_turn",
+            ) is False
+            assert restarted.set_conversation(
+                conversation,
+                "resp_recovered_turn",
+                profile="default",
+                reservation_id="resp_recovered_turn",
+            ) is True
+            assert restarted.set_conversation(
+                conversation,
+                "resp_crash_left_turn",
+                profile="default",
+                reservation_id="resp_crash_left_turn",
+            ) is False
+            assert restarted.get_conversation(
+                conversation, profile="default",
+            ) == "resp_recovered_turn"
+        finally:
+            restarted.close()
+
     def test_expired_unattached_claim_can_be_recovered(self):
         conversation = "raphael-owner-" + "6" * 32
         response_id = "resp_expired_owner_claim"
@@ -984,6 +1070,7 @@ class TestResponseStore:
             "proposal_consumed": False,
             "proposal_claimed": False,
             "active_run_id": None,
+            "completed_run_id": None,
             "conversation_closed": False,
             "data": [],
         }
@@ -2579,6 +2666,21 @@ class TestResponsesEndpoint:
             authority_response = await cli.post(authority_path, json=claim_payload)
             assert authority_response.status == 200
 
+            abandon_payload = {
+                "action": "abandon",
+                "response_id": authority_response_id,
+                "claim_id": claim_id,
+            }
+            abandoned = await cli.post(authority_path, json=abandon_payload)
+            assert abandoned.status == 200
+            assert await abandoned.json() == {
+                "object": "hermes.response.owner_authority",
+                "action": "abandon",
+                "applied": True,
+            }
+            authority_response = await cli.post(authority_path, json=claim_payload)
+            assert authority_response.status == 200
+
             # The native /v1/runs path, not this transition endpoint, owns the
             # initial binding and live run state.
             adapter._set_run_status(run_id, "running")
@@ -3067,6 +3169,142 @@ class TestResponsesEndpoint:
             "raphael-owner-" + "a" * 32,
         ) == queued["id"]
         mock_run.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_lost_owner_reservation_interrupts_background_agent(self, adapter):
+        started = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        class Agent:
+            def interrupt(self, _message=None):
+                interrupted.set()
+
+        async def _slow_run(**kwargs):
+            kwargs["agent_ref"][0] = Agent()
+            started.set()
+            await interrupted.wait()
+            return (
+                {"final_response": "Must not commit.", "messages": [], "api_calls": 1},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        conversation = "raphael-owner-" + "f" * 32
+        app = _create_app(adapter)
+        with (
+            patch(
+                "gateway.platforms.api_server."
+                "_OWNER_CONVERSATION_RESERVATION_RENEW_SECONDS",
+                0.01,
+            ),
+            patch.object(
+                adapter._response_store,
+                "renew_owner_conversation_reservation",
+                return_value=False,
+            ),
+            patch.object(adapter, "_run_agent", side_effect=_slow_run),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Plan the milestone",
+                        "conversation": conversation,
+                        "background": True,
+                        "store": True,
+                    },
+                )
+                queued = await response.json()
+                await asyncio.wait_for(started.wait(), timeout=1)
+                await asyncio.wait_for(interrupted.wait(), timeout=1)
+
+                terminal = None
+                for _ in range(100):
+                    polled = await cli.get(f"/v1/responses/{queued['id']}")
+                    terminal = await polled.json()
+                    if terminal["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.01)
+
+        assert response.status == 200
+        assert terminal is not None
+        assert terminal["status"] == "failed"
+        assert adapter._response_store.get_conversation(conversation) is None
+
+    @pytest.mark.asyncio
+    async def test_lost_owner_reservation_stops_agent_created_after_heartbeat(self, adapter):
+        creation_started = threading.Event()
+        release_creation = threading.Event()
+        interrupted = threading.Event()
+        ran = threading.Event()
+
+        class Agent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+
+            def interrupt(self, _message=None):
+                interrupted.set()
+
+            def run_conversation(self, **_kwargs):
+                ran.set()
+                return {"final_response": "Must not commit."}
+
+        def _delayed_create(**_kwargs):
+            creation_started.set()
+            assert release_creation.wait(timeout=1)
+            return Agent()
+
+        conversation = "raphael-owner-" + "e" * 32
+        app = _create_app(adapter)
+        try:
+            with (
+                patch(
+                    "gateway.platforms.api_server."
+                    "_OWNER_CONVERSATION_RESERVATION_RENEW_SECONDS",
+                    0.01,
+                ),
+                patch.object(
+                    adapter._response_store,
+                    "renew_owner_conversation_reservation",
+                    return_value=False,
+                ),
+                patch.object(adapter, "_create_agent", side_effect=_delayed_create),
+            ):
+                async with TestClient(TestServer(app)) as cli:
+                    response = await cli.post(
+                        "/v1/responses",
+                        json={
+                            "model": "hermes-agent",
+                            "input": "Plan the milestone",
+                            "conversation": conversation,
+                            "background": True,
+                            "store": True,
+                        },
+                    )
+                    queued = await response.json()
+                    assert await asyncio.to_thread(
+                        creation_started.wait, 1,
+                    ) is True
+                    await asyncio.sleep(0.05)
+                    release_creation.set()
+
+                    terminal = None
+                    for _ in range(100):
+                        polled = await cli.get(f"/v1/responses/{queued['id']}")
+                        terminal = await polled.json()
+                        if terminal["status"] == "failed":
+                            break
+                        await asyncio.sleep(0.01)
+        finally:
+            release_creation.set()
+
+        assert response.status == 200
+        assert terminal is not None
+        assert terminal["status"] == "failed"
+        assert interrupted.is_set()
+        assert not ran.is_set()
+        assert adapter._response_store.get_conversation(conversation) is None
 
     @pytest.mark.asyncio
     async def test_background_failure_is_pollable_and_redacted(self, adapter):
