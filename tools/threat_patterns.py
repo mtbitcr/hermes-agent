@@ -165,7 +165,6 @@ _PATTERNS: List[Tuple[str, str, str]] = [
 # not here.
 INVISIBLE_CHARS = frozenset({
     '\u200b',  # zero-width space
-    '\u200c',  # zero-width non-joiner
     '\u200d',  # zero-width joiner
     '\u2060',  # word joiner
     '\u2061',  # function application
@@ -271,6 +270,14 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     invisible_hits = char_set & INVISIBLE_CHARS
     for ch in invisible_hits:
         findings.append(f"invisible_unicode_U+{ord(ch):04X}")
+    if "\u200c" in content:
+        from tools.ansi_strip import is_contextual_zwnj
+
+        if any(
+            char == "\u200c" and not is_contextual_zwnj(content, index)
+            for index, char in enumerate(content)
+        ):
+            findings.append("invisible_unicode_U+200C")
 
     # Normalise to NFKC so full-width / compatibility Unicode variants
     # (e.g. ｃａｔ → cat, Ａ → A) are folded to their ASCII counterparts before
@@ -278,7 +285,7 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     # bypassing keyword checks (e.g. ``ｃａｔ ~/.hermes/.env``).  NOTE: this
     # does NOT defend against cross-script confusables (Cyrillic ``а`` U+0430),
     # which NFKC leaves untouched — that needs a TR#39 confusable database.
-    normalised = unicodedata.normalize("NFKC", content)
+    normalised = unicodedata.normalize("NFKC", content.replace("\u200c", ""))
 
     # Threat patterns
     patterns = _COMPILED.get(scope)

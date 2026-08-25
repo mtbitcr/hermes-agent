@@ -15,6 +15,7 @@ Tests cover:
 import asyncio
 import json
 import os
+import sqlite3
 import stat
 import sys
 import time
@@ -33,6 +34,7 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _derive_chat_session_id,
     _hermes_version,
+    _make_request_fingerprint,
     _redact_api_error_text,
     _resolve_owner_workspace_run_context,
     _request_reasoning_config,
@@ -41,6 +43,61 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+
+
+def _owner_new_proposal(**overrides):
+    proposal = {
+        "schema_version": 2,
+        "kind": "proposal",
+        "mode": "new",
+        "project_name": "Workshop pilot",
+        "project_description": "A private workshop pilot.",
+        "request_title": "Prepare the workshop",
+        "summary": "Prepare the first private milestone.",
+        "project_size": "small",
+        "specification": "Create one owner-visible workshop milestone.",
+        "current_milestone": "Prepare the workshop",
+        "owner_visible_result": "A reviewed workshop plan.",
+        "impact": ["Adds one private milestone."],
+        "later_milestones": [],
+        "tasks": [{
+            "title": "Draft the workshop plan",
+            "body": "Prepare the private workshop plan.",
+            "assignee": "default",
+            "responsibility": "B03",
+            "parents": [],
+        }],
+    }
+    proposal.update(overrides)
+    return proposal
+
+
+def _owner_existing_proposal(**overrides):
+    proposal = {
+        "schema_version": 3,
+        "kind": "project_change_proposal",
+        "mode": "existing",
+        "request_title": "Add the approved milestone",
+        "summary": "Add one owner-visible milestone.",
+        "project_size": "small",
+        "specification": "Add and verify the approved milestone.",
+        "current_milestone": "Add the approved milestone",
+        "owner_visible_result": "The owner can review the finished milestone.",
+        "impact": ["Keeps completed work intact."],
+        "later_milestones": [],
+        "changes": [{
+            "action": "add",
+            "reason": "The approved milestone needs one task.",
+            "title": "Prepare the milestone",
+            "body": "Prepare the owner-visible milestone.",
+            "assignee": "default",
+            "responsibility": "B03",
+            "existing_parent_refs": [],
+            "new_parents": [],
+        }],
+    }
+    proposal.update(overrides)
+    return proposal
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +312,69 @@ class TestResponseStore:
         store.delete("resp_1")
         assert store.get_conversation("chat-a") is None
 
+    def test_owner_authority_survives_lru_pressure_and_direct_delete(self):
+        """Owner approval state is durable workflow data, not an LRU entry."""
+        conversation = "raphael-owner-" + "f" * 32
+        response_id = "resp_owner_lru_anchor"
+        claim_id = "claim_" + "a" * 32
+        run_id = "run_" + "b" * 32
+        store = ResponseStore(max_size=1)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [
+                {"role": "user", "content": "Apply the approved milestone."},
+                {"role": "assistant", "content": json.dumps(
+                    _owner_existing_proposal(
+                        request_title="Apply the approved milestone",
+                    )
+                )},
+            ],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, claim_id,
+        ) is True
+        assert store.attach_owner_run(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
+
+        # The insertion itself may become the next owner response, so put()
+        # leaves it available while retaining the current owner authority.
+        store.put("resp_lru_pressure", {"response": {"id": "resp_lru_pressure"}})
+
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["latest_response_id"] == response_id
+        assert snapshot["proposal_claimed"] is True
+        assert snapshot["active_run_id"] == run_id
+        assert store.get(response_id) is not None
+        assert store.delete(response_id) is False
+        assert store.owner_history_snapshot(conversation)["active_run_id"] == run_id
+
+    def test_incomplete_proposal_never_grants_approval_authority(self):
+        conversation = "raphael-owner-" + "0" * 32
+        response_id = "resp_incomplete_proposal"
+        store = ResponseStore(max_size=10)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps({
+                    "schema_version": 2,
+                    "kind": "proposal",
+                    "mode": "new",
+                }),
+            }],
+        })
+
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is False
+        assert store.owner_proposal_record(
+            "default", conversation, response_id,
+        ) is None
+
     def test_owner_history_projects_only_final_structured_turns(self):
         secret = "sk-ant-api03-" + "a" * 80
         conversation = "raphael-owner-" + "a" * 32
@@ -270,12 +390,9 @@ class TestResponseStore:
             "kind": "question",
             "message": "Which week should it run?",
         })
-        final_change = json.dumps({
-            "schema_version": 3,
-            "kind": "project_change_proposal",
-            "mode": "existing",
-            "request_title": "Add a weekly summary",
-        })
+        final_change = json.dumps(_owner_existing_proposal(
+            request_title="Add a weekly summary",
+        ))
         store.put("resp_owner_history", {
             "response": {"id": "resp_owner_history"},
             "conversation_history": [
@@ -296,7 +413,9 @@ class TestResponseStore:
             ],
             "instructions": "private instructions",
         })
-        store.set_conversation(conversation, "resp_owner_history")
+        store.set_conversation(
+            conversation, "resp_owner_history", owner_proposal=True,
+        )
 
         history = store.owner_history(conversation)
         assert [item["owner"] for item in history] == [
@@ -311,6 +430,9 @@ class TestResponseStore:
         assert snapshot == {
             "latest_response_id": "resp_owner_history",
             "proposal_consumed": False,
+            "proposal_claimed": False,
+            "active_run_id": None,
+            "conversation_closed": False,
             "data": history,
         }
         assert "resp_owner_history" not in json.dumps(snapshot["data"])
@@ -318,20 +440,15 @@ class TestResponseStore:
     def test_owner_history_keeps_reply_within_native_response_limit(self):
         conversation = "raphael-owner-" + "b" * 32
         store = ResponseStore(max_size=10)
-        proposal = {
-            "schema_version": 3,
-            "kind": "project_change_proposal",
-            "mode": "existing",
-            "request_title": "Add the next private milestone",
-            "summary": "Prepare the next owner-visible milestone for review.",
-            "project_size": "large",
-            "specification": "Readable milestone detail. " * 500,
-            "current_milestone": "Prepare the next private milestone.",
-            "owner_visible_result": "The owner can review one complete proposal.",
-            "impact": ["Keeps the current project history intact."],
-            "later_milestones": [],
-            "changes": [],
-        }
+        proposal = _owner_existing_proposal(
+            request_title="Add the next private milestone",
+            summary="Prepare the next owner-visible milestone for review.",
+            project_size="large",
+            specification="Readable milestone detail. " * 500,
+            current_milestone="Prepare the next private milestone.",
+            owner_visible_result="The owner can review one complete proposal.",
+            impact=["Keeps the current project history intact."],
+        )
         structured_reply = json.dumps(proposal)
         assert 12_000 < len(structured_reply) < 50_000
         store.put(
@@ -347,7 +464,9 @@ class TestResponseStore:
                 ],
             },
         )
-        store.set_conversation(conversation, "resp_large_owner_history")
+        store.set_conversation(
+            conversation, "resp_large_owner_history", owner_proposal=True,
+        )
 
         snapshot = store.owner_history_snapshot(conversation)
 
@@ -363,12 +482,9 @@ class TestResponseStore:
         group = "raphael-owner-" + "c" * 32
         conversation = group + "-" + "d" * 32
         store = ResponseStore(max_size=10)
-        reply = json.dumps({
-            "schema_version": 3,
-            "kind": "project_change_proposal",
-            "mode": "existing",
-            "request_title": "Add owner summaries",
-        })
+        reply = json.dumps(_owner_existing_proposal(
+            request_title="Add owner summaries",
+        ))
         store.put("resp_scoped_history", {
             "response": {"id": "resp_scoped_history", "created_at": 200},
             "conversation_history": [
@@ -376,7 +492,9 @@ class TestResponseStore:
                 {"role": "assistant", "content": reply},
             ],
         })
-        store.set_conversation(conversation, "resp_scoped_history")
+        store.set_conversation(
+            conversation, "resp_scoped_history", owner_proposal=True,
+        )
 
         assert store.owner_history_snapshot(conversation)["data"] == [{
             "owner": "Add a weekly summary.",
@@ -454,7 +572,7 @@ class TestResponseStore:
             "private intermediate reasoning",
         )
 
-        index = store.owner_session_index(group)
+        index = store.owner_session_index("default", group)
 
         assert index == {
             "data": [
@@ -491,15 +609,18 @@ class TestResponseStore:
         store = ResponseStore(max_size=10, db_path=db_path)
         store.put(response_id, {
             "response": {"id": response_id, "created_at": 600},
-            "conversation_history": [],
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
         })
-        store.set_conversation(group, response_id)
+        store.set_conversation(group, response_id, owner_proposal=True)
 
         assert store.owner_history_snapshot(group)["proposal_consumed"] is False
         assert store.mark_owner_proposal_consumed(
-            group, "resp_wrong_proposal",
+            "default", group, "resp_wrong_proposal",
         ) is False
-        assert store.mark_owner_proposal_consumed(group, response_id) is True
+        assert store.mark_owner_proposal_consumed("default", group, response_id) is True
         assert store.owner_history_snapshot(group)["proposal_consumed"] is True
 
         store.set_conversation(group, response_id)
@@ -515,6 +636,333 @@ class TestResponseStore:
         reopened.set_conversation(group, "resp_newer_proposal")
         assert reopened.owner_history_snapshot(group)["proposal_consumed"] is False
         reopened.close()
+
+    def test_owner_proposal_claim_is_atomic_durable_and_exact(self, tmp_path):
+        db_path = str(tmp_path / "response-store.db")
+        conversation = "raphael-owner-" + "a" * 32 + "-" + "b" * 32
+        response_id = "resp_claimed_proposal"
+        claim_id = "claim_" + "c" * 32
+        run_id = "run_" + "d" * 32
+        store = ResponseStore(max_size=10, db_path=db_path)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 900},
+            "conversation_history": [
+                {"role": "user", "content": "Build the approved milestone."},
+                {"role": "assistant", "content": json.dumps(
+                    _owner_existing_proposal(
+                        request_title="Build the approved milestone",
+                    )
+                )},
+            ],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+
+        assert store.claim_owner_proposal("default", conversation, response_id, claim_id) is True
+        assert store.claim_owner_proposal("default", conversation, response_id, claim_id) is True
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, "claim_" + "e" * 32,
+        ) is False
+        assert store.set_conversation(conversation, "resp_newer_proposal") is False
+        assert store.close_owner_conversation("default", conversation, response_id) is False
+        assert store.attach_owner_run("default", conversation, response_id, claim_id, run_id) is True
+        assert store.complete_owner_claim(
+            "default", conversation, response_id, claim_id, "run_" + "f" * 32,
+        ) is False
+        assert store.complete_owner_claim(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
+        assert store.complete_owner_claim(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["proposal_consumed"] is True
+        assert snapshot["proposal_claimed"] is False
+        assert snapshot["active_run_id"] is None
+        store.close()
+
+        reopened = ResponseStore(max_size=10, db_path=db_path)
+        assert reopened.owner_history_snapshot(conversation)["proposal_consumed"] is True
+        reopened.close()
+
+    def test_owner_proposal_release_and_close_fence_new_responses(self):
+        conversation = "raphael-owner-" + "1" * 32
+        response_id = "resp_releasable_proposal"
+        claim_id = "claim_" + "2" * 32
+        run_id = "run_" + "3" * 32
+        store = ResponseStore(max_size=10)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1_000},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert store.claim_owner_proposal("default", conversation, response_id, claim_id) is True
+        assert store.attach_owner_run("default", conversation, response_id, claim_id, run_id) is True
+        assert store.release_owner_claim("default", conversation, response_id, claim_id, run_id) is True
+        assert store.close_owner_conversation("default", conversation, response_id) is True
+        assert store.close_owner_conversation("default", conversation, response_id) is True
+        assert store.set_conversation(conversation, "resp_after_close") is False
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["proposal_consumed"] is True
+        assert snapshot["proposal_claimed"] is False
+        assert snapshot["conversation_closed"] is True
+
+    def test_close_missing_owner_conversation_persists_a_tombstone(self, tmp_path):
+        """Clear wins even when an in-flight response has not been stored yet."""
+        db_path = str(tmp_path / "response-store.db")
+        conversation = "raphael-owner-" + "7" * 32 + "-" + "8" * 32
+        store = ResponseStore(max_size=10, db_path=db_path)
+
+        assert store.close_owner_conversation("default", conversation, None) is True
+        assert store.owner_history_snapshot(conversation)["conversation_closed"] is True
+        store.close()
+
+        reopened = ResponseStore(max_size=10, db_path=db_path)
+        reopened.put("resp_late_background", {
+            "response": {"id": "resp_late_background", "created_at": 1},
+            "conversation_history": [],
+        })
+        assert reopened.set_conversation(
+            conversation, "resp_late_background",
+        ) is False
+        assert reopened.owner_history_snapshot(conversation)["conversation_closed"] is True
+        reopened.close()
+
+    def test_latest_question_cannot_inherit_an_older_proposal_handle(self):
+        conversation = "raphael-owner-" + "9" * 32
+        proposal_response = "resp_actionable_proposal"
+        question_response = "resp_followup_question"
+        proposal = json.dumps(_owner_existing_proposal(
+            request_title="Add a weekly summary",
+        ))
+        question = json.dumps({
+            "schema_version": 1,
+            "kind": "question",
+            "message": "Which day should it arrive?",
+        })
+        store = ResponseStore(max_size=10)
+        store.put(proposal_response, {
+            "response": {"id": proposal_response, "created_at": 1},
+            "conversation_history": [
+                {"role": "user", "content": "Add a weekly summary."},
+                {"role": "assistant", "content": proposal},
+            ],
+        })
+        assert store.set_conversation(
+            conversation, proposal_response, owner_proposal=True,
+        ) is True
+        assert store.mark_owner_proposal_consumed(
+            "default", conversation, proposal_response,
+        )
+
+        store.put(question_response, {
+            "response": {"id": question_response, "created_at": 2},
+            "conversation_history": [
+                {"role": "user", "content": "Add a weekly summary."},
+                {"role": "assistant", "content": proposal},
+                {"role": "user", "content": "Change the delivery time."},
+                {"role": "assistant", "content": question},
+            ],
+        })
+        assert store.set_conversation(
+            conversation, question_response, owner_proposal=False,
+        ) is True
+
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["latest_response_id"] is None
+        assert snapshot["proposal_consumed"] is False
+        assert snapshot["proposal_claimed"] is False
+        assert store.claim_owner_proposal(
+            "default", conversation, proposal_response, "claim_" + "a" * 32,
+        ) is False
+        consumed = store._conn.execute(
+            "SELECT consumed_response_id FROM conversations WHERE name = ?",
+            (conversation,),
+        ).fetchone()
+        assert consumed[0] == proposal_response
+
+    def test_owner_state_isolated_by_profile_even_with_same_ids(self):
+        conversation = "raphael-owner-" + "4" * 32
+        response_id = "resp_shared_profile_id"
+        store = ResponseStore(max_size=10, default_profile="default")
+        for profile, owner_text in (
+            ("default", "Default owner request."),
+            ("secondary", "Secondary owner request."),
+        ):
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": owner_text},
+                    {"role": "assistant", "content": json.dumps(
+                        _owner_new_proposal()
+                    )},
+                ],
+            }, profile=profile)
+            assert store.set_conversation(
+                conversation,
+                response_id,
+                owner_proposal=True,
+                profile=profile,
+            ) is True
+
+        assert store.get(response_id, profile="default")["conversation_history"][0][
+            "content"
+        ] == "Default owner request."
+        assert store.get(response_id, profile="secondary")["conversation_history"][0][
+            "content"
+        ] == "Secondary owner request."
+        assert store.claim_owner_proposal(
+            "default",
+            conversation,
+            response_id,
+            "claim_" + "5" * 32,
+        ) is True
+        assert store.owner_history_snapshot(
+            conversation, profile="default",
+        )["proposal_claimed"] is True
+        assert store.owner_history_snapshot(
+            conversation, profile="secondary",
+        )["proposal_claimed"] is False
+
+    def test_owner_turn_reservation_fences_claim_close_and_competing_turn(self):
+        conversation = "raphael-owner-" + "5" * 32
+        response_id = "resp_reserved_source"
+        reserved_id = "resp_reserved_next_turn"
+        store = ResponseStore(max_size=10)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert store.reserve_owner_conversation(
+            "default", conversation, reserved_id,
+        ) is True
+        assert store.reserve_owner_conversation(
+            "default", conversation, "resp_competing_turn",
+        ) is False
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, "claim_" + "6" * 32,
+        ) is False
+        assert store.close_owner_conversation(
+            "default", conversation, response_id,
+        ) is False
+
+        store.put(reserved_id, {
+            "response": {"id": reserved_id, "created_at": 2},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps({"schema_version": 1, "kind": "question"}),
+            }],
+        })
+        assert store.set_conversation(
+            conversation,
+            reserved_id,
+            profile="default",
+            reservation_id=reserved_id,
+        ) is True
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, "claim_" + "6" * 32,
+        ) is False
+
+    def test_expired_unattached_claim_can_be_recovered(self):
+        conversation = "raphael-owner-" + "6" * 32
+        response_id = "resp_expired_owner_claim"
+        store = ResponseStore(max_size=10)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, "claim_" + "7" * 32,
+        ) is True
+        store._conn.execute(
+            "UPDATE conversations SET claim_expires_at = ? "
+            "WHERE profile = ? AND name = ?",
+            (time.time() - 1, "default", conversation),
+        )
+        store._conn.commit()
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, "claim_" + "8" * 32,
+        ) is True
+
+    def test_run_idempotency_and_owner_proposal_backfill_survive_restart(
+        self, tmp_path,
+    ):
+        db_path = str(tmp_path / "legacy-response-store.db")
+        conversation = "raphael-owner-" + "9" * 32
+        response_id = "resp_legacy_owner_proposal"
+        raw = {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
+        }
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE responses (response_id TEXT PRIMARY KEY, data TEXT NOT NULL, "
+            "accessed_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE conversations (name TEXT PRIMARY KEY, response_id TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
+            (response_id, json.dumps(raw), 1.0),
+        )
+        conn.execute(
+            "INSERT INTO conversations (name, response_id) VALUES (?, ?)",
+            (conversation, response_id),
+        )
+        conn.commit()
+        conn.close()
+
+        store = ResponseStore(
+            max_size=10, db_path=db_path, default_profile="default",
+        )
+        assert store.owner_proposal_record(
+            "default", conversation, response_id,
+        ) is not None
+        assert store.reserve_run_idempotency(
+            "default", "scope", "key", "fingerprint", "run_" + "a" * 32,
+        ) == ("new", "run_" + "a" * 32)
+        store.close()
+
+        reopened = ResponseStore(
+            max_size=10, db_path=db_path, default_profile="default",
+        )
+        assert reopened.lookup_run_idempotency(
+            "default", "scope", "key", "fingerprint",
+        ) == ("existing", "run_" + "a" * 32)
+        assert reopened.lookup_run_idempotency(
+            "secondary", "scope", "key", "fingerprint",
+        ) == ("missing", None)
+        response_pk = [
+            row[1]
+            for row in sorted(
+                reopened._conn.execute("PRAGMA table_info(responses)").fetchall(),
+                key=lambda row: row[5],
+            )
+            if row[5]
+        ]
+        assert response_pk == ["profile", "response_id"]
 
     def test_owner_history_missing_or_invalid_conversation_is_empty(self):
         store = ResponseStore(max_size=10)
@@ -533,6 +981,9 @@ class TestResponseStore:
         assert store.owner_history_snapshot("missing-history") == {
             "latest_response_id": None,
             "proposal_consumed": False,
+            "proposal_claimed": False,
+            "active_run_id": None,
+            "conversation_closed": False,
             "data": [],
         }
 
@@ -544,6 +995,20 @@ class TestResponseStore:
 
 
 class TestIdempotencyCache:
+    def test_request_fingerprint_canonicalizes_nested_maps(self):
+        first = {
+            "input": "Apply it.",
+            "owner_proposal_authority": {"payload": {"a": 1, "b": 2}},
+        }
+        reordered = {
+            "input": "Apply it.",
+            "owner_proposal_authority": {"payload": {"b": 2, "a": 1}},
+        }
+
+        assert _make_request_fingerprint(
+            first, sorted(first),
+        ) == _make_request_fingerprint(reordered, sorted(reordered))
+
     @pytest.mark.asyncio
     async def test_concurrent_same_key_and_fingerprint_runs_once(self):
         cache = _IdempotencyCache()
@@ -756,6 +1221,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post(
         "/v1/responses/conversations/{conversation}/consume",
         adapter._handle_consume_owner_proposal,
+    )
+    app.router.add_post(
+        "/v1/responses/conversations/{conversation}/authority",
+        adapter._handle_owner_conversation_authority,
     )
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
@@ -2033,12 +2502,9 @@ class TestResponsesEndpoint:
         session_id = "8" * 32
         conversation = f"{group}-{session_id}"
         response_id = "resp_route_proposal"
-        reply = json.dumps({
-            "schema_version": 3,
-            "kind": "project_change_proposal",
-            "mode": "existing",
-            "request_title": "Finish the owner flow",
-        })
+        reply = json.dumps(_owner_existing_proposal(
+            request_title="Finish the owner flow",
+        ))
         adapter._response_store.put(response_id, {
             "response": {"id": response_id, "created_at": 800},
             "conversation_history": [
@@ -2046,7 +2512,9 @@ class TestResponsesEndpoint:
                 {"role": "assistant", "content": reply},
             ],
         })
-        adapter._response_store.set_conversation(conversation, response_id)
+        adapter._response_store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        )
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -2082,6 +2550,88 @@ class TestResponsesEndpoint:
             history = await history_response.json()
             assert history["proposal_consumed"] is True
             assert history["latest_response_id"] == response_id
+            retained = await cli.delete(f"/v1/responses/{response_id}")
+            assert retained.status == 409
+            assert (await retained.json())["error"]["code"] == "owner_conversation_active"
+
+            authority_response_id = "resp_route_authority"
+            adapter._response_store.put(authority_response_id, {
+                "response": {"id": authority_response_id, "created_at": 801},
+                "conversation_history": [
+                    {"role": "user", "content": "Apply the exact plan."},
+                    {"role": "assistant", "content": reply},
+                ],
+            })
+            assert adapter._response_store.set_conversation(
+                conversation, authority_response_id, owner_proposal=True,
+            ) is True
+            authority_path = (
+                f"/v1/responses/conversations/{conversation}/authority"
+            )
+            claim_id = "claim_" + "a" * 32
+            run_id = "run_" + "b" * 32
+            claim_payload = {
+                "action": "claim",
+                "response_id": authority_response_id,
+                "claim_id": claim_id,
+            }
+            authority_response = await cli.post(authority_path, json=claim_payload)
+            assert authority_response.status == 200
+
+            # The native /v1/runs path, not this transition endpoint, owns the
+            # initial binding and live run state.
+            adapter._set_run_status(run_id, "running")
+            assert adapter._response_store.attach_owner_run(
+                "default", conversation, authority_response_id, claim_id, run_id,
+            ) is True
+            attach_payload = {
+                "action": "attach",
+                "response_id": authority_response_id,
+                "claim_id": claim_id,
+                "run_id": run_id,
+            }
+            authority_response = await cli.post(authority_path, json=attach_payload)
+            assert authority_response.status == 200
+
+            for premature_action in ("complete", "release"):
+                premature = await cli.post(authority_path, json={
+                    "action": premature_action,
+                    "response_id": authority_response_id,
+                    "claim_id": claim_id,
+                    "run_id": run_id,
+                })
+                assert premature.status == 409
+
+            adapter._set_run_status(run_id, "completed")
+            complete_payload = {
+                "action": "complete",
+                "response_id": authority_response_id,
+                "claim_id": claim_id,
+                "run_id": run_id,
+            }
+            # Generic terminal status is not mutation proof. The endpoint is
+            # verification-only until the native tool callback closes the
+            # exact claim server-side.
+            premature_complete = await cli.post(
+                authority_path, json=complete_payload,
+            )
+            assert premature_complete.status == 409
+            assert adapter._response_store.complete_owner_claim(
+                "default", conversation, authority_response_id, claim_id, run_id,
+            ) is True
+            authority_response = await cli.post(authority_path, json=complete_payload)
+            assert authority_response.status == 200
+            assert await authority_response.json() == {
+                "object": "hermes.response.owner_authority",
+                "action": "complete",
+                "applied": True,
+            }
+            authority_history = await (
+                await cli.get(f"/v1/responses/conversations/{conversation}")
+            ).json()
+            assert authority_history["proposal_consumed"] is True
+            assert authority_history["proposal_claimed"] is False
+            assert authority_history["active_run_id"] is None
 
     @pytest.mark.asyncio
     async def test_owner_session_routes_reject_invalid_shapes(self, adapter):
@@ -2097,6 +2647,12 @@ class TestResponsesEndpoint:
                 await cli.post(
                     f"/v1/responses/conversations/{group}/consume",
                     json={"response_id": "resp_safe_value", "extra": True},
+                )
+            ).status == 400
+            assert (
+                await cli.post(
+                    f"/v1/responses/conversations/{group}/authority",
+                    json={"action": "claim", "response_id": "resp_safe_value"},
                 )
             ).status == 400
 
@@ -2410,6 +2966,20 @@ class TestResponsesEndpoint:
                 ))
                 await asyncio.wait_for(started.wait(), timeout=1)
                 try:
+                    competing = await cli.post(
+                        "/v1/responses",
+                        json={
+                            "model": "hermes-agent",
+                            "input": "Replace the in-flight request",
+                            "conversation": "raphael-owner-" + "a" * 32,
+                            "background": True,
+                            "store": True,
+                        },
+                    )
+                    assert competing.status == 409
+                    assert (await competing.json())["error"]["code"] == (
+                        "owner_conversation_locked"
+                    )
                     resp = await asyncio.wait_for(
                         asyncio.shield(post_task), timeout=0.2,
                     )
@@ -2453,6 +3023,7 @@ class TestResponsesEndpoint:
     @pytest.mark.asyncio
     async def test_background_failure_is_pollable_and_redacted(self, adapter):
         raw_secret = "sk-background-leak-1234567890"
+        conversation = "raphael-owner-" + "b" * 32
 
         async def _failing_run(**kwargs):
             await asyncio.sleep(0)
@@ -2466,6 +3037,7 @@ class TestResponsesEndpoint:
                     json={
                         "model": "hermes-agent",
                         "input": "Plan the milestone",
+                        "conversation": conversation,
                         "background": True,
                         "store": True,
                     },
@@ -2481,6 +3053,31 @@ class TestResponsesEndpoint:
                     if failed["status"] == "failed":
                         break
                     await asyncio.sleep(0.01)
+
+                with patch.object(
+                    adapter,
+                    "_run_agent",
+                    new_callable=AsyncMock,
+                    return_value=(
+                        {
+                            "final_response": "A fresh plan can start.",
+                            "messages": [],
+                            "api_calls": 1,
+                        },
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    ),
+                ):
+                    retry = await cli.post(
+                        "/v1/responses",
+                        json={
+                            "model": "hermes-agent",
+                            "input": "Try the plan again",
+                            "conversation": conversation,
+                            "background": True,
+                            "store": True,
+                        },
+                    )
+                    assert retry.status == 200
 
         assert failed is not None
         assert failed["status"] == "failed"

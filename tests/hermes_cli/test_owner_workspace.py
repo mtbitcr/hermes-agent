@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import multiprocessing
 import os
 import threading
@@ -52,9 +53,54 @@ def _expire_lock(ctx, key: str) -> None:
             )
 
 
+def test_receipt_lease_covers_the_full_approval_wait(monkeypatch):
+    monkeypatch.setattr("tools.approval._get_approval_timeout", lambda: 7_200)
+    assert ow._receipt_lease_seconds() == 7_260
+
+
 @pytest.fixture
 def ctx():
     return ow.OwnerContext(actor="default", profile="default", session="run_owt")
+
+
+_RAW_COMMIT_TASK_GRAPH = ow.commit_task_graph
+_RAW_COMMIT_PROJECT_PLAN = ow.commit_project_plan
+
+
+def _authorized_context(ctx, operation: str, function, kwargs: dict):
+    bound = inspect.signature(function).bind(ctx, **kwargs)
+    bound.apply_defaults()
+    payload = dict(bound.arguments)
+    payload.pop("ctx")
+    return ow.OwnerContext(
+        actor=ctx.actor,
+        profile=ctx.profile,
+        session=ctx.session,
+        authority=ow.OwnerProposalAuthority(
+            actor=ctx.actor,
+            profile=ctx.profile,
+            session=ctx.session,
+            conversation="raphael-owner-" + "a" * 32,
+            response_id="resp_" + "b" * 32,
+            operation=operation,
+            idempotency_key=payload["idempotency_key"],
+            payload_digest=ow._digest(payload),
+        ),
+    )
+
+
+def _commit_task_graph(ctx, **kwargs):
+    return _RAW_COMMIT_TASK_GRAPH(
+        _authorized_context(ctx, "owner_task_graph_commit", _RAW_COMMIT_TASK_GRAPH, kwargs),
+        **kwargs,
+    )
+
+
+def _commit_project_plan(ctx, **kwargs):
+    return _RAW_COMMIT_PROJECT_PLAN(
+        _authorized_context(ctx, "owner_project_plan_commit", _RAW_COMMIT_PROJECT_PLAN, kwargs),
+        **kwargs,
+    )
 
 
 def _auto_approve(session_key: str, choice: str = "once", timeout: float = 5.0) -> None:
@@ -210,10 +256,27 @@ def _task_graph_args(**overrides):
     return args
 
 
+def test_task_graph_requires_authenticated_proposal_authority(ctx):
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        _RAW_COMMIT_TASK_GRAPH(ctx, **_task_graph_args())
+    assert excinfo.value.code == "proposal_authority_required"
+
+
+def test_task_graph_authority_is_bound_to_the_exact_payload(ctx):
+    args = _task_graph_args()
+    authorized = _authorized_context(
+        ctx, "owner_task_graph_commit", _RAW_COMMIT_TASK_GRAPH, args,
+    )
+    args["request_title"] = "A different milestone"
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        _RAW_COMMIT_TASK_GRAPH(authorized, **args)
+    assert excinfo.value.code == "proposal_authority_required"
+
+
 def test_task_graph_commit_creates_native_project_and_atomic_graph(ctx):
     args = _task_graph_args()
     approver = _with_approver(ctx.session)
-    result = ow.commit_task_graph(ctx, **args)
+    result = _commit_task_graph(ctx, **args)
     approver.join()
 
     assert result["ok"] is True
@@ -255,7 +318,7 @@ def test_task_graph_rejects_invalid_responsibility_before_approval(ctx):
     args["tasks"][0]["responsibility"] = "role with spaces"
 
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
-        ow.commit_task_graph(ctx, **args)
+        _commit_task_graph(ctx, **args)
 
     assert excinfo.value.code == "invalid_argument"
 
@@ -272,7 +335,7 @@ def test_task_graph_commit_existing_project_reuses_exact_native_board(ctx):
     )
 
     approver = _with_approver(ctx.session)
-    result = ow.commit_task_graph(ctx, **args)
+    result = _commit_task_graph(ctx, **args)
     approver.join()
 
     assert result["ok"] is True
@@ -284,7 +347,7 @@ def test_task_graph_commit_existing_project_reuses_exact_native_board(ctx):
 def test_task_graph_exact_replay_creates_no_duplicate_tasks(ctx):
     args = _task_graph_args(idempotency_key="graph-replay")
     approver = _with_approver(ctx.session)
-    first = ow.commit_task_graph(ctx, **args)
+    first = _commit_task_graph(ctx, **args)
     approver.join()
 
     with kanban_db.connect(board=first["board"]) as kconn:
@@ -294,7 +357,7 @@ def test_task_graph_exact_replay_creates_no_duplicate_tasks(ctx):
         ).fetchone()["n"]
 
     approval.unregister_gateway_notify(ctx.session)
-    second = ow.commit_task_graph(ctx, **args)
+    second = _commit_task_graph(ctx, **args)
 
     with kanban_db.connect(board=first["board"]) as kconn:
         after = kconn.execute(
@@ -321,7 +384,7 @@ def test_task_graph_rejects_fake_whole_project_before_persistence(ctx):
     )
 
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
-        ow.commit_task_graph(ctx, **args)
+        _commit_task_graph(ctx, **args)
 
     assert excinfo.value.code == "milestone_too_large"
     with projects_db.connect_closing() as pconn:
@@ -341,7 +404,7 @@ def test_task_graph_rejects_cycle_before_persistence(ctx):
     )
 
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
-        ow.commit_task_graph(ctx, **args)
+        _commit_task_graph(ctx, **args)
 
     assert excinfo.value.code == "invalid_graph"
 
@@ -349,7 +412,7 @@ def test_task_graph_rejects_cycle_before_persistence(ctx):
 def test_committed_project_projection_is_receipt_backed_and_read_only(ctx):
     args = _task_graph_args(idempotency_key="graph-list", project_name="Listed Project")
     approver = _with_approver(ctx.session)
-    result = ow.commit_task_graph(ctx, **args)
+    result = _commit_task_graph(ctx, **args)
     approver.join()
 
     before = projects_db.projects_db_path().stat().st_mtime_ns
@@ -365,6 +428,9 @@ def test_committed_project_projection_is_receipt_backed_and_read_only(ctx):
         "board": result["board"],
         "archived": False,
     }]
+    assert ow.list_committed_projects(
+        ctx, lifecycle_revision=True,
+    )[0]["lifecycle_revision"] == 0
 
 
 def test_project_snapshot_is_exact_receipt_backed_and_read_only(ctx):
@@ -373,7 +439,7 @@ def test_project_snapshot_is_exact_receipt_backed_and_read_only(ctx):
         project_name="Snapshot Project",
     )
     approver = _with_approver(ctx.session)
-    result = ow.commit_task_graph(ctx, **args)
+    result = _commit_task_graph(ctx, **args)
     approver.join()
 
     project_db = projects_db.projects_db_path()
@@ -419,7 +485,10 @@ def test_owner_title_projection_vectors_are_shared_with_the_owner_workspace():
     """
     assert ow.owner_title("B03 — Ship the thing") == "Ship the thing"
     assert ow.owner_title("R07: Fix the outage") == "Fix the outage"
-    assert ow.owner_title("R7-Fix the outage") == "Fix the outage"
+    assert ow.owner_title("R07-Fix the outage") == "Fix the outage"
+    assert ow.owner_title("R7-Fix the outage") == "R7-Fix the outage"
+    assert ow.owner_title("B03 — R07: Ship the thing") == "Ship the thing"
+    assert ow.owner_title(ow.owner_title("B03 — R07: Ship the thing")) == "Ship the thing"
     assert ow.owner_title("R07:   Fix   the\n  outage  ") == "Fix the outage"
     assert ow.owner_title("Rotate the shop key") == "Rotate the shop key"
     assert ow.owner_title("Version 12 of the plan") == "Version 12 of the plan"
@@ -535,6 +604,18 @@ def test_owner_title_masks_the_common_signed_url_credential_keys():
             )
             == f"Fetch https://acct.example.com/o?{key}=***&sr=b"
         )
+    assert (
+        ow.owner_title(
+            "Fetch https://acct.example.com/o?to%E2%80%8Bken=opaque-value&sr=b"
+        )
+        == "Fetch https://acct.example.com/o?to%E2%80%8Bken=***&sr=b"
+    )
+    assert (
+        ow.owner_title(
+            "Mirror https://public@credential-value@example.com/repo.git"
+        )
+        == "Mirror https://***@example.com/repo.git"
+    )
 
 
 def test_owner_title_removes_unsafe_control_and_display_characters():
@@ -1082,7 +1163,7 @@ def test_project_snapshot_run_projection_has_sanitized_task_title(ctx):
         project_name="Run Title Project",
     )
     approver = _with_approver(ctx.session)
-    result = ow.commit_task_graph(ctx, **args)
+    result = _commit_task_graph(ctx, **args)
     approver.join()
 
     now = int(time.time())
@@ -1147,7 +1228,7 @@ def test_project_snapshot_run_retry_is_decided_per_exact_task_id(ctx):
         project_name="Run Retry Project",
     )
     approver = _with_approver(ctx.session)
-    result = ow.commit_task_graph(ctx, **args)
+    result = _commit_task_graph(ctx, **args)
     approver.join()
 
     now = int(time.time())
@@ -1226,7 +1307,7 @@ def test_project_snapshot_hides_projects_without_owner_receipt(ctx):
 
 def test_project_attachment_is_exact_receipt_bound_and_bounded(ctx):
     approver = _with_approver(ctx.session)
-    result = ow.commit_task_graph(
+    result = _commit_task_graph(
         ctx,
         **_task_graph_args(
             idempotency_key="graph-attachment",
@@ -1268,7 +1349,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
         project_name="Lifecycle Project",
     )
     approver = _with_approver(ctx.session)
-    created = ow.commit_task_graph(ctx, **args)
+    created = _commit_task_graph(ctx, **args)
     approver.join()
     assert kanban_db.board_dispatch_allowed(
         kanban_db.read_board_metadata(created["board"])
@@ -1290,6 +1371,9 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
         "execution_paused": True,
     }
     assert ow.list_committed_projects(ctx)[0]["archived"] is True
+    assert ow.list_committed_projects(
+        ctx, lifecycle_revision=True,
+    )[0]["lifecycle_revision"] == 1
 
     approval.unregister_gateway_notify(ctx.session)
     assert ow.set_project_archived(
@@ -1315,6 +1399,9 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
         "execution_paused": True,
     }
     assert ow.list_committed_projects(ctx)[0]["archived"] is False
+    assert ow.list_committed_projects(
+        ctx, lifecycle_revision=True,
+    )[0]["lifecycle_revision"] == 2
     restored_meta = kanban_db.read_board_metadata(created["board"])
     assert restored_meta["dispatch_enabled"] is False
     assert restored_meta["dispatch_paused_by_owner"] is True
@@ -1344,6 +1431,25 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
     assert kanban_db.board_dispatch_allowed(
         kanban_db.read_board_metadata(created["board"])
     ) is False
+    assert ow.list_committed_projects(
+        ctx, lifecycle_revision=True,
+    )[0]["lifecycle_revision"] == 4
+
+    # Returning to the same action after an intervening restore is a new
+    # lifecycle generation, never a replay of the first archive receipt.
+    second_archive_approver = _with_approver(ctx.session)
+    second_archive = ow.set_project_archived(
+        ctx,
+        idempotency_key="project-lifecycle-archive-again",
+        project_id=created["project_id"],
+        action="archive",
+    )
+    second_archive_approver.join()
+    assert second_archive["ok"] is True
+    assert second_archive["archived"] is True
+    assert ow.list_committed_projects(
+        ctx, lifecycle_revision=True,
+    )[0]["lifecycle_revision"] == 5
 
 
 def test_project_lifecycle_rejects_project_without_owner_receipt(ctx):
@@ -1716,7 +1822,7 @@ def test_owner_approval_descriptions_project_every_project_name(ctx):
         assert boot["ok"] is True
 
         approver = _approve_once()
-        graph = ow.commit_task_graph(
+        graph = _commit_task_graph(
             ctx,
             **_task_graph_args(
                 idempotency_key="approval-graph",
@@ -1727,7 +1833,7 @@ def test_owner_approval_descriptions_project_every_project_name(ctx):
         assert graph["ok"] is True
 
         approver = _approve_once()
-        planned = ow.commit_project_plan(
+        planned = _commit_project_plan(
             ctx,
             **_project_plan_args(
                 boot,
@@ -1848,7 +1954,7 @@ def test_project_plan_timeout_can_retry_but_still_requires_approval(ctx):
         "_confirm",
         lambda *args, **kwargs: {"approved": False, "reason": "timeout"},
     ):
-        timed_out = ow.commit_project_plan(ctx, **args)
+        timed_out = _commit_project_plan(ctx, **args)
 
     assert timed_out == {
         "ok": False,
@@ -1867,7 +1973,7 @@ def test_project_plan_timeout_can_retry_but_still_requires_approval(ctx):
         "_confirm",
         lambda *args, **kwargs: {"approved": True, "choice": "once"},
     ):
-        retried = ow.commit_project_plan(ctx, **args)
+        retried = _commit_project_plan(ctx, **args)
 
     assert retried["ok"] is True
     assert retried["change_count"] == 1
@@ -1920,7 +2026,7 @@ def test_project_plan_split_is_atomic_preserves_history_and_replays(ctx):
         }],
     )
     approver = _with_approver(ctx.session)
-    first = ow.commit_project_plan(ctx, **args)
+    first = _commit_project_plan(ctx, **args)
     approver.join()
 
     assert first["ok"] is True
@@ -1941,7 +2047,7 @@ def test_project_plan_split_is_atomic_preserves_history_and_replays(ctx):
         ).fetchone()["n"]
 
     approval.unregister_gateway_notify(ctx.session)
-    replay = ow.commit_project_plan(ctx, **args)
+    replay = _commit_project_plan(ctx, **args)
     assert replay == first
 
     with kanban_db.connect(board=setup["board"]) as conn:
@@ -2011,7 +2117,7 @@ def test_project_plan_add_move_and_postpone_apply_together(ctx):
         idempotency_key="steward-standard-actions",
     )
     approver = _with_approver(ctx.session)
-    result = ow.commit_project_plan(ctx, **args)
+    result = _commit_project_plan(ctx, **args)
     approver.join()
 
     assert result["ok"] is True
@@ -2070,7 +2176,7 @@ def test_project_plan_merge_archives_sources_and_preserves_links(ctx):
         idempotency_key="steward-merge",
     )
     approver = _with_approver(ctx.session)
-    result = ow.commit_project_plan(ctx, **args)
+    result = _commit_project_plan(ctx, **args)
     approver.join()
 
     assert result["ok"] is True
@@ -2104,7 +2210,7 @@ def test_project_plan_cancel_archives_instead_of_deleting(ctx):
         idempotency_key="steward-cancel",
     )
     approver = _with_approver(ctx.session)
-    result = ow.commit_project_plan(ctx, **args)
+    result = _commit_project_plan(ctx, **args)
     approver.join()
 
     assert result["ok"] is True
@@ -2135,7 +2241,7 @@ def test_project_plan_stale_snapshot_changes_nothing(ctx):
         idempotency_key="steward-stale",
     )
     approver = _with_approver(ctx.session)
-    result = ow.commit_project_plan(ctx, **args)
+    result = _commit_project_plan(ctx, **args)
     approver.join()
 
     assert result == {
@@ -2171,7 +2277,7 @@ def test_project_plan_merge_or_cancel_requires_its_own_owner_decision(ctx):
         idempotency_key="steward-mixed-removal",
     )
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
-        ow.commit_project_plan(ctx, **args)
+        _commit_project_plan(ctx, **args)
     assert excinfo.value.code == "separate_owner_decision"
 
 
@@ -2199,7 +2305,7 @@ def test_project_plan_rejects_ready_when_parent_is_unfinished_and_rolls_back(ctx
     )
     approver = _with_approver(ctx.session)
     with pytest.raises(ValueError, match="parent is unfinished"):
-        ow.commit_project_plan(ctx, **args)
+        _commit_project_plan(ctx, **args)
     approver.join()
     with kanban_db.connect(board=setup["board"]) as conn:
         assert kanban_db.get_task(conn, child_id).status == "todo"
@@ -2220,7 +2326,7 @@ def test_move_task_cas_conflict_returns_snapshot_with_zero_changes(ctx):
     t = _with_approver(ctx.session)
     result = ow.move_task(
         ctx, idempotency_key="move-1", task_id=task_id,
-        to_status="blocked", expected_status="WRONG", expected_revision=rev, board=board,
+        to_status="blocked", expected_status="WRONG", expected_revision=rev, project_id=setup["project_id"],
     )
     t.join()
     assert result["ok"] is False
@@ -2240,7 +2346,7 @@ def test_move_task_rejects_running_target(ctx):
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
         ow.move_task(
             ctx, idempotency_key="move-running", task_id=setup["task_id"],
-            to_status="running", expected_status="ready", expected_revision=1, board=setup["board"],
+            to_status="running", expected_status="ready", expected_revision=1, project_id=setup["project_id"],
         )
     assert excinfo.value.code == "unsafe_transition"
 
@@ -2261,7 +2367,7 @@ def test_move_task_success_and_archived_parent_satisfies_child_readiness(ctx):
     t = _with_approver(ctx.session)
     result = ow.move_task(
         ctx, idempotency_key="move-archive", task_id=parent_id,
-        to_status="archived", expected_status="ready", expected_revision=rev, board=board,
+        to_status="archived", expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
     )
     t.join()
     assert result["ok"] is True
@@ -2280,7 +2386,7 @@ def test_comment_author_is_trusted_context_not_caller_supplied(ctx):
     task_id = setup["task_id"]
 
     t = _with_approver(ctx.session)
-    result = ow.comment_task(ctx, idempotency_key="comment-1", task_id=task_id, body="hello", board=board)
+    result = ow.comment_task(ctx, idempotency_key="comment-1", task_id=task_id, body="hello", project_id=setup["project_id"])
     t.join()
     assert result["ok"] is True
 
@@ -2300,11 +2406,11 @@ def test_comment_exact_replay_creates_no_duplicate(ctx):
     task_id = setup["task_id"]
 
     t = _with_approver(ctx.session)
-    first = ow.comment_task(ctx, idempotency_key="comment-replay", task_id=task_id, body="once", board=board)
+    first = ow.comment_task(ctx, idempotency_key="comment-replay", task_id=task_id, body="once", project_id=setup["project_id"])
     t.join()
 
     approval.unregister_gateway_notify(ctx.session)
-    second = ow.comment_task(ctx, idempotency_key="comment-replay", task_id=task_id, body="once", board=board)
+    second = ow.comment_task(ctx, idempotency_key="comment-replay", task_id=task_id, body="once", project_id=setup["project_id"])
     assert second == first
 
     kconn = kanban_db.connect(board=board)
@@ -2455,7 +2561,7 @@ def test_move_task_fence_blocks_concurrent_claim_attempt_during_mutation(ctx):
         with _temporarily_patch(ow.kanban_db, "cas_transition_task", paused_cas):
             old_result["value"] = ow.move_task(
                 ctx, idempotency_key=key, task_id=task_id, to_status="blocked",
-                expected_status="ready", expected_revision=rev, board=board,
+                expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
             )
         t.join()
 
@@ -2471,7 +2577,7 @@ def test_move_task_fence_blocks_concurrent_claim_attempt_during_mutation(ctx):
         with projects_db.connect_closing() as pconn2:
             ow._ensure_schema(pconn2)
             digest = ow._digest({
-                "task_id": task_id, "board": board, "to_status": "blocked",
+                "project_id": setup["project_id"], "task_id": task_id, "to_status": "blocked",
                 "expected_status": "ready", "expected_revision": rev,
             })
             # A real competing caller goes through the bounded-poll wrapper
@@ -2541,7 +2647,7 @@ def test_comment_fence_blocks_concurrent_claim_attempt_during_mutation(ctx):
         t = _with_approver(ctx.session)
         with _temporarily_patch(ow.kanban_db, "add_comment", paused_add_comment):
             old_result["value"] = ow.comment_task(
-                ctx, idempotency_key=key, task_id=task_id, body="hi", board=board,
+                ctx, idempotency_key=key, task_id=task_id, body="hi", project_id=setup["project_id"],
             )
         t.join()
 
@@ -2554,7 +2660,9 @@ def test_comment_fence_blocks_concurrent_claim_attempt_during_mutation(ctx):
     def attempt_takeover():
         with projects_db.connect_closing() as pconn2:
             ow._ensure_schema(pconn2)
-            digest = ow._digest({"task_id": task_id, "board": board, "body": "hi"})
+            digest = ow._digest({
+                "project_id": setup["project_id"], "task_id": task_id, "body": "hi",
+            })
             # See the move-task fence regression above for why this uses the
             # bounded-poll wrapper rather than the raw single-shot primitive.
             state, _row, _token = ow._acquire_or_replay(pconn2, ctx, key, "owner_task_comment", digest)
@@ -2767,13 +2875,13 @@ def test_comment_crash_before_finalize_replay_creates_no_duplicate(ctx):
     with _temporarily_patch(ow.kanban_db, "task_event_revision", boom):
         t = _with_approver(ctx.session)
         with pytest.raises(RuntimeError):
-            ow.comment_task(ctx, idempotency_key=key, task_id=task_id, body="hello", board=board)
+            ow.comment_task(ctx, idempotency_key=key, task_id=task_id, body="hello", project_id=setup["project_id"])
         t.join()
 
     _expire_lock(ctx, key)
 
     t2 = _with_approver(ctx.session)
-    result = ow.comment_task(ctx, idempotency_key=key, task_id=task_id, body="hello", board=board)
+    result = ow.comment_task(ctx, idempotency_key=key, task_id=task_id, body="hello", project_id=setup["project_id"])
     t2.join()
     assert result["ok"] is True
 
@@ -2837,7 +2945,7 @@ def test_move_task_crash_before_recompute_ready_replay_repairs_child_readiness(
         with pytest.raises(RuntimeError):
             ow.move_task(
                 ctx, idempotency_key=key, task_id=parent_id, to_status=to_status,
-                expected_status="ready", expected_revision=rev, board=board,
+                expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
             )
         t.join()
 
@@ -2854,7 +2962,7 @@ def test_move_task_crash_before_recompute_ready_replay_repairs_child_readiness(
     t2 = _with_approver(ctx.session)
     result = ow.move_task(
         ctx, idempotency_key=key, task_id=parent_id, to_status=to_status,
-        expected_status="ready", expected_revision=rev, board=board,
+        expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
     )
     t2.join()
     assert result["ok"] is True
@@ -2890,7 +2998,7 @@ def test_move_task_unrelated_drift_after_crash_still_conflicts(ctx):
         with pytest.raises(RuntimeError):
             ow.move_task(
                 ctx, idempotency_key=key, task_id=task_id, to_status="blocked",
-                expected_status="ready", expected_revision=rev, board=board,
+                expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
             )
         t.join()
 
@@ -2910,7 +3018,7 @@ def test_move_task_unrelated_drift_after_crash_still_conflicts(ctx):
     t2 = _with_approver(ctx.session)
     result = ow.move_task(
         ctx, idempotency_key=key, task_id=task_id, to_status="blocked",
-        expected_status="ready", expected_revision=rev, board=board,
+        expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
     )
     t2.join()
     assert result["ok"] is False
@@ -2942,7 +3050,7 @@ def test_move_task_exact_replay_recognizes_own_committed_event_by_full_identity(
         with pytest.raises(RuntimeError):
             ow.move_task(
                 ctx, idempotency_key=key, task_id=task_id, to_status="blocked",
-                expected_status="ready", expected_revision=rev, board=board,
+                expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
             )
         t.join()
 
@@ -2959,7 +3067,7 @@ def test_move_task_exact_replay_recognizes_own_committed_event_by_full_identity(
     t2 = _with_approver(ctx.session)
     result = ow.move_task(
         ctx, idempotency_key=key, task_id=task_id, to_status="blocked",
-        expected_status="ready", expected_revision=rev, board=board,
+        expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
     )
     t2.join()
     assert result["ok"] is True
@@ -2974,16 +3082,8 @@ def test_move_task_exact_replay_recognizes_own_committed_event_by_full_identity(
         kconn.close()
 
 
-def test_move_task_replay_recognition_requires_matching_actor_and_transition(ctx):
-    """Two different actors may validly reuse the same idempotency_key text
-    on the same task — receipts are scoped by (actor, profile,
-    idempotency_key), but the task's own event log is shared board-wide.
-    Adopting a dead claim must never mistake ANOTHER actor's already-
-    committed owner_move event (which happens to carry a matching
-    idempotency_key string) for this receipt's own — that would fabricate a
-    success snapshot (and could spuriously trigger readiness repair) for a
-    transition this receipt never performed. The real outcome must be an
-    unrelated CAS conflict against the actual current state."""
+def test_move_task_requires_the_receipt_owner_before_any_transition(ctx):
+    """A caller cannot choose another actor's Project by board or task id."""
     setup = _bootstrap_board(ctx)
     board, task_id = setup["board"], setup["task_id"]
 
@@ -2996,20 +3096,13 @@ def test_move_task_replay_recognition_requires_matching_actor_and_transition(ctx
     shared_key = "shared-cross-actor-key"
     other_ctx = ow.OwnerContext(actor="other-actor", profile="other-actor", session="run_owt_other")
 
-    # "Other" actor starts a move with the shared key but crashes before its
-    # own CAS runs — its receipt is claimed (in_progress) with no event yet.
-    def boom(*a, **kw):
-        raise RuntimeError("simulated crash before the other actor's own CAS runs")
-
-    with _temporarily_patch(ow.kanban_db, "cas_transition_task", boom):
-        t = _with_approver(other_ctx.session)
-        with pytest.raises(RuntimeError):
-            ow.move_task(
-                other_ctx, idempotency_key=shared_key, task_id=task_id,
-                to_status="archived", expected_status="ready",
-                expected_revision=rev0, board=board,
-            )
-        t.join()
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.move_task(
+            other_ctx, idempotency_key=shared_key, task_id=task_id,
+            to_status="archived", expected_status="ready",
+            expected_revision=rev0, project_id=setup["project_id"],
+        )
+    assert excinfo.value.code == "project_not_owned"
 
     # The original ("default") actor independently and legitimately moves
     # the SAME task using the SAME idempotency_key text — a completely
@@ -3018,30 +3111,11 @@ def test_move_task_replay_recognition_requires_matching_actor_and_transition(ctx
     a_result = ow.move_task(
         ctx, idempotency_key=shared_key, task_id=task_id,
         to_status="blocked", expected_status="ready",
-        expected_revision=rev0, board=board,
+        expected_revision=rev0, project_id=setup["project_id"],
     )
     t2.join()
     assert a_result["ok"] is True
     assert a_result["status"] == "blocked"
-
-    # The other actor's lease now looks expired (as if it had crashed) —
-    # it resumes/replays.
-    _expire_lock(other_ctx, shared_key)
-    t3 = _with_approver(other_ctx.session)
-    b_result = ow.move_task(
-        other_ctx, idempotency_key=shared_key, task_id=task_id,
-        to_status="archived", expected_status="ready",
-        expected_revision=rev0, board=board,
-    )
-    t3.join()
-
-    # The other actor must NOT be told its (never-performed) move to
-    # "archived" succeeded just because an unrelated event happens to carry
-    # the same idempotency_key text — it must see the real current state as
-    # a conflict, never a fabricated success.
-    assert b_result["ok"] is False
-    assert b_result["error"] == "conflict"
-    assert b_result["current_status"] == "blocked"
 
     kconn = kanban_db.connect(board=board)
     try:
@@ -3069,7 +3143,7 @@ def test_bootstrap_status_and_revision_feed_directly_into_move(ctx):
     result = ow.move_task(
         ctx, idempotency_key="pubrev-bootstrap-1-move", task_id=setup["task_id"],
         to_status="blocked", expected_status=setup["status"],
-        expected_revision=setup["revision"], board=setup["board"],
+        expected_revision=setup["revision"], project_id=setup["project_id"],
     )
     t2.join()
     assert result["ok"] is True
@@ -3082,7 +3156,7 @@ def test_comment_status_and_revision_feed_directly_into_move(ctx):
 
     t = _with_approver(ctx.session)
     comment_result = ow.comment_task(
-        ctx, idempotency_key="pubrev-comment-1", task_id=task_id, body="hi", board=board,
+        ctx, idempotency_key="pubrev-comment-1", task_id=task_id, body="hi", project_id=setup["project_id"],
     )
     t.join()
     assert comment_result["ok"] is True
@@ -3093,7 +3167,7 @@ def test_comment_status_and_revision_feed_directly_into_move(ctx):
     move_result = ow.move_task(
         ctx, idempotency_key="pubrev-comment-1-move", task_id=task_id,
         to_status="blocked", expected_status=comment_result["status"],
-        expected_revision=comment_result["revision"], board=board,
+        expected_revision=comment_result["revision"], project_id=setup["project_id"],
     )
     t2.join()
     assert move_result["ok"] is True
@@ -3340,7 +3414,7 @@ def test_task_graph_persists_canonical_native_titles_and_project_name(ctx):
     )
 
     approver = _with_approver(ctx.session)
-    result = ow.commit_task_graph(ctx, **args)
+    result = _commit_task_graph(ctx, **args)
     approver.join()
     assert result["ok"] is True
 
@@ -3400,7 +3474,7 @@ def test_task_graph_replay_matches_on_the_canonical_title_not_its_spelling(ctx):
         request_title=_UNSAFE_NATIVE_TITLE,
     )
     approver = _with_approver(ctx.session)
-    first = ow.commit_task_graph(ctx, **args)
+    first = _commit_task_graph(ctx, **args)
     approver.join()
     assert first["ok"] is True
 
@@ -3413,7 +3487,7 @@ def test_task_graph_replay_matches_on_the_canonical_title_not_its_spelling(ctx):
     # No approver from here on: a second decision request would have nothing
     # to resolve it, proving neither replay asked for one.
     approval.unregister_gateway_notify(ctx.session)
-    assert ow.commit_task_graph(ctx, **args) == first
+    assert _commit_task_graph(ctx, **args) == first
 
     zero_width = chr(0x200B)
     respelled = _task_graph_args(
@@ -3421,7 +3495,7 @@ def test_task_graph_replay_matches_on_the_canonical_title_not_its_spelling(ctx):
         project_name=_UNSAFE_NATIVE_PROJECT_NAME + zero_width,
         request_title=_UNSAFE_NATIVE_TITLE.replace("Ship", f"Ship{zero_width}"),
     )
-    assert ow.commit_task_graph(ctx, **respelled) == first
+    assert _commit_task_graph(ctx, **respelled) == first
 
     with kanban_db.connect(board=first["board"]) as kconn:
         after = kconn.execute(
@@ -3456,7 +3530,7 @@ def test_task_graph_rejects_titles_that_canonicalize_to_nothing(ctx):
     )):
         args = _task_graph_args(idempotency_key=f"graph-blank-{index}", **overrides)
         with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
-            ow.commit_task_graph(ctx, **args)
+            _commit_task_graph(ctx, **args)
         assert excinfo.value.code == "invalid_argument"
 
     with projects_db.connect_closing() as pconn:
@@ -3491,7 +3565,7 @@ def test_task_graph_persists_literal_untitled_values_the_owner_wrote(ctx):
     )
 
     approver = _with_approver(ctx.session)
-    result = ow.commit_task_graph(ctx, **args)
+    result = _commit_task_graph(ctx, **args)
     approver.join()
     assert result["ok"] is True
 
@@ -3560,7 +3634,7 @@ def test_project_plan_persists_canonical_titles_for_every_created_task(ctx):
     )
 
     approver = _with_approver(ctx.session)
-    result = ow.commit_project_plan(ctx, **args)
+    result = _commit_project_plan(ctx, **args)
     approver.join()
 
     assert result["ok"] is True
@@ -3595,7 +3669,7 @@ def test_project_plan_persists_canonical_titles_for_every_created_task(ctx):
     respelled["changes"][0]["title"] = _UNSAFE_NATIVE_TITLE.replace(
         "Ship", f"Ship{chr(0x200B)}"
     )
-    assert ow.commit_project_plan(ctx, **respelled) == result
+    assert _commit_project_plan(ctx, **respelled) == result
 
     with kanban_db.connect(board=setup["board"]) as conn:
         assert len([
@@ -3621,7 +3695,7 @@ def test_project_plan_rejects_a_created_title_that_canonicalizes_to_nothing(ctx)
     )
 
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
-        ow.commit_project_plan(ctx, **args)
+        _commit_project_plan(ctx, **args)
     assert excinfo.value.code == "invalid_argument"
 
     with kanban_db.connect(board=setup["board"]) as conn:

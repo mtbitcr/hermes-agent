@@ -147,12 +147,12 @@ class TestSchemas:
         entry = registry.get_entry("owner_task_move")
         required = set(entry.schema["parameters"]["required"])
         assert required == {
-            "idempotency_key", "task_id", "to_status",
+            "idempotency_key", "project_id", "task_id", "to_status",
             "expected_status", "expected_revision",
         }
         assert set(entry.schema["parameters"]["properties"]) == {
             "idempotency_key", "task_id", "to_status",
-            "expected_status", "expected_revision", "board",
+            "expected_status", "expected_revision", "project_id",
         }
 
     def test_project_plan_requires_bounded_exact_changes(self):
@@ -174,9 +174,9 @@ class TestSchemas:
     def test_task_comment_requires_task_id_and_body(self):
         entry = registry.get_entry("owner_task_comment")
         required = set(entry.schema["parameters"]["required"])
-        assert required == {"idempotency_key", "task_id", "body"}
+        assert required == {"idempotency_key", "project_id", "task_id", "body"}
         assert set(entry.schema["parameters"]["properties"]) == {
-            "idempotency_key", "task_id", "body", "board",
+            "idempotency_key", "project_id", "task_id", "body",
         }
 
 
@@ -392,14 +392,14 @@ class TestFieldDelegation:
         monkeypatch.setattr(owt._kernel, "move_task", kernel)
 
         owt._handle_task_move({
-            "idempotency_key": "k2", "task_id": "t1", "to_status": "done",
-            "expected_status": "review", "expected_revision": 3, "board": "b1",
+            "idempotency_key": "k2", "project_id": "p1", "task_id": "t1", "to_status": "done",
+            "expected_status": "review", "expected_revision": 3,
         })
 
         _, kwargs = kernel.calls[0]
         assert kwargs == {
-            "idempotency_key": "k2", "task_id": "t1", "to_status": "done",
-            "expected_status": "review", "expected_revision": 3, "board": "b1",
+            "idempotency_key": "k2", "project_id": "p1", "task_id": "t1", "to_status": "done",
+            "expected_status": "review", "expected_revision": 3,
         }
 
     def test_project_plan_passes_through_exact_fields(self, monkeypatch, trusted_ctx):
@@ -445,12 +445,12 @@ class TestFieldDelegation:
         monkeypatch.setattr(owt._kernel, "comment_task", kernel)
 
         owt._handle_task_comment({
-            "idempotency_key": "k3", "task_id": "t1", "body": "hi there", "board": "b1",
+            "idempotency_key": "k3", "project_id": "p1", "task_id": "t1", "body": "hi there",
         })
 
         _, kwargs = kernel.calls[0]
         assert kwargs == {
-            "idempotency_key": "k3", "task_id": "t1", "body": "hi there", "board": "b1",
+            "idempotency_key": "k3", "project_id": "p1", "task_id": "t1", "body": "hi there",
         }
 
     def test_successful_result_is_returned_verbatim_as_json(self, monkeypatch, trusted_ctx):
@@ -459,7 +459,7 @@ class TestFieldDelegation:
         monkeypatch.setattr(owt._kernel, "move_task", _RecordingKernel(return_value=result))
 
         out = owt._handle_task_move({
-            "idempotency_key": "k2", "task_id": "t1", "to_status": "done",
+            "idempotency_key": "k2", "project_id": "p1", "task_id": "t1", "to_status": "done",
             "expected_status": "review", "expected_revision": 3,
         })
 

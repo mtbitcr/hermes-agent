@@ -45,6 +45,7 @@ Requires:
 """
 
 import asyncio
+import base64
 import errno
 import hashlib
 import hmac
@@ -308,6 +309,8 @@ def _resolve_owner_workspace_run_context(value: Any) -> "dict[str, str | None] |
         raise ValueError("invalid owner workspace mode")
 
     from hermes_cli.owner_workspace import (
+        OwnerWorkspaceError,
+        _native_owner_project_name,
         list_committed_projects,
         owner_project_name,
         resolve_owner_context,
@@ -340,9 +343,12 @@ def _resolve_owner_workspace_run_context(value: Any) -> "dict[str, str | None] |
         # client claim about a Project that does not exist yet; an existing
         # name resolved from receipt-backed state was already storable, so it
         # only ever needs projecting on read.
-        candidate = project_name.strip()
-        if not candidate or len(candidate) > _OWNER_PROJECT_NAME_MAX_LENGTH:
-            raise ValueError("invalid owner Project name")
+        try:
+            project_name = _native_owner_project_name(
+                project_name, "project_name",
+            )
+        except OwnerWorkspaceError as exc:
+            raise ValueError("invalid owner Project name") from exc
 
     # The retained name is owner-facing display text on the Decisions inbox,
     # so it leaves here through the one canonical Project-name projection —
@@ -357,6 +363,47 @@ def _resolve_owner_workspace_run_context(value: Any) -> "dict[str, str | None] |
         "project_slug": project_slug if mode == "existing" else None,
         "project_name": project_name,
         "profile": profile,
+    }
+
+
+def _resolve_owner_proposal_run_authority(value: Any) -> "dict[str, Any] | None":
+    """Validate hidden proposal authority on one authenticated owner run."""
+    if value is None:
+        return None
+    expected = {
+        "conversation", "response_id", "claim_id", "operation", "idempotency_key", "payload",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("invalid owner proposal authority")
+    conversation = value.get("conversation")
+    response_id = value.get("response_id")
+    claim_id = value.get("claim_id")
+    operation = value.get("operation")
+    idempotency_key = value.get("idempotency_key")
+    payload = value.get("payload")
+    if (
+        not isinstance(conversation, str)
+        or _OWNER_CONVERSATION_RE.fullmatch(conversation) is None
+        or not isinstance(response_id, str)
+        or _OWNER_RESPONSE_RE.fullmatch(response_id) is None
+        or not isinstance(claim_id, str)
+        or _OWNER_CLAIM_RE.fullmatch(claim_id) is None
+        or operation not in {
+            "owner_task_graph_commit", "owner_project_plan_commit",
+        }
+        or not isinstance(idempotency_key, str)
+        or re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", idempotency_key) is None
+        or not isinstance(payload, dict)
+        or payload.get("idempotency_key") != idempotency_key
+    ):
+        raise ValueError("invalid owner proposal authority")
+    return {
+        "conversation": conversation,
+        "response_id": response_id,
+        "claim_id": claim_id,
+        "operation": operation,
+        "idempotency_key": idempotency_key,
+        "payload": payload,
     }
 
 
@@ -1200,7 +1247,90 @@ _OWNER_HISTORY_RAPHAEL_MAX_CHARS = 50_000
 _OWNER_CONVERSATION_RE = re.compile(
     r"raphael-owner-[a-f0-9]{32}(?:-[a-f0-9]{32})?"
 )
+_OWNER_RESPONSE_RE = re.compile(r"resp_[A-Za-z0-9_-]{8,128}")
+_OWNER_CLAIM_RE = re.compile(r"claim_[A-Za-z0-9_-]{8,128}")
+_OWNER_RUN_RE = re.compile(r"run_[a-f0-9]{32}")
+_OWNER_PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _OWNER_SESSION_INDEX_LIMIT = 100
+_OWNER_CLAIM_LEASE_SECONDS = 300
+_OWNER_PROPOSAL_MAX_MUTATIONS = 12
+_OWNER_NEW_PROPOSAL_KEYS = frozenset({
+    "schema_version", "kind", "mode", "project_name",
+    "project_description", "request_title", "summary", "project_size",
+    "specification", "current_milestone", "owner_visible_result",
+    "impact", "later_milestones", "tasks",
+})
+_OWNER_EXISTING_PROPOSAL_KEYS = frozenset({
+    "schema_version", "kind", "mode", "request_title", "summary",
+    "project_size", "specification", "current_milestone",
+    "owner_visible_result", "impact", "later_milestones", "changes",
+})
+
+
+def _active_owner_profile() -> str:
+    """Resolve the request-selected profile without accepting caller data."""
+    profile = _api_request_profile.get()
+    if not profile:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = get_active_profile_name()
+        except Exception:
+            profile = "default"
+    profile = str(profile or "default").strip().lower()
+    return profile if _OWNER_PROFILE_RE.fullmatch(profile) else "default"
+
+
+def _owner_final_proposal(history: Any) -> "dict[str, Any] | None":
+    """Return the exact final actionable assistant object, never an earlier draft."""
+    if not isinstance(history, list):
+        return None
+    for message in reversed(history):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        try:
+            candidate = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(candidate, dict):
+            return None
+        if (
+            candidate.get("schema_version") == 2
+            and candidate.get("kind") == "proposal"
+            and candidate.get("mode") == "new"
+            and set(candidate) == _OWNER_NEW_PROPOSAL_KEYS
+            and isinstance(candidate.get("tasks"), list)
+            and 1 <= len(candidate["tasks"]) <= _OWNER_PROPOSAL_MAX_MUTATIONS
+        ) or (
+            candidate.get("schema_version") == 3
+            and candidate.get("kind") == "project_change_proposal"
+            and candidate.get("mode") == "existing"
+            and set(candidate) == _OWNER_EXISTING_PROPOSAL_KEYS
+            and isinstance(candidate.get("changes"), list)
+            and 1 <= len(candidate["changes"]) <= _OWNER_PROPOSAL_MAX_MUTATIONS
+        ):
+            return candidate
+        return None
+    return None
+
+
+def _owner_proposal_digest(candidate: Any) -> "str | None":
+    if not isinstance(candidate, dict):
+        return None
+    canonical = json.dumps(
+        candidate, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _owner_history_has_actionable_final_proposal(
+    history: List[Dict[str, Any]],
+) -> bool:
+    """Return whether the exact final assistant reply grants approval authority."""
+    return _owner_final_proposal(history) is not None
 
 
 class ResponseStore:
@@ -1215,8 +1345,20 @@ class ResponseStore:
     if the on-disk path is unavailable.
     """
 
-    def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
+    def __init__(
+        self,
+        max_size: int = MAX_STORED_RESPONSES,
+        db_path: str = None,
+        *,
+        default_profile: Optional[str] = None,
+    ):
         self._max_size = max_size
+        selected_profile = str(default_profile or _active_owner_profile()).strip().lower()
+        self._default_profile = (
+            selected_profile
+            if _OWNER_PROFILE_RE.fullmatch(selected_profile)
+            else "default"
+        )
         if db_path is None:
             try:
                 from hermes_cli.config import get_hermes_home
@@ -1237,32 +1379,239 @@ class ResponseStore:
         apply_wal_with_fallback(self._conn, db_label="response_store.db")
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS responses (
-                response_id TEXT PRIMARY KEY,
+                profile TEXT NOT NULL,
+                response_id TEXT NOT NULL,
                 data TEXT NOT NULL,
-                accessed_at REAL NOT NULL
+                accessed_at REAL NOT NULL,
+                PRIMARY KEY (profile, response_id)
+            )"""
+        )
+        response_columns = {
+            str(row[1]) for row in self._conn.execute("PRAGMA table_info(responses)")
+        }
+        if "profile" not in response_columns:
+            self._conn.execute("ALTER TABLE responses ADD COLUMN profile TEXT")
+            self._conn.execute(
+                "UPDATE responses SET profile = ? WHERE profile IS NULL OR profile = ''",
+                (self._default_profile,),
+            )
+        self._ensure_response_schema()
+        self._ensure_conversation_schema()
+        self._ensure_closure_schema()
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS owner_conversation_reservations (
+                profile TEXT NOT NULL,
+                name TEXT NOT NULL,
+                response_id TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (profile, name)
             )"""
         )
         self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS conversations (
-                name TEXT PRIMARY KEY,
-                response_id TEXT NOT NULL
+            """CREATE TABLE IF NOT EXISTS run_idempotency (
+                profile TEXT NOT NULL,
+                session_scope TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (profile, session_scope, idempotency_key)
             )"""
         )
-        conversation_columns = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(conversations)")
-        }
-        if "consumed_response_id" not in conversation_columns:
-            self._conn.execute(
-                "ALTER TABLE conversations ADD COLUMN consumed_response_id TEXT"
-            )
+        self._backfill_owner_proposals()
         self._conn.commit()
+        self._conversation_lock = threading.RLock()
         # response_store.db contains conversation history (tool payloads,
         # prompts, results). Tighten to owner-only after creation so other
         # local users on a shared box can't read it. Run once at __init__
         # rather than after every commit — chmod-on-every-write is wasted
         # syscalls on a hot path.
         self._tighten_file_permissions()
+
+    def _ensure_response_schema(self) -> None:
+        """Migrate stored responses to an exact profile-scoped identity."""
+        info = self._conn.execute("PRAGMA table_info(responses)").fetchall()
+        pk_columns = [
+            str(row[1]) for row in sorted(info, key=lambda row: int(row[5]))
+            if int(row[5]) > 0
+        ]
+        if pk_columns == ["profile", "response_id"]:
+            return
+        self._conn.execute("DROP TABLE IF EXISTS responses_profile_migration")
+        self._conn.execute(
+            """CREATE TABLE responses_profile_migration (
+                profile TEXT NOT NULL,
+                response_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                accessed_at REAL NOT NULL,
+                PRIMARY KEY (profile, response_id)
+            )"""
+        )
+        for response_id, profile, data, accessed_at in self._conn.execute(
+            "SELECT response_id, profile, data, accessed_at FROM responses"
+        ).fetchall():
+            selected = str(profile or self._default_profile).strip().lower()
+            if _OWNER_PROFILE_RE.fullmatch(selected) is None:
+                selected = self._default_profile
+            self._conn.execute(
+                "INSERT OR IGNORE INTO responses_profile_migration "
+                "(profile, response_id, data, accessed_at) VALUES (?, ?, ?, ?)",
+                (selected, response_id, data, accessed_at),
+            )
+        self._conn.execute("DROP TABLE responses")
+        self._conn.execute(
+            "ALTER TABLE responses_profile_migration RENAME TO responses"
+        )
+
+    def _ensure_conversation_schema(self) -> None:
+        """Migrate conversation authority to a profile-scoped composite key."""
+        desired = """CREATE TABLE {table} (
+            profile TEXT NOT NULL,
+            name TEXT NOT NULL,
+            response_id TEXT NOT NULL,
+            proposal_response_id TEXT,
+            proposal_digest TEXT,
+            consumed_response_id TEXT,
+            claimed_response_id TEXT,
+            claim_id TEXT,
+            claim_expires_at REAL,
+            owner_run_id TEXT,
+            bound_operation TEXT,
+            bound_payload_digest TEXT,
+            claim_state TEXT,
+            closed INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (profile, name)
+        )"""
+        info = self._conn.execute("PRAGMA table_info(conversations)").fetchall()
+        if not info:
+            self._conn.execute(desired.format(table="conversations"))
+            return
+        columns = {str(row[1]) for row in info}
+        pk_columns = [
+            str(row[1]) for row in sorted(info, key=lambda row: int(row[5]))
+            if int(row[5]) > 0
+        ]
+        if "profile" not in columns or pk_columns != ["profile", "name"]:
+            self._conn.execute("DROP TABLE IF EXISTS conversations_profile_migration")
+            self._conn.execute(desired.format(table="conversations_profile_migration"))
+            selectable = [
+                name for name in (
+                    "name", "response_id", "proposal_response_id", "consumed_response_id",
+                    "claimed_response_id", "claim_id", "owner_run_id", "claim_state", "closed",
+                ) if name in columns
+            ]
+            for row in self._conn.execute(
+                f"SELECT {', '.join(selectable)} FROM conversations"
+            ).fetchall():
+                record = dict(zip(selectable, row))
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO conversations_profile_migration ("
+                    "profile, name, response_id, proposal_response_id, consumed_response_id, "
+                    "claimed_response_id, claim_id, owner_run_id, claim_state, closed"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        self._default_profile,
+                        record.get("name"),
+                        record.get("response_id"),
+                        record.get("proposal_response_id"),
+                        record.get("consumed_response_id"),
+                        record.get("claimed_response_id"),
+                        record.get("claim_id"),
+                        record.get("owner_run_id"),
+                        record.get("claim_state"),
+                        int(bool(record.get("closed"))),
+                    ),
+                )
+            self._conn.execute("DROP TABLE conversations")
+            self._conn.execute(
+                "ALTER TABLE conversations_profile_migration RENAME TO conversations"
+            )
+            return
+        for column, declaration in (
+            ("proposal_response_id", "TEXT"),
+            ("proposal_digest", "TEXT"),
+            ("consumed_response_id", "TEXT"),
+            ("claimed_response_id", "TEXT"),
+            ("claim_id", "TEXT"),
+            ("claim_expires_at", "REAL"),
+            ("owner_run_id", "TEXT"),
+            ("bound_operation", "TEXT"),
+            ("bound_payload_digest", "TEXT"),
+            ("claim_state", "TEXT"),
+            ("closed", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE conversations ADD COLUMN {column} {declaration}"
+                )
+
+    def _ensure_closure_schema(self) -> None:
+        desired = """CREATE TABLE {table} (
+            profile TEXT NOT NULL,
+            name TEXT NOT NULL,
+            closed_at REAL NOT NULL,
+            PRIMARY KEY (profile, name)
+        )"""
+        info = self._conn.execute(
+            "PRAGMA table_info(owner_conversation_closures)"
+        ).fetchall()
+        if not info:
+            self._conn.execute(desired.format(table="owner_conversation_closures"))
+            return
+        columns = {str(row[1]) for row in info}
+        pk_columns = [
+            str(row[1]) for row in sorted(info, key=lambda row: int(row[5]))
+            if int(row[5]) > 0
+        ]
+        if "profile" in columns and pk_columns == ["profile", "name"]:
+            return
+        self._conn.execute("DROP TABLE IF EXISTS owner_closures_profile_migration")
+        self._conn.execute(desired.format(table="owner_closures_profile_migration"))
+        for name, closed_at in self._conn.execute(
+            "SELECT name, closed_at FROM owner_conversation_closures"
+        ).fetchall():
+            self._conn.execute(
+                "INSERT OR IGNORE INTO owner_closures_profile_migration "
+                "(profile, name, closed_at) VALUES (?, ?, ?)",
+                (self._default_profile, name, closed_at),
+            )
+        self._conn.execute("DROP TABLE owner_conversation_closures")
+        self._conn.execute(
+            "ALTER TABLE owner_closures_profile_migration "
+            "RENAME TO owner_conversation_closures"
+        )
+
+    def _backfill_owner_proposals(self) -> None:
+        """Recover only structurally actionable final proposals from old rows."""
+        rows = self._conn.execute(
+            "SELECT profile, name, response_id FROM conversations "
+            "WHERE proposal_response_id IS NULL"
+        ).fetchall()
+        for profile, name, response_id in rows:
+            if not isinstance(name, str) or _OWNER_CONVERSATION_RE.fullmatch(name) is None:
+                continue
+            stored = self._conn.execute(
+                "SELECT data FROM responses WHERE response_id = ? AND profile = ?",
+                (response_id, profile),
+            ).fetchone()
+            if stored is None:
+                continue
+            try:
+                raw = json.loads(stored[0])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            candidate = _owner_final_proposal(
+                raw.get("conversation_history") if isinstance(raw, dict) else None
+            )
+            digest = _owner_proposal_digest(candidate)
+            if digest is None:
+                continue
+            self._conn.execute(
+                "UPDATE conversations SET proposal_response_id = ?, proposal_digest = ? "
+                "WHERE profile = ? AND name = ? AND response_id = ? "
+                "AND proposal_response_id IS NULL",
+                (response_id, digest, profile, name, response_id),
+            )
 
     def _tighten_file_permissions(self) -> None:
         """Force owner-only permissions on the DB and SQLite sidecars."""
@@ -1283,16 +1632,26 @@ class ResponseStore:
                     exc_info=True,
                 )
 
-    def get(self, response_id: str) -> Optional[Dict[str, Any]]:
+    def _profile(self, profile: Optional[str]) -> str:
+        selected = str(profile or self._default_profile).strip().lower()
+        if _OWNER_PROFILE_RE.fullmatch(selected) is None:
+            raise ValueError("invalid profile scope")
+        return selected
+
+    def get(
+        self, response_id: str, *, profile: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
+        profile = self._profile(profile)
         row = self._conn.execute(
-            "SELECT data FROM responses WHERE response_id = ?", (response_id,)
+            "SELECT data FROM responses WHERE response_id = ? AND profile = ?",
+            (response_id, profile),
         ).fetchone()
         if row is None:
             return None
         self._conn.execute(
-            "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
-            (time.time(), response_id),
+            "UPDATE responses SET accessed_at = ? WHERE response_id = ? AND profile = ?",
+            (time.time(), response_id, profile),
         )
         self._conn.commit()
         try:
@@ -1303,63 +1662,117 @@ class ResponseStore:
                 response_id,
             )
             self._conn.execute(
-                "DELETE FROM responses WHERE response_id = ?",
-                (response_id,),
+                "DELETE FROM responses WHERE response_id = ? AND profile = ?",
+                (response_id, profile),
             )
             self._conn.commit()
             return None
 
-    def put(self, response_id: str, data: Dict[str, Any]) -> None:
+    def put(
+        self, response_id: str, data: Dict[str, Any], *, profile: Optional[str] = None,
+    ) -> None:
         """Store a response, evicting the oldest if at capacity."""
+        profile = self._profile(profile)
         self._conn.execute(
-            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
+            "INSERT OR REPLACE INTO responses "
+            "(response_id, profile, data, accessed_at) VALUES (?, ?, ?, ?)",
+            (response_id, profile, json.dumps(data, default=str), time.time()),
         )
         # Evict oldest entries beyond max_size
-        count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
+        count = self._conn.execute(
+            "SELECT COUNT(*) FROM responses WHERE profile = ?", (profile,),
+        ).fetchone()[0]
         if count > self._max_size:
-            # Collect IDs that will be evicted
-            evict_ids = [
-                row[0]
-                for row in self._conn.execute(
-                    "SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?",
-                    (count - self._max_size,),
+            # A current owner conversation is durable workflow authority, not
+            # an LRU cache entry. Keep its latest response (and the response
+            # being inserted, which may be mapped immediately after put()) and
+            # evict only ordinary responses. If durable owner sessions alone
+            # exceed the cache bound, correctness wins over the soft LRU cap.
+            owner_response_ids = {
+                mapped_response_id
+                for mapped_response_id, name in self._conn.execute(
+                    "SELECT response_id, name FROM conversations WHERE profile = ?",
+                    (profile,),
                 ).fetchall()
-            ]
+                if isinstance(name, str)
+                and _OWNER_CONVERSATION_RE.fullmatch(name) is not None
+            }
+            evict_ids = []
+            for (candidate_id,) in self._conn.execute(
+                "SELECT response_id FROM responses WHERE profile = ? "
+                "ORDER BY accessed_at ASC",
+                (profile,),
+            ).fetchall():
+                if candidate_id == response_id or candidate_id in owner_response_ids:
+                    continue
+                evict_ids.append(candidate_id)
+                if len(evict_ids) >= count - self._max_size:
+                    break
             if evict_ids:
                 placeholders = ",".join("?" for _ in evict_ids)
                 # Clear conversation mappings pointing to evicted responses
                 self._conn.execute(
-                    f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
-                    evict_ids,
+                    f"DELETE FROM conversations WHERE profile = ? "
+                    f"AND response_id IN ({placeholders})",
+                    [profile, *evict_ids],
                 )
                 # Delete evicted responses
                 self._conn.execute(
-                    f"DELETE FROM responses WHERE response_id IN ({placeholders})",
-                    evict_ids,
+                    f"DELETE FROM responses WHERE profile = ? "
+                    f"AND response_id IN ({placeholders})",
+                    [profile, *evict_ids],
                 )
         self._conn.commit()
 
-    def delete(self, response_id: str) -> bool:
+    def delete(self, response_id: str, *, profile: Optional[str] = None) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
+        profile = self._profile(profile)
+        # Deleting the latest response of an owner conversation would also
+        # delete its approval/consumption fence. Those rows are durable native
+        # authority and may only move through the exact owner lifecycle.
+        if self.owner_response_is_current(response_id, profile=profile):
+            return False
         # Clear conversation mappings pointing to this response
         self._conn.execute(
-            "DELETE FROM conversations WHERE response_id = ?", (response_id,)
+            "DELETE FROM conversations WHERE response_id = ? AND profile = ?",
+            (response_id, profile),
         )
         cursor = self._conn.execute(
-            "DELETE FROM responses WHERE response_id = ?", (response_id,)
+            "DELETE FROM responses WHERE response_id = ? AND profile = ?",
+            (response_id, profile),
         )
         self._conn.commit()
         return cursor.rowcount > 0
 
-    def get_conversation(self, name: str) -> Optional[str]:
+    def owner_response_is_current(
+        self, response_id: str, *, profile: Optional[str] = None,
+    ) -> bool:
+        """Return whether a response currently anchors exact owner authority."""
+        profile = self._profile(profile)
+        rows = self._conn.execute(
+            "SELECT name FROM conversations WHERE response_id = ? AND profile = ?",
+            (response_id, profile),
+        ).fetchall()
+        return any(
+            isinstance(row[0], str)
+            and _OWNER_CONVERSATION_RE.fullmatch(row[0]) is not None
+            for row in rows
+        )
+
+    def get_conversation(
+        self, name: str, *, profile: Optional[str] = None,
+    ) -> Optional[str]:
         """Get the latest response_id for a conversation name."""
+        profile = self._profile(profile)
         row = self._conn.execute(
-            "SELECT response_id FROM conversations WHERE name = ?", (name,)
+            "SELECT response_id FROM conversations WHERE profile = ? AND name = ?",
+            (profile, name),
         ).fetchone()
         return row[0] if row else None
 
-    def owner_history_snapshot(self, name: str) -> Dict[str, Any]:
+    def owner_history_snapshot(
+        self, name: str, *, profile: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Project one conversation into owner-safe turns and its recovery handle.
 
         The stored transcript remains the native Responses authority.  This
@@ -1371,23 +1784,35 @@ class ResponseStore:
         empty: Dict[str, Any] = {
             "latest_response_id": None,
             "proposal_consumed": False,
+            "proposal_claimed": False,
+            "active_run_id": None,
+            "conversation_closed": False,
             "data": [],
         }
+        profile = self._profile(profile)
         if (
             not isinstance(name, str)
             or _OWNER_CONVERSATION_RE.fullmatch(name) is None
         ):
             return empty
         row = self._conn.execute(
-            "SELECT c.response_id, c.consumed_response_id, r.data FROM conversations c "
+            "SELECT c.response_id, c.proposal_response_id, c.consumed_response_id, "
+            "c.claimed_response_id, c.owner_run_id, c.claim_state, c.closed, r.data "
+            "FROM conversations c "
             "JOIN responses r ON r.response_id = c.response_id "
-            "WHERE c.name = ?",
-            (name,),
+            "WHERE c.profile = ? AND c.name = ? AND r.profile = c.profile",
+            (profile, name),
         ).fetchone()
         if row is None:
+            if self._conn.execute(
+                "SELECT 1 FROM owner_conversation_closures "
+                "WHERE profile = ? AND name = ?",
+                (profile, name),
+            ).fetchone() is not None:
+                empty["conversation_closed"] = True
             return empty
         try:
-            stored = json.loads(row[2])
+            stored = json.loads(row[7])
         except (json.JSONDecodeError, TypeError):
             return empty
         history = stored.get("conversation_history") if isinstance(stored, dict) else None
@@ -1450,38 +1875,449 @@ class ResponseStore:
             raphael_text = projected_text
         _flush()
         data = turns[-40:]
+        proposal_response_id = row[1]
+        proposal_consumed = (
+            proposal_response_id is not None and row[2] == proposal_response_id
+        )
+        proposal_claimed = (
+            proposal_response_id is not None
+            and not proposal_consumed
+            and row[3] == proposal_response_id
+            and row[5] == "claimed"
+        )
         return {
-            "latest_response_id": row[0] if data else None,
-            "proposal_consumed": row[1] == row[0],
+            "latest_response_id": proposal_response_id if data else None,
+            "proposal_consumed": proposal_consumed,
+            "proposal_claimed": proposal_claimed,
+            "active_run_id": row[4] if proposal_claimed else None,
+            "conversation_closed": bool(row[6]),
             "data": data,
         }
 
     def mark_owner_proposal_consumed(
-        self, name: str, response_id: str,
+        self, profile: str, name: str, response_id: str,
     ) -> bool:
         """Durably prevent one applied proposal from regaining approval authority."""
+        profile = self._profile(profile)
         if (
             not isinstance(name, str)
             or _OWNER_CONVERSATION_RE.fullmatch(name) is None
             or not isinstance(response_id, str)
-            or re.fullmatch(r"resp_[A-Za-z0-9_-]{8,128}", response_id) is None
+            or _OWNER_RESPONSE_RE.fullmatch(response_id) is None
         ):
             return False
         cursor = self._conn.execute(
             "UPDATE conversations SET consumed_response_id = ? "
-            "WHERE name = ? AND response_id = ?",
-            (response_id, name, response_id),
+            "WHERE profile = ? AND name = ? AND proposal_response_id = ? AND ("
+            "claimed_response_id IS NULL OR claimed_response_id != proposal_response_id "
+            "OR claim_state IS NULL OR claim_state != 'claimed'"
+            ")",
+            (response_id, profile, name, response_id),
         )
         self._conn.commit()
         return cursor.rowcount == 1
 
-    def owner_session_index(self, group: str) -> Dict[str, Any]:
+    @staticmethod
+    def _valid_owner_authority_ids(
+        profile: str,
+        name: str,
+        response_id: str,
+        claim_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> bool:
+        return (
+            isinstance(profile, str)
+            and _OWNER_PROFILE_RE.fullmatch(profile) is not None
+            and isinstance(name, str)
+            and _OWNER_CONVERSATION_RE.fullmatch(name) is not None
+            and isinstance(response_id, str)
+            and _OWNER_RESPONSE_RE.fullmatch(response_id) is not None
+            and (
+                claim_id is None
+                or isinstance(claim_id, str)
+                and _OWNER_CLAIM_RE.fullmatch(claim_id) is not None
+            )
+            and (
+                run_id is None
+                or isinstance(run_id, str)
+                and _OWNER_RUN_RE.fullmatch(run_id) is not None
+            )
+        )
+
+    def claim_owner_proposal(
+        self, profile: str, name: str, response_id: str, claim_id: str,
+    ) -> bool:
+        """Atomically reserve the exact current proposal for one owner approval."""
+        profile = self._profile(profile)
+        if not self._valid_owner_authority_ids(profile, name, response_id, claim_id):
+            return False
+        with self._conversation_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT proposal_response_id, consumed_response_id, claimed_response_id, "
+                    "claim_id, claim_state, closed, owner_run_id, claim_expires_at "
+                    "FROM conversations WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone()
+                reserved = self._conn.execute(
+                    "SELECT 1 FROM owner_conversation_reservations "
+                    "WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone()
+                if (
+                    row is None
+                    or row[0] != response_id
+                    or row[1] == response_id
+                    or bool(row[5])
+                    or reserved is not None
+                ):
+                    self._conn.rollback()
+                    return False
+                if row[2] == response_id and row[4] == "claimed":
+                    same_claim = row[3] == claim_id
+                    lease_live = row[6] is not None or (
+                        isinstance(row[7], (int, float)) and row[7] > time.time()
+                    )
+                    if lease_live:
+                        self._conn.rollback()
+                        return same_claim
+                self._conn.execute(
+                    "UPDATE conversations SET claimed_response_id = ?, claim_id = ?, "
+                    "claim_expires_at = ?, owner_run_id = NULL, bound_operation = NULL, "
+                    "bound_payload_digest = NULL, claim_state = 'claimed' "
+                    "WHERE profile = ? AND name = ? AND proposal_response_id = ?",
+                    (
+                        response_id, claim_id, time.time() + _OWNER_CLAIM_LEASE_SECONDS,
+                        profile, name, response_id,
+                    ),
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def attach_owner_run(
+        self,
+        profile: str,
+        name: str,
+        response_id: str,
+        claim_id: str,
+        run_id: str,
+        *,
+        operation: Optional[str] = None,
+        payload_digest: Optional[str] = None,
+    ) -> bool:
+        """Bind one native run to the exact proposal claim, idempotently."""
+        profile = self._profile(profile)
+        if not self._valid_owner_authority_ids(
+            profile, name, response_id, claim_id, run_id,
+        ):
+            return False
+        with self._conversation_lock:
+            cursor = self._conn.execute(
+                "UPDATE conversations SET owner_run_id = ?, claim_expires_at = NULL, "
+                "bound_operation = COALESCE(?, bound_operation), "
+                "bound_payload_digest = COALESCE(?, bound_payload_digest) "
+                "WHERE profile = ? AND name = ? AND proposal_response_id = ? "
+                "AND consumed_response_id IS NOT ? "
+                "AND claimed_response_id = ? AND claim_id = ? AND claim_state = 'claimed' "
+                "AND (owner_run_id IS NULL OR owner_run_id = ?) "
+                "AND (bound_operation IS NULL OR bound_operation IS ?) "
+                "AND (bound_payload_digest IS NULL OR bound_payload_digest IS ?)",
+                (
+                    run_id, operation, payload_digest, profile, name, response_id,
+                    response_id, response_id, claim_id, run_id, operation, payload_digest,
+                ),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def claim_and_attach_owner_run(
+        self,
+        profile: str,
+        name: str,
+        response_id: str,
+        claim_id: str,
+        run_id: str,
+        *,
+        operation: str,
+        payload_digest: str,
+    ) -> bool:
+        """Atomically bind one validated proposal, claim, payload, and run."""
+        profile = self._profile(profile)
+        if (
+            not self._valid_owner_authority_ids(
+                profile, name, response_id, claim_id, run_id,
+            )
+            or operation not in {
+                "owner_task_graph_commit", "owner_project_plan_commit",
+            }
+            or re.fullmatch(r"[a-f0-9]{64}", payload_digest) is None
+        ):
+            return False
+        with self._conversation_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT proposal_response_id, consumed_response_id, "
+                    "claimed_response_id, claim_id, owner_run_id, claim_state, closed, "
+                    "claim_expires_at "
+                    "FROM conversations WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone()
+                reserved = self._conn.execute(
+                    "SELECT 1 FROM owner_conversation_reservations "
+                    "WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone()
+                if (
+                    row is None
+                    or row[0] != response_id
+                    or row[1] == response_id
+                    or bool(row[6])
+                    or reserved is not None
+                ):
+                    self._conn.rollback()
+                    return False
+                if row[5] == "claimed" and row[2] == response_id:
+                    stale_unattached = (
+                        row[4] is None
+                        and isinstance(row[7], (int, float))
+                        and row[7] <= time.time()
+                    )
+                    if not stale_unattached and (
+                        row[3] != claim_id or row[4] not in {None, run_id}
+                    ):
+                        self._conn.rollback()
+                        return False
+                self._conn.execute(
+                    "UPDATE conversations SET claimed_response_id = ?, claim_id = ?, "
+                    "claim_expires_at = NULL, owner_run_id = ?, bound_operation = ?, "
+                    "bound_payload_digest = ?, claim_state = 'claimed' "
+                    "WHERE profile = ? AND name = ? AND proposal_response_id = ?",
+                    (
+                        response_id, claim_id, run_id, operation, payload_digest,
+                        profile, name, response_id,
+                    ),
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def owner_claim_is_completed(
+        self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
+    ) -> bool:
+        profile = self._profile(profile)
+        if not self._valid_owner_authority_ids(
+            profile, name, response_id, claim_id, run_id,
+        ):
+            return False
+        row = self._conn.execute(
+            "SELECT 1 FROM conversations WHERE profile = ? AND name = ? "
+            "AND proposal_response_id = ? AND consumed_response_id = ? "
+            "AND claimed_response_id = ? AND claim_id = ? AND owner_run_id = ? "
+            "AND claim_state = 'completed'",
+            (profile, name, response_id, response_id, response_id, claim_id, run_id),
+        ).fetchone()
+        return row is not None
+
+    def owner_claim_is_released(
+        self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
+    ) -> bool:
+        """Verify the server-finalized release of one exact failed owner run."""
+        profile = self._profile(profile)
+        if not self._valid_owner_authority_ids(
+            profile, name, response_id, claim_id, run_id,
+        ):
+            return False
+        row = self._conn.execute(
+            "SELECT 1 FROM conversations WHERE profile = ? AND name = ? "
+            "AND proposal_response_id = ? AND consumed_response_id IS NOT ? "
+            "AND claimed_response_id = ? AND claim_id = ? AND owner_run_id = ? "
+            "AND claim_state = 'released'",
+            (profile, name, response_id, response_id, response_id, claim_id, run_id),
+        ).fetchone()
+        return row is not None
+
+    def owner_proposal_record(
+        self, profile: str, name: str, response_id: str,
+    ) -> "tuple[dict[str, Any], str] | None":
+        """Read the exact current stored proposal and its persisted digest."""
+        profile = self._profile(profile)
+        if not self._valid_owner_authority_ids(profile, name, response_id):
+            return None
+        row = self._conn.execute(
+            "SELECT c.proposal_digest, c.consumed_response_id, c.closed, r.data "
+            "FROM conversations c JOIN responses r ON r.response_id = c.response_id "
+            "AND r.profile = c.profile WHERE c.profile = ? AND c.name = ? "
+            "AND c.response_id = ? AND c.proposal_response_id = ?",
+            (profile, name, response_id, response_id),
+        ).fetchone()
+        if row is None or row[1] == response_id or bool(row[2]):
+            return None
+        try:
+            stored = json.loads(row[3])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        candidate = _owner_final_proposal(
+            stored.get("conversation_history") if isinstance(stored, dict) else None
+        )
+        digest = _owner_proposal_digest(candidate)
+        if candidate is None or digest is None or row[0] != digest:
+            return None
+        return candidate, digest
+
+    def owner_run_is_attached(
+        self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
+    ) -> bool:
+        """Verify the exact run binding created by the native run endpoint."""
+        profile = self._profile(profile)
+        if not self._valid_owner_authority_ids(
+            profile, name, response_id, claim_id, run_id,
+        ):
+            return False
+        row = self._conn.execute(
+            "SELECT 1 FROM conversations WHERE profile = ? AND name = ? "
+            "AND proposal_response_id = ? "
+            "AND consumed_response_id IS NOT ? AND claimed_response_id = ? "
+            "AND claim_id = ? AND owner_run_id = ? AND claim_state = 'claimed'",
+            (profile, name, response_id, response_id, response_id, claim_id, run_id),
+        ).fetchone()
+        return row is not None
+
+    def complete_owner_claim(
+        self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
+    ) -> bool:
+        """Consume the exact proposal only after its exact claimed run completes."""
+        profile = self._profile(profile)
+        if not self._valid_owner_authority_ids(
+            profile, name, response_id, claim_id, run_id,
+        ):
+            return False
+        with self._conversation_lock:
+            cursor = self._conn.execute(
+                "UPDATE conversations SET consumed_response_id = ?, claim_state = 'completed' "
+                "WHERE profile = ? AND name = ? AND proposal_response_id = ? "
+                "AND claimed_response_id = ? "
+                "AND claim_id = ? AND owner_run_id = ? "
+                "AND claim_state IN ('claimed', 'completed')",
+                (response_id, profile, name, response_id, response_id, claim_id, run_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def release_owner_claim(
+        self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
+    ) -> bool:
+        """Release an exact failed run without reopening any other proposal."""
+        profile = self._profile(profile)
+        if not self._valid_owner_authority_ids(
+            profile, name, response_id, claim_id, run_id,
+        ):
+            return False
+        with self._conversation_lock:
+            cursor = self._conn.execute(
+                "UPDATE conversations SET claim_state = 'released', claim_expires_at = NULL "
+                "WHERE profile = ? AND name = ? AND proposal_response_id = ? "
+                "AND consumed_response_id IS NOT ? "
+                "AND claimed_response_id = ? AND claim_id = ? AND owner_run_id = ? "
+                "AND claim_state IN ('claimed', 'released')",
+                (profile, name, response_id, response_id, response_id, claim_id, run_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def close_owner_conversation(
+        self, profile: str, name: str, response_id: Optional[str],
+    ) -> bool:
+        """Close one exact conversation only while it has no approved work."""
+        profile = self._profile(profile)
+        if (
+            not isinstance(name, str)
+            or _OWNER_CONVERSATION_RE.fullmatch(name) is None
+            or (
+                response_id is not None
+                and (
+                    not isinstance(response_id, str)
+                    or _OWNER_RESPONSE_RE.fullmatch(response_id) is None
+                )
+            )
+        ):
+            return False
+        with self._conversation_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if self._conn.execute(
+                    "SELECT 1 FROM owner_conversation_reservations "
+                    "WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone() is not None:
+                    self._conn.rollback()
+                    return False
+                row = self._conn.execute(
+                    "SELECT proposal_response_id, consumed_response_id, claimed_response_id, "
+                    "claim_state, closed FROM conversations "
+                    "WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone()
+                if row is None:
+                    if response_id is not None:
+                        self._conn.rollback()
+                        return False
+                    self._conn.execute(
+                        "INSERT INTO owner_conversation_closures "
+                        "(profile, name, closed_at) VALUES (?, ?, ?) "
+                        "ON CONFLICT(profile, name) DO NOTHING",
+                        (profile, name, time.time()),
+                    )
+                    self._conn.commit()
+                    return True
+                if row[0] != response_id:
+                    self._conn.rollback()
+                    return False
+                if bool(row[4]):
+                    self._conn.execute(
+                        "INSERT INTO owner_conversation_closures "
+                        "(profile, name, closed_at) VALUES (?, ?, ?) "
+                        "ON CONFLICT(profile, name) DO NOTHING",
+                        (profile, name, time.time()),
+                    )
+                    self._conn.commit()
+                    return True
+                if row[2] == row[0] and row[3] == "claimed" and row[1] != row[0]:
+                    self._conn.rollback()
+                    return False
+                self._conn.execute(
+                    "UPDATE conversations SET consumed_response_id = proposal_response_id, closed = 1 "
+                    "WHERE profile = ? AND name = ? AND proposal_response_id IS ?",
+                    (profile, name, response_id),
+                )
+                self._conn.execute(
+                    "INSERT INTO owner_conversation_closures "
+                    "(profile, name, closed_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(profile, name) DO NOTHING",
+                    (profile, name, time.time()),
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def owner_session_index(
+        self, profile: str, group: str,
+    ) -> Dict[str, Any]:
         """List owner-safe change-session metadata for one conversation group.
 
         Conversation transcripts remain the native authority.  This bounded
         projection exposes no response handles, system prompts, tool output,
         internal reasoning, or sibling project history.
         """
+        profile = self._profile(profile)
         if (
             not isinstance(group, str)
             or re.fullmatch(r"raphael-owner-[a-f0-9]{32}", group) is None
@@ -1491,10 +2327,10 @@ class ResponseStore:
         rows = self._conn.execute(
             "SELECT c.name, r.data, r.accessed_at "
             "FROM conversations c "
-            "JOIN responses r ON r.response_id = c.response_id "
-            "WHERE c.name = ? OR c.name LIKE ? "
+            "JOIN responses r ON r.response_id = c.response_id AND r.profile = c.profile "
+            "WHERE c.profile = ? AND (c.name = ? OR c.name LIKE ?) "
             "ORDER BY r.accessed_at DESC LIMIT ?",
-            (group, f"{group}-%", _OWNER_SESSION_INDEX_LIMIT + 1),
+            (profile, group, f"{group}-%", _OWNER_SESSION_INDEX_LIMIT + 1),
         ).fetchall()
         truncated = len(rows) > _OWNER_SESSION_INDEX_LIMIT
         sessions: List[Dict[str, Any]] = []
@@ -1515,7 +2351,7 @@ class ResponseStore:
                 or updated_at < 0
             ):
                 continue
-            snapshot = self.owner_history_snapshot(name)
+            snapshot = self.owner_history_snapshot(name, profile=profile)
             history = snapshot["data"]
             if not history:
                 continue
@@ -1536,23 +2372,324 @@ class ResponseStore:
         )
         return {"data": sessions, "truncated": truncated}
 
-    def owner_history(self, name: str) -> List[Dict[str, str]]:
+    def owner_history(
+        self, name: str, *, profile: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
         """Return the backward-compatible owner-safe turn list."""
-        return self.owner_history_snapshot(name)["data"]
+        return self.owner_history_snapshot(name, profile=profile)["data"]
 
-    def set_conversation(self, name: str, response_id: str) -> None:
-        """Map a conversation name to its latest response_id."""
-        self._conn.execute(
-            "INSERT INTO conversations (name, response_id, consumed_response_id) "
-            "VALUES (?, ?, NULL) "
-            "ON CONFLICT(name) DO UPDATE SET "
-            "response_id = excluded.response_id, "
-            "consumed_response_id = CASE "
-            "WHEN conversations.response_id = excluded.response_id "
-            "THEN conversations.consumed_response_id ELSE NULL END",
-            (name, response_id),
+    def reserve_owner_conversation(
+        self, profile: str, name: str, response_id: str,
+    ) -> bool:
+        """Fence one owner turn before any model or tool is allowed to run."""
+        profile = self._profile(profile)
+        if not self._valid_owner_authority_ids(profile, name, response_id):
+            return False
+        with self._conversation_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if self._conn.execute(
+                    "SELECT 1 FROM owner_conversation_closures "
+                    "WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone() is not None:
+                    self._conn.rollback()
+                    return False
+                row = self._conn.execute(
+                    "SELECT proposal_response_id, consumed_response_id, "
+                    "claimed_response_id, claim_state, closed FROM conversations "
+                    "WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone()
+                if row is not None and (
+                    bool(row[4])
+                    or (
+                        row[0] is not None
+                        and row[2] == row[0]
+                        and row[3] == "claimed"
+                        and row[1] != row[0]
+                    )
+                ):
+                    self._conn.rollback()
+                    return False
+                existing = self._conn.execute(
+                    "SELECT response_id FROM owner_conversation_reservations "
+                    "WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone()
+                if existing is not None:
+                    self._conn.rollback()
+                    return existing[0] == response_id
+                self._conn.execute(
+                    "INSERT INTO owner_conversation_reservations "
+                    "(profile, name, response_id, created_at) VALUES (?, ?, ?, ?)",
+                    (profile, name, response_id, time.time()),
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def release_owner_conversation_reservation(
+        self, profile: str, name: str, response_id: str,
+    ) -> None:
+        profile = self._profile(profile)
+        with self._conversation_lock:
+            self._conn.execute(
+                "DELETE FROM owner_conversation_reservations "
+                "WHERE profile = ? AND name = ? AND response_id = ?",
+                (profile, name, response_id),
+            )
+            self._conn.commit()
+
+    def reserve_run_idempotency(
+        self,
+        profile: str,
+        session_scope: str,
+        idempotency_key: str,
+        fingerprint: str,
+        run_id: str,
+        *,
+        owner: "dict[str, str] | None" = None,
+    ) -> "tuple[str, Optional[str]]":
+        """Persist one scoped run identity before execution can be scheduled."""
+        profile = self._profile(profile)
+        with self._conversation_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                existing = self._conn.execute(
+                    "SELECT fingerprint, run_id FROM run_idempotency "
+                    "WHERE profile = ? AND session_scope = ? AND idempotency_key = ?",
+                    (profile, session_scope, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    self._conn.rollback()
+                    return (
+                        ("existing", str(existing[1]))
+                        if existing[0] == fingerprint
+                        else ("conflict", None)
+                    )
+                if owner is not None:
+                    row = self._conn.execute(
+                        "SELECT proposal_response_id, consumed_response_id, "
+                        "claimed_response_id, claim_id, owner_run_id, claim_state, closed, "
+                        "claim_expires_at "
+                        "FROM conversations WHERE profile = ? AND name = ?",
+                        (profile, owner["conversation"]),
+                    ).fetchone()
+                    reserved = self._conn.execute(
+                        "SELECT 1 FROM owner_conversation_reservations "
+                        "WHERE profile = ? AND name = ?",
+                        (profile, owner["conversation"]),
+                    ).fetchone()
+                    if (
+                        row is None
+                        or row[0] != owner["response_id"]
+                        or row[1] == owner["response_id"]
+                        or bool(row[6])
+                        or reserved is not None
+                        or (
+                            row[5] == "claimed"
+                            and not (
+                                row[4] is None
+                                and isinstance(row[7], (int, float))
+                                and row[7] <= time.time()
+                            )
+                            and (
+                                row[2] != owner["response_id"]
+                                or row[3] != owner["claim_id"]
+                                or row[4] not in {None, run_id}
+                            )
+                        )
+                    ):
+                        self._conn.rollback()
+                        return "authority_conflict", None
+                    self._conn.execute(
+                        "UPDATE conversations SET claimed_response_id = ?, claim_id = ?, "
+                        "claim_expires_at = NULL, owner_run_id = ?, bound_operation = ?, "
+                        "bound_payload_digest = ?, claim_state = 'claimed' "
+                        "WHERE profile = ? AND name = ? AND proposal_response_id = ?",
+                        (
+                            owner["response_id"], owner["claim_id"], run_id,
+                            owner["operation"], owner["payload_digest"],
+                            profile, owner["conversation"], owner["response_id"],
+                        ),
+                    )
+                self._conn.execute(
+                    "INSERT INTO run_idempotency (profile, session_scope, idempotency_key, "
+                    "fingerprint, run_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        profile, session_scope, idempotency_key,
+                        fingerprint, run_id, time.time(),
+                    ),
+                )
+                self._conn.commit()
+                return "new", run_id
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def lookup_run_idempotency(
+        self,
+        profile: str,
+        session_scope: str,
+        idempotency_key: str,
+        fingerprint: str,
+    ) -> "tuple[str, Optional[str]]":
+        profile = self._profile(profile)
+        row = self._conn.execute(
+            "SELECT fingerprint, run_id FROM run_idempotency "
+            "WHERE profile = ? AND session_scope = ? AND idempotency_key = ?",
+            (profile, session_scope, idempotency_key),
+        ).fetchone()
+        if row is None:
+            return "missing", None
+        return (
+            ("existing", str(row[1]))
+            if row[0] == fingerprint
+            else ("conflict", None)
         )
-        self._conn.commit()
+
+    def purge_run_idempotency(self, older_than: float) -> None:
+        with self._conversation_lock:
+            self._conn.execute(
+                "DELETE FROM run_idempotency WHERE created_at < ?",
+                (older_than,),
+            )
+            self._conn.commit()
+
+    def set_conversation(
+        self,
+        name: str,
+        response_id: str,
+        *,
+        owner_proposal: bool = False,
+        profile: Optional[str] = None,
+        reservation_id: Optional[str] = None,
+    ) -> bool:
+        """Map a conversation unless approved work or an explicit close owns it."""
+        profile = self._profile(profile)
+        is_owner = (
+            isinstance(name, str)
+            and _OWNER_CONVERSATION_RE.fullmatch(name) is not None
+        )
+        with self._conversation_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if (
+                    is_owner
+                    and self._conn.execute(
+                        "SELECT 1 FROM owner_conversation_closures "
+                        "WHERE profile = ? AND name = ?",
+                        (profile, name),
+                    ).fetchone() is not None
+                ):
+                    self._conn.rollback()
+                    return False
+                if is_owner:
+                    reservation = self._conn.execute(
+                        "SELECT response_id FROM owner_conversation_reservations "
+                        "WHERE profile = ? AND name = ?",
+                        (profile, name),
+                    ).fetchone()
+                    if reservation is not None and reservation[0] != reservation_id:
+                        self._conn.rollback()
+                        return False
+                row = self._conn.execute(
+                    "SELECT response_id, proposal_response_id, consumed_response_id, claimed_response_id, "
+                    "claim_state, closed FROM conversations WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone()
+                if (
+                    row is not None
+                    and row[0] != response_id
+                    and is_owner
+                    and (
+                        bool(row[5])
+                        or (
+                            row[1] is not None
+                            and row[3] == row[1]
+                            and row[4] == "claimed"
+                            and row[2] != row[1]
+                        )
+                    )
+                ):
+                    self._conn.rollback()
+                    return False
+                proposal_digest = None
+                if owner_proposal:
+                    stored = self._conn.execute(
+                        "SELECT data FROM responses WHERE response_id = ? AND profile = ?",
+                        (response_id, profile),
+                    ).fetchone()
+                    if stored is None:
+                        self._conn.rollback()
+                        return False
+                    try:
+                        raw = json.loads(stored[0])
+                    except (json.JSONDecodeError, TypeError):
+                        self._conn.rollback()
+                        return False
+                    proposal_digest = _owner_proposal_digest(
+                        _owner_final_proposal(
+                            raw.get("conversation_history")
+                            if isinstance(raw, dict) else None
+                        )
+                    )
+                    if proposal_digest is None:
+                        self._conn.rollback()
+                        return False
+                self._conn.execute(
+                    "INSERT INTO conversations ("
+                    "profile, name, response_id, proposal_response_id, proposal_digest, "
+                    "consumed_response_id, claimed_response_id, claim_id, claim_expires_at, "
+                    "owner_run_id, bound_operation, bound_payload_digest, claim_state, closed"
+                    ") VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0) "
+                    "ON CONFLICT(profile, name) DO UPDATE SET "
+                    "response_id = excluded.response_id, "
+                    "proposal_response_id = CASE "
+                    "WHEN conversations.response_id = excluded.response_id "
+                    "THEN COALESCE(excluded.proposal_response_id, conversations.proposal_response_id) "
+                    "ELSE excluded.proposal_response_id END, "
+                    "proposal_digest = CASE WHEN conversations.response_id = excluded.response_id "
+                    "THEN COALESCE(excluded.proposal_digest, conversations.proposal_digest) "
+                    "ELSE excluded.proposal_digest END, "
+                    "consumed_response_id = conversations.consumed_response_id, "
+                    "claimed_response_id = CASE "
+                    "WHEN conversations.response_id = excluded.response_id "
+                    "THEN conversations.claimed_response_id ELSE NULL END, "
+                    "claim_id = CASE WHEN conversations.response_id = excluded.response_id "
+                    "THEN conversations.claim_id ELSE NULL END, "
+                    "claim_expires_at = CASE WHEN conversations.response_id = excluded.response_id "
+                    "THEN conversations.claim_expires_at ELSE NULL END, "
+                    "owner_run_id = CASE WHEN conversations.response_id = excluded.response_id "
+                    "THEN conversations.owner_run_id ELSE NULL END, "
+                    "bound_operation = CASE WHEN conversations.response_id = excluded.response_id "
+                    "THEN conversations.bound_operation ELSE NULL END, "
+                    "bound_payload_digest = CASE WHEN conversations.response_id = excluded.response_id "
+                    "THEN conversations.bound_payload_digest ELSE NULL END, "
+                    "claim_state = CASE WHEN conversations.response_id = excluded.response_id "
+                    "THEN conversations.claim_state ELSE NULL END, "
+                    "closed = CASE WHEN conversations.response_id = excluded.response_id "
+                    "THEN conversations.closed ELSE 0 END",
+                    (
+                        profile, name, response_id,
+                        response_id if owner_proposal else None,
+                        proposal_digest,
+                    ),
+                )
+                if reservation_id is not None:
+                    self._conn.execute(
+                        "DELETE FROM owner_conversation_reservations "
+                        "WHERE profile = ? AND name = ? AND response_id = ?",
+                        (profile, name, reservation_id),
+                    )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def close(self) -> None:
         """Close the database connection."""
@@ -1843,7 +2980,10 @@ _idem_cache = _IdempotencyCache()
 def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     from hashlib import sha256
     subset = {k: body.get(k) for k in keys}
-    return sha256(repr(subset).encode("utf-8")).hexdigest()
+    canonical = json.dumps(
+        subset, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+    return sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _derive_chat_session_id(
@@ -2721,6 +3861,10 @@ class APIServerAdapter(BasePlatformAdapter):
             (
                 "POST", "/v1/responses/conversations/{conversation}/consume",
                 self._handle_consume_owner_proposal,
+            ),
+            (
+                "POST", "/v1/responses/conversations/{conversation}/authority",
+                self._handle_owner_conversation_authority,
             ),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -5363,6 +6507,8 @@ class APIServerAdapter(BasePlatformAdapter):
         store: bool,
         session_id: str,
         gateway_session_key: Optional[str] = None,
+        store_profile: Optional[str] = None,
+        conversation_reservation_id: Optional[str] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -5469,9 +6615,37 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": conversation_history_snapshot,
                 "instructions": instructions,
                 "session_id": session_id_snapshot or session_id,
-            })
+            }, profile=store_profile)
             if conversation:
-                self._response_store.set_conversation(conversation, response_id)
+                status = response_env.get("status")
+                if conversation_reservation_id is not None:
+                    if status == "completed":
+                        if not self._response_store.set_conversation(
+                            conversation,
+                            response_id,
+                            owner_proposal=_owner_history_has_actionable_final_proposal(
+                                conversation_history_snapshot
+                            ),
+                            profile=store_profile,
+                            reservation_id=conversation_reservation_id,
+                        ):
+                            raise RuntimeError("owner conversation reservation changed")
+                    elif status in {"failed", "incomplete"}:
+                        self._response_store.release_owner_conversation_reservation(
+                            str(store_profile), conversation, conversation_reservation_id,
+                        )
+                else:
+                    self._response_store.set_conversation(
+                        conversation,
+                        response_id,
+                        owner_proposal=(
+                            status == "completed"
+                            and _owner_history_has_actionable_final_proposal(
+                                conversation_history_snapshot
+                            )
+                        ),
+                        profile=store_profile,
+                    )
 
         def _persist_incomplete_if_needed() -> None:
             """Persist an ``incomplete`` snapshot if no terminal one was written.
@@ -5998,13 +7172,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        response_profile = _active_owner_profile()
+        is_owner_conversation = (
+            isinstance(conversation, str)
+            and _OWNER_CONVERSATION_RE.fullmatch(conversation) is not None
+        )
+        if is_owner_conversation and not store:
+            return web.json_response(
+                _openai_error("Owner conversations require durable storage"),
+                status=400,
+            )
+
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
 
         # Resolve conversation name to latest response_id
         if conversation:
-            previous_response_id = self._response_store.get_conversation(conversation)
+            previous_response_id = self._response_store.get_conversation(
+                conversation, profile=response_profile,
+            )
             # No error if conversation doesn't exist yet — it's a new conversation
 
         # Normalize input to message list
@@ -6053,7 +7240,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stored_session_id = None
         if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
+            stored = self._response_store.get(
+                previous_response_id, profile=response_profile,
+            )
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
             conversation_history = list(stored.get("conversation_history", []))
@@ -6094,6 +7283,20 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        conversation_reservation_id: Optional[str] = None
+        if is_owner_conversation:
+            if not self._response_store.reserve_owner_conversation(
+                response_profile, str(conversation), response_id,
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Owner conversation is busy or closed",
+                        code="owner_conversation_locked",
+                    ),
+                    status=409,
+                )
+            conversation_reservation_id = response_id
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
@@ -6154,26 +7357,35 @@ class APIServerAdapter(BasePlatformAdapter):
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put_nowait(None))
 
-            response_id = f"resp_{uuid.uuid4().hex[:28]}"
             model_name = body.get("model", self._model_name)
             created_at = int(time.time())
 
-            return await self._write_sse_responses(
-                request=request,
-                response_id=response_id,
-                model=model_name,
-                created_at=created_at,
-                stream_q=_stream_q,
-                agent_task=agent_task,
-                agent_ref=agent_ref,
-                conversation_history=conversation_history,
-                user_message=user_message,
-                instructions=instructions,
-                conversation=conversation,
-                store=store,
-                session_id=session_id,
-                gateway_session_key=gateway_session_key,
-            )
+            try:
+                return await self._write_sse_responses(
+                    request=request,
+                    response_id=response_id,
+                    model=model_name,
+                    created_at=created_at,
+                    stream_q=_stream_q,
+                    agent_task=agent_task,
+                    agent_ref=agent_ref,
+                    conversation_history=conversation_history,
+                    user_message=user_message,
+                    instructions=instructions,
+                    conversation=conversation,
+                    store=store,
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                    store_profile=response_profile,
+                    conversation_reservation_id=conversation_reservation_id,
+                )
+            finally:
+                if conversation_reservation_id is not None:
+                    self._response_store.release_owner_conversation_reservation(
+                        response_profile,
+                        str(conversation),
+                        conversation_reservation_id,
+                    )
 
         async def _compute_response():
             return await self._run_agent(
@@ -6187,7 +7399,6 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         if background:
-            response_id = f"resp_{uuid.uuid4().hex[:28]}"
             created_at = int(time.time())
             model_name = body.get("model", self._model_name)
             queued_response = {
@@ -6205,7 +7416,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "instructions": instructions,
                 "session_id": session_id,
             }
-            self._response_store.put(response_id, pending_store_data)
+            self._response_store.put(
+                response_id, pending_store_data, profile=response_profile,
+            )
 
             async def _run_background_response() -> None:
                 in_progress = dict(queued_response)
@@ -6213,7 +7426,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._response_store.put(response_id, {
                     **pending_store_data,
                     "response": in_progress,
-                })
+                }, profile=response_profile)
                 try:
                     result, usage = await _compute_response()
                 except asyncio.CancelledError:
@@ -6225,7 +7438,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._response_store.put(response_id, {
                         **pending_store_data,
                         "response": incomplete,
-                    })
+                    }, profile=response_profile)
+                    if conversation_reservation_id is not None:
+                        self._response_store.release_owner_conversation_reservation(
+                            response_profile,
+                            str(conversation),
+                            conversation_reservation_id,
+                        )
                     raise
                 except Exception as exc:
                     safe_error = _redact_api_error_text(exc)
@@ -6245,7 +7464,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._response_store.put(response_id, {
                         **pending_store_data,
                         "response": failed,
-                    })
+                    }, profile=response_profile)
+                    if conversation_reservation_id is not None:
+                        self._response_store.release_owner_conversation_reservation(
+                            response_profile,
+                            str(conversation),
+                            conversation_reservation_id,
+                        )
                     return
 
                 response_data, full_history, effective_session_id = (
@@ -6266,13 +7491,49 @@ class APIServerAdapter(BasePlatformAdapter):
                     "conversation_history": full_history,
                     "instructions": instructions,
                     "session_id": effective_session_id,
-                })
-                if conversation:
-                    self._response_store.set_conversation(conversation, response_id)
+                }, profile=response_profile)
+                if conversation and not self._response_store.set_conversation(
+                    conversation,
+                    response_id,
+                    owner_proposal=_owner_history_has_actionable_final_proposal(
+                        full_history
+                    ),
+                    profile=response_profile,
+                    reservation_id=conversation_reservation_id,
+                ):
+                    failed = dict(response_data)
+                    failed.update({
+                        "status": "failed",
+                        "output": [],
+                        "error": {
+                            "code": "owner_conversation_locked",
+                            "message": "Owner conversation changed before this response completed",
+                        },
+                    })
+                    self._response_store.put(response_id, {
+                        "response": failed,
+                        "conversation_history": list(conversation_history),
+                        "instructions": instructions,
+                        "session_id": effective_session_id,
+                    }, profile=response_profile)
+                    if conversation_reservation_id is not None:
+                        self._response_store.release_owner_conversation_reservation(
+                            response_profile,
+                            str(conversation),
+                            conversation_reservation_id,
+                        )
 
             task = asyncio.create_task(_run_background_response())
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            if conversation_reservation_id is not None:
+                task.add_done_callback(
+                    lambda _task: self._response_store.release_owner_conversation_reservation(
+                        response_profile,
+                        str(conversation),
+                        conversation_reservation_id,
+                    )
+                )
             await asyncio.sleep(0)
             return web.json_response(queued_response)
 
@@ -6295,6 +7556,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
+                if conversation_reservation_id is not None:
+                    self._response_store.release_owner_conversation_reservation(
+                        response_profile,
+                        str(conversation),
+                        conversation_reservation_id,
+                    )
                 return web.json_response(
                     _openai_error(f"Internal server error: {e}", err_type="server_error"),
                     status=500,
@@ -6304,26 +7571,48 @@ class APIServerAdapter(BasePlatformAdapter):
                 result, usage = await _compute_response()
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
+                if conversation_reservation_id is not None:
+                    self._response_store.release_owner_conversation_reservation(
+                        response_profile,
+                        str(conversation),
+                        conversation_reservation_id,
+                    )
                 return web.json_response(
                     _openai_error(f"Internal server error: {e}", err_type="server_error"),
                     status=500,
                 )
 
-        response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
-        response_data, full_history, _effective_session_id = (
-            self._finalize_response_result(
-                response_id=response_id,
-                created_at=created_at,
-                model=body.get("model", self._model_name),
-                conversation_history=conversation_history,
-                user_message=user_message,
-                session_id=session_id,
-                result=result,
-                usage=usage,
-                background=False,
+        try:
+            response_data, full_history, _effective_session_id = (
+                self._finalize_response_result(
+                    response_id=response_id,
+                    created_at=created_at,
+                    model=body.get("model", self._model_name),
+                    conversation_history=conversation_history,
+                    user_message=user_message,
+                    session_id=session_id,
+                    result=result,
+                    usage=usage,
+                    background=False,
+                )
             )
-        )
+        except Exception as exc:
+            if conversation_reservation_id is not None:
+                self._response_store.release_owner_conversation_reservation(
+                    response_profile,
+                    str(conversation),
+                    conversation_reservation_id,
+                )
+            logger.error(
+                "Error finalizing response: %s",
+                _redact_api_error_text(exc),
+                exc_info=True,
+            )
+            return web.json_response(
+                _openai_error("Internal server error", err_type="server_error"),
+                status=500,
+            )
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
@@ -6332,11 +7621,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": full_history,
                 "instructions": instructions,
                 "session_id": _effective_session_id,
-            })
+            }, profile=response_profile)
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
-            if conversation:
-                self._response_store.set_conversation(conversation, response_id)
+            if conversation and not self._response_store.set_conversation(
+                conversation,
+                response_id,
+                owner_proposal=_owner_history_has_actionable_final_proposal(
+                    full_history
+                ),
+                profile=response_profile,
+                reservation_id=conversation_reservation_id,
+            ):
+                if conversation_reservation_id is not None:
+                    self._response_store.release_owner_conversation_reservation(
+                        response_profile,
+                        str(conversation),
+                        conversation_reservation_id,
+                    )
+                return web.json_response(
+                    _openai_error(
+                        "Owner conversation changed before this response completed",
+                        code="owner_conversation_locked",
+                    ),
+                    status=409,
+                )
 
         response_headers = {"X-Hermes-Session-Id": _effective_session_id}
         if gateway_session_key:
@@ -6368,13 +7677,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     _openai_error("Invalid owner conversation group"),
                     status=400,
                 )
-            index = self._response_store.owner_session_index(conversation)
+            index = self._response_store.owner_session_index(
+                _active_owner_profile(), conversation,
+            )
             return web.json_response({
                 "object": "hermes.response.owner_sessions",
                 **index,
             })
 
-        snapshot = self._response_store.owner_history_snapshot(conversation)
+        snapshot = self._response_store.owner_history_snapshot(
+            conversation, profile=_active_owner_profile(),
+        )
         return web.json_response({
             "object": "hermes.response.owner_history",
             **snapshot,
@@ -6401,6 +7714,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
         consumed = self._response_store.mark_owner_proposal_consumed(
+            _active_owner_profile(),
             request.match_info["conversation"],
             body["response_id"],
         )
@@ -6414,6 +7728,82 @@ class APIServerAdapter(BasePlatformAdapter):
             "consumed": True,
         })
 
+    async def _handle_owner_conversation_authority(
+        self, request: "web.Request",
+    ) -> "web.Response":
+        """Apply one exact atomic owner-proposal authority transition."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict) or not isinstance(body.get("action"), str):
+            return web.json_response(
+                _openai_error("Invalid owner proposal authority request"),
+                status=400,
+            )
+
+        action = body["action"]
+        expected_keys = {
+            "claim": {"action", "response_id", "claim_id"},
+            "attach": {"action", "response_id", "claim_id", "run_id"},
+            "complete": {"action", "response_id", "claim_id", "run_id"},
+            "release": {"action", "response_id", "claim_id", "run_id"},
+            "close": {"action", "response_id"},
+        }
+        if action not in expected_keys or set(body) != expected_keys[action]:
+            return web.json_response(
+                _openai_error("Invalid owner proposal authority request"),
+                status=400,
+            )
+
+        conversation = request.match_info["conversation"]
+        response_id = body.get("response_id")
+        profile = _active_owner_profile()
+        if action == "claim":
+            applied = self._response_store.claim_owner_proposal(
+                profile, conversation, response_id, body.get("claim_id"),
+            )
+        elif action == "attach":
+            run_id = body.get("run_id")
+            # /v1/runs creates the binding before returning its run ID. This
+            # service endpoint only verifies that exact native binding; it may
+            # not attach an arbitrary caller-declared run to owner authority.
+            applied = (
+                run_id in self._run_statuses
+                and self._response_store.owner_run_is_attached(
+                    profile, conversation, response_id, body.get("claim_id"), run_id,
+                )
+            )
+        elif action == "complete":
+            run_id = body.get("run_id")
+            # Verification only: the native tool callback already consumed
+            # authority. A caller cannot turn generic run status into proof.
+            applied = self._response_store.owner_claim_is_completed(
+                profile, conversation, response_id, body.get("claim_id"), run_id,
+            )
+        elif action == "release":
+            run_id = body.get("run_id")
+            applied = self._response_store.owner_claim_is_released(
+                profile, conversation, response_id, body.get("claim_id"), run_id,
+            )
+        else:
+            applied = self._response_store.close_owner_conversation(
+                profile, conversation, response_id,
+            )
+        if not applied:
+            return web.json_response(
+                _openai_error("Owner proposal authority changed"),
+                status=409,
+            )
+        return web.json_response({
+            "object": "hermes.response.owner_authority",
+            "action": action,
+            "applied": True,
+        })
+
     async def _handle_get_response(self, request: "web.Request") -> "web.Response":
         """GET /v1/responses/{response_id} — retrieve a stored response."""
         auth_err = self._check_auth(request)
@@ -6421,7 +7811,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         response_id = request.match_info["response_id"]
-        stored = self._response_store.get(response_id)
+        profile = _active_owner_profile()
+        stored = self._response_store.get(response_id, profile=profile)
         if stored is None:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
@@ -6434,7 +7825,18 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         response_id = request.match_info["response_id"]
-        deleted = self._response_store.delete(response_id)
+        profile = _active_owner_profile()
+        if self._response_store.owner_response_is_current(
+            response_id, profile=profile,
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Response is retained by an owner conversation",
+                    code="owner_conversation_active",
+                ),
+                status=409,
+            )
+        deleted = self._response_store.delete(response_id, profile=profile)
         if not deleted:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
@@ -7519,11 +8921,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
             from hermes_cli.owner_workspace import (
+                OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY,
                 list_committed_projects,
                 resolve_owner_context,
             )
 
-            projects = list_committed_projects(resolve_owner_context())
+            projects = list_committed_projects(
+                resolve_owner_context(),
+                lifecycle_revision=_owner_workspace_capability_requested(
+                    request, OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY,
+                ),
+            )
         except Exception:
             logger.exception("[api_server] owner-workspace Project projection failed")
             return web.json_response(
@@ -7759,6 +9167,287 @@ class APIServerAdapter(BasePlatformAdapter):
             "data": decisions[:100],
         })
 
+    @staticmethod
+    def _owner_authority_clean(value: Any) -> Any:
+        """Mirror the Workspace proposal parser's semantic string trimming."""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            return [APIServerAdapter._owner_authority_clean(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                str(key): APIServerAdapter._owner_authority_clean(item)
+                for key, item in value.items()
+            }
+        return value
+
+    def _validated_owner_proposal_authority(
+        self,
+        authority: "dict[str, Any]",
+        context: "dict[str, Any]",
+        profile: str,
+    ) -> "dict[str, str]":
+        """Derive mutation authority from the stored proposal and live Project."""
+        if context.get("profile") != profile:
+            raise ValueError("owner profile mismatch")
+        record = self._response_store.owner_proposal_record(
+            profile, authority["conversation"], authority["response_id"],
+        )
+        if record is None:
+            raise ValueError("owner proposal is not current")
+        candidate, proposal_digest = record
+        idempotency_key = (
+            "conversation-"
+            + hashlib.sha256(authority["response_id"].encode("utf-8")).hexdigest()
+        )
+        if authority["idempotency_key"] != idempotency_key:
+            raise ValueError("owner idempotency key mismatch")
+
+        clean = self._owner_authority_clean
+        if candidate.get("kind") == "proposal":
+            if (
+                set(candidate) != _OWNER_NEW_PROPOSAL_KEYS
+                or context.get("mode") != "new"
+                or authority["operation"] != "owner_task_graph_commit"
+                or context.get("project_slug") is not None
+            ):
+                raise ValueError("stored proposal does not authorize this operation")
+            from hermes_cli.profiles import list_profiles
+
+            profiles = [str(item.name) for item in list_profiles()]
+            if not profiles:
+                raise ValueError("no owner workspace profile is available")
+            root_assignee = "default" if "default" in profiles else profiles[0]
+            expected_payload: Dict[str, Any] = {
+                "idempotency_key": idempotency_key,
+                "mode": "new",
+                "project_name": clean(candidate.get("project_name")),
+                "project_description": clean(candidate.get("project_description")),
+                "project_id": None,
+                "request_title": clean(candidate.get("request_title")),
+                "specification": clean(candidate.get("specification")),
+                "current_milestone": clean(candidate.get("current_milestone")),
+                "owner_visible_result": clean(candidate.get("owner_visible_result")),
+                "root_assignee": root_assignee,
+                "tasks": clean(candidate.get("tasks")),
+                "later_milestones": clean(candidate.get("later_milestones")),
+            }
+        else:
+            if (
+                set(candidate) != _OWNER_EXISTING_PROPOSAL_KEYS
+                or context.get("mode") != "existing"
+                or authority["operation"] != "owner_project_plan_commit"
+                or not isinstance(context.get("project_slug"), str)
+            ):
+                raise ValueError("stored proposal does not authorize this operation")
+            from hermes_cli.owner_workspace import read_project_snapshot, resolve_owner_context
+
+            snapshot = read_project_snapshot(
+                resolve_owner_context(), str(context["project_slug"]),
+            )
+            project = snapshot.get("project")
+            columns = snapshot.get("columns")
+            if not isinstance(project, dict) or not isinstance(columns, list):
+                raise ValueError("owner Project snapshot is unavailable")
+            tasks = [
+                task
+                for column in columns if isinstance(column, dict)
+                for task in column.get("tasks", []) if isinstance(task, dict)
+            ]
+            if not tasks:
+                raise ValueError("owner Project has no task anchor")
+            secret = self._expected_api_key()
+            if not secret:
+                raise ValueError("owner executor key is unavailable")
+            native_by_ref: Dict[str, Dict[str, Any]] = {}
+            for task in tasks:
+                canonical = json.dumps(
+                    {
+                        "version": 1,
+                        "project_id": project.get("id"),
+                        "task_id": task.get("id"),
+                        "title": task.get("title"),
+                        "status": task.get("status") or next(
+                            (
+                                column.get("name") for column in columns
+                                if isinstance(column, dict)
+                                and task in column.get("tasks", [])
+                            ),
+                            None,
+                        ),
+                        "event_revision": task.get("event_revision"),
+                        "parent_ids": sorted(task.get("parent_ids") or []),
+                        "child_ids": sorted(task.get("child_ids") or []),
+                    },
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                ref = "tr_" + base64.urlsafe_b64encode(
+                    hmac.new(
+                        secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256,
+                    ).digest()
+                ).decode("ascii").rstrip("=")
+                native_by_ref[ref] = {
+                    "task_id": task.get("id"),
+                    "expected_status": json.loads(canonical)["status"],
+                    "expected_revision": task.get("event_revision"),
+                }
+
+            def native(ref: Any) -> Dict[str, Any]:
+                value = native_by_ref.get(str(ref))
+                if value is None:
+                    raise ValueError("proposal task reference is stale")
+                return value
+
+            changes: List[Dict[str, Any]] = []
+            raw_changes = candidate.get("changes")
+            if not isinstance(raw_changes, list) or not raw_changes:
+                raise ValueError("stored proposal has no changes")
+            for raw in raw_changes:
+                if not isinstance(raw, dict):
+                    raise ValueError("stored proposal change is invalid")
+                action = raw.get("action")
+                reason = clean(raw.get("reason"))
+                if action == "add" and set(raw) == {
+                    "action", "reason", "title", "body", "assignee", "responsibility",
+                    "existing_parent_refs", "new_parents",
+                }:
+                    changes.append({
+                        "action": "add", "reason": reason,
+                        "title": clean(raw.get("title")), "body": clean(raw.get("body")),
+                        "assignee": clean(raw.get("assignee")),
+                        "responsibility": clean(raw.get("responsibility")),
+                        "existing_parents": [native(ref) for ref in raw["existing_parent_refs"]],
+                        "new_parents": clean(raw.get("new_parents")),
+                    })
+                elif action == "split" and set(raw) == {
+                    "action", "reason", "target_ref", "replacements",
+                }:
+                    changes.append({
+                        "action": "split", "reason": reason,
+                        "target": native(raw.get("target_ref")),
+                        "replacements": clean(raw.get("replacements")),
+                    })
+                elif action == "merge" and set(raw) == {
+                    "action", "reason", "target_refs", "replacement",
+                }:
+                    changes.append({
+                        "action": "merge", "reason": reason,
+                        "targets": [native(ref) for ref in raw["target_refs"]],
+                        "replacement": clean(raw.get("replacement")),
+                    })
+                elif action == "move" and set(raw) == {
+                    "action", "reason", "target_ref", "to_status",
+                }:
+                    changes.append({
+                        "action": "move", "reason": reason,
+                        "target": native(raw.get("target_ref")),
+                        "to_status": clean(raw.get("to_status")),
+                    })
+                elif action in {"postpone", "cancel"} and set(raw) == {
+                    "action", "reason", "target_ref",
+                }:
+                    changes.append({
+                        "action": action, "reason": reason,
+                        "target": native(raw.get("target_ref")),
+                    })
+                else:
+                    raise ValueError("stored proposal change is invalid")
+            ordered_tasks = sorted(
+                tasks,
+                key=lambda task: (
+                    int(bool(task.get("parent_ids"))), str(task.get("id") or ""),
+                ),
+            )
+            expected_payload = {
+                "idempotency_key": idempotency_key,
+                "project_id": project.get("id"),
+                "anchor_task_id": ordered_tasks[0].get("id"),
+                "trigger": "owner_request",
+                "request_title": clean(candidate.get("request_title")),
+                "summary": clean(candidate.get("summary")),
+                "specification": clean(candidate.get("specification")),
+                "current_milestone": clean(candidate.get("current_milestone")),
+                "owner_visible_result": clean(candidate.get("owner_visible_result")),
+                "later_milestones": clean(candidate.get("later_milestones")),
+                "changes": changes,
+            }
+
+        if clean(authority["payload"]) != expected_payload:
+            raise ValueError("run payload differs from the stored owner proposal")
+        canonical = json.dumps(
+            expected_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        return {
+            "conversation": authority["conversation"],
+            "response_id": authority["response_id"],
+            "claim_id": authority["claim_id"],
+            "operation": authority["operation"],
+            "idempotency_key": idempotency_key,
+            "payload_digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "proposal_digest": proposal_digest,
+        }
+
+    @staticmethod
+    def _owner_mutation_receipt(
+        operation: str, result: Any,
+    ) -> "str | None":
+        """Return the minimal receipt for one exact successful owner mutation.
+
+        The tool callback observes the native tool result, not the model's
+        later prose.  Only the two proposal-backed mutation shapes are
+        accepted; denied, conflicting, malformed, or merely asserted results
+        cannot consume proposal authority.
+        """
+        if isinstance(result, str):
+            try:
+                value = json.loads(result)
+            except (json.JSONDecodeError, TypeError):
+                return None
+        elif isinstance(result, dict):
+            value = result
+        else:
+            return None
+        if not isinstance(value, dict) or value.get("ok") is not True:
+            return None
+        project_slug = value.get("project_slug")
+        if (
+            not isinstance(project_slug, str)
+            or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", project_slug) is None
+        ):
+            return None
+        if operation == "owner_task_graph_commit":
+            task_count = value.get("task_count")
+            if (
+                isinstance(task_count, bool)
+                or not isinstance(task_count, int)
+                or not 1 <= task_count <= 12
+            ):
+                return None
+            receipt = {
+                "ok": True,
+                "project_slug": project_slug,
+                "task_count": task_count,
+            }
+        elif operation == "owner_project_plan_commit":
+            change_count = value.get("change_count")
+            if (
+                value.get("applied") is not True
+                or isinstance(change_count, bool)
+                or not isinstance(change_count, int)
+                or not 1 <= change_count <= 12
+            ):
+                return None
+            receipt = {
+                "ok": True,
+                "project_slug": project_slug,
+                "applied": True,
+                "change_count": change_count,
+            }
+        else:
+            return None
+        return json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+
 
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
@@ -7767,12 +9456,6 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
-
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
 
         try:
             body = await request.json()
@@ -7783,10 +9466,82 @@ class APIServerAdapter(BasePlatformAdapter):
             owner_workspace_context = _resolve_owner_workspace_run_context(
                 body.get("owner_workspace_context")
             )
+            owner_proposal_authority = _resolve_owner_proposal_run_authority(
+                body.get("owner_proposal_authority")
+            )
         except ValueError:
             return web.json_response(
-                _openai_error("Invalid 'owner_workspace_context' field"), status=400
+                _openai_error("Invalid owner-workspace authority"), status=400
             )
+        if owner_proposal_authority is not None and owner_workspace_context is None:
+            return web.json_response(
+                _openai_error(
+                    "Owner proposal authority requires owner workspace context"
+                ),
+                status=400,
+            )
+        request_owner_profile = _active_owner_profile()
+        if owner_proposal_authority is not None:
+            # A transport retry can arrive after the native tool callback has
+            # already consumed the exact proposal. Replaying the persisted,
+            # fingerprint-matched run is safe; re-validating it as fresh
+            # authority would incorrectly reject the successful retry merely
+            # because consumption did its job.
+            retry_key = request.headers.get("Idempotency-Key")
+            if retry_key == owner_proposal_authority["idempotency_key"]:
+                retry_scope = hashlib.sha256(
+                    (gateway_session_key or "").encode("utf-8")
+                ).hexdigest()
+                retry_body = dict(body)
+                retry_body["_session_scope"] = retry_scope
+                retry_fingerprint = _make_request_fingerprint(
+                    retry_body, keys=sorted(retry_body),
+                )
+                retry_state, retry_run_id = (
+                    self._response_store.lookup_run_idempotency(
+                        request_owner_profile,
+                        retry_scope,
+                        retry_key,
+                        retry_fingerprint,
+                    )
+                )
+                retry_status = self._run_statuses.get(retry_run_id or "", {})
+                retry_snapshot = self._response_store.owner_history_snapshot(
+                    owner_proposal_authority["conversation"],
+                    profile=request_owner_profile,
+                )
+                if (
+                    retry_state == "existing"
+                    and retry_run_id is not None
+                    and retry_snapshot.get("latest_response_id")
+                    == owner_proposal_authority["response_id"]
+                    and retry_snapshot.get("proposal_consumed") is True
+                    and retry_status.get("status") == "completed"
+                    and retry_status.get("owner_mutation_committed") is True
+                ):
+                    response_headers = (
+                        {"X-Hermes-Session-Key": gateway_session_key}
+                        if gateway_session_key else {}
+                    )
+                    return web.json_response(
+                        {"run_id": retry_run_id, "status": "started"},
+                        status=202,
+                        headers=response_headers,
+                    )
+            try:
+                owner_proposal_authority = self._validated_owner_proposal_authority(
+                    owner_proposal_authority,
+                    owner_workspace_context,
+                    request_owner_profile,
+                )
+            except ValueError:
+                return web.json_response(
+                    _openai_error(
+                        "Owner proposal does not authorize this run",
+                        code="owner_proposal_authority_conflict",
+                    ),
+                    status=409,
+                )
 
         raw_input = body.get("input")
         if not raw_input:
@@ -7821,7 +9576,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stored_session_id = None
         if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
+            stored = self._response_store.get(
+                previous_response_id, profile=request_owner_profile,
+            )
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
                 stored_session_id = stored.get("session_id")
@@ -7856,7 +9613,141 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if idempotency_key is not None and re.fullmatch(
+            r"[A-Za-z0-9._:-]{1,200}", idempotency_key,
+        ) is None:
+            return web.json_response(
+                _openai_error("Invalid Idempotency-Key"), status=400,
+            )
+        if owner_proposal_authority is not None and (
+            idempotency_key != owner_proposal_authority["idempotency_key"]
+        ):
+            return web.json_response(
+                _openai_error("Owner proposal authority does not match this run"),
+                status=400,
+            )
+        idempotency_fingerprint = None
+        idempotency_session_scope = hashlib.sha256(
+            (gateway_session_key or "").encode("utf-8")
+        ).hexdigest()
+        if idempotency_key is not None:
+            fingerprint_body = dict(body)
+            fingerprint_body["_session_scope"] = idempotency_session_scope
+            idempotency_fingerprint = _make_request_fingerprint(
+                fingerprint_body, keys=sorted(fingerprint_body),
+            )
+            state, existing_run_id = self._response_store.lookup_run_idempotency(
+                request_owner_profile,
+                idempotency_session_scope,
+                idempotency_key,
+                idempotency_fingerprint,
+            )
+            if state != "missing":
+                if state == "conflict":
+                    return web.json_response(
+                        _openai_error(
+                            "Idempotency-Key was already used for a different run",
+                            code="idempotency_conflict",
+                        ),
+                        status=409,
+                    )
+                if existing_run_id not in self._run_statuses:
+                    return web.json_response(
+                        _openai_error(
+                            "Idempotent run result has expired",
+                            code="idempotency_expired",
+                        ),
+                        status=409,
+                    )
+                if owner_proposal_authority is not None:
+                    owner_snapshot = self._response_store.owner_history_snapshot(
+                        owner_proposal_authority["conversation"],
+                        profile=request_owner_profile,
+                    )
+                    existing_status = self._run_statuses.get(existing_run_id, {})
+                    same_completed_mutation = (
+                        owner_snapshot.get("proposal_consumed") is True
+                        and existing_status.get("status") == "completed"
+                        and existing_status.get("owner_mutation_committed") is True
+                    )
+                    if (
+                        owner_snapshot.get("latest_response_id")
+                        != owner_proposal_authority["response_id"]
+                        or (
+                            owner_snapshot.get("active_run_id") != existing_run_id
+                            and not same_completed_mutation
+                        )
+                    ):
+                        return web.json_response(
+                            _openai_error(
+                                "Owner proposal authority no longer owns this run",
+                                code="owner_proposal_authority_conflict",
+                            ),
+                            status=409,
+                        )
+                response_headers = (
+                    {"X-Hermes-Session-Key": gateway_session_key}
+                    if gateway_session_key else {}
+                )
+                return web.json_response(
+                    {"run_id": existing_run_id, "status": "started"},
+                    status=202,
+                    headers=response_headers,
+                )
+
+        # A retry that already owns a run is returned above even while the
+        # service is at capacity. New work still obeys the shared limit.
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
+
         run_id = f"run_{uuid.uuid4().hex}"
+        authority_bound = True
+        if idempotency_key is not None:
+            reserve_state, reserved_run_id = self._response_store.reserve_run_idempotency(
+                request_owner_profile,
+                idempotency_session_scope,
+                idempotency_key,
+                str(idempotency_fingerprint),
+                run_id,
+                owner=owner_proposal_authority,
+            )
+            authority_bound = reserve_state != "authority_conflict"
+            if reserve_state == "conflict":
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was already used for a different run",
+                        code="idempotency_conflict",
+                    ),
+                    status=409,
+                )
+            if reserve_state == "existing":
+                return web.json_response(
+                    _openai_error(
+                        "Idempotent run result is owned by another process",
+                        code="idempotency_expired",
+                    ),
+                    status=409,
+                )
+        elif owner_proposal_authority is not None:
+            authority_bound = self._response_store.claim_and_attach_owner_run(
+                request_owner_profile,
+                owner_proposal_authority["conversation"],
+                owner_proposal_authority["response_id"],
+                owner_proposal_authority["claim_id"],
+                run_id,
+                operation=owner_proposal_authority["operation"],
+                payload_digest=owner_proposal_authority["payload_digest"],
+            )
+        if not authority_bound:
+            return web.json_response(
+                _openai_error(
+                    "Owner proposal authority is not current",
+                    code="owner_proposal_authority_conflict",
+                ),
+                status=409,
+            )
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -7864,6 +9755,21 @@ class APIServerAdapter(BasePlatformAdapter):
         # concurrent runs can intentionally share them, and resolving an
         # approval for one run must not unblock another run's dangerous command.
         approval_session_key = run_id
+        owner_authority_context = None
+        if owner_proposal_authority is not None:
+            from hermes_cli.owner_workspace import OwnerProposalAuthority
+
+            owner_profile = str(owner_workspace_context["profile"])
+            owner_authority_context = OwnerProposalAuthority(
+                actor=owner_profile,
+                profile=owner_profile,
+                session=approval_session_key,
+                conversation=owner_proposal_authority["conversation"],
+                response_id=owner_proposal_authority["response_id"],
+                operation=owner_proposal_authority["operation"],
+                idempotency_key=owner_proposal_authority["idempotency_key"],
+                payload_digest=owner_proposal_authority["payload_digest"],
+            )
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
@@ -7894,6 +9800,122 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             except Exception:
                 pass
+
+        owner_receipt_lock = threading.Lock()
+        owner_finalize_lock = threading.Lock()
+        owner_receipt: List[Optional[str]] = [None]
+        owner_authority_finalized = [False]
+        owner_authority_completed = [False]
+        owner_worker_future: List[Optional["asyncio.Future[Any]"]] = [None]
+
+        def _finalize_owner_authority() -> bool:
+            """Let the server, not caller-declared run status, close authority."""
+            if owner_proposal_authority is None:
+                return False
+            with owner_finalize_lock:
+                if owner_authority_finalized[0]:
+                    return owner_authority_completed[0]
+                with owner_receipt_lock:
+                    receipt = owner_receipt[0]
+                args = (
+                    request_owner_profile,
+                    owner_proposal_authority["conversation"],
+                    owner_proposal_authority["response_id"],
+                    owner_proposal_authority["claim_id"],
+                    run_id,
+                )
+                try:
+                    if receipt is not None:
+                        applied = self._response_store.complete_owner_claim(*args)
+                        applied = applied or self._response_store.owner_claim_is_completed(
+                            *args
+                        )
+                        if applied:
+                            owner_authority_completed[0] = True
+                    else:
+                        applied = self._response_store.release_owner_claim(*args)
+                        applied = applied or self._response_store.owner_claim_is_released(
+                            *args
+                        )
+                    if applied:
+                        owner_authority_finalized[0] = True
+                    return owner_authority_completed[0]
+                except Exception:
+                    logger.exception(
+                        "[api_server] owner authority finalization failed for run=%s",
+                        run_id,
+                    )
+                    return False
+
+        def _owner_tool_complete(
+            _tool_call_id: str,
+            function_name: str,
+            _function_args: Any,
+            function_result: Any,
+        ) -> None:
+            """Record only the exact proposal-backed native mutation receipt."""
+            if (
+                owner_proposal_authority is None
+                or function_name != owner_proposal_authority["operation"]
+            ):
+                return
+            receipt = self._owner_mutation_receipt(function_name, function_result)
+            if receipt is None:
+                return
+            with owner_receipt_lock:
+                if owner_receipt[0] is None:
+                    owner_receipt[0] = receipt
+                elif owner_receipt[0] != receipt:
+                    logger.error(
+                        "[api_server] inconsistent owner mutation receipts for run=%s",
+                        run_id,
+                    )
+                    return
+            # Close the crash window at the tool boundary. The native mutation
+            # has committed and its canonical result is already observable;
+            # later model prose is not execution authority.
+            _finalize_owner_authority()
+
+        def _owner_completed_receipt() -> Optional[str]:
+            if not _finalize_owner_authority():
+                return None
+            with owner_receipt_lock:
+                return owner_receipt[0]
+
+        def _publish_owner_completion(usage: Optional[Dict[str, Any]] = None) -> bool:
+            receipt = _owner_completed_receipt()
+            if receipt is None:
+                return False
+            completed_event = {
+                "event": "run.completed",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "output": receipt,
+                "usage": usage or {},
+            }
+            _put_event_if_active(completed_event)
+            self._set_run_status(
+                run_id,
+                "completed",
+                output=receipt,
+                usage=usage or {},
+                owner_mutation_committed=True,
+                last_event="run.completed",
+            )
+            return True
+
+        def _owner_worker_done(future: "asyncio.Future[Any]") -> None:
+            # Retrieve an exception when the outer task was cancelled while
+            # the executor thread kept running; this prevents a lost-future
+            # warning without trusting that exception as mutation authority.
+            try:
+                future.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+            _finalize_owner_authority()
+            status = self._run_statuses.get(run_id, {}).get("status")
+            if status in {"cancelled", "failed"}:
+                _publish_owner_completion()
 
         self._set_run_status(
             run_id,
@@ -7929,6 +9951,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_id=session_id,
                         stream_delta_callback=_text_cb,
                         tool_progress_callback=event_cb,
+                        tool_complete_callback=_owner_tool_complete,
                         gateway_session_key=gateway_session_key,
                         requested_model=agent_overrides.get("requested_model"),
                         requested_provider=agent_overrides.get("requested_provider"),
@@ -8015,6 +10038,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
                     effective_task_id = session_id or run_id
                     approval_token = None
+                    owner_authority_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile):
                         try:
@@ -8022,6 +10046,14 @@ class APIServerAdapter(BasePlatformAdapter):
                             # contextvars so concurrent runs do not share process
                             # environment state.
                             approval_token = set_current_session_key(approval_session_key)
+                            if owner_authority_context is not None:
+                                from hermes_cli.owner_workspace import (
+                                    set_owner_proposal_authority,
+                                )
+
+                                owner_authority_token = set_owner_proposal_authority(
+                                    owner_authority_context,
+                                )
                             session_tokens = self._bind_api_server_session(
                                 # chat_id carries the raw session id (the
                                 # X-Hermes-Session-Id equivalent) exactly like
@@ -8061,6 +10093,17 @@ class APIServerAdapter(BasePlatformAdapter):
                                         reset_current_session_key(approval_token)
                                     except Exception:
                                         pass
+                                if owner_authority_token is not None:
+                                    try:
+                                        from hermes_cli.owner_workspace import (
+                                            reset_owner_proposal_authority,
+                                        )
+
+                                        reset_owner_proposal_authority(
+                                            owner_authority_token,
+                                        )
+                                    except Exception:
+                                        pass
                                 if session_tokens:
                                     try:
                                         clear_session_vars(session_tokens)
@@ -8073,8 +10116,16 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
-                if run_id in self._stopping_run_ids:
+                worker_future = asyncio.get_running_loop().run_in_executor(
+                    None, _run_sync,
+                )
+                owner_worker_future[0] = worker_future
+                if owner_proposal_authority is not None:
+                    worker_future.add_done_callback(_owner_worker_done)
+                result, usage = await asyncio.shield(worker_future)
+                if _publish_owner_completion(usage):
+                    pass
+                elif run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
@@ -8102,6 +10153,21 @@ class APIServerAdapter(BasePlatformAdapter):
                         error=error_msg,
                         last_event="run.failed",
                     )
+                elif owner_proposal_authority is not None:
+                    error_msg = "The approved Project change was not committed"
+                    _put_event_if_active({
+                        "event": "run.failed",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "error": error_msg,
+                    })
+                    self._set_run_status(
+                        run_id,
+                        "failed",
+                        error=error_msg,
+                        owner_mutation_committed=False,
+                        last_event="run.failed",
+                    )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                     # Undelivered steer text (accepted after the final response;
@@ -8127,19 +10193,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         **({"pending_steer": pending_steer} if pending_steer else {}),
                     )
             except asyncio.CancelledError:
-                self._set_run_status(
-                    run_id,
-                    "cancelled",
-                    last_event="run.cancelled",
-                )
-                try:
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                except Exception:
-                    pass
+                if not _publish_owner_completion():
+                    self._set_run_status(
+                        run_id,
+                        "cancelled",
+                        last_event="run.cancelled",
+                    )
+                    try:
+                        _put_event_if_active({
+                            "event": "run.cancelled",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                        })
+                    except Exception:
+                        pass
                 raise
             except _ProviderAuthResolutionError as exc:
                 # /v1/runs builds its own agent via _create_agent() and does
@@ -8151,39 +10218,50 @@ class APIServerAdapter(BasePlatformAdapter):
                 # except-Exception branch below.
                 logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
                 error_msg = f"⚠️ Provider authentication failed: {exc}"
-                self._set_run_status(
-                    run_id,
-                    "failed",
-                    error=error_msg,
-                    last_event="run.failed",
-                )
-                try:
-                    _put_event_if_active({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": error_msg,
-                    })
-                except Exception:
-                    pass
+                if not _publish_owner_completion():
+                    self._set_run_status(
+                        run_id,
+                        "failed",
+                        error=error_msg,
+                        last_event="run.failed",
+                    )
+                    try:
+                        _put_event_if_active({
+                            "event": "run.failed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "error": error_msg,
+                        })
+                    except Exception:
+                        pass
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
-                self._set_run_status(
-                    run_id,
-                    "failed",
-                    error=_redact_api_error_text(exc),
-                    last_event="run.failed",
-                )
-                try:
-                    _put_event_if_active({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": _redact_api_error_text(exc),
-                    })
-                except Exception:
-                    pass
+                if not _publish_owner_completion():
+                    self._set_run_status(
+                        run_id,
+                        "failed",
+                        error=_redact_api_error_text(exc),
+                        last_event="run.failed",
+                    )
+                    try:
+                        _put_event_if_active({
+                            "event": "run.failed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "error": _redact_api_error_text(exc),
+                        })
+                    except Exception:
+                        pass
             finally:
+                # Before a worker exists, failure/cancellation is final and
+                # can safely release the exact proposal. Once the executor
+                # thread starts, its done callback owns finalization because
+                # asyncio cancellation does not stop that thread.
+                if (
+                    owner_proposal_authority is not None
+                    and owner_worker_future[0] is None
+                ):
+                    _finalize_owner_authority()
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -8522,6 +10600,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+        self._response_store.purge_run_idempotency(now - 24 * 60 * 60)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

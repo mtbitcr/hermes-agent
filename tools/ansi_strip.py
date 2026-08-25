@@ -12,6 +12,7 @@ single-byte escapes, and 8-bit C1 control characters.
 """
 
 import re
+import unicodedata
 
 _ANSI_ESCAPE_RE = re.compile(
     r"\x1b"
@@ -72,6 +73,25 @@ _UNICODE_TAG_SUB_RE = re.compile(
 
 # Fast-path check — plane-14 tag chars only.
 _HAS_UNICODE_TAG = re.compile(r"[\U000E0000-\U000E007F]")
+
+# Unicode 17.0 Default_Ignorable_Code_Point outside the tag block above.
+# These code points normally render as nothing while still splitting tokens,
+# identifiers and credential names. Keep the list pinned to the normative
+# DerivedCoreProperties.txt ranges so security boundaries do not grow an
+# incomplete private subset over time. The tag block is handled separately by
+# strip_unicode_tags(), which preserves only the three pinned RGI subdivision
+# flags.
+_DEFAULT_IGNORABLE_NON_TAG_RE = re.compile(
+    "["
+    "\u00ad\u034f\u061c"
+    "\u115f-\u1160\u17b4-\u17b5\u180b-\u180f"
+    "\u200b-\u200f\u202a-\u202e\u2060-\u206f"
+    "\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8"
+    "\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
+    "\U000e0080-\U000e0fff"
+    "]"
+)
+_HAS_DEFAULT_IGNORABLE_NON_TAG = _DEFAULT_IGNORABLE_NON_TAG_RE
 
 
 def strip_ansi(text: str) -> str:
@@ -136,3 +156,57 @@ def strip_unicode_tags(text: str) -> str:
     if not text or not _HAS_UNICODE_TAG.search(text):
         return text
     return _UNICODE_TAG_SUB_RE.sub(lambda m: m.group(1) or "", text)
+
+
+def is_contextual_zwnj(text: str, index: int) -> bool:
+    """Return whether U+200C joins two Arabic-script letters.
+
+    Persian and Urdu use ZWNJ as real orthography.  It is retained only in
+    that narrow context; between Latin letters or at a boundary it remains an
+    invisible token-splitting character and is removed.
+    """
+    if index < 0 or index >= len(text) or text[index] != "\u200c":
+        return False
+
+    def _base(step: int) -> str:
+        cursor = index + step
+        while 0 <= cursor < len(text):
+            char = text[cursor]
+            if not unicodedata.category(char).startswith("M"):
+                return char
+            cursor += step
+        return ""
+
+    left = _base(-1)
+    right = _base(1)
+    return bool(
+        left
+        and right
+        and unicodedata.category(left).startswith("L")
+        and unicodedata.category(right).startswith("L")
+        and unicodedata.bidirectional(left) == "AL"
+        and unicodedata.bidirectional(right) == "AL"
+    )
+
+
+def strip_default_ignorables(text: str) -> str:
+    """Remove Unicode default-ignorable code points except pinned tag flags.
+
+    Callers use this before matching security-sensitive visible text. It first
+    removes non-RGI tag characters, then removes every other code point in the
+    Unicode 17.0 Default_Ignorable_Code_Point property. The three pinned RGI
+    subdivision flags remain intact because they are visible emoji sequences.
+    """
+    if not text:
+        return text
+    text = strip_unicode_tags(text)
+    if not _HAS_DEFAULT_IGNORABLE_NON_TAG.search(text):
+        return text
+    return _DEFAULT_IGNORABLE_NON_TAG_RE.sub(
+        lambda match: (
+            "\u200c"
+            if match.group(0) == "\u200c" and is_contextual_zwnj(text, match.start())
+            else ""
+        ),
+        text,
+    )

@@ -10,8 +10,11 @@ Covers:
 """
 
 import asyncio
+import hashlib
+import json
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,6 +24,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    ResponseStore,
     _approval_event_choices,
     cors_middleware,
     security_headers_middleware,
@@ -73,6 +77,48 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
+
+
+def _new_owner_proposal():
+    return {
+        "schema_version": 2,
+        "kind": "proposal",
+        "mode": "new",
+        "project_name": "Workshop pilot",
+        "project_description": "A private workshop pilot.",
+        "request_title": "Prepare the workshop",
+        "summary": "Prepare the first private milestone.",
+        "project_size": "small",
+        "specification": "Create one owner-visible workshop milestone.",
+        "current_milestone": "Prepare the workshop",
+        "owner_visible_result": "A reviewed workshop plan.",
+        "impact": ["Adds one private milestone."],
+        "later_milestones": [],
+        "tasks": [{
+            "title": "Draft the workshop plan",
+            "body": "Prepare the private workshop plan.",
+            "assignee": "default",
+            "responsibility": "B03",
+            "parents": [],
+        }],
+    }
+
+
+def _new_owner_payload(idempotency_key: str, proposal: dict):
+    return {
+        "idempotency_key": idempotency_key,
+        "mode": "new",
+        "project_name": proposal["project_name"],
+        "project_description": proposal["project_description"],
+        "project_id": None,
+        "request_title": proposal["request_title"],
+        "specification": proposal["specification"],
+        "current_milestone": proposal["current_milestone"],
+        "owner_visible_result": proposal["owner_visible_result"],
+        "root_assignee": "default",
+        "tasks": proposal["tasks"],
+        "later_milestones": proposal["later_milestones"],
+    }
 
 
 def _make_slow_agent(**kwargs):
@@ -146,6 +192,253 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_start_idempotency_reuses_exact_run_and_rejects_conflict(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                headers = {"Idempotency-Key": "owner-run-123"}
+
+                first = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=headers,
+                )
+                second = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=headers,
+                )
+                conflict = await cli.post(
+                    "/v1/runs", json={"input": "different"}, headers=headers,
+                )
+
+                assert first.status == second.status == 202
+                assert (await first.json())["run_id"] == (await second.json())["run_id"]
+                assert conflict.status == 409
+                for _ in range(40):
+                    if mock_create.call_count:
+                        break
+                    await asyncio.sleep(0.05)
+                assert mock_create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_owner_proposal_run_atomically_claims_commits_and_retries_same_run(
+        self, adapter,
+    ):
+        conversation = "raphael-owner-" + "a" * 32
+        response_id = "resp_owner_proposal_run"
+        claim_id = "claim_" + "b" * 32
+        idempotency_key = "conversation-" + hashlib.sha256(
+            response_id.encode("utf-8")
+        ).hexdigest()
+        proposal = _new_owner_proposal()
+        adapter._response_store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [
+                {"role": "user", "content": "Prepare a workshop."},
+                {"role": "assistant", "content": json.dumps(proposal)},
+            ],
+        })
+        assert adapter._response_store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        payload = _new_owner_payload(idempotency_key, proposal)
+        body = {
+            "input": "Create the approved native task graph.",
+            "owner_workspace_context": {
+                "mode": "new",
+                "project_slug": None,
+                "project_name": "Workshop pilot",
+            },
+            "owner_proposal_authority": {
+                "conversation": conversation,
+                "response_id": response_id,
+                "claim_id": claim_id,
+                "operation": "owner_task_graph_commit",
+                "idempotency_key": idempotency_key,
+                "payload": payload,
+            },
+        }
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch.object(adapter, "_create_agent") as mock_create,
+            patch(
+                "hermes_cli.profiles.list_profiles",
+                return_value=[SimpleNamespace(name="default")],
+            ),
+            patch(
+                "hermes_cli.owner_workspace._confirm",
+                return_value={"approved": True, "reason": None},
+            ),
+        ):
+            class NativeToolAgent:
+                session_prompt_tokens = 0
+                session_completion_tokens = 0
+                session_total_tokens = 0
+                _hermes_api_runtime = {}
+
+                def __init__(self, tool_complete_callback):
+                    self._tool_complete_callback = tool_complete_callback
+
+                def run_conversation(self, **_kwargs):
+                    from tools.owner_workspace_tools import _handle_task_graph
+
+                    result = _handle_task_graph(payload)
+                    self._tool_complete_callback(
+                        "tool-call-1",
+                        "owner_task_graph_commit",
+                        payload,
+                        result,
+                    )
+                    return {"final_response": "model prose is not the receipt"}
+
+                def interrupt(self, _message=None):
+                    return None
+
+            mock_create.side_effect = lambda **kwargs: NativeToolAgent(
+                kwargs["tool_complete_callback"]
+            )
+
+            async with TestClient(TestServer(app)) as cli:
+                mismatched_body = json.loads(json.dumps(body))
+                mismatched_body["owner_proposal_authority"]["payload"][
+                    "request_title"
+                ] = "Different payload"
+                mismatched = await cli.post(
+                    "/v1/runs",
+                    json=mismatched_body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                assert mismatched.status == 409
+                assert adapter._response_store.owner_history_snapshot(
+                    conversation,
+                )["proposal_claimed"] is False
+                first = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                first_data = await first.json()
+                first_run_id = first_data["run_id"]
+                for _ in range(40):
+                    status_response = await cli.get(f"/v1/runs/{first_run_id}")
+                    status = await status_response.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+                retry = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                retry_data = await retry.json()
+
+        assert first.status == retry.status == 202
+        assert retry_data["run_id"] == first_run_id
+        snapshot = adapter._response_store.owner_history_snapshot(conversation)
+        assert snapshot["proposal_consumed"] is True
+        assert snapshot["proposal_claimed"] is False
+        assert status["owner_mutation_committed"] is True
+        assert json.loads(status["output"]) == {
+            "ok": True,
+            "project_slug": "workshop-pilot",
+            "task_count": 1,
+        }
+        assert mock_create.call_count == 1
+
+        from hermes_cli.owner_workspace import OwnerContext, list_committed_projects
+
+        projects = list_committed_projects(
+            OwnerContext(actor="default", profile="default", session="")
+        )
+        assert [project["slug"] for project in projects] == ["workshop-pilot"]
+
+        db_path = adapter._response_store._db_path
+        assert db_path is not None
+        adapter._response_store.close()
+        restarted_store = ResponseStore(db_path=db_path, default_profile="default")
+        try:
+            restarted_snapshot = restarted_store.owner_history_snapshot(conversation)
+            assert restarted_snapshot["proposal_consumed"] is True
+            assert restarted_snapshot["proposal_claimed"] is False
+        finally:
+            restarted_store.close()
+
+    @pytest.mark.asyncio
+    async def test_owner_proposal_run_rejects_mismatched_claim_without_allocating_run(
+        self, adapter,
+    ):
+        conversation = "raphael-owner-" + "c" * 32
+        response_id = "resp_owner_claim_mismatch"
+        real_claim = "claim_" + "d" * 32
+        proposal = _new_owner_proposal()
+        adapter._response_store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [
+                {"role": "user", "content": "Add the approved milestone."},
+                {"role": "assistant", "content": json.dumps(proposal)},
+            ],
+        })
+        assert adapter._response_store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert adapter._response_store.claim_owner_proposal(
+            "default", conversation, response_id, real_claim,
+        ) is True
+        idempotency_key = "owner-proposal-run-2"
+        payload = _new_owner_payload(idempotency_key, proposal)
+        body = {
+            "input": "Apply the approved Project change.",
+            "owner_workspace_context": {
+                "mode": "new",
+                "project_slug": None,
+                "project_name": "Workshop pilot",
+            },
+            "owner_proposal_authority": {
+                "conversation": conversation,
+                "response_id": response_id,
+                "claim_id": "claim_" + "e" * 32,
+                "operation": "owner_task_graph_commit",
+                "idempotency_key": idempotency_key,
+                "payload": payload,
+            },
+        }
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch(
+                "hermes_cli.profiles.list_profiles",
+                return_value=[SimpleNamespace(name="default")],
+            ),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+
+        assert response.status == 409
+        assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_invalid_idempotency_key(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs",
+                json={"input": "hello"},
+                headers={"Idempotency-Key": "bad key"},
+            )
+        assert response.status == 400
+        assert adapter._run_statuses == {}
 
     @pytest.mark.asyncio
     async def test_run_status_persists_exact_resolved_runtime(self, adapter):

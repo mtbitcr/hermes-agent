@@ -69,6 +69,7 @@ Security contract enforced HERE (not at the tool layer):
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import math
@@ -123,6 +124,7 @@ CREATE TABLE IF NOT EXISTS owner_workspace_receipts (
     board_slug       TEXT,
     task_id          TEXT,
     result_json      TEXT,
+    terminal_generation INTEGER NOT NULL DEFAULT 0,
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL,
     PRIMARY KEY (actor, profile, idempotency_key)
@@ -140,10 +142,38 @@ class OwnerWorkspaceError(Exception):
 
 
 @dataclass(frozen=True)
+class OwnerProposalAuthority:
+    actor: str
+    profile: str
+    session: str
+    conversation: str
+    response_id: str
+    operation: str
+    idempotency_key: str
+    payload_digest: str
+
+
+_owner_proposal_authority: contextvars.ContextVar[Optional[OwnerProposalAuthority]] = (
+    contextvars.ContextVar("owner_proposal_authority", default=None)
+)
+
+
+def set_owner_proposal_authority(
+    authority: Optional[OwnerProposalAuthority],
+) -> contextvars.Token:
+    return _owner_proposal_authority.set(authority)
+
+
+def reset_owner_proposal_authority(token: contextvars.Token) -> None:
+    _owner_proposal_authority.reset(token)
+
+
+@dataclass(frozen=True)
 class OwnerContext:
     actor: str
     profile: str
     session: str
+    authority: Optional[OwnerProposalAuthority] = None
 
 
 def resolve_owner_context() -> OwnerContext:
@@ -156,20 +186,86 @@ def resolve_owner_context() -> OwnerContext:
 
     profile = get_active_profile_name()
     session = get_current_session_key(default="")
-    return OwnerContext(actor=profile, profile=profile, session=session)
+    authority = _owner_proposal_authority.get()
+    if authority is not None and (
+        authority.actor != profile
+        or authority.profile != profile
+        or authority.session != session
+    ):
+        authority = None
+    return OwnerContext(
+        actor=profile,
+        profile=profile,
+        session=session,
+        authority=authority,
+    )
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_RECEIPTS_SCHEMA)
+    columns = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(owner_workspace_receipts)"
+        )
+    }
+    if "terminal_generation" not in columns:
+        conn.execute(
+            "ALTER TABLE owner_workspace_receipts "
+            "ADD COLUMN terminal_generation INTEGER NOT NULL DEFAULT 0"
+        )
+        # Existing terminal lifecycle receipts already represent completed
+        # authority generations. Preserve that fact across the migration;
+        # the exact ordinal is irrelevant because readers expose only the
+        # monotonic count of distinct terminal receipts.
+        conn.execute(
+            "UPDATE owner_workspace_receipts SET terminal_generation = 1 "
+            "WHERE operation = 'owner_project_lifecycle' "
+            "AND status IN ('committed', 'denied')"
+        )
+        conn.commit()
 
 
 def _now() -> int:
     return int(time.time())
 
 
+def _receipt_lease_seconds() -> int:
+    """Keep a mutation claim alive for the complete configured approval wait."""
+    try:
+        from tools.approval import _get_approval_timeout
+
+        approval_timeout = int(_get_approval_timeout())
+    except (ImportError, TypeError, ValueError):
+        approval_timeout = 300
+    return max(_LOCK_TTL_SECONDS, approval_timeout + 60)
+
+
 def _digest(payload: dict) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _require_proposal_authority(
+    ctx: OwnerContext,
+    *,
+    operation: str,
+    idempotency_key: str,
+    payload: dict,
+) -> None:
+    authority = ctx.authority
+    if (
+        authority is None
+        or authority.actor != ctx.actor
+        or authority.profile != ctx.profile
+        or authority.session != ctx.session
+        or authority.operation != operation
+        or authority.idempotency_key != idempotency_key
+        or authority.payload_digest != _digest(payload)
+    ):
+        raise OwnerWorkspaceError(
+            "proposal_authority_required",
+            "this mutation is not bound to an authenticated owner proposal run",
+        )
 
 
 def _require_str(value: Any, field: str) -> str:
@@ -185,6 +281,39 @@ def _get_receipt(conn: sqlite3.Connection, ctx: OwnerContext, key: str) -> Optio
         "WHERE actor = ? AND profile = ? AND idempotency_key = ?",
         (ctx.actor, ctx.profile, key),
     ).fetchone()
+
+
+def _terminal_replay(
+    conn: sqlite3.Connection,
+    ctx: OwnerContext,
+    key: str,
+    operation: str,
+    digest: str,
+) -> Optional[dict]:
+    """Return one exact durable terminal result before touching live state."""
+    row = _get_receipt(conn, ctx, key)
+    if row is None:
+        return None
+    if row["request_digest"] != digest or row["operation"] != operation:
+        raise OwnerWorkspaceError(
+            "idempotency_key_conflict",
+            f"idempotency_key {key!r} was already used for a different request",
+        )
+    if row["status"] not in {"committed", "denied"}:
+        return None
+    if _is_retryable_confirmation_timeout(row):
+        return None
+    try:
+        result = json.loads(row["result_json"])
+    except (TypeError, ValueError) as exc:
+        raise OwnerWorkspaceError(
+            "receipt_invalid", "the durable terminal receipt is unreadable",
+        ) from exc
+    if not isinstance(result, dict):
+        raise OwnerWorkspaceError(
+            "receipt_invalid", "the durable terminal receipt is unreadable",
+        )
+    return result
 
 
 def _is_retryable_confirmation_timeout(row: sqlite3.Row) -> bool:
@@ -233,7 +362,7 @@ def _claim_or_wait(
                 "(actor, profile, idempotency_key, operation, request_digest, status, "
                 " lock_token, lock_expires, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?)",
-                (ctx.actor, ctx.profile, key, operation, digest, token, now + _LOCK_TTL_SECONDS, now, now),
+                (ctx.actor, ctx.profile, key, operation, digest, token, now + _receipt_lease_seconds(), now, now),
             )
             return ("own", None, token)
         if row["request_digest"] != digest:
@@ -253,7 +382,7 @@ def _claim_or_wait(
                 "board_slug = NULL, task_id = NULL, result_json = NULL, updated_at = ? "
                 "WHERE actor = ? AND profile = ? AND idempotency_key = ? AND status = 'denied'",
                 (
-                    token, now + _LOCK_TTL_SECONDS, now,
+                    token, now + _receipt_lease_seconds(), now,
                     ctx.actor, ctx.profile, key,
                 ),
             )
@@ -268,7 +397,7 @@ def _claim_or_wait(
         conn.execute(
             "UPDATE owner_workspace_receipts SET lock_token = ?, lock_expires = ?, updated_at = ? "
             "WHERE actor = ? AND profile = ? AND idempotency_key = ?",
-            (token, now + _LOCK_TTL_SECONDS, now, ctx.actor, ctx.profile, key),
+            (token, now + _receipt_lease_seconds(), now, ctx.actor, ctx.profile, key),
         )
         return ("own", row, token)
 
@@ -343,11 +472,23 @@ def _finalize_receipt(
     conn: sqlite3.Connection, ctx: OwnerContext, key: str, token: str, *, status: str, result: dict,
 ) -> None:
     with write_txn(conn):
+        terminal_generation = 1 if status in {"committed", "denied"} else 0
         cur = conn.execute(
             "UPDATE owner_workspace_receipts SET status = ?, result_json = ?, "
+            "terminal_generation = CASE WHEN terminal_generation > 0 "
+            "THEN terminal_generation ELSE ? END, "
             "lock_token = NULL, lock_expires = NULL, updated_at = ? "
             "WHERE actor = ? AND profile = ? AND idempotency_key = ? AND lock_token = ?",
-            (status, json.dumps(result, ensure_ascii=False), _now(), ctx.actor, ctx.profile, key, token),
+            (
+                status,
+                json.dumps(result, ensure_ascii=False),
+                terminal_generation,
+                _now(),
+                ctx.actor,
+                ctx.profile,
+                key,
+                token,
+            ),
         )
         if cur.rowcount != 1:
             raise OwnerWorkspaceError(
@@ -372,13 +513,18 @@ def _confirm(ctx: OwnerContext, *, operation: str, digest: str, description: str
 
     if not ctx.session:
         return {"approved": False, "reason": "no_session"}
+    safe_description = _owner_display_text(
+        description,
+        limit=500,
+        strip_internal_prefix=False,
+    ) or "Apply the confirmed Project change"
     return request_exact_operation_approval(
         ctx.session,
         operation=operation,
         payload_digest=digest,
         actor=ctx.actor,
         profile=ctx.profile,
-        description=description,
+        description=safe_description,
     )
 
 
@@ -524,9 +670,15 @@ def bootstrap(
     :func:`_assert_owns_lease`), so a lease takeover can never land in the
     gap between "we validated ownership" and "we mutated".
     """
+    from agent.redact import redact_sensitive_text
+
     idempotency_key = _require_str(idempotency_key, "idempotency_key")
-    name = _require_str(name, "name")
-    description = str(description).strip() or None if description else None
+    name = _native_owner_project_name(name, "name")
+    description = _bounded_text(
+        description, "description", limit=2_000, required=False,
+    )
+    if description:
+        description = redact_sensitive_text(description, force=True)
 
     payload = {"name": name, "description": description}
     digest = _digest(payload)
@@ -567,6 +719,14 @@ def bootstrap(
                         "internal_error", "create_project did not honor the requested id",
                     )
                 project = projects_db.get_project(pconn, project_id)
+            elif (
+                project.name != name
+                or (project.description or None) != (description or None)
+            ):
+                raise OwnerWorkspaceError(
+                    "crash_recovery_failed",
+                    "the recovered Project does not match the approved canonical fields",
+                )
 
         # Never adopt by display name: board_slug comes from THIS project's
         # own persisted slug (looked up by the deterministic id above), never
@@ -655,6 +815,15 @@ def bootstrap(
                         f"task {task_id!r} has missing or foreign ownership "
                         f"(project_id={task.project_id!r}, expected {project_id!r}); "
                         "refusing to adopt ambiguous task ownership",
+                    )
+                if (
+                    task.title != name
+                    or (task.body or None) != (description or None)
+                    or task.idempotency_key != task_idempotency_key
+                ):
+                    raise OwnerWorkspaceError(
+                        "crash_recovery_failed",
+                        "the recovered initial task does not match the approved canonical fields",
                     )
                 task_revision = kanban_db.task_event_revision(kconn, task_id)
         finally:
@@ -855,6 +1024,11 @@ def _ensure_graph_project_board(
     with write_txn(pconn):
         _assert_owns_lease(pconn, ctx, idempotency_key, token)
         project = projects_db.get_project(pconn, project_id)
+        if not create and not _receipt_owns_project(pconn, ctx, project_id):
+            raise OwnerWorkspaceError(
+                "project_not_owned",
+                "the Project is not owned by this trusted owner receipt",
+            )
         if project is None:
             if not create:
                 raise OwnerWorkspaceError(
@@ -965,6 +1139,27 @@ def commit_task_graph(
     if mode not in {"new", "existing"}:
         raise OwnerWorkspaceError("invalid_argument", "mode must be 'new' or 'existing'")
 
+    operation = "owner_task_graph_commit"
+    _require_proposal_authority(
+        ctx,
+        operation=operation,
+        idempotency_key=idempotency_key,
+        payload={
+            "idempotency_key": idempotency_key,
+            "mode": mode,
+            "project_name": project_name,
+            "project_description": project_description,
+            "project_id": project_id,
+            "request_title": request_title,
+            "specification": specification,
+            "current_milestone": current_milestone,
+            "owner_visible_result": owner_visible_result,
+            "root_assignee": root_assignee,
+            "tasks": tasks,
+            "later_milestones": later_milestones,
+        },
+    )
+
     # The root task's native title, not prose: canonical before the digest.
     request_title = _native_owner_title(request_title, "request_title")
     specification = redact_sensitive_text(
@@ -1017,11 +1212,17 @@ def commit_task_graph(
         "later_milestones": normalized_later,
     }
     digest = _digest(payload)
-    operation = "owner_task_graph_commit"
 
     pconn = projects_db.connect()
     try:
         _ensure_schema(pconn)
+        if mode == "existing" and not _receipt_owns_project(
+            pconn, ctx, canonical_project_id,
+        ):
+            raise OwnerWorkspaceError(
+                "project_not_owned",
+                "the Project is not owned by this trusted owner receipt",
+            )
         state, row, token = _acquire_or_replay(
             pconn, ctx, idempotency_key, operation, digest,
         )
@@ -1036,7 +1237,7 @@ def commit_task_graph(
                 f"Create project {owner_project_name(project_name)!r} "
                 f"with {len(normalized_tasks)} tasks"
                 if mode == "new"
-                else f"Add {len(normalized_tasks)} tasks to project {canonical_project_id!r}"
+                else f"Add {len(normalized_tasks)} tasks to the current Project"
             ),
         )
         if not approval.get("approved"):
@@ -1212,7 +1413,12 @@ def _set_project_dispatch_state(
         ) from exc
 
 
-def list_committed_projects(ctx: OwnerContext) -> list[dict]:
+OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY = "lifecycle_revision"
+
+
+def list_committed_projects(
+    ctx: OwnerContext, *, lifecycle_revision: bool = False,
+) -> list[dict]:
     """Read-only projection of projects proven by committed owner receipts."""
     path = projects_db.projects_db_path()
     if not path.is_file():
@@ -1264,14 +1470,28 @@ def list_committed_projects(ctx: OwnerContext) -> list[dict]:
                 _assert_board_ownership(row["board_slug"], project_id)
             except OwnerWorkspaceError:
                 continue
-            projects.append({
+            projection = {
                 "project_id": row["id"],
                 "slug": row["slug"],
                 "name": owner_project_name(row["name"]),
                 "description": row["description"],
                 "board": row["board_slug"],
                 "archived": bool(row["archived"]),
-            })
+            }
+            if lifecycle_revision:
+                revision = conn.execute(
+                    "SELECT COUNT(*) FROM owner_workspace_receipts "
+                    "WHERE actor = ? AND profile = ? AND project_id = ? "
+                    "AND operation = 'owner_project_lifecycle' "
+                    "AND terminal_generation > 0",
+                    (ctx.actor, ctx.profile, project_id),
+                ).fetchone()[0]
+                # Opt-in keeps the legacy closed projection stable during a
+                # rolling deploy. The durable marker never disappears when a
+                # timed-out receipt is retried, so this generation cannot move
+                # backwards while another owner decision is pending.
+                projection["lifecycle_revision"] = int(revision)
+            projects.append(projection)
         return projects
     finally:
         conn.close()
@@ -1918,6 +2138,11 @@ def set_project_archived(
     pconn = projects_db.connect()
     try:
         _ensure_schema(pconn)
+        replay = _terminal_replay(
+            pconn, ctx, idempotency_key, operation, digest,
+        )
+        if replay is not None:
+            return replay
         if not _receipt_owns_project(pconn, ctx, project_id):
             raise OwnerWorkspaceError(
                 "project_not_owned",
@@ -1935,6 +2160,15 @@ def set_project_archived(
         )
         if state == "terminal":
             return json.loads(row["result_json"])
+
+        # Bind this receipt to the Project before either denial or mutation.
+        # The read-only Project projection can then expose a monotonic terminal
+        # lifecycle generation without parsing result JSON or counting an
+        # in-flight receipt that must retain its idempotent identity.
+        _update_progress(
+            pconn, ctx, idempotency_key, token,
+            project_id=project_id, board_slug=project.board_slug,
+        )
 
         approval = _confirm(
             ctx,
@@ -2049,7 +2283,8 @@ def set_project_archived(
 
 _PROJECT_STEWARD_LIMIT = 12
 _INTERNAL_TITLE_PREFIX = re.compile(
-    r"^[A-Za-z]{1,4}\d{1,4}[A-Za-z]?\s*(?:[—–:-])\s*"
+    r"^(?:(?:R(?:0[1-9]|1\d|2[0-5])|B(?:0[1-9]|1[0-2]))\s*(?:[—–:-])\s*)+",
+    re.IGNORECASE,
 )
 _OWNER_TITLE_LIMIT = 240
 _OWNER_PROJECT_NAME_LIMIT = 160
@@ -2060,20 +2295,6 @@ _OWNER_PROJECT_NAME_LIMIT = 160
 _UNTITLED_WORK_ITEM = "Untitled work item"
 _UNTITLED_PROJECT = "Untitled Project"
 
-# What an owner-visible string loses ON TOP of the shared
-# ``tools.threat_patterns.INVISIBLE_CHARS`` set, for two disjoint reasons.
-#
-# DEFAULT-IGNORABLE controls render as nothing yet still occupy a token and
-# still split a string: U+00AD SOFT HYPHEN, U+034F COMBINING GRAPHEME JOINER,
-# U+180E MONGOLIAN VOWEL SEPARATOR, and the variation selectors (U+FE00-U+FE0F
-# plus the U+E0100-U+E01EF supplement). Left in, one of them dropped inside a
-# credential or a query-parameter name walks the value straight past the
-# redactor, and a run of them eats the display bound while showing the owner
-# nothing. The plain bidi marks (U+061C, U+200E, U+200F) join them here: they
-# are ordinary prose punctuation, which is exactly why they are NOT a global
-# threat marker, but an owner-visible string is a short label rather than
-# prose, and there they only reorder what is read.
-#
 # LONE SURROGATES (U+D800-U+DFFF) are not Unicode scalar values at all. They
 # survive inside a ``str`` — ``json.loads('"\\ud800"')`` produces one from a
 # request body, and ``os.fsdecode`` produces U+DC80-U+DCFF for every byte of a
@@ -2081,30 +2302,9 @@ _UNTITLED_PROJECT = "Untitled Project"
 # ``UnicodeEncodeError``, so a name carrying one turns an owner read into a 500
 # from FastAPI's JSON encoder instead of a projected name.
 #
-# Scoped to this boundary on purpose: this is a display contract, not a threat
-# scan. None of these ranges touches U+E0000-U+E007F, so the pinned RGI
-# subdivision tag flags are unaffected.
-#
-# Written as code points rather than pasted literals: an invisible character in
-# this source would be unreviewable, and none of them is a regex metacharacter.
-_OWNER_DISPLAY_STRIP_RANGES = (
-    (0x00AD, 0x00AD),    # soft hyphen
-    (0x034F, 0x034F),    # combining grapheme joiner
-    (0x061C, 0x061C),    # arabic letter mark
-    (0x180E, 0x180E),    # mongolian vowel separator
-    (0x200E, 0x200F),    # left-to-right mark, right-to-left mark
-    (0xD800, 0xDFFF),    # lone surrogates
-    (0xFE00, 0xFE0F),    # variation selectors 1-16
-    (0xE0100, 0xE01EF),  # variation selectors supplement 17-256
-)
-_OWNER_DISPLAY_STRIP_RE = re.compile(
-    "["
-    + "".join(
-        chr(low) if low == high else f"{chr(low)}-{chr(high)}"
-        for low, high in _OWNER_DISPLAY_STRIP_RANGES
-    )
-    + "]"
-)
+# Default-ignorable code points are removed by the shared Unicode 17.0 helper
+# in tools.ansi_strip. This boundary adds only invalid lone surrogates.
+_OWNER_DISPLAY_STRIP_RE = re.compile("[\ud800-\udfff]")
 _OWNER_STATE_LABELS = {
     "triage": "Needs attention",
     "todo": "Planned",
@@ -2180,10 +2380,14 @@ def _owner_display_text(
     treats that disagreement as a rejection.
     """
     from agent.redact import redact_sensitive_text
-    from tools.ansi_strip import sanitize_display_text, strip_unicode_tags
+    from tools.ansi_strip import (
+        sanitize_display_text,
+        strip_default_ignorables,
+        strip_unicode_tags,
+    )
     from tools.threat_patterns import INVISIBLE_CHARS
 
-    text = strip_unicode_tags(sanitize_display_text(str(value or "")))
+    text = strip_default_ignorables(sanitize_display_text(str(value or "")))
     text = _OWNER_DISPLAY_STRIP_RE.sub("", text)
     text = "".join(char for char in text if char not in INVISIBLE_CHARS)
     text = redact_sensitive_text(text, force=True, redact_url_credentials=True)
@@ -2875,6 +3079,25 @@ def commit_project_plan(
     trigger = str(trigger or "").strip()
     if trigger not in _PROJECT_PLAN_TRIGGERS:
         raise OwnerWorkspaceError("invalid_argument", "trigger is invalid")
+    operation = "owner_project_plan_commit"
+    _require_proposal_authority(
+        ctx,
+        operation=operation,
+        idempotency_key=idempotency_key,
+        payload={
+            "idempotency_key": idempotency_key,
+            "project_id": project_id,
+            "anchor_task_id": anchor_task_id,
+            "trigger": trigger,
+            "request_title": request_title,
+            "summary": summary,
+            "specification": specification,
+            "current_milestone": current_milestone,
+            "owner_visible_result": owner_visible_result,
+            "later_milestones": later_milestones,
+            "changes": changes,
+        },
+    )
     request_title = redact_sensitive_text(
         _bounded_text(request_title, "request_title", limit=240), force=True,
     )
@@ -2907,11 +3130,15 @@ def commit_project_plan(
         "changes": normalized_changes,
     }
     digest = _digest(payload)
-    operation = "owner_project_plan_commit"
 
     pconn = projects_db.connect()
     try:
         _ensure_schema(pconn)
+        if not _receipt_owns_project(pconn, ctx, project_id):
+            raise OwnerWorkspaceError(
+                "project_not_owned",
+                "the Project is not owned by this trusted owner receipt",
+            )
         state, row, token = _acquire_or_replay(
             pconn, ctx, idempotency_key, operation, digest,
         )
@@ -2960,6 +3187,11 @@ def commit_project_plan(
 
             with write_txn(pconn):
                 _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                if not _receipt_owns_project(pconn, ctx, project_id):
+                    raise OwnerWorkspaceError(
+                        "project_not_owned",
+                        "the Project ownership receipt changed before commit",
+                    )
                 applied = kanban_db.apply_owner_project_plan(
                     kconn,
                     project_id=project_id,
@@ -3016,6 +3248,31 @@ def commit_project_plan(
 _UNSAFE_STATUSES = {"running"}
 
 
+def _resolve_receipt_owned_task(
+    pconn: sqlite3.Connection,
+    ctx: OwnerContext,
+    project_id: str,
+    task_id: str,
+):
+    if not _receipt_owns_project(pconn, ctx, project_id):
+        raise OwnerWorkspaceError(
+            "project_not_owned",
+            "the Project is not owned by this trusted owner receipt",
+        )
+    project, board_slug = _resolve_existing_project_board(pconn, project_id)
+    kconn = kanban_db.connect(board=board_slug)
+    try:
+        task = kanban_db.get_task(kconn, task_id)
+    finally:
+        kconn.close()
+    if task is None or task.project_id != project_id:
+        raise OwnerWorkspaceError(
+            "task_not_found",
+            "the task is not part of this receipt-owned Project",
+        )
+    return project, board_slug, task
+
+
 def move_task(
     ctx: OwnerContext,
     *,
@@ -3024,7 +3281,7 @@ def move_task(
     to_status: str,
     expected_status: str,
     expected_revision: Any,
-    board: Optional[str] = None,
+    project_id: str,
 ) -> dict:
     """Optimistic compare-and-swap task move inside the existing Kanban
     write transaction. See ``kanban_db.cas_transition_task``.
@@ -3055,6 +3312,7 @@ def move_task(
     the lease and committing the move.
     """
     idempotency_key = _require_str(idempotency_key, "idempotency_key")
+    project_id = _bounded_text(project_id, "project_id", limit=100)
     task_id = _require_str(task_id, "task_id")
     to_status = _require_str(to_status, "to_status")
     expected_status = _require_str(expected_status, "expected_status")
@@ -3073,9 +3331,8 @@ def move_task(
     except (TypeError, ValueError):
         raise OwnerWorkspaceError("invalid_argument", "expected_revision must be an integer")
 
-    board_norm = str(board).strip() if board else None
     payload = {
-        "task_id": task_id, "board": board_norm, "to_status": to_status,
+        "project_id": project_id, "task_id": task_id, "to_status": to_status,
         "expected_status": expected_status, "expected_revision": expected_revision,
     }
     digest = _digest(payload)
@@ -3084,20 +3341,31 @@ def move_task(
     pconn = projects_db.connect()
     try:
         _ensure_schema(pconn)
+        replay = _terminal_replay(
+            pconn, ctx, idempotency_key, operation, digest,
+        )
+        if replay is not None:
+            return replay
+        _project, board_slug, task = _resolve_receipt_owned_task(
+            pconn, ctx, project_id, task_id,
+        )
         state, row, token = _acquire_or_replay(pconn, ctx, idempotency_key, operation, digest)
         if state == "terminal":
             return json.loads(row["result_json"])
 
         approval = _confirm(
             ctx, operation=operation, digest=digest,
-            description=f"Move task {task_id} to {to_status!r} (from {expected_status!r})",
+            description=(
+                f"Move {owner_title(task.title)!r} to {to_status!r} "
+                f"(from {expected_status!r})"
+            ),
         )
         if not approval.get("approved"):
             result = {"ok": False, "error": "confirmation_denied", "reason": approval.get("reason")}
             _finalize_receipt(pconn, ctx, idempotency_key, token, status="denied", result=result)
             return result
 
-        kconn = kanban_db.connect(board=board_norm)
+        kconn = kanban_db.connect(board=board_slug)
         try:
             if kanban_db.get_task(kconn, task_id) is None:
                 raise OwnerWorkspaceError("task_not_found", f"no such task {task_id}")
@@ -3114,6 +3382,17 @@ def move_task(
             # fails closed before the CAS ever runs.
             with write_txn(pconn):
                 _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                if not _receipt_owns_project(pconn, ctx, project_id):
+                    raise OwnerWorkspaceError(
+                        "project_not_owned",
+                        "the Project ownership receipt changed before commit",
+                    )
+                current_task = kanban_db.get_task(kconn, task_id)
+                if current_task is None or current_task.project_id != project_id:
+                    raise OwnerWorkspaceError(
+                        "task_not_found",
+                        "the task is no longer part of this receipt-owned Project",
+                    )
 
                 snapshot = None
                 if row is not None:
@@ -3193,9 +3472,9 @@ def comment_task(
     ctx: OwnerContext,
     *,
     idempotency_key: str,
+    project_id: str,
     task_id: str,
     body: str,
-    board: Optional[str] = None,
 ) -> dict:
     """Append a comment as the trusted actor. Comment + audit event commit
     exactly once inside ``kanban_db.add_comment``'s existing transaction.
@@ -3213,24 +3492,36 @@ def comment_task(
     comment.
     """
     idempotency_key = _require_str(idempotency_key, "idempotency_key")
+    project_id = _bounded_text(project_id, "project_id", limit=100)
     task_id = _require_str(task_id, "task_id")
-    body = _require_str(body, "body")
+    from agent.redact import redact_sensitive_text
 
-    board_norm = str(board).strip() if board else None
-    payload = {"task_id": task_id, "board": board_norm, "body": body}
+    body = redact_sensitive_text(
+        _bounded_text(body, "body", limit=12_000), force=True,
+    )
+
+    payload = {"project_id": project_id, "task_id": task_id, "body": body}
     digest = _digest(payload)
     operation = "owner_task_comment"
 
     pconn = projects_db.connect()
     try:
         _ensure_schema(pconn)
+        replay = _terminal_replay(
+            pconn, ctx, idempotency_key, operation, digest,
+        )
+        if replay is not None:
+            return replay
+        _project, board_slug, task = _resolve_receipt_owned_task(
+            pconn, ctx, project_id, task_id,
+        )
         state, row, token = _acquire_or_replay(pconn, ctx, idempotency_key, operation, digest)
         if state == "terminal":
             return json.loads(row["result_json"])
 
         approval = _confirm(
             ctx, operation=operation, digest=digest,
-            description=f"Comment on task {task_id}",
+            description=f"Comment on {owner_title(task.title)!r}",
         )
         if not approval.get("approved"):
             result = {"ok": False, "error": "confirmation_denied", "reason": approval.get("reason")}
@@ -3238,7 +3529,7 @@ def comment_task(
             return result
 
         operation_key = f"{ctx.actor}:{ctx.profile}:{idempotency_key}"
-        kconn = kanban_db.connect(board=board_norm)
+        kconn = kanban_db.connect(board=board_slug)
         try:
             # Fence: the lease check and the comment insert share one held
             # pconn write lock, so a takeover cannot land between validating
@@ -3246,6 +3537,17 @@ def comment_task(
             # module docstring's "Real lease fencing" section.
             with write_txn(pconn):
                 _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                if not _receipt_owns_project(pconn, ctx, project_id):
+                    raise OwnerWorkspaceError(
+                        "project_not_owned",
+                        "the Project ownership receipt changed before commit",
+                    )
+                current_task = kanban_db.get_task(kconn, task_id)
+                if current_task is None or current_task.project_id != project_id:
+                    raise OwnerWorkspaceError(
+                        "task_not_found",
+                        "the task is no longer part of this receipt-owned Project",
+                    )
                 # Author comes ONLY from the trusted context — never from a
                 # tool-call argument (kanban_db.add_comment takes it as a
                 # plain parameter; the kernel is the only caller that may

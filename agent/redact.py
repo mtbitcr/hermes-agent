@@ -448,7 +448,7 @@ _STRICT_URL_PARAM_RE = re.compile(
 # Output-equivalence to the old pattern was fuzz-verified (20k random strings
 # plus targeted URL forms).
 _STRICT_URL_USERINFO_RE = re.compile(
-    r"(//)([^/\s?#@]+)@"
+    r"(//)([^/\s?#]+)@"
 )
 
 # HTTP access logs often use a relative request target rather than a full URL:
@@ -684,13 +684,15 @@ _CANONICAL_SENSITIVE_QUERY_PARAMS = frozenset(
 
 def _canonical_url_param_name(name: str) -> str:
     """Decode a URL parameter name for bounded, case-insensitive matching."""
+    from tools.ansi_strip import strip_default_ignorables
+
     decoded = name
     for _ in range(3):
         next_value = unquote_plus(decoded)
         if next_value == decoded:
             break
         decoded = next_value
-    return decoded.casefold().replace("-", "_")
+    return strip_default_ignorables(decoded).casefold().replace("-", "_")
 
 
 def _redact_strict_url_credentials(text: str) -> str:

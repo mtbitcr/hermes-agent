@@ -557,6 +557,18 @@ class TestStrictUrlCredentialRedaction:
         text = "/metrics?token_count=17&session_id=public"
         assert redact_sensitive_text(text, redact_url_credentials=True) == text
 
+    def test_percent_encoded_invisible_cannot_split_a_sensitive_key(self):
+        text = "/callback?to%E2%80%8Bken=opaque-value&state=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            "/callback?to%E2%80%8Bken=***&state=public"
+        )
+
+    def test_strict_userinfo_masks_through_the_last_at_sign(self):
+        text = "https://public@credential-value@example.com/repo.git"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            "https://***@example.com/repo.git"
+        )
+
 
 class TestBareTokenUserinfoRedaction:
     """Regression tests for #6396 — a bare credential in URL userinfo

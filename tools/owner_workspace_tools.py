@@ -141,11 +141,11 @@ def _handle_task_move(args: dict, **kw) -> str:
         result = _kernel.move_task(
             ctx,
             idempotency_key=args.get("idempotency_key"),
+            project_id=args.get("project_id"),
             task_id=args.get("task_id"),
             to_status=args.get("to_status"),
             expected_status=args.get("expected_status"),
             expected_revision=args.get("expected_revision"),
-            board=args.get("board"),
         )
         return _ok(result)
     except OwnerWorkspaceError as e:
@@ -163,9 +163,9 @@ def _handle_task_comment(args: dict, **kw) -> str:
         result = _kernel.comment_task(
             ctx,
             idempotency_key=args.get("idempotency_key"),
+            project_id=args.get("project_id"),
             task_id=args.get("task_id"),
             body=args.get("body"),
-            board=args.get("board"),
         )
         return _ok(result)
     except OwnerWorkspaceError as e:
@@ -591,6 +591,10 @@ registry.register(
                     "type": "string",
                     "description": "Stable client-chosen key so a retried call is safe.",
                 },
+                "project_id": {
+                    "type": "string",
+                    "description": "The receipt-owned Project containing the task.",
+                },
                 "task_id": {"type": "string", "description": "The task to move."},
                 "to_status": {
                     "type": "string",
@@ -604,12 +608,8 @@ registry.register(
                     "type": "integer",
                     "description": "The task's event revision you last observed — the CAS precondition.",
                 },
-                "board": {
-                    "type": "string",
-                    "description": "Optional board slug (defaults to the current board).",
-                },
             },
-            "required": ["idempotency_key", "task_id", "to_status", "expected_status", "expected_revision"],
+            "required": ["idempotency_key", "project_id", "task_id", "to_status", "expected_status", "expected_revision"],
         },
     },
     handler=lambda args, **kw: _handle_task_move(args, **kw),
@@ -636,14 +636,14 @@ registry.register(
                     "type": "string",
                     "description": "Stable client-chosen key so a retried call is safe.",
                 },
+                "project_id": {
+                    "type": "string",
+                    "description": "The receipt-owned Project containing the task.",
+                },
                 "task_id": {"type": "string", "description": "The task to comment on."},
                 "body": {"type": "string", "description": "Comment text."},
-                "board": {
-                    "type": "string",
-                    "description": "Optional board slug (defaults to the current board).",
-                },
             },
-            "required": ["idempotency_key", "task_id", "body"],
+            "required": ["idempotency_key", "project_id", "task_id", "body"],
         },
     },
     handler=lambda args, **kw: _handle_task_comment(args, **kw),

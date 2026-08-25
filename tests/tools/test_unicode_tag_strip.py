@@ -8,7 +8,7 @@ preserved.  Nothing else is — a black-flag base and a CANCEL TAG around an
 arbitrary payload is a smuggling frame, not a flag.
 """
 
-from tools.ansi_strip import strip_unicode_tags
+from tools.ansi_strip import strip_default_ignorables, strip_unicode_tags
 
 
 class TestStripUnicodeTags:
@@ -122,3 +122,29 @@ class TestStripUnicodeTags:
         # which is why an owner-visible title loses ZWJ and this does not.
         family = "\U0001F468\u200D\U0001F469\u200D\U0001F467"
         assert strip_unicode_tags(family) == family
+
+
+class TestStripDefaultIgnorables:
+    def test_strips_every_pinned_unicode_17_range(self):
+        ranges = (
+            (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C),
+            (0x115F, 0x1160), (0x17B4, 0x17B5), (0x180B, 0x180F),
+            (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x206F),
+            (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF),
+            (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8),
+            (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+            (0xE0080, 0xE0FFF),
+        )
+        for low, high in ranges:
+            for code_point in {low, high}:
+                assert strip_default_ignorables(
+                    f"a{chr(code_point)}b"
+                ) == "ab"
+
+    def test_keeps_only_pinned_tag_flags_from_the_tag_block(self):
+        for code in ("gbeng", "gbsct", "gbwls"):
+            flag = "\U0001F3F4" + "".join(
+                chr(0xE0000 + ord(char)) for char in code
+            ) + "\U000E007F"
+            assert strip_default_ignorables(flag) == flag
+        assert strip_default_ignorables("a\U000E0041b") == "ab"
