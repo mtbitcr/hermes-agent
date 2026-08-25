@@ -6,6 +6,7 @@ import json
 import inspect
 import multiprocessing
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -56,6 +57,67 @@ def _expire_lock(ctx, key: str) -> None:
 def test_receipt_lease_covers_the_full_approval_wait(monkeypatch):
     monkeypatch.setattr("tools.approval._get_approval_timeout", lambda: 7_200)
     assert ow._receipt_lease_seconds() == 7_260
+
+
+def test_receipt_schema_first_use_is_serialized(tmp_path):
+    db_path = tmp_path / "legacy-owner-receipts.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """CREATE TABLE owner_workspace_receipts (
+            actor TEXT NOT NULL,
+            profile TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            status TEXT NOT NULL,
+            lock_token TEXT,
+            lock_expires INTEGER,
+            project_id TEXT,
+            board_slug TEXT,
+            task_id TEXT,
+            result_json TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (actor, profile, idempotency_key)
+        )"""
+    )
+    conn.commit()
+    conn.close()
+
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def migrate():
+        worker = sqlite3.connect(db_path, timeout=3, check_same_thread=False)
+        try:
+            barrier.wait(timeout=1)
+            ow._ensure_schema(worker)
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            worker.close()
+
+    first = threading.Thread(target=migrate, daemon=True)
+    second = threading.Thread(target=migrate, daemon=True)
+    first.start()
+    second.start()
+    first.join(timeout=4)
+    second.join(timeout=4)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    check = sqlite3.connect(db_path)
+    try:
+        columns = {
+            row[1]
+            for row in check.execute(
+                "PRAGMA table_info(owner_workspace_receipts)"
+            )
+        }
+        assert {"terminal_generation", "authority_digest"} <= columns
+    finally:
+        check.close()
 
 
 @pytest.fixture

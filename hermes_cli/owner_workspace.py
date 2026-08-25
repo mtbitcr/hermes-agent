@@ -203,35 +203,34 @@ def resolve_owner_context() -> OwnerContext:
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(_RECEIPTS_SCHEMA)
-    columns = {
-        str(row[1]) for row in conn.execute(
-            "PRAGMA table_info(owner_workspace_receipts)"
-        )
-    }
-    migrated = False
-    if "terminal_generation" not in columns:
-        conn.execute(
-            "ALTER TABLE owner_workspace_receipts "
-            "ADD COLUMN terminal_generation INTEGER NOT NULL DEFAULT 0"
-        )
-        # Existing terminal lifecycle receipts already represent completed
-        # authority generations. Preserve that fact across the migration;
-        # the exact ordinal is irrelevant because readers expose only the
-        # monotonic count of distinct terminal receipts.
-        conn.execute(
-            "UPDATE owner_workspace_receipts SET terminal_generation = 1 "
-            "WHERE operation = 'owner_project_lifecycle' "
-            "AND status IN ('committed', 'denied')"
-        )
-        migrated = True
-    if "authority_digest" not in columns:
-        conn.execute(
-            "ALTER TABLE owner_workspace_receipts ADD COLUMN authority_digest TEXT"
-        )
-        migrated = True
-    if migrated:
-        conn.commit()
+    # Schema detection and ALTER must share one write fence. Otherwise two
+    # first-use callers can both observe a missing column and one loses the
+    # race with "duplicate column name".
+    with write_txn(conn):
+        conn.execute(_RECEIPTS_SCHEMA)
+        columns = {
+            str(row[1]) for row in conn.execute(
+                "PRAGMA table_info(owner_workspace_receipts)"
+            )
+        }
+        if "terminal_generation" not in columns:
+            conn.execute(
+                "ALTER TABLE owner_workspace_receipts "
+                "ADD COLUMN terminal_generation INTEGER NOT NULL DEFAULT 0"
+            )
+            # Existing terminal lifecycle receipts already represent completed
+            # authority generations. Preserve that fact across the migration;
+            # the exact ordinal is irrelevant because readers expose only the
+            # monotonic count of distinct terminal receipts.
+            conn.execute(
+                "UPDATE owner_workspace_receipts SET terminal_generation = 1 "
+                "WHERE operation = 'owner_project_lifecycle' "
+                "AND status IN ('committed', 'denied')"
+            )
+        if "authority_digest" not in columns:
+            conn.execute(
+                "ALTER TABLE owner_workspace_receipts ADD COLUMN authority_digest TEXT"
+            )
 
 
 def _now() -> int:

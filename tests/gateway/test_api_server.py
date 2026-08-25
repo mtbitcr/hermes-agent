@@ -1079,6 +1079,85 @@ class TestResponseStore:
         ]
         assert response_pk == ["profile", "response_id"]
 
+    def test_schema_upgrade_is_serialized_across_connections(
+        self, tmp_path, monkeypatch,
+    ):
+        db_path = str(tmp_path / "concurrent-legacy-response-store.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE responses (response_id TEXT PRIMARY KEY, data TEXT NOT NULL, "
+            "accessed_at REAL NOT NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        original = ResponseStore._initialize_schema_locked
+        first_inside = threading.Event()
+        second_started = threading.Event()
+        call_lock = threading.Lock()
+        call_count = 0
+
+        def delayed_first_migration(store):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                first = call_count == 1
+            if first:
+                first_inside.set()
+                assert second_started.wait(1)
+                time.sleep(0.1)
+            return original(store)
+
+        monkeypatch.setattr(
+            ResponseStore, "_initialize_schema_locked", delayed_first_migration,
+        )
+        errors = []
+
+        def open_store(*, second=False):
+            if second:
+                second_started.set()
+            try:
+                store = ResponseStore(db_path=db_path, max_size=10)
+                store.close()
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        first_thread = threading.Thread(target=open_store, daemon=True)
+        first_thread.start()
+        assert first_inside.wait(1)
+        second_thread = threading.Thread(
+            target=lambda: open_store(second=True), daemon=True,
+        )
+        second_thread.start()
+        first_thread.join(timeout=3)
+        second_thread.join(timeout=3)
+
+        assert not first_thread.is_alive()
+        assert not second_thread.is_alive()
+        assert errors == []
+        reopened = ResponseStore(db_path=db_path, max_size=10)
+        try:
+            response_pk = [
+                row[1]
+                for row in sorted(
+                    reopened._conn.execute(
+                        "PRAGMA table_info(responses)"
+                    ).fetchall(),
+                    key=lambda row: row[5],
+                )
+                if row[5]
+            ]
+            run_columns = {
+                row[1]
+                for row in reopened._conn.execute(
+                    "PRAGMA table_info(run_idempotency)"
+                )
+            }
+            assert response_pk == ["profile", "response_id"]
+            assert {"status_json", "terminal_json"} <= run_columns
+        finally:
+            reopened.close()
+
     def test_owner_history_missing_or_invalid_conversation_is_empty(self):
         store = ResponseStore(max_size=10)
         store.put("resp_invalid_history", {
@@ -2864,6 +2943,55 @@ class TestResponsesEndpoint:
             assert data["output"][0]["type"] == "message"
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
+
+    @pytest.mark.asyncio
+    async def test_idempotent_owner_response_replays_original_authority(self, adapter):
+        conversation = "raphael-owner-" + "d" * 32
+        body = {
+            "model": "hermes-agent",
+            "input": "Prepare the private milestone",
+            "conversation": conversation,
+            "store": True,
+        }
+        headers = {"Idempotency-Key": f"response-{uuid.uuid4().hex}"}
+        mock_result = {
+            "final_response": json.dumps(_owner_new_proposal()),
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+                return_value=(
+                    mock_result,
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                ),
+            ) as mock_run:
+                first = await cli.post(
+                    "/v1/responses", json=body, headers=headers,
+                )
+                assert first.status == 200
+                first_body = await first.json()
+                assert adapter._response_store.mark_owner_proposal_consumed(
+                    "default", conversation, first_body["id"],
+                ) is True
+
+                replay = await cli.post(
+                    "/v1/responses", json=body, headers=headers,
+                )
+                assert replay.status == 200
+                replay_body = await replay.json()
+
+        assert replay_body == first_body
+        assert replay_body["id"] == first_body["id"]
+        snapshot = adapter._response_store.owner_history_snapshot(conversation)
+        assert snapshot["latest_response_id"] == first_body["id"]
+        assert snapshot["proposal_consumed"] is True
+        mock_run.assert_awaited_once()
 
 
     @pytest.mark.asyncio

@@ -1418,12 +1418,49 @@ class ResponseStore:
         except Exception:
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
             self._db_path = None
+        self._conversation_lock = threading.RLock()
         # Use shared WAL-fallback helper so response_store.db degrades
         # gracefully on NFS/SMB/FUSE-mounted HERMES_HOME (same filesystem
         # issue addressed for state.db/kanban.db — see
         # hermes_state._WAL_INCOMPAT_MARKERS).
         from hermes_state import apply_wal_with_fallback
         apply_wal_with_fallback(self._conn, db_label="response_store.db")
+        self._initialize_schema()
+        # response_store.db contains conversation history (tool payloads,
+        # prompts, results). Tighten to owner-only after creation so other
+        # local users on a shared box can't read it. Run once at __init__
+        # rather than after every commit — chmod-on-every-write is wasted
+        # syscalls on a hot path.
+        self._tighten_file_permissions()
+
+    def _initialize_schema(self) -> None:
+        """Serialize transactional schema upgrades across gateway processes."""
+        lock_markers = (
+            "database is locked",
+            "database table is locked",
+            "database schema is locked",
+        )
+        for attempt in range(5):
+            try:
+                self._conn.execute("BEGIN EXCLUSIVE")
+                self._initialize_schema_locked()
+                self._conn.commit()
+                return
+            except sqlite3.OperationalError as exc:
+                self._conn.rollback()
+                if (
+                    attempt == 4
+                    or not any(marker in str(exc).lower() for marker in lock_markers)
+                ):
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+            except Exception:
+                self._conn.rollback()
+                raise
+        raise RuntimeError("response store schema migration did not complete")
+
+    def _initialize_schema_locked(self) -> None:
+        """Create and migrate every ResponseStore table under one DB fence."""
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS responses (
                 profile TEXT NOT NULL,
@@ -1478,6 +1515,8 @@ class ResponseStore:
                 fingerprint TEXT NOT NULL,
                 run_id TEXT NOT NULL,
                 created_at REAL NOT NULL,
+                status_json TEXT,
+                terminal_json TEXT,
                 PRIMARY KEY (profile, session_scope, idempotency_key)
             )"""
         )
@@ -1489,15 +1528,11 @@ class ResponseStore:
             self._conn.execute(
                 "ALTER TABLE run_idempotency ADD COLUMN terminal_json TEXT"
             )
+        if "status_json" not in run_idempotency_columns:
+            self._conn.execute(
+                "ALTER TABLE run_idempotency ADD COLUMN status_json TEXT"
+            )
         self._backfill_owner_proposals()
-        self._conn.commit()
-        self._conversation_lock = threading.RLock()
-        # response_store.db contains conversation history (tool payloads,
-        # prompts, results). Tighten to owner-only after creation so other
-        # local users on a shared box can't read it. Run once at __init__
-        # rather than after every commit — chmod-on-every-write is wasted
-        # syscalls on a hot path.
-        self._tighten_file_permissions()
 
     def _ensure_response_schema(self) -> None:
         """Migrate stored responses to an exact profile-scoped identity."""
@@ -2668,6 +2703,10 @@ class ResponseStore:
                             and row[8] == owner["payload_digest"]
                             and reserved is None
                         ):
+                            created_at = time.time()
+                            queued_json = self._queued_run_status_json(
+                                run_id, created_at,
+                            )
                             self._conn.execute(
                                 "UPDATE conversations SET owner_run_id = ?, "
                                 "claim_state = 'claimed' WHERE profile = ? AND name = ? "
@@ -2679,11 +2718,13 @@ class ResponseStore:
                                 ),
                             )
                             self._conn.execute(
-                                "UPDATE run_idempotency SET run_id = ?, created_at = ? "
+                                "UPDATE run_idempotency SET run_id = ?, created_at = ?, "
+                                "status_json = ?, terminal_json = NULL "
                                 "WHERE profile = ? AND session_scope = ? "
                                 "AND idempotency_key = ? AND fingerprint = ? AND run_id = ?",
                                 (
-                                    run_id, time.time(), profile, session_scope,
+                                    run_id, created_at, queued_json,
+                                    profile, session_scope,
                                     idempotency_key, fingerprint, existing_run_id,
                                 ),
                             )
@@ -2735,12 +2776,15 @@ class ResponseStore:
                             owner_profile, owner["conversation"], owner["response_id"],
                         ),
                     )
+                created_at = time.time()
+                queued_json = self._queued_run_status_json(run_id, created_at)
                 self._conn.execute(
                     "INSERT INTO run_idempotency (profile, session_scope, idempotency_key, "
-                    "fingerprint, run_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    "fingerprint, run_id, created_at, status_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         profile, session_scope, idempotency_key,
-                        fingerprint, run_id, time.time(),
+                        fingerprint, run_id, created_at, queued_json,
                     ),
                 )
                 self._conn.commit()
@@ -2748,6 +2792,21 @@ class ResponseStore:
             except Exception:
                 self._conn.rollback()
                 raise
+
+    @staticmethod
+    def _queued_run_status_json(run_id: str, created_at: float) -> str:
+        return json.dumps(
+            {
+                "object": "hermes.run",
+                "run_id": run_id,
+                "status": "queued",
+                "created_at": created_at,
+                "updated_at": created_at,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
 
     @_response_store_locked
     def lookup_run_idempotency(
@@ -2795,6 +2854,42 @@ class ResponseStore:
         ):
             return None
         return float(row[0])
+
+    @_response_store_locked
+    def run_idempotency_status(
+        self, profile: str, run_id: str,
+    ) -> "Dict[str, Any] | None":
+        """Read the durable queued state for an exact idempotent run."""
+        profile = self._profile(profile)
+        rows = self._conn.execute(
+            "SELECT status_json FROM run_idempotency "
+            "WHERE profile = ? AND run_id = ? AND status_json IS NOT NULL LIMIT 2",
+            (profile, run_id),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        try:
+            value = json.loads(rows[0][0])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if (
+            not isinstance(value, dict)
+            or set(value) != {
+                "object", "run_id", "status", "created_at", "updated_at",
+            }
+            or value.get("object") != "hermes.run"
+            or value.get("run_id") != run_id
+            or _OWNER_RUN_RE.fullmatch(run_id) is None
+            or value.get("status") != "queued"
+            or not all(
+                isinstance(value.get(field), (int, float))
+                and not isinstance(value.get(field), bool)
+                and math.isfinite(float(value[field]))
+                for field in ("created_at", "updated_at")
+            )
+        ):
+            return None
+        return value
 
     def persist_owner_run_completion(
         self,
@@ -2884,7 +2979,7 @@ class ResponseStore:
                         self._conn.rollback()
                         raise RuntimeError("owner proposal completion is unavailable")
                 cur = self._conn.execute(
-                    "UPDATE run_idempotency SET terminal_json = ? "
+                    "UPDATE run_idempotency SET terminal_json = ?, status_json = NULL "
                     "WHERE profile = ? AND session_scope = ? "
                     "AND idempotency_key = ? AND run_id = ?",
                     (
@@ -3354,6 +3449,14 @@ else:
     security_headers_middleware = None  # type: ignore[assignment]
 
 
+class _IdempotencyConflict(Exception):
+    """One idempotency key was reused for a different request."""
+
+
+class _OwnerConversationReservationChanged(Exception):
+    """The exact owner turn lost its durable conversation reservation."""
+
+
 class _IdempotencyCache:
     """In-memory idempotency cache with TTL and basic LRU semantics."""
     def __init__(self, max_items: int = 1000, ttl_seconds: int = 300):
@@ -3371,13 +3474,34 @@ class _IdempotencyCache:
         while len(self._store) > self._max:
             self._store.popitem(last=False)
 
+    async def get_existing(self, key: str, fingerprint: str):
+        """Replay a completed or in-flight exact request without recomputing."""
+        self._purge()
+        item = self._store.get(key)
+        if item:
+            if item["fp"] != fingerprint:
+                raise _IdempotencyConflict
+            return item["resp"]
+        inflight_key = (key, fingerprint)
+        task = self._inflight.get(inflight_key)
+        if task is not None:
+            return await asyncio.shield(task)
+        if any(stored_key == key for stored_key, _ in self._inflight):
+            raise _IdempotencyConflict
+        return None
+
     async def get_or_set(self, key: str, fingerprint: str, compute_coro):
         self._purge()
         item = self._store.get(key)
-        if item and item["fp"] == fingerprint:
+        if item:
+            if item["fp"] != fingerprint:
+                raise _IdempotencyConflict
             return item["resp"]
 
         inflight_key = (key, fingerprint)
+        if any(stored_key == key for stored_key, _ in self._inflight):
+            if inflight_key not in self._inflight:
+                raise _IdempotencyConflict
         task = self._inflight.get(inflight_key)
         if task is None:
             async def _compute_and_store():
@@ -6620,12 +6744,32 @@ class APIServerAdapter(BasePlatformAdapter):
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            if re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", idempotency_key) is None:
+                return web.json_response(
+                    _openai_error("Invalid Idempotency-Key"), status=400,
+                )
             fp = _make_request_fingerprint(
                 body,
                 keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
             )
+            cache_scope = hashlib.sha256(
+                f"{gateway_session_key or ''}\0{session_id or ''}".encode("utf-8")
+            ).hexdigest()
+            cache_key = (
+                f"chat:{_active_owner_profile()}:{cache_scope}:{idempotency_key}"
+            )
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+                result, usage = await _idem_cache.get_or_set(
+                    cache_key, fp, _compute_completion,
+                )
+            except _IdempotencyConflict:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was already used for a different request",
+                        code="idempotency_conflict",
+                    ),
+                    status=409,
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -7608,6 +7752,47 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        idempotency_key = request.headers.get("Idempotency-Key")
+        response_idempotency_fingerprint: Optional[str] = None
+        response_idempotency_cache_key: Optional[str] = None
+        if idempotency_key is not None:
+            if re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", idempotency_key) is None:
+                return web.json_response(
+                    _openai_error("Invalid Idempotency-Key"), status=400,
+                )
+            response_scope = hashlib.sha256(
+                (gateway_session_key or "").encode("utf-8")
+            ).hexdigest()
+            fingerprint_body = dict(body)
+            fingerprint_body["_session_scope"] = response_scope
+            response_idempotency_fingerprint = _make_request_fingerprint(
+                fingerprint_body, keys=sorted(fingerprint_body),
+            )
+            response_idempotency_cache_key = (
+                f"responses:{response_profile}:{response_scope}:{idempotency_key}"
+            )
+            try:
+                cached = await _idem_cache.get_existing(
+                    response_idempotency_cache_key,
+                    response_idempotency_fingerprint,
+                )
+            except _IdempotencyConflict:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was already used for a different request",
+                        code="idempotency_conflict",
+                    ),
+                    status=409,
+                )
+            if cached is not None:
+                cached_response, cached_session_id = cached
+                cached_headers = {}
+                if cached_session_id:
+                    cached_headers["X-Hermes-Session-Id"] = cached_session_id
+                if gateway_session_key:
+                    cached_headers["X-Hermes-Session-Key"] = gateway_session_key
+                return web.json_response(cached_response, headers=cached_headers)
+
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
@@ -7714,6 +7899,27 @@ class APIServerAdapter(BasePlatformAdapter):
             if not self._response_store.reserve_owner_conversation(
                 response_profile, str(conversation), response_id,
             ):
+                if (
+                    response_idempotency_cache_key is not None
+                    and response_idempotency_fingerprint is not None
+                ):
+                    try:
+                        cached = await _idem_cache.get_existing(
+                            response_idempotency_cache_key,
+                            response_idempotency_fingerprint,
+                        )
+                    except _IdempotencyConflict:
+                        cached = None
+                    if cached is not None:
+                        cached_response, cached_session_id = cached
+                        cached_headers = {}
+                        if cached_session_id:
+                            cached_headers["X-Hermes-Session-Id"] = cached_session_id
+                        if gateway_session_key:
+                            cached_headers["X-Hermes-Session-Key"] = gateway_session_key
+                        return web.json_response(
+                            cached_response, headers=cached_headers,
+                        )
                 return web.json_response(
                     _openai_error(
                         "Owner conversation is busy or closed",
@@ -7901,9 +8107,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 "instructions": instructions,
                 "session_id": session_id,
             }
-            self._response_store.put(
-                response_id, pending_store_data, profile=response_profile,
-            )
 
             async def _run_background_response() -> None:
                 in_progress = dict(queued_response)
@@ -7993,54 +8196,67 @@ class APIServerAdapter(BasePlatformAdapter):
                     }, profile=response_profile)
                     _release_owner_conversation_reservation()
 
-            task = asyncio.create_task(_run_background_response())
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-            if conversation_reservation_id is not None:
-                task.add_done_callback(
-                    lambda _task: _release_owner_conversation_reservation()
+            async def _start_background_response():
+                self._response_store.put(
+                    response_id, pending_store_data, profile=response_profile,
                 )
-            await asyncio.sleep(0)
-            return web.json_response(queued_response)
+                task = asyncio.create_task(_run_background_response())
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                if conversation_reservation_id is not None:
+                    task.add_done_callback(
+                        lambda _task: _release_owner_conversation_reservation()
+                    )
+                await asyncio.sleep(0)
+                return queued_response, session_id
 
-        idempotency_key = request.headers.get("Idempotency-Key")
-        if idempotency_key:
-            fp = _make_request_fingerprint(
-                body,
-                keys=[
-                    "input",
-                    "instructions",
-                    "previous_response_id",
-                    "conversation",
-                    "model",
-                    "provider",
-                    "model_options",
-                    "tools",
-                ],
-            )
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
-            except Exception as e:
-                logger.error("Error running agent for responses: %s", e, exc_info=True)
+                if (
+                    response_idempotency_cache_key is not None
+                    and response_idempotency_fingerprint is not None
+                ):
+                    cached_response, cached_session_id = await _idem_cache.get_or_set(
+                        response_idempotency_cache_key,
+                        response_idempotency_fingerprint,
+                        _start_background_response,
+                    )
+                else:
+                    cached_response, cached_session_id = (
+                        await _start_background_response()
+                    )
+            except _IdempotencyConflict:
                 _release_owner_conversation_reservation()
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
+                    _openai_error(
+                        "Idempotency-Key was already used for a different request",
+                        code="idempotency_conflict",
+                    ),
+                    status=409,
                 )
-        else:
-            try:
-                result, usage = await _compute_response()
-            except Exception as e:
-                logger.error("Error running agent for responses: %s", e, exc_info=True)
+            except Exception as exc:
                 _release_owner_conversation_reservation()
+                logger.error(
+                    "Error starting background response: %s",
+                    _redact_api_error_text(exc),
+                    exc_info=True,
+                )
                 return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    _openai_error("Internal server error", err_type="server_error"),
                     status=500,
                 )
+            if cached_response.get("id") != response_id:
+                _release_owner_conversation_reservation()
+            response_headers = {}
+            if cached_session_id:
+                response_headers["X-Hermes-Session-Id"] = cached_session_id
+            if gateway_session_key:
+                response_headers["X-Hermes-Session-Key"] = gateway_session_key
+            return web.json_response(cached_response, headers=response_headers)
 
-        created_at = int(time.time())
-        try:
-            response_data, full_history, _effective_session_id = (
+        async def _compute_finalized_response():
+            result, usage = await _compute_response()
+            created_at = int(time.time())
+            response_data, full_history, effective_session_id = (
                 self._finalize_response_result(
                     response_id=response_id,
                     created_at=created_at,
@@ -8053,45 +8269,68 @@ class APIServerAdapter(BasePlatformAdapter):
                     background=False,
                 )
             )
-        except Exception as exc:
+            if store:
+                self._response_store.put(response_id, {
+                    "response": response_data,
+                    "conversation_history": full_history,
+                    "instructions": instructions,
+                    "session_id": effective_session_id,
+                }, profile=response_profile)
+                if conversation and not self._response_store.set_conversation(
+                    conversation,
+                    response_id,
+                    owner_proposal=_owner_history_has_actionable_final_proposal(
+                        full_history
+                    ),
+                    profile=response_profile,
+                    reservation_id=conversation_reservation_id,
+                ):
+                    raise _OwnerConversationReservationChanged
+            return response_data, effective_session_id
+
+        try:
+            if (
+                response_idempotency_cache_key is not None
+                and response_idempotency_fingerprint is not None
+            ):
+                response_data, _effective_session_id = await _idem_cache.get_or_set(
+                    response_idempotency_cache_key,
+                    response_idempotency_fingerprint,
+                    _compute_finalized_response,
+                )
+            else:
+                response_data, _effective_session_id = (
+                    await _compute_finalized_response()
+                )
+        except _IdempotencyConflict:
             _release_owner_conversation_reservation()
+            return web.json_response(
+                _openai_error(
+                    "Idempotency-Key was already used for a different request",
+                    code="idempotency_conflict",
+                ),
+                status=409,
+            )
+        except _OwnerConversationReservationChanged:
+            _release_owner_conversation_reservation()
+            return web.json_response(
+                _openai_error(
+                    "Owner conversation changed before this response completed",
+                    code="owner_conversation_locked",
+                ),
+                status=409,
+            )
+        except Exception as exc:
             logger.error(
-                "Error finalizing response: %s",
+                "Error running agent for responses: %s",
                 _redact_api_error_text(exc),
                 exc_info=True,
             )
+            _release_owner_conversation_reservation()
             return web.json_response(
                 _openai_error("Internal server error", err_type="server_error"),
                 status=500,
             )
-
-        # Store the complete response object for future chaining / GET retrieval
-        if store:
-            self._response_store.put(response_id, {
-                "response": response_data,
-                "conversation_history": full_history,
-                "instructions": instructions,
-                "session_id": _effective_session_id,
-            }, profile=response_profile)
-            # Update conversation mapping so the next request with the same
-            # conversation name automatically chains to this response
-            if conversation and not self._response_store.set_conversation(
-                conversation,
-                response_id,
-                owner_proposal=_owner_history_has_actionable_final_proposal(
-                    full_history
-                ),
-                profile=response_profile,
-                reservation_id=conversation_reservation_id,
-            ):
-                _release_owner_conversation_reservation()
-                return web.json_response(
-                    _openai_error(
-                        "Owner conversation changed before this response completed",
-                        code="owner_conversation_locked",
-                    ),
-                    status=409,
-                )
 
         response_headers = {"X-Hermes-Session-Id": _effective_session_id}
         if gateway_session_key:
@@ -10153,7 +10392,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         request_owner_profile, retry_run_id,
                     )
                     if retry_run_id is not None else None
-                ) or self._run_statuses.get(retry_run_id or "") or {}
+                ) or self._run_statuses.get(retry_run_id or "") or (
+                    self._response_store.run_idempotency_status(
+                        request_owner_profile, retry_run_id,
+                    )
+                    if retry_run_id is not None else None
+                ) or {}
                 if (
                     retry_state == "existing"
                     and retry_run_id is not None
@@ -10233,7 +10477,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         request_owner_profile, retry_run_id,
                     )
                     if retry_run_id is not None else None
-                ) or self._run_statuses.get(retry_run_id or "") or {}
+                ) or self._run_statuses.get(retry_run_id or "") or (
+                    self._response_store.run_idempotency_status(
+                        request_owner_profile, retry_run_id,
+                    )
+                    if retry_run_id is not None else None
+                ) or {}
                 if (
                     retry_state == "existing"
                     and retry_run_id is not None
@@ -10399,6 +10648,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         request_owner_profile, existing_run_id,
                     )
                     if existing_run_id is not None else None
+                ) or (
+                    self._response_store.run_idempotency_status(
+                        request_owner_profile, existing_run_id,
+                    )
+                    if existing_run_id is not None else None
                 )
                 released_owner_retry = (
                     owner_proposal_authority is not None
@@ -10491,12 +10745,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=409,
                 )
             if reserve_state == "existing":
+                response_headers = (
+                    {"X-Hermes-Session-Key": gateway_session_key}
+                    if gateway_session_key else {}
+                )
                 return web.json_response(
-                    _openai_error(
-                        "Idempotent run result is owned by another process",
-                        code="idempotency_expired",
-                    ),
-                    status=409,
+                    {"run_id": reserved_run_id, "status": "started"},
+                    status=202,
+                    headers=response_headers,
                 )
         elif owner_proposal_authority is not None:
             authority_bound = self._response_store.claim_and_attach_owner_run(
@@ -11129,7 +11385,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # stale running/failed cache entry still exists for the same run.
         status = self._response_store.owner_run_completion(
             _active_owner_profile(), run_id,
-        ) or self._run_statuses.get(run_id)
+        ) or self._run_statuses.get(run_id) or (
+            self._response_store.run_idempotency_status(
+                _active_owner_profile(), run_id,
+            )
+        )
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),

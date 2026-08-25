@@ -26,6 +26,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
     _approval_event_choices,
+    _make_request_fingerprint,
     cors_middleware,
     security_headers_middleware,
 )
@@ -224,6 +225,56 @@ class TestStartRun:
                         break
                     await asyncio.sleep(0.05)
                 assert mock_create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_reservation_race_replays_winning_run_and_durable_queue(
+        self, adapter,
+    ):
+        body = {"input": "hello"}
+        idempotency_key = "reservation-race"
+        session_scope = hashlib.sha256(b"").hexdigest()
+        fingerprint_body = {**body, "_session_scope": session_scope}
+        fingerprint = _make_request_fingerprint(
+            fingerprint_body, keys=sorted(fingerprint_body),
+        )
+        winning_run_id = "run_" + "a" * 32
+        assert adapter._response_store.reserve_run_idempotency(
+            "default",
+            session_scope,
+            idempotency_key,
+            fingerprint,
+            winning_run_id,
+        ) == ("new", winning_run_id)
+
+        app = _create_runs_app(adapter)
+        with (
+            patch.object(
+                adapter._response_store,
+                "lookup_run_idempotency",
+                return_value=("missing", None),
+            ),
+            patch.object(adapter, "_create_agent") as mock_create,
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                response_body = await response.json()
+                status_response = await cli.get(
+                    f"/v1/runs/{winning_run_id}",
+                )
+                status_body = await status_response.json()
+
+        assert response.status == 202
+        assert response_body == {
+            "run_id": winning_run_id,
+            "status": "started",
+        }
+        assert status_response.status == 200
+        assert status_body["status"] == "queued"
+        mock_create.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_owner_proposal_run_atomically_claims_commits_and_retries_same_run(
