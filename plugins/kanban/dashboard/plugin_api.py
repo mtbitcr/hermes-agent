@@ -3609,6 +3609,10 @@ def _workspace_boards_response() -> Optional[dict]:
     if snapshot is None:
         return None
     _, meta = snapshot
+    # Same unconditional projection as the project name above: this builder
+    # only ever serves the machine-authenticated owner reader, and a board's
+    # display name is stored text like any other.
+    board_name = owner_workspace.owner_project_name(meta["name"])
     counts = {name: 0 for name in (*BOARD_COLUMNS, "archived")}
     conn = _workspace_ro_conn()
     if conn is not None:
@@ -3625,7 +3629,7 @@ def _workspace_boards_response() -> Optional[dict]:
         "boards": [
             {
                 "slug": meta["slug"],
-                "name": meta["name"],
+                "name": board_name,
                 "project_id": meta.get("project_id"),
                 "counts": counts,
                 "total": sum(counts[name] for name in BOARD_COLUMNS),

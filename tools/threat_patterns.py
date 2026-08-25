@@ -137,10 +137,10 @@ _PATTERNS: List[Tuple[str, str, str]] = [
 # Invisible / bidirectional unicode characters used in injection attacks.
 # Originally aligned with skills_guard.py INVISIBLE_CHARS — directional
 # isolates (U+2066-U+2069) and invisible math operators (U+2062-U+2064) are
-# real attack tools.  The bidi marks (U+061C, U+200E, U+200F), the remaining
-# invisible math operator (U+2061) and the deprecated format characters
-# (U+206A-U+206F) close the gaps in that original set: every one of them is
-# invisible, and every one can reorder or disguise what a reader is shown.
+# real attack tools.  The remaining invisible math operator (U+2061) and the
+# deprecated format characters (U+206A-U+206F) close the gaps in that original
+# set: every one of them is invisible, and every one can reorder or disguise
+# what a reader is shown.
 #
 # The interlinear annotation controls (U+FFF9-U+FFFB) and the object
 # replacement character (U+FFFC) close the last gap: each renders as nothing
@@ -148,21 +148,25 @@ _PATTERNS: List[Tuple[str, str, str]] = [
 # particular lets a payload sit between an ANCHOR and a TERMINATOR where a
 # reader sees only the annotated base text.
 #
-# This set is also the canonical DISPLAY-hardening list, not just a scanner
-# input: ``hermes_cli.owner_workspace.owner_title`` filters every character in
-# it out of an owner-visible title, which deliberately includes U+200D ZWJ.
-# That does not contradict ``tools.ansi_strip.strip_unicode_tags`` leaving ZWJ
-# untouched — that function's scope is plane-14 tag characters, where ZWJ has
-# no part.  At the owner boundary a title is a short label, never an emoji
-# composition surface, so joining an unrelated glyph pair into one rendered
-# image is exactly the display control that boundary has to remove.
+# The plain bidi MARKS — U+061C ARABIC LETTER MARK, U+200E LRM, U+200F RLM —
+# are deliberately NOT in this set.  They carry no override state and cannot
+# nest; they are ordinary punctuation-disambiguation characters that correctly
+# written Arabic and Hebrew prose contains, so scanning for them as an
+# unconditional injection marker blocks legitimate multilingual content
+# wherever this scanner runs on real text (memory entries, AGENTS.md, skills).
+# The characters that actually reorder what a reader sees — the embeddings and
+# overrides U+202A-U+202E and the isolates U+2066-U+2069 — stay listed and
+# stay blocked.
+#
+# A DISPLAY boundary asks a narrower question than a threat scan and answers it
+# for itself: ``hermes_cli.owner_workspace`` strips a superset of this set —
+# the bidi marks included — from owner-visible text, because there a string is
+# a short label rather than prose.  That superset lives at the owner egress,
+# not here.
 INVISIBLE_CHARS = frozenset({
-    '\u061c',  # arabic letter mark
     '\u200b',  # zero-width space
     '\u200c',  # zero-width non-joiner
     '\u200d',  # zero-width joiner
-    '\u200e',  # left-to-right mark
-    '\u200f',  # right-to-left mark
     '\u2060',  # word joiner
     '\u2061',  # function application
     '\u2062',  # invisible times

@@ -378,7 +378,7 @@ def test_native_project_response_projects_an_unsafe_project_name(workspace_surfa
         "projects": [{
             "id": s["project_id"],
             "slug": PROJECT,
-            "name": "Raphael Workspace https://deploy:***@git.example.com/repo.git",
+            "name": "Raphael Workspace https://***@git.example.com/repo.git",
         }]
     }
     name = project.json()["projects"][0]["name"]
@@ -389,6 +389,39 @@ def test_native_project_response_projects_an_unsafe_project_name(workspace_surfa
         "hunter2verylongpassword", "\x00", "\x1b", zero_width, annotation_anchor,
     ):
         assert forbidden not in name
+
+
+def test_native_boards_response_projects_an_unsafe_board_name(workspace_surface):
+    """The board's display name is stored text and gets the same projection.
+
+    ``/boards`` served this builder's ``meta["name"]`` straight off the board
+    metadata file, which ordinary board creation and rename write — so an
+    escape sequence, an invisible reordering character or a URL credential in
+    a board name reached the owner reader verbatim.
+    """
+    s = workspace_surface
+    zero_width, right_to_left_mark = chr(0x200B), chr(0x200F)
+    unsafe = (
+        f"Rap{zero_width}hael\x00 \x1b[31mBoard{right_to_left_mark}"
+        " https://deploy:hunter2verylongpassword@git.example.com/repo.git"
+    )
+    kb.write_board_metadata(BOARD, name=unsafe)
+
+    boards = _get(s, "/api/plugins/kanban/boards")
+
+    assert boards.status_code == 200
+    board_item = boards.json()["boards"][0]
+    assert board_item["slug"] == BOARD
+    assert (
+        board_item["name"]
+        == "Raphael Board https://***@git.example.com/repo.git"
+    )
+    assert board_item["name"] == ow.owner_project_name(unsafe)
+    for forbidden in (
+        "hunter2verylongpassword", "\x00", "\x1b",
+        zero_width, right_to_left_mark,
+    ):
+        assert forbidden not in board_item["name"]
 
 
 def test_owner_title_capability_projects_board_and_worker_titles(workspace_surface):

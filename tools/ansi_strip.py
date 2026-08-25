@@ -127,7 +127,8 @@ def strip_unicode_tags(text: str) -> str:
     characters are deliberately left untouched here, because they carry
     meaning inside legitimate emoji and RTL text.  A caller that needs full
     display hardening filters ``tools.threat_patterns.INVISIBLE_CHARS`` on
-    top of this — see ``hermes_cli.owner_workspace.owner_title``.
+    top of this, plus whatever its own boundary removes — see
+    ``hermes_cli.owner_workspace._owner_display_text``.
 
     Returns the input unchanged (fast path) when no plane-14 tag characters
     are present.  Ported from block/goose#10746.

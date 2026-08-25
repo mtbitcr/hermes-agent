@@ -500,7 +500,15 @@ class TestStrictUrlCredentialRedaction:
             (
                 "//user:NET_SECRET@x.test/path",
                 "NET_SECRET",
-                "//user:***@x.test/path",
+                "//***@x.test/path",
+            ),
+            # The credential is routinely the USERNAME: git's
+            # ``<token>:x-oauth-basic@`` form masks nothing if only the
+            # password side is replaced.
+            (
+                "https://TOKEN_AS_USERNAME:x-oauth-basic@github.test/o/r.git",
+                "TOKEN_AS_USERNAME",
+                "https://***@github.test/o/r.git",
             ),
             # A hyphenated vendor name has to match its own canonical
             # (``-`` folded to ``_``) spelling, or a pre-signed URL's
@@ -509,6 +517,29 @@ class TestStrictUrlCredentialRedaction:
                 "https://b.s3.x.test/o?X-Amz-Expires=900&X-Amz-Signature=PRESIGN_SECRET",
                 "PRESIGN_SECRET",
                 "https://b.s3.x.test/o?X-Amz-Expires=900&X-Amz-Signature=***",
+            ),
+            # The other signed-URL families carry bearer authority in a
+            # query parameter too: the AWS SigV4 session token, the GCS V4
+            # signature, and the Azure SAS ``sig``.
+            (
+                "https://b.s3.x.test/o?X-Amz-Security-Token=STS_SESSION&X-Amz-Expires=900",
+                "STS_SESSION",
+                "https://b.s3.x.test/o?X-Amz-Security-Token=***&X-Amz-Expires=900",
+            ),
+            (
+                "https://s.x.test/o?X-Goog-Expires=900&X-Goog-Signature=GOOG_PRESIGN",
+                "GOOG_PRESIGN",
+                "https://s.x.test/o?X-Goog-Expires=900&X-Goog-Signature=***",
+            ),
+            (
+                "https://a.blob.x.test/c/o?sp=r&sr=b&sig=AZURE_SAS",
+                "AZURE_SAS",
+                "https://a.blob.x.test/c/o?sp=r&sr=b&sig=***",
+            ),
+            (
+                "https://b.s3.x.test/o?X%2DAmz%2DSecurity%2DToken=ENC_STS&sr=b",
+                "ENC_STS",
+                "https://b.s3.x.test/o?X%2DAmz%2DSecurity%2DToken=***&sr=b",
             ),
         ],
     )

@@ -469,9 +469,19 @@ def test_owner_title_masks_url_credentials_at_a_non_navigation_egress():
         == "Upload https://bucket.s3.example.com/report.pdf"
         "?X-Amz-Expires=900&X-Amz-Signature=***"
     )
+    # The whole userinfo is masked, username included: the credential is
+    # routinely the USERNAME in these forms, so keeping it would publish the
+    # token and mask only the constant marker beside it.
     assert (
         ow.owner_title("Mirror https://deploy:hunter2verylongpassword@git.example.com/repo.git")
-        == "Mirror https://deploy:***@git.example.com/repo.git"
+        == "Mirror https://***@git.example.com/repo.git"
+    )
+    assert (
+        ow.owner_title(
+            "Clone https://opaque-placeholder-value:x-oauth-basic"
+            "@github.com/example/repo.git"
+        )
+        == "Clone https://***@github.com/example/repo.git"
     )
     # A public parameter that merely resembles a credential name is not a
     # credential and must survive intact.
@@ -479,6 +489,52 @@ def test_owner_title_masks_url_credentials_at_a_non_navigation_egress():
         ow.owner_title("Open https://api.example.com/jobs?token_count=17&session_id=public")
         == "Open https://api.example.com/jobs?token_count=17&session_id=public"
     )
+
+
+def test_owner_title_masks_the_common_signed_url_credential_keys():
+    """A pre-signed URL's own credential keys are masked at this boundary.
+
+    Ordinary display redaction leaves a pre-signed URL clickable on purpose.
+    A title is never followed, so the three signed-URL families that carry
+    bearer authority in a query parameter — the AWS SigV4 session token, the
+    GCS V4 signature and the Azure SAS ``sig`` — are masked here, in their
+    canonical and percent-encoded spellings alike. The public parameters that
+    make the URL readable (expiry, algorithm, resource) are left alone.
+    """
+    assert (
+        ow.owner_title(
+            "Fetch https://bucket.s3.example.com/report.pdf"
+            "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+            "&X-Amz-Security-Token=placeholder-session-value"
+        )
+        == "Fetch https://bucket.s3.example.com/report.pdf"
+        "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Security-Token=***"
+    )
+    assert (
+        ow.owner_title(
+            "Fetch https://storage.example.com/o/report.pdf"
+            "?X-Goog-Expires=900&X-Goog-Signature=deadbeefdeadbeefdeadbeef"
+        )
+        == "Fetch https://storage.example.com/o/report.pdf"
+        "?X-Goog-Expires=900&X-Goog-Signature=***"
+    )
+    assert (
+        ow.owner_title(
+            "Fetch https://acct.blob.example.com/c/report.pdf"
+            "?sp=r&sr=b&sig=placeholder-sas-value"
+        )
+        == "Fetch https://acct.blob.example.com/c/report.pdf?sp=r&sr=b&sig=***"
+    )
+    # The canonical form decodes the key, folds its case, and folds ``-`` to
+    # ``_``, so an encoded or reshaped spelling of the same key matches too —
+    # and the ORIGINAL spelling is what the owner still reads.
+    for key in ("x_amz_security_token", "X%2DAmz%2DSecurity%2DToken", "SIG"):
+        assert (
+            ow.owner_title(
+                f"Fetch https://acct.example.com/o?{key}=placeholder-value&sr=b"
+            )
+            == f"Fetch https://acct.example.com/o?{key}=***&sr=b"
+        )
 
 
 def test_owner_title_removes_unsafe_control_and_display_characters():
@@ -519,24 +575,26 @@ def test_owner_title_removes_unsafe_control_and_display_characters():
 
 
 def test_owner_title_removes_bidi_marks_and_deprecated_directional_controls():
-    """Every code point in INVISIBLE_CHARS has to be gone from a title.
+    """A title loses more than the shared threat set covers.
 
-    The bidi marks (U+061C arabic letter mark, U+200E LRM, U+200F RLM) and
-    the deprecated directional controls (U+206A-U+206F) render as nothing
-    while still reordering or reshaping what the owner reads, and U+2061
-    function application is invisible outright. They are removed on the same
-    pass as the zero-width characters — before redaction, so none of them can
-    split a credential past the redactor.
+    The deprecated directional controls (U+206A-U+206F) and U+2061 function
+    application are invisible outright, so they are threats anywhere and live
+    in ``INVISIBLE_CHARS``. The plain bidi marks — U+061C arabic letter mark,
+    U+200E LRM, U+200F RLM — deliberately do NOT: correctly written Arabic and
+    Hebrew prose contains them, so treating them as unconditional injection
+    markers blocked legitimate multilingual memory and AGENTS content. A title
+    is a short label rather than prose, so this boundary removes them from its
+    own owner-scoped set instead.
+
+    Either way they go before redaction, so none of them can split a
+    credential past the redactor.
 
     Code points are written as ``chr(...)`` rather than pasted: a literal
     invisible character in this file would be unreviewable.
     """
     from tools.threat_patterns import INVISIBLE_CHARS
 
-    marks = (
-        chr(0x061C),  # arabic letter mark
-        chr(0x200E),  # left-to-right mark
-        chr(0x200F),  # right-to-left mark
+    shared_controls = (
         chr(0x2061),  # function application
         chr(0x206A),  # inhibit symmetric swapping
         chr(0x206B),  # activate symmetric swapping
@@ -545,10 +603,20 @@ def test_owner_title_removes_bidi_marks_and_deprecated_directional_controls():
         chr(0x206E),  # national digit shapes
         chr(0x206F),  # nominal digit shapes
     )
-    for mark in marks:
+    owner_only_marks = (
+        chr(0x061C),  # arabic letter mark
+        chr(0x200E),  # left-to-right mark
+        chr(0x200F),  # right-to-left mark
+    )
+    for mark in shared_controls:
         assert mark in INVISIBLE_CHARS
+    for mark in owner_only_marks:
+        assert mark not in INVISIBLE_CHARS
+
+    for mark in (*shared_controls, *owner_only_marks):
         assert ow.owner_title(f"Sh{mark}ip the {mark}thing") == "Ship the thing"
         assert ow.owner_title(mark * 3) == "Untitled work item"
+        assert ow.owner_project_name(f"Shoe{mark} Shop{mark}") == "Shoe Shop"
 
     # Removal runs BEFORE redaction, so a credential split across one of
     # these is still redacted rather than projected in full.
@@ -558,6 +626,76 @@ def test_owner_title_removes_bidi_marks_and_deprecated_directional_controls():
         )
         == "Rotate ghp_AB...6789 before Friday"
     )
+
+
+def test_owner_projections_remove_default_ignorables_and_lone_surrogates():
+    """Invisible-but-not-INVISIBLE_CHARS code points and invalid scalars.
+
+    Three separate failures share one cause — a character the owner cannot
+    see surviving into the projected string:
+
+    * a credential or a query-parameter NAME split across one of them walks
+      past the redactor, because neither the vendor prefix regexes nor the
+      strict URL parameter pattern spans a foreign code point;
+    * a run of them spends the display bound while showing nothing, so the
+      visible text is silently truncated;
+    * a lone surrogate is not a Unicode scalar value at all — it survives in
+      a ``str`` but raises ``UnicodeEncodeError`` on the way out, turning an
+      owner read into a 500 from FastAPI's JSON encoder.
+
+    Code points are written as ``chr(...)`` rather than pasted: a literal
+    invisible character in this file would be unreviewable.
+    """
+    ignorables = (
+        chr(0x00AD),   # soft hyphen
+        chr(0x034F),   # combining grapheme joiner
+        chr(0x180E),   # mongolian vowel separator
+        chr(0xFE00),   # variation selector-1
+        chr(0xFE0F),   # variation selector-16
+        chr(0xE0100),  # variation selector-17 (supplement)
+        chr(0xE01EF),  # variation selector-256 (supplement)
+        chr(0xD800),   # lone high surrogate
+        chr(0xDC00),   # lone low surrogate
+        chr(0xDFFF),   # lone low surrogate (top of range)
+    )
+    for char in ignorables:
+        assert ow.owner_title(f"Sh{char}ip the {char}thing") == "Ship the thing"
+        assert ow.owner_title(char * 3) == "Untitled work item"
+        assert ow.owner_project_name(f"Shoe{char} Shop{char}") == "Shoe Shop"
+        assert ow.owner_project_name(char * 3) == "Untitled Project"
+
+        # A credential split across one of them is still a credential.
+        assert (
+            ow.owner_title(
+                f"Rotate ghp_ABCDEF{char}GHIJKLMNOPQRSTUVWXYZ0123456789 now"
+            )
+            == "Rotate ghp_AB...6789 now"
+        )
+        # So is a query-parameter NAME split across one of them: the strict
+        # URL pattern's key class stops at the foreign code point, so without
+        # this removal the whole parameter goes unrecognised and the token is
+        # projected verbatim.
+        assert (
+            ow.owner_title(
+                f"Retry https://api.example.com/v1/sync?to{char}ken=OPAQUESECRET123&page=2"
+            )
+            == "Retry https://api.example.com/v1/sync?token=***&page=2"
+        )
+        # Invisible padding cannot eat the bound.
+        assert ow.owner_title(f"a{char}" * 300) == "a" * 240
+        assert ow.owner_project_name(f"a{char}" * 300) == "a" * 160
+
+    # Every projection is UTF-8 encodable, which is what FastAPI's JSON
+    # encoder needs and what a lone surrogate would otherwise break.
+    surrogate_title = ow.owner_title(f"Ship{chr(0xD800)} the thing")
+    assert surrogate_title == "Ship the thing"
+    assert json.dumps(
+        {"title": surrogate_title}, ensure_ascii=False
+    ).encode("utf-8")
+
+    # Emoji presentation is a variation selector, so it goes with them; the
+    # base glyph the owner actually sees stays.
+    assert ow.owner_title(f"Ship ✈{chr(0xFE0F)}") == "Ship ✈"
 
 
 def test_owner_title_removes_zwj_so_a_zwj_title_is_never_canonical():
@@ -755,7 +893,7 @@ def test_owner_project_name_is_the_canonical_project_display_projection():
         ow.owner_project_name(
             "Shop https://deploy:hunter2verylongpassword@git.example.com/repo.git"
         )
-        == "Shop https://deploy:***@git.example.com/repo.git"
+        == "Shop https://***@git.example.com/repo.git"
     )
     assert (
         ow.owner_project_name(
@@ -796,6 +934,72 @@ def test_owner_project_name_bounds_at_160_unicode_code_points():
     assert ow.owner_project_name(f"a{zero_width}" * 200) == "a" * 160
     # A work-item title keeps its own, wider bound.
     assert ow.owner_title("a" * 200) == "a" * 200
+
+
+@pytest.mark.parametrize(
+    ("projector", "limit"),
+    [
+        (ow.owner_title, 240),
+        (ow.owner_project_name, 160),
+    ],
+)
+def test_owner_projection_is_idempotent_at_its_bound(projector, limit):
+    """``projector(projector(x)) == projector(x)`` — the bound included.
+
+    These projections ARE the canonical owner text: every surface that shows
+    a name or title projects it, and the Workspace compares what it receives
+    against its own projection of the same value. Anything that changes on a
+    second pass therefore reads as a mismatch and is rejected.
+
+    The bound is where that used to break. It is a raw code point slice, so it
+    can cut mid-word and strand the whitespace in front of the cut at the end
+    of the string — which the second pass's whitespace collapse would then
+    remove. It can also cut a preserved RGI tag flag, which the trailing
+    ``strip_unicode_tags`` reduces to its visible base. Both tails have to
+    settle in one pass.
+    """
+    def _tag_flag(code: str) -> str:
+        return (
+            "\U0001F3F4"
+            + "".join(chr(0xE0000 + ord(c)) for c in code)
+            + chr(0xE007F)
+        )
+
+    vectors = [
+        # Nothing to do.
+        "Shoe Shop",
+        "Café naïve 日本語 \U0001F680",
+        # The empty-input fallbacks are themselves projections.
+        "",
+        "   ",
+        # Cut exactly at, one before, and one after the bound.
+        "a" * (limit - 1),
+        "a" * limit,
+        "a" * (limit + 1),
+        # The cut lands on a space — the case the final strip exists for.
+        "a" * (limit - 1) + " bcd",
+        "a " * limit,
+        # Astral characters are one code point each.
+        "\U0001F680" * (limit + 5),
+        # A preserved flag cut by the bound, at every offset that cuts it.
+        *[
+            "a" * (limit - offset) + _tag_flag(code)
+            for code in ("gbeng", "gbsct", "gbwls")
+            for offset in (7, 6, 2, 1, 0)
+        ],
+        # Already-redacted output must not be re-redacted into something else.
+        "Rotate ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 before Friday",
+        "Key sk-ABCDEFGHIJ rotated",
+        "Mirror https://deploy:hunter2verylongpassword@git.example.com/repo.git",
+        "Sync https://api.example.com/v1/sync?token=OPAQUEVALUE123&page=2",
+        # Sanitized-away input, at and past the bound.
+        f"a{chr(0x200B)}" * (limit + 40),
+        f"Ship{chr(0xD800)} the {chr(0x00AD)}thing",
+    ]
+    for value in vectors:
+        once = projector(value)
+        assert projector(once) == once
+        assert len(once) <= limit
 
 
 def test_owner_run_projection_uses_only_native_runtime_and_cost_receipt():
@@ -1406,7 +1610,7 @@ _UNSAFE_STORED_PROJECT_NAME = (
     " https://deploy:hunter2verylongpassword@git.example.com/repo.git"
 )
 _PROJECTED_PROJECT_NAME = (
-    "Shoe Shop plan https://deploy:***@git.example.com/repo.git"
+    "Shoe Shop plan https://***@git.example.com/repo.git"
 )
 
 
@@ -1473,6 +1677,114 @@ def test_unsafe_project_name_is_projected_on_every_owner_surface(ctx):
             _ZERO_WIDTH_SPACE, _RL_OVERRIDE, _ANNOTATION_SEPARATOR,
         ):
             assert forbidden not in name
+
+
+def test_owner_approval_descriptions_project_every_project_name(ctx):
+    """The approval prompt is an owner egress like every other one.
+
+    ``description`` reaches the gateway notify callback and the
+    ``pre_approval_request`` plugin hook verbatim, and it is the text the
+    owner reads before deciding. A raw name interpolated into it would carry
+    an ESC sequence, an invisible reordering character or a URL-borne
+    credential onto the one surface whose whole job is to be trustworthy — and
+    unlike a snapshot field, that text is what authorises a mutation.
+
+    All four exact-operation descriptions that name a Project are covered:
+    bootstrap and task-graph name the REQUESTED name, lifecycle and
+    project-plan name the STORED one.
+    """
+    notified: list[dict] = []
+    hooked: list[dict] = []
+
+    def _record_hook(hook_name, **kwargs):
+        hooked.append({"hook": hook_name, **kwargs})
+
+    def _approve_once() -> threading.Thread:
+        approval.register_gateway_notify(ctx.session, notified.append)
+        thread = threading.Thread(target=_auto_approve, args=(ctx.session,))
+        thread.start()
+        return thread
+
+    with _temporarily_patch(approval, "_fire_approval_hook", _record_hook):
+        approver = _approve_once()
+        boot = ow.bootstrap(
+            ctx,
+            idempotency_key="approval-bootstrap",
+            name=_UNSAFE_STORED_PROJECT_NAME,
+        )
+        approver.join()
+        assert boot["ok"] is True
+
+        approver = _approve_once()
+        graph = ow.commit_task_graph(
+            ctx,
+            **_task_graph_args(
+                idempotency_key="approval-graph",
+                project_name=_UNSAFE_STORED_PROJECT_NAME,
+            ),
+        )
+        approver.join()
+        assert graph["ok"] is True
+
+        approver = _approve_once()
+        planned = ow.commit_project_plan(
+            ctx,
+            **_project_plan_args(
+                boot,
+                [{
+                    "action": "add",
+                    "reason": "Create one bounded owner-approved task.",
+                    "title": "Prepare the approved deliverable",
+                    "body": "Produce the owner-visible result.",
+                    "assignee": "default",
+                    "existing_parents": [],
+                    "new_parents": [],
+                }],
+                idempotency_key="approval-plan",
+            ),
+        )
+        approver.join()
+        assert planned["ok"] is True
+
+        approver = _approve_once()
+        archived = ow.set_project_archived(
+            ctx,
+            idempotency_key="approval-archive",
+            project_id=boot["project_id"],
+            action="archive",
+        )
+        approver.join()
+        assert archived["ok"] is True
+
+    approval.unregister_gateway_notify(ctx.session)
+
+    expected = [
+        f"Bootstrap owner workspace project {_PROJECTED_PROJECT_NAME!r}",
+        f"Create project {_PROJECTED_PROJECT_NAME!r} with 2 tasks",
+        f"Apply 1 approved Project change(s) to {_PROJECTED_PROJECT_NAME!r}",
+        f"Archive Project {_PROJECTED_PROJECT_NAME!r}",
+    ]
+    assert [item["description"] for item in notified] == expected
+    # ``command`` is the same string on the same payload — the gateway
+    # surfaces render one or the other, so neither may be the raw name.
+    assert [item["command"] for item in notified] == expected
+
+    # Observer plugins read the same text off the hook, before any UI does.
+    pre_request = [
+        item for item in hooked if item["hook"] == "pre_approval_request"
+    ]
+    assert [item["description"] for item in pre_request] == expected
+    assert [item["command"] for item in pre_request] == expected
+
+    # Asserted on the strings, not on ``json.dumps`` output: JSON renders a
+    # NUL as a six-character escape, so a serialized membership check would
+    # pass whether or not the control character actually survived.
+    for text in expected:
+        for forbidden in (
+            "hunter2verylongpassword", "\x00", "\x1b",
+            _ZERO_WIDTH_SPACE, _RL_OVERRIDE, _ANNOTATION_SEPARATOR,
+        ):
+            assert forbidden not in text
 
 
 def test_owner_project_name_bound_is_applied_to_a_stored_name(ctx):
@@ -2947,3 +3259,373 @@ def test_cross_profile_bootstrap_of_same_board_elects_exactly_one_owner(tmp_path
         loser_project = projects_db.get_project(pconn, project_ids[loser])
     assert loser_project is not None
     assert loser_project.board_slug != board
+
+
+# ---------------------------------------------------------------------------
+# Native titles and names at the DIRECT Hermes mutation boundary.
+#
+# The Workspace client enforces the owner-title contract on what it sends, but
+# these kernel functions are reachable without it: the API-server toolset is a
+# thin pass-through, and an in-process caller skips the tool layer entirely.
+# Whatever they write into projects.db/kanban.db is read back by every owner
+# surface through ``owner_title``/``owner_project_name``, so the stored string
+# has to already BE that projection — established before the request digest,
+# the owner's approval description, persistence and the replay comparison all
+# bind to it.
+#
+# Code points are written as ``chr(...)``: a literal invisible character in
+# this file would be unreviewable.
+# ---------------------------------------------------------------------------
+
+_ENGLAND_FLAG = (
+    "\U0001F3F4"
+    + "".join(chr(0xE0000 + ord(char)) for char in "gbeng")
+    + chr(0xE007F)
+)
+
+# One value carrying every class this boundary must resolve: an internal
+# dispatcher prefix, an INVISIBLE_CHARS zero-width space, a default-ignorable
+# soft hyphen, a bidi override, a lone surrogate, a URL credential — and one
+# pinned RGI subdivision flag, which is legitimate Unicode and must survive.
+_UNSAFE_NATIVE_TITLE = (
+    f"B03 — Ship{chr(0x200B)} the{chr(0x00AD)} {chr(0x202E)}release{chr(0xD800)}"
+    f" {_ENGLAND_FLAG}"
+    " https://deploy:hunter2verylongpassword@git.example.com/repo.git"
+)
+_UNSAFE_NATIVE_PROJECT_NAME = (
+    f"B03 — Shoe{chr(0x200B)} Shop{chr(0x00AD)} {chr(0x202E)}plan{chr(0xD800)}"
+    f" {_ENGLAND_FLAG} key sk-ABCDEFGHIJ"
+)
+# Non-blank on arrival — none of these is Python whitespace, so ``strip()``
+# keeps them — and nothing at all after canonicalization.
+_HIDDEN_ONLY = f"{chr(0x200B)}{chr(0x00AD)}{chr(0x202E)}{chr(0xD800)}"
+_PREFIX_ONLY_TITLE = "B03 —"
+
+
+def _assert_canonical_stored_title(stored: str) -> None:
+    """The stored title IS its own projection, and carries nothing hidden."""
+    assert stored == ow.owner_title(stored)
+    assert stored != ow._UNTITLED_WORK_ITEM
+    for forbidden in (
+        "B03 —", "B04 —", "R12 —",
+        chr(0x200B), chr(0x00AD), chr(0x202E), chr(0xD800),
+        "hunter2verylongpassword", "sk-ABCDEFGHIJ",
+    ):
+        assert forbidden not in stored
+    # A lone surrogate raises here — the owner-read 500 this boundary exists
+    # to make impossible.
+    stored.encode("utf-8")
+
+
+def test_task_graph_persists_canonical_native_titles_and_project_name(ctx):
+    """Root title, child titles and the new Project name, all canonical."""
+    args = _task_graph_args(
+        idempotency_key="graph-canonical-titles",
+        project_name=_UNSAFE_NATIVE_PROJECT_NAME,
+        request_title=_UNSAFE_NATIVE_TITLE,
+        tasks=[
+            {
+                "title": f"B04 — Prepare{chr(0x200B)} the release{chr(0xD800)}",
+                "body": "Create the smallest complete release.",
+                "assignee": "default",
+                "parents": [],
+            },
+            {
+                "title": f"R12 — Verify the {chr(0x202E)}release{chr(0x00AD)}",
+                "body": "Check the owner-visible result.",
+                "assignee": "default",
+                "parents": [0],
+            },
+        ],
+    )
+
+    approver = _with_approver(ctx.session)
+    result = ow.commit_task_graph(ctx, **args)
+    approver.join()
+    assert result["ok"] is True
+
+    with kanban_db.connect(board=result["board"]) as kconn:
+        root = kanban_db.get_task(kconn, result["root_task_id"])
+        children = [
+            kanban_db.get_task(kconn, task_id) for task_id in result["task_ids"]
+        ]
+    with projects_db.connect_closing() as pconn:
+        project = projects_db.get_project(pconn, result["project_id"])
+
+    assert root.title == ow.owner_title(_UNSAFE_NATIVE_TITLE)
+    _assert_canonical_stored_title(root.title)
+    # The pinned subdivision flag survives whole; the credential does not.
+    assert _ENGLAND_FLAG in root.title
+    assert "https://***@git.example.com/repo.git" in root.title
+
+    assert [child.title for child in children] == [
+        "Prepare the release",
+        "Verify the release",
+    ]
+    for child in children:
+        _assert_canonical_stored_title(child.title)
+
+    # A Project name gets the same sanitizing contract with its own two
+    # pinned differences: the 160 bound, and NO internal-prefix strip, because
+    # an owner-authored name that happens to start like a dispatcher label is
+    # still the owner's words.
+    assert project.name == ow.owner_project_name(_UNSAFE_NATIVE_PROJECT_NAME)
+    assert project.name == ow.owner_project_name(project.name)
+    assert project.name.startswith("B03 — Shoe Shop plan")
+    assert "sk-ABCDEFGHIJ" not in project.name
+    assert chr(0xD800) not in project.name
+    project.name.encode("utf-8")
+
+    # The read-side projection now has nothing left to change.
+    listed = [
+        entry for entry in ow.list_committed_projects(ctx)
+        if entry["project_id"] == result["project_id"]
+    ]
+    assert [entry["name"] for entry in listed] == [project.name]
+
+
+def test_task_graph_replay_matches_on_the_canonical_title_not_its_spelling(ctx):
+    """Canonicalization precedes the digest, so an equivalent spelling is the
+    same operation — one approval, one root task, no conflict.
+
+    Both halves of the boundary need it: the receipt digest is computed on the
+    canonical payload, and the post-create check compares the stored root
+    title against ``request_title``. Had either kept the raw spelling, a retry
+    differing only in characters the owner cannot see would fail closed as an
+    ``idempotency_key_conflict`` over what reads as the same words.
+    """
+    args = _task_graph_args(
+        idempotency_key="graph-canonical-replay",
+        project_name=_UNSAFE_NATIVE_PROJECT_NAME,
+        request_title=_UNSAFE_NATIVE_TITLE,
+    )
+    approver = _with_approver(ctx.session)
+    first = ow.commit_task_graph(ctx, **args)
+    approver.join()
+    assert first["ok"] is True
+
+    with kanban_db.connect(board=first["board"]) as kconn:
+        before = kconn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?",
+            (first["project_id"],),
+        ).fetchone()["n"]
+
+    # No approver from here on: a second decision request would have nothing
+    # to resolve it, proving neither replay asked for one.
+    approval.unregister_gateway_notify(ctx.session)
+    assert ow.commit_task_graph(ctx, **args) == first
+
+    zero_width = chr(0x200B)
+    respelled = _task_graph_args(
+        idempotency_key="graph-canonical-replay",
+        project_name=_UNSAFE_NATIVE_PROJECT_NAME + zero_width,
+        request_title=_UNSAFE_NATIVE_TITLE.replace("Ship", f"Ship{zero_width}"),
+    )
+    assert ow.commit_task_graph(ctx, **respelled) == first
+
+    with kanban_db.connect(board=first["board"]) as kconn:
+        after = kconn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?",
+            (first["project_id"],),
+        ).fetchone()["n"]
+    assert before == after == 3
+
+
+def test_task_graph_rejects_titles_that_canonicalize_to_nothing(ctx):
+    """The ``Untitled`` fallback is a read-side placeholder, never a write.
+
+    ``owner_title``/``owner_project_name`` substitute it for empty input,
+    which is right when projecting an already-stored value and wrong when it
+    would BE the stored value: the owner never wrote those words. Each input
+    below arrives non-blank and canonicalizes to nothing, so the whole request
+    fails before approval or persistence.
+
+    What rejects is the canonical emptiness, never the wording — the literal
+    strings are owner text and persist, as the next test pins.
+    """
+    for index, overrides in enumerate((
+        {"request_title": _HIDDEN_ONLY},
+        {"request_title": _PREFIX_ONLY_TITLE},
+        {"project_name": _HIDDEN_ONLY},
+        {"tasks": [{
+            "title": _PREFIX_ONLY_TITLE,
+            "body": "Create the smallest complete release.",
+            "assignee": "default",
+            "parents": [],
+        }]},
+    )):
+        args = _task_graph_args(idempotency_key=f"graph-blank-{index}", **overrides)
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            ow.commit_task_graph(ctx, **args)
+        assert excinfo.value.code == "invalid_argument"
+
+    with projects_db.connect_closing() as pconn:
+        names = {
+            project.name
+            for project in projects_db.list_projects(pconn, include_archived=True)
+        }
+    assert names.isdisjoint({"Launch Shop", ow._UNTITLED_PROJECT, _HIDDEN_ONLY})
+
+
+def test_task_graph_persists_literal_untitled_values_the_owner_wrote(ctx):
+    """The placeholder wording is not itself a rejection.
+
+    ``Untitled work item`` and ``Untitled Project`` canonicalize to themselves,
+    so they carry owner-visible text and are stored as written, on every native
+    write path: root title, child title and new Project name. A boundary that
+    recognized emptiness by comparing a projection against the fallback would
+    refuse exactly the owner who really used those words.
+    """
+    args = _task_graph_args(
+        idempotency_key="graph-literal-untitled",
+        project_name=ow._UNTITLED_PROJECT,
+        request_title=ow._UNTITLED_WORK_ITEM,
+        tasks=[
+            {
+                "title": ow._UNTITLED_WORK_ITEM,
+                "body": "Create the smallest complete release.",
+                "assignee": "default",
+                "parents": [],
+            },
+        ],
+    )
+
+    approver = _with_approver(ctx.session)
+    result = ow.commit_task_graph(ctx, **args)
+    approver.join()
+    assert result["ok"] is True
+
+    with kanban_db.connect(board=result["board"]) as kconn:
+        root = kanban_db.get_task(kconn, result["root_task_id"])
+        child = kanban_db.get_task(kconn, result["task_ids"][0])
+    with projects_db.connect_closing() as pconn:
+        project = projects_db.get_project(pconn, result["project_id"])
+
+    assert root.title == child.title == ow._UNTITLED_WORK_ITEM
+    assert project.name == ow._UNTITLED_PROJECT
+    # Stored as its own projection, exactly like any other owner text.
+    assert ow.owner_title(root.title) == root.title
+    assert ow.owner_project_name(project.name) == project.name
+
+
+def test_project_plan_persists_canonical_titles_for_every_created_task(ctx):
+    """Added and replacement tasks are native writes too — same contract.
+
+    The plan's own ``request_title`` is NOT one of them: on an existing
+    Project it is prose inside the recorded plan, not a work-item title, so it
+    keeps its wording — internal-looking prefix included.
+    """
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        broad_id = kanban_db.create_task(
+            conn, title="Broad task", assignee="default", project_id=setup["project_id"],
+        )
+        broad_ref = _project_task_ref(conn, broad_id)
+
+    prose_request_title = "B03 — Adapt the current plan"
+    args = _project_plan_args(
+        setup,
+        [
+            {
+                "action": "add",
+                "reason": "Create one bounded owner-approved task.",
+                "title": _UNSAFE_NATIVE_TITLE,
+                "body": "Produce the owner-visible result.",
+                "assignee": "default",
+                "existing_parents": [],
+                "new_parents": [],
+            },
+            {
+                "action": "split",
+                "reason": "The current task is too broad to verify safely.",
+                "target": broad_ref,
+                "replacements": [
+                    {
+                        "title": f"B04 — Build{chr(0x200B)} the change{chr(0xD800)}",
+                        "body": "Produce one owner-visible outcome.",
+                        "assignee": "default",
+                        "parents": [],
+                    },
+                    {
+                        "title": f"R12 — Check the {chr(0x202E)}change{chr(0x00AD)}",
+                        "body": "Verify the outcome before downstream work continues.",
+                        "assignee": "default",
+                        "parents": [0],
+                    },
+                ],
+            },
+        ],
+        idempotency_key="steward-canonical-titles",
+        request_title=prose_request_title,
+    )
+
+    approver = _with_approver(ctx.session)
+    result = ow.commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result["ok"] is True
+    assert len(result["created_task_ids"]) == 3
+    with kanban_db.connect(board=setup["board"]) as conn:
+        titles = [
+            kanban_db.get_task(conn, task_id).title
+            for task_id in result["created_task_ids"]
+        ]
+        applied = [
+            event for event in kanban_db.list_events(conn, setup["task_id"])
+            if event.kind == "owner_project_plan_applied"
+        ]
+
+    assert set(titles) == {
+        ow.owner_title(_UNSAFE_NATIVE_TITLE),
+        "Build the change",
+        "Check the change",
+    }
+    for title in titles:
+        _assert_canonical_stored_title(title)
+
+    # Prose, unchanged: the plan record keeps the request title as written.
+    assert len(applied) == 1
+    assert applied[0].payload["plan_summary"].startswith(prose_request_title)
+
+    # Same canonical payload under a different spelling is the same operation.
+    approval.unregister_gateway_notify(ctx.session)
+    respelled = dict(args)
+    respelled["request_title"] = prose_request_title
+    respelled["changes"] = json.loads(json.dumps(args["changes"]))
+    respelled["changes"][0]["title"] = _UNSAFE_NATIVE_TITLE.replace(
+        "Ship", f"Ship{chr(0x200B)}"
+    )
+    assert ow.commit_project_plan(ctx, **respelled) == result
+
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert len([
+            task for task in kanban_db.list_tasks(conn)
+            if task.title in titles
+        ]) == 3
+
+
+def test_project_plan_rejects_a_created_title_that_canonicalizes_to_nothing(ctx):
+    setup = _bootstrap_board(ctx)
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "add",
+            "reason": "Create one bounded owner-approved task.",
+            "title": _HIDDEN_ONLY,
+            "body": "Produce the owner-visible result.",
+            "assignee": "default",
+            "existing_parents": [],
+            "new_parents": [],
+        }],
+        idempotency_key="steward-blank-title",
+    )
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.commit_project_plan(ctx, **args)
+    assert excinfo.value.code == "invalid_argument"
+
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert all(
+            task.title not in {_HIDDEN_ONLY, ow._UNTITLED_WORK_ITEM}
+            for task in kanban_db.list_tasks(conn)
+        )

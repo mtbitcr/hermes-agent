@@ -358,6 +358,16 @@ def _finalize_receipt(
 
 
 def _confirm(ctx: OwnerContext, *, operation: str, digest: str, description: str) -> dict:
+    """Ask the owner for one fresh decision on one exact operation.
+
+    ``description`` is an owner egress: it reaches the gateway notify callback
+    and the ``pre_approval_request``/``post_approval_response`` plugin hooks
+    verbatim, and is what the owner actually reads before deciding. So any
+    stored name interpolated into it is projected through
+    :func:`owner_project_name` (or :func:`owner_title`) FIRST — a raw name
+    would otherwise carry escape sequences, invisible reordering characters or
+    a URL-borne credential onto the approval surface itself.
+    """
     from tools.approval import request_exact_operation_approval
 
     if not ctx.session:
@@ -531,7 +541,7 @@ def bootstrap(
 
         approval = _confirm(
             ctx, operation=operation, digest=digest,
-            description=f"Bootstrap owner workspace project {name!r}",
+            description=f"Bootstrap owner workspace project {owner_project_name(name)!r}",
         )
         if not approval.get("approved"):
             result = {"ok": False, "error": "confirmation_denied", "reason": approval.get("reason")}
@@ -700,7 +710,7 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
     for index, raw in enumerate(tasks):
         if not isinstance(raw, dict):
             raise OwnerWorkspaceError("invalid_argument", f"tasks[{index}] must be an object")
-        title = _bounded_text(raw.get("title"), f"tasks[{index}].title", limit=240)
+        title = _native_owner_title(raw.get("title"), f"tasks[{index}].title")
         body = _bounded_text(raw.get("body"), f"tasks[{index}].body", limit=12_000)
         assignee_raw = _bounded_text(
             raw.get("assignee"), f"tasks[{index}].assignee", limit=64,
@@ -742,7 +752,7 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
                 clean_parents.append(parent)
 
         normalized.append({
-            "title": redact_sensitive_text(title, force=True),
+            "title": title,
             "body": redact_sensitive_text(body, force=True),
             "assignee": assignee,
             "responsibility": responsibility,
@@ -955,9 +965,8 @@ def commit_task_graph(
     if mode not in {"new", "existing"}:
         raise OwnerWorkspaceError("invalid_argument", "mode must be 'new' or 'existing'")
 
-    request_title = redact_sensitive_text(
-        _bounded_text(request_title, "request_title", limit=240), force=True,
-    )
+    # The root task's native title, not prose: canonical before the digest.
+    request_title = _native_owner_title(request_title, "request_title")
     specification = redact_sensitive_text(
         _bounded_text(specification, "specification", limit=20_000), force=True,
     )
@@ -977,9 +986,7 @@ def commit_task_graph(
             raise OwnerWorkspaceError(
                 "invalid_argument", "project_id is not accepted when mode is 'new'",
             )
-        project_name = redact_sensitive_text(
-            _bounded_text(project_name, "project_name", limit=160), force=True,
-        )
+        project_name = _native_owner_project_name(project_name, "project_name")
         project_description = _bounded_text(
             project_description, "project_description", limit=2_000, required=False,
         )
@@ -1026,7 +1033,8 @@ def commit_task_graph(
             operation=operation,
             digest=digest,
             description=(
-                f"Create project {project_name!r} with {len(normalized_tasks)} tasks"
+                f"Create project {owner_project_name(project_name)!r} "
+                f"with {len(normalized_tasks)} tasks"
                 if mode == "new"
                 else f"Add {len(normalized_tasks)} tasks to project {canonical_project_id!r}"
             ),
@@ -1932,7 +1940,7 @@ def set_project_archived(
             ctx,
             operation=operation,
             digest=digest,
-            description=f"{action.title()} Project {project.name!r}",
+            description=f"{action.title()} Project {owner_project_name(project.name)!r}",
         )
         if not approval.get("approved"):
             result = {
@@ -2045,6 +2053,58 @@ _INTERNAL_TITLE_PREFIX = re.compile(
 )
 _OWNER_TITLE_LIMIT = 240
 _OWNER_PROJECT_NAME_LIMIT = 160
+# What a projection returns when the input canonicalizes to nothing. Read-side
+# placeholders for absent text, never a value to test against: an owner may
+# legitimately write either of these exact strings, so the native write boundary
+# reads emptiness from the canonical text itself instead of comparing to these.
+_UNTITLED_WORK_ITEM = "Untitled work item"
+_UNTITLED_PROJECT = "Untitled Project"
+
+# What an owner-visible string loses ON TOP of the shared
+# ``tools.threat_patterns.INVISIBLE_CHARS`` set, for two disjoint reasons.
+#
+# DEFAULT-IGNORABLE controls render as nothing yet still occupy a token and
+# still split a string: U+00AD SOFT HYPHEN, U+034F COMBINING GRAPHEME JOINER,
+# U+180E MONGOLIAN VOWEL SEPARATOR, and the variation selectors (U+FE00-U+FE0F
+# plus the U+E0100-U+E01EF supplement). Left in, one of them dropped inside a
+# credential or a query-parameter name walks the value straight past the
+# redactor, and a run of them eats the display bound while showing the owner
+# nothing. The plain bidi marks (U+061C, U+200E, U+200F) join them here: they
+# are ordinary prose punctuation, which is exactly why they are NOT a global
+# threat marker, but an owner-visible string is a short label rather than
+# prose, and there they only reorder what is read.
+#
+# LONE SURROGATES (U+D800-U+DFFF) are not Unicode scalar values at all. They
+# survive inside a ``str`` — ``json.loads('"\\ud800"')`` produces one from a
+# request body, and ``os.fsdecode`` produces U+DC80-U+DCFF for every byte of a
+# path that is not valid UTF-8 — but encoding one raises
+# ``UnicodeEncodeError``, so a name carrying one turns an owner read into a 500
+# from FastAPI's JSON encoder instead of a projected name.
+#
+# Scoped to this boundary on purpose: this is a display contract, not a threat
+# scan. None of these ranges touches U+E0000-U+E007F, so the pinned RGI
+# subdivision tag flags are unaffected.
+#
+# Written as code points rather than pasted literals: an invisible character in
+# this source would be unreviewable, and none of them is a regex metacharacter.
+_OWNER_DISPLAY_STRIP_RANGES = (
+    (0x00AD, 0x00AD),    # soft hyphen
+    (0x034F, 0x034F),    # combining grapheme joiner
+    (0x061C, 0x061C),    # arabic letter mark
+    (0x180E, 0x180E),    # mongolian vowel separator
+    (0x200E, 0x200F),    # left-to-right mark, right-to-left mark
+    (0xD800, 0xDFFF),    # lone surrogates
+    (0xFE00, 0xFE0F),    # variation selectors 1-16
+    (0xE0100, 0xE01EF),  # variation selectors supplement 17-256
+)
+_OWNER_DISPLAY_STRIP_RE = re.compile(
+    "["
+    + "".join(
+        chr(low) if low == high else f"{chr(low)}-{chr(high)}"
+        for low, high in _OWNER_DISPLAY_STRIP_RANGES
+    )
+    + "]"
+)
 _OWNER_STATE_LABELS = {
     "triage": "Needs attention",
     "todo": "Planned",
@@ -2090,12 +2150,17 @@ def _owner_display_text(
     ``tools.ansi_strip`` for NUL/C0/C1/DEL, ESC sequences and the invisible
     plane-14 tag characters, and ``tools.threat_patterns.INVISIBLE_CHARS``
     for zero-width characters, bidi overrides/isolates and the interlinear
-    annotation frame. Doing it before redaction means a credential cannot
-    survive by splitting its own token across an invisible character, and
-    doing it at all means the text cannot reorder or hide what the owner is
-    shown. Safe human Unicode is left exactly as written. Whitespace collapse
-    (which also folds U+2028/U+2029), the optional internal-prefix strip, and
-    the ``limit`` Unicode code point bound then apply to already-sanitized,
+    annotation frame. :data:`_OWNER_DISPLAY_STRIP_RE` adds the removals that
+    belong to THIS boundary and not to a global threat scan — the
+    default-ignorable controls, the plain bidi marks and the lone surrogates.
+    Doing all of it before redaction means a credential cannot survive by
+    splitting its own token, or a query key its own name, across a character
+    the owner cannot see; doing it at all means the text cannot reorder or
+    hide what the owner is shown, cannot spend the display bound on nothing,
+    and cannot break the JSON encoding of the response carrying it. Safe human
+    Unicode is left exactly as written. Whitespace collapse (which also folds
+    U+2028/U+2029), the optional internal-prefix strip, and the ``limit``
+    Unicode code point bound then apply to already-sanitized,
     already-redacted text.
 
     ``strip_unicode_tags`` runs once more AFTER that bound, and the order
@@ -2106,18 +2171,26 @@ def _owner_display_text(
     correctly rejects. Re-running the same pinned sanitizer on the bounded
     text keeps an intact flag intact and reduces a cut one to its visible
     black-flag base, with no grapheme parsing of our own.
+
+    The final ``strip`` closes that tail: the bound is a raw code point slice,
+    so it can cut mid-word and leave the whitespace before it stranded at the
+    end. Without the strip a projected string would not survive being
+    projected again — the second pass's whitespace collapse would shorten it —
+    and every surface comparing a response against the canonical projection
+    treats that disagreement as a rejection.
     """
     from agent.redact import redact_sensitive_text
     from tools.ansi_strip import sanitize_display_text, strip_unicode_tags
     from tools.threat_patterns import INVISIBLE_CHARS
 
     text = strip_unicode_tags(sanitize_display_text(str(value or "")))
+    text = _OWNER_DISPLAY_STRIP_RE.sub("", text)
     text = "".join(char for char in text if char not in INVISIBLE_CHARS)
     text = redact_sensitive_text(text, force=True, redact_url_credentials=True)
     text = " ".join(text.split())
     if strip_internal_prefix:
         text = _INTERNAL_TITLE_PREFIX.sub("", text).strip()
-    return strip_unicode_tags(text[:limit])
+    return strip_unicode_tags(text[:limit]).strip()
 
 
 def owner_title(value: Any) -> str:
@@ -2129,7 +2202,7 @@ def owner_title(value: Any) -> str:
     """
     return _owner_display_text(
         value, limit=_OWNER_TITLE_LIMIT, strip_internal_prefix=True
-    ) or "Untitled work item"
+    ) or _UNTITLED_WORK_ITEM
 
 
 def owner_project_name(value: Any) -> str:
@@ -2149,7 +2222,66 @@ def owner_project_name(value: Any) -> str:
     """
     return _owner_display_text(
         value, limit=_OWNER_PROJECT_NAME_LIMIT
-    ) or "Untitled Project"
+    ) or _UNTITLED_PROJECT
+
+
+def _native_owner_title(value: Any, field: str) -> str:
+    """Canonicalize one work-item title Hermes itself is about to write.
+
+    Hermes is not only a projection surface: ``owner_task_graph_commit`` and
+    ``owner_project_plan_commit`` write task titles straight into
+    ``kanban.db``, and every owner surface reads them back through
+    :func:`owner_title`. Canonicalizing at input — BEFORE the request digest,
+    the owner's approval description, persistence and the replay comparison
+    all bind to this exact string — is what keeps the stored title and its
+    projection the same text, so a caller that reaches this kernel directly
+    cannot store a title that only becomes safe on the way back out.
+
+    The ``limit`` is unchanged (:data:`_OWNER_TITLE_LIMIT`, still enforced by
+    :func:`_bounded_text` as a rejection, not a truncation, of raw input);
+    :func:`_owner_display_text` — the one core :func:`owner_title` projects
+    through — supplies the rest of the contract, including the same secret
+    redaction and the internal-prefix strip.
+
+    It is called directly rather than through :func:`owner_title` so that
+    emptiness is read from the canonical text itself. A value that
+    canonicalizes to nothing carries no owner-visible text at all — it was
+    invisible characters, or nothing but an internal dispatcher prefix — and
+    storing the read-side placeholder would record a title the owner never
+    wrote, so it is rejected. Testing the projection against that placeholder
+    instead would also reject ``Untitled work item`` as a literal title, which
+    is owner-visible text like any other and persists as written.
+    """
+    title = _owner_display_text(
+        _bounded_text(value, field, limit=_OWNER_TITLE_LIMIT),
+        limit=_OWNER_TITLE_LIMIT,
+        strip_internal_prefix=True,
+    )
+    if not title:
+        raise OwnerWorkspaceError(
+            "invalid_argument", f"{field} has no owner-visible text",
+        )
+    return title
+
+
+def _native_owner_project_name(value: Any, field: str) -> str:
+    """Canonicalize one Project name Hermes itself is about to write.
+
+    Same native-write contract as :func:`_native_owner_title`, against the
+    core :func:`owner_project_name` projects through: the 160 code point bound,
+    no internal-prefix strip, and canonical emptiness rejected rather than
+    stored as the ``Untitled Project`` placeholder. A Project an owner really
+    named ``Untitled Project`` is owner text and is written as it stands.
+    """
+    name = _owner_display_text(
+        _bounded_text(value, field, limit=_OWNER_PROJECT_NAME_LIMIT),
+        limit=_OWNER_PROJECT_NAME_LIMIT,
+    )
+    if not name:
+        raise OwnerWorkspaceError(
+            "invalid_argument", f"{field} has no owner-visible text",
+        )
+    return name
 
 
 def _open_read_only_sqlite(path, *, label: str) -> sqlite3.Connection:
@@ -2489,9 +2621,7 @@ def _normalize_project_task_spec(
     from agent.redact import redact_sensitive_text
 
     result = {
-        "title": redact_sensitive_text(
-            _bounded_text(raw["title"], f"{field}.title", limit=240), force=True,
-        ),
+        "title": _native_owner_title(raw["title"], f"{field}.title"),
         "body": redact_sensitive_text(
             _bounded_text(raw["body"], f"{field}.body", limit=12_000), force=True,
         ),
@@ -2818,7 +2948,7 @@ def commit_project_plan(
                 digest=digest,
                 description=(
                     f"Apply {len(normalized_changes)} approved Project change(s) "
-                    f"to {project.name!r}"
+                    f"to {owner_project_name(project.name)!r}"
                 ),
             )
             if not approval.get("approved"):
