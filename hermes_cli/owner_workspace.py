@@ -1494,6 +1494,7 @@ def _set_project_dispatch_state(
 
 
 OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY = "lifecycle_revision"
+_OWNER_PROJECT_LIFECYCLE_ACTIONS = ("archive", "restore", "pause", "resume")
 
 
 def _project_lifecycle_revision(
@@ -1521,12 +1522,19 @@ def _project_lifecycle_revision(
         # generations while keeping this projection read-only. The first later
         # mutation will add the durable marker normally.
         generation_filter = "AND status IN ('committed', 'denied')"
+    legacy_digests = tuple(
+        _digest({"project_id": project_id, "action": action})
+        for action in _OWNER_PROJECT_LIFECYCLE_ACTIONS
+    )
+    legacy_digest_placeholders = ", ".join("?" for _ in legacy_digests)
     rows = conn.execute(
         "SELECT * FROM owner_workspace_receipts "
-        "WHERE actor = ? AND profile = ? AND project_id = ? "
+        "WHERE actor = ? AND profile = ? "
+        "AND (project_id = ? OR (project_id IS NULL AND request_digest IN ("
+        f"{legacy_digest_placeholders}))) "
         "AND operation = 'owner_project_lifecycle' "
         f"{generation_filter}",
-        (ctx.actor, ctx.profile, project_id),
+        (ctx.actor, ctx.profile, project_id, *legacy_digests),
     ).fetchall()
     return sum(1 for row in rows if not _is_retryable_confirmation_timeout(row))
 
@@ -2234,7 +2242,7 @@ def set_project_archived(
             "invalid_argument", "expected_revision must be a non-negative integer",
         )
     action = str(action or "").strip().lower()
-    if action not in {"archive", "restore", "pause", "resume"}:
+    if action not in _OWNER_PROJECT_LIFECYCLE_ACTIONS:
         raise OwnerWorkspaceError(
             "invalid_argument",
             "action must be 'archive', 'restore', 'pause', or 'resume'",

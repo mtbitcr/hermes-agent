@@ -1535,14 +1535,16 @@ def test_project_lifecycle_projection_reads_pre_migration_receipts(ctx):
         conn.execute(
             "INSERT INTO owner_workspace_receipts "
             "(actor, profile, idempotency_key, operation, request_digest, "
-            "status, project_id, result_json, created_at, updated_at) "
-            "VALUES (?, ?, ?, 'owner_project_lifecycle', ?, 'committed', ?, ?, ?, ?)",
+            "status, result_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'owner_project_lifecycle', ?, 'committed', ?, ?, ?)",
             (
                 ctx.actor,
                 ctx.profile,
                 "legacy-lifecycle-receipt",
-                "legacy-lifecycle-digest",
-                created["project_id"],
+                ow._digest({
+                    "project_id": created["project_id"],
+                    "action": "archive",
+                }),
                 json.dumps({"ok": True, "action": "archive"}),
                 1,
                 1,
@@ -1562,6 +1564,20 @@ def test_project_lifecycle_projection_reads_pre_migration_receipts(ctx):
             )
         }
     assert "terminal_generation" not in columns
+
+    with projects_db.connect_closing() as conn:
+        ow._ensure_schema(conn)
+
+    project = ow.list_committed_projects(ctx, lifecycle_revision=True)[0]
+    assert project["lifecycle_revision"] == 1
+    with projects_db.connect_closing() as conn:
+        columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(owner_workspace_receipts)"
+            )
+        }
+    assert "terminal_generation" in columns
 
 
 def test_project_lifecycle_requires_exact_authenticated_run_authority(ctx):
