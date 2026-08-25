@@ -709,7 +709,8 @@ class TestResponseStore:
         assert store.close_owner_conversation("default", conversation, response_id) is True
         assert store.set_conversation(conversation, "resp_after_close") is False
         snapshot = store.owner_history_snapshot(conversation)
-        assert snapshot["proposal_consumed"] is True
+        assert snapshot["proposal_consumed"] is False
+        assert snapshot["conversation_closed"] is True
         assert snapshot["proposal_claimed"] is False
         assert snapshot["conversation_closed"] is True
 
@@ -2655,6 +2656,53 @@ class TestResponsesEndpoint:
                     json={"action": "claim", "response_id": "resp_safe_value"},
                 )
             ).status == 400
+
+    @pytest.mark.asyncio
+    async def test_owner_authority_reconciles_only_an_orphaned_exact_run(self, adapter):
+        conversation = "raphael-owner-" + "4" * 32
+        response_id = "resp_orphaned_owner_run"
+        claim_id = "claim_" + "5" * 32
+        run_id = "run_" + "6" * 32
+        adapter._response_store.put(response_id, {
+            "response": {"id": response_id, "created_at": 900},
+            "conversation_history": [
+                {"role": "assistant", "content": json.dumps(_owner_new_proposal())},
+            ],
+        })
+        assert adapter._response_store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert adapter._response_store.claim_owner_proposal(
+            "default", conversation, response_id, claim_id,
+        ) is True
+        assert adapter._response_store.attach_owner_run(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
+        payload = {
+            "action": "reconcile",
+            "response_id": response_id,
+            "claim_id": claim_id,
+            "run_id": run_id,
+        }
+        adapter._set_run_status(run_id, "running")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            live = await cli.post(
+                f"/v1/responses/conversations/{conversation}/authority",
+                json=payload,
+            )
+            assert live.status == 409
+            adapter._run_statuses.pop(run_id)
+            recovered = await cli.post(
+                f"/v1/responses/conversations/{conversation}/authority",
+                json=payload,
+            )
+
+        assert recovered.status == 200
+        assert adapter._response_store.owner_claim_is_released(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
 
     @pytest.mark.asyncio
     async def test_successful_response_with_string_input(self, adapter):

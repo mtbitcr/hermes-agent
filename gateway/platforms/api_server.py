@@ -371,10 +371,12 @@ def _resolve_owner_proposal_run_authority(value: Any) -> "dict[str, Any] | None"
     if value is None:
         return None
     expected = {
-        "conversation", "response_id", "claim_id", "operation", "idempotency_key", "payload",
+        "proposal_profile", "conversation", "response_id", "claim_id",
+        "operation", "idempotency_key", "payload",
     }
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError("invalid owner proposal authority")
+    proposal_profile = value.get("proposal_profile")
     conversation = value.get("conversation")
     response_id = value.get("response_id")
     claim_id = value.get("claim_id")
@@ -382,7 +384,9 @@ def _resolve_owner_proposal_run_authority(value: Any) -> "dict[str, Any] | None"
     idempotency_key = value.get("idempotency_key")
     payload = value.get("payload")
     if (
-        not isinstance(conversation, str)
+        not isinstance(proposal_profile, str)
+        or _OWNER_PROFILE_RE.fullmatch(proposal_profile) is None
+        or not isinstance(conversation, str)
         or _OWNER_CONVERSATION_RE.fullmatch(conversation) is None
         or not isinstance(response_id, str)
         or _OWNER_RESPONSE_RE.fullmatch(response_id) is None
@@ -398,6 +402,7 @@ def _resolve_owner_proposal_run_authority(value: Any) -> "dict[str, Any] | None"
     ):
         raise ValueError("invalid owner proposal authority")
     return {
+        "proposal_profile": proposal_profile,
         "conversation": conversation,
         "response_id": response_id,
         "claim_id": claim_id,
@@ -2292,7 +2297,7 @@ class ResponseStore:
                     self._conn.rollback()
                     return False
                 self._conn.execute(
-                    "UPDATE conversations SET consumed_response_id = proposal_response_id, closed = 1 "
+                    "UPDATE conversations SET closed = 1 "
                     "WHERE profile = ? AND name = ? AND proposal_response_id IS ?",
                     (profile, name, response_id),
                 )
@@ -2463,25 +2468,76 @@ class ResponseStore:
                     "WHERE profile = ? AND session_scope = ? AND idempotency_key = ?",
                     (profile, session_scope, idempotency_key),
                 ).fetchone()
+                owner_profile = (
+                    self._profile(owner["proposal_profile"])
+                    if owner is not None else profile
+                )
                 if existing is not None:
+                    if existing[0] != fingerprint:
+                        self._conn.rollback()
+                        return "conflict", None
+                    existing_run_id = str(existing[1])
+                    if owner is not None:
+                        row = self._conn.execute(
+                            "SELECT proposal_response_id, consumed_response_id, "
+                            "claimed_response_id, claim_id, owner_run_id, claim_state, closed, "
+                            "bound_operation, bound_payload_digest "
+                            "FROM conversations WHERE profile = ? AND name = ?",
+                            (owner_profile, owner["conversation"]),
+                        ).fetchone()
+                        reserved = self._conn.execute(
+                            "SELECT 1 FROM owner_conversation_reservations "
+                            "WHERE profile = ? AND name = ?",
+                            (owner_profile, owner["conversation"]),
+                        ).fetchone()
+                        if (
+                            row is not None
+                            and row[0] == owner["response_id"]
+                            and row[1] != owner["response_id"]
+                            and row[2] == owner["response_id"]
+                            and row[3] == owner["claim_id"]
+                            and row[4] == existing_run_id
+                            and row[5] == "released"
+                            and not bool(row[6])
+                            and row[7] == owner["operation"]
+                            and row[8] == owner["payload_digest"]
+                            and reserved is None
+                        ):
+                            self._conn.execute(
+                                "UPDATE conversations SET owner_run_id = ?, "
+                                "claim_state = 'claimed' WHERE profile = ? AND name = ? "
+                                "AND proposal_response_id = ? AND owner_run_id = ? "
+                                "AND claim_state = 'released'",
+                                (
+                                    run_id, owner_profile, owner["conversation"],
+                                    owner["response_id"], existing_run_id,
+                                ),
+                            )
+                            self._conn.execute(
+                                "UPDATE run_idempotency SET run_id = ?, created_at = ? "
+                                "WHERE profile = ? AND session_scope = ? "
+                                "AND idempotency_key = ? AND fingerprint = ? AND run_id = ?",
+                                (
+                                    run_id, time.time(), profile, session_scope,
+                                    idempotency_key, fingerprint, existing_run_id,
+                                ),
+                            )
+                            self._conn.commit()
+                            return "new", run_id
                     self._conn.rollback()
-                    return (
-                        ("existing", str(existing[1]))
-                        if existing[0] == fingerprint
-                        else ("conflict", None)
-                    )
+                    return "existing", existing_run_id
                 if owner is not None:
                     row = self._conn.execute(
                         "SELECT proposal_response_id, consumed_response_id, "
                         "claimed_response_id, claim_id, owner_run_id, claim_state, closed, "
                         "claim_expires_at "
                         "FROM conversations WHERE profile = ? AND name = ?",
-                        (profile, owner["conversation"]),
+                        (owner_profile, owner["conversation"]),
                     ).fetchone()
                     reserved = self._conn.execute(
                         "SELECT 1 FROM owner_conversation_reservations "
                         "WHERE profile = ? AND name = ?",
-                        (profile, owner["conversation"]),
+                        (owner_profile, owner["conversation"]),
                     ).fetchone()
                     if (
                         row is None
@@ -2513,7 +2569,7 @@ class ResponseStore:
                         (
                             owner["response_id"], owner["claim_id"], run_id,
                             owner["operation"], owner["payload_digest"],
-                            profile, owner["conversation"], owner["response_id"],
+                            owner_profile, owner["conversation"], owner["response_id"],
                         ),
                     )
                 self._conn.execute(
@@ -7751,6 +7807,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "attach": {"action", "response_id", "claim_id", "run_id"},
             "complete": {"action", "response_id", "claim_id", "run_id"},
             "release": {"action", "response_id", "claim_id", "run_id"},
+            "reconcile": {"action", "response_id", "claim_id", "run_id"},
             "close": {"action", "response_id"},
         }
         if action not in expected_keys or set(body) != expected_keys[action]:
@@ -7788,6 +7845,18 @@ class APIServerAdapter(BasePlatformAdapter):
             run_id = body.get("run_id")
             applied = self._response_store.owner_claim_is_released(
                 profile, conversation, response_id, body.get("claim_id"), run_id,
+            )
+        elif action == "reconcile":
+            run_id = body.get("run_id")
+            # A caller may ask the server to recover authority after a restart,
+            # but may not release a run the current process can still observe.
+            # The exact durable proposal/claim/run tuple remains the final fence.
+            applied = (
+                run_id not in self._run_statuses
+                and run_id not in self._active_run_tasks
+                and self._response_store.release_owner_claim(
+                    profile, conversation, response_id, body.get("claim_id"), run_id,
+                )
             )
         else:
             applied = self._response_store.close_owner_conversation(
@@ -9190,8 +9259,9 @@ class APIServerAdapter(BasePlatformAdapter):
         """Derive mutation authority from the stored proposal and live Project."""
         if context.get("profile") != profile:
             raise ValueError("owner profile mismatch")
+        proposal_profile = authority["proposal_profile"]
         record = self._response_store.owner_proposal_record(
-            profile, authority["conversation"], authority["response_id"],
+            proposal_profile, authority["conversation"], authority["response_id"],
         )
         if record is None:
             raise ValueError("owner proposal is not current")
@@ -9379,6 +9449,7 @@ class APIServerAdapter(BasePlatformAdapter):
             expected_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
         )
         return {
+            "proposal_profile": proposal_profile,
             "conversation": authority["conversation"],
             "response_id": authority["response_id"],
             "claim_id": authority["claim_id"],
@@ -9508,7 +9579,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 retry_status = self._run_statuses.get(retry_run_id or "", {})
                 retry_snapshot = self._response_store.owner_history_snapshot(
                     owner_proposal_authority["conversation"],
-                    profile=request_owner_profile,
+                    profile=owner_proposal_authority["proposal_profile"],
                 )
                 if (
                     retry_state == "existing"
@@ -9652,7 +9723,18 @@ class APIServerAdapter(BasePlatformAdapter):
                         ),
                         status=409,
                     )
-                if existing_run_id not in self._run_statuses:
+                released_owner_retry = (
+                    owner_proposal_authority is not None
+                    and existing_run_id is not None
+                    and self._response_store.owner_claim_is_released(
+                        owner_proposal_authority["proposal_profile"],
+                        owner_proposal_authority["conversation"],
+                        owner_proposal_authority["response_id"],
+                        owner_proposal_authority["claim_id"],
+                        existing_run_id,
+                    )
+                )
+                if not released_owner_retry and existing_run_id not in self._run_statuses:
                     return web.json_response(
                         _openai_error(
                             "Idempotent run result has expired",
@@ -9660,10 +9742,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         ),
                         status=409,
                     )
-                if owner_proposal_authority is not None:
+                if owner_proposal_authority is not None and not released_owner_retry:
                     owner_snapshot = self._response_store.owner_history_snapshot(
                         owner_proposal_authority["conversation"],
-                        profile=request_owner_profile,
+                        profile=owner_proposal_authority["proposal_profile"],
                     )
                     existing_status = self._run_statuses.get(existing_run_id, {})
                     same_completed_mutation = (
@@ -9686,15 +9768,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             ),
                             status=409,
                         )
-                response_headers = (
-                    {"X-Hermes-Session-Key": gateway_session_key}
-                    if gateway_session_key else {}
-                )
-                return web.json_response(
-                    {"run_id": existing_run_id, "status": "started"},
-                    status=202,
-                    headers=response_headers,
-                )
+                if not released_owner_retry:
+                    response_headers = (
+                        {"X-Hermes-Session-Key": gateway_session_key}
+                        if gateway_session_key else {}
+                    )
+                    return web.json_response(
+                        {"run_id": existing_run_id, "status": "started"},
+                        status=202,
+                        headers=response_headers,
+                    )
 
         # A retry that already owns a run is returned above even while the
         # service is at capacity. New work still obeys the shared limit.
@@ -9732,7 +9815,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
         elif owner_proposal_authority is not None:
             authority_bound = self._response_store.claim_and_attach_owner_run(
-                request_owner_profile,
+                owner_proposal_authority["proposal_profile"],
                 owner_proposal_authority["conversation"],
                 owner_proposal_authority["response_id"],
                 owner_proposal_authority["claim_id"],
@@ -9818,7 +9901,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 with owner_receipt_lock:
                     receipt = owner_receipt[0]
                 args = (
-                    request_owner_profile,
+                    owner_proposal_authority["proposal_profile"],
                     owner_proposal_authority["conversation"],
                     owner_proposal_authority["response_id"],
                     owner_proposal_authority["claim_id"],

@@ -242,9 +242,10 @@ class TestStartRun:
                 {"role": "user", "content": "Prepare a workshop."},
                 {"role": "assistant", "content": json.dumps(proposal)},
             ],
-        })
+        }, profile="raphael-planner")
         assert adapter._response_store.set_conversation(
             conversation, response_id, owner_proposal=True,
+            profile="raphael-planner",
         ) is True
         payload = _new_owner_payload(idempotency_key, proposal)
         body = {
@@ -255,6 +256,7 @@ class TestStartRun:
                 "project_name": "Workshop pilot",
             },
             "owner_proposal_authority": {
+                "proposal_profile": "raphael-planner",
                 "conversation": conversation,
                 "response_id": response_id,
                 "claim_id": claim_id,
@@ -317,7 +319,7 @@ class TestStartRun:
                 )
                 assert mismatched.status == 409
                 assert adapter._response_store.owner_history_snapshot(
-                    conversation,
+                    conversation, profile="raphael-planner",
                 )["proposal_claimed"] is False
                 first = await cli.post(
                     "/v1/runs",
@@ -341,7 +343,9 @@ class TestStartRun:
 
         assert first.status == retry.status == 202
         assert retry_data["run_id"] == first_run_id
-        snapshot = adapter._response_store.owner_history_snapshot(conversation)
+        snapshot = adapter._response_store.owner_history_snapshot(
+            conversation, profile="raphael-planner",
+        )
         assert snapshot["proposal_consumed"] is True
         assert snapshot["proposal_claimed"] is False
         assert status["owner_mutation_committed"] is True
@@ -364,7 +368,9 @@ class TestStartRun:
         adapter._response_store.close()
         restarted_store = ResponseStore(db_path=db_path, default_profile="default")
         try:
-            restarted_snapshot = restarted_store.owner_history_snapshot(conversation)
+            restarted_snapshot = restarted_store.owner_history_snapshot(
+                conversation, profile="raphael-planner",
+            )
             assert restarted_snapshot["proposal_consumed"] is True
             assert restarted_snapshot["proposal_claimed"] is False
         finally:
@@ -384,12 +390,13 @@ class TestStartRun:
                 {"role": "user", "content": "Add the approved milestone."},
                 {"role": "assistant", "content": json.dumps(proposal)},
             ],
-        })
+        }, profile="raphael-planner")
         assert adapter._response_store.set_conversation(
             conversation, response_id, owner_proposal=True,
+            profile="raphael-planner",
         ) is True
         assert adapter._response_store.claim_owner_proposal(
-            "default", conversation, response_id, real_claim,
+            "raphael-planner", conversation, response_id, real_claim,
         ) is True
         idempotency_key = "owner-proposal-run-2"
         payload = _new_owner_payload(idempotency_key, proposal)
@@ -401,6 +408,7 @@ class TestStartRun:
                 "project_name": "Workshop pilot",
             },
             "owner_proposal_authority": {
+                "proposal_profile": "raphael-planner",
                 "conversation": conversation,
                 "response_id": response_id,
                 "claim_id": "claim_" + "e" * 32,
@@ -427,6 +435,120 @@ class TestStartRun:
 
         assert response.status == 409
         assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_failed_owner_run_retries_same_request_with_a_new_run(self, adapter):
+        conversation = "raphael-owner-" + "f" * 32
+        response_id = "resp_owner_provider_retry"
+        claim_id = "claim_" + "1" * 32
+        idempotency_key = "conversation-" + hashlib.sha256(
+            response_id.encode("utf-8")
+        ).hexdigest()
+        proposal = _new_owner_proposal()
+        adapter._response_store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [
+                {"role": "user", "content": "Prepare a workshop."},
+                {"role": "assistant", "content": json.dumps(proposal)},
+            ],
+        }, profile="raphael-planner")
+        assert adapter._response_store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+            profile="raphael-planner",
+        ) is True
+        payload = _new_owner_payload(idempotency_key, proposal)
+        body = {
+            "input": "Create the approved native task graph.",
+            "owner_workspace_context": {
+                "mode": "new",
+                "project_slug": None,
+                "project_name": "Workshop pilot",
+            },
+            "owner_proposal_authority": {
+                "proposal_profile": "raphael-planner",
+                "conversation": conversation,
+                "response_id": response_id,
+                "claim_id": claim_id,
+                "operation": "owner_task_graph_commit",
+                "idempotency_key": idempotency_key,
+                "payload": payload,
+            },
+        }
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        attempts = []
+
+        class RetryAgent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+            _hermes_api_runtime = {}
+
+            def __init__(self, tool_complete_callback, succeeds):
+                self._tool_complete_callback = tool_complete_callback
+                self._succeeds = succeeds
+
+            def run_conversation(self, **_kwargs):
+                if not self._succeeds:
+                    return {"failed": True, "error": "provider unavailable"}
+                from tools.owner_workspace_tools import _handle_task_graph
+
+                result = _handle_task_graph(payload)
+                self._tool_complete_callback(
+                    "tool-call-retry", "owner_task_graph_commit", payload, result,
+                )
+                return {"final_response": "done"}
+
+            def interrupt(self, _message=None):
+                return None
+
+        def create_agent(**kwargs):
+            succeeds = bool(attempts)
+            attempts.append(succeeds)
+            return RetryAgent(kwargs["tool_complete_callback"], succeeds)
+
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch.object(adapter, "_create_agent", side_effect=create_agent),
+            patch(
+                "hermes_cli.profiles.list_profiles",
+                return_value=[SimpleNamespace(name="default")],
+            ),
+            patch(
+                "hermes_cli.owner_workspace._confirm",
+                return_value={"approved": True, "reason": None},
+            ),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                first = await cli.post(
+                    "/v1/runs", json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                first_run_id = (await first.json())["run_id"]
+                for _ in range(40):
+                    if adapter._run_statuses.get(first_run_id, {}).get("status") == "failed":
+                        break
+                    await asyncio.sleep(0.05)
+                assert adapter._response_store.owner_claim_is_released(
+                    "raphael-planner", conversation, response_id, claim_id, first_run_id,
+                ) is True
+
+                retry = await cli.post(
+                    "/v1/runs", json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                retry_run_id = (await retry.json())["run_id"]
+                for _ in range(40):
+                    if adapter._run_statuses.get(retry_run_id, {}).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert first.status == retry.status == 202
+        assert retry_run_id != first_run_id
+        assert attempts == [False, True]
+        assert adapter._response_store.owner_history_snapshot(
+            conversation, profile="raphael-planner",
+        )["proposal_consumed"] is True
 
     @pytest.mark.asyncio
     async def test_start_rejects_invalid_idempotency_key(self, adapter):
