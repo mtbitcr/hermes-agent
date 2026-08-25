@@ -29,6 +29,7 @@ def workspace_surface(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb._INITIALIZED_PATHS.clear()
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid or 0) == 4242)
 
     repo = tmp_path / "workspace-repo"
     repo.mkdir()
@@ -52,7 +53,11 @@ def workspace_surface(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         running_id = kb.create_task(
             conn, title="Running work", assignee="coder", board=BOARD
         )
-        claimed = kb.claim_task(conn, running_id, claimer="test:worker")
+        claimed = kb.claim_task(
+            conn,
+            running_id,
+            claimer=f"{kb._claimer_id().split(':', 1)[0]}:worker",
+        )
         assert claimed is not None and claimed.current_run_id is not None
         run_id = claimed.current_run_id
         conn.execute(
@@ -468,6 +473,7 @@ def test_owner_title_capability_projects_board_and_worker_titles(workspace_surfa
     assert "hunter2verylongpassword" not in serialized
     assert "sk-abcdef1234567890" not in serialized
     assert all(not title.startswith("B03") for title in task_titles.values())
+
     assert all(not title.startswith("R07") for title in task_titles.values())
 
     # No capability means the legacy response shape and semantics remain
@@ -480,6 +486,22 @@ def test_owner_title_capability_projects_board_and_worker_titles(workspace_surfa
     }
     assert legacy_titles[s["ready_id"]] == raw_ready
     assert legacy_titles[s["running_id"]] == raw_running
+
+
+def test_owner_worker_projection_omits_a_recorded_run_without_live_process_proof(
+    workspace_surface, monkeypatch,
+):
+    s = workspace_surface
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    query = (
+        f"?board={BOARD}&capabilities="
+        f"{plugin_api.WORKSPACE_OWNER_TITLES_CAPABILITY}"
+    )
+
+    workers = _get(s, "/api/plugins/kanban/workers/active", query=query)
+
+    assert workers.status_code == 200
+    assert workers.json() == {"workers": []}
 
 
 def _machine_audit_entries(surface) -> list[dict]:

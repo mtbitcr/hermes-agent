@@ -3688,19 +3688,23 @@ def _workspace_workers_response(*, owner_titles: bool = False) -> dict:
     if conn is None:
         return {"workers": []}
     try:
-        rows = conn.execute(
-            """
-            SELECT r.profile, t.title AS task_title, r.started_at
-            FROM task_runs r
-            JOIN tasks t ON t.id = r.task_id
-            WHERE r.ended_at IS NULL
-              AND r.worker_pid IS NOT NULL
-              AND r.profile IS NOT NULL
-              AND t.status = 'running'
-              AND t.task_kind = 'work'
-            ORDER BY r.started_at ASC
-            """
-        ).fetchall()
+        rows = (
+            kanban_db.verified_active_worker_rows(conn)
+            if owner_titles
+            else conn.execute(
+                """
+                SELECT r.profile, t.title AS task_title, r.started_at
+                FROM task_runs r
+                JOIN tasks t ON t.id = r.task_id
+                WHERE r.ended_at IS NULL
+                  AND r.worker_pid IS NOT NULL
+                  AND r.profile IS NOT NULL
+                  AND t.status = 'running'
+                  AND t.task_kind = 'work'
+                ORDER BY r.started_at ASC
+                """
+            ).fetchall()
+        )
         return {
             "workers": [
                 {

@@ -245,7 +245,7 @@ def _digest(payload: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _require_proposal_authority(
+def _require_owner_run_authority(
     ctx: OwnerContext,
     *,
     operation: str,
@@ -263,8 +263,8 @@ def _require_proposal_authority(
         or authority.payload_digest != _digest(payload)
     ):
         raise OwnerWorkspaceError(
-            "proposal_authority_required",
-            "this mutation is not bound to an authenticated owner proposal run",
+            "owner_run_authority_required",
+            "this mutation is not bound to the authenticated owner run",
         )
 
 
@@ -379,7 +379,8 @@ def _claim_or_wait(
             conn.execute(
                 "UPDATE owner_workspace_receipts SET status = 'in_progress', "
                 "lock_token = ?, lock_expires = ?, project_id = NULL, "
-                "board_slug = NULL, task_id = NULL, result_json = NULL, updated_at = ? "
+                "board_slug = NULL, task_id = NULL, result_json = NULL, "
+                "terminal_generation = 0, updated_at = ? "
                 "WHERE actor = ? AND profile = ? AND idempotency_key = ? AND status = 'denied'",
                 (
                     token, now + _receipt_lease_seconds(), now,
@@ -1140,7 +1141,7 @@ def commit_task_graph(
         raise OwnerWorkspaceError("invalid_argument", "mode must be 'new' or 'existing'")
 
     operation = "owner_task_graph_commit"
-    _require_proposal_authority(
+    _require_owner_run_authority(
         ctx,
         operation=operation,
         idempotency_key=idempotency_key,
@@ -1419,14 +1420,23 @@ OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY = "lifecycle_revision"
 def _project_lifecycle_revision(
     conn: sqlite3.Connection, ctx: OwnerContext, project_id: str,
 ) -> int:
-    """Return the monotonic terminal lifecycle generation for one Project."""
-    return int(conn.execute(
-        "SELECT COUNT(*) FROM owner_workspace_receipts "
+    """Return the monotonic effective lifecycle generation for one Project.
+
+    A confirmation timeout is silence rather than an owner decision.  It is
+    intentionally retryable under the same idempotency key, so it must not
+    advance the optimistic revision that guards that exact retry.  Reading
+    and classifying the small receipt set also handles rows migrated from an
+    earlier schema where every terminal denial was initially marked as a
+    generation.
+    """
+    rows = conn.execute(
+        "SELECT * FROM owner_workspace_receipts "
         "WHERE actor = ? AND profile = ? AND project_id = ? "
         "AND operation = 'owner_project_lifecycle' "
         "AND terminal_generation > 0",
         (ctx.actor, ctx.profile, project_id),
-    ).fetchone()[0])
+    ).fetchall()
+    return sum(1 for row in rows if not _is_retryable_confirmation_timeout(row))
 
 
 def list_committed_projects(
@@ -1803,15 +1813,9 @@ def read_project_snapshot(
                 "child_ids": child_map[task.id],
             })
 
-        worker_rows = conn.execute(
-            "SELECT r.profile, t.title AS task_title, r.started_at "
-            "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
-            "WHERE t.project_id = ? AND t.task_kind = 'work' "
-            "AND r.ended_at IS NULL AND r.worker_pid IS NOT NULL "
-            "AND r.profile IS NOT NULL AND t.status = 'running' "
-            "ORDER BY r.started_at ASC LIMIT ?",
-            (project_id, _OWNER_PROJECT_MAX_WORKERS + 1),
-        ).fetchall()
+        worker_rows = kanban_db.verified_active_worker_rows(
+            conn, project_id=project_id,
+        )[:_OWNER_PROJECT_MAX_WORKERS + 1]
 
         attachment_rows = conn.execute(
             "SELECT a.id, a.filename, a.content_type, a.size, a.created_at "
@@ -2143,13 +2147,24 @@ def set_project_archived(
             "invalid_argument",
             "action must be 'archive', 'restore', 'pause', or 'resume'",
         )
+    operation = "owner_project_lifecycle"
+    _require_owner_run_authority(
+        ctx,
+        operation=operation,
+        idempotency_key=idempotency_key,
+        payload={
+            "idempotency_key": idempotency_key,
+            "project_id": project_id,
+            "expected_revision": expected_revision,
+            "action": action,
+        },
+    )
     payload = {
         "project_id": project_id,
         "expected_revision": expected_revision,
         "action": action,
     }
     digest = _digest(payload)
-    operation = "owner_project_lifecycle"
     target_archived = action == "archive"
 
     pconn = projects_db.connect()
@@ -2344,6 +2359,49 @@ _UNTITLED_PROJECT = "Untitled Project"
 # Default-ignorable code points are removed by the shared Unicode 17.0 helper
 # in tools.ansi_strip. This boundary adds only invalid lone surrogates.
 _OWNER_DISPLAY_STRIP_RE = re.compile("[\ud800-\udfff]")
+_OWNER_PRIVATE_WORK_ITEM_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bgh[opsu]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._-]{16,}", re.IGNORECASE),
+    re.compile(
+        r"\b(?:api[_-]?key|secret|password|passwd|access[_-]?token)"
+        r"\s*[:=]\s*\S+",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b[0-9a-f]{64}\b", re.IGNORECASE),
+    re.compile(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{12}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:task|run|resp|claim)[_-][0-9a-z]{6,}\b", re.IGNORECASE),
+    re.compile(r"\braphael-[a-z0-9][a-z0-9_-]{2,}\b", re.IGNORECASE),
+    re.compile(r"(?:^|\s)(?:/[A-Za-z0-9._-]+){2,}(?:\s|$)"),
+    re.compile(r"\b[A-Za-z]:\\(?:[^\\\s]+\\)+[^\\\s]+"),
+    re.compile(
+        r"\bclaude\s+(?:opus|sonnet|haiku)(?:\s*\d+(?:\.\d+)*)?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bgpt(?:[-\s]?\d[A-Za-z0-9._-]*)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:gpt|claude|gemini|llama|mistral|deepseek|qwen|grok)-"
+        r"[A-Za-z0-9._-]*\d[A-Za-z0-9._-]*\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:openai|anthropic|google|aws|azure|bedrock)\s*[:/]\s*"
+        r"[A-Za-z0-9._-]+\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:openai|anthropic|claude|gpt|gemini|llama|mistral|deepseek|"
+        r"qwen|grok|bedrock|opus|sonnet|haiku)\b",
+        re.IGNORECASE,
+    ),
+)
 _OWNER_STATE_LABELS = {
     "triage": "Needs attention",
     "todo": "Planned",
@@ -2443,9 +2501,14 @@ def owner_title(value: Any) -> str:
     title additionally loses the internal ``B03 — ``-style dispatcher prefix,
     which is Raphael's own bookkeeping and means nothing to the owner.
     """
-    return _owner_display_text(
+    title = _owner_display_text(
         value, limit=_OWNER_TITLE_LIMIT, strip_internal_prefix=True
-    ) or _UNTITLED_WORK_ITEM
+    )
+    if not title or any(
+        pattern.search(title) for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS
+    ):
+        return _UNTITLED_WORK_ITEM
+    return title
 
 
 def owner_project_name(value: Any) -> str:
@@ -2503,6 +2566,10 @@ def _native_owner_title(value: Any, field: str) -> str:
     if not title:
         raise OwnerWorkspaceError(
             "invalid_argument", f"{field} has no owner-visible text",
+        )
+    if any(pattern.search(title) for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS):
+        raise OwnerWorkspaceError(
+            "invalid_argument", f"{field} contains private operational detail",
         )
     return title
 
@@ -3119,7 +3186,7 @@ def commit_project_plan(
     if trigger not in _PROJECT_PLAN_TRIGGERS:
         raise OwnerWorkspaceError("invalid_argument", "trigger is invalid")
     operation = "owner_project_plan_commit"
-    _require_proposal_authority(
+    _require_owner_run_authority(
         ctx,
         operation=operation,
         idempotency_key=idempotency_key,
@@ -3224,57 +3291,72 @@ def commit_project_plan(
                 )
                 return result
 
-            with write_txn(pconn):
-                _assert_owns_lease(pconn, ctx, idempotency_key, token)
-                if not _receipt_owns_project(pconn, ctx, project_id):
-                    raise OwnerWorkspaceError(
-                        "project_not_owned",
-                        "the Project ownership receipt changed before commit",
-                    )
-                applied = kanban_db.apply_owner_project_plan(
-                    kconn,
-                    project_id=project_id,
-                    anchor_task_id=anchor_task_id,
-                    changes=normalized_changes,
-                    actor=ctx.actor,
-                    profile=ctx.profile,
-                    idempotency_key=idempotency_key,
-                    request_digest=digest,
-                    trigger=trigger,
-                    plan_summary=plan_record,
-                    current_milestone=current_milestone,
-                    later_milestones=normalized_later,
-                    board=board_slug,
+            # Lifecycle changes and owner board writes share this cross-process
+            # guard.  Re-read the Project only after the approval wait and
+            # keep the guard through receipt finalization, so an approval for
+            # stale active state can neither mutate an archived Project nor
+            # leave a committed board change without its durable receipt.
+            with _global_board_guard(board_slug):
+                with write_txn(pconn):
+                    _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                    if not _receipt_owns_project(pconn, ctx, project_id):
+                        raise OwnerWorkspaceError(
+                            "project_not_owned",
+                            "the Project ownership receipt changed before commit",
+                        )
+                    current_project = projects_db.get_project(pconn, project_id)
+                    if (
+                        current_project is None
+                        or current_project.archived
+                        or current_project.board_slug != board_slug
+                    ):
+                        applied = {"applied": False}
+                    else:
+                        _assert_board_ownership(board_slug, project_id)
+                        applied = kanban_db.apply_owner_project_plan(
+                            kconn,
+                            project_id=project_id,
+                            anchor_task_id=anchor_task_id,
+                            changes=normalized_changes,
+                            actor=ctx.actor,
+                            profile=ctx.profile,
+                            idempotency_key=idempotency_key,
+                            request_digest=digest,
+                            trigger=trigger,
+                            plan_summary=plan_record,
+                            current_milestone=current_milestone,
+                            later_milestones=normalized_later,
+                            board=board_slug,
+                        )
+
+                if not applied["applied"]:
+                    result = {
+                        "ok": False,
+                        "error": "conflict",
+                        "project_id": project_id,
+                        "project_slug": project.slug,
+                        "change_count": 0,
+                    }
+                else:
+                    _set_project_dispatch_state(board_slug, enabled=True)
+                    result = {
+                        "ok": True,
+                        "project_id": project_id,
+                        "project_slug": project.slug,
+                        "board": board_slug,
+                        "risk_level": risk_level,
+                        **applied,
+                    }
+                _update_progress(
+                    pconn, ctx, idempotency_key, token,
+                    project_id=project_id, board_slug=board_slug, task_id=anchor_task_id,
                 )
+                _finalize_receipt(
+                    pconn, ctx, idempotency_key, token, status="committed", result=result,
+                )
+                return result
         finally:
             kconn.close()
-
-        if not applied["applied"]:
-            result = {
-                "ok": False,
-                "error": "conflict",
-                "project_id": project_id,
-                "project_slug": project.slug,
-                "change_count": 0,
-            }
-        else:
-            _set_project_dispatch_state(board_slug, enabled=True)
-            result = {
-                "ok": True,
-                "project_id": project_id,
-                "project_slug": project.slug,
-                "board": board_slug,
-                "risk_level": risk_level,
-                **applied,
-            }
-        _update_progress(
-            pconn, ctx, idempotency_key, token,
-            project_id=project_id, board_slug=board_slug, task_id=anchor_task_id,
-        )
-        _finalize_receipt(
-            pconn, ctx, idempotency_key, token, status="committed", result=result,
-        )
-        return result
     finally:
         pconn.close()
 
@@ -3409,95 +3491,100 @@ def move_task(
             if kanban_db.get_task(kconn, task_id) is None:
                 raise OwnerWorkspaceError("task_not_found", f"no such task {task_id}")
 
-            # Fence: the lease check, the replay-recognition read, the CAS
-            # move, and readiness recompute all run under ONE held pconn
-            # write lock. A competing claimant's adoption needs that same
-            # lock (see :func:`_claim_or_wait`'s own ``write_txn``), so it
-            # cannot land between "we validated the lease" and "we moved the
-            # task" — it either waits for this block to finish (and then
-            # finds a terminal/foreign row instead of a live one to adopt),
-            # or it already committed before this block started, in which
-            # case `_assert_owns_lease` observes the new token right here and
-            # fails closed before the CAS ever runs.
-            with write_txn(pconn):
-                _assert_owns_lease(pconn, ctx, idempotency_key, token)
-                if not _receipt_owns_project(pconn, ctx, project_id):
-                    raise OwnerWorkspaceError(
-                        "project_not_owned",
-                        "the Project ownership receipt changed before commit",
-                    )
-                current_task = kanban_db.get_task(kconn, task_id)
-                if current_task is None or current_task.project_id != project_id:
-                    raise OwnerWorkspaceError(
-                        "task_not_found",
-                        "the task is no longer part of this receipt-owned Project",
-                    )
-
-                snapshot = None
-                if row is not None:
-                    # Adopting a dead claim — check whether THIS receipt
-                    # already committed the CAS before crashing.
-                    # ``task_events.id`` is a board-wide AUTOINCREMENT
-                    # sequence (not contiguous per task), so "the next event
-                    # after expected_revision" — NOT necessarily
-                    # ``expected_revision + 1`` — is the one that would have
-                    # been our CAS's commit, if it happened. Receipts are
-                    # scoped per (actor, profile, idempotency_key), but
-                    # ``task_events`` is shared across the whole board — a
-                    # DIFFERENT actor/profile may legitimately reuse the same
-                    # idempotency_key text on the same task, so matching on
-                    # idempotency_key alone could recognize a foreign event as
-                    # this receipt's own. Require the full identity this
-                    # receipt actually emitted: actor, profile, idempotency
-                    # key, AND the requested transition (to_status /
-                    # expected_status) — anything less risks fabricating a
-                    # success snapshot (and triggering readiness repair) for
-                    # a mutation this receipt never performed.
-                    already = kanban_db.get_next_event_after(kconn, task_id, expected_revision)
+            # Serialize the active-state recheck, board write, and receipt
+            # finalization against archive/restore.  The approval may have
+            # taken minutes; only state observed under this guard is allowed
+            # to authorize the mutation.
+            with _global_board_guard(board_slug):
+                with write_txn(pconn):
+                    _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                    if not _receipt_owns_project(pconn, ctx, project_id):
+                        raise OwnerWorkspaceError(
+                            "project_not_owned",
+                            "the Project ownership receipt changed before commit",
+                        )
+                    current_project = projects_db.get_project(pconn, project_id)
+                    current_task = kanban_db.get_task(kconn, task_id)
                     if (
-                        already is not None
-                        and already.kind == "owner_move"
-                        and (already.payload or {}).get("idempotency_key") == idempotency_key
-                        and (already.payload or {}).get("actor") == ctx.actor
-                        and (already.payload or {}).get("profile") == ctx.profile
-                        and (already.payload or {}).get("to_status") == to_status
-                        and (already.payload or {}).get("expected_status") == expected_status
+                        current_project is None
+                        or current_project.archived
+                        or current_project.board_slug != board_slug
                     ):
-                        snapshot = {"moved": True, "status": to_status, "revision": already.id}
+                        snapshot = {
+                            "moved": False,
+                            "status": current_task.status if current_task else task.status,
+                            "revision": (
+                                kanban_db.task_event_revision(kconn, task_id)
+                                if current_task else expected_revision
+                            ),
+                        }
+                    else:
+                        _assert_board_ownership(board_slug, project_id)
+                        if current_task is None or current_task.project_id != project_id:
+                            raise OwnerWorkspaceError(
+                                "task_not_found",
+                                "the task is no longer part of this receipt-owned Project",
+                            )
 
-                if snapshot is None:
-                    snapshot = kanban_db.cas_transition_task(
-                        kconn, task_id,
-                        expected_status=expected_status,
-                        expected_revision=expected_revision,
-                        to_status=to_status,
-                        event_kind="owner_move",
-                        event_payload={
-                            "actor": ctx.actor, "profile": ctx.profile,
-                            "idempotency_key": idempotency_key,
-                            "to_status": to_status, "expected_status": expected_status,
-                        },
-                    )
-                if snapshot["moved"] and to_status in ("done", "archived"):
-                    # Both done and archived parents satisfy readiness;
-                    # promote any children this move just unblocked.
-                    # Idempotent — safe to re-run on a replay that repairs a
-                    # prior crash gap between the status commit above and
-                    # this call, without re-emitting the move event (already
-                    # committed above).
-                    kanban_db.recompute_ready(kconn)
+                        snapshot = None
+                        if row is not None:
+                            # Adopting a dead claim: recognize only the exact
+                            # event identity this receipt could have emitted.
+                            already = kanban_db.get_next_event_after(
+                                kconn, task_id, expected_revision,
+                            )
+                            if (
+                                already is not None
+                                and already.kind == "owner_move"
+                                and (already.payload or {}).get("idempotency_key") == idempotency_key
+                                and (already.payload or {}).get("actor") == ctx.actor
+                                and (already.payload or {}).get("profile") == ctx.profile
+                                and (already.payload or {}).get("to_status") == to_status
+                                and (already.payload or {}).get("expected_status") == expected_status
+                            ):
+                                snapshot = {
+                                    "moved": True,
+                                    "status": to_status,
+                                    "revision": already.id,
+                                }
+
+                        if snapshot is None:
+                            snapshot = kanban_db.cas_transition_task(
+                                kconn, task_id,
+                                expected_status=expected_status,
+                                expected_revision=expected_revision,
+                                to_status=to_status,
+                                event_kind="owner_move",
+                                event_payload={
+                                    "actor": ctx.actor, "profile": ctx.profile,
+                                    "idempotency_key": idempotency_key,
+                                    "to_status": to_status,
+                                    "expected_status": expected_status,
+                                },
+                            )
+                        if snapshot["moved"] and to_status in ("done", "archived"):
+                            kanban_db.recompute_ready(kconn)
+
+                if snapshot["moved"]:
+                    result = {
+                        "ok": True,
+                        "task_id": task_id,
+                        "status": snapshot["status"],
+                        "revision": snapshot["revision"],
+                    }
+                else:
+                    result = {
+                        "ok": False, "error": "conflict", "task_id": task_id,
+                        "current_status": snapshot["status"],
+                        "current_revision": snapshot["revision"],
+                    }
+                _finalize_receipt(
+                    pconn, ctx, idempotency_key, token,
+                    status="committed", result=result,
+                )
+                return result
         finally:
             kconn.close()
-
-        if snapshot["moved"]:
-            result = {"ok": True, "task_id": task_id, "status": snapshot["status"], "revision": snapshot["revision"]}
-        else:
-            result = {
-                "ok": False, "error": "conflict", "task_id": task_id,
-                "current_status": snapshot["status"], "current_revision": snapshot["revision"],
-            }
-        _finalize_receipt(pconn, ctx, idempotency_key, token, status="committed", result=result)
-        return result
     finally:
         pconn.close()
 
@@ -3570,40 +3657,62 @@ def comment_task(
         operation_key = f"{ctx.actor}:{ctx.profile}:{idempotency_key}"
         kconn = kanban_db.connect(board=board_slug)
         try:
-            # Fence: the lease check and the comment insert share one held
-            # pconn write lock, so a takeover cannot land between validating
-            # the lease and actually appending the comment — see the
-            # module docstring's "Real lease fencing" section.
-            with write_txn(pconn):
-                _assert_owns_lease(pconn, ctx, idempotency_key, token)
-                if not _receipt_owns_project(pconn, ctx, project_id):
-                    raise OwnerWorkspaceError(
-                        "project_not_owned",
-                        "the Project ownership receipt changed before commit",
-                    )
-                current_task = kanban_db.get_task(kconn, task_id)
-                if current_task is None or current_task.project_id != project_id:
-                    raise OwnerWorkspaceError(
-                        "task_not_found",
-                        "the task is no longer part of this receipt-owned Project",
-                    )
-                # Author comes ONLY from the trusted context — never from a
-                # tool-call argument (kanban_db.add_comment takes it as a
-                # plain parameter; the kernel is the only caller that may
-                # supply it).
-                comment_id = kanban_db.add_comment(
-                    kconn, task_id, author=ctx.actor, body=body, operation_key=operation_key,
+            with _global_board_guard(board_slug):
+                with write_txn(pconn):
+                    _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                    if not _receipt_owns_project(pconn, ctx, project_id):
+                        raise OwnerWorkspaceError(
+                            "project_not_owned",
+                            "the Project ownership receipt changed before commit",
+                        )
+                    current_project = projects_db.get_project(pconn, project_id)
+                    current_task = kanban_db.get_task(kconn, task_id)
+                    if (
+                        current_project is None
+                        or current_project.archived
+                        or current_project.board_slug != board_slug
+                    ):
+                        comment_id = None
+                        revision = (
+                            kanban_db.task_event_revision(kconn, task_id)
+                            if current_task else 0
+                        )
+                    else:
+                        _assert_board_ownership(board_slug, project_id)
+                        if current_task is None or current_task.project_id != project_id:
+                            raise OwnerWorkspaceError(
+                                "task_not_found",
+                                "the task is no longer part of this receipt-owned Project",
+                            )
+                        # Author comes only from the trusted context.
+                        comment_id = kanban_db.add_comment(
+                            kconn,
+                            task_id,
+                            author=ctx.actor,
+                            body=body,
+                            operation_key=operation_key,
+                        )
+                        task = kanban_db.get_task(kconn, task_id)
+                        revision = kanban_db.task_event_revision(kconn, task_id)
+
+                if comment_id is None:
+                    result = {
+                        "ok": False,
+                        "error": "conflict",
+                        "task_id": task_id,
+                        "current_revision": revision,
+                    }
+                else:
+                    result = {
+                        "ok": True, "task_id": task_id, "comment_id": comment_id,
+                        "status": task.status, "revision": revision,
+                    }
+                _finalize_receipt(
+                    pconn, ctx, idempotency_key, token,
+                    status="committed", result=result,
                 )
-                task = kanban_db.get_task(kconn, task_id)
-                revision = kanban_db.task_event_revision(kconn, task_id)
+                return result
         finally:
             kconn.close()
-
-        result = {
-            "ok": True, "task_id": task_id, "comment_id": comment_id,
-            "status": task.status, "revision": revision,
-        }
-        _finalize_receipt(pconn, ctx, idempotency_key, token, status="committed", result=result)
-        return result
     finally:
         pconn.close()

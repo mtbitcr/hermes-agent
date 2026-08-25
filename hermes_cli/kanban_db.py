@@ -11009,6 +11009,81 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def verified_active_worker_rows(
+    conn: sqlite3.Connection,
+    *,
+    project_id: Optional[str] = None,
+    now: Optional[int] = None,
+) -> list[sqlite3.Row]:
+    """Return only running workers whose native claim is live on this host.
+
+    A persisted ``running`` row is historical state, not proof that a process
+    is doing work now.  Owner-facing surfaces may say "Working now" only when
+    the task and run still point at each other, their claim/PID agree, the
+    claim has not expired, the heartbeat is not stale, and that exact local
+    PID is alive.  A remote or otherwise unverifiable worker is omitted rather
+    than upgraded from recorded state to a live claim.
+    """
+    observed_at = int(time.time()) if now is None else int(now)
+    where = [
+        "t.task_kind = 'work'",
+        "t.status = 'running'",
+        "r.status = 'running'",
+        "r.ended_at IS NULL",
+        "r.profile IS NOT NULL",
+        "r.worker_pid IS NOT NULL",
+        "t.current_run_id = r.id",
+        "t.worker_pid = r.worker_pid",
+        "t.claim_lock = r.claim_lock",
+        "t.claim_expires = r.claim_expires",
+    ]
+    params: list[Any] = []
+    if project_id is not None:
+        where.append("t.project_id = ?")
+        params.append(str(project_id))
+    rows = conn.execute(
+        "SELECT r.id AS run_id, r.profile, t.title AS task_title, "
+        "r.started_at, r.worker_pid, r.claim_lock, r.claim_expires, "
+        "r.last_heartbeat_at AS run_heartbeat, "
+        "t.last_heartbeat_at AS task_heartbeat "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE "
+        + " AND ".join(where)
+        + " ORDER BY r.started_at ASC, r.id ASC",
+        params,
+    ).fetchall()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    verified: list[sqlite3.Row] = []
+    for row in rows:
+        claim_lock = str(row["claim_lock"] or "")
+        claim_expires = row["claim_expires"]
+        if (
+            not claim_lock.startswith(host_prefix)
+            or claim_expires is None
+            or int(claim_expires) < observed_at
+            or not _pid_alive(row["worker_pid"])
+        ):
+            continue
+        task_heartbeat = row["task_heartbeat"]
+        run_heartbeat = row["run_heartbeat"]
+        if task_heartbeat != run_heartbeat:
+            continue
+        if task_heartbeat is None:
+            # A worker can be visible before its first activity callback, but
+            # only for a short launch window.  Beyond that, PID state alone is
+            # not evidence of useful work.
+            if observed_at - int(row["started_at"]) > 120:
+                continue
+        else:
+            heartbeat_age = observed_at - int(task_heartbeat)
+            if (
+                heartbeat_age < 0
+                or heartbeat_age > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+            ):
+                continue
+        verified.append(row)
+    return verified
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],

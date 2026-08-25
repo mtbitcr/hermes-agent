@@ -65,6 +65,7 @@ def ctx():
 
 _RAW_COMMIT_TASK_GRAPH = ow.commit_task_graph
 _RAW_COMMIT_PROJECT_PLAN = ow.commit_project_plan
+_RAW_SET_PROJECT_LIFECYCLE = ow.set_project_archived
 
 
 def _authorized_context(ctx, operation: str, function, kwargs: dict):
@@ -99,6 +100,18 @@ def _commit_task_graph(ctx, **kwargs):
 def _commit_project_plan(ctx, **kwargs):
     return _RAW_COMMIT_PROJECT_PLAN(
         _authorized_context(ctx, "owner_project_plan_commit", _RAW_COMMIT_PROJECT_PLAN, kwargs),
+        **kwargs,
+    )
+
+
+def _set_project_archived(ctx, **kwargs):
+    return _RAW_SET_PROJECT_LIFECYCLE(
+        _authorized_context(
+            ctx,
+            "owner_project_lifecycle",
+            _RAW_SET_PROJECT_LIFECYCLE,
+            kwargs,
+        ),
         **kwargs,
     )
 
@@ -259,7 +272,7 @@ def _task_graph_args(**overrides):
 def test_task_graph_requires_authenticated_proposal_authority(ctx):
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
         _RAW_COMMIT_TASK_GRAPH(ctx, **_task_graph_args())
-    assert excinfo.value.code == "proposal_authority_required"
+    assert excinfo.value.code == "owner_run_authority_required"
 
 
 def test_task_graph_authority_is_bound_to_the_exact_payload(ctx):
@@ -270,7 +283,7 @@ def test_task_graph_authority_is_bound_to_the_exact_payload(ctx):
     args["request_title"] = "A different milestone"
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
         _RAW_COMMIT_TASK_GRAPH(authorized, **args)
-    assert excinfo.value.code == "proposal_authority_required"
+    assert excinfo.value.code == "owner_run_authority_required"
 
 
 def test_task_graph_commit_creates_native_project_and_atomic_graph(ctx):
@@ -515,6 +528,22 @@ def test_owner_title_projection_vectors_are_shared_with_the_owner_workspace():
         )
         == "Rotate ghp_AB...6789 before Friday"
     )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Use OpenAI for review",
+        "Run GPT-5.6 for verification",
+        "Open /srv/raphael/private/config.yaml",
+        "Project 123e4567-e89b-12d3-a456-426614174000",
+    ],
+)
+def test_owner_title_hides_private_operational_detail_but_project_name_keeps_owner_text(
+    value,
+):
+    assert ow.owner_title(value) == "Untitled work item"
+    assert ow.owner_project_name(value) == value
 
 
 def test_owner_title_masks_url_credentials_at_a_non_navigation_egress():
@@ -1356,7 +1385,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
     ) is True
 
     archive_approver = _with_approver(ctx.session)
-    archived = ow.set_project_archived(
+    archived = _set_project_archived(
         ctx,
         idempotency_key="project-lifecycle-archive",
         project_id=created["project_id"],
@@ -1377,7 +1406,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
     )[0]["lifecycle_revision"] == 1
 
     approval.unregister_gateway_notify(ctx.session)
-    assert ow.set_project_archived(
+    assert _set_project_archived(
         ctx,
         idempotency_key="project-lifecycle-archive",
         project_id=created["project_id"],
@@ -1386,7 +1415,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
     ) == archived
 
     restore_approver = _with_approver(ctx.session)
-    restored = ow.set_project_archived(
+    restored = _set_project_archived(
         ctx,
         idempotency_key="project-lifecycle-restore",
         project_id=created["project_id"],
@@ -1410,7 +1439,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
     assert restored_meta["dispatch_paused_by_owner"] is True
 
     resume_approver = _with_approver(ctx.session)
-    resumed = ow.set_project_archived(
+    resumed = _set_project_archived(
         ctx,
         idempotency_key="project-lifecycle-resume",
         project_id=created["project_id"],
@@ -1424,7 +1453,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
     ) is True
 
     pause_approver = _with_approver(ctx.session)
-    paused = ow.set_project_archived(
+    paused = _set_project_archived(
         ctx,
         idempotency_key="project-lifecycle-pause",
         project_id=created["project_id"],
@@ -1443,7 +1472,7 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
     # Returning to the same action after an intervening restore is a new
     # lifecycle generation, never a replay of the first archive receipt.
     second_archive_approver = _with_approver(ctx.session)
-    second_archive = ow.set_project_archived(
+    second_archive = _set_project_archived(
         ctx,
         idempotency_key="project-lifecycle-archive-again",
         project_id=created["project_id"],
@@ -1458,6 +1487,32 @@ def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
     )[0]["lifecycle_revision"] == 5
 
 
+def test_project_lifecycle_requires_exact_authenticated_run_authority(ctx):
+    approver = _with_approver(ctx.session)
+    created = _commit_task_graph(
+        ctx,
+        **_task_graph_args(
+            idempotency_key="graph-lifecycle-authority",
+            project_name="Lifecycle authority Project",
+        ),
+    )
+    approver.join()
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        _RAW_SET_PROJECT_LIFECYCLE(
+            ctx,
+            idempotency_key="project-lifecycle-without-authority",
+            project_id=created["project_id"],
+            expected_revision=0,
+            action="archive",
+        )
+
+    assert excinfo.value.code == "owner_run_authority_required"
+    project = ow.list_committed_projects(ctx, lifecycle_revision=True)[0]
+    assert project["archived"] is False
+    assert project["lifecycle_revision"] == 0
+
+
 def test_project_lifecycle_rejects_a_stale_owner_revision_before_approval(ctx):
     approver = _with_approver(ctx.session)
     created = _commit_task_graph(
@@ -1470,7 +1525,7 @@ def test_project_lifecycle_rejects_a_stale_owner_revision_before_approval(ctx):
     approver.join()
 
     approver = _with_approver(ctx.session)
-    archived = ow.set_project_archived(
+    archived = _set_project_archived(
         ctx,
         idempotency_key="project-lifecycle-stale-archive",
         project_id=created["project_id"],
@@ -1482,7 +1537,7 @@ def test_project_lifecycle_rejects_a_stale_owner_revision_before_approval(ctx):
 
     approval.unregister_gateway_notify(ctx.session)
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
-        ow.set_project_archived(
+        _set_project_archived(
             ctx,
             idempotency_key="project-lifecycle-stale-restore",
             project_id=created["project_id"],
@@ -1492,6 +1547,53 @@ def test_project_lifecycle_rejects_a_stale_owner_revision_before_approval(ctx):
 
     assert excinfo.value.code == "stale_revision"
     assert ow.list_committed_projects(ctx)[0]["archived"] is True
+    assert ow.list_committed_projects(
+        ctx, lifecycle_revision=True,
+    )[0]["lifecycle_revision"] == 1
+
+
+def test_project_lifecycle_timeout_does_not_consume_the_retry_revision(ctx):
+    approver = _with_approver(ctx.session)
+    created = _commit_task_graph(
+        ctx,
+        **_task_graph_args(
+            idempotency_key="graph-lifecycle-timeout",
+            project_name="Lifecycle Timeout Project",
+        ),
+    )
+    approver.join()
+    args = {
+        "idempotency_key": "project-lifecycle-timeout-archive",
+        "project_id": created["project_id"],
+        "expected_revision": 0,
+        "action": "archive",
+    }
+
+    with _temporarily_patch(
+        ow,
+        "_confirm",
+        lambda *args, **kwargs: {"approved": False, "reason": "timeout"},
+    ):
+        timed_out = _set_project_archived(ctx, **args)
+
+    assert timed_out == {
+        "ok": False,
+        "error": "confirmation_denied",
+        "reason": "timeout",
+    }
+    assert ow.list_committed_projects(
+        ctx, lifecycle_revision=True,
+    )[0]["lifecycle_revision"] == 0
+
+    with _temporarily_patch(
+        ow,
+        "_confirm",
+        lambda *args, **kwargs: {"approved": True, "choice": "once"},
+    ):
+        retried = _set_project_archived(ctx, **args)
+
+    assert retried["ok"] is True
+    assert retried["archived"] is True
     assert ow.list_committed_projects(
         ctx, lifecycle_revision=True,
     )[0]["lifecycle_revision"] == 1
@@ -1515,7 +1617,7 @@ def test_project_lifecycle_rechecks_revision_after_approval(ctx, monkeypatch):
         lambda _conn, _ctx, _project_id: next(revisions),
     )
     approver = _with_approver(ctx.session)
-    result = ow.set_project_archived(
+    result = _set_project_archived(
         ctx,
         idempotency_key="project-lifecycle-race-archive",
         project_id=created["project_id"],
@@ -1542,7 +1644,7 @@ def test_project_lifecycle_rejects_project_without_owner_receipt(ctx):
         project_id = projects_db.create_project(conn, name="Foreign Project")
 
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
-        ow.set_project_archived(
+        _set_project_archived(
             ctx,
             idempotency_key="foreign-project-archive",
             project_id=project_id,
@@ -1778,7 +1880,7 @@ def test_owner_decisions_projects_native_gates_without_writes_or_identifiers(ctx
         assert forbidden not in payload
 
     archived_approver = _with_approver(ctx.session)
-    ow.set_project_archived(
+    _set_project_archived(
         ctx,
         idempotency_key="decisions-archive-project",
         project_id=setup["project_id"],
@@ -1940,7 +2042,7 @@ def test_owner_approval_descriptions_project_every_project_name(ctx):
         assert planned["ok"] is True
 
         approver = _approve_once()
-        archived = ow.set_project_archived(
+        archived = _set_project_archived(
             ctx,
             idempotency_key="approval-archive",
             project_id=boot["project_id"],
@@ -2072,6 +2174,43 @@ def test_project_plan_timeout_can_retry_but_still_requires_approval(ctx):
             and task.title == "Prepare the approved deliverable"
         ]
     assert len(matching) == 1
+
+
+def test_project_plan_approval_cannot_mutate_a_project_archived_while_waiting(ctx):
+    setup = _bootstrap_board(ctx)
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "add",
+            "reason": "Create one bounded owner-approved task.",
+            "title": "Must not land after archive",
+            "body": "This stale approval must fail closed.",
+            "assignee": "default",
+            "existing_parents": [],
+            "new_parents": [],
+        }],
+        idempotency_key="steward-archive-race",
+    )
+
+    def archive_then_approve(*_args, **_kwargs):
+        with projects_db.connect_closing() as pconn:
+            with ow.write_txn(pconn):
+                pconn.execute(
+                    "UPDATE projects SET archived = 1 WHERE id = ?",
+                    (setup["project_id"],),
+                )
+        return {"approved": True, "choice": "once"}
+
+    with _temporarily_patch(ow, "_confirm", archive_then_approve):
+        result = _commit_project_plan(ctx, **args)
+
+    assert result["ok"] is False
+    assert result["error"] == "conflict"
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert all(
+            task.title != "Must not land after archive"
+            for task in kanban_db.list_tasks(conn)
+        )
 
 
 def test_project_plan_split_is_atomic_preserves_history_and_replays(ctx):
@@ -2468,6 +2607,37 @@ def test_move_task_success_and_archived_parent_satisfies_child_readiness(ctx):
         kconn.close()
 
 
+def test_move_task_approval_cannot_mutate_a_project_archived_while_waiting(ctx):
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        revision = kanban_db.task_event_revision(conn, setup["task_id"])
+
+    def archive_then_approve(*_args, **_kwargs):
+        with projects_db.connect_closing() as pconn:
+            with ow.write_txn(pconn):
+                pconn.execute(
+                    "UPDATE projects SET archived = 1 WHERE id = ?",
+                    (setup["project_id"],),
+                )
+        return {"approved": True, "choice": "once"}
+
+    with _temporarily_patch(ow, "_confirm", archive_then_approve):
+        result = ow.move_task(
+            ctx,
+            idempotency_key="move-archive-race",
+            task_id=setup["task_id"],
+            to_status="blocked",
+            expected_status="ready",
+            expected_revision=revision,
+            project_id=setup["project_id"],
+        )
+
+    assert result["ok"] is False
+    assert result["error"] == "conflict"
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert kanban_db.get_task(conn, setup["task_id"]).status == "ready"
+
+
 def test_comment_author_is_trusted_context_not_caller_supplied(ctx):
     setup = _bootstrap_board(ctx)
     board = setup["board"]
@@ -2486,6 +2656,36 @@ def test_comment_author_is_trusted_context_not_caller_supplied(ctx):
     assert len(comments) == 1
     assert comments[0].author == ctx.actor
     assert comments[0].body == "hello"
+
+
+def test_comment_approval_cannot_write_to_a_project_archived_while_waiting(ctx):
+    setup = _bootstrap_board(ctx)
+
+    def archive_then_approve(*_args, **_kwargs):
+        with projects_db.connect_closing() as pconn:
+            with ow.write_txn(pconn):
+                pconn.execute(
+                    "UPDATE projects SET archived = 1 WHERE id = ?",
+                    (setup["project_id"],),
+                )
+        return {"approved": True, "choice": "once"}
+
+    with _temporarily_patch(ow, "_confirm", archive_then_approve):
+        result = ow.comment_task(
+            ctx,
+            idempotency_key="comment-archive-race",
+            task_id=setup["task_id"],
+            body="must not be added",
+            project_id=setup["project_id"],
+        )
+
+    assert result["ok"] is False
+    assert result["error"] == "conflict"
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert all(
+            comment.body != "must not be added"
+            for comment in kanban_db.list_comments(conn, setup["task_id"])
+        )
 
 
 def test_comment_exact_replay_creates_no_duplicate(ctx):

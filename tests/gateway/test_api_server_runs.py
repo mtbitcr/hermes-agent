@@ -373,6 +373,30 @@ class TestStartRun:
             )
             assert restarted_snapshot["proposal_consumed"] is True
             assert restarted_snapshot["proposal_claimed"] is False
+            adapter._response_store = restarted_store
+            adapter._run_statuses.clear()
+            restarted_app = _create_runs_app(adapter)
+            with (
+                patch("gateway.run._load_gateway_config", return_value=config),
+                patch.object(adapter, "_create_agent") as restarted_create,
+            ):
+                async with TestClient(TestServer(restarted_app)) as cli:
+                    restored = await cli.get(f"/v1/runs/{first_run_id}")
+                    restored_status = await restored.json()
+                    replay = await cli.post(
+                        "/v1/runs",
+                        json=body,
+                        headers={"Idempotency-Key": idempotency_key},
+                    )
+                    replay_data = await replay.json()
+            assert restored.status == 200
+            assert restored_status["run_id"] == first_run_id
+            assert restored_status["status"] == "completed"
+            assert restored_status["owner_mutation_committed"] is True
+            assert restored_status["output"] == status["output"]
+            assert replay.status == 202, replay_data
+            assert replay_data["run_id"] == first_run_id
+            restarted_create.assert_not_called()
         finally:
             restarted_store.close()
 
@@ -435,6 +459,167 @@ class TestStartRun:
 
         assert response.status == 409
         assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_owner_lifecycle_run_is_exact_native_and_restart_safe(self, adapter):
+        from hermes_cli import owner_workspace as ow
+
+        setup_key = "setup-lifecycle-project"
+        proposal = _new_owner_proposal()
+        setup_payload = _new_owner_payload(setup_key, proposal)
+        setup_context = ow.OwnerContext(
+            actor="default",
+            profile="default",
+            session="setup-owner-lifecycle",
+            authority=ow.OwnerProposalAuthority(
+                actor="default",
+                profile="default",
+                session="setup-owner-lifecycle",
+                conversation="raphael-owner-" + "9" * 32,
+                response_id="resp_" + "8" * 32,
+                operation="owner_task_graph_commit",
+                idempotency_key=setup_key,
+                payload_digest=ow._digest(setup_payload),
+            ),
+        )
+        with (
+            patch(
+                "hermes_cli.profiles.list_profiles",
+                return_value=[SimpleNamespace(name="default")],
+            ),
+            patch(
+                "hermes_cli.owner_workspace._confirm",
+                return_value={"approved": True, "reason": None},
+            ),
+        ):
+            created = ow.commit_task_graph(setup_context, **setup_payload)
+
+        idempotency_key = "project-lifecycle-exact-run"
+        lifecycle_payload = {
+            "idempotency_key": idempotency_key,
+            "project_id": created["project_id"],
+            "expected_revision": 0,
+            "action": "archive",
+        }
+        body = {
+            "input": "Archive the confirmed Project now.",
+            "owner_workspace_context": {
+                "mode": "existing",
+                "project_slug": created["project_slug"],
+                "project_name": proposal["project_name"],
+            },
+            "owner_lifecycle_authority": {
+                "operation": "owner_project_lifecycle",
+                "idempotency_key": idempotency_key,
+                "payload": lifecycle_payload,
+            },
+        }
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+
+        class LifecycleAgent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+            _hermes_api_runtime = {}
+
+            def __init__(self, tool_complete_callback):
+                self._tool_complete_callback = tool_complete_callback
+
+            def run_conversation(self, **_kwargs):
+                from tools.owner_workspace_tools import _handle_project_lifecycle
+
+                result = _handle_project_lifecycle(lifecycle_payload)
+                self._tool_complete_callback(
+                    "tool-call-lifecycle",
+                    "owner_project_lifecycle",
+                    lifecycle_payload,
+                    result,
+                )
+                return {"final_response": "model prose is not lifecycle proof"}
+
+            def interrupt(self, _message=None):
+                return None
+
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch.object(adapter, "_create_agent") as mock_create,
+            patch(
+                "hermes_cli.owner_workspace._confirm",
+                return_value={"approved": True, "reason": None},
+            ),
+        ):
+            mock_create.side_effect = lambda **kwargs: LifecycleAgent(
+                kwargs["tool_complete_callback"]
+            )
+            async with TestClient(TestServer(app)) as cli:
+                stale_body = json.loads(json.dumps(body))
+                stale_body["owner_lifecycle_authority"]["payload"][
+                    "expected_revision"
+                ] = 99
+                stale = await cli.post(
+                    "/v1/runs",
+                    json=stale_body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                assert stale.status == 409
+                assert mock_create.call_count == 0
+
+                first = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                first_run_id = (await first.json())["run_id"]
+                for _ in range(40):
+                    polled = await cli.get(f"/v1/runs/{first_run_id}")
+                    status = await polled.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert first.status == 202
+        assert status["owner_mutation_committed"] is True
+        assert json.loads(status["output"]) == {
+            "ok": True,
+            "action": "archive",
+            "project_slug": created["project_slug"],
+            "archived": True,
+            "execution_paused": True,
+        }
+        assert "model prose" not in status["output"]
+        assert mock_create.call_count == 1
+
+        db_path = adapter._response_store._db_path
+        assert db_path is not None
+        adapter._response_store.close()
+        restarted_store = ResponseStore(db_path=db_path, default_profile="default")
+        try:
+            adapter._response_store = restarted_store
+            adapter._run_statuses.clear()
+            restarted_app = _create_runs_app(adapter)
+            with (
+                patch("gateway.run._load_gateway_config", return_value=config),
+                patch.object(adapter, "_create_agent") as restarted_create,
+            ):
+                async with TestClient(TestServer(restarted_app)) as cli:
+                    restored = await cli.get(f"/v1/runs/{first_run_id}")
+                    restored_status = await restored.json()
+                    replay = await cli.post(
+                        "/v1/runs",
+                        json=body,
+                        headers={"Idempotency-Key": idempotency_key},
+                    )
+                    replay_data = await replay.json()
+            assert restored.status == 200
+            assert restored_status["status"] == "completed"
+            assert restored_status["owner_mutation_committed"] is True
+            assert restored_status["output"] == status["output"]
+            assert replay.status == 202, replay_data
+            assert replay_data["run_id"] == first_run_id
+            restarted_create.assert_not_called()
+        finally:
+            restarted_store.close()
 
     @pytest.mark.asyncio
     async def test_failed_owner_run_retries_same_request_with_a_new_run(self, adapter):

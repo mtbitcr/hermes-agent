@@ -682,16 +682,25 @@ _CANONICAL_SENSITIVE_QUERY_PARAMS = frozenset(
 )
 
 
-def _canonical_url_param_name(name: str) -> str:
-    """Decode a URL parameter name for bounded, case-insensitive matching."""
+def _canonical_url_param_name(name: str) -> str | None:
+    """Decode a URL parameter name for bounded, case-insensitive matching.
+
+    Nested percent encoding is decoded to a fixed point.  Eight passes cover
+    legitimate double-encoding with ample margin; a name that still changes
+    after that is deliberately treated as ambiguous so the strict egress
+    boundary can fail closed without doing attacker-controlled unbounded work.
+    """
     from tools.ansi_strip import strip_default_ignorables
 
     decoded = name
-    for _ in range(3):
+    for _ in range(8):
         next_value = unquote_plus(decoded)
         if next_value == decoded:
             break
         decoded = next_value
+    else:
+        if unquote_plus(decoded) != decoded:
+            return None
     return strip_default_ignorables(decoded).casefold().replace("-", "_")
 
 
@@ -706,9 +715,10 @@ def _redact_strict_url_credentials(text: str) -> str:
     the percent-decoded, case-folded, hyphen-folded spelling of the key.
     """
     def _redact_param(match: re.Match) -> str:
+        canonical_name = _canonical_url_param_name(match.group(2))
         if (
-            _canonical_url_param_name(match.group(2))
-            not in _CANONICAL_SENSITIVE_QUERY_PARAMS
+            canonical_name is not None
+            and canonical_name not in _CANONICAL_SENSITIVE_QUERY_PARAMS
         ):
             return match.group(0)
         return f"{match.group(1)}{match.group(2)}=***"

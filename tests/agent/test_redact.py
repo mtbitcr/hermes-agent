@@ -563,6 +563,21 @@ class TestStrictUrlCredentialRedaction:
             "/callback?to%E2%80%8Bken=***&state=public"
         )
 
+    def test_nested_percent_encoding_cannot_hide_a_sensitive_key(self):
+        text = "/callback?to%252525E2%25252580%2525258Bken=opaque-value&state=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            "/callback?to%252525E2%25252580%2525258Bken=***&state=public"
+        )
+
+    def test_excessive_nested_encoding_fails_closed(self):
+        key = "token"
+        for _ in range(12):
+            key = key.replace("%", "%25").replace("t", "%74", 1)
+        text = f"/callback?{key}=opaque-value&state=public"
+        result = redact_sensitive_text(text, redact_url_credentials=True)
+        assert "opaque-value" not in result
+        assert result.endswith("=***&state=public")
+
     def test_strict_userinfo_masks_through_the_last_at_sign(self):
         text = "https://public@credential-value@example.com/repo.git"
         assert redact_sensitive_text(text, redact_url_credentials=True) == (

@@ -412,6 +412,35 @@ def _resolve_owner_proposal_run_authority(value: Any) -> "dict[str, Any] | None"
     }
 
 
+def _resolve_owner_lifecycle_run_authority(value: Any) -> "dict[str, Any] | None":
+    """Validate the closed transport shape for one Project lifecycle run."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "operation", "idempotency_key", "payload",
+    }:
+        raise ValueError("invalid owner lifecycle authority")
+    operation = value.get("operation")
+    idempotency_key = value.get("idempotency_key")
+    payload = value.get("payload")
+    if (
+        operation != "owner_project_lifecycle"
+        or not isinstance(idempotency_key, str)
+        or re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", idempotency_key) is None
+        or not isinstance(payload, dict)
+        or set(payload) != {
+            "idempotency_key", "project_id", "expected_revision", "action",
+        }
+        or payload.get("idempotency_key") != idempotency_key
+    ):
+        raise ValueError("invalid owner lifecycle authority")
+    return {
+        "operation": operation,
+        "idempotency_key": idempotency_key,
+        "payload": payload,
+    }
+
+
 def _normalize_api_route_rule(value: str) -> "str | None":
     """Normalize one legacy path prefix or exact METHOD route-template."""
     rule = value.strip()
@@ -1423,6 +1452,14 @@ class ResponseStore:
                 PRIMARY KEY (profile, session_scope, idempotency_key)
             )"""
         )
+        run_idempotency_columns = {
+            str(row[1])
+            for row in self._conn.execute("PRAGMA table_info(run_idempotency)")
+        }
+        if "terminal_json" not in run_idempotency_columns:
+            self._conn.execute(
+                "ALTER TABLE run_idempotency ADD COLUMN terminal_json TEXT"
+            )
         self._backfill_owner_proposals()
         self._conn.commit()
         self._conversation_lock = threading.RLock()
@@ -2606,6 +2643,154 @@ class ResponseStore:
             if row[0] == fingerprint
             else ("conflict", None)
         )
+
+    def persist_owner_run_completion(
+        self,
+        profile: str,
+        session_scope: str,
+        idempotency_key: str,
+        run_id: str,
+        receipt: str,
+        *,
+        created_at: float,
+        owner: "dict[str, str] | None" = None,
+    ) -> Dict[str, Any]:
+        """Atomically persist the native receipt and consume its proposal."""
+        profile = self._profile(profile)
+        if (
+            _OWNER_RUN_RE.fullmatch(run_id) is None
+            or re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", idempotency_key) is None
+            or not isinstance(created_at, (int, float))
+            or isinstance(created_at, bool)
+            or not math.isfinite(float(created_at))
+        ):
+            raise ValueError("invalid owner run completion")
+        try:
+            receipt_value = json.loads(receipt)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ValueError("invalid owner run receipt") from exc
+        if not isinstance(receipt_value, dict) or receipt_value.get("ok") is not True:
+            raise ValueError("invalid owner run receipt")
+
+        owner_profile = profile
+        if owner is not None:
+            required_owner_keys = {
+                "proposal_profile", "conversation", "response_id", "claim_id",
+                "operation", "payload_digest",
+            }
+            if not required_owner_keys.issubset(owner):
+                raise ValueError("invalid owner proposal completion")
+            owner_profile = self._profile(owner["proposal_profile"])
+            if (
+                not self._valid_owner_authority_ids(
+                    owner_profile,
+                    owner["conversation"],
+                    owner["response_id"],
+                    owner["claim_id"],
+                    run_id,
+                )
+                or owner["operation"] not in {
+                    "owner_task_graph_commit", "owner_project_plan_commit",
+                }
+                or re.fullmatch(r"[a-f0-9]{64}", owner["payload_digest"]) is None
+            ):
+                raise ValueError("invalid owner proposal completion")
+        now = time.time()
+        terminal = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "completed",
+            "created_at": float(created_at),
+            "updated_at": now,
+            "output": receipt,
+            "usage": {},
+            "owner_mutation_committed": True,
+            "last_event": "run.completed",
+        }
+        encoded = json.dumps(
+            terminal, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        with self._conversation_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if owner is not None:
+                    proposal_cursor = self._conn.execute(
+                        "UPDATE conversations SET consumed_response_id = ?, "
+                        "claim_state = 'completed' "
+                        "WHERE profile = ? AND name = ? AND proposal_response_id = ? "
+                        "AND claimed_response_id = ? AND claim_id = ? AND owner_run_id = ? "
+                        "AND bound_operation = ? AND bound_payload_digest = ? "
+                        "AND claim_state IN ('claimed', 'completed')",
+                        (
+                            owner["response_id"], owner_profile,
+                            owner["conversation"], owner["response_id"],
+                            owner["response_id"], owner["claim_id"], run_id,
+                            owner["operation"], owner["payload_digest"],
+                        ),
+                    )
+                    if proposal_cursor.rowcount != 1:
+                        self._conn.rollback()
+                        raise RuntimeError("owner proposal completion is unavailable")
+                cur = self._conn.execute(
+                    "UPDATE run_idempotency SET terminal_json = ? "
+                    "WHERE profile = ? AND session_scope = ? "
+                    "AND idempotency_key = ? AND run_id = ?",
+                    (
+                        encoded, profile, session_scope, idempotency_key, run_id,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    self._conn.rollback()
+                    raise RuntimeError("owner run idempotency record is unavailable")
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return terminal
+
+    def owner_run_completion(
+        self, profile: str, run_id: str,
+    ) -> "Dict[str, Any] | None":
+        """Read one closed persisted owner completion, failing closed on drift."""
+        profile = self._profile(profile)
+        rows = self._conn.execute(
+            "SELECT terminal_json FROM run_idempotency "
+            "WHERE profile = ? AND run_id = ? AND terminal_json IS NOT NULL "
+            "LIMIT 2",
+            (profile, run_id),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        try:
+            value = json.loads(rows[0][0])
+            output = value.get("output") if isinstance(value, dict) else None
+            receipt = json.loads(output) if isinstance(output, str) else None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        expected_keys = {
+            "object", "run_id", "status", "created_at", "updated_at",
+            "output", "usage", "owner_mutation_committed", "last_event",
+        }
+        if (
+            not isinstance(value, dict)
+            or set(value) != expected_keys
+            or value.get("object") != "hermes.run"
+            or value.get("run_id") != run_id
+            or _OWNER_RUN_RE.fullmatch(run_id) is None
+            or value.get("status") != "completed"
+            or value.get("owner_mutation_committed") is not True
+            or value.get("last_event") != "run.completed"
+            or value.get("usage") != {}
+            or not isinstance(receipt, dict)
+            or receipt.get("ok") is not True
+            or not all(
+                isinstance(value.get(field), (int, float))
+                and math.isfinite(float(value[field]))
+                for field in ("created_at", "updated_at")
+            )
+        ):
+            return None
+        return value
 
     def purge_run_idempotency(self, older_than: float) -> None:
         with self._conversation_lock:
@@ -9459,6 +9644,60 @@ class APIServerAdapter(BasePlatformAdapter):
             "proposal_digest": proposal_digest,
         }
 
+    def _validated_owner_lifecycle_authority(
+        self,
+        authority: "dict[str, Any]",
+        context: "dict[str, Any]",
+        profile: str,
+    ) -> "dict[str, str]":
+        """Bind one lifecycle run to exact receipt-backed Project state."""
+        if (
+            context.get("profile") != profile
+            or context.get("mode") != "existing"
+            or not isinstance(context.get("project_slug"), str)
+        ):
+            raise ValueError("owner lifecycle context mismatch")
+        payload = authority["payload"]
+        project_id = payload.get("project_id")
+        expected_revision = payload.get("expected_revision")
+        action = payload.get("action")
+        if (
+            not isinstance(project_id, str)
+            or not project_id
+            or isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+            or action not in {"archive", "restore", "pause", "resume"}
+        ):
+            raise ValueError("owner lifecycle payload is invalid")
+
+        from hermes_cli.owner_workspace import (
+            list_committed_projects,
+            resolve_owner_context,
+        )
+
+        projects = list_committed_projects(
+            resolve_owner_context(), lifecycle_revision=True,
+        )
+        matches = [
+            project for project in projects
+            if project.get("slug") == context["project_slug"]
+            and project.get("project_id") == project_id
+            and project.get("lifecycle_revision") == expected_revision
+        ]
+        if len(matches) != 1:
+            raise ValueError("owner lifecycle Project state is stale")
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        return {
+            "operation": "owner_project_lifecycle",
+            "idempotency_key": authority["idempotency_key"],
+            "payload_digest": hashlib.sha256(
+                canonical.encode("utf-8")
+            ).hexdigest(),
+        }
+
     @staticmethod
     def _owner_mutation_receipt(
         operation: str, result: Any,
@@ -9466,9 +9705,8 @@ class APIServerAdapter(BasePlatformAdapter):
         """Return the minimal receipt for one exact successful owner mutation.
 
         The tool callback observes the native tool result, not the model's
-        later prose.  Only the two proposal-backed mutation shapes are
-        accepted; denied, conflicting, malformed, or merely asserted results
-        cannot consume proposal authority.
+        later prose. Denied, conflicting, malformed, or merely asserted
+        results cannot become successful owner receipts.
         """
         if isinstance(result, str):
             try:
@@ -9515,6 +9753,30 @@ class APIServerAdapter(BasePlatformAdapter):
                 "applied": True,
                 "change_count": change_count,
             }
+        elif operation == "owner_project_lifecycle":
+            action = value.get("action")
+            archived = value.get("archived")
+            execution_paused = value.get("execution_paused")
+            expected_state = {
+                "archive": (True, True),
+                "restore": (False, True),
+                "pause": (False, True),
+                "resume": (False, False),
+            }.get(action)
+            if (
+                expected_state is None
+                or type(archived) is not bool
+                or type(execution_paused) is not bool
+                or (archived, execution_paused) != expected_state
+            ):
+                return None
+            receipt = {
+                "ok": True,
+                "action": action,
+                "project_slug": project_slug,
+                "archived": archived,
+                "execution_paused": execution_paused,
+            }
         else:
             return None
         return json.dumps(receipt, sort_keys=True, separators=(",", ":"))
@@ -9540,14 +9802,27 @@ class APIServerAdapter(BasePlatformAdapter):
             owner_proposal_authority = _resolve_owner_proposal_run_authority(
                 body.get("owner_proposal_authority")
             )
+            owner_lifecycle_authority = _resolve_owner_lifecycle_run_authority(
+                body.get("owner_lifecycle_authority")
+            )
         except ValueError:
             return web.json_response(
                 _openai_error("Invalid owner-workspace authority"), status=400
             )
-        if owner_proposal_authority is not None and owner_workspace_context is None:
+        if (
+            owner_proposal_authority is not None
+            and owner_lifecycle_authority is not None
+        ):
+            return web.json_response(
+                _openai_error("Owner authorities cannot be combined"), status=400
+            )
+        if (
+            (owner_proposal_authority is not None or owner_lifecycle_authority is not None)
+            and owner_workspace_context is None
+        ):
             return web.json_response(
                 _openai_error(
-                    "Owner proposal authority requires owner workspace context"
+                    "Owner authority requires owner workspace context"
                 ),
                 status=400,
             )
@@ -9576,7 +9851,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         retry_fingerprint,
                     )
                 )
-                retry_status = self._run_statuses.get(retry_run_id or "", {})
+                retry_status = self._run_statuses.get(retry_run_id or "") or (
+                    self._response_store.owner_run_completion(
+                        request_owner_profile, retry_run_id,
+                    )
+                    if retry_run_id is not None else None
+                ) or {}
                 retry_snapshot = self._response_store.owner_history_snapshot(
                     owner_proposal_authority["conversation"],
                     profile=owner_proposal_authority["proposal_profile"],
@@ -9613,6 +9893,69 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=409,
                 )
+        if owner_lifecycle_authority is not None:
+            # A completed lifecycle command changes the revision it was bound
+            # to. An exact transport retry must therefore resolve from the
+            # persisted terminal receipt before fresh-state validation.
+            retry_key = request.headers.get("Idempotency-Key")
+            if retry_key == owner_lifecycle_authority["idempotency_key"]:
+                retry_scope = hashlib.sha256(
+                    (gateway_session_key or "").encode("utf-8")
+                ).hexdigest()
+                retry_body = dict(body)
+                retry_body["_session_scope"] = retry_scope
+                retry_fingerprint = _make_request_fingerprint(
+                    retry_body, keys=sorted(retry_body),
+                )
+                retry_state, retry_run_id = (
+                    self._response_store.lookup_run_idempotency(
+                        request_owner_profile,
+                        retry_scope,
+                        retry_key,
+                        retry_fingerprint,
+                    )
+                )
+                retry_status = self._run_statuses.get(retry_run_id or "") or (
+                    self._response_store.owner_run_completion(
+                        request_owner_profile, retry_run_id,
+                    )
+                    if retry_run_id is not None else None
+                ) or {}
+                if (
+                    retry_state == "existing"
+                    and retry_run_id is not None
+                    and retry_status.get("status") == "completed"
+                    and retry_status.get("owner_mutation_committed") is True
+                ):
+                    response_headers = (
+                        {"X-Hermes-Session-Key": gateway_session_key}
+                        if gateway_session_key else {}
+                    )
+                    return web.json_response(
+                        {"run_id": retry_run_id, "status": "started"},
+                        status=202,
+                        headers=response_headers,
+                    )
+        if owner_lifecycle_authority is not None:
+            try:
+                owner_lifecycle_authority = (
+                    self._validated_owner_lifecycle_authority(
+                        owner_lifecycle_authority,
+                        owner_workspace_context,
+                        request_owner_profile,
+                    )
+                )
+            except ValueError:
+                return web.json_response(
+                    _openai_error(
+                        "Owner lifecycle state does not authorize this run",
+                        code="owner_lifecycle_authority_conflict",
+                    ),
+                    status=409,
+                )
+        owner_mutation_authority = (
+            owner_proposal_authority or owner_lifecycle_authority
+        )
 
         raw_input = body.get("input")
         if not raw_input:
@@ -9691,11 +10034,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(
                 _openai_error("Invalid Idempotency-Key"), status=400,
             )
-        if owner_proposal_authority is not None and (
-            idempotency_key != owner_proposal_authority["idempotency_key"]
+        if owner_mutation_authority is not None and (
+            idempotency_key != owner_mutation_authority["idempotency_key"]
         ):
             return web.json_response(
-                _openai_error("Owner proposal authority does not match this run"),
+                _openai_error("Owner authority does not match this run"),
                 status=400,
             )
         idempotency_fingerprint = None
@@ -9723,6 +10066,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         ),
                         status=409,
                     )
+                persisted_status = (
+                    self._response_store.owner_run_completion(
+                        request_owner_profile, existing_run_id,
+                    )
+                    if existing_run_id is not None else None
+                )
                 released_owner_retry = (
                     owner_proposal_authority is not None
                     and existing_run_id is not None
@@ -9734,7 +10083,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         existing_run_id,
                     )
                 )
-                if not released_owner_retry and existing_run_id not in self._run_statuses:
+                if (
+                    not released_owner_retry
+                    and existing_run_id not in self._run_statuses
+                    and persisted_status is None
+                ):
                     return web.json_response(
                         _openai_error(
                             "Idempotent run result has expired",
@@ -9747,7 +10100,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         owner_proposal_authority["conversation"],
                         profile=owner_proposal_authority["proposal_profile"],
                     )
-                    existing_status = self._run_statuses.get(existing_run_id, {})
+                    existing_status = (
+                        self._run_statuses.get(existing_run_id)
+                        or persisted_status
+                        or {}
+                    )
                     same_completed_mutation = (
                         owner_snapshot.get("proposal_consumed") is True
                         and existing_status.get("status") == "completed"
@@ -9839,7 +10196,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # approval for one run must not unblock another run's dangerous command.
         approval_session_key = run_id
         owner_authority_context = None
-        if owner_proposal_authority is not None:
+        if owner_mutation_authority is not None:
             from hermes_cli.owner_workspace import OwnerProposalAuthority
 
             owner_profile = str(owner_workspace_context["profile"])
@@ -9847,11 +10204,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 actor=owner_profile,
                 profile=owner_profile,
                 session=approval_session_key,
-                conversation=owner_proposal_authority["conversation"],
-                response_id=owner_proposal_authority["response_id"],
-                operation=owner_proposal_authority["operation"],
-                idempotency_key=owner_proposal_authority["idempotency_key"],
-                payload_digest=owner_proposal_authority["payload_digest"],
+                conversation=(
+                    owner_proposal_authority["conversation"]
+                    if owner_proposal_authority is not None else ""
+                ),
+                response_id=(
+                    owner_proposal_authority["response_id"]
+                    if owner_proposal_authority is not None else ""
+                ),
+                operation=owner_mutation_authority["operation"],
+                idempotency_key=owner_mutation_authority["idempotency_key"],
+                payload_digest=owner_mutation_authority["payload_digest"],
             )
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
@@ -9889,10 +10252,11 @@ class APIServerAdapter(BasePlatformAdapter):
         owner_receipt: List[Optional[str]] = [None]
         owner_authority_finalized = [False]
         owner_authority_completed = [False]
+        owner_completion_persisted = [False]
         owner_worker_future: List[Optional["asyncio.Future[Any]"]] = [None]
 
         def _finalize_owner_authority() -> bool:
-            """Let the server, not caller-declared run status, close authority."""
+            """Release an uncommitted proposal; success closes atomically elsewhere."""
             if owner_proposal_authority is None:
                 return False
             with owner_finalize_lock:
@@ -9900,6 +10264,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     return owner_authority_completed[0]
                 with owner_receipt_lock:
                     receipt = owner_receipt[0]
+                if receipt is not None:
+                    return False
                 args = (
                     owner_proposal_authority["proposal_profile"],
                     owner_proposal_authority["conversation"],
@@ -9908,18 +10274,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     run_id,
                 )
                 try:
-                    if receipt is not None:
-                        applied = self._response_store.complete_owner_claim(*args)
-                        applied = applied or self._response_store.owner_claim_is_completed(
-                            *args
-                        )
-                        if applied:
-                            owner_authority_completed[0] = True
-                    else:
-                        applied = self._response_store.release_owner_claim(*args)
-                        applied = applied or self._response_store.owner_claim_is_released(
-                            *args
-                        )
+                    applied = self._response_store.release_owner_claim(*args)
+                    applied = applied or self._response_store.owner_claim_is_released(
+                        *args
+                    )
                     if applied:
                         owner_authority_finalized[0] = True
                     return owner_authority_completed[0]
@@ -9930,16 +10288,48 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     return False
 
+        def _persist_owner_completion(receipt: str) -> bool:
+            """Close one native owner mutation and its retry record together."""
+            if owner_mutation_authority is None or idempotency_key is None:
+                return False
+            with owner_finalize_lock:
+                if owner_completion_persisted[0]:
+                    return True
+                if owner_authority_finalized[0] and not owner_authority_completed[0]:
+                    return False
+                try:
+                    terminal = self._response_store.persist_owner_run_completion(
+                        request_owner_profile,
+                        idempotency_session_scope,
+                        idempotency_key,
+                        run_id,
+                        receipt,
+                        created_at=created_at,
+                        owner=owner_proposal_authority,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[api_server] owner completion persistence failed for run=%s",
+                        run_id,
+                    )
+                    return False
+                owner_completion_persisted[0] = True
+                if owner_proposal_authority is not None:
+                    owner_authority_finalized[0] = True
+                    owner_authority_completed[0] = True
+                self._run_statuses[run_id] = terminal
+                return True
+
         def _owner_tool_complete(
             _tool_call_id: str,
             function_name: str,
             _function_args: Any,
             function_result: Any,
         ) -> None:
-            """Record only the exact proposal-backed native mutation receipt."""
+            """Record only the exact authority-bound native mutation receipt."""
             if (
-                owner_proposal_authority is None
-                or function_name != owner_proposal_authority["operation"]
+                owner_mutation_authority is None
+                or function_name != owner_mutation_authority["operation"]
             ):
                 return
             receipt = self._owner_mutation_receipt(function_name, function_result)
@@ -9957,13 +10347,16 @@ class APIServerAdapter(BasePlatformAdapter):
             # Close the crash window at the tool boundary. The native mutation
             # has committed and its canonical result is already observable;
             # later model prose is not execution authority.
-            _finalize_owner_authority()
+            _persist_owner_completion(receipt)
 
         def _owner_completed_receipt() -> Optional[str]:
-            if not _finalize_owner_authority():
+            if owner_mutation_authority is None:
                 return None
             with owner_receipt_lock:
-                return owner_receipt[0]
+                receipt = owner_receipt[0]
+            if receipt is None or not _persist_owner_completion(receipt):
+                return None
+            return receipt
 
         def _publish_owner_completion(usage: Optional[Dict[str, Any]] = None) -> bool:
             receipt = _owner_completed_receipt()
@@ -9995,7 +10388,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 future.exception()
             except (asyncio.CancelledError, Exception):
                 pass
-            _finalize_owner_authority()
+            if _owner_completed_receipt() is None:
+                _finalize_owner_authority()
             status = self._run_statuses.get(run_id, {}).get("status")
             if status in {"cancelled", "failed"}:
                 _publish_owner_completion()
@@ -10203,7 +10597,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     None, _run_sync,
                 )
                 owner_worker_future[0] = worker_future
-                if owner_proposal_authority is not None:
+                if owner_mutation_authority is not None:
                     worker_future.add_done_callback(_owner_worker_done)
                 result, usage = await asyncio.shield(worker_future)
                 if _publish_owner_completion(usage):
@@ -10236,7 +10630,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         error=error_msg,
                         last_event="run.failed",
                     )
-                elif owner_proposal_authority is not None:
+                elif owner_mutation_authority is not None:
                     error_msg = "The approved Project change was not committed"
                     _put_event_if_active({
                         "event": "run.failed",
@@ -10393,6 +10787,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
+        if status is None:
+            status = self._response_store.owner_run_completion(
+                _active_owner_profile(), run_id,
+            )
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
