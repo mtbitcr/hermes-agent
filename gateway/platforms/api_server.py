@@ -64,7 +64,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -1282,14 +1282,65 @@ _OWNER_CONVERSATION_RE = re.compile(
     r"raphael-owner-[a-f0-9]{32}(?:-[a-f0-9]{32})?"
 )
 _OWNER_RESPONSE_RE = re.compile(r"resp_[A-Za-z0-9_-]{8,128}")
+# "The caller asserted nothing about the predecessor", which is distinct from
+# asserting ``None`` ("this conversation must still have no turn").
+_UNSTATED: Any = object()
 _OWNER_CLAIM_RE = re.compile(r"claim_[A-Za-z0-9_-]{8,128}")
 _OWNER_RUN_RE = re.compile(r"run_[a-f0-9]{32}")
 _OWNER_PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _OWNER_SESSION_INDEX_LIMIT = 100
+# This process's identity as the executor of durably queued owner work. A
+# queued response or run lives in the store, but its only executor is an
+# in-memory asyncio task, so a restart leaves the durable state with nobody
+# driving it. The job row names the executor that owns it and carries a
+# renewable lease; recovery reclaims a row whose lease has expired (or whose
+# named process is provably gone, which is only a faster path to the same
+# answer). Fencing on the lease rather than on pid liveness is what stops a
+# recycled pid from stranding queued owner work forever.
+_EXECUTOR_ID = uuid.uuid4().hex
+# Jobs younger than this are never reaped, so a sibling gateway process that
+# just reserved one is not mistaken for a dead executor on a pid-reuse hit.
+_OWNER_JOB_REAP_MIN_AGE_SECONDS = 30.0
+# How long one executor's claim on a job stands without a heartbeat. Renewed on
+# every 60s sweep while the work is still running, so the margin is wide enough
+# that a busy process is never mistaken for a dead one.
+_OWNER_JOB_LEASE_SECONDS = 300.0
+# Plain-English, non-technical: this text reaches the owner.
+_OWNER_ORPHAN_RUN_MESSAGE = (
+    "This stopped before it finished because Raphael restarted. Nothing was "
+    "changed. You can ask for it again."
+)
+_OWNER_ORPHAN_RESPONSE_MESSAGE = (
+    "This stopped before it finished because Raphael restarted. Please send "
+    "your message again."
+)
+_OWNER_RUN_STOPPED_MESSAGE = (
+    "This stopped before it finished. Nothing was changed. You can ask for it "
+    "again."
+)
+# The terminal states a run's durable row may record, and the full set a poller
+# may read back from it.
+_TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_DURABLE_RUN_STATUSES = frozenset({"queued"}) | _TERMINAL_RUN_STATUSES
+# How many owner-visible turns one history projection carries. The reader
+# fetches this many and reports whether more exist, so a caller is never handed
+# a silently shortened transcript.
+_OWNER_HISTORY_TURN_LIMIT = 40
 _OWNER_CLAIM_LEASE_SECONDS = 300
 _OWNER_CONVERSATION_RESERVATION_LEASE_SECONDS = 300
 _OWNER_CONVERSATION_RESERVATION_RENEW_SECONDS = 60
 _OWNER_PROPOSAL_MAX_MUTATIONS = 12
+# The exact proposal schema versions that carry approval authority. Every
+# created task must now name its ``execution_tier``, so only these versions can
+# be committed: an older stored proposal stays readable (see
+# ``_OWNER_HISTORY_SCHEMA_VERSIONS``) but is no longer actionable, because
+# committing it would leave the native kernel resolving a route from a class
+# the planner never stated.
+_OWNER_NEW_PROPOSAL_SCHEMA = 3
+_OWNER_EXISTING_PROPOSAL_SCHEMA = 4
+# Every schema version whose structured assistant replies remain projectable in
+# owner conversation history, including the pre-tier ones.
+_OWNER_HISTORY_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
 _OWNER_NEW_PROPOSAL_KEYS = frozenset({
     "schema_version", "kind", "mode", "project_name",
     "project_description", "request_title", "summary", "project_size",
@@ -1301,6 +1352,46 @@ _OWNER_EXISTING_PROPOSAL_KEYS = frozenset({
     "project_size", "specification", "current_milestone",
     "owner_visible_result", "impact", "later_milestones", "changes",
 })
+# Exact shape of one ``add`` change inside an actionable existing-project
+# proposal. ``execution_tier`` is part of the authority: it is what the native
+# kernel resolves the task's immutable route from, so a change object without
+# it does not authorize anything.
+_OWNER_PROPOSAL_ADD_KEYS = frozenset({
+    "action", "reason", "title", "body", "assignee", "responsibility",
+    "execution_tier", "existing_parent_refs", "new_parents",
+})
+
+
+class OwnerAuthorityBroken(RuntimeError):
+    """The stored owner authority exists but cannot be read as authority.
+
+    A conversation that never existed and a conversation whose stored response
+    row is missing, whose JSON is corrupt, or whose transcript is malformed are
+    not the same answer. The first is genuinely empty; the second is a service
+    failure, and projecting it as "no history" invites a caller to plan a first
+    turn against a conversation that already has turns nobody can read.
+    """
+
+
+class _OwnerNativeReceiptUnreadable(RuntimeError):
+    """Whether one run's native mutation committed could not be decided.
+
+    Distinct from "it committed nothing". A run whose external effect is
+    undecided must not be reported failed and must not have its approval
+    released, because both invite the owner to run the same mutation twice.
+    """
+
+
+class OwnerAuthorityUnavailable(RuntimeError):
+    """Owner-authoritative state has no durable store, so nothing may proceed.
+
+    An owner proposal claim, conversation closure, run attachment or run
+    idempotency record IS authority: losing it does not merely lose history, it
+    re-opens an approval that was already spent and lets the same owner
+    mutation run twice. So when the configured durable store cannot be opened,
+    those operations fail closed with one stable error rather than silently
+    continuing against ephemeral in-memory state.
+    """
 
 
 def _response_store_locked(method):
@@ -1312,6 +1403,17 @@ def _response_store_locked(method):
             return method(self, *args, **kwargs)
 
     return locked
+
+
+def _owner_authority(method):
+    """Gate one owner-authoritative store operation on durable storage."""
+
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        self._require_durable_owner_authority()
+        return method(self, *args, **kwargs)
+
+    return guarded
 
 
 def _active_owner_profile() -> str:
@@ -1326,6 +1428,20 @@ def _active_owner_profile() -> str:
             profile = "default"
     profile = str(profile or "default").strip().lower()
     return profile if _OWNER_PROFILE_RE.fullmatch(profile) else "default"
+
+
+def _owner_conversation_group(name: Any) -> "tuple[Optional[str], Optional[str]]":
+    """Split one owner conversation name into ``(group, session)``.
+
+    ``session`` is ``None`` for the group's own (legacy) conversation. Returns
+    ``(None, None)`` for anything that is not an owner conversation name.
+    """
+    if not isinstance(name, str) or _OWNER_CONVERSATION_RE.fullmatch(name) is None:
+        return None, None
+    parts = name.split("-")
+    if len(parts) == 3:
+        return name, None
+    return "-".join(parts[:3]), parts[3]
 
 
 def _owner_final_proposal(history: Any) -> "dict[str, Any] | None":
@@ -1345,14 +1461,14 @@ def _owner_final_proposal(history: Any) -> "dict[str, Any] | None":
         if not isinstance(candidate, dict):
             return None
         if (
-            candidate.get("schema_version") == 2
+            candidate.get("schema_version") == _OWNER_NEW_PROPOSAL_SCHEMA
             and candidate.get("kind") == "proposal"
             and candidate.get("mode") == "new"
             and set(candidate) == _OWNER_NEW_PROPOSAL_KEYS
             and isinstance(candidate.get("tasks"), list)
             and 1 <= len(candidate["tasks"]) <= _OWNER_PROPOSAL_MAX_MUTATIONS
         ) or (
-            candidate.get("schema_version") == 3
+            candidate.get("schema_version") == _OWNER_EXISTING_PROPOSAL_SCHEMA
             and candidate.get("kind") == "project_change_proposal"
             and candidate.get("mode") == "existing"
             and set(candidate) == _OWNER_EXISTING_PROPOSAL_KEYS
@@ -1411,11 +1527,27 @@ class ResponseStore:
                 from hermes_cli.config import get_hermes_home
                 db_path = str(get_hermes_home() / "response_store.db")
             except Exception:
+                logger.error(
+                    "Response store path could not be resolved; owner workspace "
+                    "authority is unavailable in this process",
+                    exc_info=True,
+                )
                 db_path = ":memory:"
         self._db_path: Optional[str] = db_path if db_path != ":memory:" else None
         try:
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
         except Exception:
+            # Generic Responses traffic may still be served from memory — a lost
+            # cache entry there cannot authorize or duplicate anything. Owner
+            # authority may not: ``_require_durable_owner_authority`` refuses
+            # every owner operation for the life of this store instead of
+            # letting a claim, closure or run identity live somewhere that
+            # disappears on restart.
+            logger.error(
+                "Response store %s could not be opened; owner workspace "
+                "authority is unavailable in this process", db_path,
+                exc_info=True,
+            )
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
             self._db_path = None
         self._conversation_lock = threading.RLock()
@@ -1531,6 +1663,61 @@ class ResponseStore:
         if "status_json" not in run_idempotency_columns:
             self._conn.execute(
                 "ALTER TABLE run_idempotency ADD COLUMN status_json TEXT"
+            )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS owner_response_idempotency (
+                profile TEXT NOT NULL,
+                session_scope TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                conversation TEXT NOT NULL,
+                response_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                replay_json TEXT,
+                session_id TEXT,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (profile, session_scope, idempotency_key)
+            )"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS owner_conversation_sessions (
+                profile TEXT NOT NULL,
+                group_name TEXT NOT NULL,
+                name TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (profile, name)
+            )"""
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS owner_conversation_sessions_group "
+            "ON owner_conversation_sessions (profile, group_name, seq)"
+        )
+        self._backfill_owner_conversation_sessions()
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS owner_executor_jobs (
+                kind TEXT NOT NULL,
+                job_key TEXT NOT NULL,
+                profile TEXT NOT NULL,
+                executor_id TEXT NOT NULL,
+                executor_pid INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (kind, job_key)
+            )"""
+        )
+        job_columns = {
+            str(row[1])
+            for row in self._conn.execute("PRAGMA table_info(owner_executor_jobs)")
+        }
+        if "lease_expires_at" not in job_columns:
+            # A renewable lease, not PID liveness, is what fences an executor.
+            # A recycled PID looks alive forever, so a job whose owner died
+            # could be stranded permanently; a lease expires on its own. Rows
+            # written by an older build start with no lease, which reads as
+            # already expired — correct, since that process is long gone.
+            self._conn.execute(
+                "ALTER TABLE owner_executor_jobs ADD COLUMN lease_expires_at REAL"
             )
         self._backfill_owner_proposals()
 
@@ -1687,6 +1874,70 @@ class ResponseStore:
             "RENAME TO owner_conversation_closures"
         )
 
+    def _backfill_owner_conversation_sessions(self) -> None:
+        """Give every already-mapped owner conversation its durable sequence.
+
+        A one-time seed for stores written before this table existed. The seed
+        order is the only signal such a store has — the group's own conversation
+        first (it is by construction the oldest), then each sibling by the LRU
+        access time of its mapped response. That timestamp is exactly what this
+        sequence exists to stop depending on, which is why it is read ONCE here
+        and never again: from this point the sequence is immutable, so a later
+        read of an old session cannot reorder anything.
+        """
+        rows = self._conn.execute(
+            "SELECT c.profile, c.name, r.accessed_at FROM conversations c "
+            "LEFT JOIN responses r ON r.profile = c.profile "
+            "AND r.response_id = c.response_id "
+            "WHERE c.name NOT IN ("
+            "  SELECT name FROM owner_conversation_sessions s "
+            "  WHERE s.profile = c.profile"
+            ")"
+        ).fetchall()
+        seeded: List[tuple] = []
+        for profile, name, accessed_at in rows:
+            group, session = _owner_conversation_group(name)
+            if group is None:
+                continue
+            order = (
+                float(accessed_at)
+                if isinstance(accessed_at, (int, float))
+                and not isinstance(accessed_at, bool)
+                and math.isfinite(float(accessed_at))
+                else 0.0
+            )
+            seeded.append((str(profile), group, str(name), session is None, order))
+        # Within each group: its legacy (group-named) conversation first — it is
+        # by construction the oldest — then oldest access first, so the newest
+        # sibling ends up with the highest sequence.
+        seeded.sort(
+            key=lambda item: (
+                item[0], item[1], 0 if item[3] else 1, item[4], item[2],
+            )
+        )
+        for profile, group, name, _is_legacy, _order in seeded:
+            self._record_owner_session_locked(profile, group, name)
+
+    def _record_owner_session_locked(
+        self, profile: str, group: str, name: str,
+    ) -> None:
+        """Assign this owner conversation its immutable place in its group.
+
+        Assigned once, when the conversation is first mapped, and never changed.
+        That is what makes "which session is current" a durable fact rather than
+        a side effect of which response was read most recently: an owner opening
+        an old change no longer promotes it, and a bounded read can only ever cut
+        the OLDEST sessions.
+        """
+        self._conn.execute(
+            "INSERT INTO owner_conversation_sessions "
+            "(profile, group_name, name, seq, created_at) "
+            "SELECT ?, ?, ?, COALESCE(MAX(seq), 0) + 1, ? "
+            "FROM owner_conversation_sessions WHERE profile = ? AND group_name = ? "
+            "ON CONFLICT(profile, name) DO NOTHING",
+            (profile, group, name, time.time(), profile, group),
+        )
+
     def _backfill_owner_proposals(self) -> None:
         """Recover only structurally actionable final proposals from old rows."""
         rows = self._conn.execute(
@@ -1738,6 +1989,37 @@ class ResponseStore:
                     exc_info=True,
                 )
 
+    def _require_durable_owner_authority(self) -> None:
+        """Fail closed unless owner authority is backed by durable storage.
+
+        ``_db_path`` is None only when the configured on-disk store could not
+        be opened (or was never resolved) and the constructor fell back to an
+        in-memory connection. That fallback is fine for the generic Responses
+        cache; for owner state it would silently drop proposal claims,
+        conversation closures and run idempotency on restart, so every owner
+        operation refuses here instead. One stable error, checked per call, so
+        a store that starts durable and is later replaced does not need a
+        second code path.
+
+        Checked per call for a second reason: a store that WAS durable can stop
+        being so while the process runs. If the file is unlinked underneath us,
+        SQLite keeps serving the open inode, so reads and writes still appear to
+        succeed — and vanish at the next restart. An owner claim, closure or run
+        identity recorded there is not durable, so the same refusal applies.
+        """
+        if self._db_path is None:
+            raise OwnerAuthorityUnavailable(
+                "the owner workspace store is unavailable"
+            )
+        if not os.path.exists(self._db_path):
+            logger.error(
+                "Response store %s is no longer on disk; owner workspace "
+                "authority is unavailable in this process", self._db_path,
+            )
+            raise OwnerAuthorityUnavailable(
+                "the owner workspace store is unavailable"
+            )
+
     def _profile(self, profile: Optional[str]) -> str:
         selected = str(profile or self._default_profile).strip().lower()
         if _OWNER_PROFILE_RE.fullmatch(selected) is None:
@@ -1780,7 +2062,20 @@ class ResponseStore:
         self, response_id: str, data: Dict[str, Any], *, profile: Optional[str] = None,
     ) -> None:
         """Store a response, evicting the oldest if at capacity."""
-        profile = self._profile(profile)
+        self._put_response_locked(response_id, data, self._profile(profile))
+        self._conn.commit()
+
+    def _put_response_locked(
+        self, response_id: str, data: Dict[str, Any], profile: str,
+    ) -> None:
+        """Write one response row and its eviction, WITHOUT committing.
+
+        Split out so an owner turn can publish its response, its conversation
+        head, its reservation release and its durable replay record inside ONE
+        transaction (see :meth:`publish_owner_turn`). As four separate commits,
+        a crash between any two left a turn that had happened but could not be
+        replayed, or a head with no response behind it.
+        """
         self._conn.execute(
             "INSERT OR REPLACE INTO responses "
             "(response_id, profile, data, accessed_at) VALUES (?, ?, ?, ?)",
@@ -1830,7 +2125,6 @@ class ResponseStore:
                     f"AND response_id IN ({placeholders})",
                     [profile, *evict_ids],
                 )
-        self._conn.commit()
 
     @_response_store_locked
     def delete(self, response_id: str, *, profile: Optional[str] = None) -> bool:
@@ -1881,6 +2175,7 @@ class ResponseStore:
         ).fetchone()
         return row[0] if row else None
 
+    @_owner_authority
     @_response_store_locked
     def owner_history_snapshot(
         self, name: str, *, profile: Optional[str] = None,
@@ -1892,14 +2187,25 @@ class ResponseStore:
         assistant text, usage, sessions, or private reasoning.  The opaque
         handle stays service-to-service so callers can re-read and validate
         the stored response before granting any approval authority.
+
+        Absent and BROKEN authority are answered differently. A conversation
+        with no mapping is the empty snapshot; one whose mapped response row is
+        missing, whose stored JSON is corrupt, whose transcript is not a list,
+        or which carries a malformed authoritative turn raises
+        :class:`OwnerAuthorityBroken`, which the endpoint reports as a service
+        failure. Returning the same empty snapshot for both invited a caller to
+        plan a first turn against a conversation that already had turns.
         """
         empty: Dict[str, Any] = {
+            "head_response_id": None,
             "latest_response_id": None,
             "proposal_consumed": False,
             "proposal_claimed": False,
             "active_run_id": None,
             "completed_run_id": None,
             "conversation_closed": False,
+            "truncated": False,
+            "incomplete": False,
             "data": [],
         }
         profile = self._profile(profile)
@@ -1908,6 +2214,10 @@ class ResponseStore:
             or _OWNER_CONVERSATION_RE.fullmatch(name) is None
         ):
             return empty
+        mapping = self._conn.execute(
+            "SELECT response_id FROM conversations WHERE profile = ? AND name = ?",
+            (profile, name),
+        ).fetchone()
         row = self._conn.execute(
             "SELECT c.response_id, c.proposal_response_id, c.consumed_response_id, "
             "c.claimed_response_id, c.owner_run_id, c.claim_state, c.closed, r.data "
@@ -1917,6 +2227,12 @@ class ResponseStore:
             (profile, name),
         ).fetchone()
         if row is None:
+            if mapping is not None:
+                # The conversation IS mapped, but the response it names is gone.
+                # That is a broken authority, not an empty conversation.
+                raise OwnerAuthorityBroken(
+                    f"owner conversation {name} maps a response that is missing"
+                )
             if self._conn.execute(
                 "SELECT 1 FROM owner_conversation_closures "
                 "WHERE profile = ? AND name = ?",
@@ -1926,52 +2242,85 @@ class ResponseStore:
             return empty
         try:
             stored = json.loads(row[7])
-        except (json.JSONDecodeError, TypeError):
-            return empty
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise OwnerAuthorityBroken(
+                f"owner conversation {name} has an unreadable stored response"
+            ) from exc
         history = stored.get("conversation_history") if isinstance(stored, dict) else None
         if not isinstance(history, list):
-            return empty
+            raise OwnerAuthorityBroken(
+                f"owner conversation {name} has no readable transcript"
+            )
 
         from agent.redact import redact_sensitive_text
 
         turns: List[Dict[str, str]] = []
         owner_text: Optional[str] = None
         raphael_text: Optional[str] = None
+        incomplete = False
 
         def _flush() -> None:
-            nonlocal owner_text, raphael_text
+            nonlocal owner_text, raphael_text, incomplete
             if owner_text is not None and raphael_text is not None:
                 turns.append({"owner": owner_text, "raphael": raphael_text})
+            elif owner_text is not None:
+                # An owner turn with no projectable reply before the next turn
+                # boundary — consecutive owner messages, or a trailing one. The
+                # turn really happened, so it is NOT silently dropped: the
+                # projection is marked incomplete, which is what stops a caller
+                # presenting the remaining turns as the whole conversation.
+                incomplete = True
             owner_text = None
             raphael_text = None
 
+        # An OWNER message is a turn BOUNDARY, so it is authoritative in a way
+        # an assistant message is not: dropping one silently merges two owner
+        # turns into one and shows the owner a transcript that never happened.
+        # Every one of them therefore has to be projectable, or the whole
+        # projection fails. The assistant side keeps selecting the last
+        # structured reply and skipping everything else — tool traffic and
+        # intermediate text are legitimately not owner-visible, and a reply
+        # kind this projection deliberately excludes (an Automations
+        # ``automation_proposal``) is not a defect either.
         for message in history:
             if not isinstance(message, dict):
-                continue
+                # A stored transcript is written by this service; a record that
+                # is not an object at all is corrupt authority, not a message
+                # to skip past. Skipping it could merge two owner turns.
+                raise OwnerAuthorityBroken(
+                    f"owner conversation {name} has an unreadable transcript record"
+                )
             role = message.get("role")
             content = message.get("content")
+            if role == "user":
+                if not isinstance(content, str) or not content.strip():
+                    raise OwnerAuthorityBroken(
+                        f"owner conversation {name} has an unreadable owner turn"
+                    )
+                text = content.strip()
+                _flush()
+                if len(text) > _OWNER_HISTORY_OWNER_MAX_CHARS:
+                    raise OwnerAuthorityBroken(
+                        f"owner conversation {name} has an owner turn that "
+                        "cannot be projected"
+                    )
+                owner_text = redact_sensitive_text(text, force=True)
+                continue
+            if role != "assistant" or owner_text is None:
+                continue
             if not isinstance(content, str):
                 continue
             text = content.strip()
             if not text:
                 continue
-            if role == "user":
-                _flush()
-                if len(text) > _OWNER_HISTORY_OWNER_MAX_CHARS:
-                    continue
-                owner_text = redact_sensitive_text(text, force=True)
-                continue
-            if role != "assistant" or owner_text is None:
-                continue
-            if len(text) > _OWNER_HISTORY_RAPHAEL_MAX_CHARS:
-                continue
             try:
                 candidate = json.loads(text)
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
                 continue
             if (
                 not isinstance(candidate, dict)
-                or candidate.get("schema_version") not in {1, 2, 3}
+                or candidate.get("schema_version")
+                not in _OWNER_HISTORY_SCHEMA_VERSIONS
                 or candidate.get("kind")
                 not in {"question", "proposal", "project_change_proposal"}
             ):
@@ -1983,11 +2332,21 @@ class ResponseStore:
             projected_text = json.dumps(
                 redact_review_value(candidate), ensure_ascii=False,
             )
-            if len(projected_text) > _OWNER_HISTORY_RAPHAEL_MAX_CHARS:
-                continue
+            if (
+                len(text) > _OWNER_HISTORY_RAPHAEL_MAX_CHARS
+                or len(projected_text) > _OWNER_HISTORY_RAPHAEL_MAX_CHARS
+            ):
+                # This IS the turn's authoritative structured reply. Skipping it
+                # would leave an EARLIER reply standing as final, so the whole
+                # projection fails instead of quietly showing the wrong answer.
+                raise OwnerAuthorityBroken(
+                    f"owner conversation {name} has a reply that cannot be "
+                    "projected"
+                )
             raphael_text = projected_text
         _flush()
-        data = turns[-40:]
+        truncated = len(turns) > _OWNER_HISTORY_TURN_LIMIT
+        data = turns[-_OWNER_HISTORY_TURN_LIMIT:]
         proposal_response_id = row[1]
         proposal_consumed = (
             proposal_response_id is not None and row[2] == proposal_response_id
@@ -2012,15 +2371,39 @@ class ResponseStore:
         ):
             completed_run_id = row[4]
         return {
+            # The exact turn this conversation currently ends at, whatever it
+            # was. Distinct from ``latest_response_id``, which names the
+            # outstanding PROPOSAL and is null after an ordinary question — a
+            # caller that has to state the turn it planned against needs the
+            # head, not the proposal. Service-to-service only, like every other
+            # opaque handle in this projection.
+            # Independent of the projected turns. The projection deliberately
+            # excludes some reply kinds (an Automations ``automation_proposal``
+            # is one), so a conversation with a real durable head can project
+            # zero turns — and nulling the head there made every later turn on
+            # that conversation either conflict as stale or replay the old
+            # proposal.
+            "head_response_id": row[0],
             "latest_response_id": proposal_response_id if data else None,
             "proposal_consumed": proposal_consumed,
             "proposal_claimed": proposal_claimed,
             "active_run_id": row[4] if proposal_claimed else None,
             "completed_run_id": completed_run_id,
             "conversation_closed": bool(row[6]),
+            # Whether older owner-visible turns exist beyond the window this
+            # projection carries, so a caller renders "there is more" instead
+            # of presenting a shortened transcript as the whole conversation.
+            "truncated": truncated,
+            # Whether an owner turn inside this window could not be projected as
+            # a turn at all — a reply kind this projection excludes, or a
+            # transcript that does not alternate. Reported for the same reason
+            # ``truncated`` is: a caller must not present what is left as the
+            # complete conversation.
+            "incomplete": incomplete,
             "data": data,
         }
 
+    @_owner_authority
     @_response_store_locked
     def mark_owner_proposal_consumed(
         self, profile: str, name: str, response_id: str,
@@ -2094,6 +2477,7 @@ class ResponseStore:
             (profile, name, now),
         ).fetchone()
 
+    @_owner_authority
     def claim_owner_proposal(
         self, profile: str, name: str, response_id: str, claim_id: str,
     ) -> bool:
@@ -2146,6 +2530,7 @@ class ResponseStore:
                 self._conn.rollback()
                 raise
 
+    @_owner_authority
     def attach_owner_run(
         self,
         profile: str,
@@ -2182,6 +2567,7 @@ class ResponseStore:
             self._conn.commit()
             return cursor.rowcount == 1
 
+    @_owner_authority
     def claim_and_attach_owner_run(
         self,
         profile: str,
@@ -2192,8 +2578,15 @@ class ResponseStore:
         *,
         operation: str,
         payload_digest: str,
+        job_payload: "Optional[Dict[str, Any]]" = None,
+        job_profile: Optional[str] = None,
     ) -> bool:
-        """Atomically bind one validated proposal, claim, payload, and run."""
+        """Atomically bind one validated proposal, claim, payload, and run.
+
+        ``job_payload`` puts the durable executor recovery job in the SAME
+        transaction as the claim, so a crash between them can never leave a
+        proposal claimed by a run nobody is driving.
+        """
         profile = self._profile(profile)
         if (
             not self._valid_owner_authority_ids(
@@ -2248,12 +2641,17 @@ class ResponseStore:
                         profile, name, response_id,
                     ),
                 )
+                if job_payload is not None:
+                    self._reserve_owner_job_locked(
+                        "run", run_id, self._profile(job_profile), job_payload,
+                    )
                 self._conn.commit()
                 return True
             except Exception:
                 self._conn.rollback()
                 raise
 
+    @_owner_authority
     @_response_store_locked
     def owner_claim_is_completed(
         self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
@@ -2272,6 +2670,7 @@ class ResponseStore:
         ).fetchone()
         return row is not None
 
+    @_owner_authority
     @_response_store_locked
     def owner_claim_is_released(
         self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
@@ -2291,6 +2690,7 @@ class ResponseStore:
         ).fetchone()
         return row is not None
 
+    @_owner_authority
     def abandon_unattached_owner_claim(
         self, profile: str, name: str, response_id: str, claim_id: str,
     ) -> bool:
@@ -2312,6 +2712,7 @@ class ResponseStore:
             self._conn.commit()
             return cursor.rowcount == 1
 
+    @_owner_authority
     @_response_store_locked
     def owner_proposal_record(
         self, profile: str, name: str, response_id: str,
@@ -2341,6 +2742,7 @@ class ResponseStore:
             return None
         return candidate, digest
 
+    @_owner_authority
     @_response_store_locked
     def owner_run_is_attached(
         self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
@@ -2360,6 +2762,7 @@ class ResponseStore:
         ).fetchone()
         return row is not None
 
+    @_owner_authority
     def complete_owner_claim(
         self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
     ) -> bool:
@@ -2381,6 +2784,7 @@ class ResponseStore:
             self._conn.commit()
             return cursor.rowcount == 1
 
+    @_owner_authority
     def release_owner_claim(
         self, profile: str, name: str, response_id: str, claim_id: str, run_id: str,
     ) -> bool:
@@ -2402,10 +2806,26 @@ class ResponseStore:
             self._conn.commit()
             return cursor.rowcount == 1
 
+    @_owner_authority
     def close_owner_conversation(
-        self, profile: str, name: str, response_id: Optional[str],
+        self,
+        profile: str,
+        name: str,
+        response_id: Optional[str],
+        *,
+        expected_head_response_id: Any = _UNSTATED,
     ) -> bool:
-        """Close one exact conversation only while it has no approved work."""
+        """Close one exact conversation only while it has no approved work.
+
+        ``expected_head_response_id`` is the caller's assertion about the turn
+        this conversation currently ENDS at, compared inside the closing
+        transaction. Comparing only the outstanding proposal could not see a
+        concurrent question landing: an ordinary question leaves
+        ``proposal_response_id`` untouched, so a stale tab still matched and
+        closed the conversation — hiding a newer turn the owner had already
+        been shown. ``None`` asserts "no turn yet"; :data:`_UNSTATED` preserves
+        the previous behaviour for a caller that states no head.
+        """
         profile = self._profile(profile)
         if (
             not isinstance(name, str)
@@ -2415,6 +2835,14 @@ class ResponseStore:
                 and (
                     not isinstance(response_id, str)
                     or _OWNER_RESPONSE_RE.fullmatch(response_id) is None
+                )
+            )
+            or (
+                expected_head_response_id is not _UNSTATED
+                and expected_head_response_id is not None
+                and (
+                    not isinstance(expected_head_response_id, str)
+                    or _OWNER_RESPONSE_RE.fullmatch(expected_head_response_id) is None
                 )
             )
         ):
@@ -2429,12 +2857,15 @@ class ResponseStore:
                     return False
                 row = self._conn.execute(
                     "SELECT proposal_response_id, consumed_response_id, claimed_response_id, "
-                    "claim_state, closed FROM conversations "
+                    "claim_state, closed, response_id FROM conversations "
                     "WHERE profile = ? AND name = ?",
                     (profile, name),
                 ).fetchone()
                 if row is None:
-                    if response_id is not None:
+                    if response_id is not None or (
+                        expected_head_response_id is not _UNSTATED
+                        and expected_head_response_id is not None
+                    ):
                         self._conn.rollback()
                         return False
                     self._conn.execute(
@@ -2446,6 +2877,12 @@ class ResponseStore:
                     self._conn.commit()
                     return True
                 if row[0] != response_id:
+                    self._conn.rollback()
+                    return False
+                if (
+                    expected_head_response_id is not _UNSTATED
+                    and row[5] != expected_head_response_id
+                ):
                     self._conn.rollback()
                     return False
                 if bool(row[4]):
@@ -2460,11 +2897,15 @@ class ResponseStore:
                 if row[2] == row[0] and row[3] == "claimed" and row[1] != row[0]:
                     self._conn.rollback()
                     return False
-                self._conn.execute(
+                cursor = self._conn.execute(
                     "UPDATE conversations SET closed = 1 "
-                    "WHERE profile = ? AND name = ? AND proposal_response_id IS ?",
-                    (profile, name, response_id),
+                    "WHERE profile = ? AND name = ? AND proposal_response_id IS ? "
+                    "AND response_id IS ?",
+                    (profile, name, response_id, row[5]),
                 )
+                if cursor.rowcount != 1:
+                    self._conn.rollback()
+                    return False
                 self._conn.execute(
                     "INSERT INTO owner_conversation_closures "
                     "(profile, name, closed_at) VALUES (?, ?, ?) "
@@ -2477,6 +2918,7 @@ class ResponseStore:
                 self._conn.rollback()
                 raise
 
+    @_owner_authority
     @_response_store_locked
     def owner_session_index(
         self, profile: str, group: str,
@@ -2486,72 +2928,151 @@ class ResponseStore:
         Conversation transcripts remain the native authority.  This bounded
         projection exposes no response handles, system prompts, tool output,
         internal reasoning, or sibling project history.
+
+        Ordered by each session's own immutable sequence (see
+        :meth:`_record_owner_session_locked`), newest FIRST, so the group's
+        current session is always the first entry and a bounded read can only
+        ever cut the oldest ones. Ordering by the mapped response's LRU access
+        time instead meant reading an old change promoted it, and could push the
+        real current session past the bound before anything validated it.
+
+        Nothing is silently dropped. A session whose mapped response row is
+        missing, whose stored JSON is unreadable, or whose transcript cannot be
+        projected is listed as explicitly unavailable, and a session with a
+        valid head but no owner-visible turns yet is listed with a zero turn
+        count — dropping either made a caller select an older session, or a
+        legacy one, as if the real one did not exist.
         """
         profile = self._profile(profile)
         if (
             not isinstance(group, str)
             or re.fullmatch(r"raphael-owner-[a-f0-9]{32}", group) is None
         ):
-            return {"data": [], "truncated": False}
+            return {"data": [], "truncated": False, "current_session_id": None}
 
+        # Resolved from the durable sequence alone, independently of the bound
+        # below, so "which session is current" is one unambiguous fact even for
+        # a group whose list is truncated. A caller must never infer it from a
+        # cookie it cannot find in the list.
+        current_row = self._conn.execute(
+            "SELECT name FROM owner_conversation_sessions "
+            "WHERE profile = ? AND group_name = ? ORDER BY seq DESC LIMIT 1",
+            (profile, group),
+        ).fetchone()
+        current_session_id: Optional[str] = None
+        if current_row is not None and isinstance(current_row[0], str):
+            current_session_id = (
+                "legacy" if current_row[0] == group
+                else current_row[0].removeprefix(f"{group}-")
+            )
         rows = self._conn.execute(
-            "SELECT c.name, r.data, r.accessed_at "
-            "FROM conversations c "
-            "JOIN responses r ON r.response_id = c.response_id AND r.profile = c.profile "
-            "WHERE c.profile = ? AND (c.name = ? OR c.name LIKE ?) "
-            "ORDER BY r.accessed_at DESC LIMIT ?",
-            (profile, group, f"{group}-%", _OWNER_SESSION_INDEX_LIMIT + 1),
+            "SELECT s.name, s.created_at, c.response_id, r.data "
+            "FROM owner_conversation_sessions s "
+            "JOIN conversations c ON c.profile = s.profile AND c.name = s.name "
+            "LEFT JOIN responses r ON r.profile = c.profile "
+            "AND r.response_id = c.response_id "
+            "WHERE s.profile = ? AND s.group_name = ? "
+            "ORDER BY s.seq DESC LIMIT ?",
+            (profile, group, _OWNER_SESSION_INDEX_LIMIT + 1),
         ).fetchall()
         truncated = len(rows) > _OWNER_SESSION_INDEX_LIMIT
         sessions: List[Dict[str, Any]] = []
         expected = re.compile(re.escape(group) + r"(?:-[a-f0-9]{32})?")
-        for name, raw, _accessed_at in rows[:_OWNER_SESSION_INDEX_LIMIT]:
+        for name, session_created_at, _mapped_response_id, raw in rows[
+            :_OWNER_SESSION_INDEX_LIMIT
+        ]:
             if not isinstance(name, str) or expected.fullmatch(name) is None:
                 continue
-            try:
-                stored = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            response = stored.get("response") if isinstance(stored, dict) else None
-            updated_at = response.get("created_at") if isinstance(response, dict) else None
+            session_id = (
+                "legacy" if name == group else name.removeprefix(f"{group}-")
+            )
+            fallback_at = (
+                int(session_created_at)
+                if isinstance(session_created_at, (int, float))
+                and not isinstance(session_created_at, bool)
+                and math.isfinite(float(session_created_at))
+                and session_created_at >= 0
+                else 0
+            )
+
+            def _unavailable() -> Dict[str, Any]:
+                return {
+                    "session_id": session_id,
+                    "updated_at": fallback_at,
+                    "preview": "",
+                    "visible_turn_count": 0,
+                    "available": False,
+                }
+
+            updated_at: Any = None
+            if raw is not None:
+                try:
+                    stored = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    stored = None
+                response = (
+                    stored.get("response") if isinstance(stored, dict) else None
+                )
+                updated_at = (
+                    response.get("created_at") if isinstance(response, dict) else None
+                )
             if (
-                isinstance(updated_at, bool)
+                raw is None
+                or isinstance(updated_at, bool)
                 or not isinstance(updated_at, (int, float))
                 or not math.isfinite(updated_at)
                 or updated_at < 0
             ):
+                sessions.append(_unavailable())
                 continue
-            snapshot = self.owner_history_snapshot(name, profile=profile)
+            try:
+                snapshot = self.owner_history_snapshot(name, profile=profile)
+            except OwnerAuthorityBroken:
+                sessions.append(_unavailable())
+                continue
             history = snapshot["data"]
-            if not history:
-                continue
-            owner = history[0]["owner"]
-            preview = owner
+            preview = history[0]["owner"] if history else ""
             if len(preview) > 180:
                 preview = preview[:177].rstrip() + "..."
             sessions.append({
-                "session_id": "legacy" if name == group else name.removeprefix(f"{group}-"),
+                "session_id": session_id,
                 "updated_at": int(updated_at),
                 "preview": preview,
                 "visible_turn_count": len(history),
+                "available": True,
             })
+        return {
+            "data": sessions,
+            "truncated": truncated,
+            "current_session_id": current_session_id,
+        }
 
-        sessions.sort(
-            key=lambda item: (item["updated_at"], item["session_id"]),
-            reverse=True,
-        )
-        return {"data": sessions, "truncated": truncated}
-
+    @_owner_authority
     def owner_history(
         self, name: str, *, profile: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """Return the backward-compatible owner-safe turn list."""
         return self.owner_history_snapshot(name, profile=profile)["data"]
 
+    @_owner_authority
     def reserve_owner_conversation(
-        self, profile: str, name: str, response_id: str,
+        self,
+        profile: str,
+        name: str,
+        response_id: str,
+        *,
+        expected_previous_response_id: Any = _UNSTATED,
     ) -> bool:
-        """Fence one owner turn before any model or tool is allowed to run."""
+        """Fence one owner turn before any model or tool is allowed to run.
+
+        ``expected_previous_response_id`` is the caller's assertion about the
+        turn this one follows, compared HERE — inside the same transaction that
+        takes the fence — so a delayed request planned against predecessor A
+        cannot take the fence after a newer request has already committed
+        predecessor B. ``None`` asserts "no turn yet"; :data:`_UNSTATED` (the
+        default) asserts nothing and preserves the previous behaviour for every
+        caller that does not state one.
+        """
         profile = self._profile(profile)
         if not self._valid_owner_authority_ids(profile, name, response_id):
             return False
@@ -2567,10 +3088,16 @@ class ResponseStore:
                     return False
                 row = self._conn.execute(
                     "SELECT proposal_response_id, consumed_response_id, "
-                    "claimed_response_id, claim_state, closed FROM conversations "
-                    "WHERE profile = ? AND name = ?",
+                    "claimed_response_id, claim_state, closed, response_id "
+                    "FROM conversations WHERE profile = ? AND name = ?",
                     (profile, name),
                 ).fetchone()
+                if expected_previous_response_id is not _UNSTATED and (
+                    (row[5] if row is not None else None)
+                    != expected_previous_response_id
+                ):
+                    self._conn.rollback()
+                    return False
                 if row is not None and (
                     bool(row[4])
                     or (
@@ -2617,6 +3144,7 @@ class ResponseStore:
                 self._conn.rollback()
                 raise
 
+    @_owner_authority
     def release_owner_conversation_reservation(
         self, profile: str, name: str, response_id: str,
     ) -> None:
@@ -2629,6 +3157,7 @@ class ResponseStore:
             )
             self._conn.commit()
 
+    @_owner_authority
     def renew_owner_conversation_reservation(
         self, profile: str, name: str, response_id: str,
     ) -> bool:
@@ -2650,6 +3179,7 @@ class ResponseStore:
             self._conn.commit()
             return cursor.rowcount == 1
 
+    @_owner_authority
     def reserve_run_idempotency(
         self,
         profile: str,
@@ -2659,8 +3189,17 @@ class ResponseStore:
         run_id: str,
         *,
         owner: "dict[str, str] | None" = None,
+        job_payload: "Optional[Dict[str, Any]]" = None,
     ) -> "tuple[str, Optional[str]]":
-        """Persist one scoped run identity before execution can be scheduled."""
+        """Persist one scoped run identity before execution can be scheduled.
+
+        ``job_payload`` makes the durable executor recovery job part of THIS
+        transaction. The run's idempotency row and its owner proposal claim used
+        to commit here while the job was reserved much later, so a crash in that
+        gap left a durable queued run and a claimed proposal with no executor:
+        polling reported working forever and the owner could not approve the same
+        proposal again.
+        """
         profile = self._profile(profile)
         with self._conversation_lock:
             try:
@@ -2728,6 +3267,10 @@ class ResponseStore:
                                     idempotency_key, fingerprint, existing_run_id,
                                 ),
                             )
+                            if job_payload is not None:
+                                self._reserve_owner_job_locked(
+                                    "run", run_id, profile, job_payload,
+                                )
                             self._conn.commit()
                             return "new", run_id
                     self._conn.rollback()
@@ -2787,11 +3330,240 @@ class ResponseStore:
                         fingerprint, run_id, created_at, queued_json,
                     ),
                 )
+                if job_payload is not None:
+                    self._reserve_owner_job_locked(
+                        "run", run_id, profile, job_payload,
+                    )
                 self._conn.commit()
                 return "new", run_id
             except Exception:
                 self._conn.rollback()
                 raise
+
+    @_owner_authority
+    def reserve_owner_response(
+        self,
+        profile: str,
+        session_scope: str,
+        idempotency_key: str,
+        fingerprint: str,
+        conversation: str,
+        response_id: str,
+    ) -> "tuple[str, Optional[dict], Optional[str]]":
+        """Claim one owner turn's idempotency key durably, or replay it.
+
+        The five-minute in-process cache cannot own this. An owner turn mints a
+        proposal whose response id later carries approval authority, so an
+        exact retry after a restart — or after that cache expired — must replay
+        the FIRST attempt rather than plan a second one. The key, its request
+        fingerprint, the response id it minted and the body to replay therefore
+        live here, next to the conversation state they authorize.
+
+        Returns ``(outcome, replay_body, session_id)``:
+
+        * ``"new"`` — this key is now reserved for ``response_id``; proceed.
+        * ``"replay"`` — the original attempt's exact stored body.
+        * ``"conflict"`` — the same key was used for a different request.
+        * ``"incomplete"`` — a previous attempt reserved the key, minted a
+          response and then died before recording a body. It is NOT re-run:
+          replaying its stored response is the caller's only safe move, and a
+          second proposal is never minted under a key that already produced one.
+
+        A reservation whose response never reached the response store at all
+        (a crash between reserving and storing) minted nothing, so this adopts
+        the key for the new attempt instead of stranding it forever.
+        """
+        profile = self._profile(profile)
+        with self._conversation_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                outcome, replay, session, row = self._owner_response_state_locked(
+                    profile, session_scope, idempotency_key, fingerprint,
+                    conversation,
+                )
+                if outcome != "new":
+                    self._conn.rollback()
+                    return outcome, replay, session
+                if row is not None:
+                    self._conn.execute(
+                        "UPDATE owner_response_idempotency SET response_id = ?, "
+                        "state = 'reserved', replay_json = NULL, session_id = NULL, "
+                        "created_at = ? WHERE profile = ? AND session_scope = ? "
+                        "AND idempotency_key = ?",
+                        (
+                            response_id, time.time(),
+                            profile, session_scope, idempotency_key,
+                        ),
+                    )
+                    self._conn.commit()
+                    return "new", None, None
+                self._conn.execute(
+                    "INSERT INTO owner_response_idempotency ("
+                    "profile, session_scope, idempotency_key, fingerprint, "
+                    "conversation, response_id, state, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?)",
+                    (
+                        profile, session_scope, idempotency_key, fingerprint,
+                        conversation, response_id, time.time(),
+                    ),
+                )
+                self._conn.commit()
+                return "new", None, None
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _owner_response_state_locked(
+        self,
+        profile: str,
+        session_scope: str,
+        idempotency_key: str,
+        fingerprint: str,
+        conversation: str,
+    ) -> "tuple[str, Optional[dict], Optional[str], Any]":
+        """Classify one owner idempotency key, and return its row if any.
+
+        Shared by the read-only lookup and the reservation so both answer from
+        exactly the same rules; only the reservation writes.
+        """
+        row = self._conn.execute(
+            "SELECT fingerprint, conversation, response_id, state, "
+            "replay_json, session_id FROM owner_response_idempotency "
+            "WHERE profile = ? AND session_scope = ? AND idempotency_key = ?",
+            (profile, session_scope, idempotency_key),
+        ).fetchone()
+        if row is None:
+            return "new", None, None, None
+        if row[0] != fingerprint or row[1] != conversation:
+            return "conflict", None, None, row
+        if row[3] == "completed" and row[4]:
+            try:
+                replay = json.loads(row[4])
+            except (json.JSONDecodeError, TypeError):
+                replay = None
+            if isinstance(replay, dict):
+                return "replay", replay, row[5], row
+        minted = self._conn.execute(
+            "SELECT 1 FROM responses WHERE profile = ? AND response_id = ?",
+            (profile, str(row[2])),
+        ).fetchone()
+        if minted is not None:
+            return "incomplete", None, row[5], row
+        # Reserved, but nothing was ever minted under it: adopting the key is
+        # safe and is the only thing that keeps a crashed attempt from locking
+        # this exact request out forever.
+        return "new", None, None, row
+
+    @_owner_authority
+    @_response_store_locked
+    def lookup_owner_response(
+        self,
+        profile: str,
+        session_scope: str,
+        idempotency_key: str,
+        fingerprint: str,
+        conversation: str,
+    ) -> "tuple[str, Optional[dict], Optional[str]]":
+        """Answer an exact retry before this request is treated as a new turn.
+
+        A replay is not a new turn, so it must be recognized BEFORE the
+        predecessor assertion is compared: the conversation has legitimately
+        moved on since the original attempt — by that attempt's own reply — and
+        refusing the retry as stale would hide the answer the owner already
+        has. Read-only; the reservation stays the atomic authority.
+        """
+        outcome, replay, session, _row = self._owner_response_state_locked(
+            self._profile(profile), session_scope, idempotency_key, fingerprint,
+            conversation,
+        )
+        return outcome, replay, session
+
+    @_owner_authority
+    @_response_store_locked
+    def complete_owner_response(
+        self,
+        profile: str,
+        session_scope: str,
+        idempotency_key: str,
+        response_id: str,
+        replay: dict,
+        session_id: Optional[str],
+    ) -> None:
+        """Record the exact body an exact retry of this owner turn replays."""
+        self._complete_owner_response_locked(
+            self._profile(profile), session_scope, idempotency_key, response_id,
+            replay, session_id,
+        )
+        self._conn.commit()
+
+    def _complete_owner_response_locked(
+        self,
+        profile: str,
+        session_scope: str,
+        idempotency_key: str,
+        response_id: str,
+        replay: dict,
+        session_id: Optional[str],
+    ) -> None:
+        """The replay record's write, WITHOUT committing (see
+        :meth:`publish_owner_turn`)."""
+        self._conn.execute(
+            "UPDATE owner_response_idempotency SET state = 'completed', "
+            "replay_json = ?, session_id = ? "
+            "WHERE profile = ? AND session_scope = ? AND idempotency_key = ? "
+            "AND response_id = ?",
+            (
+                json.dumps(replay, sort_keys=True, separators=(",", ":")),
+                session_id, profile, session_scope, idempotency_key, response_id,
+            ),
+        )
+
+    @_owner_authority
+    @_response_store_locked
+    def release_owner_response(
+        self,
+        profile: str,
+        session_scope: str,
+        idempotency_key: str,
+        response_id: str,
+    ) -> None:
+        """Drop a reservation whose turn never minted anything.
+
+        Only ever removes a row still in ``reserved`` naming this exact
+        response id, so a completed record — the durable replay authority — is
+        never dropped, and neither is a newer attempt's reservation.
+        """
+        profile = self._profile(profile)
+        self._conn.execute(
+            "DELETE FROM owner_response_idempotency "
+            "WHERE profile = ? AND session_scope = ? AND idempotency_key = ? "
+            "AND response_id = ? AND state = 'reserved'",
+            (profile, session_scope, idempotency_key, response_id),
+        )
+        self._conn.commit()
+
+    @_response_store_locked
+    def purge_owner_response_idempotency(self, older_than: float) -> None:
+        """Bound retention without evicting live owner authority.
+
+        A record is only dropped once it is old AND its response is no longer
+        the conversation's head, its outstanding proposal, or a claim — i.e.
+        once replaying it could not grant authority over anything. An owner who
+        comes back to a still-open proposal therefore still replays it.
+        """
+        self._conn.execute(
+            "DELETE FROM owner_response_idempotency WHERE created_at < ? "
+            "AND response_id NOT IN ("
+            "  SELECT response_id FROM conversations "
+            "  WHERE profile = owner_response_idempotency.profile "
+            "  UNION SELECT proposal_response_id FROM conversations "
+            "  WHERE profile = owner_response_idempotency.profile "
+            "  UNION SELECT claimed_response_id FROM conversations "
+            "  WHERE profile = owner_response_idempotency.profile"
+            ")",
+            (older_than,),
+        )
+        self._conn.commit()
 
     @staticmethod
     def _queued_run_status_json(run_id: str, created_at: float) -> str:
@@ -2808,6 +3580,7 @@ class ResponseStore:
             ensure_ascii=True,
         )
 
+    @_owner_authority
     @_response_store_locked
     def lookup_run_idempotency(
         self,
@@ -2830,6 +3603,7 @@ class ResponseStore:
             else ("conflict", None)
         )
 
+    @_owner_authority
     @_response_store_locked
     def run_idempotency_created_at(
         self,
@@ -2855,11 +3629,20 @@ class ResponseStore:
             return None
         return float(row[0])
 
+    @_owner_authority
     @_response_store_locked
     def run_idempotency_status(
         self, profile: str, run_id: str,
     ) -> "Dict[str, Any] | None":
-        """Read the durable queued state for an exact idempotent run."""
+        """Read the durable queued — or terminal — state of a run.
+
+        Every terminal state is admitted alongside ``queued``, because every one
+        of them is persisted (see :meth:`persist_terminal_run_status`). A run
+        that ended has to STOP reporting working, and this durable status is the
+        one thing a poller can still read after the process that owned the run
+        is gone; leaving the row saying ``queued`` made an ordinary failure,
+        cancellation or completion look like work still in progress forever.
+        """
         profile = self._profile(profile)
         rows = self._conn.execute(
             "SELECT status_json FROM run_idempotency "
@@ -2872,15 +3655,20 @@ class ResponseStore:
             value = json.loads(rows[0][0])
         except (json.JSONDecodeError, TypeError, ValueError):
             return None
+        allowed = {"object", "run_id", "status", "created_at", "updated_at"}
+        if value.get("status") == "failed" if isinstance(value, dict) else False:
+            allowed = allowed | {"error"}
         if (
             not isinstance(value, dict)
-            or set(value) != {
-                "object", "run_id", "status", "created_at", "updated_at",
-            }
+            or set(value) != allowed
             or value.get("object") != "hermes.run"
             or value.get("run_id") != run_id
             or _OWNER_RUN_RE.fullmatch(run_id) is None
-            or value.get("status") != "queued"
+            or value.get("status") not in _DURABLE_RUN_STATUSES
+            or (
+                value.get("status") == "failed"
+                and not isinstance(value.get("error"), str)
+            )
             or not all(
                 isinstance(value.get(field), (int, float))
                 and not isinstance(value.get(field), bool)
@@ -2891,6 +3679,70 @@ class ResponseStore:
             return None
         return value
 
+    @_owner_authority
+    @_response_store_locked
+    def persist_terminal_run_status(
+        self, profile: str, run_id: str, status: str,
+    ) -> None:
+        """Persist a run's terminal status and retire its job, in ONE transaction.
+
+        The job row is the only record that says "somebody must still finish
+        this run". Deleting it separately from the terminal status meant a
+        restart found a durable row still saying ``queued`` with no executor and
+        no recovery authority, so polling reported working forever.
+
+        A failed run records one plain, non-diagnostic sentence. The exception
+        text stays in the log and in this process's transport status; it is not
+        copied into a durable row an owner surface can read.
+
+        A run that already persisted a terminal receipt is left exactly as it
+        is: that receipt outranks any transport-level status.
+        """
+        profile = self._profile(profile)
+        if status not in _TERMINAL_RUN_STATUSES:
+            raise ValueError("not a terminal run status")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            for row in self._conn.execute(
+                "SELECT profile, session_scope, idempotency_key, created_at "
+                "FROM run_idempotency WHERE run_id = ? AND terminal_json IS NULL",
+                (run_id,),
+            ).fetchall():
+                record: Dict[str, Any] = {
+                    "object": "hermes.run",
+                    "run_id": run_id,
+                    "status": status,
+                    "created_at": (
+                        float(row[3])
+                        if isinstance(row[3], (int, float))
+                        and not isinstance(row[3], bool)
+                        and math.isfinite(float(row[3]))
+                        else now
+                    ),
+                    "updated_at": now,
+                }
+                if status == "failed":
+                    record["error"] = _OWNER_RUN_STOPPED_MESSAGE
+                self._conn.execute(
+                    "UPDATE run_idempotency SET status_json = ? "
+                    "WHERE profile = ? AND session_scope = ? AND idempotency_key = ? "
+                    "AND run_id = ? AND terminal_json IS NULL",
+                    (
+                        json.dumps(
+                            record, sort_keys=True, separators=(",", ":"),
+                            ensure_ascii=True,
+                        ),
+                        row[0], row[1], row[2], run_id,
+                    ),
+                )
+            self._release_owner_job_locked("run", run_id)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_owner_authority
     def persist_owner_run_completion(
         self,
         profile: str,
@@ -2989,12 +3841,17 @@ class ResponseStore:
                 if cur.rowcount != 1:
                     self._conn.rollback()
                     raise RuntimeError("owner run idempotency record is unavailable")
+                # Same transaction as the terminal receipt: the recovery job row
+                # is retired exactly when — and only when — this run becomes
+                # durably terminal.
+                self._release_owner_job_locked("run", run_id)
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
         return terminal
 
+    @_owner_authority
     @_response_store_locked
     def owner_run_completion(
         self, profile: str, run_id: str,
@@ -3063,6 +3920,293 @@ class ResponseStore:
             return None
         return self.owner_run_completion(rows[0][0], run_id)
 
+    @_owner_authority
+    @_response_store_locked
+    def reserve_owner_job(
+        self, kind: str, job_key: str, profile: str, payload: Dict[str, Any],
+    ) -> None:
+        """Persist that THIS process is the executor of one queued owner job.
+
+        Written before the in-memory executor exists, so the durable queued
+        state a caller is about to be told about (a 202) is never the only
+        record of work with nobody driving it. Released only in the same
+        transaction that persists the work's terminal state.
+
+        Used standalone only for work that has no other durable authority to
+        commit alongside; owner responses and owner runs reserve their job
+        INSIDE the transaction that commits that authority (see
+        :meth:`accept_owner_background_response`,
+        :meth:`reserve_run_idempotency`, :meth:`claim_and_attach_owner_run`).
+        """
+        self._reserve_owner_job_locked(kind, job_key, self._profile(profile), payload)
+        self._conn.commit()
+
+    def _reserve_owner_job_locked(
+        self, kind: str, job_key: str, profile: str, payload: Dict[str, Any],
+    ) -> None:
+        """Write one job row and its lease, WITHOUT committing."""
+        now = time.time()
+        self._conn.execute(
+            "INSERT INTO owner_executor_jobs ("
+            "kind, job_key, profile, executor_id, executor_pid, payload, "
+            "created_at, lease_expires_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(kind, job_key) DO UPDATE SET "
+            "executor_id = excluded.executor_id, "
+            "executor_pid = excluded.executor_pid, "
+            "payload = excluded.payload, created_at = excluded.created_at, "
+            "lease_expires_at = excluded.lease_expires_at",
+            (
+                kind, job_key, profile, _EXECUTOR_ID, os.getpid(),
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                now, now + _OWNER_JOB_LEASE_SECONDS,
+            ),
+        )
+
+    def _release_owner_job_locked(self, kind: str, job_key: str) -> None:
+        """Drop one job row, WITHOUT committing.
+
+        Only ever called from inside the transaction that persists the job's
+        terminal state, so the row and the terminal fact appear (or fail to
+        appear) together. A separate delete meant a publication that raised
+        still dropped the recovery authority and left the work queued forever.
+        """
+        self._conn.execute(
+            "DELETE FROM owner_executor_jobs WHERE kind = ? AND job_key = ?",
+            (kind, job_key),
+        )
+
+    @_response_store_locked
+    def renew_owner_job_leases(self, kind: str, job_keys: "Iterable[str]") -> None:
+        """Heartbeat: extend this executor's lease on jobs it is still driving.
+
+        The lease — not PID liveness — is what proves an executor is still
+        there, so it has to be renewed while the work runs. Only rows this
+        process actually owns are touched, so a heartbeat can never extend a
+        dead sibling's claim.
+        """
+        keys = [str(key) for key in job_keys]
+        if not keys:
+            return
+        expires = time.time() + _OWNER_JOB_LEASE_SECONDS
+        self._conn.executemany(
+            "UPDATE owner_executor_jobs SET lease_expires_at = ? "
+            "WHERE kind = ? AND job_key = ? AND executor_id = ?",
+            [(expires, kind, key, _EXECUTOR_ID) for key in keys],
+        )
+        self._conn.commit()
+
+    @_response_store_locked
+    def claim_orphaned_owner_jobs(
+        self, kind: str, driving: "Iterable[str]" = (),
+    ) -> "list[Dict[str, Any]]":
+        """Lease every job of ``kind`` whose executor is gone, WITHOUT deleting it.
+
+        Atomic: each returned row is re-leased to THIS process in the same
+        transaction that selects it, so two gateway processes starting together
+        cannot both recover the same job. The row itself survives until the
+        transaction that makes its work terminal deletes it — deleting first
+        meant a crash, a malformed payload, or an exception during
+        terminalization permanently lost the only record of what to recover.
+
+        ``driving`` names the jobs THIS process still has a live executor for.
+        Everything else is reclaimable once it is old enough that a sibling
+        reserving one right now is never mistaken for a dead executor:
+
+        * one of this process's OWN rows with no live executor left — the task
+          died without recording a terminal state, so nobody is coming back for
+          it and only this process can tell;
+        * a sibling's row whose lease has expired, or whose named process is
+          provably gone. The lease is the load-bearing half: a recycled pid
+          looks alive forever, so pid liveness alone could strand queued owner
+          work permanently. The liveness check only makes recovery from a crash
+          faster than the lease TTL.
+        """
+        live = {str(key) for key in driving}
+        orphans: list[Dict[str, Any]] = []
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            cutoff = now - _OWNER_JOB_REAP_MIN_AGE_SECONDS
+            for row in self._conn.execute(
+                "SELECT job_key, profile, executor_id, executor_pid, payload, "
+                "lease_expires_at "
+                "FROM owner_executor_jobs WHERE kind = ? AND created_at < ?",
+                (kind, cutoff),
+            ).fetchall():
+                if str(row[0]) in live:
+                    continue
+                lease = row[5]
+                leased = (
+                    isinstance(lease, (int, float))
+                    and not isinstance(lease, bool)
+                    and float(lease) > now
+                )
+                if row[2] != _EXECUTOR_ID and leased and _process_is_alive(row[3]):
+                    continue
+                try:
+                    payload = json.loads(row[4])
+                except (json.JSONDecodeError, TypeError):
+                    payload = None
+                orphans.append({
+                    "job_key": str(row[0]),
+                    "profile": str(row[1]),
+                    "payload": payload if isinstance(payload, dict) else {},
+                })
+            for orphan in orphans:
+                self._conn.execute(
+                    "UPDATE owner_executor_jobs SET executor_id = ?, "
+                    "executor_pid = ?, lease_expires_at = ? "
+                    "WHERE kind = ? AND job_key = ?",
+                    (
+                        _EXECUTOR_ID, os.getpid(),
+                        now + _OWNER_JOB_LEASE_SECONDS, kind, orphan["job_key"],
+                    ),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return orphans
+
+    @_owner_authority
+    @_response_store_locked
+    def fail_orphaned_owner_response(
+        self, profile: str, conversation: str, response_id: str, message: str,
+    ) -> bool:
+        """Terminally fail one queued owner response nobody is executing.
+
+        One transaction: the stored response becomes ``failed`` so polling
+        stops, this turn's conversation reservation is dropped so the
+        conversation is not locked, this exact turn's terminal failure becomes
+        the durable body its own idempotency key replays, and the recovery job
+        row is retired. The conversation head is deliberately left alone — a
+        turn that never completed never owned it — and nothing is touched at all
+        if this response DID become the head.
+
+        The idempotency record is UPDATED, never deleted. An owner turn's key is
+        immutable authority: it already minted this response id, so deleting the
+        record let an exact retry mint a SECOND turn for the same submission
+        instead of being told what happened to the first. Recording the terminal
+        failure under the original key is what makes the retry replay it.
+        """
+        profile = self._profile(profile)
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            head = self._conn.execute(
+                "SELECT response_id FROM conversations WHERE profile = ? AND name = ?",
+                (profile, conversation),
+            ).fetchone()
+            if head is not None and head[0] == response_id:
+                # It completed after all; its publication is the authority.
+                self._conn.rollback()
+                return False
+            stored = self._conn.execute(
+                "SELECT data FROM responses WHERE profile = ? AND response_id = ?",
+                (profile, response_id),
+            ).fetchone()
+            record: Dict[str, Any] = {}
+            if stored is not None:
+                try:
+                    parsed = json.loads(stored[0])
+                except (json.JSONDecodeError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    record = parsed
+            response = record.get("response")
+            failed = dict(response) if isinstance(response, dict) else {
+                "id": response_id, "object": "response",
+            }
+            if failed.get("status") in {"completed", "failed", "incomplete"}:
+                self._conn.rollback()
+                return False
+            failed.update({
+                "status": "failed",
+                "output": [],
+                "error": {"code": "server_error", "message": message},
+            })
+            record["response"] = failed
+            self._put_response_locked(response_id, record, profile)
+            self._conn.execute(
+                "DELETE FROM owner_conversation_reservations "
+                "WHERE profile = ? AND name = ? AND response_id = ?",
+                (profile, conversation, response_id),
+            )
+            self._conn.execute(
+                "UPDATE owner_response_idempotency SET state = 'completed', "
+                "replay_json = ? "
+                "WHERE profile = ? AND conversation = ? AND response_id = ?",
+                (
+                    json.dumps(failed, sort_keys=True, separators=(",", ":")),
+                    profile, conversation, response_id,
+                ),
+            )
+            self._release_owner_job_locked("response", response_id)
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_owner_authority
+    @_response_store_locked
+    def fail_orphaned_owner_run(
+        self, profile: str, run_id: str, owner: "Optional[Dict[str, str]]",
+    ) -> bool:
+        """Terminally fail one queued owner run nobody is executing.
+
+        One transaction: the run's durable status becomes ``failed`` so polling
+        stops reporting working forever, its owner proposal claim is released so
+        the owner can approve the same proposal again, and its recovery job row
+        is retired. A run that already persisted its terminal receipt is left
+        exactly as it is — and its job row stays, so nothing is lost if this
+        recovery pass cannot decide.
+        """
+        profile = self._profile(profile)
+        if _OWNER_RUN_RE.fullmatch(run_id) is None:
+            return False
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                "SELECT profile, session_scope, idempotency_key, terminal_json "
+                "FROM run_idempotency WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+            if any(row[3] is not None for row in rows):
+                self._conn.rollback()
+                return False
+            now = time.time()
+            for row in rows:
+                self._conn.execute(
+                    "UPDATE run_idempotency SET status_json = ? "
+                    "WHERE profile = ? AND session_scope = ? AND idempotency_key = ? "
+                    "AND run_id = ? AND terminal_json IS NULL",
+                    (
+                        _failed_run_status_json(run_id, now),
+                        row[0], row[1], row[2], run_id,
+                    ),
+                )
+            if owner:
+                self._conn.execute(
+                    "UPDATE conversations SET claim_state = 'released', "
+                    "claim_expires_at = NULL WHERE profile = ? AND name = ? "
+                    "AND proposal_response_id = ? AND consumed_response_id IS NOT ? "
+                    "AND claimed_response_id = ? AND claim_id = ? AND owner_run_id = ? "
+                    "AND claim_state = 'claimed'",
+                    (
+                        self._profile(owner.get("proposal_profile")),
+                        owner.get("conversation"),
+                        owner.get("response_id"), owner.get("response_id"),
+                        owner.get("response_id"), owner.get("claim_id"), run_id,
+                    ),
+                )
+            self._release_owner_job_locked("run", run_id)
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def purge_run_idempotency(self, older_than: float) -> None:
         with self._conversation_lock:
             self._conn.execute(
@@ -3079,136 +4223,329 @@ class ResponseStore:
         owner_proposal: bool = False,
         profile: Optional[str] = None,
         reservation_id: Optional[str] = None,
+        expected_previous_response_id: Any = _UNSTATED,
     ) -> bool:
-        """Map a conversation unless approved work or an explicit close owns it."""
+        """Map a conversation unless approved work or an explicit close owns it.
+
+        ``expected_previous_response_id`` is the same assertion the turn's
+        reservation compared, re-compared here in the mapping transaction, so a
+        turn can only ever append to the exact predecessor it planned against —
+        never overwrite a newer one that appeared while it was running.
+        """
         profile = self._profile(profile)
         is_owner = (
             isinstance(name, str)
             and _OWNER_CONVERSATION_RE.fullmatch(name) is not None
         )
+        if is_owner:
+            # Mapping an owner conversation publishes the proposal handle that
+            # a later approval is granted against, so it is authority too.
+            # Generic conversation names are unaffected.
+            self._require_durable_owner_authority()
         with self._conversation_lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                if (
-                    is_owner
-                    and self._conn.execute(
-                        "SELECT 1 FROM owner_conversation_closures "
-                        "WHERE profile = ? AND name = ?",
-                        (profile, name),
-                    ).fetchone() is not None
-                ):
-                    self._conn.rollback()
-                    return False
-                if is_owner:
-                    reservation = self._active_owner_conversation_reservation_locked(
-                        profile, name,
-                    )
-                    if (
-                        reservation_id is not None
-                        and (
-                            reservation is None
-                            or reservation[0] != reservation_id
-                        )
-                    ) or (
-                        reservation_id is None and reservation is not None
-                    ):
-                        self._conn.rollback()
-                        return False
-                row = self._conn.execute(
-                    "SELECT response_id, proposal_response_id, consumed_response_id, claimed_response_id, "
-                    "claim_state, closed FROM conversations WHERE profile = ? AND name = ?",
-                    (profile, name),
-                ).fetchone()
-                if (
-                    row is not None
-                    and row[0] != response_id
-                    and is_owner
-                    and (
-                        bool(row[5])
-                        or (
-                            row[1] is not None
-                            and row[3] == row[1]
-                            and row[4] == "claimed"
-                            and row[2] != row[1]
-                        )
-                    )
-                ):
-                    self._conn.rollback()
-                    return False
-                proposal_digest = None
-                if owner_proposal:
-                    stored = self._conn.execute(
-                        "SELECT data FROM responses WHERE response_id = ? AND profile = ?",
-                        (response_id, profile),
-                    ).fetchone()
-                    if stored is None:
-                        self._conn.rollback()
-                        return False
-                    try:
-                        raw = json.loads(stored[0])
-                    except (json.JSONDecodeError, TypeError):
-                        self._conn.rollback()
-                        return False
-                    proposal_digest = _owner_proposal_digest(
-                        _owner_final_proposal(
-                            raw.get("conversation_history")
-                            if isinstance(raw, dict) else None
-                        )
-                    )
-                    if proposal_digest is None:
-                        self._conn.rollback()
-                        return False
-                self._conn.execute(
-                    "INSERT INTO conversations ("
-                    "profile, name, response_id, proposal_response_id, proposal_digest, "
-                    "consumed_response_id, claimed_response_id, claim_id, claim_expires_at, "
-                    "owner_run_id, bound_operation, bound_payload_digest, claim_state, closed"
-                    ") VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0) "
-                    "ON CONFLICT(profile, name) DO UPDATE SET "
-                    "response_id = excluded.response_id, "
-                    "proposal_response_id = CASE "
-                    "WHEN conversations.response_id = excluded.response_id "
-                    "THEN COALESCE(excluded.proposal_response_id, conversations.proposal_response_id) "
-                    "ELSE excluded.proposal_response_id END, "
-                    "proposal_digest = CASE WHEN conversations.response_id = excluded.response_id "
-                    "THEN COALESCE(excluded.proposal_digest, conversations.proposal_digest) "
-                    "ELSE excluded.proposal_digest END, "
-                    "consumed_response_id = conversations.consumed_response_id, "
-                    "claimed_response_id = CASE "
-                    "WHEN conversations.response_id = excluded.response_id "
-                    "THEN conversations.claimed_response_id ELSE NULL END, "
-                    "claim_id = CASE WHEN conversations.response_id = excluded.response_id "
-                    "THEN conversations.claim_id ELSE NULL END, "
-                    "claim_expires_at = CASE WHEN conversations.response_id = excluded.response_id "
-                    "THEN conversations.claim_expires_at ELSE NULL END, "
-                    "owner_run_id = CASE WHEN conversations.response_id = excluded.response_id "
-                    "THEN conversations.owner_run_id ELSE NULL END, "
-                    "bound_operation = CASE WHEN conversations.response_id = excluded.response_id "
-                    "THEN conversations.bound_operation ELSE NULL END, "
-                    "bound_payload_digest = CASE WHEN conversations.response_id = excluded.response_id "
-                    "THEN conversations.bound_payload_digest ELSE NULL END, "
-                    "claim_state = CASE WHEN conversations.response_id = excluded.response_id "
-                    "THEN conversations.claim_state ELSE NULL END, "
-                    "closed = CASE WHEN conversations.response_id = excluded.response_id "
-                    "THEN conversations.closed ELSE 0 END",
-                    (
-                        profile, name, response_id,
-                        response_id if owner_proposal else None,
-                        proposal_digest,
-                    ),
+                mapped = self._set_conversation_locked(
+                    name,
+                    response_id,
+                    owner_proposal=owner_proposal,
+                    profile=profile,
+                    reservation_id=reservation_id,
+                    expected_previous_response_id=expected_previous_response_id,
                 )
-                if reservation_id is not None:
-                    self._conn.execute(
-                        "DELETE FROM owner_conversation_reservations "
-                        "WHERE profile = ? AND name = ? AND response_id = ?",
-                        (profile, name, reservation_id),
-                    )
+                if not mapped:
+                    self._conn.rollback()
+                    return False
                 self._conn.commit()
                 return True
             except Exception:
                 self._conn.rollback()
                 raise
 
+    @_owner_authority
+    @_response_store_locked
+    def accept_owner_background_response(
+        self,
+        *,
+        profile: Optional[str],
+        response_id: str,
+        data: Dict[str, Any],
+        conversation: Optional[str],
+        replay: Optional[Dict[str, Any]] = None,
+        session_scope: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Commit everything a background 202 promises, as ONE transaction.
+
+        The queued response body, the durable executor recovery job, and the
+        replay record an exact retry answers from are three facts about the same
+        acceptance. Committing them separately meant a crash between any two
+        left an accepted owner response with no executor to drive it — queued
+        forever — or a reserved idempotency key that had minted a response but
+        could never record a body, so the key was permanently unusable and its
+        exact retry could only ever replay a queued turn.
+        """
+        profile = self._profile(profile)
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._put_response_locked(response_id, data, profile)
+            if conversation is not None:
+                self._reserve_owner_job_locked(
+                    "response", response_id, profile,
+                    {"conversation": str(conversation)},
+                )
+            if (
+                replay is not None
+                and session_scope is not None
+                and idempotency_key is not None
+            ):
+                self._complete_owner_response_locked(
+                    profile, session_scope, idempotency_key, response_id,
+                    replay, session_id,
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_owner_authority
+    @_response_store_locked
+    def store_terminal_owner_response(
+        self,
+        *,
+        profile: Optional[str],
+        response_id: str,
+        data: Dict[str, Any],
+        release_job: bool,
+    ) -> None:
+        """Persist one terminal background response, retiring its job with it.
+
+        The job row is the ONLY record that says "somebody must finish this
+        response". It may therefore be dropped only in the same transaction that
+        makes the response terminal: if this write fails the row survives and a
+        later sweep recovers the work, instead of the response being left queued
+        forever with its recovery authority already deleted.
+        """
+        profile = self._profile(profile)
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._put_response_locked(response_id, data, profile)
+            if release_job:
+                self._release_owner_job_locked("response", response_id)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @_owner_authority
+    def publish_owner_turn(
+        self,
+        *,
+        profile: Optional[str],
+        conversation: str,
+        response_id: str,
+        data: Dict[str, Any],
+        owner_proposal: bool,
+        reservation_id: Optional[str],
+        expected_previous_response_id: Any,
+        replay: Optional[Dict[str, Any]] = None,
+        session_scope: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        session_id: Optional[str] = None,
+        release_job: bool = False,
+    ) -> bool:
+        """Commit one owner turn's whole publication as ONE transaction.
+
+        The response body, the conversation head compare-and-swap, the release
+        of this turn's reservation and the durable replay record an exact retry
+        answers from are four facts about the same event. Committing them
+        separately meant a crash between any two left a turn that had really
+        happened but that an exact retry could not replay — it would plan a
+        second one — or a published head with no durable replay behind it.
+
+        Returns ``False`` (having written nothing) when the head is no longer
+        this turn's to take, exactly like :meth:`set_conversation`.
+        """
+        profile = self._profile(profile)
+        with self._conversation_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._put_response_locked(response_id, data, profile)
+                if not self._set_conversation_locked(
+                    conversation,
+                    response_id,
+                    owner_proposal=owner_proposal,
+                    profile=profile,
+                    reservation_id=reservation_id,
+                    expected_previous_response_id=expected_previous_response_id,
+                ):
+                    self._conn.rollback()
+                    return False
+                if (
+                    replay is not None
+                    and session_scope is not None
+                    and idempotency_key is not None
+                ):
+                    self._complete_owner_response_locked(
+                        profile, session_scope, idempotency_key, response_id,
+                        replay, session_id,
+                    )
+                if release_job:
+                    # Same transaction as the publication it proves. The job row
+                    # is retired only once this turn is durably terminal.
+                    self._release_owner_job_locked("response", response_id)
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _set_conversation_locked(
+        self,
+        name: str,
+        response_id: str,
+        *,
+        owner_proposal: bool,
+        profile: str,
+        reservation_id: Optional[str],
+        expected_previous_response_id: Any,
+    ) -> bool:
+        """The mapping decision and write, inside the CALLER's transaction.
+
+        Split out of :meth:`set_conversation` so an owner turn can commit its
+        response, this head compare-and-swap, its reservation release and its
+        durable replay record together (see :meth:`publish_owner_turn`).
+        Returns ``False`` without writing when the head is not this turn's to
+        take; the caller owns the rollback.
+        """
+        is_owner = (
+            isinstance(name, str)
+            and _OWNER_CONVERSATION_RE.fullmatch(name) is not None
+        )
+        if (
+            is_owner
+            and self._conn.execute(
+                "SELECT 1 FROM owner_conversation_closures "
+                "WHERE profile = ? AND name = ?",
+                (profile, name),
+            ).fetchone() is not None
+        ):
+            return False
+        if is_owner:
+            reservation = self._active_owner_conversation_reservation_locked(
+                profile, name,
+            )
+            if (
+                reservation_id is not None
+                and (
+                    reservation is None
+                    or reservation[0] != reservation_id
+                )
+            ) or (
+                reservation_id is None and reservation is not None
+            ):
+                return False
+        row = self._conn.execute(
+            "SELECT response_id, proposal_response_id, consumed_response_id, claimed_response_id, "
+            "claim_state, closed FROM conversations WHERE profile = ? AND name = ?",
+            (profile, name),
+        ).fetchone()
+        if expected_previous_response_id is not _UNSTATED and (
+            (row[0] if row is not None else None)
+            not in (expected_previous_response_id, response_id)
+        ):
+            # Anything but the stated predecessor (or this same turn,
+            # already mapped) means a newer turn owns the conversation.
+            return False
+        if (
+            row is not None
+            and row[0] != response_id
+            and is_owner
+            and (
+                bool(row[5])
+                or (
+                    row[1] is not None
+                    and row[3] == row[1]
+                    and row[4] == "claimed"
+                    and row[2] != row[1]
+                )
+            )
+        ):
+            return False
+        proposal_digest = None
+        if owner_proposal:
+            stored = self._conn.execute(
+                "SELECT data FROM responses WHERE response_id = ? AND profile = ?",
+                (response_id, profile),
+            ).fetchone()
+            if stored is None:
+                return False
+            try:
+                raw = json.loads(stored[0])
+            except (json.JSONDecodeError, TypeError):
+                return False
+            proposal_digest = _owner_proposal_digest(
+                _owner_final_proposal(
+                    raw.get("conversation_history")
+                    if isinstance(raw, dict) else None
+                )
+            )
+            if proposal_digest is None:
+                return False
+        self._conn.execute(
+            "INSERT INTO conversations ("
+            "profile, name, response_id, proposal_response_id, proposal_digest, "
+            "consumed_response_id, claimed_response_id, claim_id, claim_expires_at, "
+            "owner_run_id, bound_operation, bound_payload_digest, claim_state, closed"
+            ") VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0) "
+            "ON CONFLICT(profile, name) DO UPDATE SET "
+            "response_id = excluded.response_id, "
+            "proposal_response_id = CASE "
+            "WHEN conversations.response_id = excluded.response_id "
+            "THEN COALESCE(excluded.proposal_response_id, conversations.proposal_response_id) "
+            "ELSE excluded.proposal_response_id END, "
+            "proposal_digest = CASE WHEN conversations.response_id = excluded.response_id "
+            "THEN COALESCE(excluded.proposal_digest, conversations.proposal_digest) "
+            "ELSE excluded.proposal_digest END, "
+            "consumed_response_id = conversations.consumed_response_id, "
+            "claimed_response_id = CASE "
+            "WHEN conversations.response_id = excluded.response_id "
+            "THEN conversations.claimed_response_id ELSE NULL END, "
+            "claim_id = CASE WHEN conversations.response_id = excluded.response_id "
+            "THEN conversations.claim_id ELSE NULL END, "
+            "claim_expires_at = CASE WHEN conversations.response_id = excluded.response_id "
+            "THEN conversations.claim_expires_at ELSE NULL END, "
+            "owner_run_id = CASE WHEN conversations.response_id = excluded.response_id "
+            "THEN conversations.owner_run_id ELSE NULL END, "
+            "bound_operation = CASE WHEN conversations.response_id = excluded.response_id "
+            "THEN conversations.bound_operation ELSE NULL END, "
+            "bound_payload_digest = CASE WHEN conversations.response_id = excluded.response_id "
+            "THEN conversations.bound_payload_digest ELSE NULL END, "
+            "claim_state = CASE WHEN conversations.response_id = excluded.response_id "
+            "THEN conversations.claim_state ELSE NULL END, "
+            "closed = CASE WHEN conversations.response_id = excluded.response_id "
+            "THEN conversations.closed ELSE 0 END",
+            (
+                profile, name, response_id,
+                response_id if owner_proposal else None,
+                proposal_digest,
+            ),
+        )
+        if is_owner:
+            # Same transaction as the mapping: a conversation that exists must
+            # have its immutable place in its group, or "which session is
+            # current" would depend on read order again.
+            group, _session = _owner_conversation_group(name)
+            if group is not None:
+                self._record_owner_session_locked(profile, group, name)
+        if reservation_id is not None:
+            self._conn.execute(
+                "DELETE FROM owner_conversation_reservations "
+                "WHERE profile = ? AND name = ? AND response_id = ?",
+                (profile, name, reservation_id),
+            )
+        return True
     @_response_store_locked
     def close(self) -> None:
         """Close the database connection."""
@@ -3327,6 +4664,48 @@ def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     if limit is not None:
         return redacted[:limit]
     return redacted
+
+
+def _process_is_alive(pid: Any) -> bool:
+    """Whether ``pid`` names a live process on this host.
+
+    Uses the shared :func:`gateway.status._pid_exists`, which is the one
+    cross-platform liveness check in this tree that does not kill the target
+    (``os.kill(pid, 0)`` sends Ctrl+C to the whole console process group on
+    Windows — see that function's own note).
+
+    ``True`` when liveness cannot be decided at all, because reaping another
+    process's LIVE job is worse than leaving an orphan for the next start.
+    """
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if value <= 0:
+        return False
+    try:
+        from gateway.status import _pid_exists
+
+        return _pid_exists(value)
+    except Exception:
+        return True
+
+
+def _failed_run_status_json(run_id: str, updated_at: float) -> str:
+    """The terminal status a recovered orphan run reports to a poller."""
+    return json.dumps(
+        {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "failed",
+            "created_at": updated_at,
+            "updated_at": updated_at,
+            "error": _OWNER_ORPHAN_RUN_MESSAGE,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
 
 
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
@@ -3703,6 +5082,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
+        # Background owner responses this process is still driving. Their durable
+        # recovery job is fenced by a renewable lease, so a turn that legitimately
+        # takes longer than the lease has to keep saying it is alive — otherwise a
+        # sibling gateway would reclaim live work.
+        self._owner_response_jobs: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
@@ -4375,6 +5759,37 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         return route_allowlist_middleware
+
+    def _make_owner_authority_middleware(self):
+        """Turn a missing durable owner store into one stable, safe refusal.
+
+        :class:`OwnerAuthorityUnavailable` is raised by the response store
+        before any owner state is read or written, so reaching here means the
+        request performed no owner mutation and started no run. The reply is
+        deliberately uninformative about the storage failure — the operator
+        gets the details in ``errors.log``, the caller gets a retryable 503.
+        """
+
+        @web.middleware
+        async def owner_authority_middleware(request: "web.Request", handler):
+            try:
+                return await handler(request)
+            except OwnerAuthorityUnavailable:
+                logger.error(
+                    "Owner workspace storage is unavailable; refused %s %s",
+                    request.method, request.path,
+                )
+                return web.json_response(
+                    _openai_error(
+                        "The workspace is unavailable right now. Nothing was "
+                        "changed. Please try again shortly.",
+                        err_type="server_error",
+                        code="owner_workspace_unavailable",
+                    ),
+                    status=503,
+                )
+
+        return owner_authority_middleware
 
     def _http_route_table(self) -> List[tuple]:
         """Return (method, path, handler) rows registered by ``connect()``.
@@ -7078,6 +8493,8 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         store_profile: Optional[str] = None,
         conversation_reservation_id: Optional[str] = None,
+        expected_previous_response_id: Any = _UNSTATED,
+        owner_publish: Optional[Any] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -7106,6 +8523,14 @@ class APIServerAdapter(BasePlatformAdapter):
         ``incomplete`` snapshot so GET /v1/responses/{id} and
         ``previous_response_id`` chaining still have something to
         recover from.
+
+        ``owner_publish`` commits an owner turn's terminal snapshot, its
+        conversation head, its reservation release and its durable replay
+        record as ONE transaction, and returns whether the head was still this
+        turn's to take. That single commit is the moment the turn really
+        happened, so it is the moment — and the only one — at which an exact
+        retry may replay it instead of planning a second one. Nothing else
+        about the stream changes, and a non-owner stream never passes one.
         """
         sse_headers = {
             "Content-Type": "text/event-stream",
@@ -7179,6 +8604,23 @@ class APIServerAdapter(BasePlatformAdapter):
             if conversation_history_snapshot is None:
                 conversation_history_snapshot = list(conversation_history)
                 conversation_history_snapshot.append({"role": "user", "content": user_message})
+            status = response_env.get("status")
+            if (
+                conversation
+                and conversation_reservation_id is not None
+                and owner_publish is not None
+                and status == "completed"
+            ):
+                # ONE commit for the response, the head, the reservation and the
+                # replay record — the streaming path has the same contract as
+                # the standard and background ones.
+                if not owner_publish(
+                    response_env,
+                    conversation_history_snapshot,
+                    session_id_snapshot or session_id,
+                ):
+                    raise RuntimeError("owner conversation reservation changed")
+                return
             self._response_store.put(response_id, {
                 "response": response_env,
                 "conversation_history": conversation_history_snapshot,
@@ -7186,20 +8628,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_id": session_id_snapshot or session_id,
             }, profile=store_profile)
             if conversation:
-                status = response_env.get("status")
                 if conversation_reservation_id is not None:
-                    if status == "completed":
-                        if not self._response_store.set_conversation(
-                            conversation,
-                            response_id,
-                            owner_proposal=_owner_history_has_actionable_final_proposal(
-                                conversation_history_snapshot
-                            ),
-                            profile=store_profile,
-                            reservation_id=conversation_reservation_id,
-                        ):
-                            raise RuntimeError("owner conversation reservation changed")
-                    elif status in {"failed", "incomplete"}:
+                    if status in {"failed", "incomplete"}:
                         self._response_store.release_owner_conversation_reservation(
                             str(store_profile), conversation, conversation_reservation_id,
                         )
@@ -7697,6 +9127,41 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    @staticmethod
+    def _owner_idempotency_response(
+        stored: "tuple[str, Optional[dict], Optional[str]]",
+        gateway_session_key: Optional[str],
+    ) -> "Optional[web.Response]":
+        """Turn a durable owner idempotency verdict into its HTTP answer.
+
+        ``None`` means "this really is a new turn; carry on".
+        """
+        outcome, replay, session = stored
+        if outcome == "conflict":
+            return web.json_response(
+                _openai_error(
+                    "Idempotency-Key was already used for a different request",
+                    code="idempotency_conflict",
+                ),
+                status=409,
+            )
+        if outcome == "replay" and replay is not None:
+            headers = {}
+            if session:
+                headers["X-Hermes-Session-Id"] = session
+            if gateway_session_key:
+                headers["X-Hermes-Session-Key"] = gateway_session_key
+            return web.json_response(replay, headers=headers)
+        if outcome == "incomplete":
+            return web.json_response(
+                _openai_error(
+                    "That request is still being prepared. Reload and try again.",
+                    code="owner_response_incomplete",
+                ),
+                status=409,
+            )
+        return None
+
     @_admit_api_agent_request
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
         """POST /v1/responses — OpenAI Responses API format."""
@@ -7751,8 +9216,74 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error("Owner conversations require durable storage"),
                 status=400,
             )
+        # An owner conversation's history is the durable head, and only the
+        # durable head. A caller-supplied transcript would let a direct caller
+        # publish a fabricated or truncated conversation as the new authority,
+        # and ``previous_response_id`` would let it plan against a turn the
+        # conversation has moved past. Both are refused rather than ignored, so
+        # a caller that sends one is told its request was not carried out.
+        if is_owner_conversation and "conversation_history" in body:
+            return web.json_response(
+                _openai_error(
+                    "Owner conversations derive history from the conversation "
+                    "itself and cannot accept 'conversation_history'",
+                    param="conversation_history",
+                ),
+                status=400,
+            )
+        if is_owner_conversation and body.get("previous_response_id") is not None:
+            return web.json_response(
+                _openai_error(
+                    "Owner conversations cannot accept 'previous_response_id'",
+                    param="previous_response_id",
+                ),
+                status=400,
+            )
+
+        # The exact turn this request was planned against, stated by the
+        # caller. Machine-only: it never reaches the model and is never
+        # projected to the owner. Present (including an explicit ``null`` for
+        # "this conversation has no turn yet") means the caller is asserting
+        # the predecessor, and the assertion is compared atomically both when
+        # this turn reserves the conversation and when it maps its result.
+        # Absent means no assertion, which is what every non-owner client and
+        # every older caller sends.
+        expected_predecessor_stated = "expected_previous_response_id" in body
+        expected_predecessor = body.get("expected_previous_response_id")
+        if expected_predecessor_stated and not (
+            expected_predecessor is None
+            or (
+                isinstance(expected_predecessor, str)
+                and _OWNER_RESPONSE_RE.fullmatch(expected_predecessor) is not None
+            )
+        ):
+            return web.json_response(
+                _openai_error("Invalid expected_previous_response_id"), status=400,
+            )
+        # Both contracts are MANDATORY on an owner conversation, including an
+        # explicit ``null`` for the first turn. Optional, they let an older or
+        # direct caller append to whatever the latest head happens to be and
+        # duplicate an already-answered turn after a restart; there is nothing
+        # to compare and nothing to replay.
+        if is_owner_conversation and not expected_predecessor_stated:
+            return web.json_response(
+                _openai_error(
+                    "Owner conversations must state "
+                    "'expected_previous_response_id' (null for the first turn)",
+                    param="expected_previous_response_id",
+                ),
+                status=400,
+            )
 
         idempotency_key = request.headers.get("Idempotency-Key")
+        if is_owner_conversation and idempotency_key is None:
+            return web.json_response(
+                _openai_error(
+                    "Owner conversations require an Idempotency-Key header",
+                    param="Idempotency-Key",
+                ),
+                status=400,
+            )
         response_idempotency_fingerprint: Optional[str] = None
         response_idempotency_cache_key: Optional[str] = None
         if idempotency_key is not None:
@@ -7792,6 +9323,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 if gateway_session_key:
                     cached_headers["X-Hermes-Session-Key"] = gateway_session_key
                 return web.json_response(cached_response, headers=cached_headers)
+            if is_owner_conversation:
+                # A durable replay is answered before anything treats this as a
+                # new turn — including the predecessor comparison below, which
+                # this conversation has legitimately moved past by virtue of
+                # the very reply being replayed.
+                replayed = self._owner_idempotency_response(
+                    self._response_store.lookup_owner_response(
+                        response_profile,
+                        response_scope,
+                        idempotency_key,
+                        response_idempotency_fingerprint,
+                        str(conversation),
+                    ),
+                    gateway_session_key,
+                )
+                if replayed is not None:
+                    return replayed
 
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
@@ -7803,6 +9351,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation, profile=response_profile,
             )
             # No error if conversation doesn't exist yet — it's a new conversation
+            if (
+                expected_predecessor_stated
+                and previous_response_id != expected_predecessor
+            ):
+                # The conversation moved on since the caller read it. Planning
+                # this turn against the history it actually has would silently
+                # answer a different question than the one that was asked, so
+                # it is refused before any model is run.
+                return web.json_response(
+                    _openai_error(
+                        "The conversation moved on before this request was planned",
+                        code="owner_conversation_stale",
+                    ),
+                    status=409,
+                )
 
         # Normalize input to message list
         input_messages: List[Dict[str, Any]] = []
@@ -7895,10 +9458,96 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(selection_error), status=400)
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         conversation_reservation_id: Optional[str] = None
+        owner_response_idempotency: Optional[tuple[str, str]] = None
+
+        def _release_owner_response_reservation() -> None:
+            nonlocal owner_response_idempotency
+            reserved = owner_response_idempotency
+            owner_response_idempotency = None
+            if reserved is not None:
+                self._response_store.release_owner_response(
+                    response_profile, reserved[0], reserved[1], response_id,
+                )
+
+        def _publish_owner_turn(
+            terminal: dict,
+            history_snapshot: List[Dict[str, Any]],
+            effective_session_id: Optional[str],
+            *,
+            release_job: bool = False,
+        ) -> bool:
+            """Commit this owner turn's whole publication, or take no head.
+
+            The stored response, the conversation head compare-and-swap, this
+            turn's reservation release and the durable replay record an exact
+            retry answers from all land in ONE transaction. Clearing the
+            in-memory reservation afterwards is what makes the release in the
+            caller's ``finally`` a no-op, so a turn that really did complete is
+            never demoted back to "nothing was minted" and replanned.
+            """
+            nonlocal owner_response_idempotency
+            reserved = owner_response_idempotency
+            published = self._response_store.publish_owner_turn(
+                profile=response_profile,
+                conversation=str(conversation),
+                response_id=response_id,
+                data={
+                    "response": terminal,
+                    "conversation_history": history_snapshot,
+                    "instructions": instructions,
+                    "session_id": effective_session_id,
+                },
+                owner_proposal=_owner_history_has_actionable_final_proposal(
+                    history_snapshot
+                ),
+                reservation_id=conversation_reservation_id,
+                expected_previous_response_id=(
+                    expected_predecessor if expected_predecessor_stated
+                    else _UNSTATED
+                ),
+                replay=terminal if reserved is not None else None,
+                session_scope=reserved[0] if reserved is not None else None,
+                idempotency_key=reserved[1] if reserved is not None else None,
+                session_id=effective_session_id,
+                release_job=release_job,
+            )
+            if published:
+                owner_response_idempotency = None
+            return published
+
         if is_owner_conversation:
-            if not self._response_store.reserve_owner_conversation(
-                response_profile, str(conversation), response_id,
+            if (
+                idempotency_key is not None
+                and response_idempotency_fingerprint is not None
             ):
+                # Durable, not process-local: this turn may mint a proposal
+                # whose response id later carries approval authority, so an
+                # exact retry after a restart or past the in-memory TTL has to
+                # replay the first attempt rather than plan a second one. The
+                # same classification the early lookup made, taken atomically.
+                replayed = self._owner_idempotency_response(
+                    self._response_store.reserve_owner_response(
+                        response_profile,
+                        response_scope,
+                        idempotency_key,
+                        response_idempotency_fingerprint,
+                        str(conversation),
+                        response_id,
+                    ),
+                    gateway_session_key,
+                )
+                if replayed is not None:
+                    return replayed
+                owner_response_idempotency = (response_scope, idempotency_key)
+            if not self._response_store.reserve_owner_conversation(
+                response_profile,
+                str(conversation),
+                response_id,
+                expected_previous_response_id=(
+                    expected_predecessor if expected_predecessor_stated else _UNSTATED
+                ),
+            ):
+                _release_owner_response_reservation()
                 if (
                     response_idempotency_cache_key is not None
                     and response_idempotency_fingerprint is not None
@@ -8069,9 +9718,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                     store_profile=response_profile,
                     conversation_reservation_id=conversation_reservation_id,
+                    expected_previous_response_id=(
+                        expected_predecessor if expected_predecessor_stated
+                        else _UNSTATED
+                    ),
+                    owner_publish=_publish_owner_turn,
                 )
             finally:
+                # A stream that never produced a durably mapped response has
+                # minted no authority, so its reservation is dropped and an
+                # exact retry is free to plan the turn again. One that did has
+                # already been completed above, and this is a no-op.
                 _release_owner_conversation_reservation()
+                _release_owner_response_reservation()
 
         async def _compute_response():
             result = await self._run_agent(
@@ -8108,6 +9767,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_id": session_id,
             }
 
+            def _store_terminal_background(response: dict) -> None:
+                """Persist a terminal background body, retiring its job with it.
+
+                For an owner conversation the recovery job row is the only
+                record that says this response still needs finishing, so it is
+                dropped in the SAME transaction that makes the response
+                terminal. A separate release ran even when the terminal write
+                itself failed, which left the response queued forever with
+                nobody left to recover it.
+                """
+                if is_owner_conversation:
+                    self._response_store.store_terminal_owner_response(
+                        profile=response_profile,
+                        response_id=response_id,
+                        data={**pending_store_data, "response": response},
+                        release_job=True,
+                    )
+                    return
+                self._response_store.put(response_id, {
+                    **pending_store_data,
+                    "response": response,
+                }, profile=response_profile)
+
             async def _run_background_response() -> None:
                 in_progress = dict(queued_response)
                 in_progress["status"] = "in_progress"
@@ -8123,10 +9805,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "status": "incomplete",
                         "incomplete_details": {"reason": "cancelled"},
                     })
-                    self._response_store.put(response_id, {
-                        **pending_store_data,
-                        "response": incomplete,
-                    }, profile=response_profile)
+                    _store_terminal_background(incomplete)
                     _release_owner_conversation_reservation()
                     raise
                 except Exception as exc:
@@ -8144,10 +9823,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             "message": safe_error,
                         },
                     })
-                    self._response_store.put(response_id, {
-                        **pending_store_data,
-                        "response": failed,
-                    }, profile=response_profile)
+                    _store_terminal_background(failed)
                     _release_owner_conversation_reservation()
                     return
 
@@ -8164,21 +9840,40 @@ class APIServerAdapter(BasePlatformAdapter):
                         background=True,
                     )
                 )
-                self._response_store.put(response_id, {
-                    "response": response_data,
-                    "conversation_history": full_history,
-                    "instructions": instructions,
-                    "session_id": effective_session_id,
-                }, profile=response_profile)
-                if conversation and not self._response_store.set_conversation(
-                    conversation,
-                    response_id,
-                    owner_proposal=_owner_history_has_actionable_final_proposal(
-                        full_history
-                    ),
-                    profile=response_profile,
-                    reservation_id=conversation_reservation_id,
-                ):
+                published = True
+                if is_owner_conversation:
+                    # ONE commit for the whole publication, exactly as the
+                    # standard and streaming paths do — plus, on this path, the
+                    # retirement of the recovery job the 202 reserved.
+                    published = _publish_owner_turn(
+                        response_data, full_history, effective_session_id,
+                        release_job=True,
+                    )
+                else:
+                    self._response_store.put(response_id, {
+                        "response": response_data,
+                        "conversation_history": full_history,
+                        "instructions": instructions,
+                        "session_id": effective_session_id,
+                    }, profile=response_profile)
+                    if conversation:
+                        published = self._response_store.set_conversation(
+                            conversation,
+                            response_id,
+                            owner_proposal=(
+                                _owner_history_has_actionable_final_proposal(
+                                    full_history
+                                )
+                            ),
+                            profile=response_profile,
+                            reservation_id=conversation_reservation_id,
+                            expected_previous_response_id=(
+                                expected_predecessor
+                                if expected_predecessor_stated
+                                else _UNSTATED
+                            ),
+                        )
+                if not published:
                     failed = dict(response_data)
                     failed.update({
                         "status": "failed",
@@ -8188,21 +9883,75 @@ class APIServerAdapter(BasePlatformAdapter):
                             "message": "Owner conversation changed before this response completed",
                         },
                     })
-                    self._response_store.put(response_id, {
-                        "response": failed,
-                        "conversation_history": list(conversation_history),
-                        "instructions": instructions,
-                        "session_id": effective_session_id,
-                    }, profile=response_profile)
+                    # Publication failure is still a terminal outcome for THIS
+                    # response, so its job retires with the terminal body — and
+                    # only with it. If this write fails the job survives and a
+                    # later sweep recovers the response.
+                    if is_owner_conversation:
+                        self._response_store.store_terminal_owner_response(
+                            profile=response_profile,
+                            response_id=response_id,
+                            data={
+                                "response": failed,
+                                "conversation_history": list(conversation_history),
+                                "instructions": instructions,
+                                "session_id": effective_session_id,
+                            },
+                            release_job=True,
+                        )
+                    else:
+                        self._response_store.put(response_id, {
+                            "response": failed,
+                            "conversation_history": list(conversation_history),
+                            "instructions": instructions,
+                            "session_id": effective_session_id,
+                        }, profile=response_profile)
                     _release_owner_conversation_reservation()
 
             async def _start_background_response():
-                self._response_store.put(
-                    response_id, pending_store_data, profile=response_profile,
-                )
+                if is_owner_conversation:
+                    # ONE transaction for everything the 202 promises: the
+                    # queued body, the durable executor recovery job, and the
+                    # replay record an exact retry answers from — including
+                    # after a restart, when the in-memory cache is gone. Three
+                    # separate commits meant a crash between any two left an
+                    # accepted owner turn with no executor, or an idempotency
+                    # key that had minted a response and could never record one.
+                    self._response_store.accept_owner_background_response(
+                        profile=response_profile,
+                        response_id=response_id,
+                        data=pending_store_data,
+                        conversation=str(conversation),
+                        replay=(
+                            queued_response
+                            if owner_response_idempotency is not None else None
+                        ),
+                        session_scope=(
+                            owner_response_idempotency[0]
+                            if owner_response_idempotency is not None else None
+                        ),
+                        idempotency_key=(
+                            owner_response_idempotency[1]
+                            if owner_response_idempotency is not None else None
+                        ),
+                        session_id=session_id,
+                    )
+                else:
+                    self._response_store.put(
+                        response_id, pending_store_data, profile=response_profile,
+                    )
                 task = asyncio.create_task(_run_background_response())
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
+                if is_owner_conversation:
+                    # Marks this job as one THIS process is still driving, so
+                    # its lease is heartbeated and no sibling reclaims it — and
+                    # so a task that dies without recording a terminal state
+                    # becomes reclaimable the moment it stops.
+                    self._owner_response_jobs.add(response_id)
+                    task.add_done_callback(
+                        lambda _task: self._owner_response_jobs.discard(response_id)
+                    )
                 if conversation_reservation_id is not None:
                     task.add_done_callback(
                         lambda _task: _release_owner_conversation_reservation()
@@ -8226,6 +9975,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
             except _IdempotencyConflict:
                 _release_owner_conversation_reservation()
+                _release_owner_response_reservation()
                 return web.json_response(
                     _openai_error(
                         "Idempotency-Key was already used for a different request",
@@ -8235,6 +9985,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             except Exception as exc:
                 _release_owner_conversation_reservation()
+                _release_owner_response_reservation()
                 logger.error(
                     "Error starting background response: %s",
                     _redact_api_error_text(exc),
@@ -8270,6 +10021,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             )
             if store:
+                if is_owner_conversation:
+                    # ONE commit: the response, the head compare-and-swap, this
+                    # turn's reservation release and the durable replay record
+                    # an exact retry answers from.
+                    if not _publish_owner_turn(
+                        response_data, full_history, effective_session_id,
+                    ):
+                        raise _OwnerConversationReservationChanged
+                    return response_data, effective_session_id
                 self._response_store.put(response_id, {
                     "response": response_data,
                     "conversation_history": full_history,
@@ -8284,6 +10044,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     profile=response_profile,
                     reservation_id=conversation_reservation_id,
+                    expected_previous_response_id=(
+                        expected_predecessor if expected_predecessor_stated
+                        else _UNSTATED
+                    ),
                 ):
                     raise _OwnerConversationReservationChanged
             return response_data, effective_session_id
@@ -8304,6 +10068,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
         except _IdempotencyConflict:
             _release_owner_conversation_reservation()
+            _release_owner_response_reservation()
             return web.json_response(
                 _openai_error(
                     "Idempotency-Key was already used for a different request",
@@ -8313,6 +10078,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except _OwnerConversationReservationChanged:
             _release_owner_conversation_reservation()
+            _release_owner_response_reservation()
             return web.json_response(
                 _openai_error(
                     "Owner conversation changed before this response completed",
@@ -8327,6 +10093,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             _release_owner_conversation_reservation()
+            _release_owner_response_reservation()
             return web.json_response(
                 _openai_error("Internal server error", err_type="server_error"),
                 status=500,
@@ -8371,9 +10138,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 **index,
             })
 
-        snapshot = self._response_store.owner_history_snapshot(
-            conversation, profile=_active_owner_profile(),
-        )
+        try:
+            snapshot = self._response_store.owner_history_snapshot(
+                conversation, profile=_active_owner_profile(),
+            )
+        except OwnerAuthorityBroken as exc:
+            logger.error("Owner conversation authority is unreadable: %s", exc)
+            return web.json_response(
+                _openai_error(
+                    "Owner conversation history is unavailable",
+                    err_type="server_error",
+                    code="owner_history_unavailable",
+                ),
+                status=503,
+            )
         return web.json_response({
             "object": "hermes.response.owner_history",
             **snapshot,
@@ -8439,9 +10217,19 @@ class APIServerAdapter(BasePlatformAdapter):
             "complete": {"action", "response_id", "claim_id", "run_id"},
             "release": {"action", "response_id", "claim_id", "run_id"},
             "reconcile": {"action", "response_id", "claim_id", "run_id"},
-            "close": {"action", "response_id"},
+            # ``head_response_id`` is optional so an older caller still works,
+            # but a caller that states it gets its close compare-and-swapped
+            # against the conversation's actual durable head.
+            "close": ({"action", "response_id"}, {"head_response_id"}),
         }
-        if action not in expected_keys or set(body) != expected_keys[action]:
+        if action not in expected_keys:
+            return web.json_response(
+                _openai_error("Invalid owner proposal authority request"),
+                status=400,
+            )
+        shape = expected_keys[action]
+        required, optional = shape if isinstance(shape, tuple) else (shape, set())
+        if not required <= set(body) or not set(body) <= (required | optional):
             return web.json_response(
                 _openai_error("Invalid owner proposal authority request"),
                 status=400,
@@ -8496,6 +10284,10 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             applied = self._response_store.close_owner_conversation(
                 profile, conversation, response_id,
+                expected_head_response_id=(
+                    body["head_response_id"] if "head_response_id" in body
+                    else _UNSTATED
+                ),
             )
         if not applied:
             return web.json_response(
@@ -9815,7 +11607,9 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
             owner = resolve_owner_context()
-            decisions = list_owner_decisions(owner)
+            projected = list_owner_decisions(owner)
+            decisions = list(projected["data"])
+            truncated = bool(projected["truncated"])
             owner_profile = str(owner.profile)
         except Exception:
             logger.exception("[api_server] owner-workspace decision projection failed")
@@ -9874,6 +11668,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({
             "object": "hermes.owner_workspace.decision_list",
+            # Truncation is reported, not hidden: an owner who cannot tell a
+            # full inbox from a clipped one can believe they have answered
+            # everything Raphael is waiting on.
+            "truncated": truncated or len(decisions) > 100,
             "data": decisions[:100],
         })
 
@@ -10035,15 +11833,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     raise ValueError("stored proposal change is invalid")
                 action = raw.get("action")
                 reason = clean(raw.get("reason"))
-                if action == "add" and set(raw) == {
-                    "action", "reason", "title", "body", "assignee", "responsibility",
-                    "existing_parent_refs", "new_parents",
-                }:
+                if action == "add" and set(raw) == _OWNER_PROPOSAL_ADD_KEYS:
                     changes.append({
                         "action": "add", "reason": reason,
                         "title": clean(raw.get("title")), "body": clean(raw.get("body")),
                         "assignee": clean(raw.get("assignee")),
                         "responsibility": clean(raw.get("responsibility")),
+                        "execution_tier": clean(raw.get("execution_tier")),
                         "existing_parents": [native(ref) for ref in raw["existing_parent_refs"]],
                         "new_parents": clean(raw.get("new_parents")),
                     })
@@ -10080,16 +11876,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                 else:
                     raise ValueError("stored proposal change is invalid")
-            ordered_tasks = sorted(
-                tasks,
-                key=lambda task: (
-                    int(bool(task.get("parent_ids"))), str(task.get("id") or ""),
-                ),
-            )
+            # No anchor here: the Project's control anchor is resolved inside
+            # Hermes from its committed bootstrap receipt. Deriving one from
+            # this owner-visible task list could only ever name a work row.
             expected_payload = {
                 "idempotency_key": idempotency_key,
                 "project_id": project.get("id"),
-                "anchor_task_id": ordered_tasks[0].get("id"),
                 "trigger": "owner_request",
                 "request_title": clean(candidate.get("request_title")),
                 "summary": clean(candidate.get("summary")),
@@ -10188,25 +11980,58 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id: str,
         authority: "dict[str, Any]",
         owner: "dict[str, str] | None",
+        authority_digest: Optional[str] = None,
     ) -> "Dict[str, Any] | None":
-        """Close the cross-database crash window from a bound native receipt."""
-        try:
-            from hermes_cli.owner_workspace import read_committed_owner_run_receipt
+        """Close the cross-database crash window from a bound native receipt.
 
-            authority_digest = self._owner_authority_digest_for_recovery(authority)
+        ``None`` means this exact run provably committed nothing. Anything that
+        leaves the external effect UNDECIDED — a receipt that cannot be read,
+        more than one committed receipt claiming the same run, a receipt whose
+        minimal projection fails, or an error while persisting the recovered
+        completion — raises :class:`_OwnerNativeReceiptUnreadable`. Answering
+        "nothing committed" for those let a completed change be reported as
+        failed and its approval released for a second run.
+        """
+        from hermes_cli.owner_workspace import (
+            OwnerReceiptUnreadable,
+            read_committed_owner_run_receipt,
+        )
+
+        try:
+            if authority_digest is None:
+                authority_digest = self._owner_authority_digest_for_recovery(
+                    authority
+                )
             receipt = read_committed_owner_run_receipt(
                 profile=profile,
                 idempotency_key=authority["idempotency_key"],
                 operation=authority["operation"],
                 authority_digest=authority_digest,
             )
-            if receipt is None:
-                return None
+        except OwnerReceiptUnreadable as exc:
+            logger.error(
+                "[api_server] native owner receipt for run=%s is unreadable: %s",
+                run_id, exc,
+            )
+            raise _OwnerNativeReceiptUnreadable(str(exc)) from exc
+        except Exception as exc:
+            logger.exception(
+                "[api_server] native owner receipt for run=%s could not be read",
+                run_id,
+            )
+            raise _OwnerNativeReceiptUnreadable(
+                "the native owner receipt could not be read"
+            ) from exc
+        if receipt is None:
+            return None
+        try:
             minimal_receipt = self._owner_mutation_receipt(
                 authority["operation"], receipt,
             )
             if minimal_receipt is None:
-                return None
+                raise _OwnerNativeReceiptUnreadable(
+                    "a committed native receipt could not be projected"
+                )
             created_at = self._response_store.run_idempotency_created_at(
                 profile,
                 session_scope,
@@ -10214,7 +12039,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 run_id,
             )
             if created_at is None:
-                return None
+                raise _OwnerNativeReceiptUnreadable(
+                    "a committed native receipt has no run identity to bind to"
+                )
             completion_owner = dict(owner) if owner is not None else None
             if completion_owner is not None:
                 completion_owner["payload_digest"] = authority_digest
@@ -10227,12 +12054,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 created_at=created_at,
                 owner=completion_owner,
             )
-        except Exception:
+        except _OwnerNativeReceiptUnreadable:
+            raise
+        except Exception as exc:
             logger.exception(
                 "[api_server] native owner completion recovery failed for run=%s",
                 run_id,
             )
-            return None
+            raise _OwnerNativeReceiptUnreadable(
+                "a committed native receipt could not be recorded"
+            ) from exc
 
     @staticmethod
     def _owner_mutation_receipt(
@@ -10406,21 +12237,35 @@ class APIServerAdapter(BasePlatformAdapter):
                         and retry_status.get("owner_mutation_committed") is True
                     )
                 ):
-                    retry_status = self._recover_native_owner_completion(
-                        profile=request_owner_profile,
-                        session_scope=retry_scope,
-                        run_id=retry_run_id,
-                        authority=owner_proposal_authority,
-                        owner={
-                            "proposal_profile": owner_proposal_authority[
-                                "proposal_profile"
-                            ],
-                            "conversation": owner_proposal_authority["conversation"],
-                            "response_id": owner_proposal_authority["response_id"],
-                            "claim_id": owner_proposal_authority["claim_id"],
-                            "operation": owner_proposal_authority["operation"],
-                        },
-                    ) or retry_status
+                    try:
+                        retry_status = self._recover_native_owner_completion(
+                            profile=request_owner_profile,
+                            session_scope=retry_scope,
+                            run_id=retry_run_id,
+                            authority=owner_proposal_authority,
+                            owner={
+                                "proposal_profile": owner_proposal_authority[
+                                    "proposal_profile"
+                                ],
+                                "conversation": owner_proposal_authority["conversation"],
+                                "response_id": owner_proposal_authority["response_id"],
+                                "claim_id": owner_proposal_authority["claim_id"],
+                                "operation": owner_proposal_authority["operation"],
+                            },
+                        ) or retry_status
+                    except _OwnerNativeReceiptUnreadable:
+                        # Whether the first attempt's change committed cannot be
+                        # decided, so this retry may neither replay it as
+                        # completed nor start a second one.
+                        return web.json_response(
+                            _openai_error(
+                                "The earlier attempt's outcome could not be "
+                                "confirmed",
+                                err_type="server_error",
+                                code="owner_run_outcome_unconfirmed",
+                            ),
+                            status=503,
+                        )
                 if (
                     retry_state == "existing"
                     and retry_run_id is not None
@@ -10491,13 +12336,24 @@ class APIServerAdapter(BasePlatformAdapter):
                         and retry_status.get("owner_mutation_committed") is True
                     )
                 ):
-                    retry_status = self._recover_native_owner_completion(
-                        profile=request_owner_profile,
-                        session_scope=retry_scope,
-                        run_id=retry_run_id,
-                        authority=owner_lifecycle_authority,
-                        owner=None,
-                    ) or retry_status
+                    try:
+                        retry_status = self._recover_native_owner_completion(
+                            profile=request_owner_profile,
+                            session_scope=retry_scope,
+                            run_id=retry_run_id,
+                            authority=owner_lifecycle_authority,
+                            owner=None,
+                        ) or retry_status
+                    except _OwnerNativeReceiptUnreadable:
+                        return web.json_response(
+                            _openai_error(
+                                "The earlier attempt's outcome could not be "
+                                "confirmed",
+                                err_type="server_error",
+                                code="owner_run_outcome_unconfirmed",
+                            ),
+                            status=503,
+                        )
                 if (
                     retry_state == "existing"
                     and retry_run_id is not None
@@ -10678,10 +12534,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         status=409,
                     )
                 if owner_proposal_authority is not None and not released_owner_retry:
-                    owner_snapshot = self._response_store.owner_history_snapshot(
-                        owner_proposal_authority["conversation"],
-                        profile=owner_proposal_authority["proposal_profile"],
-                    )
+                    try:
+                        owner_snapshot = (
+                            self._response_store.owner_history_snapshot(
+                                owner_proposal_authority["conversation"],
+                                profile=owner_proposal_authority[
+                                    "proposal_profile"
+                                ],
+                            )
+                        )
+                    except OwnerAuthorityBroken:
+                        return web.json_response(
+                            _openai_error(
+                                "Owner proposal authority could not be read",
+                                code="owner_proposal_authority_conflict",
+                            ),
+                            status=409,
+                        )
                     existing_status = (
                         self._run_statuses.get(existing_run_id)
                         or persisted_status
@@ -10725,6 +12594,28 @@ class APIServerAdapter(BasePlatformAdapter):
             return limited
 
         run_id = f"run_{uuid.uuid4().hex}"
+        # Everything startup recovery needs to decide this run's fate WITHOUT
+        # guessing: which proposal claim to release, and — before it declares
+        # anything failed — the exact native mutation authority whose committed
+        # receipt would prove the change actually landed. Reserved in the same
+        # transaction as the run's own authority, never after it.
+        recovery_job_payload: Dict[str, Any] = {}
+        if owner_proposal_authority is not None:
+            recovery_job_payload["owner"] = {
+                "proposal_profile": owner_proposal_authority["proposal_profile"],
+                "conversation": owner_proposal_authority["conversation"],
+                "response_id": owner_proposal_authority["response_id"],
+                "claim_id": owner_proposal_authority["claim_id"],
+                "operation": owner_proposal_authority["operation"],
+            }
+        native_authority = owner_proposal_authority or owner_lifecycle_authority
+        if native_authority is not None and idempotency_key is not None:
+            recovery_job_payload["native"] = {
+                "operation": native_authority["operation"],
+                "idempotency_key": native_authority["idempotency_key"],
+                "authority_digest": native_authority["payload_digest"],
+                "session_scope": idempotency_session_scope,
+            }
         authority_bound = True
         if idempotency_key is not None:
             reserve_state, reserved_run_id = self._response_store.reserve_run_idempotency(
@@ -10734,6 +12625,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 str(idempotency_fingerprint),
                 run_id,
                 owner=owner_proposal_authority,
+                job_payload=recovery_job_payload,
             )
             authority_bound = reserve_state != "authority_conflict"
             if reserve_state == "conflict":
@@ -10763,6 +12655,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 run_id,
                 operation=owner_proposal_authority["operation"],
                 payload_digest=owner_proposal_authority["payload_digest"],
+                job_payload=recovery_job_payload,
+                job_profile=request_owner_profile,
+            )
+        else:
+            # No idempotency key and no proposal authority: this run has no
+            # other durable record, so its job row IS the recovery authority
+            # and one write commits it.
+            self._response_store.reserve_owner_job(
+                "run", run_id, request_owner_profile, recovery_job_payload,
             )
         if not authority_bound:
             return web.json_response(
@@ -11354,8 +13255,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
+        # The durable recovery job was reserved in the same transaction as this
+        # run's own authority, above — never after it, because a crash in that
+        # gap left a durable queued run and a claimed proposal with no executor.
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
+        task.add_done_callback(
+            lambda _task: self._finalize_run_recovery_job(
+                run_id, request_owner_profile,
+            )
+        )
         self._active_run_tasks[run_id] = task
         try:
             self._background_tasks.add(task)
@@ -11681,6 +13590,177 @@ class APIServerAdapter(BasePlatformAdapter):
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
         self._response_store.purge_run_idempotency(now - 24 * 60 * 60)
+        self._response_store.purge_owner_response_idempotency(now - 24 * 60 * 60)
+        # Heartbeat BEFORE recovery, so work this process is still driving can
+        # never be reaped by its own sweep.
+        self._heartbeat_owner_job_leases()
+        self._recover_orphaned_owner_jobs()
+
+    def _finalize_run_recovery_job(self, run_id: str, profile: str) -> None:
+        """Persist this run's terminal status and retire its recovery job.
+
+        Both in ONE transaction. Deleting the job row on its own left a durable
+        row still saying ``queued`` after a restart — with no executor and no
+        recovery authority — so polling reported working forever. A run that
+        already persisted a terminal receipt keeps it; that receipt outranks any
+        transport-level status.
+
+        Nothing is deleted when the run did not actually reach a terminal state
+        (the task died before recording one): the job row survives so a later
+        sweep can recover it.
+        """
+        status = self._run_statuses.get(run_id) or {}
+        state = str(status.get("status") or "")
+        if state not in _TERMINAL_RUN_STATUSES:
+            state = "failed"
+        try:
+            self._response_store.persist_terminal_run_status(profile, run_id, state)
+        except OwnerAuthorityUnavailable:
+            return
+        except Exception:
+            logger.exception(
+                "[api_server] run %s terminal state could not be persisted", run_id,
+            )
+
+    def _driving_owner_jobs(self, kind: str) -> "list[str]":
+        """The jobs of ``kind`` this process still has a live executor for."""
+        if kind == "run":
+            return [
+                run_id for run_id, task in list(self._active_run_tasks.items())
+                if not task.done()
+            ]
+        return list(self._owner_response_jobs)
+
+    def _heartbeat_owner_job_leases(self) -> None:
+        """Renew this executor's lease on the owner work it is still driving.
+
+        The lease — not pid liveness — is what proves an executor is alive, so a
+        run or response that is genuinely still working has to keep saying so,
+        or a sibling process would reclaim live work once the lease ran out.
+        """
+        for kind in ("run", "response"):
+            try:
+                self._response_store.renew_owner_job_leases(
+                    kind, self._driving_owner_jobs(kind),
+                )
+            except OwnerAuthorityUnavailable:
+                return
+            except Exception:
+                logger.exception("[api_server] owner job lease heartbeat failed")
+
+    def _recover_orphaned_owner_jobs(self) -> None:
+        """Close out durably queued owner work whose executor is gone.
+
+        A queued owner response or run is durable, but its only executor is an
+        in-memory task in the process that started it. When that process dies
+        the work cannot resume, so each orphan is made terminal exactly once:
+        the response reports failed, frees its conversation and records that
+        terminal failure under its own immutable idempotency key, and the run
+        reports failed and releases its owner proposal claim so the owner can
+        approve the same change again. Runs on every start and on every sweep,
+        so a sibling process that dies later is reconciled too.
+
+        Each orphan is CLAIMED under a fresh lease rather than deleted. Its row
+        is removed only by the transaction that makes its work terminal, so a
+        crash, a malformed payload, or an exception during terminalization
+        leaves the recovery authority intact for the next sweep instead of
+        destroying it.
+
+        A mutation run is never declared failed before its exact native receipt
+        has been reconciled: the gateway can die after the native database
+        committed but before its own run terminal was stored, and reporting that
+        completed change as failed — while releasing its proposal — would invite
+        the owner to approve the very same mutation a second time.
+        """
+        try:
+            responses = self._response_store.claim_orphaned_owner_jobs(
+                "response", self._driving_owner_jobs("response"),
+            )
+            runs = self._response_store.claim_orphaned_owner_jobs(
+                "run", self._driving_owner_jobs("run"),
+            )
+        except OwnerAuthorityUnavailable:
+            return
+        except Exception:
+            logger.exception("[api_server] owner job recovery could not read state")
+            return
+        for job in responses:
+            conversation = str(job["payload"].get("conversation") or "")
+            if not conversation:
+                continue
+            try:
+                if self._response_store.fail_orphaned_owner_response(
+                    job["profile"], conversation, job["job_key"],
+                    _OWNER_ORPHAN_RESPONSE_MESSAGE,
+                ):
+                    logger.warning(
+                        "[api_server] recovered orphaned owner response %s",
+                        job["job_key"],
+                    )
+            except Exception:
+                logger.exception(
+                    "[api_server] orphaned owner response %s could not be closed",
+                    job["job_key"],
+                )
+        for job in runs:
+            owner = job["payload"].get("owner")
+            try:
+                if self._reconcile_orphaned_native_run(job):
+                    logger.warning(
+                        "[api_server] recovered a committed native mutation for "
+                        "orphaned owner run %s", job["job_key"],
+                    )
+                    continue
+            except _OwnerNativeReceiptUnreadable:
+                # The mutation may or may not have committed. Its job row keeps
+                # its lease and a later sweep decides; failing it now could
+                # report a completed change as failed and release its proposal.
+                logger.error(
+                    "[api_server] orphaned owner run %s left for another pass: "
+                    "its native receipt could not be read", job["job_key"],
+                )
+                continue
+            try:
+                if self._response_store.fail_orphaned_owner_run(
+                    job["profile"], job["job_key"],
+                    owner if isinstance(owner, dict) else None,
+                ):
+                    logger.warning(
+                        "[api_server] recovered orphaned owner run %s",
+                        job["job_key"],
+                    )
+            except Exception:
+                logger.exception(
+                    "[api_server] orphaned owner run %s could not be closed",
+                    job["job_key"],
+                )
+
+    def _reconcile_orphaned_native_run(self, job: "Dict[str, Any]") -> bool:
+        """Persist an orphaned run's committed native receipt, if it has one.
+
+        Returns True when the receipt was found and the run's terminal
+        completion is now durable. Returns False only when this exact run
+        provably committed NOTHING — the one state in which it may be reported
+        failed. Raises :class:`_OwnerNativeReceiptUnreadable` when that cannot
+        be decided.
+        """
+        native = job["payload"].get("native")
+        if not isinstance(native, dict):
+            # A run with no native mutation authority (an ordinary agent run)
+            # has no external effect to reconcile.
+            return False
+        owner = job["payload"].get("owner")
+        return self._recover_native_owner_completion(
+            profile=str(job["profile"]),
+            session_scope=str(native.get("session_scope") or ""),
+            run_id=str(job["job_key"]),
+            authority={
+                "operation": str(native.get("operation") or ""),
+                "idempotency_key": str(native.get("idempotency_key") or ""),
+            },
+            owner=owner if isinstance(owner, dict) else None,
+            authority_digest=str(native.get("authority_digest") or ""),
+        ) is not None
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -11764,6 +13844,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 for mw in (
                     self._make_profile_prefix_middleware(),
                     self._make_route_allowlist_middleware(),
+                    self._make_owner_authority_middleware(),
                     cors_middleware,
                     body_limit_middleware,
                     security_headers_middleware,
@@ -11785,6 +13866,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app["api_server_adapter"] = self
             if self.gateway_runner is not None:
                 self._app["gateway_runner"] = self.gateway_runner
+
+            # Durably queued owner work whose executor died with the previous
+            # process cannot resume, so it is made terminal before this one
+            # starts serving.
+            self._recover_orphaned_owner_jobs()
 
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())

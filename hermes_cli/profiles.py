@@ -379,6 +379,27 @@ def get_profile_dir(name: str) -> Path:
     return _get_profiles_root() / canon
 
 
+def profile_name_for_home(home: Path) -> str:
+    """Reverse :func:`get_profile_dir`: which profile owns this HERMES_HOME.
+
+    The inverse is needed by writers that only know the resolved config path
+    (the shared config-save boundary) but must decide policy per profile.
+    Anything outside the profiles root — including the default home itself —
+    is ``default``, matching how :func:`get_profile_dir` resolves that name.
+    """
+    try:
+        resolved = Path(home).resolve()
+        root = _get_profiles_root().resolve()
+    except OSError:
+        return "default"
+    if resolved.parent != root:
+        return "default"
+    try:
+        return normalize_profile_name(resolved.name)
+    except ValueError:
+        return "default"
+
+
 def profile_exists(name: str) -> bool:
     """Check whether a profile directory exists."""
     canon = normalize_profile_name(name)

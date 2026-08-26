@@ -708,6 +708,41 @@ load_hermes_dotenv(
     load_external_secrets=sys.argv[1:2] != ["update"],
 )
 
+# No-fallback authority, latched AFTER every dotenv load above. A worker
+# dispatched for a task with an exact owner-approved route is launched with
+# ``--no-fallbacks``; the profile's own ``.env`` is loaded with override=True
+# and could reset an env var, but it cannot reach this module-level latch. The
+# flag is then stripped from argv so argparse never sees it.
+from hermes_cli.fallback_config import (  # noqa: E402
+    apply_process_fallback_policy,
+    strip_no_fallback_flag,
+)
+
+apply_process_fallback_policy()
+sys.argv = sys.argv[:1] + strip_no_fallback_flag(sys.argv[1:])
+
+# An all-or-nothing multi-role model change writes several live config files
+# before it updates enrollment and its audit record. Power loss in that window
+# can leave some roles on the new route and some on the old, with no record of
+# either, so the journal it fsyncs first is reconciled here — before anything
+# in this process reads a route.
+try:
+    from hermes_cli.config import reconcile_profile_route_batch_journal
+
+    reconcile_profile_route_batch_journal()
+except Exception:
+    # A journal that cannot be reconciled leaves this machine's route authority
+    # unknown, and the reconciler has already latched that: every route read and
+    # every route write in this process now refuses until it is resolved (see
+    # ``hermes_cli.config.assert_route_journal_reconciled``). The process itself
+    # still starts, deliberately — an operator needs a working CLI to repair it.
+    import logging as _logging
+
+    _logging.getLogger(__name__).exception(
+        "multi-role model change reconciliation failed at startup; model "
+        "routing is blocked until it is reconciled"
+    )
+
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
 # module-import time). Without this, config.yaml's toggle is ignored because

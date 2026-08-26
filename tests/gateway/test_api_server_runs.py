@@ -12,6 +12,7 @@ Covers:
 import asyncio
 import hashlib
 import json
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -82,7 +83,9 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
 
 def _new_owner_proposal():
     return {
-        "schema_version": 2,
+        # v3 is the first new-project schema that carries execution_tier, so it
+        # is the first one that grants commit authority.
+        "schema_version": 3,
         "kind": "proposal",
         "mode": "new",
         "project_name": "Workshop pilot",
@@ -100,6 +103,7 @@ def _new_owner_proposal():
             "body": "Prepare the private workshop plan.",
             "assignee": "default",
             "responsibility": "B03",
+            "execution_tier": "routine",
             "parents": [],
         }],
     }
@@ -120,6 +124,30 @@ def _new_owner_payload(idempotency_key: str, proposal: dict):
         "tasks": proposal["tasks"],
         "later_milestones": proposal["later_milestones"],
     }
+
+
+@pytest.fixture(autouse=True)
+def _resolved_owner_task_routes():
+    """Resolve owner task routes without a real profile config on disk.
+
+    These tests exercise the run lifecycle, not the model matrix (which is
+    covered by tests/plugins/dashboard_auth/test_raphael_model_policy.py); the
+    owner kernel only needs *some* admitted route to pin.
+    """
+    from hermes_cli import owner_workspace as ow
+
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    original = model_policy.configured_assignment_for
+    # Only the on-disk provider selection is faked; the admitted matrix, the
+    # tier resolution and the durable lock minting are all production code.
+    model_policy.configured_assignment_for = (
+        lambda profile: model_policy.assignment_for(profile, "anthropic")
+    )
+    try:
+        yield
+    finally:
+        model_policy.configured_assignment_for = original
 
 
 def _make_slow_agent(**kwargs):
@@ -1603,3 +1631,443 @@ class TestRunsProviderAuthFailure:
                 assert status["status"] == "failed"
                 assert status["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
                 assert status["last_event"] == "run.failed"
+
+
+# ---------------------------------------------------------------------------
+# Item 32TK: a run's only executor is this process, so a restart must
+# reconcile it instead of polling "working" forever
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanedRunRecovery:
+    _RUN_ID = "run_" + "a" * 32
+    _CONVERSATION = "raphael-owner-" + "1" * 32
+    _RESPONSE_ID = "resp_" + "9" * 28
+    _CLAIM_ID = "claim_" + "9" * 20
+
+    def _queued_owner_run(self, adapter, *, dead: bool = True) -> dict:
+        """Exactly what a 202 leaves durable: a queued run and a claimed
+        proposal, attributed to a process that is gone."""
+        store = adapter._response_store
+        scope = hashlib.sha256(b"").hexdigest()
+        key = "run-key-1"
+        owner = {
+            "proposal_profile": "default",
+            "conversation": self._CONVERSATION,
+            "response_id": self._RESPONSE_ID,
+            "claim_id": self._CLAIM_ID,
+            "operation": "owner_project_plan_commit",
+            "payload_digest": "digest",
+        }
+        store.put(self._RESPONSE_ID, {
+            "response": {"id": self._RESPONSE_ID, "status": "completed"},
+            "conversation_history": [
+                {"role": "user", "content": "Apply it."},
+                {"role": "assistant", "content": json.dumps(
+                    {"schema_version": 1, "kind": "question", "message": "ok?"}
+                )},
+            ],
+        })
+        assert store.set_conversation(
+            self._CONVERSATION, self._RESPONSE_ID, owner_proposal=False,
+        ) is True
+        store._conn.execute(
+            "UPDATE conversations SET proposal_response_id = ?, "
+            "claimed_response_id = ?, claim_id = ?, owner_run_id = ?, "
+            "claim_state = 'claimed' WHERE profile = 'default' AND name = ?",
+            (
+                self._RESPONSE_ID, self._RESPONSE_ID, self._CLAIM_ID,
+                self._RUN_ID, self._CONVERSATION,
+            ),
+        )
+        store._conn.commit()
+        state, _existing = store.reserve_run_idempotency(
+            "default", scope, key, "fingerprint", self._RUN_ID,
+        )
+        assert state == "new"
+        store.reserve_owner_job("run", self._RUN_ID, "default", {"owner": owner})
+        if dead:
+            store._conn.execute(
+                "UPDATE owner_executor_jobs SET executor_id = 'dead', "
+                "executor_pid = 2147483646, created_at = ? WHERE job_key = ?",
+                (time.time() - 3600, self._RUN_ID),
+            )
+            store._conn.commit()
+        return {"scope": scope, "key": key, "owner": owner}
+
+    @pytest.mark.asyncio
+    async def test_a_run_whose_executor_died_stops_reporting_working(self, adapter):
+        reserved = self._queued_owner_run(adapter)
+        store = adapter._response_store
+
+        # Before recovery: the durable state still says queued, and its only
+        # executor no longer exists.
+        assert store.run_idempotency_status("default", self._RUN_ID)["status"] == (
+            "queued"
+        )
+
+        adapter._recover_orphaned_owner_jobs()
+
+        recovered = store.run_idempotency_status("default", self._RUN_ID)
+        assert recovered["status"] == "failed"
+        assert "restarted" in recovered["error"]
+        # The claim is released, so the owner can approve the same change again.
+        assert store.owner_claim_is_released(
+            "default", self._CONVERSATION, self._RESPONSE_ID,
+            self._CLAIM_ID, self._RUN_ID,
+        ) is True
+        assert store.claim_orphaned_owner_jobs("run") == []
+        assert reserved["owner"]["conversation"] == self._CONVERSATION
+
+    @pytest.mark.asyncio
+    async def test_a_recovered_run_polls_as_failed(self, adapter):
+        self._queued_owner_run(adapter)
+        adapter._recover_orphaned_owner_jobs()
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(f"/v1/runs/{self._RUN_ID}")
+            body = await resp.json()
+
+        assert resp.status == 200
+        assert body["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_a_run_with_a_live_executor_is_left_alone(self, adapter):
+        self._queued_owner_run(adapter, dead=False)
+        adapter._recover_orphaned_owner_jobs()
+
+        store = adapter._response_store
+        assert store.run_idempotency_status("default", self._RUN_ID)["status"] == (
+            "queued"
+        )
+        assert store.owner_claim_is_released(
+            "default", self._CONVERSATION, self._RESPONSE_ID,
+            self._CLAIM_ID, self._RUN_ID,
+        ) is False
+
+    @pytest.mark.asyncio
+    async def test_a_run_that_already_persisted_its_receipt_is_left_alone(
+        self, adapter,
+    ):
+        reserved = self._queued_owner_run(adapter)
+        store = adapter._response_store
+        # Exactly what ``persist_owner_run_completion`` leaves behind.
+        store._conn.execute(
+            "UPDATE run_idempotency SET terminal_json = ?, status_json = NULL "
+            "WHERE run_id = ?",
+            (json.dumps({"status": "completed"}), self._RUN_ID),
+        )
+        store._conn.commit()
+
+        adapter._recover_orphaned_owner_jobs()
+
+        assert store.run_idempotency_status("default", self._RUN_ID) is None
+        assert store.owner_claim_is_released(
+            "default", self._CONVERSATION, reserved["owner"]["response_id"],
+            self._CLAIM_ID, self._RUN_ID,
+        ) is False
+
+    # -----------------------------------------------------------------------
+    # Item 32TK round 2
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_a_run_reservation_and_its_recovery_job_commit_together(
+        self, adapter,
+    ):
+        """A crash between them left a durable queued run and a claimed proposal
+        with no executor: polling reported working forever and the owner could
+        not approve the same proposal again."""
+        store = adapter._response_store
+        scope = hashlib.sha256(b"").hexdigest()
+        with patch.object(
+            store, "_reserve_owner_job_locked",
+            side_effect=RuntimeError("disk full"),
+        ):
+            with pytest.raises(RuntimeError):
+                store.reserve_run_idempotency(
+                    "default", scope, "atomic-key", "fingerprint", self._RUN_ID,
+                    job_payload={"owner": None},
+                )
+
+        # Neither half landed.
+        assert store.run_idempotency_status("default", self._RUN_ID) is None
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+            (self._RUN_ID,),
+        ).fetchone()[0] == 0
+
+        state, _run = store.reserve_run_idempotency(
+            "default", scope, "atomic-key", "fingerprint", self._RUN_ID,
+            job_payload={"owner": None},
+        )
+        assert state == "new"
+        assert store.run_idempotency_status("default", self._RUN_ID)["status"] == (
+            "queued"
+        )
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+            (self._RUN_ID,),
+        ).fetchone()[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_proposal_claim_and_its_recovery_job_commit_together(
+        self, adapter,
+    ):
+        store = adapter._response_store
+        conversation = "raphael-owner-" + "7" * 32
+        response_id = "resp_" + "7" * 28
+        claim_id = "claim_" + "7" * 20
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 100},
+            "conversation_history": [
+                {"role": "assistant", "content": json.dumps(_new_owner_proposal())},
+            ],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+
+        with patch.object(
+            store, "_reserve_owner_job_locked",
+            side_effect=RuntimeError("disk full"),
+        ):
+            with pytest.raises(RuntimeError):
+                store.claim_and_attach_owner_run(
+                    "default", conversation, response_id, claim_id, self._RUN_ID,
+                    operation="owner_task_graph_commit",
+                    payload_digest="d" * 64,
+                    job_payload={},
+                    job_profile="default",
+                )
+
+        # The proposal is NOT claimed by a run nobody is driving.
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["proposal_claimed"] is False
+        assert snapshot["active_run_id"] is None
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+            (self._RUN_ID,),
+        ).fetchone()[0] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_recycled_pid_cannot_strand_queued_owner_work(self, adapter):
+        """PID liveness alone is not a fence: a recycled pid looks alive
+        forever, so an expired LEASE has to be enough to reclaim the job."""
+        self._queued_owner_run(adapter, dead=False)
+        store = adapter._response_store
+        # A sibling executor that is gone, whose pid has since been reused by
+        # this very process — the exact case PID liveness cannot decide.
+        store._conn.execute(
+            "UPDATE owner_executor_jobs SET executor_id = 'dead-sibling', "
+            "executor_pid = ?, created_at = ?, lease_expires_at = ? "
+            "WHERE job_key = ?",
+            (os.getpid(), time.time() - 3600, time.time() - 1, self._RUN_ID),
+        )
+        store._conn.commit()
+
+        adapter._recover_orphaned_owner_jobs()
+
+        assert store.run_idempotency_status("default", self._RUN_ID)["status"] == (
+            "failed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_heartbeat_keeps_a_live_executors_job(self, adapter):
+        """Work that legitimately outlives one lease must keep saying it is
+        alive, or a sibling gateway would reclaim it mid-flight."""
+        self._queued_owner_run(adapter, dead=False)
+        store = adapter._response_store
+        store._conn.execute(
+            "UPDATE owner_executor_jobs SET created_at = ?, lease_expires_at = ? "
+            "WHERE job_key = ?",
+            (time.time() - 3600, time.time() - 1, self._RUN_ID),
+        )
+        store._conn.commit()
+        # This process is genuinely still driving the run.
+        adapter._active_run_tasks[self._RUN_ID] = SimpleNamespace(
+            done=lambda: False
+        )
+        adapter._heartbeat_owner_job_leases()
+
+        # The renewed lease is what a SIBLING sees.
+        assert (
+            store._conn.execute(
+                "SELECT lease_expires_at FROM owner_executor_jobs WHERE job_key = ?",
+                (self._RUN_ID,),
+            ).fetchone()[0]
+            > time.time()
+        )
+        adapter._recover_orphaned_owner_jobs()
+        assert store.run_idempotency_status("default", self._RUN_ID)["status"] == (
+            "queued"
+        )
+
+    @pytest.mark.asyncio
+    async def test_this_process_reclaims_its_own_job_once_its_task_is_gone(
+        self, adapter,
+    ):
+        """A task that died without recording a terminal state leaves a job row
+        only this process can tell is abandoned. Skipping every one of its own
+        rows left such a response or run queued until the next restart."""
+        self._queued_owner_run(adapter, dead=False)
+        store = adapter._response_store
+        store._conn.execute(
+            "UPDATE owner_executor_jobs SET created_at = ? WHERE job_key = ?",
+            (time.time() - 3600, self._RUN_ID),
+        )
+        store._conn.commit()
+        assert adapter._active_run_tasks.get(self._RUN_ID) is None
+
+        adapter._recover_orphaned_owner_jobs()
+
+        assert store.run_idempotency_status("default", self._RUN_ID)["status"] == (
+            "failed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_orphan_job_survives_a_failed_terminalization(self, adapter):
+        """The job row is the only record of what to recover, so deleting it
+        before terminalizing lost the recovery authority for good."""
+        self._queued_owner_run(adapter)
+        store = adapter._response_store
+        with patch.object(
+            store, "fail_orphaned_owner_run", side_effect=RuntimeError("db is busy"),
+        ):
+            adapter._recover_orphaned_owner_jobs()
+
+        # Still queued AND still recoverable.
+        assert store.run_idempotency_status("default", self._RUN_ID)["status"] == (
+            "queued"
+        )
+        store._conn.execute(
+            "UPDATE owner_executor_jobs SET executor_id = 'dead', "
+            "executor_pid = 2147483646, created_at = ?, lease_expires_at = ? "
+            "WHERE job_key = ?",
+            (time.time() - 3600, time.time() - 1, self._RUN_ID),
+        )
+        store._conn.commit()
+        adapter._recover_orphaned_owner_jobs()
+        assert store.run_idempotency_status("default", self._RUN_ID)["status"] == (
+            "failed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_committed_native_receipt_is_reconciled_before_failing(
+        self, adapter,
+    ):
+        """The gateway can die after the native database commits. Reporting that
+        completed change as failed — and releasing its approval — invited the
+        owner to run the very same mutation twice."""
+        reserved = self._queued_owner_run(adapter)
+        store = adapter._response_store
+        store._conn.execute(
+            "UPDATE conversations SET bound_operation = ?, "
+            "bound_payload_digest = ? WHERE name = ?",
+            ("owner_task_graph_commit", "d" * 64, self._CONVERSATION),
+        )
+        store._conn.execute(
+            "UPDATE owner_executor_jobs SET payload = ? WHERE job_key = ?",
+            (
+                json.dumps({
+                    "owner": {
+                        **reserved["owner"],
+                        "operation": "owner_task_graph_commit",
+                    },
+                    "native": {
+                        "operation": "owner_task_graph_commit",
+                        "idempotency_key": reserved["key"],
+                        "authority_digest": "d" * 64,
+                        "session_scope": reserved["scope"],
+                    },
+                }),
+                self._RUN_ID,
+            ),
+        )
+        store._conn.commit()
+
+        with patch(
+            "hermes_cli.owner_workspace.read_committed_owner_run_receipt",
+            return_value={
+                "ok": True, "project_slug": "workshop-pilot", "task_count": 2,
+            },
+        ):
+            adapter._recover_orphaned_owner_jobs()
+
+        completion = store.owner_run_completion("default", self._RUN_ID)
+        assert completion["status"] == "completed"
+        assert completion["owner_mutation_committed"] is True
+        # The approval was CONSUMED, not released back to the owner.
+        assert store.owner_claim_is_released(
+            "default", self._CONVERSATION, self._RESPONSE_ID,
+            self._CLAIM_ID, self._RUN_ID,
+        ) is False
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_native_receipt_never_declares_failure(
+        self, adapter,
+    ):
+        reserved = self._queued_owner_run(adapter)
+        store = adapter._response_store
+        store._conn.execute(
+            "UPDATE owner_executor_jobs SET payload = ? WHERE job_key = ?",
+            (
+                json.dumps({
+                    "owner": reserved["owner"],
+                    "native": {
+                        "operation": "owner_task_graph_commit",
+                        "idempotency_key": reserved["key"],
+                        "authority_digest": "e" * 64,
+                        "session_scope": reserved["scope"],
+                    },
+                }),
+                self._RUN_ID,
+            ),
+        )
+        store._conn.commit()
+
+        from hermes_cli.owner_workspace import OwnerReceiptUnreadable
+
+        with patch(
+            "hermes_cli.owner_workspace.read_committed_owner_run_receipt",
+            side_effect=OwnerReceiptUnreadable("two committed receipts"),
+        ):
+            adapter._recover_orphaned_owner_jobs()
+
+        # Undecided: nothing was failed, nothing was released, and the job row
+        # is still there for the next pass.
+        assert store.run_idempotency_status("default", self._RUN_ID)["status"] == (
+            "queued"
+        )
+        assert store.owner_claim_is_released(
+            "default", self._CONVERSATION, self._RESPONSE_ID,
+            self._CLAIM_ID, self._RUN_ID,
+        ) is False
+        store._conn.execute(
+            "UPDATE owner_executor_jobs SET executor_id = 'dead', "
+            "executor_pid = 2147483646, created_at = ?, lease_expires_at = ? "
+            "WHERE job_key = ?",
+            (time.time() - 3600, time.time() - 1, self._RUN_ID),
+        )
+        store._conn.commit()
+        assert [job["job_key"] for job in store.claim_orphaned_owner_jobs("run")] == [
+            self._RUN_ID
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_terminal_run_persists_its_status_with_its_job(self, adapter):
+        """After a restart the durable row used to still say queued, so polling
+        reported working forever."""
+        self._queued_owner_run(adapter, dead=False)
+        store = adapter._response_store
+        adapter._run_statuses[self._RUN_ID] = {
+            "object": "hermes.run", "run_id": self._RUN_ID, "status": "cancelled",
+        }
+
+        adapter._finalize_run_recovery_job(self._RUN_ID, "default")
+
+        assert store.run_idempotency_status("default", self._RUN_ID)["status"] == (
+            "cancelled"
+        )
+        assert store.claim_orphaned_owner_jobs("run") == []

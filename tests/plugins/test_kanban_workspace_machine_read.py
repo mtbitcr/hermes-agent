@@ -734,12 +734,57 @@ def test_revocation_is_effective_on_the_next_request(workspace_surface):
     assert response.json() == {"error": "unauthenticated", "detail": "Unauthorized"}
 
 
-def test_broken_scope_binding_fails_closed(workspace_surface):
+def test_a_mismatched_binding_is_an_authority_failure_not_an_absence(
+    workspace_surface,
+):
+    """Both halves of the grant still exist; only their binding disagrees. A 404
+    there told the owner their Project does not exist."""
     s = workspace_surface
     kb.write_board_metadata(BOARD, project_id="p_wrong")
     response = _get(s, "/api/plugins/kanban/projects")
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Not Found"}
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+def test_a_project_row_with_no_board_is_an_authority_failure(workspace_surface):
+    """Half the grant is gone and half is still there, which is not absence."""
+    s = workspace_surface
+    import shutil
+
+    shutil.rmtree(kb.board_dir(BOARD))
+    assert kb.board_exists(BOARD) is False
+    response = _get(s, "/api/plugins/kanban/projects")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+def test_a_board_with_no_project_row_is_an_authority_failure(workspace_surface):
+    s = workspace_surface
+    conn = pdb.connect()
+    try:
+        with ow.write_txn(conn):
+            conn.execute("DELETE FROM projects")
+    finally:
+        conn.close()
+    response = _get(s, "/api/plugins/kanban/projects")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+def test_malformed_board_ownership_metadata_blocks_the_machine_read(
+    workspace_surface,
+):
+    """A ``board.json`` that parses but publishes an unusable authority field is
+    unread ownership, not verified ownership."""
+    s = workspace_surface
+    path = kb.board_metadata_path(BOARD)
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    meta["dispatch_enabled"] = "yes"
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    assert kb.read_board_metadata(BOARD)["ownership_verified"] is False
+    response = _get(s, "/api/plugins/kanban/projects")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
 
 
 def test_process_path_overrides_cannot_widen_the_fixed_board(
@@ -765,3 +810,178 @@ def test_process_path_overrides_cannot_widen_the_fixed_board(
         query=f"?board={BOARD}",
     )
     assert attachment.content == s["attachment_body"]
+
+
+# An existing board database that cannot be OPENED is not a board with no work
+# on it. Answering an empty 200 (or a per-object 404) for it hands Workspace a
+# complete, zero-task plan it can then plan against, so every machine read that
+# touches board state must fail closed with 503 instead. A board file that is
+# genuinely absent keeps its own, different answer.
+def _break_board_open(monkeypatch):
+    real_connect = plugin_api.sqlite3.connect
+
+    def refuse(target, *args, **kwargs):
+        if isinstance(target, str) and "kanban.db" in target:
+            raise plugin_api.sqlite3.OperationalError("unable to open database file")
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(plugin_api.sqlite3, "connect", refuse)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/plugins/kanban/board",
+        "/api/plugins/kanban/boards",
+        "/api/plugins/kanban/assignees",
+        "/api/plugins/kanban/workers/active",
+        "/api/plugins/kanban/tasks/{ready_id}",
+        "/api/plugins/kanban/tasks/{ready_id}/attachments",
+        "/api/plugins/kanban/attachments/{attachment_id}",
+        "/api/plugins/kanban/runs/{run_id}",
+    ],
+)
+def test_unreadable_board_is_unavailable_not_empty_or_missing(
+    workspace_surface, monkeypatch, path
+):
+    s = workspace_surface
+    board_query = "" if path.endswith("/boards") else f"?board={BOARD}"
+    _break_board_open(monkeypatch)
+
+    response = _get(s, path.format(**s), query=board_query)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+def test_unreadable_board_read_is_audited_as_a_denied_read(
+    workspace_surface, monkeypatch
+):
+    s = workspace_surface
+    _break_board_open(monkeypatch)
+
+    assert _get(
+        s, "/api/plugins/kanban/board", query=f"?board={BOARD}"
+    ).status_code == 503
+    denials = [
+        entry
+        for entry in _machine_audit_entries(s)
+        if entry.get("decision") == "deny" and entry.get("status") == 503
+    ]
+    assert denials and denials[-1]["reason"] == "read_unavailable"
+    assert all("kanban.db" not in json.dumps(entry) for entry in denials)
+
+
+def test_absent_board_database_still_projects_as_no_board_state(
+    workspace_surface, monkeypatch
+):
+    """Absence keeps its own answer: an empty board, not an outage."""
+    s = workspace_surface
+    kb.kanban_db_path(BOARD).unlink()
+
+    board = _get(s, "/api/plugins/kanban/board", query=f"?board={BOARD}")
+    assert board.status_code == 200
+    assert all(column["tasks"] == [] for column in board.json()["columns"])
+    assert _get(
+        s, f"/api/plugins/kanban/runs/{s['run_id']}", query=f"?board={BOARD}"
+    ).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Item 32TK: an existing Project must not disappear during an outage, and a
+# storage fault behind an authorized attachment is not proven absence
+# ---------------------------------------------------------------------------
+
+
+def test_an_unreadable_projects_db_is_unavailable_not_a_missing_scope(
+    workspace_surface, monkeypatch
+):
+    """Collapsing an open failure to an inactive scope made existing Projects
+    disappear behind a 404 whenever projects.db could not be read."""
+    s = workspace_surface
+    real_connect = plugin_api.sqlite3.connect
+
+    def refuse(target, *args, **kwargs):
+        if isinstance(target, str) and "projects.db" in target:
+            raise plugin_api.sqlite3.OperationalError("unable to open database file")
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(plugin_api.sqlite3, "connect", refuse)
+
+    response = _get(s, "/api/plugins/kanban/projects")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+def test_an_absent_projects_db_still_projects_as_no_scope(workspace_surface):
+    """Absence keeps its own answer."""
+    s = workspace_surface
+    pdb.projects_db_path().unlink()
+
+    response = _get(s, "/api/plugins/kanban/projects")
+    assert response.status_code == 404
+
+
+def test_unreadable_board_ownership_is_unavailable_not_a_missing_scope(
+    workspace_surface
+):
+    s = workspace_surface
+    kb.board_metadata_path(BOARD).write_text("{not json", encoding="utf-8")
+
+    response = _get(s, "/api/plugins/kanban/projects")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+@pytest.mark.parametrize(
+    "break_it", ["missing_file", "short_file", "trailing_bytes", "unreadable"],
+)
+def test_a_storage_fault_behind_an_authorized_attachment_is_not_a_404(
+    workspace_surface, break_it
+):
+    """Once the authority row is found, "not found" is off the table: a short
+    read, a size race or an I/O error is a fault, not proven absence."""
+    s = workspace_surface
+    conn = kb.connect(board=BOARD)
+    try:
+        stored = Path(
+            conn.execute(
+                "SELECT stored_path FROM task_attachments WHERE id = ?",
+                (s["attachment_id"],),
+            ).fetchone()["stored_path"]
+        )
+    finally:
+        conn.close()
+
+    if break_it == "missing_file":
+        stored.unlink()
+    elif break_it == "short_file":
+        stored.write_bytes(s["attachment_body"][:2])
+    elif break_it == "trailing_bytes":
+        stored.write_bytes(s["attachment_body"] + b"extra")
+    else:
+        stored.chmod(0o000)
+
+    try:
+        response = _get(
+            s,
+            f"/api/plugins/kanban/attachments/{s['attachment_id']}",
+            query=f"?board={BOARD}",
+        )
+    finally:
+        if break_it == "unreadable":
+            stored.chmod(0o600)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+def test_an_attachment_id_with_no_row_is_still_indistinguishable_from_missing(
+    workspace_surface
+):
+    """The adjacent success path: proven absence keeps its 404."""
+    s = workspace_surface
+    response = _get(
+        s, "/api/plugins/kanban/attachments/987654", query=f"?board={BOARD}",
+    )
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}

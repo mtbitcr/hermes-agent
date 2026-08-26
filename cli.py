@@ -4700,10 +4700,15 @@ def save_config_value(key_path: str, value: any) -> bool:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Save back atomically while preserving comments, ordering, quotes, and
-        # readable Unicode in user-edited config.yaml.
-        from utils import atomic_roundtrip_yaml_update
-        atomic_roundtrip_yaml_update(config_path, key_path, value)
-        
+        # readable Unicode in user-edited config.yaml — through the shared
+        # route boundary, so a model/provider/effort/fallback key persisted by
+        # /model, /reasoning or the TUI takes the same lock, policy check and
+        # owner-work fence as `hermes config set` and the dashboard API.
+        from hermes_cli.config import save_shared_config_key
+
+        save_shared_config_key(config_path, key_path, value, round_trip=True)
+
+
         # Enforce owner-only permissions on config files (contain API keys)
         try:
             os.chmod(config_path, 0o600)

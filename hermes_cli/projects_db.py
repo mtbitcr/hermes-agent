@@ -28,12 +28,19 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, write_txn
+from hermes_cli.sqlite_util import (
+    INIT_LOCK_POLL_SECONDS,
+    INIT_LOCK_TIMEOUT_SECONDS,
+    add_column_if_missing as _add_column_if_missing,
+    cross_process_init_lock,
+    write_txn,
+)
 from hermes_constants import get_hermes_home
 
 # ---------------------------------------------------------------------------
@@ -150,6 +157,23 @@ def _normalize_path(path: str) -> str:
 # ---------------------------------------------------------------------------
 
 _INITIALIZED_PATHS: set[str] = set()
+_INIT_LOCK = threading.RLock()
+_BUSY_TIMEOUT_MS = 120_000
+# Bounded wait for the cross-process first-open lock. Unlike the kanban
+# dispatch bus, this store fails CLOSED at the deadline: the Projects DB holds
+# the owner receipts that every route change and every plan is proven against,
+# so "we could not serialize first open, but carried on anyway" is itself the
+# failure. A caller that gets an error can retry; a caller handed an
+# unserialized connection cannot know it was.
+_INIT_LOCK_TIMEOUT_SECONDS = INIT_LOCK_TIMEOUT_SECONDS
+_INIT_LOCK_POLL_SECONDS = INIT_LOCK_POLL_SECONDS
+
+
+def _sqlite_connect(path: Path) -> sqlite3.Connection:
+    """Open a Projects connection that waits out normal writer bursts."""
+    conn = sqlite3.connect(str(path), timeout=_BUSY_TIMEOUT_MS / 1000.0)
+    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+    return conn
 
 
 def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
@@ -158,21 +182,44 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     WAL with DELETE fallback for network filesystems (shared helper from
     ``hermes_state``). Schema init is idempotent (``CREATE TABLE IF NOT
     EXISTS`` + additive migrations) and cached per-path per-process.
+
+    Raises :class:`~hermes_cli.sqlite_util.InitLockUnavailable` when the
+    cross-process first-open lock cannot be taken within the bounded deadline,
+    rather than opening the store with that step unserialized.
     """
     path = db_path if db_path is not None else projects_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
-    conn = sqlite3.connect(str(path))
+    conn = _sqlite_connect(path)
     try:
         conn.row_factory = sqlite3.Row
-        from hermes_state import apply_wal_with_fallback
+        # ``_INIT_LOCK`` only orders threads inside THIS process, and
+        # ``_INITIALIZED_PATHS`` is per-process too. Owner requests, the
+        # dashboard, the gateway and CLI workers are separate processes that
+        # can all reach a fresh ``projects.db`` at once, each convinced it is
+        # the first: two of them would then activate WAL and run the schema
+        # script concurrently on the same file. The cross-process lock (a
+        # stable ``<db>.init.lock`` sibling, the same shape the kanban store
+        # uses) makes first-open single-writer host-wide; the thread lock is
+        # kept because it is cheaper for the common same-process case.
+        with _INIT_LOCK, cross_process_init_lock(
+            path,
+            timeout_seconds=_INIT_LOCK_TIMEOUT_SECONDS,
+            poll_seconds=_INIT_LOCK_POLL_SECONDS,
+            required=True,
+        ):
+            from hermes_state import apply_wal_with_fallback
 
-        apply_wal_with_fallback(conn, db_label="projects.db")
-        conn.execute("PRAGMA foreign_keys=ON")
-        if resolved not in _INITIALIZED_PATHS:
-            conn.executescript(SCHEMA_SQL)
-            _migrate_add_optional_columns(conn)
-            _INITIALIZED_PATHS.add(resolved)
+            # A fresh database needs an exclusive lock while SQLite creates
+            # its WAL sidecars. Keep WAL activation and schema setup in one
+            # critical section so simultaneous owner requests cannot race
+            # through first open before the path cache is set.
+            apply_wal_with_fallback(conn, db_label="projects.db")
+            conn.execute("PRAGMA foreign_keys=ON")
+            if resolved not in _INITIALIZED_PATHS:
+                conn.executescript(SCHEMA_SQL)
+                _migrate_add_optional_columns(conn)
+                _INITIALIZED_PATHS.add(resolved)
     except Exception:
         conn.close()
         raise

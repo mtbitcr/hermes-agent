@@ -39,6 +39,7 @@ from hermes_cli.web_models import (
     ProfileSoulUpdate,
     ProfileDescriptionUpdate,
     ProfileModelUpdate,
+    ProfileModelBatchUpdate,
     ProfileDescribeAuto,
     SessionPrScanBody,
 )
@@ -1114,6 +1115,7 @@ async def update_profile_model_endpoint(
     model = (body.model or "").strip()
     if not provider or not model:
         raise HTTPException(status_code=400, detail="provider and model are required")
+    _reject_null_expected_revision(body)
     if model_machine_request(request):
         try:
             validate_assignment(
@@ -1125,14 +1127,48 @@ async def update_profile_model_endpoint(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="Invalid model assignment") from exc
+        # A Models-machine write is not complete until the role is enrolled and
+        # the strict audit record is durable. Run it as a one-entry batch so the
+        # config snapshot, the write, enrollment, the audit and the restoration
+        # of BOTH the config and the enrollment registry are one operation under
+        # one held lock — never a committed route reported back as a failure.
+        revisions = await _apply_models_machine_batch(
+            request, [(name, body)], action="assign",
+        )
+        return {
+            "ok": True,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": (body.reasoning_effort or "").strip().lower(),
+            "revision": revisions[name],
+        }
+    # Compare-and-swap: the caller states the revision it read. Anything else
+    # already landed between that read and this write, so the caller's
+    # multi-role selection is no longer coherent and must be refused rather
+    # than half-applied. The read, the comparison, the policy validation, the
+    # legacy-work fence, the write and the revision returned below all happen
+    # under one cross-process lock for this profile inside ``save_config``, so
+    # two writers stating the same revision yield exactly one success and one
+    # conflict.
+    from hermes_cli.config import RouteRevisionConflict
+
     try:
-        _write_profile_model(
+        revision = _write_profile_model(
             profile_dir,
             provider,
             model,
             reasoning_effort=body.reasoning_effort,
             disable_fallbacks=body.disable_fallbacks,
+            expected_revision=body.expected_revision,
         )
+    except HTTPException:
+        raise
+    except RouteRevisionConflict as exc:
+        _log.warning("PUT /api/profiles/%s/model rejected: %s", name, exc)
+        raise HTTPException(status_code=409, detail="Conflict") from exc
+    except ValueError as exc:
+        _log.warning("PUT /api/profiles/%s/model rejected: %s", name, exc)
+        raise HTTPException(status_code=409, detail="Conflict") from exc
     except Exception as e:
         _log.exception("PUT /api/profiles/%s/model failed", name)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1144,7 +1180,213 @@ async def update_profile_model_endpoint(
         "provider": provider,
         "model": model,
         "reasoning_effort": (body.reasoning_effort or "").strip().lower(),
+        "revision": revision or _profile_route_revision(profile_dir),
     }
+
+
+@router.post("/api/profiles/model-batch")
+async def update_profile_model_batch_endpoint(
+    body: ProfileModelBatchUpdate, request: Request
+):
+    """Apply several roles' approved base routes as ONE operation.
+
+    Preflights every entry against the canonical policy, takes every affected
+    profile's route lock in a deterministic order, fences the owner work each
+    role holds, writes every admitted fallback-free base route, and restores
+    each profile's exact previous ``config.yaml`` — while still holding all the
+    locks — if anything fails. No profile can be left partially changed by an
+    ordinary failure, so the caller never has to emulate a transaction.
+
+    Models-machine only; the whole batch is refused when any entry is not an
+    exactly admitted assignment for an admitted profile id.
+    """
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        admitted_profile_ids,
+        model_machine_request,
+    )
+
+    if not model_machine_request(request):
+        raise HTTPException(status_code=404, detail="Not found")
+    entries = list(body.assignments or [])
+    if not entries or len(entries) > len(admitted_profile_ids()):
+        raise HTTPException(status_code=400, detail="Invalid batch")
+    prepared = [((entry.profile or "").strip(), entry) for entry in entries]
+    revisions = await _apply_models_machine_batch(request, prepared, action="assign")
+    return {
+        "ok": True,
+        "applied": [
+            {
+                "profile": profile,
+                "provider": (entry.provider or "").strip(),
+                "model": (entry.model or "").strip(),
+                "reasoning_effort": (entry.reasoning_effort or "").strip().lower(),
+                "revision": revisions[profile],
+            }
+            for profile, entry in prepared
+        ],
+    }
+
+
+def _reject_null_expected_revision(entry) -> None:
+    """Refuse a request that SENT ``expected_revision: null``.
+
+    Pydantic collapses "field omitted" and "field present with an explicit
+    null" into the same ``None``, so without inspecting which fields were
+    actually supplied an explicit null reads as "no revision stated" and
+    silently downgrades a conditional write to an unconditional one. Omission
+    stays supported (documented compatibility for callers that never had the
+    field); a present null is a client bug and is rejected before any mutation.
+    """
+    if (
+        "expected_revision" in getattr(entry, "model_fields_set", ())
+        and entry.expected_revision is None
+    ):
+        raise HTTPException(
+            status_code=400, detail="expected_revision must not be null"
+        )
+
+
+async def _apply_models_machine_batch(
+    request: Request, prepared: "List[Tuple[str, Any]]", *, action: str
+) -> Dict[str, str]:
+    """Write, enroll and audit one Models-machine route selection atomically.
+
+    Preflights every entry against the canonical policy, takes every affected
+    profile's route lock in a deterministic order, fences the owner work each
+    role holds, writes every admitted fallback-free base route, enrolls every
+    role and writes the strict audit record — all while the locks are held. If
+    any step fails, each profile's exact previous ``config.yaml`` and the exact
+    previous enrollment registry are restored before the error is returned, so
+    a failure response never leaves a new route live.
+
+    A role whose config already equals the requested route still goes through
+    this operation: the write is a no-op on the bytes, but the revision check,
+    the policy validation, the enrollment and the audit all still happen, so
+    "already correct" and "just set" end in the same governed state.
+    """
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        admitted_profile_ids,
+        enrollment_transaction,
+        journal_models_machine_batch_success,
+        validate_assignment,
+    )
+
+    # Preflight: EVERY role must be exactly admitted before anything is
+    # written, so a batch is never partly applicable.
+    admitted = set(admitted_profile_ids())
+    seen: set = set()
+    for profile, entry in prepared:
+        provider = (entry.provider or "").strip()
+        model = (entry.model or "").strip()
+        if profile not in admitted or profile in seen or not provider or not model:
+            raise HTTPException(status_code=400, detail="Invalid batch")
+        seen.add(profile)
+        _reject_null_expected_revision(entry)
+        try:
+            validate_assignment(
+                profile,
+                provider,
+                model,
+                entry.reasoning_effort or "",
+                disable_fallbacks=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="Invalid model assignment"
+            ) from exc
+
+    from starlette.concurrency import run_in_threadpool
+
+    from hermes_cli.config import (
+        ProfileRouteBatchError,
+        RouteJournalUnreconciled,
+        apply_profile_route_batch,
+        mark_route_batch_audit_committed,
+        mark_route_batch_enrollment_written,
+    )
+
+    def _apply_one(profile: str, entry) -> str:
+        revision = _write_profile_model(
+            _resolve_profile_dir(profile),
+            (entry.provider or "").strip(),
+            (entry.model or "").strip(),
+            reasoning_effort=entry.reasoning_effort,
+            disable_fallbacks=True,
+            expected_revision=entry.expected_revision,
+        )
+        if not revision:
+            raise RuntimeError("the write reported no revision")
+        return revision
+
+    def _enroll_and_audit(_revisions: Dict[str, str]) -> None:
+        # Enrollment and the audit record are ONE registry transaction: the
+        # registry lock is held across both, so a concurrent batch cannot
+        # enroll in between and then be erased by this one's rollback.
+        with enrollment_transaction(
+            [profile for profile, _ in prepared]
+        ) as enrollment_snapshot:
+            # The write-ahead journal learns each half as it becomes durable.
+            # A crash between enrollment and the audit commit has to put BOTH
+            # the configs and the exact prior enrollment document back, and only
+            # the journal survives the process to say so.
+            mark_route_batch_enrollment_written(enrollment_snapshot)
+            audit = journal_models_machine_batch_success(
+                request,
+                action=action,
+                roles=[
+                    (profile, (entry.provider or "").strip())
+                    for profile, entry in prepared
+                ],
+            )
+            # Every write this operation owes — the configs, the enrollment —
+            # has now landed and nothing left can revert them, so the batch's
+            # commit marker is the last durable act. Until it lands, no reader
+            # counts any of these roles as allowed; a failure on either half
+            # rolls the whole operation back with the batch still uncommitted.
+            audit.commit()
+            # Committed: from here the operation may only be rolled FORWARD, so
+            # the journal records that before anything else can fail.
+            mark_route_batch_audit_committed()
+
+    try:
+        # Off the event loop: this holds kernel file locks and does blocking
+        # file I/O for every role.
+        return await run_in_threadpool(
+            functools.partial(
+                apply_profile_route_batch,
+                list(prepared),
+                apply_one=_apply_one,
+                after_write=_enroll_and_audit,
+            )
+        )
+    except RouteJournalUnreconciled as exc:
+        # An earlier multi-role change's write-ahead journal is unreconciled, so
+        # this machine's route authority is unknown and nothing was changed. The
+        # detail stays generic: the reason names a filesystem path, which is
+        # for the log, not for a caller.
+        _log.error("Models-machine route batch refused: %s", exc)
+        raise HTTPException(
+            status_code=503, detail="Service Unavailable"
+        ) from exc
+    except ProfileRouteBatchError as exc:
+        # The audit writer signals its own unavailability as an HTTPException;
+        # surface that verbatim rather than mislabelling it a conflict.
+        if isinstance(exc.__cause__, HTTPException):
+            raise exc.__cause__ from exc
+        _log.warning("Models-machine route batch rejected: %s", exc.reason)
+        raise HTTPException(status_code=409, detail="Conflict") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _log.exception("Models-machine route batch failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _profile_route_revision(profile_dir) -> str:
+    """Hermes-owned revision of one profile's effective model route."""
+    from hermes_cli.config import profile_route_revision
+
+    return profile_route_revision(profile_dir)
 
 
 @router.post("/api/profiles/{name}/describe-auto")

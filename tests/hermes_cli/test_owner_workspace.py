@@ -10,10 +10,12 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from hermes_cli import kanban_db, owner_workspace as ow, projects_db
+from plugins.dashboard_auth.raphael_workspace import model_policy
 from tools import approval
 
 
@@ -125,6 +127,27 @@ def ctx():
     return ow.OwnerContext(actor="default", profile="default", session="run_owt")
 
 
+def _configured_anthropic(profile):
+    """Stand in for the profile's on-disk config — never for the policy.
+
+    Only the *provider selection* a role's config.yaml would carry is faked
+    here; the admitted matrix, the tier resolution, and the durable lock
+    minting all run as the real production code, so a lock these tests
+    persist is one the dispatcher would actually accept. The end-to-end path
+    through a real temporary HERMES_HOME is covered by
+    ``test_real_profile_config_resolves_and_locks_owner_task_routes``.
+    """
+    return model_policy.assignment_for(profile, "anthropic")
+
+
+@pytest.fixture(autouse=True)
+def _configured_provider():
+    with _temporarily_patch(
+        model_policy, "configured_assignment_for", _configured_anthropic
+    ):
+        yield
+
+
 _RAW_COMMIT_TASK_GRAPH = ow.commit_task_graph
 _RAW_COMMIT_PROJECT_PLAN = ow.commit_project_plan
 _RAW_SET_PROJECT_LIFECYCLE = ow.set_project_archived
@@ -219,7 +242,10 @@ def test_bootstrap_creates_exactly_one_project_board_task(ctx):
     assert kanban_db.board_exists(result["board"])
     kconn = kanban_db.connect(board=result["board"])
     try:
-        task = kanban_db.get_task(kconn, result["task_id"])
+        # The anchor is a non-executable control row, so it resolves only
+        # through the control reader — never through the executable one.
+        assert kanban_db.get_task(kconn, result["task_id"]) is None
+        task = kanban_db.get_control_task(kconn, result["task_id"])
         assert task is not None
         assert task.title == "Owner WS"
     finally:
@@ -312,6 +338,7 @@ def _task_graph_args(**overrides):
                 "body": "Create the smallest complete release.",
                 "assignee": "default",
                 "responsibility": "B03",
+                "execution_tier": "routine",
                 "parents": [],
             },
             {
@@ -319,6 +346,7 @@ def _task_graph_args(**overrides):
                 "body": "Check the owner-visible result.",
                 "assignee": "default",
                 "responsibility": "R12",
+                "execution_tier": "routine",
                 "parents": [0],
             },
         ],
@@ -357,7 +385,10 @@ def test_task_graph_commit_creates_native_project_and_atomic_graph(ctx):
     assert result["ok"] is True
     assert result["mode"] == "new"
     assert result["task_count"] == 2
-    assert result["task_statuses"] == ["ready", "todo"]
+    # The durable receipt records the state at receipt time: every approved
+    # task parked and non-claimable. Activation happens strictly after it.
+    assert result["task_statuses"] == ["scheduled", "scheduled"]
+    assert result["parked_task_ids"] == result["task_ids"]
 
     with projects_db.connect_closing() as pconn:
         project = projects_db.get_project(pconn, result["project_id"])
@@ -369,6 +400,13 @@ def test_task_graph_commit_creates_native_project_and_atomic_graph(ctx):
         root = kanban_db.get_task(kconn, result["root_task_id"])
         first = kanban_db.get_task(kconn, result["task_ids"][0])
         second = kanban_db.get_task(kconn, result["task_ids"][1])
+        anchors = [
+            str(row["id"])
+            for row in kconn.execute(
+                "SELECT id FROM tasks WHERE project_id = ? AND task_kind = 'control'",
+                (result["project_id"],),
+            )
+        ]
         second_parents = {
             row["parent_id"]
             for row in kconn.execute(
@@ -376,6 +414,11 @@ def test_task_graph_commit_creates_native_project_and_atomic_graph(ctx):
                 (second.id,),
             )
         }
+
+    # Exactly one hidden control anchor, receipt-bound, never a work row.
+    assert anchors == [result["anchor_task_id"]]
+    # ...and the approved work is live once the receipt committed.
+    assert [first.status, second.status] == ["ready", "todo"]
 
     assert root.project_id == result["project_id"]
     assert root.status == "todo"
@@ -386,6 +429,125 @@ def test_task_graph_commit_creates_native_project_and_atomic_graph(ctx):
     assert second.project_id == result["project_id"]
     assert second.responsibility == "R12"
     assert first.id in second_parents
+
+
+def test_task_graph_resolves_and_locks_model_routes_before_approval(ctx):
+    args = _task_graph_args(idempotency_key="graph-model-routes")
+    args["tasks"][0]["execution_tier"] = "deep"
+    args["tasks"][1]["execution_tier"] = "routine"
+
+    resolved: list[tuple[str, str]] = []
+
+    real_resolve = ow.resolve_task_assignment
+
+    def resolved_route(profile, execution_tier):
+        resolved.append((profile, execution_tier))
+        return real_resolve(profile, execution_tier)
+
+    with _temporarily_patch(ow, "resolve_task_assignment", resolved_route):
+        approver = _with_approver(ctx.session)
+        result = _commit_task_graph(ctx, **args)
+        approver.join()
+
+    # Every route resolved before the owner was asked to confirm.
+    assert resolved == [
+        ("default", "deep"), ("default", "routine"), ("default", "deep"),
+    ]
+
+    with kanban_db.connect(board=result["board"]) as conn:
+        root = kanban_db.get_task(conn, result["root_task_id"])
+        first = kanban_db.get_task(conn, result["task_ids"][0])
+        second = kanban_db.get_task(conn, result["task_ids"][1])
+
+    def route(task):
+        return (
+            task.provider_override,
+            task.model_override,
+            task.reasoning_effort,
+            task.model_policy_lock,
+        )
+
+    def lock(assignee, model, tier):
+        return kanban_db.mint_policy_lock(
+            assignee, "anthropic", model, "max", tier,
+        )
+
+    # 'default'/anthropic admits claude-opus-5 on BOTH lanes, so the digest —
+    # not the model — is what distinguishes the deep pin from the routine one.
+    assert route(first) == (
+        "anthropic", "claude-opus-5", "max", lock("default", "claude-opus-5", "deep"),
+    )
+    assert route(second) == (
+        "anthropic", "claude-opus-5", "max",
+        lock("default", "claude-opus-5", "routine"),
+    )
+    assert (first.execution_tier, second.execution_tier) == ("deep", "routine")
+    # The executable root reviews a milestone containing deep work, so it is
+    # pinned too — and on the deep lane.
+    assert route(root) == (
+        "anthropic", "claude-opus-5", "max", lock("default", "claude-opus-5", "deep"),
+    )
+    # Every persisted lock is one the dispatcher would actually accept.
+    with kanban_db.connect(board=result["board"]) as conn:
+        for task_id in (result["root_task_id"], *result["task_ids"]):
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            assert kanban_db.task_policy_lock_error(row) is None
+
+
+def test_task_graph_root_is_pinned_on_the_routine_lane_for_routine_work(ctx):
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **_task_graph_args(idempotency_key="graph-root-routine"))
+    approver.join()
+
+    with kanban_db.connect(board=result["board"]) as conn:
+        root = kanban_db.get_task(conn, result["root_task_id"])
+
+    assert (root.execution_tier, root.model_policy_lock) == (
+        "routine",
+        kanban_db.mint_policy_lock(
+            "default", "anthropic", root.model_override, "max", "routine",
+        ),
+    )
+
+
+@pytest.mark.parametrize("tier", [None, "", "ultra", "Ultracode", "complex", 1])
+def test_task_graph_requires_an_admitted_execution_tier_before_approval(ctx, tier):
+    args = _task_graph_args(idempotency_key=f"graph-tier-{tier!r}")
+    if tier is None:
+        del args["tasks"][0]["execution_tier"]
+    else:
+        args["tasks"][0]["execution_tier"] = tier
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        _commit_task_graph(ctx, **args)
+
+    assert excinfo.value.code == "invalid_model_route"
+
+    with projects_db.connect_closing() as pconn:
+        assert all(
+            p.name != "Launch Shop"
+            for p in projects_db.list_projects(pconn, include_archived=True)
+        )
+
+
+def test_committed_owner_task_route_cannot_be_mutated_afterwards(ctx):
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **_task_graph_args(idempotency_key="graph-immutable"))
+    approver.join()
+
+    with kanban_db.connect(board=result["board"]) as conn:
+        for task_id in (result["root_task_id"], *result["task_ids"]):
+            with pytest.raises(RuntimeError, match="owner-governed"):
+                kanban_db.set_model_override(
+                    conn, task_id, "claude-fable-5", provider="anthropic",
+                )
+            with pytest.raises(RuntimeError, match="owner-governed"):
+                kanban_db.set_reasoning_effort(conn, task_id, "ultra")
+            task = kanban_db.get_task(conn, task_id)
+            assert task.model_override == "claude-opus-5"
+            assert task.reasoning_effort == "max"
 
 
 def test_task_graph_rejects_invalid_responsibility_before_approval(ctx):
@@ -441,7 +603,8 @@ def test_task_graph_exact_replay_creates_no_duplicate_tasks(ctx):
         ).fetchone()["n"]
 
     assert second == first
-    assert before == after == 3
+    # root + two children + the Project's one hidden control anchor
+    assert before == after == 4
 
 
 def test_task_graph_rejects_fake_whole_project_before_persistence(ctx):
@@ -452,6 +615,7 @@ def test_task_graph_rejects_fake_whole_project_before_persistence(ctx):
                 "title": f"Task {index}",
                 "body": "Too much speculative work.",
                 "assignee": "default",
+                "execution_tier": "routine",
                 "parents": [],
             }
             for index in range(13)
@@ -473,8 +637,14 @@ def test_task_graph_rejects_cycle_before_persistence(ctx):
     args = _task_graph_args(
         idempotency_key="graph-cycle",
         tasks=[
-            {"title": "A", "body": "A", "assignee": "default", "parents": [1]},
-            {"title": "B", "body": "B", "assignee": "default", "parents": [0]},
+            {
+                "title": "A", "body": "A", "assignee": "default",
+                "execution_tier": "routine", "parents": [1],
+            },
+            {
+                "title": "B", "body": "B", "assignee": "default",
+                "execution_tier": "routine", "parents": [0],
+            },
         ],
     )
 
@@ -1212,7 +1382,11 @@ def test_owner_run_projection_uses_only_native_runtime_and_cost_receipt():
     )
 
     projection = ow._owner_project_run_projection(
-        run, "B03 — Ship the thing", has_newer_run=False, run_context=True,
+        run,
+        "B03 — Ship the thing",
+        task_pin=None,
+        has_newer_run=False,
+        run_context=True,
     )
     assert projection["task_title"] == "Ship the thing"
     assert projection["has_newer_run"] is False
@@ -1235,7 +1409,11 @@ def test_owner_run_projection_uses_only_native_runtime_and_cost_receipt():
 
     run.metadata["runtime_receipt"]["model"] = "unadmitted-model"
     rejected = ow._owner_project_run_projection(
-        run, "B03 — Ship the thing", has_newer_run=True, run_context=True,
+        run,
+        "B03 — Ship the thing",
+        task_pin=None,
+        has_newer_run=True,
+        run_context=True,
     )["receipt"]
     assert rejected["runtime"] == ow._OWNER_UNKNOWN_RUNTIME
     assert rejected["cost"] == ow._OWNER_UNKNOWN_COST
@@ -1244,8 +1422,147 @@ def test_owner_run_projection_uses_only_native_runtime_and_cost_receipt():
     # the first owner Workspace release accepts, so a Hermes-first rollout
     # cannot make a snapshot unreadable.
     assert set(ow._owner_project_run_projection(
-        run, "B03 — Ship the thing", has_newer_run=True, run_context=False,
+        run,
+        "B03 — Ship the thing",
+        task_pin=None,
+        has_newer_run=True,
+        run_context=False,
     )) == {"started_at", "finished_at", "receipt"}
+
+
+def test_run_receipt_is_checked_against_that_task_own_pinned_route(ctx):
+    """An admitted route is not enough: it must be THIS task's pinned route."""
+    run = kanban_db.Run(
+        id=7,
+        task_id="task-1",
+        profile="raphael-verifier",
+        step_key=None,
+        status="done",
+        claim_lock=None,
+        claim_expires=None,
+        worker_pid=None,
+        max_runtime_seconds=None,
+        last_heartbeat_at=None,
+        started_at=1_700_000_000,
+        ended_at=1_700_000_100,
+        outcome="completed",
+        summary="ignored raw summary",
+        metadata={
+            "runtime_receipt": {
+                "schema_version": 2,
+                "engine": "hermes",
+                "profile": "raphael-verifier",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "max",
+                "route_evidence": "session-row",
+            }
+        },
+        error=None,
+    )
+
+    def runtime(pin):
+        return ow._owner_project_run_receipt(run, pin)["runtime"]
+
+    def pin(profile, provider, model, effort, *, valid=True):
+        return ow.OwnerTaskRoutePin(
+            valid=valid,
+            profile=profile,
+            provider=provider,
+            model=model,
+            reasoning_effort=effort,
+        )
+
+    assert runtime(
+        pin("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max")
+    )["state"] == "known"
+
+    # Independent verification exists to be independent OF the implementation
+    # family, so there is no admitted Claude verifier route at all: the
+    # role-level check itself refuses it, and the pinned check refuses the run.
+    with pytest.raises(ValueError):
+        ow.validate_raphael_model_assignment(
+            "raphael-verifier", "anthropic", "claude-opus-5", "max",
+            disable_fallbacks=True,
+        )
+    assert runtime(
+        pin("raphael-verifier", "anthropic", "claude-opus-5", "max")
+    ) == ow._OWNER_UNKNOWN_RUNTIME
+    # Same model and provider, different approved depth.
+    assert runtime(
+        pin("raphael-verifier", "openai-codex", "gpt-5.6-sol", "high")
+    ) == ow._OWNER_UNKNOWN_RUNTIME
+    # Same route, different role: the pin binds the assignee too. ``default``
+    # is independently admitted for this exact provider/model/effort, so only
+    # the role binding can be what makes this unconfirmed.
+    assert ow.validate_raphael_model_assignment(
+        "default", "openai-codex", "gpt-5.6-sol", "max", disable_fallbacks=True,
+    ).model == "gpt-5.6-sol"
+    assert runtime(
+        pin("default", "openai-codex", "gpt-5.6-sol", "max")
+    ) == ow._OWNER_UNKNOWN_RUNTIME
+    # An INVALID lock proves nothing — it must never fall back to the looser
+    # role-level check that an unlocked task legitimately uses.
+    assert runtime(
+        pin("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max", valid=False)
+    ) == ow._OWNER_UNKNOWN_RUNTIME
+
+    # The core claim on a role that really does have two admitted providers:
+    # the run's route passes the role-level check, and is still unconfirmed
+    # because it is not the route THIS task was pinned to.
+    run.profile = "raphael-planner"
+    run.metadata["runtime_receipt"]["profile"] = "raphael-planner"
+    assert ow.validate_raphael_model_assignment(
+        "raphael-planner", "anthropic", "claude-sonnet-5", "max",
+        disable_fallbacks=True,
+    ).model == "claude-sonnet-5"
+    assert runtime(
+        pin("raphael-planner", "openai-codex", "gpt-5.6-sol", "max")
+    )["state"] == "known"
+    assert runtime(
+        pin("raphael-planner", "anthropic", "claude-sonnet-5", "max")
+    ) == ow._OWNER_UNKNOWN_RUNTIME
+
+
+def test_task_route_pin_distinguishes_unlocked_from_invalid():
+    locked = {
+        "assignee": "raphael-verifier",
+        "provider_override": "openai-codex",
+        "model_override": "gpt-5.6-sol",
+        "reasoning_effort": "MAX",
+        "execution_tier": "routine",
+        "model_policy_lock": kanban_db.mint_policy_lock(
+            "raphael-verifier", "openai-codex", "gpt-5.6-sol", "max", "routine",
+        ),
+    }
+    assert ow.owner_task_route_pin(locked) == ow.OwnerTaskRoutePin(
+        valid=True,
+        profile="raphael-verifier",
+        provider="openai-codex",
+        model="gpt-5.6-sol",
+        reasoning_effort="max",
+    )
+    # An unlocked (manual / pre-lock) task has no pin and keeps the older
+    # role-level check.
+    assert ow.owner_task_route_pin({**locked, "model_policy_lock": None}) is None
+    # A row projected without the lock column at all cannot carry a lock.
+    assert ow.owner_task_route_pin({"title": "manual card"}) is None
+    # Every other break is INVALID, never "unlocked": an incomplete route, a
+    # hand-edited component, an unknown authority, a stale version, and the
+    # old truthy marker all report a pin that cannot confirm anything.
+    for broken in (
+        {"provider_override": ""},
+        {"model_override": "gpt-5.6-terra"},
+        {"execution_tier": None},
+        # ``default`` is independently admitted for this exact route, so the
+        # route still resolves and only the role-bound digest catches the edit.
+        {"assignee": "default"},
+        {"model_policy_lock": "bogus:v1:" + "a" * 64},
+        {"model_policy_lock": "raphael:v99:" + "a" * 64},
+        {"model_policy_lock": "raphael"},
+    ):
+        pin = ow.owner_task_route_pin({**locked, **broken})
+        assert pin is not None and pin.valid is False, broken
 
 
 def test_project_snapshot_run_projection_has_sanitized_task_title(ctx):
@@ -1432,6 +1749,295 @@ def test_project_attachment_is_exact_receipt_bound_and_bounded(ctx):
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
         ow.read_project_attachment(ctx, result["project_slug"], "../1")
     assert excinfo.value.code == "attachment_not_found"
+
+
+# ---------------------------------------------------------------------------
+# Item 32TK: an absent store is empty; a broken one is a service failure
+# ---------------------------------------------------------------------------
+
+
+def test_no_projects_db_at_all_projects_as_genuinely_empty(ctx):
+    projects_db.projects_db_path().unlink(missing_ok=True)
+    assert ow.list_committed_projects(ctx) == []
+
+
+def test_a_projects_db_with_no_owner_receipts_table_is_genuinely_empty(ctx):
+    """The receipt table is created by the FIRST owner operation, so its
+    absence really is "no owner authority was ever written here"."""
+    with projects_db.connect_closing() as conn:
+        projects_db.create_project(conn, name="Not owner work")
+    with contextlib.closing(
+        sqlite3.connect(projects_db.projects_db_path())
+    ) as raw:
+        raw.execute("DROP TABLE IF EXISTS owner_workspace_receipts")
+        raw.commit()
+
+    assert ow.list_committed_projects(ctx) == []
+
+
+def _committed_project(ctx, *, key: str, name: str) -> dict:
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(
+        ctx, **_task_graph_args(idempotency_key=key, project_name=name),
+    )
+    approver.join()
+    assert result["ok"] is True
+    return result
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project_id", ""),
+        ("project_id", None),
+        ("project_id", 12),
+        ("ok", False),
+        ("ok", "yes"),
+    ],
+)
+def test_a_committed_receipt_missing_its_identifier_is_never_an_empty_list(
+    ctx, field, value,
+):
+    """Skipping such a row let corrupt authority become an authoritative
+    "you have no Projects"."""
+    result = _committed_project(
+        ctx, key="graph-receipt-identifier", name="Receipt Identifier",
+    )
+    assert [item["slug"] for item in ow.list_committed_projects(ctx)] == [
+        result["project_slug"]
+    ]
+    path = projects_db.projects_db_path()
+    with contextlib.closing(sqlite3.connect(path)) as raw:
+        raw.row_factory = sqlite3.Row
+        row = raw.execute(
+            "SELECT idempotency_key, result_json FROM owner_workspace_receipts "
+            "WHERE status = 'committed'"
+        ).fetchone()
+        stored = json.loads(row["result_json"])
+        if value is None:
+            stored.pop(field, None)
+        else:
+            stored[field] = value
+        raw.execute(
+            "UPDATE owner_workspace_receipts SET result_json = ? "
+            "WHERE idempotency_key = ?",
+            (json.dumps(stored), row["idempotency_key"]),
+        )
+        raw.commit()
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.list_committed_projects(ctx)
+    assert excinfo.value.code == "snapshot_unavailable"
+
+
+def test_a_malformed_ownership_receipt_is_unavailable_not_not_owned(ctx):
+    """Swallowing it and answering False turned "ownership cannot be read"
+    into "you do not own this Project" — a 404 before a mutation."""
+    result = _committed_project(
+        ctx, key="graph-ownership-unreadable", name="Ownership Unreadable",
+    )
+    path = projects_db.projects_db_path()
+    with contextlib.closing(sqlite3.connect(path)) as raw:
+        raw.execute(
+            "UPDATE owner_workspace_receipts SET result_json = '{not json' "
+            "WHERE status = 'committed'"
+        )
+        raw.commit()
+
+    with contextlib.closing(projects_db.connect()) as conn:
+        ow._ensure_schema(conn)
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            ow._receipt_owns_project(conn, ctx, result["project_id"])
+    assert excinfo.value.code == "snapshot_unavailable"
+
+
+def test_a_native_run_receipt_is_absent_committed_or_unreadable(ctx):
+    """Collapsing "unreadable" into "absent" put a committed external effect
+    back on the retry path."""
+    result = _committed_project(
+        ctx, key="graph-native-receipt", name="Native Receipt",
+    )
+    with contextlib.closing(projects_db.connect()) as conn:
+        row = conn.execute(
+            "SELECT idempotency_key, operation, authority_digest FROM "
+            "owner_workspace_receipts WHERE status = 'committed'"
+        ).fetchone()
+    digest = row["authority_digest"] or "a" * 64
+
+    # Absent: nothing matching this authority ever committed.
+    assert ow.read_committed_owner_run_receipt(
+        profile=ctx.profile,
+        idempotency_key="never-used",
+        operation=row["operation"],
+        authority_digest=digest,
+    ) is None
+
+    if row["authority_digest"]:
+        # Committed: the exact receipt comes back.
+        recovered = ow.read_committed_owner_run_receipt(
+            profile=ctx.profile,
+            idempotency_key=row["idempotency_key"],
+            operation=row["operation"],
+            authority_digest=digest,
+        )
+        assert recovered["project_id"] == result["project_id"]
+
+    # Unreadable: a committed row whose result cannot be read is its own
+    # answer, never "absent".
+    path = projects_db.projects_db_path()
+    with contextlib.closing(sqlite3.connect(path)) as raw:
+        raw.execute(
+            "UPDATE owner_workspace_receipts SET result_json = '{not json', "
+            "authority_digest = ? WHERE idempotency_key = ?",
+            (digest, row["idempotency_key"]),
+        )
+        raw.commit()
+    with pytest.raises(ow.OwnerReceiptUnreadable):
+        ow.read_committed_owner_run_receipt(
+            profile=ctx.profile,
+            idempotency_key=row["idempotency_key"],
+            operation=row["operation"],
+            authority_digest=digest,
+        )
+
+
+@pytest.mark.parametrize(
+    "break_it",
+    [
+        "unreadable_db",
+        "missing_projects_table",
+        "malformed_receipt",
+        "missing_project_row",
+        "foreign_board_binding",
+    ],
+)
+def test_a_broken_projects_store_is_never_projected_as_empty(ctx, break_it):
+    """An authority outage must not read as "you have no Projects"."""
+    result = _committed_project(ctx, key="graph-broken-store", name="Broken Store")
+    assert [item["slug"] for item in ow.list_committed_projects(ctx)] == [
+        result["project_slug"]
+    ]
+
+    path = projects_db.projects_db_path()
+    if break_it == "unreadable_db":
+        path.write_bytes(b"this is not a sqlite database")
+    elif break_it == "missing_projects_table":
+        with contextlib.closing(sqlite3.connect(path)) as raw:
+            raw.execute("DROP TABLE projects")
+            raw.commit()
+    elif break_it == "malformed_receipt":
+        with contextlib.closing(sqlite3.connect(path)) as raw:
+            raw.execute(
+                "UPDATE owner_workspace_receipts SET result_json = '{not json' "
+                "WHERE status = 'committed'"
+            )
+            raw.commit()
+    elif break_it == "missing_project_row":
+        with contextlib.closing(sqlite3.connect(path)) as raw:
+            raw.execute("DELETE FROM projects")
+            raw.commit()
+    else:
+        kanban_db.write_board_metadata(
+            result["board"], project_id="proj_someone_else",
+        )
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.list_committed_projects(ctx)
+    assert excinfo.value.code == "snapshot_unavailable"
+
+
+@pytest.mark.parametrize(
+    "break_it", ["missing_file", "short_file", "trailing_bytes", "unreadable"],
+)
+def test_an_unreadable_attachment_is_not_reported_as_missing(ctx, break_it):
+    """404 is for a missing authority row. A storage or integrity failure is
+    not proof the attachment is not there."""
+    result = _committed_project(
+        ctx, key="graph-attachment-broken", name="Attachment Faults",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        attachment_id = kanban_db.store_attachment_bytes(
+            conn, result["task_ids"][0], "note.txt", b"owner bytes",
+            content_type="text/plain", board=result["board"],
+        )
+        stored = Path(
+            conn.execute(
+                "SELECT stored_path FROM task_attachments WHERE id = ?",
+                (attachment_id,),
+            ).fetchone()["stored_path"]
+        )
+
+    if break_it == "missing_file":
+        stored.unlink()
+    elif break_it == "short_file":
+        stored.write_bytes(b"owner")
+    elif break_it == "trailing_bytes":
+        stored.write_bytes(b"owner bytes and more")
+    else:
+        stored.chmod(0o000)
+
+    try:
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            ow.read_project_attachment(
+                ctx, result["project_slug"], str(attachment_id),
+            )
+    finally:
+        if break_it == "unreadable":
+            stored.chmod(0o600)
+    assert excinfo.value.code == "snapshot_unavailable"
+
+
+def test_an_attachment_id_with_no_authority_row_is_still_not_found(ctx):
+    """The adjacent success path for the same boundary: proven absence."""
+    result = _committed_project(
+        ctx, key="graph-attachment-absent", name="Attachment Absent",
+    )
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.read_project_attachment(ctx, result["project_slug"], "987654")
+    assert excinfo.value.code == "attachment_not_found"
+
+
+def test_a_truncated_decision_inbox_says_so(ctx):
+    """An owner who cannot tell a full inbox from a clipped one can believe
+    they have answered everything Raphael is waiting on."""
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        for index in range(ow._OWNER_DECISIONS_LIMIT + 3):
+            task_id = kanban_db.create_task(
+                conn, title=f"Needs an answer {index}", assignee="default",
+                project_id=setup["project_id"], board=setup["board"],
+            )
+            with kanban_db.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', "
+                    "block_kind = 'needs_input' WHERE id = ?",
+                    (task_id,),
+                )
+
+    projected = ow.list_owner_decisions(ctx)
+
+    assert projected["truncated"] is True
+    assert len(projected["data"]) == ow._OWNER_DECISIONS_LIMIT
+
+
+def test_a_complete_decision_inbox_says_it_is_complete(ctx):
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        task_id = kanban_db.create_task(
+            conn, title="Needs an answer", assignee="default",
+            project_id=setup["project_id"], board=setup["board"],
+        )
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', "
+                "block_kind = 'needs_input' WHERE id = ?",
+                (task_id,),
+            )
+
+    projected = ow.list_owner_decisions(ctx)
+
+    assert projected["truncated"] is False
+    assert len(projected["data"]) == 1
 
 
 def test_project_lifecycle_archives_and_restores_receipt_backed_project(ctx):
@@ -1811,6 +2417,11 @@ def test_project_lifecycle_rejects_project_without_owner_receipt(ctx):
         assert projects_db.get_project(conn, project_id).archived is False
 
 
+# The bootstrap anchor is non-executable by construction (no assignee, no
+# execution tier, no approved route), so it lands in ``triage``.
+_ANCHOR_STATUS = "triage"
+
+
 def _bootstrap_board(ctx):
     t = _with_approver(ctx.session)
     result = ow.bootstrap(ctx, idempotency_key=f"setup-{ctx.session}-{time.monotonic()}", name="Board Setup")
@@ -2010,7 +2621,9 @@ def test_owner_decisions_projects_native_gates_without_writes_or_identifiers(ctx
     board_db = kanban_db.board_dir(setup["board"]) / "kanban.db"
     before = (project_db.stat().st_mtime_ns, board_db.stat().st_mtime_ns)
 
-    decisions = ow.list_owner_decisions(ctx)
+    projected = ow.list_owner_decisions(ctx)
+    decisions = projected["data"]
+    assert projected["truncated"] is False
 
     assert (project_db.stat().st_mtime_ns, board_db.stat().st_mtime_ns) == before
     assert {(item["authority"], item["kind"], item["title"]) for item in decisions} == {
@@ -2043,7 +2656,7 @@ def test_owner_decisions_projects_native_gates_without_writes_or_identifiers(ctx
         action="archive",
     )
     archived_approver.join()
-    assert ow.list_owner_decisions(ctx) == []
+    assert ow.list_owner_decisions(ctx) == {"data": [], "truncated": False}
 
 
 # A stored Project name Raphael never validated on the way in: an ANSI
@@ -2105,7 +2718,9 @@ def test_unsafe_project_name_is_projected_on_every_owner_surface(ctx):
     listed = ow.list_committed_projects(ctx)
     snapshot = ow.read_project_snapshot(ctx, setup["board"])
     steward = ow.project_steward_snapshot(project_id=setup["project_id"])
-    decisions = ow.list_owner_decisions(ctx)
+    projected = ow.list_owner_decisions(ctx)
+    decisions = projected["data"]
+    assert projected["truncated"] is False
 
     projected = [
         *[item["name"] for item in listed],
@@ -2187,6 +2802,7 @@ def test_owner_approval_descriptions_project_every_project_name(ctx):
                     "title": "Prepare the approved deliverable",
                     "body": "Produce the owner-visible result.",
                     "assignee": "default",
+                    "execution_tier": "routine",
                     "existing_parents": [],
                     "new_parents": [],
                 }],
@@ -2251,7 +2867,9 @@ def test_owner_project_name_bound_is_applied_to_a_stored_name(ctx):
 
 
 def _project_task_ref(conn, task_id: str) -> dict:
-    task = kanban_db.get_task(conn, task_id)
+    # A plan can reference the Project's control anchor as a parent, so this
+    # helper resolves either kind — exactly like the owner kernel does.
+    task = kanban_db.get_task(conn, task_id, include_control=True)
     assert task is not None
     return {
         "task_id": task_id,
@@ -2264,7 +2882,8 @@ def _project_plan_args(setup: dict, changes: list[dict], **overrides) -> dict:
     args = {
         "idempotency_key": "steward-plan-1",
         "project_id": setup["project_id"],
-        "anchor_task_id": setup["task_id"],
+        # No anchor: the Project's hidden control row is resolved inside the
+        # kernel from its committed bootstrap receipt, never named by a caller.
         "trigger": "owner_request",
         "request_title": "Adapt the current plan",
         "summary": "Keep the active work small and current.",
@@ -2288,6 +2907,7 @@ def test_project_plan_timeout_can_retry_but_still_requires_approval(ctx):
             "title": "Prepare the approved deliverable",
             "body": "Produce the owner-visible result.",
             "assignee": "default",
+            "execution_tier": "routine",
             "existing_parents": [],
             "new_parents": [],
         }],
@@ -2331,6 +2951,242 @@ def test_project_plan_timeout_can_retry_but_still_requires_approval(ctx):
     assert len(matching) == 1
 
 
+def test_project_plan_resolves_and_locks_a_new_task_model_route(ctx):
+    setup = _bootstrap_board(ctx)
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "add",
+            "reason": "Create one complex owner-approved deliverable.",
+            "title": "Build the complex deliverable",
+            "body": "Produce and verify the owner-visible result.",
+            "assignee": "default",
+            "execution_tier": "deep",
+            "existing_parents": [],
+            "new_parents": [],
+        }],
+        idempotency_key="steward-model-route",
+    )
+
+    real_resolve = ow.resolve_task_assignment
+
+    def resolved_route(profile, execution_tier):
+        assert (profile, execution_tier) == ("default", "deep")
+        return real_resolve(profile, execution_tier)
+
+    with _temporarily_patch(ow, "resolve_task_assignment", resolved_route):
+        approver = _with_approver(ctx.session)
+        result = _commit_project_plan(ctx, **args)
+        approver.join()
+
+    with kanban_db.connect(board=setup["board"]) as conn:
+        task = kanban_db.get_task(conn, result["created_task_ids"][0])
+        with pytest.raises(RuntimeError, match="owner-governed"):
+            kanban_db.set_model_override(
+                conn, task.id, "claude-sonnet-5", provider="anthropic",
+            )
+
+    assert (
+        task.provider_override,
+        task.model_override,
+        task.reasoning_effort,
+        task.execution_tier,
+        task.model_policy_lock,
+    ) == (
+        "anthropic", "claude-opus-5", "max", "deep",
+        kanban_db.mint_policy_lock(
+            "default", "anthropic", "claude-opus-5", "max", "deep",
+        ),
+    )
+
+
+@pytest.mark.parametrize("action", ["add", "split", "merge"])
+def test_project_plan_requires_an_execution_tier_for_every_created_task(ctx, action):
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        target = _project_task_ref(conn, setup["task_id"])
+        sibling = _project_task_ref(
+            conn,
+            kanban_db.create_task(
+                conn,
+                title="Second half",
+                assignee="default",
+                project_id=setup["project_id"],
+            ),
+        )
+
+    spec = {
+        "title": "Untiered work",
+        "body": "This must not reach an owner decision.",
+        "assignee": "default",
+        "responsibility": "B04",
+    }
+    if action == "add":
+        change = {
+            "action": "add",
+            "reason": "Create untiered work.",
+            **spec,
+            "existing_parents": [],
+            "new_parents": [],
+        }
+    elif action == "split":
+        change = {
+            "action": "split",
+            "reason": "Split into untiered work.",
+            "target": target,
+            "replacements": [
+                {**spec, "parents": []},
+                {**spec, "title": "Second untiered work", "parents": [0]},
+            ],
+        }
+    else:
+        change = {
+            "action": "merge",
+            "reason": "Merge into untiered work.",
+            "targets": [target, sibling],
+            "replacement": spec,
+        }
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        _commit_project_plan(
+            ctx,
+            **_project_plan_args(
+                setup, [change], idempotency_key=f"steward-untiered-{action}",
+            ),
+        )
+
+    assert excinfo.value.code == "invalid_argument"
+
+
+def test_effective_route_fence_pins_exposed_owner_work_and_nothing_else(ctx, monkeypatch):
+    """The rollout fence freezes pre-lock owner work and nothing else."""
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **_task_graph_args(idempotency_key="graph-fence"))
+    approver.join()
+
+    approved_lock = kanban_db.mint_policy_lock(
+        "default", "anthropic", "claude-opus-5", "max", "routine",
+    )
+    routeless_id, partial_id = result["task_ids"][0], result["root_task_id"]
+    with kanban_db.connect(board=result["board"]) as conn:
+        # Rewind one task to the pre-change shape: an owner task whose whole
+        # route still comes from its profile.
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET model_override = NULL, provider_override = NULL, "
+                "reasoning_effort = NULL, model_policy_lock = NULL WHERE id = ?",
+                (routeless_id,),
+            )
+            # And rewind another to the shape the old fence SKIPPED: an
+            # explicit model with an inherited provider and an explicit
+            # non-default effort. It is exposed too — and its completed route
+            # is not one the policy admits, so it must be parked rather than
+            # left runnable.
+            conn.execute(
+                "UPDATE tasks SET model_override = 'claude-sonnet-5', "
+                "provider_override = NULL, reasoning_effort = 'high', "
+                "model_policy_lock = NULL WHERE id = ?",
+                (partial_id,),
+            )
+        # A human card on the SAME owner board and role: it inherits the
+        # board's project but the kernel did not create it.
+        manual_id = kanban_db.create_task(
+            conn, title="manual card", assignee="default", board=result["board"],
+        )
+        manual_in_project_id = kanban_db.create_task(
+            conn,
+            title="manual card inside the Project",
+            assignee="default",
+            board=result["board"],
+            project_id=result["project_id"],
+        )
+        other_role_id = kanban_db.create_task(
+            conn,
+            title="another role's card",
+            assignee="raphael-verifier",
+            board=result["board"],
+            project_id=result["project_id"],
+        )
+
+    monkeypatch.setattr(
+        ow,
+        "configured_assignment_for",
+        lambda profile: SimpleNamespace(
+            provider="anthropic", model="claude-opus-5", reasoning_effort="max",
+        ),
+    )
+    # Only the task the policy can actually authorize is pinned.
+    assert ow.fence_effective_task_routes("default") == [routeless_id]
+
+    with kanban_db.connect(board=result["board"]) as conn:
+        fully_inherited = kanban_db.get_task(conn, routeless_id)
+        assert (
+            fully_inherited.provider_override,
+            fully_inherited.model_override,
+            fully_inherited.reasoning_effort,
+            fully_inherited.model_policy_lock,
+        ) == ("anthropic", "claude-opus-5", "max", approved_lock)
+
+        # Its explicit components are preserved exactly — the fence never
+        # rewrites an operator's route. Completing it from the profile still
+        # yields a route the policy does not admit, and an unlocked owner task
+        # must never stay dispatchable, so it is parked for re-approval.
+        partial = kanban_db.get_task(conn, partial_id)
+        assert (
+            partial.provider_override,
+            partial.model_override,
+            partial.reasoning_effort,
+            partial.model_policy_lock,
+        ) == (None, "claude-sonnet-5", "high", None)
+        assert (partial.status, partial.block_kind) == ("blocked", "needs_input")
+        assert any(
+            event.kind == "model_route_unapproved"
+            and event.payload["reapproval_required"] is True
+            for event in kanban_db.list_events(conn, partial_id)
+        )
+
+        # Manual cards — inside the Project or not — and another role's card
+        # are all untouched: only ids a committed receipt records creating,
+        # and that this role holds, are fenced.
+        for untouched_id in (manual_id, manual_in_project_id, other_role_id):
+            untouched = kanban_db.get_task(conn, untouched_id)
+            assert untouched.model_policy_lock is None
+            assert untouched.model_override is None
+
+        # Already-locked owner tasks are left exactly as approved.
+        assert (
+            kanban_db.get_task(conn, result["task_ids"][1]).model_policy_lock
+            == approved_lock
+        )
+    # A second pass pins nothing new: the pinned task now carries a lock and
+    # is no longer exposed, and the unpinnable one is already parked.
+    assert ow.fence_effective_task_routes("default") == []
+    with kanban_db.connect(board=result["board"]) as conn:
+        assert kanban_db.get_task(conn, partial_id).status == "blocked"
+
+
+def test_effective_route_fence_fails_closed_on_unprovable_receipts(ctx, monkeypatch):
+    """An unreadable receipt store must never read as "no owner work"."""
+    _bootstrap_board(ctx)  # the receipt store now exists and has work in it
+
+    def _boom(*_args, **_kwargs):
+        raise sqlite3.Error("receipt store unavailable")
+
+    monkeypatch.setattr(ow.sqlite3, "connect", _boom)
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.fence_effective_task_routes("default")
+    assert excinfo.value.code == "execution_state_busy"
+
+
+def test_effective_route_fence_needs_no_route_when_nothing_is_exposed(monkeypatch):
+    """A role with no routeless owner work must not require a route read."""
+    def _never(profile):  # pragma: no cover - asserted by not being called
+        raise AssertionError("current route must not be read with nothing to fence")
+
+    monkeypatch.setattr(ow, "configured_assignment_for", _never)
+    assert ow.fence_effective_task_routes("raphael-builder") == []
+
+
 def test_project_plan_approval_cannot_mutate_a_project_archived_while_waiting(ctx):
     setup = _bootstrap_board(ctx)
     args = _project_plan_args(
@@ -2341,6 +3197,7 @@ def test_project_plan_approval_cannot_mutate_a_project_archived_while_waiting(ct
             "title": "Must not land after archive",
             "body": "This stale approval must fail closed.",
             "assignee": "default",
+            "execution_tier": "routine",
             "existing_parents": [],
             "new_parents": [],
         }],
@@ -2394,6 +3251,7 @@ def test_project_plan_split_is_atomic_preserves_history_and_replays(ctx):
                     "title": "Build the bounded change",
                     "body": "Produce one owner-visible outcome.",
                     "assignee": "default",
+                    "execution_tier": "routine",
                     "responsibility": "B04",
                     "parents": [],
                 },
@@ -2401,6 +3259,7 @@ def test_project_plan_split_is_atomic_preserves_history_and_replays(ctx):
                     "title": "Check the bounded change",
                     "body": "Verify the outcome before downstream work continues.",
                     "assignee": "default",
+                    "execution_tier": "routine",
                     "responsibility": "R12",
                     "parents": [0],
                 },
@@ -2472,6 +3331,7 @@ def test_project_plan_add_move_and_postpone_apply_together(ctx):
                 "title": "Prepare the deliverable",
                 "body": "Produce the owner-visible input.",
                 "assignee": "default",
+                "execution_tier": "routine",
                 "existing_parents": [parent_ref],
                 "new_parents": [],
             },
@@ -2481,6 +3341,7 @@ def test_project_plan_add_move_and_postpone_apply_together(ctx):
                 "title": "Verify the deliverable",
                 "body": "Check the preceding result.",
                 "assignee": "default",
+                "execution_tier": "routine",
                 "existing_parents": [],
                 "new_parents": [0],
             },
@@ -2520,7 +3381,9 @@ def test_project_plan_add_move_and_postpone_apply_together(ctx):
         assert kanban_db.get_task(conn, postpone_id).status == "scheduled"
         assert any(
             event.kind == "owner_project_plan_applied"
-            for event in kanban_db.list_events(conn, setup["task_id"])
+            for event in kanban_db.list_events(
+                conn, setup["task_id"], include_control=True,
+            )
         )
 
 
@@ -2553,6 +3416,7 @@ def test_project_plan_merge_archives_sources_and_preserves_links(ctx):
                 "title": "Combined deliverable",
                 "body": "Replace both overlapping work items without deleting history.",
                 "assignee": "default",
+                "execution_tier": "routine",
             },
         }],
         idempotency_key="steward-merge",
@@ -2652,6 +3516,7 @@ def test_project_plan_merge_or_cancel_requires_its_own_owner_decision(ctx):
                 "title": "Another task",
                 "body": "This must be approved separately.",
                 "assignee": "default",
+                "execution_tier": "routine",
                 "existing_parents": [],
                 "new_parents": [],
             },
@@ -2713,14 +3578,14 @@ def test_move_task_cas_conflict_returns_snapshot_with_zero_changes(ctx):
     t.join()
     assert result["ok"] is False
     assert result["error"] == "conflict"
-    assert result["current_status"] == "ready"
+    assert result["current_status"] == _ANCHOR_STATUS
 
     kconn = kanban_db.connect(board=board)
     try:
-        task = kanban_db.get_task(kconn, task_id)
+        task = kanban_db.get_control_task(kconn, task_id)
     finally:
         kconn.close()
-    assert task.status == "ready"
+    assert task.status == _ANCHOR_STATUS
 
 
 def test_move_task_rejects_running_target(ctx):
@@ -2728,7 +3593,7 @@ def test_move_task_rejects_running_target(ctx):
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
         ow.move_task(
             ctx, idempotency_key="move-running", task_id=setup["task_id"],
-            to_status="running", expected_status="ready", expected_revision=1, project_id=setup["project_id"],
+            to_status="running", expected_status=_ANCHOR_STATUS, expected_revision=1, project_id=setup["project_id"],
         )
     assert excinfo.value.code == "unsafe_transition"
 
@@ -2749,7 +3614,8 @@ def test_move_task_success_and_archived_parent_satisfies_child_readiness(ctx):
     t = _with_approver(ctx.session)
     result = ow.move_task(
         ctx, idempotency_key="move-archive", task_id=parent_id,
-        to_status="archived", expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
+        to_status="archived", expected_status=_ANCHOR_STATUS, expected_revision=rev,
+        project_id=setup["project_id"],
     )
     t.join()
     assert result["ok"] is True
@@ -2782,7 +3648,7 @@ def test_move_task_approval_cannot_mutate_a_project_archived_while_waiting(ctx):
             idempotency_key="move-archive-race",
             task_id=setup["task_id"],
             to_status="blocked",
-            expected_status="ready",
+            expected_status=_ANCHOR_STATUS,
             expected_revision=revision,
             project_id=setup["project_id"],
         )
@@ -2790,7 +3656,9 @@ def test_move_task_approval_cannot_mutate_a_project_archived_while_waiting(ctx):
     assert result["ok"] is False
     assert result["error"] == "conflict"
     with kanban_db.connect(board=setup["board"]) as conn:
-        assert kanban_db.get_task(conn, setup["task_id"]).status == "ready"
+        assert kanban_db.get_control_task(
+            conn, setup["task_id"]
+        ).status == _ANCHOR_STATUS
 
 
 def test_comment_author_is_trusted_context_not_caller_supplied(ctx):
@@ -2805,7 +3673,7 @@ def test_comment_author_is_trusted_context_not_caller_supplied(ctx):
 
     kconn = kanban_db.connect(board=board)
     try:
-        comments = kanban_db.list_comments(kconn, task_id)
+        comments = kanban_db.list_comments(kconn, task_id, include_control=True)
     finally:
         kconn.close()
     assert len(comments) == 1
@@ -2839,7 +3707,9 @@ def test_comment_approval_cannot_write_to_a_project_archived_while_waiting(ctx):
     with kanban_db.connect(board=setup["board"]) as conn:
         assert all(
             comment.body != "must not be added"
-            for comment in kanban_db.list_comments(conn, setup["task_id"])
+            for comment in kanban_db.list_comments(
+                conn, setup["task_id"], include_control=True,
+            )
         )
 
 
@@ -2858,7 +3728,7 @@ def test_comment_exact_replay_creates_no_duplicate(ctx):
 
     kconn = kanban_db.connect(board=board)
     try:
-        comments = kanban_db.list_comments(kconn, task_id)
+        comments = kanban_db.list_comments(kconn, task_id, include_control=True)
     finally:
         kconn.close()
     assert len(comments) == 1
@@ -3004,7 +3874,8 @@ def test_move_task_fence_blocks_concurrent_claim_attempt_during_mutation(ctx):
         with _temporarily_patch(ow.kanban_db, "cas_transition_task", paused_cas):
             old_result["value"] = ow.move_task(
                 ctx, idempotency_key=key, task_id=task_id, to_status="blocked",
-                expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
+                expected_status=_ANCHOR_STATUS, expected_revision=rev,
+                project_id=setup["project_id"],
             )
         t.join()
 
@@ -3021,7 +3892,7 @@ def test_move_task_fence_blocks_concurrent_claim_attempt_during_mutation(ctx):
             ow._ensure_schema(pconn2)
             digest = ow._digest({
                 "project_id": setup["project_id"], "task_id": task_id, "to_status": "blocked",
-                "expected_status": "ready", "expected_revision": rev,
+                "expected_status": _ANCHOR_STATUS, "expected_revision": rev,
             })
             # A real competing caller goes through the bounded-poll wrapper
             # (not the raw single-shot primitive) — it may transiently
@@ -3062,7 +3933,7 @@ def test_move_task_fence_blocks_concurrent_claim_attempt_during_mutation(ctx):
 
     kconn = kanban_db.connect(board=board)
     try:
-        task = kanban_db.get_task(kconn, task_id)
+        task = kanban_db.get_control_task(kconn, task_id)
     finally:
         kconn.close()
     assert task.status == "blocked"
@@ -3129,7 +4000,7 @@ def test_comment_fence_blocks_concurrent_claim_attempt_during_mutation(ctx):
 
     kconn = kanban_db.connect(board=board)
     try:
-        comments = kanban_db.list_comments(kconn, task_id)
+        comments = kanban_db.list_comments(kconn, task_id, include_control=True)
     finally:
         kconn.close()
     assert len(comments) == 1
@@ -3279,18 +4150,21 @@ def test_bootstrap_replay_fails_closed_on_missing_task_ownership(ctx):
     board_slug = project.slug
     task_idempotency_key = "owtask_" + ow._derive_id(ctx, key, "task")
 
-    # A task with the SAME deterministic idempotency key already exists but
-    # was never linked to a project (missing ownership metadata) — pass
-    # project_id="" explicitly so it does NOT inherit the board's own
+    # A CONTROL anchor with the SAME deterministic idempotency key already
+    # exists but was never linked to a project (missing ownership metadata) —
+    # pass project_id="" explicitly so it does NOT inherit the board's own
     # project_id (create_task's board-inheritance only fires when the
-    # caller omits project_id entirely).
+    # caller omits project_id entirely). It has to be the same kind the replay
+    # creates: create_task's idempotency lookup is scoped per task_kind, so a
+    # 'work' row carrying this key is a different row the anchor path can
+    # never resolve — and therefore never adopt — at all.
     kconn = kanban_db.connect(board=board_slug)
     try:
         precreated_task_id = kanban_db.create_task(
             kconn, title=name, board=board_slug, idempotency_key=task_idempotency_key,
-            project_id="",
+            project_id="", triage=True, control=True,
         )
-        assert kanban_db.get_task(kconn, precreated_task_id).project_id is None
+        assert kanban_db.get_control_task(kconn, precreated_task_id).project_id is None
     finally:
         kconn.close()
 
@@ -3332,7 +4206,7 @@ def test_comment_crash_before_finalize_replay_creates_no_duplicate(ctx):
 
     kconn = kanban_db.connect(board=board)
     try:
-        comments = kanban_db.list_comments(kconn, task_id)
+        comments = kanban_db.list_comments(kconn, task_id, include_control=True)
     finally:
         kconn.close()
     assert len(comments) == 1
@@ -3349,10 +4223,16 @@ def test_comment_replay_conflicting_payload_fails_closed_at_board_layer(ctx):
 
     kconn = kanban_db.connect(board=board)
     try:
-        kanban_db.add_comment(kconn, task_id, author="default", body="first", operation_key="opk-1")
+        kanban_db.add_comment(
+            kconn, task_id, author="default", body="first",
+            operation_key="opk-1", include_control=True,
+        )
         with pytest.raises(ValueError):
-            kanban_db.add_comment(kconn, task_id, author="default", body="different", operation_key="opk-1")
-        comments = kanban_db.list_comments(kconn, task_id)
+            kanban_db.add_comment(
+                kconn, task_id, author="default", body="different",
+                operation_key="opk-1", include_control=True,
+            )
+        comments = kanban_db.list_comments(kconn, task_id, include_control=True)
     finally:
         kconn.close()
     assert len(comments) == 1
@@ -3391,7 +4271,8 @@ def test_move_task_crash_before_recompute_ready_replay_repairs_child_readiness(
         with pytest.raises(RuntimeError):
             ow.move_task(
                 ctx, idempotency_key=key, task_id=parent_id, to_status=to_status,
-                expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
+                expected_status=_ANCHOR_STATUS, expected_revision=rev,
+                project_id=setup["project_id"],
             )
         t.join()
 
@@ -3401,7 +4282,7 @@ def test_move_task_crash_before_recompute_ready_replay_repairs_child_readiness(
     # succeeded before the crash — only recompute_ready failed.
     kconn = kanban_db.connect(board=board)
     try:
-        assert kanban_db.get_task(kconn, parent_id).status == to_status
+        assert kanban_db.get_control_task(kconn, parent_id).status == to_status
     finally:
         kconn.close()
 
@@ -3412,7 +4293,8 @@ def test_move_task_crash_before_recompute_ready_replay_repairs_child_readiness(
     t2 = _with_approver(ctx.session)
     result = ow.move_task(
         ctx, idempotency_key=key, task_id=parent_id, to_status=to_status,
-        expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
+        expected_status=_ANCHOR_STATUS, expected_revision=rev,
+        project_id=setup["project_id"],
     )
     t2.join()
     assert result["ok"] is True
@@ -3448,7 +4330,8 @@ def test_move_task_unrelated_drift_after_crash_still_conflicts(ctx):
         with pytest.raises(RuntimeError):
             ow.move_task(
                 ctx, idempotency_key=key, task_id=task_id, to_status="blocked",
-                expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
+                expected_status=_ANCHOR_STATUS, expected_revision=rev,
+                project_id=setup["project_id"],
             )
         t.join()
 
@@ -3459,7 +4342,7 @@ def test_move_task_unrelated_drift_after_crash_still_conflicts(ctx):
     kconn = kanban_db.connect(board=board)
     try:
         kanban_db.cas_transition_task(
-            kconn, task_id, expected_status="ready", expected_revision=rev,
+            kconn, task_id, expected_status=_ANCHOR_STATUS, expected_revision=rev,
             to_status="review", event_kind="unrelated_move",
         )
     finally:
@@ -3468,7 +4351,8 @@ def test_move_task_unrelated_drift_after_crash_still_conflicts(ctx):
     t2 = _with_approver(ctx.session)
     result = ow.move_task(
         ctx, idempotency_key=key, task_id=task_id, to_status="blocked",
-        expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
+        expected_status=_ANCHOR_STATUS, expected_revision=rev,
+        project_id=setup["project_id"],
     )
     t2.join()
     assert result["ok"] is False
@@ -3500,14 +4384,15 @@ def test_move_task_exact_replay_recognizes_own_committed_event_by_full_identity(
         with pytest.raises(RuntimeError):
             ow.move_task(
                 ctx, idempotency_key=key, task_id=task_id, to_status="blocked",
-                expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
+                expected_status=_ANCHOR_STATUS, expected_revision=rev,
+                project_id=setup["project_id"],
             )
         t.join()
 
     # The CAS really did commit before the simulated crash.
     kconn = kanban_db.connect(board=board)
     try:
-        committed_task = kanban_db.get_task(kconn, task_id)
+        committed_task = kanban_db.get_control_task(kconn, task_id)
         committed_revision = kanban_db.task_event_revision(kconn, task_id)
     finally:
         kconn.close()
@@ -3519,7 +4404,8 @@ def test_move_task_exact_replay_recognizes_own_committed_event_by_full_identity(
     t2 = _with_approver(ctx.session)
     result = ow.move_task(
         ctx, idempotency_key=key, task_id=task_id, to_status="blocked",
-        expected_status="ready", expected_revision=rev, project_id=setup["project_id"],
+        expected_status=_ANCHOR_STATUS, expected_revision=rev,
+        project_id=setup["project_id"],
     )
     t2.join()
     assert result["ok"] is True
@@ -3532,6 +4418,303 @@ def test_move_task_exact_replay_recognizes_own_committed_event_by_full_identity(
         assert kanban_db.task_event_revision(kconn, task_id) == committed_revision
     finally:
         kconn.close()
+
+
+# ---------------------------------------------------------------------------
+# A terminal move's dependency release is bounded by receipt durability
+# ---------------------------------------------------------------------------
+
+
+def _dependent_setup(ctx):
+    """One bootstrapped Project whose anchor task gates one dependent."""
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as kconn:
+        child_id = kanban_db.create_task(
+            kconn, title="child", parents=[setup["task_id"]],
+        )
+        assert kanban_db.get_task(kconn, child_id).status == "todo"
+        setup["child_id"] = child_id
+        setup["revision"] = kanban_db.task_event_revision(kconn, setup["task_id"])
+    return setup
+
+
+def _status_of(board: str, task_id: str) -> str:
+    with kanban_db.connect(board=board) as kconn:
+        return kanban_db.get_task(kconn, task_id).status
+
+
+@pytest.mark.parametrize("to_status", ["done", "archived"])
+def test_move_task_dependent_is_unclaimable_until_the_receipt_is_durable(
+    ctx, to_status,
+):
+    """A dispatcher tick in the crash window cannot claim the dependent.
+
+    The parent really is terminal at that moment — its dependency is
+    satisfied — so the ONLY thing keeping the dependent out of the work pool
+    is that the same transaction parked it. A readiness recompute run from an
+    independent connection right before the receipt commits stands in for the
+    live dispatcher tick.
+    """
+    setup = _dependent_setup(ctx)
+    board, child_id = setup["board"], setup["child_id"]
+    observed: dict = {}
+    real_finalize = ow._finalize_receipt
+
+    def _observe_then_finalize(pconn, ctx_, key, token, *, status, result):
+        with kanban_db.connect(board=board) as tick:
+            observed["parent_status"] = kanban_db.get_task(
+                tick, setup["task_id"], include_control=True,
+            ).status
+            observed["promoted"] = kanban_db.recompute_ready(tick)
+            observed["child_status"] = kanban_db.get_task(tick, child_id).status
+        return real_finalize(
+            pconn, ctx_, key, token, status=status, result=result,
+        )
+
+    with _temporarily_patch(ow, "_finalize_receipt", _observe_then_finalize):
+        t = _with_approver(ctx.session)
+        result = ow.move_task(
+            ctx, idempotency_key=f"park-window-{to_status}",
+            task_id=setup["task_id"], to_status=to_status,
+            expected_status=_ANCHOR_STATUS, expected_revision=setup["revision"],
+            project_id=setup["project_id"],
+        )
+        t.join()
+
+    assert result["ok"] is True
+    assert observed["parent_status"] == to_status
+    assert observed["child_status"] == kanban_db.PARKED_STATUS
+    assert observed["promoted"] == 0
+    assert observed["child_status"] not in kanban_db.EXECUTABLE_STATUSES
+
+    # The receipt is durable now, so the same dependent is runnable.
+    assert result["parked_dependents"] == [[child_id, "todo"]]
+    assert _status_of(board, child_id) == "ready"
+
+
+@pytest.mark.parametrize("to_status", ["done", "archived"])
+def test_move_task_crash_before_activation_replays_the_exact_parked_set(
+    ctx, to_status,
+):
+    """A crash after the receipt commits leaves the dependent parked, and the
+    replay releases exactly the set that receipt records."""
+    setup = _dependent_setup(ctx)
+    board, child_id = setup["board"], setup["child_id"]
+    key = f"park-crash-{to_status}"
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("crash after terminal receipt, before activation")
+
+    with _temporarily_patch(ow, "_activate_committed_owner_move", boom):
+        t = _with_approver(ctx.session)
+        with pytest.raises(RuntimeError):
+            ow.move_task(
+                ctx, idempotency_key=key, task_id=setup["task_id"],
+                to_status=to_status, expected_status=_ANCHOR_STATUS,
+                expected_revision=setup["revision"],
+                project_id=setup["project_id"],
+            )
+        t.join()
+
+    # Premise: the receipt committed, and the dependent is parked — not
+    # claimable, and not lost either.
+    with projects_db.connect_closing() as pconn:
+        row = ow._get_receipt(pconn, ctx, key)
+        assert row["status"] == "committed"
+        committed = json.loads(row["result_json"])
+    assert committed["parked_dependents"] == [[child_id, "todo"]]
+    assert _status_of(board, child_id) == kanban_db.PARKED_STATUS
+
+    replay = ow.move_task(
+        ctx, idempotency_key=key, task_id=setup["task_id"], to_status=to_status,
+        expected_status=_ANCHOR_STATUS, expected_revision=setup["revision"],
+        project_id=setup["project_id"],
+    )
+    assert replay == committed
+    assert _status_of(board, child_id) == "ready"
+
+    # Activation is idempotent: replaying again changes nothing.
+    assert ow.move_task(
+        ctx, idempotency_key=key, task_id=setup["task_id"], to_status=to_status,
+        expected_status=_ANCHOR_STATUS, expected_revision=setup["revision"],
+        project_id=setup["project_id"],
+    ) == committed
+    assert _status_of(board, child_id) == "ready"
+
+
+def test_move_task_dead_claim_recovery_reconstructs_the_parked_set(ctx):
+    """A crash between the CAS commit and finalization is recovered from the
+    committed ``owner_move`` event, parked set included."""
+    setup = _dependent_setup(ctx)
+    board, child_id = setup["board"], setup["child_id"]
+    key = "park-dead-claim"
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("crash after CAS commit, before finalize")
+
+    with _temporarily_patch(ow, "_finalize_receipt", boom):
+        t = _with_approver(ctx.session)
+        with pytest.raises(RuntimeError):
+            ow.move_task(
+                ctx, idempotency_key=key, task_id=setup["task_id"],
+                to_status="done", expected_status=_ANCHOR_STATUS,
+                expected_revision=setup["revision"],
+                project_id=setup["project_id"],
+            )
+        t.join()
+
+    assert _status_of(board, child_id) == kanban_db.PARKED_STATUS
+    with kanban_db.connect(board=board) as kconn:
+        event = kanban_db.get_next_event_after(
+            kconn, setup["task_id"], setup["revision"],
+        )
+    assert event.kind == "owner_move"
+    assert event.payload["parked_dependents"] == [[child_id, "todo"]]
+
+    _expire_lock(ctx, key)
+    t2 = _with_approver(ctx.session)
+    result = ow.move_task(
+        ctx, idempotency_key=key, task_id=setup["task_id"], to_status="done",
+        expected_status=_ANCHOR_STATUS, expected_revision=setup["revision"],
+        project_id=setup["project_id"],
+    )
+    t2.join()
+    assert result["ok"] is True
+    assert result["parked_dependents"] == [[child_id, "todo"]]
+    assert _status_of(board, child_id) == "ready"
+
+
+def test_move_task_never_parks_or_promotes_a_sticky_blocked_dependent(ctx):
+    """An explicit operator hold survives the parent going terminal."""
+    setup = _dependent_setup(ctx)
+    board, child_id = setup["board"], setup["child_id"]
+    with kanban_db.connect(board=board) as kconn:
+        # An explicit ``blocked`` event is what makes the hold sticky.
+        assert kanban_db.cas_transition_task(
+            kconn, child_id, expected_status="todo",
+            expected_revision=kanban_db.task_event_revision(kconn, child_id),
+            to_status="blocked", event_kind="blocked",
+            event_payload={"reason": "review-required: owner input"},
+        )["moved"] is True
+        assert kanban_db._has_sticky_block(kconn, child_id) is True
+
+    t = _with_approver(ctx.session)
+    result = ow.move_task(
+        ctx, idempotency_key="park-sticky", task_id=setup["task_id"],
+        to_status="done", expected_status=_ANCHOR_STATUS,
+        expected_revision=setup["revision"], project_id=setup["project_id"],
+    )
+    t.join()
+
+    assert result["ok"] is True
+    assert result["parked_dependents"] == []
+    assert _status_of(board, child_id) == "blocked"
+    with kanban_db.connect(board=board) as kconn:
+        kinds = [
+            row["kind"] for row in kconn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (child_id,),
+            )
+        ]
+    assert "owner_work_parked" not in kinds
+    assert "owner_work_activated" not in kinds
+
+
+def test_move_task_non_terminal_move_parks_nothing(ctx):
+    """An ordinary move satisfies no dependency, so it releases nothing."""
+    setup = _dependent_setup(ctx)
+    board, child_id = setup["board"], setup["child_id"]
+
+    t = _with_approver(ctx.session)
+    result = ow.move_task(
+        ctx, idempotency_key="park-ordinary", task_id=setup["task_id"],
+        to_status="blocked", expected_status=_ANCHOR_STATUS,
+        expected_revision=setup["revision"], project_id=setup["project_id"],
+    )
+    t.join()
+
+    assert result["ok"] is True
+    assert result["parked_dependents"] == []
+    assert _status_of(board, child_id) == "todo"
+    with kanban_db.connect(board=board) as kconn:
+        event = kanban_db.get_next_event_after(
+            kconn, setup["task_id"], setup["revision"],
+        )
+    # A move that cannot satisfy a dependency records no release at all, so
+    # its event payload is exactly what it always was.
+    assert "parked_dependents" not in event.payload
+
+
+def test_move_task_leaves_a_dependent_with_another_open_parent_alone(ctx):
+    """Only work this transition NEWLY enables is parked."""
+    setup = _dependent_setup(ctx)
+    board, child_id = setup["board"], setup["child_id"]
+    with kanban_db.connect(board=board) as kconn:
+        other_parent = kanban_db.create_task(
+            kconn, title="other parent", project_id=setup["project_id"],
+        )
+        kanban_db.link_tasks(kconn, other_parent, child_id)
+        revision = kanban_db.task_event_revision(kconn, setup["task_id"])
+
+    t = _with_approver(ctx.session)
+    result = ow.move_task(
+        ctx, idempotency_key="park-not-enabled", task_id=setup["task_id"],
+        to_status="done", expected_status=_ANCHOR_STATUS,
+        expected_revision=revision, project_id=setup["project_id"],
+    )
+    t.join()
+
+    assert result["ok"] is True
+    assert result["parked_dependents"] == []
+    assert _status_of(board, child_id) == "todo"
+
+
+def test_move_task_dependent_is_released_once_under_concurrent_replays(ctx):
+    """Concurrent callers of the same key release the dependent exactly once."""
+    setup = _dependent_setup(ctx)
+    board, child_id = setup["board"], setup["child_id"]
+    key = "park-concurrent"
+
+    t = _with_approver(ctx.session)
+    first = ow.move_task(
+        ctx, idempotency_key=key, task_id=setup["task_id"], to_status="done",
+        expected_status=_ANCHOR_STATUS, expected_revision=setup["revision"],
+        project_id=setup["project_id"],
+    )
+    t.join()
+    assert first["ok"] is True
+
+    results: list = []
+    errors: list = []
+
+    def _replay():
+        try:
+            results.append(
+                ow.move_task(
+                    ctx, idempotency_key=key, task_id=setup["task_id"],
+                    to_status="done", expected_status=_ANCHOR_STATUS,
+                    expected_revision=setup["revision"],
+                    project_id=setup["project_id"],
+                )
+            )
+        except Exception as exc:  # pragma: no cover - surfaced by the assert
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_replay) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert all(result == first for result in results)
+    assert _status_of(board, child_id) == "ready"
+    with kanban_db.connect(board=board) as kconn:
+        activations = kconn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id = ? AND kind = 'owner_work_activated'",
+            (child_id,),
+        ).fetchone()["n"]
+    assert activations == 1
 
 
 def test_move_task_requires_the_receipt_owner_before_any_transition(ctx):
@@ -3551,7 +4734,7 @@ def test_move_task_requires_the_receipt_owner_before_any_transition(ctx):
     with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
         ow.move_task(
             other_ctx, idempotency_key=shared_key, task_id=task_id,
-            to_status="archived", expected_status="ready",
+            to_status="archived", expected_status=_ANCHOR_STATUS,
             expected_revision=rev0, project_id=setup["project_id"],
         )
     assert excinfo.value.code == "project_not_owned"
@@ -3562,7 +4745,7 @@ def test_move_task_requires_the_receipt_owner_before_any_transition(ctx):
     t2 = _with_approver(ctx.session)
     a_result = ow.move_task(
         ctx, idempotency_key=shared_key, task_id=task_id,
-        to_status="blocked", expected_status="ready",
+        to_status="blocked", expected_status=_ANCHOR_STATUS,
         expected_revision=rev0, project_id=setup["project_id"],
     )
     t2.join()
@@ -3571,7 +4754,7 @@ def test_move_task_requires_the_receipt_owner_before_any_transition(ctx):
 
     kconn = kanban_db.connect(board=board)
     try:
-        task = kanban_db.get_task(kconn, task_id)
+        task = kanban_db.get_control_task(kconn, task_id)
     finally:
         kconn.close()
     assert task.status == "blocked"
@@ -3588,7 +4771,7 @@ def test_bootstrap_status_and_revision_feed_directly_into_move(ctx):
     setup = ow.bootstrap(ctx, idempotency_key="pubrev-bootstrap-1", name="Pub Rev WS")
     t.join()
     assert setup["ok"] is True
-    assert setup["status"] == "ready"
+    assert setup["status"] == _ANCHOR_STATUS
     assert setup["revision"] == 1
 
     t2 = _with_approver(ctx.session)
@@ -3612,7 +4795,7 @@ def test_comment_status_and_revision_feed_directly_into_move(ctx):
     )
     t.join()
     assert comment_result["ok"] is True
-    assert comment_result["status"] == "ready"
+    assert comment_result["status"] == _ANCHOR_STATUS
     assert comment_result["revision"] == 2  # task "created" + "commented"
 
     t2 = _with_approver(ctx.session)
@@ -3854,12 +5037,14 @@ def test_task_graph_persists_canonical_native_titles_and_project_name(ctx):
                 "title": f"B04 — Prepare{chr(0x200B)} the release{chr(0xD800)}",
                 "body": "Create the smallest complete release.",
                 "assignee": "default",
+                "execution_tier": "routine",
                 "parents": [],
             },
             {
                 "title": f"R12 — Verify the {chr(0x202E)}release{chr(0x00AD)}",
                 "body": "Check the owner-visible result.",
                 "assignee": "default",
+                "execution_tier": "routine",
                 "parents": [0],
             },
         ],
@@ -3954,7 +5139,8 @@ def test_task_graph_replay_matches_on_the_canonical_title_not_its_spelling(ctx):
             "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?",
             (first["project_id"],),
         ).fetchone()["n"]
-    assert before == after == 3
+    # root + two children + the Project's one hidden control anchor
+    assert before == after == 4
 
 
 def test_task_graph_rejects_titles_that_canonicalize_to_nothing(ctx):
@@ -3977,6 +5163,7 @@ def test_task_graph_rejects_titles_that_canonicalize_to_nothing(ctx):
             "title": _PREFIX_ONLY_TITLE,
             "body": "Create the smallest complete release.",
             "assignee": "default",
+            "execution_tier": "routine",
             "parents": [],
         }]},
     )):
@@ -4011,6 +5198,7 @@ def test_task_graph_persists_literal_untitled_values_the_owner_wrote(ctx):
                 "title": ow._UNTITLED_WORK_ITEM,
                 "body": "Create the smallest complete release.",
                 "assignee": "default",
+                "execution_tier": "routine",
                 "parents": [],
             },
         ],
@@ -4058,6 +5246,7 @@ def test_project_plan_persists_canonical_titles_for_every_created_task(ctx):
                 "title": _UNSAFE_NATIVE_TITLE,
                 "body": "Produce the owner-visible result.",
                 "assignee": "default",
+                "execution_tier": "routine",
                 "existing_parents": [],
                 "new_parents": [],
             },
@@ -4070,12 +5259,14 @@ def test_project_plan_persists_canonical_titles_for_every_created_task(ctx):
                         "title": f"B04 — Build{chr(0x200B)} the change{chr(0xD800)}",
                         "body": "Produce one owner-visible outcome.",
                         "assignee": "default",
+                        "execution_tier": "routine",
                         "parents": [],
                     },
                     {
                         "title": f"R12 — Check the {chr(0x202E)}change{chr(0x00AD)}",
                         "body": "Verify the outcome before downstream work continues.",
                         "assignee": "default",
+                        "execution_tier": "routine",
                         "parents": [0],
                     },
                 ],
@@ -4097,7 +5288,10 @@ def test_project_plan_persists_canonical_titles_for_every_created_task(ctx):
             for task_id in result["created_task_ids"]
         ]
         applied = [
-            event for event in kanban_db.list_events(conn, setup["task_id"])
+            event
+            for event in kanban_db.list_events(
+                conn, setup["task_id"], include_control=True,
+            )
             if event.kind == "owner_project_plan_applied"
         ]
 
@@ -4140,6 +5334,7 @@ def test_project_plan_rejects_a_created_title_that_canonicalizes_to_nothing(ctx)
             "title": _HIDDEN_ONLY,
             "body": "Produce the owner-visible result.",
             "assignee": "default",
+            "execution_tier": "routine",
             "existing_parents": [],
             "new_parents": [],
         }],
@@ -4155,3 +5350,954 @@ def test_project_plan_rejects_a_created_title_that_canonicalizes_to_nothing(ctx)
             task.title not in {_HIDDEN_ONLY, ow._UNTITLED_WORK_ITEM}
             for task in kanban_db.list_tasks(conn)
         )
+
+
+# ---------------------------------------------------------------------------
+# Real production-path integration (no stubbed resolver at all)
+# ---------------------------------------------------------------------------
+
+
+def _write_real_profile_config(profile: str, provider: str, model: str, effort: str):
+    """Materialise a real profile config.yaml under the sandboxed HERMES_HOME."""
+    from hermes_cli.profiles import get_profile_dir
+
+    directory = Path(get_profile_dir(profile))
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.joinpath("config.yaml").write_text(
+        "model:\n"
+        f"  provider: {provider}\n"
+        f"  default: {model}\n"
+        "agent:\n"
+        f"  reasoning_effort: {effort}\n"
+        "fallback_providers: []\n",
+        encoding="utf-8",
+    )
+    return directory
+
+
+@pytest.fixture
+def real_resolver():
+    """Run the genuine config-reading resolver, defeating the autouse stub."""
+    with _temporarily_patch(
+        model_policy,
+        "configured_assignment_for",
+        model_policy.configured_assignment_for.__wrapped__
+        if hasattr(model_policy.configured_assignment_for, "__wrapped__")
+        else _REAL_CONFIGURED_ASSIGNMENT_FOR,
+    ):
+        yield
+
+
+_REAL_CONFIGURED_ASSIGNMENT_FOR = model_policy.configured_assignment_for
+
+
+def test_real_profile_config_resolves_and_locks_owner_task_routes(ctx, real_resolver):
+    """End-to-end: a real config.yaml drives the pin the dispatcher accepts.
+
+    Nothing about the route is stubbed here — the profile's provider is read
+    off disk by the production resolver, the admitted matrix decides the model
+    and effort, and the lock is minted, persisted and then re-validated exactly
+    as ``_default_spawn`` does.
+    """
+    _write_real_profile_config(
+        "raphael-builder", "anthropic", "claude-sonnet-5", "max"
+    )
+    args = _task_graph_args(
+        idempotency_key="graph-real-config",
+        project_name="Real Config Project",
+        root_assignee="raphael-builder",
+    )
+    for task in args["tasks"]:
+        task["assignee"] = "raphael-builder"
+        task["responsibility"] = "B03"
+    args["tasks"][0]["execution_tier"] = "deep"
+    args["tasks"][1]["execution_tier"] = "routine"
+
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+
+    with kanban_db.connect(board=result["board"]) as conn:
+        rows = {
+            task_id: conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            for task_id in (result["root_task_id"], *result["task_ids"])
+        }
+
+    deep_row = rows[result["task_ids"][0]]
+    routine_row = rows[result["task_ids"][1]]
+    # The matrix — not the test — decides the lanes: raphael-builder on
+    # anthropic is Sonnet for routine work and Opus for deep work.
+    assert (deep_row["execution_tier"], deep_row["model_override"]) == (
+        "deep", "claude-opus-5",
+    )
+    assert (routine_row["execution_tier"], routine_row["model_override"]) == (
+        "routine", "claude-sonnet-5",
+    )
+    # Every persisted lock is one the dispatcher would honour.
+    for task_id, row in rows.items():
+        assert row["model_policy_lock"], task_id
+        assert kanban_db.task_policy_lock_error(row) is None, task_id
+
+    # Selecting the other provider afterwards changes only NEW work: the fence
+    # runs first, and the already-pinned rows keep their approved route.
+    _write_real_profile_config(
+        "raphael-builder", "openai-codex", "gpt-5.6-terra", "max"
+    )
+    assert ow.fence_effective_task_routes("raphael-builder") == []
+    with kanban_db.connect(board=result["board"]) as conn:
+        for task_id, row in rows.items():
+            after = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            assert after["model_override"] == row["model_override"]
+            assert after["model_policy_lock"] == row["model_policy_lock"]
+            assert kanban_db.task_policy_lock_error(after) is None
+
+
+def test_real_profile_config_with_fallbacks_enabled_cannot_pin_a_route(
+    ctx, real_resolver
+):
+    """A role that can still fall back has no confirmable route to approve."""
+    directory = _write_real_profile_config(
+        "raphael-builder", "anthropic", "claude-sonnet-5", "max"
+    )
+    directory.joinpath("config.yaml").write_text(
+        "model:\n"
+        "  provider: anthropic\n"
+        "  default: claude-sonnet-5\n"
+        "agent:\n"
+        "  reasoning_effort: max\n"
+        "fallback_providers:\n"
+        "  - provider: openai\n"
+        "    model: gpt-x\n",
+        encoding="utf-8",
+    )
+    args = _task_graph_args(
+        idempotency_key="graph-real-fallbacks", root_assignee="raphael-builder",
+    )
+    for task in args["tasks"]:
+        task["assignee"] = "raphael-builder"
+        task["responsibility"] = "B03"
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        _commit_task_graph(ctx, **args)
+    assert excinfo.value.code == "invalid_model_route"
+
+
+def _install_profiles(*names):
+    from hermes_cli.profiles import get_profile_dir
+
+    for name in names:
+        Path(get_profile_dir(name)).mkdir(parents=True, exist_ok=True)
+
+
+def test_locked_review_handoff_is_refused_rather_than_silently_repinned(ctx):
+    """Independent review is separately approved work, never a re-pin.
+
+    Handing a locked task to a reviewer would mint a new route for a task whose
+    assignee/provider/model/effort/tier the owner approved for its whole run.
+    That is exactly the silent switch the lock exists to prevent, so the
+    handoff is refused and the task stays put.
+    """
+    _install_profiles("raphael-builder", "raphael-verifier")
+    args = _task_graph_args(idempotency_key="graph-review-handoff")
+    args["tasks"][0]["assignee"] = "raphael-builder"
+    args["tasks"][0]["responsibility"] = "B03"
+    args["tasks"][0]["execution_tier"] = "routine"
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+
+    task_id = result["task_ids"][0]
+    with kanban_db.connect(board=result["board"]) as conn:
+        before = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        assert before["model_override"] == "claude-sonnet-5"
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,)
+            )
+        with pytest.raises(RuntimeError, match="the owner approved that exact"):
+            kanban_db.request_review(
+                conn, task_id, reviewer="raphael-verifier", force=True,
+            )
+        after = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+
+    for column in (
+        "assignee", "model_override", "provider_override", "reasoning_effort",
+        "execution_tier", "model_policy_lock",
+    ):
+        assert after[column] == before[column]
+    assert kanban_db.task_policy_lock_error(after) is None
+
+
+def test_locked_task_transition_to_any_other_role_is_refused(ctx):
+    """No silent repin — not even to a role that IS separately approved."""
+    _install_profiles("raphael-verifier")
+    args = _task_graph_args(idempotency_key="graph-refuse-role")
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+
+    task_id = result["task_ids"][0]
+    with kanban_db.connect(board=result["board"]) as conn:
+        kanban_db.create_task(conn, title="unrelated", assignee="default")
+        before = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        # raphael-verifier has its own admitted route for this tier, so this is
+        # not "unroutable" — it is simply not this task's approved authority.
+        with pytest.raises(RuntimeError, match="the owner approved that exact"):
+            kanban_db.assign_task(conn, task_id, "raphael-verifier")
+        # Unassignment would strand the lock, so it is refused too.
+        with pytest.raises(RuntimeError, match="would strand the lock"):
+            kanban_db.assign_task(conn, task_id, None)
+        after = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+
+    assert after["assignee"] == before["assignee"]
+    assert after["model_policy_lock"] == before["model_policy_lock"]
+
+
+def test_invalid_lock_blocks_every_role_transition(ctx):
+    """A corrupt lock is not "unlocked": it fails closed on transition too."""
+    _install_profiles("raphael-verifier")
+    args = _task_graph_args(idempotency_key="graph-corrupt-lock")
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+
+    task_id = result["task_ids"][0]
+    with kanban_db.connect(board=result["board"]) as conn:
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET model_policy_lock = 'raphael' WHERE id = ?",
+                (task_id,),
+            )
+        with pytest.raises(RuntimeError, match="provenance is unreadable"):
+            kanban_db.assign_task(conn, task_id, "raphael-verifier")
+        with pytest.raises(RuntimeError, match="owner-governed"):
+            kanban_db.set_model_override(
+                conn, task_id, "claude-sonnet-5", provider="anthropic",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Durable before activation: nothing is claimable until the receipt is terminal
+# ---------------------------------------------------------------------------
+
+
+class _CrashInjected(RuntimeError):
+    """The simulated crash, distinguishable from a real defect."""
+
+
+def _receipt_row(ctx, key: str):
+    with projects_db.connect_closing() as pconn:
+        ow._ensure_schema(pconn)
+        return pconn.execute(
+            "SELECT status, result_json FROM owner_workspace_receipts "
+            "WHERE actor = ? AND profile = ? AND idempotency_key = ?",
+            (ctx.actor, ctx.profile, key),
+        ).fetchone()
+
+
+def _live_dispatch_probe(board: str) -> dict:
+    """Run one REAL dispatcher tick and report what it was able to take.
+
+    Called from inside the injected crash, so it observes the board at exactly
+    the instant the commit died — the window a live dispatcher would actually
+    have hit.
+    """
+    spawned: list = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 9999
+
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        kanban_db.recompute_ready(conn)
+        kanban_db.dispatch_once(conn, spawn_fn=fake_spawn, board=board)
+        rows = [
+            (str(row["id"]), row["status"], row["claim_lock"])
+            for row in conn.execute(
+                "SELECT id, status, claim_lock FROM tasks "
+                "WHERE task_kind = 'work' ORDER BY id"
+            )
+        ]
+    return {"spawned": spawned, "rows": rows}
+
+
+def _work_rows(board: str, project_id: str) -> dict:
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        return {
+            str(row["id"]): row["status"]
+            for row in conn.execute(
+                "SELECT id, status FROM tasks "
+                "WHERE task_kind = 'work' AND project_id = ?",
+                (project_id,),
+            )
+        }
+
+
+# Where the commit is made to die, and which internal step is interrupted.
+_PRE_TERMINAL_CRASH_POINTS = {
+    "after_graph_mutation": "_update_progress",
+    "after_progress_write": "_finalize_receipt",
+}
+
+
+@pytest.mark.parametrize("crash_point", sorted(_PRE_TERMINAL_CRASH_POINTS))
+def test_no_owner_work_is_claimable_before_the_terminal_receipt(ctx, crash_point):
+    """A live dispatcher tick at the crash instant must find nothing to take."""
+    key = f"graph-crash-{crash_point}"
+    args = _task_graph_args(idempotency_key=key, project_name=f"Crash {crash_point}")
+    probes: list = []
+    target = _PRE_TERMINAL_CRASH_POINTS[crash_point]
+    real = getattr(ow, target)
+
+    def crash(pconn, c, idem, token, **kwargs):
+        if crash_point == "after_graph_mutation" and "task_id" not in kwargs:
+            # The FIRST progress write happens before the graph exists; the
+            # one that records the root is the post-mutation step to die on.
+            return real(pconn, c, idem, token, **kwargs)
+        probes.append(_live_dispatch_probe(_board_for_project(args["project_name"])))
+        raise _CrashInjected(crash_point)
+
+    approver = _with_approver(ctx.session)
+    with _temporarily_patch(ow, target, crash):
+        with pytest.raises(_CrashInjected):
+            _commit_task_graph(ctx, **args)
+    approver.join()
+    assert real is getattr(ow, target)
+
+    # The dispatcher saw the board mid-commit and could take nothing: every
+    # approved child was parked in the same insert that created it, and the
+    # root it hangs under never reached an executable column.
+    assert len(probes) == 1
+    assert probes[0]["rows"], "the graph really was written before the crash"
+    assert probes[0]["spawned"] == []
+    assert all(lock is None for _id, _status, lock in probes[0]["rows"])
+    statuses_at_crash = {status for _id, status, _lock in probes[0]["rows"]}
+    assert not statuses_at_crash & {"ready", "review", "running"}
+    assert "scheduled" in statuses_at_crash
+    # ...and no terminal receipt exists to replay from.
+    assert _receipt_row(ctx, key)["status"] not in ("committed", "denied")
+
+    # Replay finishes the SAME approved graph — no second copy of anything.
+    _expire_lock(ctx, key)
+    approver = _with_approver(ctx.session)
+    replayed = _commit_task_graph(ctx, **args)
+    approver.join()
+
+    assert replayed["ok"] is True
+    assert replayed["task_count"] == 2
+    statuses = _work_rows(replayed["board"], replayed["project_id"])
+    # root + exactly two children, activated, with nothing duplicated.
+    assert len(statuses) == 3
+    assert "scheduled" not in statuses.values()
+
+
+def _board_for_project(name: str) -> str:
+    """The board an in-flight commit is writing to, resolved from projects.db.
+
+    Deliberately not from the receipt: the receipt only learns its board on the
+    progress write, which is one of the steps these tests crash before.
+    """
+    with projects_db.connect_closing() as pconn:
+        for project in projects_db.list_projects(pconn, include_archived=True):
+            if project.name == name:
+                return project.board_slug
+    return kanban_db.DEFAULT_BOARD
+
+
+@pytest.mark.parametrize("crash_point", ["during_activation", "after_activation"])
+def test_replay_from_a_committed_receipt_activates_once_without_reapproval(
+    ctx, crash_point
+):
+    """The terminal receipt IS the authority; replay finishes the same transition."""
+    key = f"graph-activation-{crash_point}"
+    args = _task_graph_args(idempotency_key=key, project_name=f"Activate {crash_point}")
+    probes: list = []
+
+    real_activate = kanban_db.activate_owner_work
+    real_dispatch_state = ow._set_project_dispatch_state
+
+    def crash_during(conn, task_ids, **kwargs):
+        probes.append(list(task_ids))
+        raise _CrashInjected("during_activation")
+
+    def crash_after(board_slug, *, enabled):
+        probes.append(board_slug)
+        raise _CrashInjected("after_activation")
+
+    approver = _with_approver(ctx.session)
+    if crash_point == "during_activation":
+        patch_target = (kanban_db, "activate_owner_work", crash_during)
+    else:
+        patch_target = (ow, "_set_project_dispatch_state", crash_after)
+    with _temporarily_patch(*patch_target):
+        with pytest.raises(_CrashInjected):
+            _commit_task_graph(ctx, **args)
+    approver.join()
+
+    # The receipt committed BEFORE activation was attempted.
+    receipt = _receipt_row(ctx, key)
+    assert receipt["status"] == "committed"
+    committed = json.loads(receipt["result_json"])
+    assert probes
+    if crash_point == "during_activation":
+        # Still parked: the transition never ran.
+        assert set(_work_rows(committed["board"], committed["project_id"]).values()) <= {
+            "scheduled", "triage", "todo",
+        }
+        assert kanban_db.board_dispatch_allowed(
+            kanban_db.read_board_metadata(committed["board"])
+        ) is False
+
+    # Replay: no approver registered at all, and asking for one is a failure.
+    approval.unregister_gateway_notify(ctx.session)
+    _expire_lock(ctx, key)
+    with _temporarily_patch(
+        ow, "_confirm",
+        lambda *a, **k: pytest.fail("replay asked the owner to approve again"),
+    ):
+        replayed = _commit_task_graph(ctx, **args)
+        # Exactly once: replaying again changes nothing further.
+        again = _commit_task_graph(ctx, **args)
+
+    assert replayed == committed == again
+    statuses = _work_rows(replayed["board"], replayed["project_id"])
+    assert len(statuses) == 3
+    assert "scheduled" not in statuses.values()
+    assert kanban_db.board_dispatch_allowed(
+        kanban_db.read_board_metadata(replayed["board"])
+    ) is True
+    assert real_activate is kanban_db.activate_owner_work
+    assert real_dispatch_state is ow._set_project_dispatch_state
+
+
+def test_an_owner_pause_survives_replayed_activation(ctx):
+    """Activation is idempotent AND preserves an explicit owner stop."""
+    args = _task_graph_args(idempotency_key="graph-pause", project_name="Paused Work")
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+
+    kanban_db.write_board_dispatch_state(
+        result["board"], dispatch_enabled=False, dispatch_paused_by_owner=True,
+    )
+    ow._activate_committed_owner_work(result)
+
+    assert kanban_db.board_dispatch_allowed(
+        kanban_db.read_board_metadata(result["board"])
+    ) is False
+
+
+def test_project_plan_work_is_parked_until_its_receipt_commits(ctx):
+    """The same contract on the plan path, with a live dispatcher at the crash."""
+    setup = _bootstrap_board(ctx)
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "add",
+            "reason": "Create one bounded owner-approved task.",
+            "title": "Prepare the approved deliverable",
+            "body": "Produce the owner-visible result.",
+            "assignee": "default",
+            "execution_tier": "routine",
+            "existing_parents": [],
+            "new_parents": [],
+        }],
+        idempotency_key="steward-plan-crash",
+    )
+    probes: list = []
+
+    def crash(*a, **k):
+        probes.append(_live_dispatch_probe(setup["board"]))
+        raise _CrashInjected("plan_finalize")
+
+    approver = _with_approver(ctx.session)
+    with _temporarily_patch(ow, "_finalize_receipt", crash):
+        with pytest.raises(_CrashInjected):
+            _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert probes and probes[0]["spawned"] == []
+    created = [
+        (task_id, status)
+        for task_id, status, _lock in probes[0]["rows"]
+        if status == "scheduled"
+    ]
+    assert created, "the approved task should exist, parked and unclaimable"
+
+    _expire_lock(ctx, "steward-plan-crash")
+    approver = _with_approver(ctx.session)
+    replayed = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert replayed["ok"] is True
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        matching = [
+            task for task in kanban_db.list_tasks(conn)
+            if task.title == "Prepare the approved deliverable"
+        ]
+    # One task, activated exactly once — the crashed attempt left no duplicate.
+    assert len(matching) == 1
+    assert matching[0].status != kanban_db.PARKED_STATUS
+
+
+# ---------------------------------------------------------------------------
+# Cancelling a parent releases its dependents — but not before the receipt
+# ---------------------------------------------------------------------------
+
+
+def _cancel_plan_with_dependent(ctx, *, key: str, child_setup=None):
+    """One Project holding a parent, its waiting child, and a cancel plan."""
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        parent_id = kanban_db.create_task(
+            conn, title="Obsolete parent", assignee="default",
+            project_id=setup["project_id"],
+        )
+        child_id = kanban_db.create_task(
+            conn, title="Waiting dependent", assignee="default",
+            parents=[parent_id], project_id=setup["project_id"],
+        )
+        if child_setup is not None:
+            child_setup(conn, child_id)
+        parent_ref = _project_task_ref(conn, parent_id)
+        assert kanban_db.get_task(conn, child_id).status in ("todo", "blocked")
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "cancel",
+            "reason": "The owner explicitly removed this outcome.",
+            "target": parent_ref,
+        }],
+        idempotency_key=key,
+    )
+    return setup, parent_id, child_id, args
+
+
+def test_a_cancelled_parent_never_releases_its_dependent_before_the_receipt(ctx):
+    """A live dispatcher tick at the crash instant must find nothing to take."""
+    setup, parent_id, child_id, args = _cancel_plan_with_dependent(
+        ctx, key="steward-cancel-dependent-crash",
+    )
+    probes: list = []
+
+    def crash(*a, **k):
+        probes.append(_live_dispatch_probe(setup["board"]))
+        raise _CrashInjected("plan_finalize")
+
+    approver = _with_approver(ctx.session)
+    with _temporarily_patch(ow, "_finalize_receipt", crash):
+        with pytest.raises(_CrashInjected):
+            _commit_project_plan(ctx, **args)
+    approver.join()
+
+    # The dispatcher ran a real tick against the board mid-commit: the parent
+    # was already archived, and the child it unblocked was still unclaimable.
+    assert probes and probes[0]["spawned"] == []
+    statuses = dict((task_id, status) for task_id, status, _ in probes[0]["rows"])
+    assert statuses[parent_id] == "archived"
+    assert statuses[child_id] == kanban_db.PARKED_STATUS
+
+    # Replay finishes the SAME approved plan and releases the dependent once.
+    _expire_lock(ctx, args["idempotency_key"])
+    approver = _with_approver(ctx.session)
+    replayed = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert replayed["ok"] is True
+    assert replayed["parked_dependents"] == [[child_id, "todo"]]
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        assert kanban_db.get_task(conn, child_id).status != kanban_db.PARKED_STATUS
+
+    # Exactly once: replaying the committed activation again changes nothing.
+    before = _work_rows(setup["board"], setup["project_id"])
+    ow._activate_committed_owner_work(replayed)
+    assert _work_rows(setup["board"], setup["project_id"]) == before
+
+
+def test_a_cancelled_parent_records_and_then_releases_its_dependent(ctx):
+    setup, _parent_id, child_id, args = _cancel_plan_with_dependent(
+        ctx, key="steward-cancel-dependent-ok",
+    )
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result["ok"] is True
+    # The committed receipt names the dependent it released, with the exact
+    # column to restore — that record is what makes the replay recoverable.
+    assert result["parked_dependents"] == [[child_id, "todo"]]
+    assert child_id in result["affected_task_ids"]
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        assert kanban_db.get_task(conn, child_id).status != kanban_db.PARKED_STATUS
+
+
+def test_replaying_a_receipt_never_un_postpones_work_the_owner_parked_since(ctx):
+    """``scheduled`` is a shared column, so activation matches a generation.
+
+    The dependent this plan released is later postponed by the owner — back
+    into the very same column. Replaying the committed receipt (which every
+    crash-recovery path does) must not read that as its own parked work and
+    reactivate it, nor enable anything waiting on it.
+    """
+    setup, _parent_id, child_id, args = _cancel_plan_with_dependent(
+        ctx, key="steward-replay-after-postpone",
+    )
+    approver = _with_approver(ctx.session)
+    committed = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert committed["parked_dependents"] == [[child_id, "todo"]]
+    assert committed["park_generation"]
+
+    # The owner then deliberately postpones that same task, which lands it in
+    # the parked column again — this time as the owner's own decision.
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        released = kanban_db.get_task(conn, child_id)
+        assert released.status != kanban_db.PARKED_STATUS
+        postponed = kanban_db.cas_transition_task(
+            conn,
+            child_id,
+            expected_status=released.status,
+            expected_revision=kanban_db.task_event_revision(conn, child_id),
+            to_status=kanban_db.PARKED_STATUS,
+            event_kind="owner_move",
+        )
+        assert postponed["moved"] is True
+
+    # The exact replay every crash-recovery path performs.
+    ow._activate_committed_owner_work(committed)
+    ow._activate_committed_owner_move(committed)
+
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        assert kanban_db.get_task(conn, child_id).status == kanban_db.PARKED_STATUS
+
+
+def test_a_receipt_with_no_recorded_generation_releases_nothing(ctx):
+    """Fail closed: an unidentifiable parking is never claimed by activation."""
+    setup, _parent_id, child_id, args = _cancel_plan_with_dependent(
+        ctx, key="steward-generation-missing",
+    )
+    approver = _with_approver(ctx.session)
+    committed = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    # Re-park the dependent and then replay a receipt whose generation is gone.
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?",
+                (kanban_db.PARKED_STATUS, child_id),
+            )
+    ow._activate_committed_owner_work({**committed, "park_generation": None})
+
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        assert kanban_db.get_task(conn, child_id).status == kanban_db.PARKED_STATUS
+
+
+def _circuit_broken(conn, child_id: str) -> None:
+    """A dependent the breaker stopped: blocked, at its retry limit."""
+    with kanban_db.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', consecutive_failures = ?, "
+            "max_retries = 1 WHERE id = ?",
+            (kanban_db.DEFAULT_FAILURE_LIMIT + 1, child_id),
+        )
+    kanban_db._append_event(conn, child_id, "gave_up", None)
+    conn.commit()
+
+
+def test_parking_a_blocked_dependent_restores_it_blocked_with_its_guards(ctx):
+    """Parking must never launder a stopped dependent into the work pool."""
+    setup, _parent_id, child_id, args = _cancel_plan_with_dependent(
+        ctx, key="steward-cancel-blocked-dependent", child_setup=_circuit_broken,
+    )
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result["parked_dependents"] == [[child_id, "blocked"]]
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        assert kanban_db.get_task(conn, child_id).status == "blocked"
+
+
+def _sticky_blocked(conn, child_id: str) -> None:
+    """An explicit operator hold: ``blocked`` with a ``blocked`` event."""
+    with kanban_db.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked' WHERE id = ?", (child_id,)
+        )
+        kanban_db._append_event(
+            conn, child_id, "blocked",
+            {"reason": "review-required: owner input", "block_kind": "needs_input"},
+        )
+
+
+def test_an_explicitly_blocked_dependent_is_left_exactly_as_it_is(ctx):
+    setup, _parent_id, child_id, args = _cancel_plan_with_dependent(
+        ctx, key="steward-cancel-sticky-dependent", child_setup=_sticky_blocked,
+    )
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result["parked_dependents"] == []
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        assert kanban_db.get_task(conn, child_id).status == "blocked"
+
+
+def test_a_merged_parents_dependent_waits_on_the_parked_replacement(ctx):
+    """Merge relinks every dependent under the replacement, which is parked."""
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        left_id = kanban_db.create_task(
+            conn, title="Left half", assignee="default", project_id=setup["project_id"],
+        )
+        right_id = kanban_db.create_task(
+            conn, title="Right half", assignee="default", project_id=setup["project_id"],
+        )
+        child_id = kanban_db.create_task(
+            conn, title="Dependent work", assignee="default",
+            parents=[left_id, right_id], project_id=setup["project_id"],
+        )
+        left_ref = _project_task_ref(conn, left_id)
+        right_ref = _project_task_ref(conn, right_id)
+
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "merge",
+            "reason": "One coherent deliverable is easier to own and verify.",
+            "targets": [left_ref, right_ref],
+            "replacement": {
+                "title": "Combined deliverable",
+                "body": "Replace both overlapping work items without deleting history.",
+                "assignee": "default",
+                "execution_tier": "routine",
+            },
+        }],
+        idempotency_key="steward-merge-dependent-crash",
+    )
+    probes: list = []
+
+    def crash(*a, **k):
+        probes.append(_live_dispatch_probe(setup["board"]))
+        raise _CrashInjected("plan_finalize")
+
+    approver = _with_approver(ctx.session)
+    with _temporarily_patch(ow, "_finalize_receipt", crash):
+        with pytest.raises(_CrashInjected):
+            _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert probes and probes[0]["spawned"] == []
+    statuses = dict((task_id, status) for task_id, status, _ in probes[0]["rows"])
+    assert statuses[left_id] == statuses[right_id] == "archived"
+    assert statuses[child_id] not in kanban_db.EXECUTABLE_STATUSES
+
+
+# ---------------------------------------------------------------------------
+# A graph-created Project can accept a LATER plan, through its own anchor
+# ---------------------------------------------------------------------------
+
+
+def _control_rows(board: str, project_id: str) -> list:
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        return [
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE project_id = ? AND task_kind = 'control' "
+                "ORDER BY id",
+                (project_id,),
+            )
+        ]
+
+
+def _graph_created_project(ctx, key="graph-followup"):
+    args = _task_graph_args(idempotency_key=key, project_name="Follow-up Project")
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+    assert result["ok"] is True
+    return args, result
+
+
+def test_a_graph_created_project_accepts_a_later_existing_project_plan(ctx):
+    """The whole follow-up path: create, read, prepare, commit, verify."""
+    _args, created = _graph_created_project(ctx)
+
+    # The owner reads the Project back exactly as the Workspace would.
+    snapshot = ow.read_project_snapshot(ctx, created["project_slug"])
+    before_ids = {
+        task["id"] for column in snapshot["columns"] for task in column["tasks"]
+    }
+    assert before_ids == {created["root_task_id"], *created["task_ids"]}
+
+    # A later approved plan hangs one new task under the Project's own hidden
+    # anchor — an id the caller never sees and never supplies.
+    plan = _project_plan_args(
+        created,
+        [{
+            "action": "add",
+            "reason": "The owner approved one more bounded step.",
+            "title": "Ship the follow-up step",
+            "body": "Deliver the newly approved milestone step.",
+            "assignee": "default",
+            "execution_tier": "deep",
+            "existing_parents": [],
+            "new_parents": [],
+        }],
+        idempotency_key="graph-followup-plan",
+    )
+    approver = _with_approver(ctx.session)
+    applied = _commit_project_plan(ctx, **plan)
+    approver.join()
+
+    assert applied["ok"] is True
+    assert applied["change_count"] == 1
+    assert len(applied["created_task_ids"]) == 1
+    new_task_id = applied["created_task_ids"][0]
+
+    # The exact changed graph: the original three rows, plus exactly one new
+    # task, carrying the deep lane's route pinned under an owner-approved lock.
+    after = ow.read_project_snapshot(ctx, created["project_slug"])
+    after_ids = {
+        task["id"] for column in after["columns"] for task in column["tasks"]
+    }
+    assert after_ids == before_ids | {new_task_id}
+    deep = model_policy.task_assignment_for("default", "anthropic", "deep")
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        added = kanban_db.get_task(conn, new_task_id)
+    assert (added.model_override, added.provider_override) == (deep.model, deep.provider)
+    assert (added.reasoning_effort, added.execution_tier) == (
+        deep.reasoning_effort, "deep",
+    )
+    assert kanban_db.policy_lock_error(
+        added.model_policy_lock, added.assignee, added.provider_override,
+        added.model_override, added.reasoning_effort, added.execution_tier,
+    ) is None
+    # Activated by the plan's own terminal receipt, never left parked.
+    assert added.status != kanban_db.PARKED_STATUS
+
+    # Still exactly one hidden anchor, and it is the one the graph receipt
+    # recorded creating.
+    assert _control_rows(created["board"], created["project_id"]) == [
+        created["anchor_task_id"]
+    ]
+
+
+def test_replaying_the_graph_commit_mints_no_second_anchor_or_task(ctx):
+    args, created = _graph_created_project(ctx, key="graph-anchor-replay")
+
+    replayed = _commit_task_graph(ctx, **args)
+    assert replayed == created
+    # Re-open the board from scratch (a fresh process would too).
+    assert _control_rows(created["board"], created["project_id"]) == [
+        created["anchor_task_id"]
+    ]
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        work = [
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE project_id = ? AND task_kind = 'work'",
+                (created["project_id"],),
+            )
+        ]
+    assert sorted(work) == sorted([created["root_task_id"], *created["task_ids"]])
+
+
+def test_a_project_whose_anchor_is_missing_refuses_a_plan(ctx):
+    _args, created = _graph_created_project(ctx, key="graph-anchor-missing")
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        conn.execute(
+            "DELETE FROM tasks WHERE id = ?", (created["anchor_task_id"],)
+        )
+        conn.commit()
+
+    plan = _project_plan_args(
+        created,
+        [{
+            "action": "add",
+            "reason": "This must never land.",
+            "title": "Unanchored work",
+            "body": "Work with no proven anchor.",
+            "assignee": "default",
+            "execution_tier": "routine",
+            "existing_parents": [],
+            "new_parents": [],
+        }],
+        idempotency_key="graph-anchor-missing-plan",
+    )
+    with _temporarily_patch(
+        ow, "_confirm",
+        lambda *a, **k: pytest.fail("an unprovable anchor reached the owner"),
+    ):
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            _commit_project_plan(ctx, **plan)
+    assert excinfo.value.code == "project_not_owned"
+
+
+def test_a_project_holding_two_anchors_refuses_a_plan(ctx):
+    _args, created = _graph_created_project(ctx, key="graph-anchor-ambiguous")
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        kanban_db.create_task(
+            conn,
+            title="a second anchor nobody approved",
+            control=True,
+            triage=True,
+            board=created["board"],
+            project_id=created["project_id"],
+        )
+
+    plan = _project_plan_args(
+        created,
+        [{
+            "action": "add",
+            "reason": "This must never land either.",
+            "title": "Ambiguously anchored work",
+            "body": "Work whose anchor cannot be proven.",
+            "assignee": "default",
+            "execution_tier": "routine",
+            "existing_parents": [],
+            "new_parents": [],
+        }],
+        idempotency_key="graph-anchor-ambiguous-plan",
+    )
+    with _temporarily_patch(
+        ow, "_confirm",
+        lambda *a, **k: pytest.fail("an ambiguous anchor reached the owner"),
+    ):
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            _commit_project_plan(ctx, **plan)
+    assert excinfo.value.code == "project_not_owned"
+
+
+def test_the_control_anchor_never_appears_in_any_owner_or_task_only_surface(ctx):
+    _args, created = _graph_created_project(ctx, key="graph-anchor-hidden")
+    anchor = created["anchor_task_id"]
+
+    snapshot = ow.read_project_snapshot(ctx, created["project_slug"])
+    owner_ids = {
+        task["id"] for column in snapshot["columns"] for task in column["tasks"]
+    }
+    assert anchor not in owner_ids
+    assert snapshot["board"]["total"] == len(owner_ids)
+
+    steward = ow.project_steward_snapshot(project_id=created["project_id"])
+    assert anchor not in json.dumps(steward)
+
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        assert anchor not in {task.id for task in kanban_db.list_tasks(conn)}
+        assert kanban_db.get_task(conn, anchor) is None
+        assert kanban_db.get_task(conn, anchor, include_control=True) is not None

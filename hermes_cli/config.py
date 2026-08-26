@@ -14,6 +14,7 @@ This module provides:
 - hermes config wizard   - Re-run setup wizard
 """
 
+import contextvars
 import copy
 import json
 import logging
@@ -28,12 +29,23 @@ import tempfile
 import threading
 import time
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
+
+try:  # POSIX
+    import fcntl
+except ImportError:  # pragma: no cover - platform-dependent
+    fcntl = None  # type: ignore[assignment]
+
+try:  # Windows
+    import msvcrt
+except ImportError:  # pragma: no cover - platform-dependent
+    msvcrt = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -3733,8 +3745,15 @@ def save_config(
     strip_defaults: bool = True,
     preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
     merge_existing: bool = False,
-):
+    expected_revision: Optional[str] = None,
+) -> Optional[str]:
     """Save configuration to ~/.hermes/config.yaml.\n
+
+    Returns the profile's model-route revision AFTER the write (computed while
+    the route lock is still held), or ``None`` when the write was skipped by
+    the managed-scope guard. ``expected_revision`` makes the write a
+    compare-and-swap: it raises :class:`RouteRevisionConflict` when the
+    profile's route revision is not the one the caller read.
 
     Default values from ``DEFAULT_CONFIG`` are not written to disk unless
     the user explicitly set them (i.e. the path exists in the raw config
@@ -3773,74 +3792,1084 @@ def save_config(
         ensure_hermes_home()
         config_path = get_config_path()
         require_readable_config_before_write(config_path)
-        # Compute explicit user paths BEFORE any normalisation --------
-        # _normalize_max_turns_config may inject agent.max_turns from
-        # DEFAULT_CONFIG; using the raw dict preserves which paths the
-        # user actually set so _strip_default_values can keep them.
-        _raw_for_paths = read_raw_config()
-        explicit_raw_paths: Optional[Set[Tuple[str, ...]]] = (
-            _explicit_config_paths(_raw_for_paths) if _raw_for_paths else None
+        governed = _profile_under_policy(
+            _profile_for_config_path(config_path)
         )
-        if merge_existing and _raw_for_paths:
-            config = _merge_partial_save(_raw_for_paths, config)
-        # ----------------------------------------------------------------
+        # Shared model-route mutation boundary. Every surface that can move a
+        # profile's model, provider, reasoning effort or fallback policy —
+        # /api/profiles/{name}/model, /api/model/set, /api/config,
+        # /api/config/raw, the CLI, /model, /reasoning, the TUI and setup —
+        # lands here, so the read, the compare-and-swap, the policy decision,
+        # the legacy-work fence, the write and the revision reported back are
+        # one serialized decision instead of one per caller.
+        with profile_route_write(
+            config_path, expected_revision=expected_revision, governed=governed,
+        ) as governed:
+            # Compute explicit user paths BEFORE any normalisation --------
+            # _normalize_max_turns_config may inject agent.max_turns from
+            # DEFAULT_CONFIG; using the raw dict preserves which paths the
+            # user actually set so _strip_default_values can keep them.
+            _raw_for_paths = read_raw_config()
+            explicit_raw_paths: Optional[Set[Tuple[str, ...]]] = (
+                _explicit_config_paths(_raw_for_paths) if _raw_for_paths else None
+            )
+            if merge_existing and _raw_for_paths:
+                config = _merge_partial_save(_raw_for_paths, config)
+            # ----------------------------------------------------------------
 
-        current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-        normalized = current_normalized
-        raw_existing = (
-            _normalize_root_model_keys(_normalize_max_turns_config(_raw_for_paths))
-            if _raw_for_paths
-            else {}
-        )
-        if raw_existing:
-            normalized = _preserve_env_ref_templates(
+            current_normalized = _normalize_root_model_keys(
+                _normalize_max_turns_config(config)
+            )
+            normalized = current_normalized
+            raw_existing = (
+                _normalize_root_model_keys(_normalize_max_turns_config(_raw_for_paths))
+                if _raw_for_paths
+                else {}
+            )
+            if raw_existing:
+                normalized = _preserve_env_ref_templates(
+                    normalized,
+                    raw_existing,
+                    _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)),
+                )
+
+            # Strip schema-default values so the user's custom settings are not
+            # silently reset on every save.  Keys the user explicitly set (paths
+            # from the raw pre-normalisation config) are always preserved.
+            effective_preserve_keys: Set[Tuple[str, ...]] = {("_config_version",)}
+            if explicit_raw_paths:
+                effective_preserve_keys.update(explicit_raw_paths)
+            if preserve_keys:
+                effective_preserve_keys.update(preserve_keys)
+
+            if strip_defaults and effective_preserve_keys:
+                # _preserve_env_ref_templates may return Any; cast for type-checker.
+                from typing import cast as _cast
+                normalized = _cast(Dict[str, Any], normalized)
+                normalized = _strip_default_values(
+                    normalized,  # type: ignore[arg-type]
+                    DEFAULT_CONFIG,
+                    preserve_keys=effective_preserve_keys,
+                )
+
+            # Build optional commented-out sections for features that are off by
+            # default or only relevant when explicitly configured.
+            parts = []
+            sec = normalized.get("security", {})
+            if not sec or sec.get("redact_secrets") is None:
+                parts.append(_SECURITY_COMMENT)
+            fb = normalized.get("fallback_model", {})
+            fb_is_valid = False
+            if isinstance(fb, list):
+                fb_is_valid = any(isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb)
+            elif isinstance(fb, dict):
+                fb_is_valid = bool(fb.get("provider") and fb.get("model"))
+            if not fb_is_valid:
+                parts.append(_FALLBACK_COMMENT)
+
+            _guard_model_route_change(
+                config_path, raw_existing, current_normalized, governed=governed,
+            )
+            atomic_yaml_write(
+                config_path,
                 normalized,
-                raw_existing,
-                _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)),
+                extra_content="".join(parts) if parts else None,
             )
-
-        # Strip schema-default values so the user's custom settings are not
-        # silently reset on every save.  Keys the user explicitly set (paths
-        # from the raw pre-normalisation config) are always preserved.
-        effective_preserve_keys: Set[Tuple[str, ...]] = {("_config_version",)}
-        if explicit_raw_paths:
-            effective_preserve_keys.update(explicit_raw_paths)
-        if preserve_keys:
-            effective_preserve_keys.update(preserve_keys)
-
-        if strip_defaults and effective_preserve_keys:
-            # _preserve_env_ref_templates may return Any; cast for type-checker.
-            from typing import cast as _cast
-            normalized = _cast(Dict[str, Any], normalized)
-            normalized = _strip_default_values(
-                normalized,  # type: ignore[arg-type]
-                DEFAULT_CONFIG,
-                preserve_keys=effective_preserve_keys,
+            _secure_file(config_path)
+            _RAW_CONFIG_CACHE.pop(str(config_path), None)
+            _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(
+                current_normalized
             )
+            # Read back through the same helper the compare-and-swap uses, so
+            # the revision a caller echoes on its next write is comparable.
+            return profile_route_revision(config_path.parent)
 
-        # Build optional commented-out sections for features that are off by
-        # default or only relevant when explicitly configured.
-        parts = []
-        sec = normalized.get("security", {})
-        if not sec or sec.get("redact_secrets") is None:
-            parts.append(_SECURITY_COMMENT)
-        fb = normalized.get("fallback_model", {})
-        fb_is_valid = False
-        if isinstance(fb, list):
-            fb_is_valid = any(isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb)
-        elif isinstance(fb, dict):
-            fb_is_valid = bool(fb.get("provider") and fb.get("model"))
-        if not fb_is_valid:
-            parts.append(_FALLBACK_COMMENT)
 
-        atomic_yaml_write(
-            config_path,
-            normalized,
-            extra_content="".join(parts) if parts else None,
+def model_route_fingerprint(config: Optional[Dict[str, Any]]) -> Tuple[str, str, str, bool]:
+    """The effective (provider, model, effort, fallbacks-disabled) of a config.
+
+    Resolved against ``DEFAULT_CONFIG`` so a value that merely happens to
+    equal a schema default — and is therefore stripped on save — compares
+    equal to itself rather than looking like a route change.
+    """
+    def _leaf(section: str, *keys: str) -> str:
+        for source in (config, DEFAULT_CONFIG):
+            block = source.get(section)
+            if not isinstance(block, dict):
+                continue
+            for key in keys:
+                value = block.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    # Resolved against the defaults for the same reason: ``fallback_providers:
+    # []`` IS the schema default, so it is stripped on save — an absent key
+    # means "no configured fallbacks", exactly what a readonly load reports.
+    fallback_providers = (
+        config["fallback_providers"]
+        if "fallback_providers" in config
+        else DEFAULT_CONFIG.get("fallback_providers")
+    )
+    fallback_model = (
+        config["fallback_model"]
+        if "fallback_model" in config
+        else DEFAULT_CONFIG.get("fallback_model")
+    )
+    fallbacks_disabled = (
+        isinstance(fallback_providers, list)
+        and not fallback_providers
+        and not fallback_model
+    )
+    return (
+        _leaf("model", "provider"),
+        _leaf("model", "default", "model"),
+        _leaf("agent", "reasoning_effort").lower(),
+        fallbacks_disabled,
+    )
+
+
+def route_revision(config: Optional[Dict[str, Any]]) -> str:
+    """The Hermes-owned revision of one config's effective model route."""
+    import hashlib
+
+    return hashlib.sha256(
+        json.dumps(
+            model_route_fingerprint(config or {}),
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def current_route_revision() -> str:
+    """The route revision of the config the active HERMES_HOME resolves to.
+
+    Refuses while this machine's multi-role change journal is unreconciled: the
+    live config may be half of an interrupted batch, so the revision read off it
+    is not authority anybody may act on — least of all as one side of a
+    compare-and-swap.
+    """
+    assert_route_journal_reconciled()
+    return route_revision(load_config_readonly())
+
+
+class RouteRevisionConflict(RuntimeError):
+    """The caller's stated revision is not the one on disk; refuse the write."""
+
+
+# Which config paths this thread already holds the cross-process profile route
+# lock for. The lock is a kernel file lock on a per-profile path, so a second
+# acquisition from the same process would block against itself; nesting is
+# normal here because the outer boundary (a CLI key write, or the profiles
+# endpoint) drives ``save_config``, which is itself a boundary.
+_ROUTE_LOCKS_HELD: contextvars.ContextVar[frozenset] = contextvars.ContextVar(
+    "hermes_route_locks_held", default=frozenset()
+)
+
+
+@contextmanager
+def profile_route_write(
+    config_path: Path,
+    *,
+    expected_revision: Optional[str] = None,
+    governed: Optional[bool] = None,
+):
+    """The one locked boundary every route-affecting config write passes.
+
+    Yields the in-lock "is this profile governed?" answer. Inside the ``with``
+    body the caller does its read, its own mutation and its atomic write, so
+    everything — the pre-read, the compare-and-swap, the policy validation, the
+    owner-work fence, the write, and the revision the caller reports back —
+    happens while one cross-process, kernel-held lock for THIS profile is held.
+    Two writers that read the same revision therefore produce exactly one
+    success and one :class:`RouteRevisionConflict`.
+
+    A profile is governed only when it is EXPLICITLY enrolled into Raphael
+    policy by the trusted Models-machine surface (see
+    ``model_policy.enrolled_profile_ids``): an enrolled role stays governed
+    even if its config has drifted, and an ordinary profile — including a
+    default profile that happens to run the same model — stays native and
+    unrestricted. Enrollment is never inferred from the current route.
+
+    A profile that is not an admitted Raphael role id, with no stated revision,
+    keeps the historical behaviour exactly: no lock, no fence, no validation.
+    Such a profile can never become governed, because enrollment only ever
+    records an admitted id.
+
+    An admitted id is different: whether it is enrolled can change under an
+    unlocked reader. Answering that question outside the lock and then writing
+    lets a normal writer observe "unenrolled", another process enroll, and this
+    writer land afterwards as an unrestricted mutation on a now-governed role.
+    So for an admitted id the lock is ALWAYS taken first and enrollment is
+    re-read while holding it (see :func:`_route_write_decision`).
+    """
+    from hermes_cli.profiles import profile_name_for_home
+
+    # No route-affecting write may land on top of an unreconciled multi-role
+    # change: its journal is the only record of what to put back, and the next
+    # write is exactly what would make that record wrong.
+    assert_route_journal_reconciled()
+    profile = profile_name_for_home(config_path.parent)
+    if governed is None:
+        governed = _profile_under_policy(profile)
+    if not governed and expected_revision is None and not _profile_is_admitted(profile):
+        yield False
+        return
+
+    from hermes_cli.owner_workspace import profile_route_lock
+
+    held = _ROUTE_LOCKS_HELD.get()
+    key = str(config_path)
+    if key in held:
+        # An enclosing frame (the multi-role batch) already holds this
+        # profile's lock. Taking the same kernel lock on a second descriptor
+        # would block against ourselves, so only the acquisition is skipped —
+        # the compare-and-swap and the policy decision still happen here.
+        with _route_write_decision(config_path, profile, expected_revision) as answer:
+            yield answer
+        return
+    token = _ROUTE_LOCKS_HELD.set(held | {key})
+    try:
+        # THE lock order for every route-affecting write in this process:
+        # ``_CONFIG_LOCK`` first, then the per-profile kernel lock. Taking them
+        # here — rather than leaving each caller to choose — is what makes the
+        # order global. An ordinary single-profile writer already held
+        # ``_CONFIG_LOCK`` on the way in (it is an ``RLock``, so re-entering is
+        # free), while the multi-role batch used to take the profile locks
+        # first and then enter ``save_config``: two writers in opposite orders,
+        # which deadlocked permanently.
+        with _CONFIG_LOCK:
+            with profile_route_lock(profile):
+                with _route_write_decision(
+                    config_path, profile, expected_revision
+                ) as answer:
+                    yield answer
+    finally:
+        _ROUTE_LOCKS_HELD.reset(token)
+
+
+@contextmanager
+def _route_write_decision(
+    config_path: Path, profile: str, expected_revision: Optional[str]
+):
+    """Compare-and-swap, then answer "is this profile governed?" — under lock."""
+    before_revision = profile_route_revision(config_path.parent)
+    if (
+        expected_revision is not None
+        and str(expected_revision).strip() != before_revision
+    ):
+        raise RouteRevisionConflict(
+            "profile route revision changed before the write "
+            f"(expected {expected_revision!r}, current {before_revision!r})"
         )
-        _secure_file(config_path)
+    # Read enrollment under the lock: an enrollment that landed between an
+    # unlocked pre-check and here must still govern this write.
+    yield _profile_under_policy(profile)
+
+
+def profile_route_revision(home: Path) -> str:
+    """The route revision of one profile home, read exactly as it is reported.
+
+    Both the compare-and-swap and the revision handed back to a caller resolve
+    through here, so the value a client echoes on its next write is the same
+    value the CAS compares against.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(home))
+    try:
+        return current_route_revision()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _profile_for_config_path(config_path: Path) -> str:
+    """Which profile owns the config file at ``config_path``."""
+    from hermes_cli.profiles import profile_name_for_home
+
+    return profile_name_for_home(config_path.parent)
+
+
+class ProfileRouteBatchError(RuntimeError):
+    """A batch route change was rejected; no profile was left changed."""
+
+    def __init__(self, reason: str, profile: Optional[str] = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.profile = profile
+
+
+# The all-or-nothing multi-role route change writes several LIVE config files
+# and only afterwards updates enrollment and the audit record. In-process
+# rollback covers a raised exception, but not power loss or a SIGKILL, which
+# can leave some roles on the new route and some on the old — with no audit
+# record for either. So the exact pre-batch bytes of every file are journalled
+# and fsynced BEFORE the first mutation, and the journal is reconciled on
+# startup: a batch that did not reach its own completion is put back.
+#
+# One journal, at the machine root (not in any profile home), because a batch
+# spans profiles. Its presence IS the "a batch is in flight or unreconciled"
+# fact, and one machine-wide interprocess lock (``_route_batch_journal_lock``)
+# orders reconciliation against every live batch: without it a second process
+# could restore — and then delete — the journal of a batch that was still
+# actively writing, destroying the only record of what to put back.
+#
+# The journal is PHASE-AWARE, because "interrupted" is not one state. A batch
+# that died before its audit commit must be rolled BACK; one that died after it
+# must be rolled FORWARD, because the audit log may already assert those routes
+# and reverting them would leave a committed record of a change that no longer
+# exists. The phase is what tells those two apart after the process is gone.
+_ROUTE_BATCH_JOURNAL_NAME = "profile-route-batch.journal"
+_ROUTE_BATCH_JOURNAL_VERSION = 2
+
+# Written, in order, as each half of the operation becomes durable.
+_ROUTE_BATCH_PREPARED = "prepared"
+_ROUTE_BATCH_CONFIG_WRITTEN = "config-written"
+_ROUTE_BATCH_ENROLLMENT_WRITTEN = "enrollment-written"
+_ROUTE_BATCH_AUDIT_COMMITTED = "audit-committed"
+_ROUTE_BATCH_PHASES = (
+    _ROUTE_BATCH_PREPARED,
+    _ROUTE_BATCH_CONFIG_WRITTEN,
+    _ROUTE_BATCH_ENROLLMENT_WRITTEN,
+    _ROUTE_BATCH_AUDIT_COMMITTED,
+)
+# The one phase that means "this batch is committed": every write it owed has
+# landed AND the audit record asserting them is (or may be) in the log.
+_ROUTE_BATCH_COMMITTED_PHASES = frozenset({_ROUTE_BATCH_AUDIT_COMMITTED})
+
+
+class RouteJournalUnreconciled(RuntimeError):
+    """A multi-role route change's journal could not be reconciled.
+
+    Fatal on purpose. The journal is the only record of what an interrupted
+    batch must be put back to, so a journal that cannot be read, cannot be
+    restored, or cannot be retired leaves the machine's route authority in an
+    unknown state. Returning normally let startup continue and let the NEXT
+    batch truncate that record, so this is raised instead and every route read
+    and route write in the process refuses until reconciliation succeeds.
+    """
+
+
+# Set when reconciliation failed; cleared when it succeeds. Every Hermes
+# process reconciles at startup (``hermes_cli.main``), so a machine whose
+# journal is unreconcilable latches every process that could route, not just
+# the one that first noticed.
+_ROUTE_JOURNAL_BLOCKED: Optional[str] = None
+
+# Re-entrancy depth for the machine-wide journal lock, per THREAD. ``flock`` is
+# per-descriptor: a second acquire from the same process on a second descriptor
+# blocks forever, and a batch legitimately reconciles (and then journals) while
+# already holding the lock.
+_route_journal_lock_depth = threading.local()
+
+
+def _route_batch_journal_path() -> Path:
+    from hermes_cli.profiles import _get_default_hermes_home
+
+    return _get_default_hermes_home() / _ROUTE_BATCH_JOURNAL_NAME
+
+
+def _route_journal_lock_held() -> bool:
+    return bool(getattr(_route_journal_lock_depth, "value", 0))
+
+
+@contextmanager
+def _route_batch_journal_lock():
+    """Hold the one machine-wide lock that orders journal work.
+
+    Reconciliation and a live batch's whole lifetime — including its journal's
+    retirement — happen under this lock, so no second process can read, restore
+    or delete a journal another process is still writing against. Kernel-held
+    by the open file description, so it is dropped when the process dies rather
+    than needing a stale-lock reaper.
+
+    Fails closed: with no lock there is no reconciliation and no batch, because
+    either one performed unlocked can destroy the other's rollback evidence.
+
+    THE global lock order for route work: this lock, then ``_CONFIG_LOCK``,
+    then each profile's route lock, then the policy enrollment registry lock.
+    """
+    if _route_journal_lock_held():
+        _route_journal_lock_depth.value += 1
+        try:
+            yield
+        finally:
+            _route_journal_lock_depth.value -= 1
+        return
+    path = _route_batch_journal_path()
+    lock_path = path.with_name(path.name + ".lock")
+    handle = None
+    try:
+        if fcntl is None and msvcrt is None:  # pragma: no cover - exotic platform
+            raise RuntimeError("no OS file-locking primitive is available")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+b")
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        else:  # pragma: no cover - Windows-only path
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    except (OSError, RuntimeError) as exc:
+        if handle is not None:
+            handle.close()
+        raise RouteJournalUnreconciled(
+            "the multi-role model change journal could not be locked"
+        ) from exc
+    _route_journal_lock_depth.value = 1
+    try:
+        yield
+    finally:
+        _route_journal_lock_depth.value = 0
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            else:  # pragma: no cover - Windows-only path
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        handle.close()
+
+
+def assert_route_journal_reconciled() -> None:
+    """Refuse route work while this machine's journal is unreconciled."""
+    if _ROUTE_JOURNAL_BLOCKED is not None:
+        raise RouteJournalUnreconciled(_ROUTE_JOURNAL_BLOCKED)
+
+
+def _block_route_journal(reason: str) -> "RouteJournalUnreconciled":
+    global _ROUTE_JOURNAL_BLOCKED
+
+    _ROUTE_JOURNAL_BLOCKED = reason
+    logger.error("%s; model routing is blocked until it is reconciled", reason)
+    return RouteJournalUnreconciled(reason)
+
+
+def _clear_route_journal_block() -> None:
+    global _ROUTE_JOURNAL_BLOCKED
+
+    _ROUTE_JOURNAL_BLOCKED = None
+
+
+def _write_route_batch_journal(
+    snapshots: "Dict[str, Optional[Tuple[str, int]]]",
+    paths: "Dict[str, Path]",
+) -> None:
+    """Journal the exact pre-batch state of every file, durably.
+
+    fsynced before the first mutation — including the directory entry, so the
+    journal is findable after a crash — because a journal that is not on disk
+    when the power goes is no journal at all.
+    """
+    _write_route_batch_journal_record({
+        "version": _ROUTE_BATCH_JOURNAL_VERSION,
+        "created_at": time.time(),
+        "phase": _ROUTE_BATCH_PREPARED,
+        "roles": [
+            {
+                "profile": profile,
+                "path": str(paths[profile]),
+                "text": None if snapshot is None else snapshot[0],
+                "mode": None if snapshot is None else snapshot[1],
+            }
+            for profile, snapshot in sorted(snapshots.items())
+        ],
+    })
+
+
+def _write_route_batch_journal_record(record: "Dict[str, Any]") -> None:
+    """Replace the journal with ``record``, atomically and durably.
+
+    Temp file in the same directory + fsync + ``os.replace`` + directory fsync,
+    so a crash or a short write during a PHASE transition leaves either the
+    whole previous record or the whole new one. Truncating the live journal in
+    place would have made an interrupted transition indistinguishable from a
+    corrupt journal — which is now fatal.
+    """
+    path = _route_batch_journal_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(tmp, flags, stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        written = os.write(fd, payload)
+        if written != len(payload):
+            raise OSError(
+                f"short route batch journal write: {written} of {len(payload)}"
+            )
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    else:
+        os.close(fd)
+    os.replace(tmp, path)
+    _fsync_directory(path.parent)
+
+
+def _read_route_batch_journal() -> "Optional[Dict[str, Any]]":
+    """Return the journal record, ``None`` when there is none, or fail closed."""
+    path = _route_batch_journal_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise _block_route_journal(
+            f"A multi-role model change journal exists at {path} but could not "
+            "be read, so the roles it names may be split across two routes"
+        ) from exc
+    try:
+        record = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise _block_route_journal(
+            f"A multi-role model change journal exists at {path} but is not "
+            "readable"
+        ) from exc
+    roles = record.get("roles") if isinstance(record, dict) else None
+    # A pre-phase (version 1) journal carries no phase. Such a batch could only
+    # ever have been interrupted BEFORE this build's audit commit marker
+    # existed, so it is uncommitted — the conservative reading, and the one that
+    # matches what the previous build promised for a failure.
+    phase = record.get("phase", _ROUTE_BATCH_PREPARED) if isinstance(record, dict) else None
+    if (
+        not isinstance(record, dict)
+        or not isinstance(roles, list)
+        or phase not in _ROUTE_BATCH_PHASES
+        or not all(
+            isinstance(role, dict)
+            and isinstance(role.get("path"), str)
+            and role["path"]
+            and (role.get("text") is None or isinstance(role.get("text"), str))
+            for role in roles
+        )
+    ):
+        raise _block_route_journal(
+            f"A multi-role model change journal exists at {path} but is not a "
+            "shape this build wrote"
+        )
+    record["phase"] = phase
+    return record
+
+
+def _advance_route_batch_journal(phase: str, **fields: Any) -> None:
+    """Record that this batch reached ``phase``, durably, under the lock."""
+    if not _route_journal_lock_held():
+        raise RouteJournalUnreconciled(
+            "a multi-role model change phase was recorded without the journal lock"
+        )
+    record = _read_route_batch_journal()
+    if record is None:
+        raise _block_route_journal(
+            "A multi-role model change reached "
+            f"{phase!r} with no journal to record it in"
+        )
+    record.update(fields)
+    record["phase"] = phase
+    try:
+        _write_route_batch_journal_record(record)
+    except OSError as exc:
+        raise _block_route_journal(
+            f"A multi-role model change could not record that it reached {phase!r}"
+        ) from exc
+
+
+def mark_route_batch_enrollment_written(snapshot: Optional[str]) -> None:
+    """Journal that policy enrollment landed, with its exact prior text.
+
+    The enrollment registry is the second live thing a batch mutates, and a
+    crash after it — but before the audit commit — has to put BOTH back. The
+    exact prior document text is therefore recorded here, next to the config
+    snapshots, so reconciliation restores the state that really was there
+    rather than a re-derived equivalent.
+    """
+    _advance_route_batch_journal(
+        _ROUTE_BATCH_ENROLLMENT_WRITTEN, enrollment={"text": snapshot},
+    )
+
+
+def mark_route_batch_audit_committed() -> None:
+    """Journal that the audit record is committed: this batch is COMMITTED.
+
+    The last durable act before retirement. From here on the operation may only
+    be rolled FORWARD — the log asserts (or may assert) these routes, and
+    reverting them would leave a committed audit record describing a state that
+    no longer exists.
+    """
+    _advance_route_batch_journal(_ROUTE_BATCH_AUDIT_COMMITTED)
+
+
+def _route_batch_journal_is_committed() -> bool:
+    record = _read_route_batch_journal()
+    return (
+        record is not None
+        and record["phase"] in _ROUTE_BATCH_COMMITTED_PHASES
+    )
+
+
+def _clear_route_batch_journal() -> None:
+    """Retire the journal, durably, once the batch owns its outcome.
+
+    Retirement failure is fatal (see :class:`RouteJournalUnreconciled`): a
+    journal that outlives its batch is read by the next start as an interrupted
+    one, and swallowing the failure is what let a committed batch's configs be
+    rolled back later while its audit record stood.
+    """
+    path = _route_batch_journal_path()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise _block_route_journal(
+            f"A finished multi-role model change's journal at {path} could not "
+            "be retired"
+        ) from exc
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def reconcile_profile_route_batch_journal() -> "List[str]":
+    """Reconcile any multi-role route change that never reached its own end.
+
+    Called at process start, and again — under the same machine-wide lock — by
+    every new batch, so a batch never layers on top of an unreconciled one.
+
+    A journal on disk means some process was between "about to write the first
+    live config" and "the whole operation is done", so the roles it names may be
+    split across two routes. Which way it is reconciled is decided by the
+    journal's own phase:
+
+    * uncommitted (``prepared`` / ``config-written`` / ``enrollment-written``)
+      — every recorded config, and the exact prior enrollment document if that
+      phase was reached, are put back. That is the only outcome the operation
+      ever promised for a failure.
+    * committed (``audit-committed``) — rolled FORWARD. Every write it owed had
+      landed and its audit record asserts them, so the journal is only retired.
+
+    Returns the profiles it put back (empty for a roll-forward). Raises
+    :class:`RouteJournalUnreconciled` when the journal cannot be read, cannot be
+    restored, or cannot be retired: that is unknown route authority, and every
+    route read and write in this process refuses until it is resolved.
+    """
+    with _route_batch_journal_lock():
+        record = _read_route_batch_journal()
+        if record is None:
+            _clear_route_journal_block()
+            return []
+        path = _route_batch_journal_path()
+        if record["phase"] in _ROUTE_BATCH_COMMITTED_PHASES:
+            _clear_route_batch_journal()
+            _clear_route_journal_block()
+            logger.warning(
+                "Rolled forward a committed multi-role model change that was "
+                "interrupted before its journal was retired",
+            )
+            return []
+        restored: List[str] = []
+        for role in record["roles"]:
+            target = str(role["path"])
+            text = role.get("text")
+            mode = role.get("mode")
+            snapshot = (
+                None if text is None
+                else (text, int(mode) if isinstance(mode, int) else 0o600)
+            )
+            if not _restore_config_snapshot(Path(target), snapshot):
+                raise _block_route_journal(
+                    f"A multi-role model change could not be undone for "
+                    f"{target}; its previous settings are still in {path}"
+                )
+            restored.append(str(role.get("profile") or target))
+        enrollment = record.get("enrollment")
+        if isinstance(enrollment, dict):
+            _restore_batch_enrollment(enrollment.get("text"), path)
+        _clear_route_batch_journal()
+        _clear_route_journal_block()
+        if restored:
+            logger.warning(
+                "Put back an interrupted multi-role model change for: %s",
+                ", ".join(restored),
+            )
+        return restored
+
+
+def _restore_batch_enrollment(snapshot: Any, path: Path) -> None:
+    """Put the policy enrollment registry back to its exact pre-batch text."""
+    if snapshot is not None and not isinstance(snapshot, str):
+        raise _block_route_journal(
+            f"A multi-role model change journal at {path} records an "
+            "unreadable previous enrollment"
+        )
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        EnrollmentUnavailable,
+        restore_enrollment,
+    )
+
+    try:
+        restore_enrollment(snapshot)
+    except EnrollmentUnavailable as exc:
+        raise _block_route_journal(
+            "A multi-role model change's previous policy enrollment could not "
+            f"be restored; it is still recorded in {path}"
+        ) from exc
+
+
+def apply_profile_route_batch(
+    changes: "List[Tuple[str, Any]]",
+    *,
+    apply_one,
+    after_write=None,
+) -> Dict[str, str]:
+    """Apply several profiles' route changes as one all-or-nothing operation.
+
+    ``changes`` is ``[(profile, payload), ...]``; ``apply_one(profile, payload)``
+    performs one profile's write and must be the ordinary guarded write path.
+
+    ``after_write(revisions)`` runs while every lock is STILL held, for the
+    mandatory steps that must succeed for the new routes to be legitimate —
+    policy enrollment and the strict audit record. It owns restoring anything
+    outside ``config.yaml`` that it changed before it raises; this function then
+    restores the configs, so a post-write failure leaves neither a live new
+    route nor a half-written registry.
+
+    Every profile's lock is acquired UP FRONT in a deterministic (sorted) order,
+    so two concurrent batches can never deadlock against each other and no
+    third writer can move a profile between the preflight and the write. Every
+    profile's exact raw ``config.yaml`` bytes and permission mode — or its
+    absence — are snapshotted before anything is written; if anything fails,
+    EVERY snapshot is restored in reverse order while all the locks
+    are STILL held — including the profile whose own ``apply_one`` raised, which
+    may already have written its file before failing. Returns
+    ``{profile: revision}`` on success.
+
+    Rollback that itself fails raises :class:`ProfileRouteBatchError` naming the
+    profile that could not be restored — a closed result, never a silent
+    partial success.
+    """
+    import contextlib
+
+    from hermes_cli.owner_workspace import profile_route_lock
+    from hermes_cli.profiles import get_profile_dir
+
+    assert_route_journal_reconciled()
+    ordered = sorted(changes, key=lambda item: item[0])
+    if len({profile for profile, _ in ordered}) != len(ordered):
+        raise ProfileRouteBatchError("a profile appears twice in one batch")
+
+    paths = {
+        profile: get_profile_dir(profile) / "config.yaml"
+        for profile, _ in ordered
+    }
+    revisions: Dict[str, str] = {}
+    with contextlib.ExitStack() as stack:
+        # The machine-wide journal lock is the OUTERMOST lock of the whole
+        # operation, and it is held through this batch's journal retirement.
+        # Reconciling before taking it let a second process restore — and then
+        # delete — the journal of a batch that was still actively writing.
+        stack.enter_context(_route_batch_journal_lock())
+        # An interrupted earlier batch is reconciled before a new one starts, so
+        # a batch never layers on top of a half-applied one, and never truncates
+        # the only record of what that one must be put back to.
+        reconcile_profile_route_batch_journal()
+        # ``_CONFIG_LOCK`` BEFORE every profile lock — the one global order
+        # (see :func:`profile_route_write`). Taking the profile locks first and
+        # only entering ``_CONFIG_LOCK`` inside ``apply_one`` inverted the order
+        # an ordinary single-profile writer uses, so a concurrent batch and
+        # single write deadlocked with no timeout and no recovery.
+        stack.enter_context(_CONFIG_LOCK)
+        for profile, _ in ordered:
+            stack.enter_context(profile_route_lock(profile))
+        # Register every path as already locked, so the per-profile write each
+        # ``apply_one`` performs joins THIS frame instead of trying to take the
+        # same kernel lock on a second descriptor — which would block against
+        # ourselves forever. Registered under the locks, released with them.
+        held = _ROUTE_LOCKS_HELD.get()
+        stack.callback(
+            _ROUTE_LOCKS_HELD.reset,
+            _ROUTE_LOCKS_HELD.set(
+                held | {str(path) for path in paths.values()}
+            ),
+        )
+        # Snapshot the exact contents (or absence) of every file first, so a
+        # rollback restores what was really there rather than a re-serialized
+        # equivalent. ``None`` IS the "there was no file" case; a file that was
+        # there is kept as its exact text together with its exact permission
+        # mode, because the mode is as much part of "what was there" as the
+        # bytes are.
+        snapshots: Dict[str, Optional[Tuple[str, int]]] = {}
+        for profile, _ in ordered:
+            path = paths[profile]
+            try:
+                snapshots[profile] = (
+                    (
+                        path.read_text(encoding="utf-8"),
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    if path.is_file()
+                    else None
+                )
+            except (OSError, UnicodeDecodeError) as exc:
+                raise ProfileRouteBatchError(
+                    "a role's current settings could not be read", profile
+                ) from exc
+
+        # Durable BEFORE the first live config is touched. In-process rollback
+        # only covers a raised exception; power loss or a SIGKILL between two
+        # files — or between the last file and the enrollment/audit half — has
+        # no in-process anything. The journal is what a later start reads to
+        # put the whole operation back.
+        try:
+            _write_route_batch_journal(snapshots, paths)
+        except OSError as exc:
+            raise ProfileRouteBatchError(
+                "this change could not be made safely to undo", None
+            ) from exc
+
+        attempted: List[str] = []
+        failure_profile: Optional[str] = None
+        try:
+            for profile, payload in ordered:
+                # Recorded BEFORE the call: a write-then-raise inside
+                # ``apply_one`` leaves this profile's file already changed, so
+                # it must be part of the rollback set even though it never
+                # returned a revision.
+                failure_profile = profile
+                attempted.append(profile)
+                revisions[profile] = apply_one(profile, payload)
+            failure_profile = None
+            _advance_route_batch_journal(_ROUTE_BATCH_CONFIG_WRITTEN)
+            if after_write is not None:
+                # Records the enrollment and audit-commit phases itself, as each
+                # becomes durable (``mark_route_batch_*`` above).
+                after_write(dict(revisions))
+        except Exception as exc:
+            if _route_batch_journal_is_committed():
+                # The audit record is committed: the log asserts these routes.
+                # Undoing them now would leave a durable claim of a change that
+                # no longer exists — the one outcome the two-phase record exists
+                # to prevent — so the batch is rolled FORWARD instead.
+                _clear_route_batch_journal()
+                raise
+            for profile in reversed(attempted):
+                if not _restore_config_snapshot(paths[profile], snapshots[profile]):
+                    # The journal stays: it is the only remaining record of
+                    # what this role must be put back to, and the next start
+                    # reads it.
+                    raise ProfileRouteBatchError(
+                        "a role's previous settings could not be restored", profile,
+                    ) from exc
+            _clear_route_batch_journal()
+            raise ProfileRouteBatchError(str(exc) or "rejected", failure_profile) from exc
+        # Every write this operation owed has landed and nothing left can
+        # revert it, so the journal is retired inside the locks — a reader that
+        # finds one after this point really is looking at an interrupted batch.
+        _clear_route_batch_journal()
+    return revisions
+
+
+def _restore_config_snapshot(
+    config_path: Path, snapshot: Optional[Tuple[str, int]]
+) -> bool:
+    """Put back the exact pre-batch state of one profile's config.yaml.
+
+    ``snapshot`` is ``None`` when there was no file — it is removed again — or
+    ``(text, mode)`` for a file that was there.
+
+    The bytes go back through ``atomic_write_text``: temp file + fsync +
+    ``atomic_replace``, so a managed deployment's symlinked ``config.yaml`` is
+    written through rather than detached, and ``preserve_mode`` carries the
+    POSIX owner across the replace instead of leaving mkstemp's. ``create_mode``
+    covers a file that has to be recreated, so it never lands as mkstemp's mode.
+    The mode is then set explicitly, because ``preserve_mode`` preserves the
+    mode the FAILED write left behind (``_secure_file``'s 0600), which is not
+    necessarily the mode the file had before the batch — a managed 0640, say.
+    Restoring the recorded mode is exact by construction and never loosens a
+    file beyond what it already was.
+
+    Returns False on any failure, so the caller fails the whole batch closed
+    naming this profile rather than reporting a silent partial restoration.
+    """
+    from utils import atomic_write_text
+
+    try:
+        if snapshot is None:
+            config_path.unlink(missing_ok=True)
+        else:
+            text, mode = snapshot
+            atomic_write_text(
+                config_path, text, preserve_mode=True, create_mode=mode
+            )
+            os.chmod(config_path, mode)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
-        _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+        _LAST_EXPANDED_CONFIG_BY_PATH.pop(str(config_path), None)
+        return True
+    except OSError:
+        return False
+
+
+def _write_user_config_guarded(
+    config_path: Path, user_config: Dict[str, Any]
+) -> None:
+    """Persist a whole raw user config document through the route boundary.
+
+    Used by the ``hermes config set`` / ``unset`` round trip, which already
+    holds the document it wants on disk. Same guarantees as
+    :func:`save_shared_config_key`, without re-deriving the mutation.
+    """
+    from utils import atomic_yaml_write
+
+    governed = _profile_under_policy(_profile_for_config_path(config_path))
+    with _CONFIG_LOCK:
+        with profile_route_write(config_path, governed=governed) as governed:
+            before = read_user_config_raw(config_path)
+            _guard_model_route_change(
+                config_path,
+                _normalize_root_model_keys(_normalize_max_turns_config(before or {})),
+                _normalize_root_model_keys(_normalize_max_turns_config(user_config)),
+                governed=governed,
+            )
+            atomic_yaml_write(config_path, user_config, sort_keys=False)
+            _RAW_CONFIG_CACHE.pop(str(config_path), None)
+
+
+def save_shared_config_key(
+    config_path: Path, key_path: str, value: Any, *, round_trip: bool = False
+) -> None:
+    """Write one dotted key into a profile's ``config.yaml`` through the guard.
+
+    The single entry point for every surface that persists an individual
+    setting outside :func:`save_config` — ``hermes config set``, ``/model``,
+    ``/reasoning``, ``/fast``, the TUI and the runtime persistence helper —
+    so a route-affecting key from ANY of them lands under the same lock,
+    policy validation and owner-work fence as a full save. Unrelated keys are
+    unaffected: the guard only validates and fences when the write actually
+    moves the profile's effective route, and only for an enrolled profile.
+
+    ``round_trip`` preserves the user's comments, ordering and quoting (the
+    ``/model`` and TUI persistence behaviour); the default writes the
+    normalized document ``atomic_config_write`` produces.
+    """
+    from utils import atomic_roundtrip_yaml_update
+
+    governed = _profile_under_policy(_profile_for_config_path(config_path))
+    with _CONFIG_LOCK:
+        with profile_route_write(config_path, governed=governed) as governed:
+            before = read_user_config_raw(config_path)
+            after = copy.deepcopy(before)
+            _set_nested(after, key_path, value)
+            _guard_model_route_change(
+                config_path,
+                _normalize_root_model_keys(_normalize_max_turns_config(before or {})),
+                _normalize_root_model_keys(_normalize_max_turns_config(after)),
+                governed=governed,
+            )
+            if round_trip:
+                atomic_roundtrip_yaml_update(config_path, key_path, value)
+            else:
+                atomic_config_write(config_path, after)
+            _RAW_CONFIG_CACHE.pop(str(config_path), None)
+
+
+def _profile_is_admitted(profile: str) -> bool:
+    """Whether this profile id is one the Raphael policy is allowed to govern.
+
+    Only an admitted id can ever be enrolled, so this is the exact set for
+    which "is it enrolled?" must be answered under the route lock rather than
+    before it. Every other profile is permanently outside the policy.
+    """
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        admitted_profile_ids,
+    )
+
+    return str(profile or "").strip() in admitted_profile_ids()
+
+
+def _profile_under_policy(profile: str) -> bool:
+    """Whether this profile is explicitly enrolled into Raphael policy.
+
+    Fails closed: an enrollment record that exists but cannot be read is not
+    evidence that nothing is governed, so the write is refused.
+    """
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        EnrollmentUnavailable,
+        is_profile_enrolled,
+    )
+
+    try:
+        return is_profile_enrolled(profile)
+    except EnrollmentUnavailable as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def _guard_model_route_change(
+    config_path: Path,
+    before: Optional[Dict[str, Any]],
+    after: Optional[Dict[str, Any]],
+    *,
+    governed: bool,
+) -> None:
+    """Validate and fence a route change on an enrolled profile.
+
+    Called from inside :func:`profile_route_write`, so the decision is made
+    against state that cannot move under it. A no-op — and free of the policy
+    import entirely — when the profile is not enrolled or the write does not
+    actually move the effective route or fallback policy, so ordinary config
+    writes keep their current cost and behaviour.
+    """
+    if not governed:
+        return
+    if model_route_fingerprint(before or {}) == model_route_fingerprint(after or {}):
+        return
+    from hermes_cli.profiles import profile_name_for_home
+
+    profile = profile_name_for_home(config_path.parent)
+    _assert_admitted_model_route(profile, after)
+    from hermes_cli.owner_workspace import fence_effective_task_routes
+
+    fence_effective_task_routes(profile)
+
+
+def _assert_admitted_model_route(
+    profile: str, config: Optional[Dict[str, Any]]
+) -> None:
+    """Reject a base route this profile's canonical policy does not admit.
+
+    Base profile configs are validated with ``validate_assignment`` — the
+    role's ONE admitted base assignment — never with the task-runtime check:
+    a deep task lane is authority for a task pin, not for the role's own
+    configured route, and accepting it here would erase the routine/deep
+    separation. Raises ``ValueError`` when the effective route is not that
+    exact assignment, or when it still allows any fallback.
+    """
+    from plugins.dashboard_auth.raphael_workspace.model_policy import (
+        validate_assignment,
+    )
+
+    provider, model, effort, fallbacks_disabled = model_route_fingerprint(config)
+    validate_assignment(
+        profile, provider, model, effort, disable_fallbacks=fallbacks_disabled,
+    )
 
 
 def _parse_env_value(raw_value: str) -> str:
@@ -5438,11 +6467,13 @@ def set_config_value(key: str, value: str, force: bool = False):
         user_config = _normalize_root_model_keys(user_config)
         key = "model.base_url"
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
-    # Write only user config back (not the full merged defaults)
+    # Write only user config back (not the full merged defaults), through the
+    # shared route boundary: `config set model.default ...` is a route change
+    # like any other and must not bypass the lock, the policy check or the
+    # owner-work fence that the API and setup paths go through.
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
-    
+    _write_user_config_guarded(config_path, user_config)
+
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
     env_var = terminal_config_env_var_for_key(key)
@@ -5568,8 +6599,7 @@ def unset_config_value(key: str):
         sys.exit(1)
 
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    _write_user_config_guarded(config_path, user_config)
     print(f"✓ Unset {key} from {config_path}")
 
 

@@ -116,5 +116,115 @@ def test_decompose_children_inherit_root_project_id(kanban_home):
         ]
 
 
+def test_decompose_locks_each_preapproved_model_route(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="ship a complex feature")
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="default",
+            children=[{
+                "title": "build the feature",
+                "assignee": "raphael-claude-worker",
+                "execution_tier": "deep",
+                "model_override": "claude-opus-5",
+                "provider_override": "anthropic",
+                "reasoning_effort": "max",
+                "model_policy_lock": kb.mint_policy_lock(
+                    "raphael-claude-worker", "anthropic", "claude-opus-5",
+                    "max", "deep",
+                ),
+            }],
+            author="raphael",
+        )
+
+        assert child_ids is not None
+        child = kb.get_task(conn, child_ids[0])
+        created = next(
+            event for event in kb.list_events(conn, child.id)
+            if event.kind == "created"
+        )
+
+        assert child.model_override == "claude-opus-5"
+        assert child.provider_override == "anthropic"
+        assert child.reasoning_effort == "max"
+        assert child.execution_tier == "deep"
+        assert child.model_policy_lock == kb.mint_policy_lock(
+            "raphael-claude-worker", "anthropic", "claude-opus-5", "max", "deep",
+        )
+        assert kb.task_policy_lock_error(
+            kb.connect().execute(
+                "SELECT * FROM tasks WHERE id = ?", (child.id,)
+            ).fetchone()
+        ) is None
+        assert created.payload["execution_tier"] == "deep"
+        assert created.payload["model_route_pinned"] is True
+
+        # The lock is the whole point: no route mutator may move it.
+        with pytest.raises(RuntimeError, match="owner-governed"):
+            kb.set_model_override(conn, child.id, "claude-sonnet-5", provider="anthropic")
+        with pytest.raises(RuntimeError, match="owner-governed"):
+            kb.set_reasoning_effort(conn, child.id, "high")
+
+        reread = kb.get_task(conn, child.id)
+        assert (reread.model_override, reread.reasoning_effort) == (
+            "claude-opus-5",
+            "max",
+        )
+
+
+def test_decompose_rejects_a_forbidden_locked_route(kanban_home):
+    # A forbidden route cannot even be minted into a lock...
+    with pytest.raises(ValueError, match="forbidden model"):
+        kb.mint_policy_lock(
+            "raphael-claude-worker", "anthropic", "claude-fable-5", "max", "deep",
+        )
+    with pytest.raises(ValueError, match="forbidden reasoning effort"):
+        kb.mint_policy_lock(
+            "raphael-claude-worker", "anthropic", "claude-opus-5", "ultra", "deep",
+        )
+    # ...and a hand-written authority string never authorizes one either.
+    real = kb.mint_policy_lock(
+        "raphael-claude-worker", "anthropic", "claude-opus-5", "max", "deep",
+    )
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="ship a complex feature")
+        for model, effort, expected in (
+            ("claude-fable-5", "max", "forbidden model"),
+            ("claude-opus-5", "ultra", "forbidden reasoning effort"),
+            ("claude-sonnet-5", "max", "not the admitted route"),
+        ):
+            with pytest.raises(ValueError, match=expected):
+                kb.decompose_triage_task(
+                    conn,
+                    tid,
+                    root_assignee="default",
+                    children=[{
+                        "title": "build the feature",
+                        "assignee": "raphael-claude-worker",
+                        "execution_tier": "deep",
+                        "model_override": model,
+                        "provider_override": "anthropic",
+                        "reasoning_effort": effort,
+                        "model_policy_lock": real,
+                    }],
+                    author="raphael",
+                )
+
+
+def test_unlocked_manual_task_routes_stay_mutable(kanban_home):
+    """The lock must not leak onto ordinary Kanban work."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="manual card", assignee="engineer")
+        assert kb.get_task(conn, tid).model_policy_lock is None
+        assert kb.set_model_override(conn, tid, "claude-fable-5", provider="anthropic")
+        assert kb.set_reasoning_effort(conn, tid, "ultra")
+
+        task = kb.get_task(conn, tid)
+        assert (task.model_override, task.reasoning_effort) == (
+            "claude-fable-5",
+            "ultra",
+        )
+
 
 

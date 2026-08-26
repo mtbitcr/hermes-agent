@@ -6957,7 +6957,19 @@ async def get_model_options(
         )
 
         if model_machine_request(request):
-            result = project_options_payload(result)
+            # The route revision travels with the projection so a caller that
+            # selects across several roles can write conditionally against
+            # exactly the state it read.
+            from hermes_cli.web_routers.profiles import _profile_route_revision
+            from hermes_cli.profiles import get_profile_dir
+
+            result = project_options_payload(
+                result,
+                profile=scoped_profile,
+                revision=await run_in_threadpool(
+                    _profile_route_revision, get_profile_dir(scoped_profile)
+                ),
+            )
         audit_models_machine_success(
             request, action="options", profile=scoped_profile
         )
@@ -14720,7 +14732,8 @@ def _write_profile_model(
     *,
     reasoning_effort: Optional[str] = None,
     disable_fallbacks: bool = False,
-) -> None:
+    expected_revision: Optional[str] = None,
+) -> Optional[str]:
     """Write the main model assignment into a specific profile's config.yaml.
 
     Scopes ``load_config``/``save_config`` to ``profile_dir`` via the
@@ -14728,6 +14741,13 @@ def _write_profile_model(
     profile's config rather than the dashboard process's active profile.
     Clears any stale ``base_url`` / ``context_length`` the same way
     ``POST /api/model/set`` does, since the new model may differ.
+
+    ``expected_revision`` makes the write a compare-and-swap on this profile's
+    model-route revision; the revision after the write is returned, computed
+    while ``save_config`` still holds the profile's route lock. It is passed
+    only when a caller actually stated one, so the ordinary write keeps the
+    single-positional-argument ``save_config(cfg)`` call shape every other
+    profile writer uses.
     """
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
@@ -14750,7 +14770,9 @@ def _write_profile_model(
         if disable_fallbacks:
             cfg["fallback_providers"] = []
             cfg.pop("fallback_model", None)
-        save_config(cfg)
+        if expected_revision is None:
+            return save_config(cfg)
+        return save_config(cfg, expected_revision=expected_revision)
     finally:
         reset_hermes_home_override(token)
 

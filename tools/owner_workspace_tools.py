@@ -29,6 +29,20 @@ def _ok(result: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+# The planner classifies risk only; the kernel resolves the exact provider,
+# model and effort from the role's current native setting and pins them on
+# the task before it can run.
+_EXECUTION_TIER = {
+    "type": "string",
+    "enum": ["routine", "deep"],
+    "description": (
+        "Required task class: 'deep' for architecture, multi-system change, "
+        "migration, security-sensitive or ambiguous work; 'routine' for "
+        "bounded, localized, reversible work. Never a model or provider."
+    ),
+}
+
+
 def _handle_bootstrap(args: dict, **kw) -> str:
     try:
         ctx = resolve_owner_context()
@@ -96,7 +110,6 @@ def _handle_project_plan(args: dict, **kw) -> str:
             ctx,
             idempotency_key=args.get("idempotency_key"),
             project_id=args.get("project_id"),
-            anchor_task_id=args.get("anchor_task_id"),
             trigger=args.get("trigger"),
             request_title=args.get("request_title"),
             summary=args.get("summary"),
@@ -329,6 +342,7 @@ registry.register(
                                     "this is not the runtime profile."
                                 ),
                             },
+                            "execution_tier": _EXECUTION_TIER,
                             "parents": {
                                 "type": "array",
                                 "items": {"type": "integer", "minimum": 0},
@@ -336,7 +350,8 @@ registry.register(
                             },
                         },
                         "required": [
-                            "title", "body", "assignee", "responsibility", "parents",
+                            "title", "body", "assignee", "responsibility",
+                            "execution_tier", "parents",
                         ],
                     },
                 },
@@ -385,8 +400,9 @@ _PROJECT_TASK_SPEC = {
             "type": "string",
             "description": "Stable logical responsibility; separate from the runtime profile.",
         },
+        "execution_tier": _EXECUTION_TIER,
     },
-    "required": ["title", "body", "assignee", "responsibility"],
+    "required": ["title", "body", "assignee", "responsibility", "execution_tier"],
 }
 
 _PROJECT_REPLACEMENT_SPEC = {
@@ -399,7 +415,9 @@ _PROJECT_REPLACEMENT_SPEC = {
             "items": {"type": "integer", "minimum": 0},
         },
     },
-    "required": ["title", "body", "assignee", "responsibility", "parents"],
+    "required": [
+        "title", "body", "assignee", "responsibility", "execution_tier", "parents",
+    ],
 }
 
 
@@ -422,7 +440,6 @@ registry.register(
             "properties": {
                 "idempotency_key": {"type": "string"},
                 "project_id": {"type": "string"},
-                "anchor_task_id": {"type": "string"},
                 "trigger": {
                     "type": "string",
                     "enum": [
@@ -466,7 +483,7 @@ registry.register(
                                 },
                                 "required": [
                                     "action", "reason", "title", "body", "assignee", "responsibility",
-                                    "existing_parents", "new_parents",
+                                    "execution_tier", "existing_parents", "new_parents",
                                 ],
                             },
                             {
@@ -527,7 +544,7 @@ registry.register(
                 },
             },
             "required": [
-                "idempotency_key", "project_id", "anchor_task_id", "trigger",
+                "idempotency_key", "project_id", "trigger",
                 "request_title", "summary", "specification", "current_milestone",
                 "owner_visible_result", "later_milestones", "changes",
             ],

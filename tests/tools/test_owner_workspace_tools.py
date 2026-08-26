@@ -102,7 +102,7 @@ _ALLOWED_PARAM_NAMES = {
     "body", "mode", "project_name", "project_description", "project_id",
     "request_title", "specification", "current_milestone",
     "owner_visible_result", "root_assignee", "tasks", "later_milestones",
-    "anchor_task_id", "trigger", "summary", "changes", "action",
+    "trigger", "summary", "changes", "action",
 }
 
 
@@ -140,8 +140,32 @@ class TestSchemas:
         assert tasks["maxItems"] == 12
         assert tasks["items"]["additionalProperties"] is False
         assert set(tasks["items"]["required"]) == {
-            "title", "body", "assignee", "responsibility", "parents",
+            "title", "body", "assignee", "responsibility", "execution_tier",
+            "parents",
         }
+        assert tasks["items"]["properties"]["execution_tier"]["enum"] == [
+            "routine", "deep",
+        ]
+
+    def test_every_created_task_schema_requires_an_admitted_execution_tier(self):
+        """No closed planner schema may leave the task class optional."""
+        changes = registry.get_entry(
+            "owner_project_plan_commit"
+        ).schema["parameters"]["properties"]["changes"]["items"]["oneOf"]
+        add, split, merge = changes[0], changes[1], changes[2]
+
+        specs = [
+            add,
+            split["properties"]["replacements"]["items"],
+            merge["properties"]["replacement"],
+        ]
+        for spec in specs:
+            assert "execution_tier" in spec["required"]
+            assert spec["properties"]["execution_tier"]["enum"] == ["routine", "deep"]
+            # The planner classifies risk; it never names a runtime route.
+            assert not {"model", "provider", "reasoning_effort"} & set(
+                spec["properties"]
+            )
 
     def test_task_move_requires_full_cas_precondition(self):
         entry = registry.get_entry("owner_task_move")
@@ -159,11 +183,14 @@ class TestSchemas:
         entry = registry.get_entry("owner_project_plan_commit")
         params = entry.schema["parameters"]
         assert params["additionalProperties"] is False
+        # No caller-named anchor: the Project's hidden control row is resolved
+        # inside the kernel from its committed receipt.
         assert set(params["required"]) == {
-            "idempotency_key", "project_id", "anchor_task_id", "trigger",
+            "idempotency_key", "project_id", "trigger",
             "request_title", "summary", "specification", "current_milestone",
             "owner_visible_result", "later_milestones", "changes",
         }
+        assert "anchor_task_id" not in params["properties"]
         assert params["properties"]["changes"]["maxItems"] == 12
         assert len(params["properties"]["changes"]["items"]["oneOf"]) == 5
 
@@ -269,7 +296,7 @@ class TestTrustedContextResolution:
         kernel = _RecordingKernel()
         monkeypatch.setattr(owt._kernel, "commit_project_plan", kernel)
         owt._handle_project_plan({
-            "idempotency_key": "p1", "project_id": "project", "anchor_task_id": "anchor",
+            "idempotency_key": "p1", "project_id": "project",
             "trigger": "owner_request", "request_title": "Adapt", "summary": "Summary",
             "specification": "Spec", "current_milestone": "Now",
             "owner_visible_result": "Visible", "later_milestones": [], "changes": [],
@@ -407,7 +434,7 @@ class TestFieldDelegation:
         kernel = _RecordingKernel()
         monkeypatch.setattr(owt._kernel, "commit_project_plan", kernel)
         args = {
-            "idempotency_key": "p1", "project_id": "project", "anchor_task_id": "anchor",
+            "idempotency_key": "p1", "project_id": "project",
             "trigger": "owner_request", "request_title": "Adapt", "summary": "Summary",
             "specification": "Spec", "current_milestone": "Now",
             "owner_visible_result": "Visible", "later_milestones": [],

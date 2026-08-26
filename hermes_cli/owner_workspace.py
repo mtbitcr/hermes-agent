@@ -69,6 +69,7 @@ Security contract enforced HERE (not at the tool layer):
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import hashlib
 import json
@@ -88,7 +89,10 @@ from typing import Any, Optional
 from hermes_cli import kanban_db, projects_db
 from hermes_cli.sqlite_util import write_txn
 from plugins.dashboard_auth.raphael_workspace.model_policy import (
-    validate_assignment as validate_raphael_model_assignment,
+    configured_assignment_for,
+    normalize_execution_tier,
+    resolve_task_assignment,
+    validate_runtime_assignment as validate_raphael_model_assignment,
 )
 
 # fcntl is Unix-only; on Windows msvcrt provides the equivalent kernel file
@@ -291,6 +295,61 @@ def _get_receipt(conn: sqlite3.Connection, ctx: OwnerContext, key: str) -> Optio
     ).fetchone()
 
 
+# The identifier each committed receipt's own operation MUST record. A
+# committed receipt is durable authority: the operations that create a Project
+# always write its id, so a committed row of one of those operations without a
+# usable ``project_id`` is unreadable authority, never "this receipt owns no
+# Project". Operations absent from this map are still required to record
+# ``ok: True`` — that is the fact "committed" means.
+_OWNER_RECEIPT_REQUIRED_IDENTIFIERS: dict[str, tuple[str, ...]] = {
+    "owner_workspace_bootstrap": ("project_id",),
+    "owner_task_graph_commit": ("project_id",),
+}
+
+
+class OwnerReceiptUnreadable(Exception):
+    """One committed receipt could not be read as the authority it claims to be.
+
+    Deliberately its own type rather than a ``None``/``False`` return: every
+    caller that reads committed receipts is answering a question about
+    authority, and "the authority is unreadable" is a third answer alongside
+    "absent" and "present". Collapsing it into either of the other two is what
+    turned an unreadable Project record into an authoritative empty Project
+    list, an unreadable ownership row into a 404, and an unreadable native
+    receipt into "the mutation did not commit" — which puts an external effect
+    back on the retry path.
+    """
+
+
+def decode_committed_owner_receipt(result_json: Any, operation: str) -> dict:
+    """Strictly decode ONE committed receipt's result, or fail closed.
+
+    The single validator every committed-receipt reader uses — the Project
+    projection, the Project ownership check, and native crash recovery — so
+    "which receipts are believable" is one rule rather than three that drift.
+    Raises :class:`OwnerReceiptUnreadable` for anything that is not a JSON
+    object recording ``ok: True`` plus the non-empty identifiers this exact
+    operation must carry.
+    """
+    if not isinstance(result_json, str) or not result_json:
+        raise OwnerReceiptUnreadable("a committed receipt has no readable result")
+    try:
+        result = json.loads(result_json)
+    except (TypeError, ValueError) as exc:
+        raise OwnerReceiptUnreadable(
+            "a committed receipt could not be read"
+        ) from exc
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise OwnerReceiptUnreadable("a committed receipt does not record success")
+    for field in _OWNER_RECEIPT_REQUIRED_IDENTIFIERS.get(operation, ()):
+        value = result.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise OwnerReceiptUnreadable(
+                f"a committed {operation} receipt records no usable {field}"
+            )
+    return result
+
+
 def _receipt_authority_digest(
     ctx: OwnerContext, key: str, operation: str,
 ) -> Optional[str]:
@@ -351,6 +410,15 @@ def read_committed_owner_run_receipt(
     run terminal is stored. Recovery is allowed only when the trusted profile,
     idempotency key, operation, and authority digest all match the receipt
     written by that exact run.
+
+    Three distinct answers, never two. ``None`` means this exact run committed
+    NOTHING — the only state in which its work may be reported failed and its
+    proposal released. A dict is the exact committed receipt. Anything else —
+    more than one matching committed row, or a row whose result cannot be read
+    as a successful receipt — raises :class:`OwnerReceiptUnreadable`, because
+    it is uncertainty about an EXTERNAL effect: answering "absent" there put a
+    committed change back on the retry path and let a completed change be
+    reported to the owner as failed.
     """
     if (
         not isinstance(profile, str)
@@ -375,13 +443,13 @@ def read_committed_owner_run_receipt(
                 operation, authority_digest,
             ),
         ).fetchall()
+        if not rows:
+            return None
         if len(rows) != 1:
-            return None
-        try:
-            result = json.loads(rows[0]["result_json"])
-        except (TypeError, ValueError):
-            return None
-        return result if isinstance(result, dict) and result.get("ok") is True else None
+            raise OwnerReceiptUnreadable(
+                "more than one committed receipt claims this exact native run"
+            )
+        return decode_committed_owner_receipt(rows[0]["result_json"], operation)
     finally:
         conn.close()
 
@@ -651,13 +719,26 @@ def _global_board_guard(board_slug: str):
     gets :class:`OwnerWorkspaceError` and performs no board mutation at all.
     """
     slug = kanban_db._normalize_board_slug(board_slug) or kanban_db.DEFAULT_BOARD
+    with _global_guard(f"board-{slug}", label="global board ownership"):
+        yield
+
+
+@contextmanager
+def _global_guard(lock_name: str, *, label: str):
+    """Hold one exclusive, kernel-held file lock under the shared lock root.
+
+    The shared primitive behind :func:`_global_board_guard` and
+    :func:`profile_route_lock`: both need to order unrelated PROCESSES
+    (dashboard, CLI, workers, other profiles) around a resource that is not
+    itself a single database row, and both must fail closed when they cannot.
+    """
     fd = None
     try:
         if fcntl is None and msvcrt is None:  # pragma: no cover - exotic platform
             raise RuntimeError("no OS file-locking primitive is available")
         lock_dir = kanban_db.kanban_home() / "kanban" / "locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = lock_dir / f"board-{slug}.lock"
+        lock_path = lock_dir / f"{lock_name}.lock"
         if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
             lock_path.write_text(" ", encoding="utf-8")
         fd = open(lock_path, "r+" if msvcrt else "a+", encoding="utf-8")
@@ -675,7 +756,7 @@ def _global_board_guard(board_slug: str):
             fd.close()
         raise OwnerWorkspaceError(
             "ownership_guard_unavailable",
-            f"could not acquire the global board ownership guard for {slug!r}: {exc}",
+            f"could not acquire the {label} guard for {lock_name!r}: {exc}",
         ) from exc
 
     try:
@@ -871,16 +952,28 @@ def bootstrap(
                 # create_task's own idempotency_key dedupe (kanban_db.py)
                 # returns the existing task on replay instead of creating a
                 # second one.
+                # Non-executable by construction, and non-promotable too: this
+                # anchor carries no assignee, no execution tier and therefore no
+                # approved route, so it must never be dispatchable AND must
+                # never become dispatchable. ``task_kind='control'`` is what
+                # makes that structural rather than a matter of which column it
+                # sits in: generic specify/decompose, the dispatcher's ready
+                # queue, the claim paths and the default-assignee adoption all
+                # positively require ``task_kind = 'work'``, so none of them can
+                # see this row. Only owner-approved graph creation makes
+                # executable tasks, and those carry exact route authority.
                 task_id = kanban_db.create_task(
                     kconn,
                     title=name,
                     body=description,
                     created_by=ctx.actor,
+                    triage=True,
+                    control=True,
                     board=board_slug,
                     project_id=project_id,
                     idempotency_key=task_idempotency_key,
                 )
-                task = kanban_db.get_task(kconn, task_id)
+                task = kanban_db.get_control_task(kconn, task_id)
                 if task is None:
                     raise OwnerWorkspaceError(
                         "crash_recovery_failed", f"created/adopted task_id {task_id!r} does not resolve",
@@ -899,6 +992,8 @@ def bootstrap(
                     task.title != name
                     or (task.body or None) != (description or None)
                     or task.idempotency_key != task_idempotency_key
+                    or task.assignee is not None
+                    or task.status != "triage"
                 ):
                     raise OwnerWorkspaceError(
                         "crash_recovery_failed",
@@ -940,6 +1035,55 @@ def _bounded_text(value: Any, field: str, *, limit: int, required: bool = True) 
     return text
 
 
+def _pinned_route_fields(assignee: str, execution_tier: str, route: Any) -> dict:
+    """Return the durable, owner-approved route pin for one new task.
+
+    The planner only ever supplies the semantic tier; every model, provider
+    and effort here comes from the Raphael model policy resolved against the
+    role's current native setting. ``model_policy_lock`` is a versioned,
+    digest-bound authority over the whole (assignee, provider, model, effort,
+    tier) tuple, so none of them can move under the task afterwards.
+    """
+    try:
+        lock = kanban_db.mint_policy_lock(
+            assignee,
+            route.provider,
+            route.model,
+            route.reasoning_effort,
+            execution_tier,
+        )
+    except ValueError as exc:
+        raise OwnerWorkspaceError("invalid_model_route", str(exc)) from exc
+    return {
+        "execution_tier": execution_tier,
+        "model_override": route.model,
+        "provider_override": route.provider,
+        "reasoning_effort": route.reasoning_effort,
+        "model_policy_lock": lock,
+    }
+
+
+def _resolved_route_pin(assignee: str, execution_tier: Any, field: str) -> dict:
+    """Resolve and pin one role's approved route for a semantic task class."""
+    try:
+        tier = normalize_execution_tier(execution_tier)
+        route = resolve_task_assignment(assignee, tier)
+    except (ValueError, OSError) as exc:
+        raise OwnerWorkspaceError("invalid_model_route", f"{field}: {exc}") from exc
+    return _pinned_route_fields(assignee, tier, route)
+
+
+def _graph_root_route(tasks: list[dict], root_assignee: str) -> dict:
+    """Resolve the pin for the executable root that reviews this milestone.
+
+    The root is not a planner-classified task — it wakes up to judge the whole
+    milestone once its children are done — so its tier is derived, not
+    supplied: reviewing a milestone that contains deep work is itself deep.
+    """
+    tier = "deep" if any(task["execution_tier"] == "deep" for task in tasks) else "routine"
+    return _resolved_route_pin(root_assignee, tier, "root_assignee")
+
+
 def _normalize_graph_tasks(tasks: Any) -> list[dict]:
     """Validate one executable milestone, never a fake whole-project backlog."""
     if not isinstance(tasks, list) or not tasks:
@@ -979,6 +1123,10 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
                 f"tasks[{index}].assignee names an unavailable profile: {assignee!r}",
             )
 
+        route_pin = _resolved_route_pin(
+            assignee, raw.get("execution_tier"), f"tasks[{index}].execution_tier",
+        )
+
         parents = raw.get("parents", [])
         if not isinstance(parents, list):
             raise OwnerWorkspaceError(
@@ -1005,6 +1153,7 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
             "assignee": assignee,
             "responsibility": responsibility,
             "parents": clean_parents,
+            **route_pin,
         })
 
     # Reject the whole request before approval or persistence when sibling
@@ -1157,6 +1306,76 @@ def _ensure_graph_project_board(
     return project, board_slug
 
 
+def _ensure_project_control_anchor(
+    pconn: sqlite3.Connection,
+    kconn: sqlite3.Connection,
+    ctx: OwnerContext,
+    idempotency_key: str,
+    token: str,
+    *,
+    project_id: str,
+    board_slug: str,
+    name: Optional[str],
+    description: Optional[str],
+) -> str:
+    """Create/adopt the ONE hidden control anchor this Project is steered by.
+
+    Every later approved change to a Project is hung off its canonical control
+    anchor (:func:`_receipt_bound_control_anchor`), so a Project created
+    without one is permanently unable to accept another approved plan. The
+    anchor is therefore created in the SAME recoverable operation that creates
+    the Project, under the same lease fence, with a deterministic identity — a
+    crash-and-retry recomputes the same key and adopts the same row instead of
+    minting a second anchor.
+
+    It is a ``task_kind='control'`` row, never an executable bootstrap task:
+    it carries no assignee, no execution tier and therefore no approved route,
+    and every dispatch/claim/promote/assign query in ``kanban_db`` positively
+    requires ``task_kind = 'work'``. Owner-visible projections list work rows
+    only, so it never reaches the owner either.
+    """
+    anchor_key = "owanchor_" + _derive_id(ctx, idempotency_key, "project-anchor")
+    with write_txn(pconn):
+        _assert_owns_lease(pconn, ctx, idempotency_key, token)
+        existing = kconn.execute(
+            "SELECT id FROM tasks WHERE project_id = ? AND task_kind = 'control'",
+            (project_id,),
+        ).fetchall()
+        if len(existing) > 1:
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                "this Project already holds more than one control anchor",
+            )
+        anchor_id = kanban_db.create_task(
+            kconn,
+            title=name,
+            body=description,
+            created_by=ctx.actor,
+            triage=True,
+            control=True,
+            board=board_slug,
+            project_id=project_id,
+            idempotency_key=anchor_key,
+        )
+        if existing and str(existing[0]["id"]) != anchor_id:
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                "this Project's control anchor is not the one this receipt owns",
+            )
+        anchor = kanban_db.get_control_task(kconn, anchor_id)
+        if (
+            anchor is None
+            or anchor.project_id != project_id
+            or anchor.idempotency_key != anchor_key
+            or anchor.assignee is not None
+        ):
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                "the Project control anchor does not match this receipt",
+            )
+    return anchor_id
+
+
 def _committed_graph_children(
     kconn: sqlite3.Connection,
     *,
@@ -1253,6 +1472,7 @@ def commit_task_graph(
     )
     root_assignee = _normalize_graph_assignee(root_assignee, "root_assignee")
     normalized_tasks = _normalize_graph_tasks(tasks)
+    root_route = _graph_root_route(normalized_tasks, root_assignee)
     normalized_later = _normalize_later_milestones(later_milestones)
 
     if mode == "new":
@@ -1287,6 +1507,7 @@ def commit_task_graph(
         "current_milestone": current_milestone,
         "owner_visible_result": owner_visible_result,
         "root_assignee": root_assignee,
+        "root_route": root_route,
         "tasks": normalized_tasks,
         "later_milestones": normalized_later,
     }
@@ -1306,7 +1527,12 @@ def commit_task_graph(
             pconn, ctx, idempotency_key, operation, digest,
         )
         if state == "terminal":
-            return json.loads(row["result_json"])
+            # A crash between the terminal receipt and activation leaves work
+            # approved but parked. Replay finishes the same activation from the
+            # committed receipt — no owner confirmation, no duplicate tasks.
+            committed = json.loads(row["result_json"])
+            _activate_committed_owner_work(committed)
+            return committed
 
         approval = _confirm(
             ctx,
@@ -1358,17 +1584,47 @@ def commit_task_graph(
         root_key = "owgraph_" + _derive_id(ctx, idempotency_key, "graph-root")
         kconn = kanban_db.connect(board=board_slug)
         try:
+            # A graph-created Project gets its canonical control anchor in the
+            # same recoverable operation that creates it; without one, no later
+            # approved plan could ever be applied to it.
+            anchor_task_id = (
+                _ensure_project_control_anchor(
+                    pconn,
+                    kconn,
+                    ctx,
+                    idempotency_key,
+                    token,
+                    project_id=canonical_project_id,
+                    board_slug=board_slug,
+                    name=project_name,
+                    description=project_description,
+                )
+                if mode == "new"
+                else _receipt_bound_control_anchor(
+                    pconn, kconn, ctx, canonical_project_id,
+                )
+            )
             with write_txn(pconn):
                 _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                # The root's assignee is written HERE, not left to the later
+                # decompose flip: its lock binds the role, so the row must
+                # never exist carrying a route without the role it belongs to.
                 root_task_id = kanban_db.create_task(
                     kconn,
                     title=request_title,
                     body=root_body,
+                    assignee=root_assignee,
                     created_by=ctx.actor,
                     triage=True,
                     board=board_slug,
                     project_id=canonical_project_id,
                     idempotency_key=root_key,
+                    model_override=root_route["model_override"],
+                    provider_override=root_route["provider_override"],
+                    reasoning_effort=root_route["reasoning_effort"],
+                    execution_tier=root_route["execution_tier"],
+                    model_policy_lock=root_route["model_policy_lock"],
+                    receipt_owned=True,
                 )
                 root = kanban_db.get_task(kconn, root_task_id)
                 if (
@@ -1377,12 +1633,26 @@ def commit_task_graph(
                     or root.idempotency_key != root_key
                     or root.title != request_title
                     or root.body != root_body
+                    or root.assignee != root_assignee
+                    or root.model_policy_lock != root_route["model_policy_lock"]
+                    or root.model_override != root_route["model_override"]
+                    or root.provider_override != root_route["provider_override"]
+                    or root.reasoning_effort != root_route["reasoning_effort"]
+                    or root.execution_tier != root_route["execution_tier"]
                 ):
                     raise OwnerWorkspaceError(
                         "crash_recovery_failed",
                         "the task-graph root does not match the approved proposal",
                     )
 
+            # Deterministic from this receipt's own identity, so a replay that
+            # recovers already-committed children activates exactly the rows
+            # this receipt parked — never a task the owner postponed since.
+            graph_park_generation = kanban_db.park_generation(
+                actor=ctx.actor,
+                profile=ctx.profile,
+                idempotency_key=idempotency_key,
+            )
             with write_txn(pconn):
                 _assert_owns_lease(pconn, ctx, idempotency_key, token)
                 child_ids = _committed_graph_children(
@@ -1399,7 +1669,13 @@ def commit_task_graph(
                         root_assignee=root_assignee,
                         children=normalized_tasks,
                         author=ctx.actor,
-                        auto_promote=True,
+                        # Parked in the same insert and never auto-promoted:
+                        # the approved graph stays non-claimable until this
+                        # receipt's terminal result is durable.
+                        auto_promote=False,
+                        receipt_owned=True,
+                        parked=True,
+                        park_generation=graph_park_generation,
                         event_metadata={
                             "owner_task_graph_digest": digest,
                             "idempotency_key": idempotency_key,
@@ -1428,19 +1704,17 @@ def commit_task_graph(
                 "project_id": canonical_project_id,
                 "project_slug": project.slug,
                 "board": board_slug,
+                "anchor_task_id": anchor_task_id,
                 "root_task_id": root_task_id,
                 "root_status": root.status,
                 "task_ids": child_ids,
                 "task_statuses": [task.status for task in task_rows],
                 "task_count": len(child_ids),
+                "parked_task_ids": list(child_ids),
+                "park_generation": graph_park_generation,
             }
         finally:
             kconn.close()
-
-        # One milestone approval is the execution authority. Activation is
-        # idempotent and preserves an explicit owner pause, so a crash/retry
-        # cannot silently resume a Project the owner stopped.
-        _set_project_dispatch_state(board_slug, enabled=True)
 
         _update_progress(
             pconn, ctx, idempotency_key, token, task_id=root_task_id,
@@ -1448,27 +1722,100 @@ def commit_task_graph(
         _finalize_receipt(
             pconn, ctx, idempotency_key, token, status="committed", result=result,
         )
+        # Everything above is parked and non-claimable. Only now — with the
+        # terminal receipt durable — does the approved work become runnable, in
+        # one idempotent recoverable transition a replay can finish on its own.
+        _activate_committed_owner_work(result)
         return result
     finally:
         pconn.close()
 
 
+def _activate_committed_owner_work(result: Any) -> None:
+    """Make one committed owner approval's parked work runnable.
+
+    The single activation transition, driven entirely by the committed receipt
+    so a replay after a crash performs exactly the same one. Idempotent on both
+    halves: :func:`kanban_db.activate_owner_work` only moves rows still sitting
+    in the parked column, and the dispatch-state write preserves an explicit
+    owner pause. Never called before the terminal receipt is durable.
+
+    ``parked_dependents`` carries the work a plan's archives newly unblocked,
+    each with the exact column it must go back to, so releasing it is the same
+    receipt-driven transition rather than a readiness recompute that could have
+    run before this receipt existed.
+
+    ``park_generation`` is the receipt's own parking identity, and it is what
+    makes replay exact: the parked column is shared with work the owner
+    deliberately postponed, so a receipt with no recorded generation releases
+    NOTHING rather than matching on the column and un-postponing it.
+    """
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return
+    board_slug = str(result.get("board") or "").strip()
+    generation = str(result.get("park_generation") or "").strip()
+    if not board_slug:
+        return
+    parked = result.get("parked_task_ids")
+    task_ids = [
+        task_id for task_id in (parked if isinstance(parked, list) else [])
+        if isinstance(task_id, str)
+    ]
+    restore_statuses: dict[str, str] = {}
+    dependents = result.get("parked_dependents")
+    for entry in dependents if isinstance(dependents, list) else []:
+        if (
+            isinstance(entry, (list, tuple))
+            and len(entry) == 2
+            and isinstance(entry[0], str)
+            and isinstance(entry[1], str)
+        ):
+            task_ids.append(entry[0])
+            restore_statuses[entry[0]] = entry[1]
+    if task_ids and generation:
+        with contextlib.closing(kanban_db.connect(board=board_slug)) as kconn:
+            kanban_db.activate_owner_work(
+                kconn,
+                task_ids,
+                generation=generation,
+                restore_statuses=restore_statuses,
+            )
+    # One milestone approval is the execution authority. Activation is
+    # idempotent and preserves an explicit owner pause, so a crash/retry
+    # cannot silently resume a Project the owner stopped.
+    _set_project_dispatch_state(board_slug, enabled=True)
+
+
 def _receipt_owns_project(
     conn: sqlite3.Connection, ctx: OwnerContext, project_id: str,
 ) -> bool:
-    """Return whether this trusted owner has a committed Project receipt."""
+    """Return whether this trusted owner has a committed Project receipt.
+
+    Fails closed on unreadable authority. Swallowing a malformed committed
+    receipt and answering ``False`` turned "this Project's ownership cannot be
+    read" into "you do not own this Project" — a 404 on a Project that exists,
+    immediately before a mutation. Every candidate row therefore goes through
+    the one strict validator, and a row that cannot be read raises
+    ``snapshot_unavailable`` instead of being skipped.
+    """
     rows = conn.execute(
-        "SELECT result_json FROM owner_workspace_receipts "
+        "SELECT operation, result_json FROM owner_workspace_receipts "
         "WHERE actor = ? AND profile = ? AND status = 'committed' "
         "AND operation IN ('owner_workspace_bootstrap', 'owner_task_graph_commit')",
         (ctx.actor, ctx.profile),
     ).fetchall()
     for row in rows:
         try:
-            if json.loads(row["result_json"]).get("project_id") == project_id:
-                return True
-        except Exception:
-            continue
+            committed = decode_committed_owner_receipt(
+                row["result_json"], str(row["operation"]),
+            )
+        except OwnerReceiptUnreadable as exc:
+            raise OwnerWorkspaceError(
+                "snapshot_unavailable",
+                "the Project ownership record could not be read",
+            ) from exc
+        if committed["project_id"].strip() == project_id:
+            return True
     return False
 
 
@@ -1541,57 +1888,97 @@ def _project_lifecycle_revision(
 def list_committed_projects(
     ctx: OwnerContext, *, lifecycle_revision: bool = False,
 ) -> list[dict]:
-    """Read-only projection of projects proven by committed owner receipts."""
+    """Read-only projection of projects proven by committed owner receipts.
+
+    Empty means EMPTY. An absent ``projects.db`` is the only state that
+    projects as "there are no Projects yet"; a database that exists but cannot
+    be opened, is missing this projection's tables, holds a committed receipt
+    whose result cannot be read, names a Project that is not there, or names a
+    board whose ownership cannot be verified all raise ``snapshot_unavailable``.
+    Answering any of those with an empty list told the owner their Projects
+    were gone during an authority outage, and invited a caller to plan new work
+    as though nothing existed.
+    """
     path = projects_db.projects_db_path()
     if not path.is_file():
         return []
 
-    try:
-        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-    except sqlite3.Error:
-        return []
+    conn = _open_read_only_sqlite(path, label="projects.db")
 
     try:
-        tables = {
-            row["name"]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name IN ('projects', 'owner_workspace_receipts')"
-            )
-        }
-        if tables != {"projects", "owner_workspace_receipts"}:
-            return []
-        receipts = conn.execute(
-            "SELECT result_json FROM owner_workspace_receipts "
-            "WHERE actor = ? AND profile = ? AND status = 'committed' "
-            "AND operation IN ('owner_workspace_bootstrap', 'owner_task_graph_commit') "
-            "ORDER BY updated_at ASC",
-            (ctx.actor, ctx.profile),
-        ).fetchall()
+        try:
+            tables = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('projects', 'owner_workspace_receipts')"
+                )
+            }
+            if "owner_workspace_receipts" not in tables:
+                # The receipt table is created by the first owner operation
+                # (see ``_ensure_schema``), so its absence really is "no owner
+                # authority has ever been written here" — genuinely empty.
+                return []
+            if "projects" not in tables:
+                raise OwnerWorkspaceError(
+                    "snapshot_unavailable", "projects.db schema is unavailable"
+                )
+            receipts = conn.execute(
+                "SELECT operation, result_json FROM owner_workspace_receipts "
+                "WHERE actor = ? AND profile = ? AND status = 'committed' "
+                "AND operation IN ('owner_workspace_bootstrap', 'owner_task_graph_commit') "
+                "ORDER BY updated_at ASC",
+                (ctx.actor, ctx.profile),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise OwnerWorkspaceError(
+                "snapshot_unavailable", "the Project list could not be read"
+            ) from exc
 
         project_ids: list[str] = []
         for receipt in receipts:
+            # One strict validator, shared with the ownership check and native
+            # crash recovery. A committed receipt nobody can read — including
+            # one whose ``project_id`` is missing or empty — is not evidence of
+            # "no Project"; it is unreadable authority, and skipping it is what
+            # let corrupt authority become an authoritative empty Project list.
             try:
-                project_id = str(json.loads(receipt["result_json"]).get("project_id") or "")
-            except Exception:
-                continue
-            if project_id and project_id not in project_ids:
+                committed = decode_committed_owner_receipt(
+                    receipt["result_json"], str(receipt["operation"]),
+                )
+            except OwnerReceiptUnreadable as exc:
+                raise OwnerWorkspaceError(
+                    "snapshot_unavailable",
+                    "a committed Project record could not be read",
+                ) from exc
+            project_id = committed["project_id"].strip()
+            if project_id not in project_ids:
                 project_ids.append(project_id)
 
         projects: list[dict] = []
         for project_id in project_ids:
-            row = conn.execute(
-                "SELECT id, slug, name, description, board_slug, archived "
-                "FROM projects WHERE id = ?",
-                (project_id,),
-            ).fetchone()
+            try:
+                row = conn.execute(
+                    "SELECT id, slug, name, description, board_slug, archived "
+                    "FROM projects WHERE id = ?",
+                    (project_id,),
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise OwnerWorkspaceError(
+                    "snapshot_unavailable", "the Project could not be read"
+                ) from exc
             if row is None or not row["board_slug"]:
-                continue
+                raise OwnerWorkspaceError(
+                    "snapshot_unavailable",
+                    "a committed Project is not in projects.db",
+                )
             try:
                 _assert_board_ownership(row["board_slug"], project_id)
-            except OwnerWorkspaceError:
-                continue
+            except OwnerWorkspaceError as exc:
+                raise OwnerWorkspaceError(
+                    "snapshot_unavailable",
+                    "the Project board ownership could not be verified",
+                ) from exc
             projection = {
                 "project_id": row["id"],
                 "slug": row["slug"],
@@ -1612,6 +1999,379 @@ def list_committed_projects(
         return projects
     finally:
         conn.close()
+
+
+_OWNER_TASK_RECEIPT_OPERATIONS = (
+    "owner_workspace_bootstrap",
+    "owner_task_graph_commit",
+    "owner_project_plan_commit",
+)
+# The exact result keys under which each committed receipt records the tasks IT
+# owns. Nothing else is owner-kernel work: a card a human added to the same
+# board appears in no receipt and is deliberately left alone.
+_OWNER_TASK_RECEIPT_KEYS = (
+    "task_id",
+    "root_task_id",
+    "task_ids",
+    "created_task_ids",
+    "affected_task_ids",
+)
+# Which of those keys a SUCCESSFUL receipt of each operation must carry, per
+# operation. A committed successful receipt that cannot prove the work it owns
+# is not evidence of "no owner work" — it is an unreadable authority, so the
+# caller fails closed. An empty list is fine (a plan that only edited existing
+# tasks created none); a MISSING or malformed key is not.
+_OWNER_TASK_RECEIPT_REQUIRED_KEYS = {
+    "owner_workspace_bootstrap": ("task_id",),
+    "owner_task_graph_commit": ("root_task_id", "task_ids"),
+    "owner_project_plan_commit": ("created_task_ids", "affected_task_ids"),
+}
+# Explicit terminal non-success errors that legitimately own no tasks. Only
+# these may contribute nothing.
+_OWNER_RECEIPT_EMPTY_ERRORS = frozenset({"conflict", "noop", "no_op", "denied"})
+
+
+def owner_executor_home():
+    """The canonical owner-executor HERMES_HOME, ignoring any profile override.
+
+    Owner receipts are committed by the sole owner-facing coordinator under its
+    own ``projects.db``. A route change for a NAMED role scopes HERMES_HOME to
+    that role's profile home, so resolving the receipt store from the ambient
+    home would scan a different (usually empty) database and silently fence
+    nothing. ``get_profile_dir('default')`` resolves against the hermes root
+    rather than the context-local override, which is exactly the invariance
+    needed here.
+    """
+    from hermes_cli.profiles import get_profile_dir
+
+    return get_profile_dir("default")
+
+
+@contextlib.contextmanager
+def _owner_executor_scope():
+    """Scope reads to the canonical owner-executor store for this block."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(owner_executor_home()))
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _receipt_unreadable(detail: str) -> OwnerWorkspaceError:
+    return OwnerWorkspaceError("execution_state_busy", detail)
+
+
+def _owner_receipt_owned_ids(operation: str, result: Any) -> Optional[set[str]]:
+    """Return the task ids one committed receipt proves it owns.
+
+    ``None`` means "this receipt is an explicit terminal no-op/conflict and
+    owns nothing", which is the only legitimate way for a committed receipt to
+    contribute no tasks. Every other shape must prove, per operation, exactly
+    which work it created; anything that cannot raises, because treating it as
+    empty would let a settings change run over work it cannot see.
+    """
+    if not isinstance(result, dict) or "ok" not in result:
+        raise _receipt_unreadable(
+            "an owner work receipt does not record a readable result"
+        )
+    if result["ok"] is not True:
+        error = str(result.get("error") or "").strip().lower()
+        if result["ok"] is False and error in _OWNER_RECEIPT_EMPTY_ERRORS:
+            return None
+        raise _receipt_unreadable(
+            "an owner work receipt does not record a readable outcome"
+        )
+    required = _OWNER_TASK_RECEIPT_REQUIRED_KEYS.get(operation)
+    if required is None:
+        raise _receipt_unreadable(
+            "an owner work receipt names an operation with no known shape"
+        )
+    owned: set[str] = set()
+    for key in _OWNER_TASK_RECEIPT_KEYS:
+        if key not in result:
+            if key in required:
+                raise _receipt_unreadable(
+                    "an owner work receipt does not record the work it created"
+                )
+            continue
+        value = result[key]
+        if isinstance(value, str) and value.strip():
+            owned.add(value.strip())
+        elif isinstance(value, list) and all(
+            isinstance(item, str) and item.strip() for item in value
+        ):
+            owned.update(item.strip() for item in value)
+        else:
+            raise _receipt_unreadable(
+                "an owner work receipt records unreadable work identity"
+            )
+    return owned
+
+
+def _owner_receipt_task_ids() -> dict[str, set[str]]:
+    """Map board slug -> exact task ids proven created by committed receipts.
+
+    Derived from the durable receipts themselves rather than from any public
+    id or key prefix: a task belongs to the owner kernel only because a
+    committed receipt records having created it. Read from the canonical
+    owner-executor store (see :func:`owner_executor_home`), never from whatever
+    profile the caller happens to be scoped to.
+
+    Fails closed on every ambiguity — an unreadable store, a malformed
+    successful receipt, a receipt whose project cannot be resolved, and a
+    project whose board ownership cannot be proven all raise rather than
+    reporting "no owner work", because that answer would let a settings change
+    proceed over work it cannot see.
+    """
+    with _owner_executor_scope():
+        path = projects_db.projects_db_path()
+        if not path.is_file():
+            # No projects.db at all: there are provably no owner Projects yet.
+            return {}
+        try:
+            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error as exc:
+            raise _receipt_unreadable(
+                "existing owner work could not be read before the change"
+            ) from exc
+        try:
+            tables = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('projects', 'owner_workspace_receipts')"
+                )
+            }
+            if not tables & {"owner_workspace_receipts"}:
+                # No receipt table means no committed owner receipt can exist.
+                return {}
+            if tables != {"projects", "owner_workspace_receipts"}:
+                # Receipts exist but their Projects cannot be resolved.
+                raise _receipt_unreadable(
+                    "existing owner work could not be read before the change"
+                )
+            placeholders = ",".join("?" for _ in _OWNER_TASK_RECEIPT_OPERATIONS)
+            by_project: dict[str, set[str]] = {}
+            for receipt in conn.execute(
+                "SELECT operation, project_id, result_json FROM owner_workspace_receipts "
+                f"WHERE status = 'committed' AND operation IN ({placeholders})",
+                _OWNER_TASK_RECEIPT_OPERATIONS,
+            ):
+                try:
+                    result = json.loads(receipt["result_json"] or "null")
+                except (TypeError, ValueError) as exc:
+                    raise _receipt_unreadable(
+                        "an owner work receipt could not be read before the change"
+                    ) from exc
+                owned = _owner_receipt_owned_ids(
+                    str(receipt["operation"]), result
+                )
+                if owned is None:
+                    continue
+                project_id = str(result.get("project_id") or receipt["project_id"] or "")
+                if not project_id:
+                    raise _receipt_unreadable(
+                        "an owner work receipt does not record which Project it belongs to"
+                    )
+                by_project.setdefault(project_id, set()).update(owned)
+
+            boards: dict[str, set[str]] = {}
+            for project_id, task_ids in by_project.items():
+                row = conn.execute(
+                    "SELECT board_slug FROM projects WHERE id = ?", (project_id,)
+                ).fetchone()
+                if row is None or not row["board_slug"]:
+                    raise _receipt_unreadable(
+                        "an owner work receipt does not resolve to a board"
+                    )
+                board_slug = str(row["board_slug"])
+                # Ownership must be provable. An unprovable binding is not
+                # "someone else's problem": it means this fence cannot tell
+                # whose work these tasks are, so it must not proceed.
+                _assert_board_ownership(board_slug, project_id)
+                boards.setdefault(board_slug, set()).update(task_ids)
+            return boards
+        except sqlite3.Error as exc:
+            raise _receipt_unreadable(
+                "existing owner work could not be read before the change"
+            ) from exc
+        finally:
+            conn.close()
+
+
+# How long the fence waits for a board's dispatch lock before failing closed.
+# Matches the owner pause/resume wait: long enough to ride out one in-flight
+# tick's critical section, short enough that a settings change never hangs.
+_FENCE_LOCK_WAIT_SECONDS = 5.0
+
+
+@contextlib.contextmanager
+def _fence_board_connection(board_slug: str):
+    """Open one board for fencing while holding its native dispatch lock.
+
+    The lock is the board's own dispatcher guard, so for as long as this is
+    held no dispatcher tick on this board can be inside its critical section:
+    no new claim starts and no worker spawns. Discovery and the pin therefore
+    see the same rows, instead of a claim landing between "these are unlocked"
+    and "these are now pinned".
+
+    Acquired UNDER the caller's profile route lock, in sorted board order, and
+    never the other way around, so the guards cannot deadlock. Fails closed on
+    a busy lock — the caller must not write a route change it could not fence.
+    """
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(
+                kanban_db.board_dispatch_lock(
+                    board_slug, wait_seconds=_FENCE_LOCK_WAIT_SECONDS
+                )
+            )
+            conn = stack.enter_context(
+                contextlib.closing(kanban_db.connect(board=board_slug))
+            )
+        except (OSError, TimeoutError, sqlite3.Error) as exc:
+            raise OwnerWorkspaceError(
+                "execution_state_busy",
+                "existing owner work could not be pinned before the change",
+            ) from exc
+        yield conn
+
+
+def _owner_tasks_for_role(
+    conn: sqlite3.Connection, task_ids: set[str], assignee: str
+) -> list[str]:
+    """Narrow receipt-created ids to the ones this role currently holds."""
+    if not task_ids:
+        return []
+    ordered = sorted(task_ids)
+    placeholders = ",".join("?" for _ in ordered)
+    rows = conn.execute(
+        f"SELECT id FROM tasks WHERE id IN ({placeholders}) "
+        "AND assignee = ? AND task_kind = 'work'",
+        (*ordered, assignee),
+    ).fetchall()
+    return [str(row["id"]) for row in rows]
+
+
+def fence_effective_task_routes(profile: str) -> list[str]:
+    """Freeze owner work on an exact approved route, before a route change.
+
+    Provider selection rewrites a role's native route, which is part of the
+    *effective* route of every owner task that does not already carry an exact
+    owner-approved lock. Called immediately ahead of that write — under the same
+    serialization as the write (see :func:`profile_route_lock`) — this pins each
+    exposed task's route so a settings change can only ever affect newly
+    approved work.
+
+    EVERY receipt-owned executable task this role holds is covered, including
+    one that already names a model, provider and effort but carries no lock:
+    "fully specified" is not the same as "owner-approved", and an unlocked
+    executable owner task must never be dispatchable as ordinary work. A task
+    whose completed route is not an admitted authority cannot be pinned at all,
+    so it is parked in the native blocked column with a re-approval
+    requirement rather than left runnable.
+
+    Only tasks a committed owner receipt records having created, and that this
+    role currently holds, are touched; manual and non-Raphael Kanban cards are
+    never mutated, so a role with no such work is a no-op and needs no route
+    read at all. When there IS such work it fails closed: if the role's current
+    route cannot be read and validated the caller must not write, because those
+    tasks would otherwise silently inherit the new route. Returns the pinned
+    ids.
+
+    Work that is ALREADY claimed or running cannot be fenced at all: a worker
+    is executing under the authority the row carries right now, and rewriting
+    its route columns underneath it would neither stop that process nor
+    re-authorize it. The whole change is refused (``execution_state_busy``) so
+    a stale claim can never launch or continue under changed authority.
+
+    Every board's native dispatch lock is held — in sorted slug order, under
+    the caller's profile route lock — across discovery, the active-work check,
+    the route read and the pin, so no dispatcher tick can claim or spawn in
+    between. Any failure propagates before the caller's config write, so the
+    profile is left untouched and the caller's own rollback still applies.
+    """
+    boards = _owner_receipt_task_ids()
+    if not boards:
+        return []
+
+    pinned: list[str] = []
+    with contextlib.ExitStack() as stack:
+        exposed: list[tuple[sqlite3.Connection, list[str]]] = []
+        for board_slug in sorted(boards):
+            conn = stack.enter_context(_fence_board_connection(board_slug))
+            try:
+                candidates = _owner_tasks_for_role(conn, boards[board_slug], profile)
+                if not kanban_db.count_unpinned_owner_tasks(conn, task_ids=candidates):
+                    continue
+                active = kanban_db.list_active_unpinned_owner_tasks(
+                    conn, task_ids=candidates,
+                )
+            except sqlite3.Error as exc:
+                raise OwnerWorkspaceError(
+                    "execution_state_busy",
+                    "existing owner work could not be read before the change",
+                ) from exc
+            if active:
+                raise OwnerWorkspaceError(
+                    "execution_state_busy",
+                    "some of this role's existing work is running right now; "
+                    "try this change again once it has finished",
+                )
+            exposed.append((conn, candidates))
+        if not exposed:
+            return []
+
+        try:
+            route = configured_assignment_for(profile)
+        except (ValueError, OSError) as exc:
+            raise OwnerWorkspaceError(
+                "invalid_model_route",
+                "the role's current route could not be confirmed before the change",
+            ) from exc
+
+        for conn, candidates in exposed:
+            try:
+                pinned.extend(
+                    kanban_db.pin_effective_task_routes(
+                        conn,
+                        task_ids=candidates,
+                        model=route.model,
+                        provider=route.provider,
+                        reasoning_effort=route.reasoning_effort,
+                    )
+                )
+            except (ValueError, sqlite3.Error) as exc:
+                raise OwnerWorkspaceError(
+                    "invalid_model_route",
+                    "existing owner work could not be pinned before the change",
+                ) from exc
+    return pinned
+
+
+@contextlib.contextmanager
+def profile_route_lock(profile: str):
+    """Hold the cross-process lock that orders one profile's route changes.
+
+    Every surface that can move a role's model, provider, effort or fallback
+    policy — the Models endpoint, ``/api/model/set``, the config editors, the
+    CLI, ``/model``, ``/reasoning``, the TUI and setup — takes this lock, so
+    the pre-read, the compare-and-swap, the policy validation, the legacy fence
+    and the write itself cannot interleave with another writer's. It is a
+    kernel-held file lock keyed on the profile, not an in-process mutex, so
+    concurrent dashboard, CLI and worker processes are ordered too. Fails
+    closed: with no lock there is no write.
+
+    The caller owns the ordering INSIDE the lock (see
+    ``hermes_cli.config.profile_route_write``), because a compare-and-swap has
+    to see the same state the validation and the fence do.
+    """
+    canonical = str(profile or "").strip().lower() or "default"
+    with _global_guard(f"profile-route-{canonical}", label="profile route"):
+        yield
 
 
 _OWNER_PROJECT_COLUMNS = (
@@ -1668,7 +2428,108 @@ def _owner_runtime_value(value: object) -> Optional[str]:
     return clean if _OWNER_RUNTIME_VALUE_RE.fullmatch(clean) else None
 
 
-def _owner_project_runtime_and_cost(run: kanban_db.Run) -> tuple[dict, dict]:
+_OWNER_TASK_PIN_COLUMNS = (
+    "assignee",
+    "provider_override",
+    "model_override",
+    "reasoning_effort",
+    "execution_tier",
+    "model_policy_lock",
+)
+
+
+def owner_task_pin_select(conn: sqlite3.Connection, alias: str) -> str:
+    """Return the pin columns this database actually has, as a SELECT tail.
+
+    Read-only owner projections must never assume a board has been migrated:
+    an older ``kanban.db`` genuinely cannot carry a lock, so omitting the
+    missing columns projects those tasks as unlocked — without a schema write
+    hidden inside a GET.
+
+    Two things are NOT tolerated. A schema read that fails is not evidence that
+    a board is old: it means this projection cannot know whether a lock exists,
+    so it raises ``snapshot_unavailable``. And a board that HAS
+    ``model_policy_lock`` but is missing any column the lock's digest binds
+    cannot prove a pin either, so the lock column is still projected and the
+    pin reads back as invalid/unknown rather than as unlocked.
+    """
+    try:
+        present = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+    except sqlite3.Error as exc:
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable",
+            "this Project's work could not be read right now",
+        ) from exc
+    if "model_policy_lock" not in present:
+        # Without the lock column there is no pin to project at all.
+        return ""
+    selected = [
+        column for column in _OWNER_TASK_PIN_COLUMNS if column in present
+    ]
+    return "".join(f", {alias}.{column}" for column in selected)
+
+
+@dataclass(frozen=True)
+class OwnerTaskRoutePin:
+    """One task's persisted route authority, or the fact that it is broken.
+
+    ``valid`` False is deliberately NOT the same as "no pin": a task carrying a
+    lock this build cannot validate has unknown routing, so every projection
+    must report unknown rather than fall back to the looser role-level check
+    that an unlocked task legitimately uses.
+    """
+
+    valid: bool
+    profile: str = ""
+    provider: str = ""
+    model: str = ""
+    reasoning_effort: str = ""
+
+
+def owner_task_route_pin(row: Any) -> Optional[OwnerTaskRoutePin]:
+    """Return one task's persisted route authority, or None when unlocked.
+
+    ``None`` only for a row that cannot carry a lock at all (a pre-lock schema,
+    projected without the lock column) or that carries none — an ordinary,
+    manual, or pre-lock task, which keeps the older role-level check. A lock
+    that does not validate against this build's policy for this exact
+    assignee/provider/model/effort/tier returns an INVALID pin, and so does a
+    lock whose bound columns are not all present: a partially migrated row
+    proves nothing, and must never read as unlocked.
+    """
+    try:
+        lock = row["model_policy_lock"]
+    except (IndexError, KeyError, TypeError):
+        # The row was projected without the lock column at all: this schema
+        # cannot carry a lock, so the task is genuinely unlocked.
+        return None
+    if not lock:
+        return None
+    try:
+        profile = str(row["assignee"] or "").strip()
+        provider = str(row["provider_override"] or "").strip()
+        model = str(row["model_override"] or "").strip()
+        effort = str(row["reasoning_effort"] or "").strip().lower()
+    except (IndexError, KeyError, TypeError):
+        # Locked, but the digest's bound columns are not all here: unprovable.
+        return OwnerTaskRoutePin(valid=False)
+    if kanban_db.task_policy_lock_error(row):
+        return OwnerTaskRoutePin(valid=False)
+    return OwnerTaskRoutePin(
+        valid=True,
+        profile=profile,
+        provider=provider,
+        model=model,
+        reasoning_effort=effort,
+    )
+
+
+def _owner_project_runtime_and_cost(
+    run: kanban_db.Run, task_pin: Optional[OwnerTaskRoutePin],
+) -> tuple[dict, dict]:
     metadata = run.metadata if isinstance(run.metadata, dict) else {}
     raw = metadata.get("runtime_receipt")
     if not isinstance(raw, dict) or raw.get("schema_version") != 2:
@@ -1689,16 +2550,29 @@ def _owner_project_runtime_and_cost(run: kanban_db.Run) -> tuple[dict, dict]:
         or evidence not in {"dominant-session-usage", "session-row"}
     ):
         return dict(_OWNER_UNKNOWN_RUNTIME), dict(_OWNER_UNKNOWN_COST)
-    try:
-        validate_raphael_model_assignment(
-            profile,
-            provider,
-            model,
-            effort,
-            disable_fallbacks=True,
-        )
-    except ValueError:
-        return dict(_OWNER_UNKNOWN_RUNTIME), dict(_OWNER_UNKNOWN_COST)
+    if task_pin is not None:
+        # A policy-locked task is answerable to its OWN pinned authority, not
+        # to any route the role happens to admit: a run that used an admitted
+        # but different model is exactly the silent switch this receipt must
+        # catch. An invalid lock proves nothing at all, so it reads as unknown.
+        if not task_pin.valid or (profile, provider, model, effort.lower()) != (
+            task_pin.profile,
+            task_pin.provider,
+            task_pin.model,
+            task_pin.reasoning_effort,
+        ):
+            return dict(_OWNER_UNKNOWN_RUNTIME), dict(_OWNER_UNKNOWN_COST)
+    else:
+        try:
+            validate_raphael_model_assignment(
+                profile,
+                provider,
+                model,
+                effort,
+                disable_fallbacks=True,
+            )
+        except ValueError:
+            return dict(_OWNER_UNKNOWN_RUNTIME), dict(_OWNER_UNKNOWN_COST)
 
     runtime = {
         "state": "known",
@@ -1740,7 +2614,9 @@ def _owner_project_runtime_and_cost(run: kanban_db.Run) -> tuple[dict, dict]:
     }
 
 
-def _owner_project_run_receipt(run: kanban_db.Run) -> dict:
+def _owner_project_run_receipt(
+    run: kanban_db.Run, task_pin: Optional[OwnerTaskRoutePin],
+) -> dict:
     outcome = (run.outcome or run.status or "").strip().lower()
     if run.status == "running":
         owner_outcome, summary = "running", "Work is still in progress."
@@ -1757,7 +2633,7 @@ def _owner_project_run_receipt(run: kanban_db.Run) -> dict:
         owner_outcome, summary = "attention", "Work stopped and needs attention."
     else:
         owner_outcome, summary = "unknown", "The final outcome could not be confirmed."
-    runtime, cost = _owner_project_runtime_and_cost(run)
+    runtime, cost = _owner_project_runtime_and_cost(run, task_pin)
     return {
         "outcome": owner_outcome,
         "summary": summary,
@@ -1772,9 +2648,17 @@ def _owner_project_run_receipt(run: kanban_db.Run) -> dict:
 
 
 def _owner_project_run_projection(
-    run: kanban_db.Run, task_title: Any, *, has_newer_run: bool, run_context: bool,
+    run: kanban_db.Run,
+    task_title: Any,
+    *,
+    task_pin: Optional[OwnerTaskRoutePin],
+    has_newer_run: bool,
+    run_context: bool,
 ) -> dict:
     """Project one run for the owner, carrying its retry fact but never its id.
+
+    ``task_pin`` is the run's own task's persisted owner-approved route, so a
+    recorded run that drifted off it reads as unknown rather than confirmed.
 
     ``has_newer_run`` is decided by the caller from the exact native task id
     while it walks the newest-first run list — never from ``task_title``,
@@ -1790,7 +2674,7 @@ def _owner_project_run_projection(
     projection = {
         "started_at": _owner_timestamp(run.started_at),
         "finished_at": _owner_timestamp(run.ended_at),
-        "receipt": _owner_project_run_receipt(run),
+        "receipt": _owner_project_run_receipt(run, task_pin),
     }
     if not run_context:
         return projection
@@ -1928,8 +2812,15 @@ def read_project_snapshot(
             for row in attachment_rows[:_OWNER_PROJECT_MAX_ATTACHMENTS]
         ]
 
+        # The task's own pinned route travels with its runs: a receipt is
+        # checked against the route approved for THAT task, not against
+        # whatever the role currently admits. Selected schema-aware because
+        # this is a read-only connection — a board whose kanban.db predates the
+        # pin columns must project as "unlocked", never fail and never migrate.
         run_rows = conn.execute(
-            "SELECT r.*, t.title AS task_title FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            "SELECT r.*, t.title AS task_title"
+            + owner_task_pin_select(conn, "t")
+            + " FROM task_runs r JOIN tasks t ON t.id = r.task_id "
             "WHERE t.project_id = ? AND t.task_kind = 'work' "
             "ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
             (project_id, _OWNER_PROJECT_MAX_RUNS + 1),
@@ -1949,6 +2840,7 @@ def read_project_snapshot(
                 _owner_project_run_projection(
                     run,
                     row["task_title"],
+                    task_pin=owner_task_route_pin(row),
                     has_newer_run=run_task_id in task_ids_with_newer_run,
                     run_context=run_context,
                 )
@@ -2049,6 +2941,10 @@ def read_project_attachment(
     if row is None:
         raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable")
 
+    # The authority row exists from here on, so 404 is off the table: a
+    # storage or integrity failure is not proof that the attachment is not
+    # there, and telling the owner "not found" for one hides a real fault and
+    # invites them to re-upload a file that already exists.
     root = (
         kanban_db.kanban_home() / "kanban" / "attachments"
         if board_slug == kanban_db.DEFAULT_BOARD
@@ -2058,7 +2954,11 @@ def read_project_attachment(
         stored = Path(str(row["stored_path"])).resolve()
         stored.relative_to(root)
     except (OSError, ValueError) as exc:
-        raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable") from exc
+        # The row points outside this board's attachment store: that is broken
+        # authority, not an absent file.
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", "the attachment record could not be verified"
+        ) from exc
 
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -2066,7 +2966,9 @@ def read_project_attachment(
     try:
         fd = os.open(stored, flags)
     except OSError as exc:
-        raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable") from exc
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", "the attachment could not be read"
+        ) from exc
     try:
         info = os.fstat(fd)
         size = int(info.st_size)
@@ -2077,19 +2979,30 @@ def read_project_attachment(
             or size > kanban_db.KANBAN_ATTACHMENT_MAX_BYTES
             or size != expected_size
         ):
-            raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable")
+            raise OwnerWorkspaceError(
+                "snapshot_unavailable",
+                "the stored attachment does not match its record",
+            )
         chunks: list[bytes] = []
         remaining = size
         while remaining:
             chunk = os.read(fd, min(remaining, 1024 * 1024))
             if not chunk:
-                raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable")
+                raise OwnerWorkspaceError(
+                    "snapshot_unavailable",
+                    "the stored attachment does not match its record",
+                )
             chunks.append(chunk)
             remaining -= len(chunk)
         if os.read(fd, 1):
-            raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable")
+            raise OwnerWorkspaceError(
+                "snapshot_unavailable",
+                "the stored attachment does not match its record",
+            )
     except OSError as exc:
-        raise OwnerWorkspaceError("attachment_not_found", "the attachment is unavailable") from exc
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", "the attachment could not be read"
+        ) from exc
     finally:
         os.close(fd)
 
@@ -2119,8 +3032,13 @@ def _owner_decision_reason(value: Any, *, fallback: str) -> str:
     return text[:500] or fallback
 
 
-def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
+def list_owner_decisions(ctx: OwnerContext) -> dict:
     """Project pending native gates into one owner-safe read-only inbox.
+
+    Returns ``{"data": [...], "truncated": bool}``. The window is bounded both
+    per Project and globally, and ``truncated`` says whether anything was left
+    out — an owner who cannot tell a full inbox from a clipped one can believe
+    they have answered everything Raphael is waiting on.
 
     This is deliberately a projection, not a decision store or mutation
     router. Work reviews and owner-input blocks stay native Tasks;
@@ -2132,6 +3050,7 @@ def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
     boundary.
     """
     decisions: list[dict] = []
+    truncated = False
     projects = list_committed_projects(ctx)
     for project in projects:
         if project["archived"]:
@@ -2178,6 +3097,11 @@ def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
         finally:
             conn.close()
 
+        # ``LIMIT`` is one more than the window, so a full page proves there
+        # is at least one more decision this Project could not carry.
+        if len(rows) > _OWNER_DECISIONS_LIMIT:
+            truncated = True
+            rows = rows[:_OWNER_DECISIONS_LIMIT]
         for row in rows:
             task_kind = str(row["task_kind"])
             if task_kind == "recommendation":
@@ -2215,7 +3139,10 @@ def list_owner_decisions(ctx: OwnerContext) -> list[dict]:
             str(item["decision_ref"]),
         )
     )
-    return decisions[:_OWNER_DECISIONS_LIMIT]
+    return {
+        "data": decisions[:_OWNER_DECISIONS_LIMIT],
+        "truncated": truncated or len(decisions) > _OWNER_DECISIONS_LIMIT,
+    }
 
 
 def set_project_archived(
@@ -2903,7 +3830,14 @@ def project_steward_snapshot(
     dispatch_allowed = kanban_db.board_dispatch_allowed(metadata)
     paused_by_owner = metadata.get("dispatch_paused_by_owner") is True
     running_now = any(item["status"] == "running" for item in items)
-    if not active_rows and not decision_rows and not attention_rows:
+    if not items:
+        # Only the Project's non-executable control anchor exists: nothing has
+        # been approved yet, so there is no work to be complete.
+        execution_state = "waiting_for_approval"
+        execution_summary = (
+            "Raphael is waiting for an approved milestone before starting work."
+        )
+    elif not active_rows and not decision_rows and not attention_rows:
         execution_state = "complete"
         execution_summary = "The approved work is complete."
     elif not dispatch_allowed:
@@ -3017,9 +3951,9 @@ def _normalize_project_task_ref(value: Any, field: str, *, mutating: bool) -> di
 def _normalize_project_task_spec(
     value: Any, field: str, *, parent_limit: Optional[int] = None,
 ) -> dict:
-    required = {"title", "body", "assignee", "parents"} if parent_limit is not None else {
-        "title", "body", "assignee",
-    }
+    required = {
+        "title", "body", "assignee", "execution_tier",
+    } | ({"parents"} if parent_limit is not None else set())
     allowed = required | {"responsibility"}
     if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(allowed):
         raise OwnerWorkspaceError(
@@ -3042,6 +3976,11 @@ def _normalize_project_task_spec(
         )
     except ValueError as exc:
         raise OwnerWorkspaceError("invalid_argument", str(exc)) from exc
+    result.update(
+        _resolved_route_pin(
+            result["assignee"], raw["execution_tier"], f"{field}.execution_tier",
+        )
+    )
     if parent_limit is not None:
         parents = raw["parents"]
         if not isinstance(parents, list):
@@ -3083,14 +4022,15 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
 
         if action == "add":
             required = {
-                "action", "reason", "title", "body", "assignee",
+                "action", "reason", "title", "body", "assignee", "execution_tier",
                 "existing_parents", "new_parents",
             }
             allowed = required | {"responsibility"}
             if not required.issubset(item) or not set(item).issubset(allowed):
                 raise OwnerWorkspaceError(
                     "invalid_argument",
-                    f"{field} must contain {sorted(required)} and only optional responsibility",
+                    f"{field} must contain {sorted(required)} and only optional "
+                    "responsibility",
                 )
             raw = item
             existing = raw["existing_parents"]
@@ -3113,7 +4053,13 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
                     )
                 parent_indexes.append(parent)
             spec = _normalize_project_task_spec(
-                {**{key: raw[key] for key in ("title", "body", "assignee")}, "responsibility": raw.get("responsibility")},
+                {
+                    **{
+                        key: raw[key]
+                        for key in ("title", "body", "assignee", "execution_tier")
+                    },
+                    "responsibility": raw.get("responsibility"),
+                },
                 field,
                 parent_limit=None,
             )
@@ -3248,11 +4194,86 @@ def _resolve_existing_project_board(
     return project, project.board_slug
 
 
+def _receipt_bound_control_anchor(
+    pconn: sqlite3.Connection,
+    kconn: sqlite3.Connection,
+    ctx: OwnerContext,
+    project_id: str,
+) -> str:
+    """Resolve the Project's one canonical, receipt-bound control anchor.
+
+    The anchor is never supplied by the caller. An owner-facing snapshot
+    contains only executable work rows, so a caller-supplied id could only ever
+    be a work row — and a plan that hung new work off a dispatchable task would
+    defeat the whole point of the anchor. It is instead derived here from the
+    durable receipt that recorded creating it (a ``owner_workspace_bootstrap``
+    receipt records it as ``task_id``, a graph-created Project's
+    ``owner_task_graph_commit`` receipt as ``anchor_task_id``), and then
+    confirmed against the board.
+
+    Both creation paths must converge on exactly ONE anchor per Project, so
+    every committed receipt for this Project has to name the same row. Fails
+    closed on every ambiguity: no committed receipt names an anchor, a
+    bootstrap receipt that does not record which task it created, more than one
+    distinct anchor across receipts, a board that holds no control row for this
+    Project, or a board that holds more than one. Each of those means ownership
+    of the anchor cannot be proven, which is not a licence to pick one — the
+    recovery path is to re-derive the anchor explicitly, never to guess.
+    """
+    anchors: set[str] = set()
+    for row in pconn.execute(
+        "SELECT operation, result_json FROM owner_workspace_receipts "
+        "WHERE actor = ? AND profile = ? AND status = 'committed' "
+        "AND operation IN ('owner_workspace_bootstrap', 'owner_task_graph_commit')",
+        (ctx.actor, ctx.profile),
+    ).fetchall():
+        try:
+            result = json.loads(row["result_json"] or "null")
+        except (TypeError, ValueError) as exc:
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                "an owner Project receipt could not be read",
+            ) from exc
+        if not isinstance(result, dict) or result.get("project_id") != project_id:
+            continue
+        bootstrap = row["operation"] == "owner_workspace_bootstrap"
+        task_id = result.get("task_id") if bootstrap else result.get("anchor_task_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            if bootstrap:
+                raise OwnerWorkspaceError(
+                    "crash_recovery_failed",
+                    "an owner Project receipt does not record its Project anchor",
+                )
+            # A graph receipt written before Projects carried their own anchor.
+            # It proves ownership of the Project but names no anchor, so it
+            # neither supplies nor contradicts one.
+            continue
+        anchors.add(task_id.strip())
+    if len(anchors) != 1:
+        raise OwnerWorkspaceError(
+            "project_not_owned",
+            "this Project has no single receipt-bound anchor to apply a plan to",
+        )
+    anchor_task_id = next(iter(anchors))
+    rows = kconn.execute(
+        "SELECT id FROM tasks WHERE project_id = ? AND task_kind = 'control'",
+        (project_id,),
+    ).fetchall()
+    if len(rows) != 1 or str(rows[0]["id"]) != anchor_task_id:
+        raise OwnerWorkspaceError(
+            "project_not_owned",
+            "this Project's anchor could not be confirmed on its board",
+        )
+    return anchor_task_id
+
+
 def _committed_project_plan_result(
     kconn: sqlite3.Connection, *, anchor_task_id: str, digest: str,
     idempotency_key: str, ctx: OwnerContext,
 ) -> Optional[dict]:
-    for event in reversed(kanban_db.list_events(kconn, anchor_task_id)):
+    for event in reversed(
+        kanban_db.list_events(kconn, anchor_task_id, include_control=True)
+    ):
         payload = event.payload or {}
         if (
             event.kind == "owner_project_plan_applied"
@@ -3271,7 +4292,6 @@ def commit_project_plan(
     *,
     idempotency_key: str,
     project_id: str,
-    anchor_task_id: str,
     trigger: str,
     request_title: str,
     summary: str,
@@ -3281,12 +4301,17 @@ def commit_project_plan(
     later_milestones: Any,
     changes: Any,
 ) -> dict:
-    """Commit one approved Project Steward plan to the existing native board."""
+    """Commit one approved Project Steward plan to the existing native board.
+
+    The Project's control anchor is resolved internally from its committed
+    bootstrap receipt (see :func:`_receipt_bound_control_anchor`) — it is
+    deliberately not part of the request, so no caller can name the row a plan
+    hangs its work under.
+    """
     from agent.redact import redact_sensitive_text
 
     idempotency_key = _bounded_text(idempotency_key, "idempotency_key", limit=200)
     project_id = _bounded_text(project_id, "project_id", limit=100)
-    anchor_task_id = _bounded_text(anchor_task_id, "anchor_task_id", limit=100)
     trigger = str(trigger or "").strip()
     if trigger not in _PROJECT_PLAN_TRIGGERS:
         raise OwnerWorkspaceError("invalid_argument", "trigger is invalid")
@@ -3298,7 +4323,6 @@ def commit_project_plan(
         payload={
             "idempotency_key": idempotency_key,
             "project_id": project_id,
-            "anchor_task_id": anchor_task_id,
             "trigger": trigger,
             "request_title": request_title,
             "summary": summary,
@@ -3329,7 +4353,6 @@ def commit_project_plan(
     )
     payload = {
         "project_id": project_id,
-        "anchor_task_id": anchor_task_id,
         "trigger": trigger,
         "request_title": request_title,
         "summary": summary,
@@ -3354,10 +4377,15 @@ def commit_project_plan(
             pconn, ctx, idempotency_key, operation, digest,
         )
         if state == "terminal":
-            return json.loads(row["result_json"])
+            committed = json.loads(row["result_json"])
+            _activate_committed_owner_work(committed)
+            return committed
         project, board_slug = _resolve_existing_project_board(pconn, project_id)
         kconn = kanban_db.connect(board=board_slug)
         try:
+            anchor_task_id = _receipt_bound_control_anchor(
+                pconn, kconn, ctx, project_id,
+            )
             recovered = _committed_project_plan_result(
                 kconn,
                 anchor_task_id=anchor_task_id,
@@ -3366,7 +4394,6 @@ def commit_project_plan(
                 ctx=ctx,
             )
             if recovered is not None:
-                _set_project_dispatch_state(board_slug, enabled=True)
                 result = {
                     "ok": True,
                     "project_id": project_id,
@@ -3378,6 +4405,7 @@ def commit_project_plan(
                 _finalize_receipt(
                     pconn, ctx, idempotency_key, token, status="committed", result=result,
                 )
+                _activate_committed_owner_work(result)
                 return result
 
             approval = _confirm(
@@ -3443,7 +4471,6 @@ def commit_project_plan(
                         "change_count": 0,
                     }
                 else:
-                    _set_project_dispatch_state(board_slug, enabled=True)
                     result = {
                         "ok": True,
                         "project_id": project_id,
@@ -3459,7 +4486,11 @@ def commit_project_plan(
                 _finalize_receipt(
                     pconn, ctx, idempotency_key, token, status="committed", result=result,
                 )
-                return result
+            # Outside the ownership guard, and only after the terminal receipt:
+            # the plan's new and reactivated work is parked until here, so a
+            # failure anywhere above leaves nothing runnable.
+            _activate_committed_owner_work(result)
+            return result
         finally:
             kconn.close()
     finally:
@@ -3492,7 +4523,9 @@ def _resolve_receipt_owned_task(
     )
     kconn = kanban_db.connect(board=board_slug)
     try:
-        task = kanban_db.get_task(kconn, task_id)
+        # The owner kernel also owns the Project's non-executable control
+        # anchor, so it resolves that kind here too; no executable path can.
+        task = kanban_db.get_task(kconn, task_id, include_control=True)
     finally:
         kconn.close()
     if task is None or task.project_id != project_id:
@@ -3516,8 +4549,23 @@ def move_task(
     """Optimistic compare-and-swap task move inside the existing Kanban
     write transaction. See ``kanban_db.cas_transition_task``.
 
+    Durability boundary: a move into ``done``/``archived`` satisfies its
+    dependents' dependency the instant the Kanban transaction commits, which
+    is BEFORE this receipt's terminal result is durable. Recomputing readiness
+    there — or letting a live dispatcher tick land in that gap — would hand a
+    newly enabled dependent to a worker for a move that may still fail to
+    finalize. So the transition parks exactly the dependents it newly enables
+    in its OWN transaction (see ``kanban_db.cas_transition_task``'s
+    ``park_newly_enabled_dependents``), records that exact set and each
+    dependent's restore column in the ``owner_move`` event and in the terminal
+    result, and only once the receipt is committed does
+    :func:`_activate_committed_owner_move` release them and recompute
+    readiness. Sticky blocked/circuit-breaker holds are preserved: a parked
+    dependent goes back to the column it came from, so the readiness guards
+    apply exactly as they would have.
+
     Crash-safe readiness repair: if the CAS status move + event commit
-    succeeds but a crash follows before ``recompute_ready`` (or before
+    succeeds but a crash follows before activation (or before
     finalization), a replay adopting the dead claim recognizes — by the
     committed event's payload carrying THIS receipt's full identity (actor,
     profile, idempotency_key, AND the requested to_status/expected_status
@@ -3527,8 +4575,9 @@ def move_task(
     ``expected_revision + 1``) — that it already performed the transition.
     It does not re-run the CAS (which would misread the already-advanced
     status/revision as an unrelated conflict); it rebuilds the same success
-    snapshot, reruns readiness recompute (idempotent — safe to repeat), and
-    finalizes the original success. Genuinely unrelated status/revision
+    snapshot — including the parked set that event recorded — finalizes the
+    original success, and then completes the same idempotent activation.
+    Genuinely unrelated status/revision
     drift still reports a conflict — including a DIFFERENT actor/profile
     validly reusing the same idempotency_key text on the same task (receipts
     are scoped per actor/profile/key, but the task's event log is
@@ -3536,8 +4585,8 @@ def move_task(
     otherwise let one receipt fabricate a success snapshot for a mutation an
     entirely different receipt performed).
 
-    Lease-fenced: the lease check, replay recognition, CAS, and readiness
-    recompute all run inside one held ``projects.db`` write lock (see
+    Lease-fenced: the lease check, replay recognition, CAS, and dependency
+    parking all run inside one held ``projects.db`` write lock (see
     :func:`_assert_owns_lease`) so a takeover cannot land between validating
     the lease and committing the move.
     """
@@ -3575,6 +4624,10 @@ def move_task(
             pconn, ctx, idempotency_key, operation, digest,
         )
         if replay is not None:
+            # A crash between the terminal receipt and activation leaves this
+            # move's newly enabled dependents parked. Replay finishes exactly
+            # the same activation from the committed receipt.
+            _activate_committed_owner_move(replay)
             return replay
         pending = _get_receipt(pconn, ctx, idempotency_key)
         recovery_pending = bool(
@@ -3589,7 +4642,9 @@ def move_task(
         )
         state, row, token = _acquire_or_replay(pconn, ctx, idempotency_key, operation, digest)
         if state == "terminal":
-            return json.loads(row["result_json"])
+            committed = json.loads(row["result_json"])
+            _activate_committed_owner_move(committed)
+            return committed
 
         approval = _confirm(
             ctx, operation=operation, digest=digest,
@@ -3603,9 +4658,15 @@ def move_task(
             _finalize_receipt(pconn, ctx, idempotency_key, token, status="denied", result=result)
             return result
 
+        # Deterministic from this receipt's own identity, so a replay that
+        # recognizes its own already-committed transition releases exactly the
+        # dependents it parked.
+        move_park_generation = kanban_db.park_generation(
+            actor=ctx.actor, profile=ctx.profile, idempotency_key=idempotency_key,
+        )
         kconn = kanban_db.connect(board=board_slug)
         try:
-            if kanban_db.get_task(kconn, task_id) is None:
+            if kanban_db.get_task(kconn, task_id, include_control=True) is None:
                 raise OwnerWorkspaceError("task_not_found", f"no such task {task_id}")
 
             # Serialize the active-state recheck, board write, and receipt
@@ -3621,7 +4682,9 @@ def move_task(
                             "the Project ownership receipt changed before commit",
                         )
                     current_project = projects_db.get_project(pconn, project_id)
-                    current_task = kanban_db.get_task(kconn, task_id)
+                    current_task = kanban_db.get_task(
+                        kconn, task_id, include_control=True
+                    )
                     snapshot = None
                     if row is not None and current_task is not None:
                         # Adopting a dead claim: recognize only the exact
@@ -3642,6 +4705,14 @@ def move_task(
                                 "moved": True,
                                 "status": to_status,
                                 "revision": already.id,
+                                # The exact set that transition parked, read
+                                # back from its own committed event — never
+                                # re-derived from a board that has since moved.
+                                "parked_dependents": _decode_parked_dependents(
+                                    (already.payload or {}).get(
+                                        "parked_dependents"
+                                    )
+                                ),
                             }
                     if (
                         current_project is None
@@ -3678,14 +4749,13 @@ def move_task(
                                     "to_status": to_status,
                                     "expected_status": expected_status,
                                 },
+                                # A terminal move releases its dependents in
+                                # this very transaction — parked, not
+                                # promoted, so nothing is claimable until the
+                                # receipt below is durable.
+                                park_newly_enabled_dependents=True,
+                                park_generation=move_park_generation,
                             )
-                    if snapshot["moved"] and to_status in ("done", "archived"):
-                        # Also repair readiness when an exact crash recovery is
-                        # replayed after the Project was archived. The status
-                        # event committed before the archive, and restore must
-                        # not revive the stale dependency state left by that
-                        # interrupted write.
-                        kanban_db.recompute_ready(kconn)
 
                 if snapshot["moved"]:
                     result = {
@@ -3693,6 +4763,13 @@ def move_task(
                         "task_id": task_id,
                         "status": snapshot["status"],
                         "revision": snapshot["revision"],
+                        # Activation authority, driven entirely by the durable
+                        # receipt so a replay performs exactly the same one.
+                        "board": board_slug,
+                        "parked_dependents": _decode_parked_dependents(
+                            snapshot.get("parked_dependents")
+                        ),
+                        "park_generation": move_park_generation,
                     }
                 else:
                     result = {
@@ -3704,11 +4781,75 @@ def move_task(
                     pconn, ctx, idempotency_key, token,
                     status="committed", result=result,
                 )
+                # Everything this move enabled is parked and non-claimable.
+                # Only now — with the terminal receipt durable — does it
+                # become runnable, in one idempotent recoverable transition a
+                # replay can finish on its own.
+                _activate_committed_owner_move(result)
                 return result
         finally:
             kconn.close()
     finally:
         pconn.close()
+
+
+def _decode_parked_dependents(raw: Any) -> list[list[str]]:
+    """Normalize a durable ``[[task_id, restore_status], ...]`` parked set.
+
+    Malformed or absent data decodes to "nothing was parked", which is the
+    safe reading: activation then releases nothing and only recomputes
+    readiness, which proves each task's own gating before promoting it.
+    """
+    return [
+        [entry[0], entry[1]]
+        for entry in (raw if isinstance(raw, list) else [])
+        if (
+            isinstance(entry, (list, tuple))
+            and len(entry) == 2
+            and isinstance(entry[0], str)
+            and isinstance(entry[1], str)
+        )
+    ]
+
+
+def _activate_committed_owner_move(result: Any) -> None:
+    """Make one committed owner move's parked dependents runnable.
+
+    The single activation transition a terminal move performs AFTER its
+    receipt is durable, driven entirely by that receipt so a replay after a
+    crash performs exactly the same one. Idempotent on both halves:
+    :func:`kanban_db.activate_owner_work` only moves rows still sitting in the
+    parked column, and the readiness recompute it ends with is safe to repeat.
+
+    A move that enabled nothing still recomputes readiness — the same
+    crash-safe repair the pre-parking code performed, now on the safe side of
+    the receipt. A non-terminal move, a conflict and a denial all release
+    nothing, because none of them can have satisfied a dependency.
+    """
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return
+    if result.get("status") not in ("done", "archived"):
+        return
+    board_slug = str(result.get("board") or "").strip()
+    generation = str(result.get("park_generation") or "").strip()
+    if not board_slug:
+        return
+    restore = {
+        task_id: status
+        for task_id, status in _decode_parked_dependents(
+            result.get("parked_dependents")
+        )
+    }
+    with contextlib.closing(kanban_db.connect(board=board_slug)) as kconn:
+        if restore and generation:
+            kanban_db.activate_owner_work(
+                kconn,
+                list(restore),
+                generation=generation,
+                restore_statuses=restore,
+            )
+        else:
+            kanban_db.recompute_ready(kconn)
 
 
 # ---------------------------------------------------------------------------
@@ -3796,7 +4937,9 @@ def comment_task(
                             "the Project ownership receipt changed before commit",
                         )
                     current_project = projects_db.get_project(pconn, project_id)
-                    current_task = kanban_db.get_task(kconn, task_id)
+                    current_task = kanban_db.get_task(
+                        kconn, task_id, include_control=True
+                    )
                     if (
                         current_project is None
                         or current_project.archived
@@ -3841,8 +4984,11 @@ def comment_task(
                             author=ctx.actor,
                             body=body,
                             operation_key=operation_key,
+                            include_control=True,
                         )
-                        task = kanban_db.get_task(kconn, task_id)
+                        task = kanban_db.get_task(
+                            kconn, task_id, include_control=True
+                        )
                         revision = kanban_db.task_event_revision(kconn, task_id)
 
                 if comment_id is None:

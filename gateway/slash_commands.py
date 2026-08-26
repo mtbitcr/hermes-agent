@@ -3495,20 +3495,15 @@ class GatewaySlashCommandsMixin:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast
         and their interactive pickers)."""
         from gateway.run import _hermes_home
-        from hermes_cli.config import read_user_config_raw
+        from hermes_cli.config import save_shared_config_key
         config_path = _hermes_home / "config.yaml"
         try:
-            # Write-back round-trip: raw read is correct (merged defaults must
-            # not be persisted back to the user's file).
-            user_config = read_user_config_raw(config_path)
-            keys = key_path.split(".")
-            current = user_config
-            for k in keys[:-1]:
-                if k not in current or not isinstance(current[k], dict):
-                    current[k] = {}
-                current = current[k]
-            current[keys[-1]] = value
-            atomic_config_write(config_path, user_config)
+            # Write-back round-trip through the shared route boundary: raw read
+            # is correct (merged defaults must not be persisted back to the
+            # user's file), and a reasoning-effort key is a route change, so it
+            # takes the same lock, policy check and owner-work fence as every
+            # other surface.
+            save_shared_config_key(config_path, key_path, value)
             return True
         except Exception as e:
             logger.error("Failed to save config key %s: %s", key_path, e)
