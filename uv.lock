@@ -1648,6 +1648,7 @@ dev = [
     { name = "debugpy" },
     { name = "httpx2" },
     { name = "mcp" },
+    { name = "opensandbox" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -1891,6 +1892,7 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'wake'", specifier = "==2.4.3" },
     { name = "onnxruntime", marker = "extra == 'wake'", specifier = "==1.27.0" },
     { name = "openai", specifier = "==2.24.0" },
+    { name = "opensandbox", marker = "extra == 'dev'", specifier = "==0.1.15" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otlp'", specifier = "==1.39.1" },
     { name = "opentelemetry-sdk", marker = "extra == 'otlp'", specifier = "==1.39.1" },
     { name = "openwakeword", marker = "extra == 'wake'", specifier = "==0.6.0" },
@@ -2935,6 +2937,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/55/13/17e87641b89b74552ed408a92b231283786523edddc95f3545809fab673c/openai-2.24.0.tar.gz", hash = "sha256:1e5769f540dbd01cb33bc4716a23e67b9d695161a734aff9c5f925e2bf99a673", size = 658717, upload-time = "2026-02-24T20:02:07.958Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c9/30/844dc675ee6902579b8eef01ed23917cc9319a1c9c0c14ec6e39340c96d0/openai-2.24.0-py3-none-any.whl", hash = "sha256:fed30480d7d6c884303287bde864980a4b137b60553ffbcf9ab4a233b7a73d94", size = 1120122, upload-time = "2026-02-24T20:02:05.669Z" },
+]
+
+[[package]]
+name = "opensandbox"
+version = "0.1.15"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/43/21/654a3d69815b09690e926d553f3f4a178640d1206000a1b49f5e22c8eb68/opensandbox-0.1.15.tar.gz", hash = "sha256:017abc9b399b88da51bf077d6fb94ee89b1783e601495e85ba85fed478fed1b0", size = 228729, upload-time = "2026-07-24T09:36:29.988Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d5/5c/ab87ea696531210790feb8f575471036fccba29dedaff201736f15bbb3a7/opensandbox-0.1.15-py3-none-any.whl", hash = "sha256:992b01490551f4d8e3f99caa25e34cb9d1690f0c5027eeebab912738291957d1", size = 538522, upload-time = "2026-07-24T09:36:28.277Z" },
 ]
 
 [[package]]
