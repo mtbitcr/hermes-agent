@@ -42,6 +42,34 @@ _EXECUTION_TIER = {
     ),
 }
 
+# The explicit repository write boundary for one created task. The field stays
+# optional so a proposal committed before it existed still replays unchanged
+# (the kernel keeps that task's historical NULL whole-repository ownership),
+# but omission is legacy/non-repository behaviour only: the trusted Server 2
+# dispatch refuses to provision a coding sandbox for a task whose scope is
+# NULL, so any task that will execute in or change a repository has to state
+# its boundary here — and the planner needs that rule while it is drafting,
+# not after the owner has approved a task that cannot then be provisioned.
+# Entries are validated by the native owned-paths contract (literal canonical
+# relative POSIX paths — no globs, no '..', no '.git'), and a mutating scope
+# requires the Project to have a primary repository folder. This is never
+# inferred from the assignee or the task class.
+_OWNED_PATHS = {
+    "type": "array",
+    "maxItems": 64,
+    "items": {"type": "string", "maxLength": 512},
+    "description": (
+        "Repository write boundary for this task, as canonical "
+        "repository-relative paths (a file or a directory prefix). Every "
+        "repository-executing or coding task MUST state its scope here: use "
+        "[] only for genuinely read-only repository work, and ['.'] only when "
+        "whole-repository mutation is actually approved. Omitting the field is "
+        "legacy/non-repository behaviour and cannot provision a coding "
+        "sandbox, so a coding task that omits it will not be able to run. "
+        "Wildcards, absolute paths, '..' and '.git' are rejected."
+    ),
+}
+
 
 def _handle_bootstrap(args: dict, **kw) -> str:
     try:
@@ -273,8 +301,9 @@ registry.register(
             "Project and Kanban Task graph. For large projects, create only the "
             "current executable milestone (maximum 12 tasks) and keep future "
             "milestones as roadmap context. The board, author, actor, profile, "
-            "session and filesystem scope are derived by the trusted kernel. "
-            "Idempotent and guarded by one exact human confirmation."
+            "session and every host filesystem path are derived by the trusted "
+            "kernel; a task may declare only a repository-relative write "
+            "boundary. Idempotent and guarded by one exact human confirmation."
         ),
         "parameters": {
             "type": "object",
@@ -343,6 +372,7 @@ registry.register(
                                 ),
                             },
                             "execution_tier": _EXECUTION_TIER,
+                            "owned_paths": _OWNED_PATHS,
                             "parents": {
                                 "type": "array",
                                 "items": {"type": "integer", "minimum": 0},
@@ -401,6 +431,7 @@ _PROJECT_TASK_SPEC = {
             "description": "Stable logical responsibility; separate from the runtime profile.",
         },
         "execution_tier": _EXECUTION_TIER,
+        "owned_paths": _OWNED_PATHS,
     },
     "required": ["title", "body", "assignee", "responsibility", "execution_tier"],
 }

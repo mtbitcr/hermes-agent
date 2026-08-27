@@ -7,6 +7,7 @@ import inspect
 import multiprocessing
 import os
 import sqlite3
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -3295,6 +3296,416 @@ def test_project_plan_replace_preserves_history_edges_and_replays(ctx):
             "SELECT COUNT(*) FROM task_events WHERE task_id IN (?, ?)",
             (source_id, replacement_id),
         ).fetchone()[0] == event_count
+
+
+# ---------------------------------------------------------------------------
+# Explicit repository ownership scope on owner-created tasks
+# ---------------------------------------------------------------------------
+
+
+def _project_repo(tmp_path: Path, ctx, project_id: str) -> Path:
+    """Attach a real git repo as the Project's primary folder."""
+    repo = tmp_path / "owner-repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True, capture_output=True, text=True,
+    )
+    (repo / "README.md").write_text("owner\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=T", "-c", "user.email=t@e.x",
+         "-c", "commit.gpgsign=false", "add", "."],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=T", "-c", "user.email=t@e.x",
+         "-c", "commit.gpgsign=false", "commit", "-m", "init"],
+        check=True, capture_output=True, text=True,
+    )
+    with projects_db.connect_closing() as pconn:
+        projects_db.add_folder(pconn, project_id, str(repo), is_primary=True)
+    return repo
+
+
+def test_project_plan_replace_carries_an_explicit_ownership_scope(ctx, tmp_path):
+    """An owner-approved replace persists the scope, worktree, and locks."""
+    setup = _bootstrap_board(ctx)
+    repo = _project_repo(tmp_path, ctx, setup["project_id"])
+    with kanban_db.connect(board=setup["board"]) as conn:
+        source_id = kanban_db.create_task(
+            conn,
+            title="Unscoped implementation",
+            assignee="default",
+            parents=[setup["task_id"]],
+            project_id=setup["project_id"],
+        )
+        downstream_id = kanban_db.create_task(
+            conn,
+            title="Review the scoped implementation",
+            assignee="default",
+            parents=[source_id],
+            project_id=setup["project_id"],
+        )
+        source_ref = _project_task_ref(conn, source_id)
+        source_events = kanban_db.task_event_revision(conn, source_id)
+
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "replace",
+            "reason": "Bound the retry to exactly the files it may change.",
+            "target": source_ref,
+            "replacement": {
+                "title": "Scoped retry of the implementation",
+                "body": "Change only the owned subtree and its tests.",
+                "assignee": "default",
+                "execution_tier": "deep",
+                "responsibility": "R09",
+                "owned_paths": ["src/api", "tests/api"],
+            },
+        }],
+        idempotency_key="steward-replace-scoped",
+    )
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result["ok"] is True
+    replacement_id = result["created_task_ids"][0]
+    with kanban_db.connect(board=setup["board"]) as conn:
+        replacement = kanban_db.get_task(conn, replacement_id)
+        # The explicit boundary, exactly as approved and canonicalised.
+        assert replacement.owned_paths == ["src/api", "tests/api"]
+        # A mutating scope must land in an isolated project worktree.
+        assert replacement.workspace_kind == "worktree"
+        assert replacement.workspace_path == str(
+            repo / ".worktrees" / replacement_id
+        )
+        # The route lock still binds the whole approved route tuple.
+        assert replacement.model_policy_lock == kanban_db.mint_policy_lock(
+            "default", "anthropic", "claude-opus-5", "max", "deep",
+        )
+        assert replacement.responsibility == "R09"
+        with pytest.raises(RuntimeError, match="owner-governed"):
+            kanban_db.set_model_override(
+                conn, replacement_id, "claude-sonnet-5", provider="anthropic",
+            )
+        # History and dependency edges survive the replacement.
+        assert kanban_db.get_task(conn, source_id).status == "archived"
+        assert kanban_db.task_event_revision(conn, source_id) > source_events
+        assert kanban_db.parent_ids(conn, replacement_id) == [setup["task_id"]]
+        assert replacement_id in kanban_db.parent_ids(conn, downstream_id)
+
+    replay = _commit_project_plan(ctx, **args)
+    assert replay == result
+
+
+@pytest.mark.parametrize("action", ["add", "replace", "split", "merge"])
+def test_every_plan_action_that_creates_a_task_can_carry_a_scope(
+    ctx, tmp_path, action
+):
+    setup = _bootstrap_board(ctx)
+    _project_repo(tmp_path, ctx, setup["project_id"])
+    spec = {
+        "title": "Scoped work item",
+        "body": "Change only the owned subtree.",
+        "assignee": "default",
+        "execution_tier": "routine",
+        "responsibility": "R10",
+        "owned_paths": ["docs"],
+    }
+    with kanban_db.connect(board=setup["board"]) as conn:
+        # replace/split/merge mutate their targets, so a target must be a work
+        # task: the Project's control anchor is never mutable.
+        target = _project_task_ref(
+            conn,
+            kanban_db.create_task(
+                conn,
+                title="First mergeable item",
+                assignee="default",
+                parents=[setup["task_id"]],
+                project_id=setup["project_id"],
+            ),
+        )
+        sibling = _project_task_ref(
+            conn,
+            kanban_db.create_task(
+                conn,
+                title="Second mergeable item",
+                assignee="default",
+                parents=[setup["task_id"]],
+                project_id=setup["project_id"],
+            ),
+        )
+    if action == "add":
+        change = {
+            "action": "add", "reason": "Add one scoped task.", **spec,
+            "existing_parents": [], "new_parents": [],
+        }
+    elif action == "replace":
+        change = {
+            "action": "replace", "reason": "Rescope the stalled task.",
+            "target": target, "replacement": spec,
+        }
+    elif action == "split":
+        change = {
+            "action": "split", "reason": "Split into two disjoint scopes.",
+            "target": target,
+            "replacements": [
+                {**spec, "owned_paths": ["docs"], "parents": []},
+                {**spec, "owned_paths": ["src"], "parents": []},
+            ],
+        }
+    else:
+        change = {
+            "action": "merge", "reason": "Merge into one scoped task.",
+            "targets": [target, sibling], "replacement": spec,
+        }
+
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(
+        ctx, **_project_plan_args(
+            setup, [change], idempotency_key=f"steward-scope-{action}",
+        )
+    )
+    approver.join()
+
+    assert result["ok"] is True
+    with kanban_db.connect(board=setup["board"]) as conn:
+        scopes = [
+            kanban_db.get_task(conn, task_id).owned_paths
+            for task_id in result["created_task_ids"]
+        ]
+    assert all(scope for scope in scopes), scopes
+    assert scopes[0] == ["docs"]
+
+
+def test_a_plan_without_a_scope_keeps_the_default_boundary(ctx, tmp_path):
+    """Backward compatibility: omitting the field changes nothing."""
+    setup = _bootstrap_board(ctx)
+    _project_repo(tmp_path, ctx, setup["project_id"])
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(
+        ctx, **_project_plan_args(
+            setup,
+            [{
+                "action": "add",
+                "reason": "Add one ordinary task.",
+                "title": "Ordinary work item",
+                "body": "No explicit boundary is declared.",
+                "assignee": "default",
+                "execution_tier": "routine",
+                "existing_parents": [],
+                "new_parents": [],
+            }],
+            idempotency_key="steward-scope-absent",
+        )
+    )
+    approver.join()
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert kanban_db.get_task(
+            conn, result["created_task_ids"][0]
+        ).owned_paths is None
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "src",
+        ["/etc/passwd"],
+        ["../escape"],
+        ["src/*"],
+        [".git"],
+        [".git/config"],
+        ["src/../../etc"],
+        [".", "src"],
+        [""],
+        [None],
+        ["src" + "/deep" * 200],
+    ],
+)
+def test_a_malformed_scope_is_refused_before_approval(ctx, tmp_path, scope):
+    setup = _bootstrap_board(ctx)
+    _project_repo(tmp_path, ctx, setup["project_id"])
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "add",
+            "reason": "Attempt an unsafe boundary.",
+            "title": "Unsafe work item",
+            "body": "This must never reach an approval prompt.",
+            "assignee": "default",
+            "execution_tier": "routine",
+            "existing_parents": [],
+            "new_parents": [],
+            "owned_paths": scope,
+        }],
+        idempotency_key="steward-scope-malformed",
+    )
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        _commit_project_plan(ctx, **args)
+    assert excinfo.value.code == "invalid_ownership_scope"
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = 'Unsafe work item'"
+        ).fetchone()[0] == 0
+
+
+def test_a_mutating_scope_needs_a_project_repository(ctx):
+    setup = _bootstrap_board(ctx)  # bootstrap attaches no folders
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "add",
+            "reason": "Declare a boundary with no repository behind it.",
+            "title": "Repo-less scoped item",
+            "body": "There is nothing to scope a worktree in.",
+            "assignee": "default",
+            "execution_tier": "routine",
+            "existing_parents": [],
+            "new_parents": [],
+            "owned_paths": ["src"],
+        }],
+        idempotency_key="steward-scope-no-repo",
+    )
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        _commit_project_plan(ctx, **args)
+    assert excinfo.value.code == "ownership_scope_unavailable"
+
+
+def test_a_read_only_scope_needs_no_project_repository(ctx):
+    setup = _bootstrap_board(ctx)
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(
+        ctx, **_project_plan_args(
+            setup,
+            [{
+                "action": "add",
+                "reason": "Add one explicitly read-only task.",
+                "title": "Read-only investigation",
+                "body": "Report findings; change nothing.",
+                "assignee": "default",
+                "execution_tier": "routine",
+                "existing_parents": [],
+                "new_parents": [],
+                "owned_paths": [],
+            }],
+            idempotency_key="steward-scope-readonly",
+        )
+    )
+    approver.join()
+    assert result["ok"] is True
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert kanban_db.get_task(
+            conn, result["created_task_ids"][0]
+        ).owned_paths == []
+
+
+def test_task_graph_carries_explicit_scopes_into_committed_children(ctx, tmp_path):
+    setup = _bootstrap_board(ctx)
+    repo = _project_repo(tmp_path, ctx, setup["project_id"])
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(
+        ctx,
+        idempotency_key="graph-scoped-milestone",
+        mode="existing",
+        project_id=setup["project_id"],
+        request_title="Deliver the scoped milestone",
+        specification="Two workers own disjoint subtrees.",
+        current_milestone="Split the delivery by ownership.",
+        owner_visible_result="Both subtrees change without conflicting.",
+        root_assignee="default",
+        tasks=[
+            {
+                "title": "Own the api subtree",
+                "body": "Change only src/api.",
+                "assignee": "default",
+                "responsibility": "R11",
+                "execution_tier": "routine",
+                "parents": [],
+                "owned_paths": ["src/api"],
+            },
+            {
+                "title": "Own the web subtree",
+                "body": "Change only src/web.",
+                "assignee": "default",
+                "responsibility": "R12",
+                "execution_tier": "routine",
+                "parents": [],
+                "owned_paths": ["src/web"],
+            },
+        ],
+    )
+    approver.join()
+
+    assert result["ok"] is True
+    with kanban_db.connect(board=setup["board"]) as conn:
+        children = [
+            kanban_db.get_task(conn, task_id) for task_id in result["task_ids"]
+        ]
+    assert [child.owned_paths for child in children] == [["src/api"], ["src/web"]]
+    for child in children:
+        assert child.workspace_kind == "worktree"
+        assert child.workspace_path == str(repo / ".worktrees" / child.id)
+        assert child.model_policy_lock
+
+
+def test_task_graph_scope_is_never_inferred_from_the_assignee(ctx, tmp_path):
+    # The remote coding worker is the profile most likely to have a boundary
+    # guessed for it, so it is the one this asserts nothing is guessed from.
+    _install_profiles("raphael-claude-worker")
+    setup = _bootstrap_board(ctx)
+    _project_repo(tmp_path, ctx, setup["project_id"])
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(
+        ctx,
+        idempotency_key="graph-unscoped-milestone",
+        mode="existing",
+        project_id=setup["project_id"],
+        request_title="Deliver the unscoped milestone",
+        specification="No boundary is declared for either task.",
+        current_milestone="Keep the historical boundary.",
+        owner_visible_result="The tasks behave exactly as before.",
+        root_assignee="default",
+        tasks=[{
+            "title": "Do the work",
+            "body": "No boundary is declared.",
+            "assignee": "raphael-claude-worker",
+            "responsibility": "R13",
+            "execution_tier": "routine",
+            "parents": [],
+        }],
+    )
+    approver.join()
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert kanban_db.get_task(
+            conn, result["task_ids"][0]
+        ).owned_paths is None
+
+
+def test_a_new_project_cannot_declare_a_mutating_scope(ctx):
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        _commit_task_graph(
+            ctx,
+            idempotency_key="graph-new-scoped",
+            mode="new",
+            project_name="Brand New Project",
+            request_title="Deliver something scoped",
+            specification="A new Project has no repository yet.",
+            current_milestone="Refuse before asking the owner.",
+            owner_visible_result="Nothing is created.",
+            root_assignee="default",
+            tasks=[{
+                "title": "Scoped work in a repo-less project",
+                "body": "There is no repository to scope.",
+                "assignee": "default",
+                "responsibility": "R14",
+                "execution_tier": "routine",
+                "parents": [],
+                "owned_paths": ["src"],
+            }],
+        )
+    assert excinfo.value.code == "ownership_scope_unavailable"
 
 
 def test_project_plan_split_is_atomic_preserves_history_and_replays(ctx):

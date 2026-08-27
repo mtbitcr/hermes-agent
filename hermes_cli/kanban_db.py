@@ -10885,6 +10885,11 @@ def apply_owner_project_plan(
                 reasoning_effort=spec.get("reasoning_effort"),
                 execution_tier=spec.get("execution_tier"),
                 model_policy_lock=spec.get("model_policy_lock"),
+                # Absent means legacy fail-closed whole-repository ownership,
+                # exactly as before this key existed; a present value is the
+                # owner-approved explicit write boundary and forces the
+                # project-anchored worktree inside create_task.
+                owned_paths=spec.get("owned_paths"),
                 created_by=actor,
                 parents=parent_task_ids,
                 idempotency_key=_owner_plan_task_key(
@@ -11977,6 +11982,225 @@ def record_worktree_base(
         if not existing:
             raise WorktreeScopeError("could not persist the worktree base commit")
         return existing
+
+
+# ---------------------------------------------------------------------------
+# Per-run remote sandbox reservation (native authority, no side store)
+# ---------------------------------------------------------------------------
+#
+# A run that hands work to a remote sandbox (see
+# :func:`_materialize_remote_worktree_handoff`) must own exactly ONE sandbox:
+# two concurrent provisioning retries inside one worker turn would otherwise
+# leave a live machine nobody tracks. The reservation therefore lives in the
+# board's append-only ``task_events`` log, folded per run — not in a side
+# JSON file:
+#
+#   * ``task_events`` is append-only and never rewritten, unlike
+#     ``task_runs.metadata`` (which every ``UPDATE task_runs SET metadata``
+#     writer replaces wholesale, so a reservation there could be silently
+#     dropped mid-run and a duplicate machine created).
+#   * ``write_txn`` is ``BEGIN IMMEDIATE``, so folding the log and appending
+#     the next transition in one transaction IS the compare-and-swap. A
+#     generation number makes the CAS explicit and visible in the history.
+#   * The record is board-scoped, so it resolves identically from every
+#     profile home, and it shows up in the ordinary task history an operator
+#     already reads.
+
+#: The transition kinds this reservation appends, in ``task_events.kind``.
+RUN_SANDBOX_EVENTS = (
+    "sandbox_reserved",
+    "sandbox_provisioned",
+    "sandbox_released",
+)
+_RUN_SANDBOX_STATES = {
+    "sandbox_reserved": "reserved",
+    "sandbox_provisioned": "active",
+    "sandbox_released": "released",
+}
+#: Which prior states each transition may follow. ``reserved`` opens a new
+#: generation; the other two settle the generation already open.
+_RUN_SANDBOX_FROM = {
+    "sandbox_reserved": {"absent", "released"},
+    "sandbox_provisioned": {"reserved"},
+    "sandbox_released": {"reserved", "active"},
+}
+_RUN_SANDBOX_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_MAX_RUN_SANDBOX_RECEIPT_KEYS = 32
+
+
+class RunSandboxConflict(Exception):
+    """Another attempt advanced this run's sandbox reservation first."""
+
+
+def _run_sandbox_receipt(value: Any) -> dict:
+    """Admit only a flat, printable, JSON-safe receipt.
+
+    The receipt is read back by a model-facing tool, so the shapes that can
+    be persisted here are deliberately narrow: no nested containers beyond
+    one level, no floats, and no non-string keys. A malformed or hostile
+    payload is refused at write time rather than surfacing later.
+    """
+    if not isinstance(value, dict) or not value:
+        raise ValueError("sandbox receipt must be a non-empty object")
+    if len(value) > _MAX_RUN_SANDBOX_RECEIPT_KEYS:
+        raise ValueError("sandbox receipt has too many fields")
+
+    def _scalar(item: Any) -> bool:
+        return isinstance(item, (str, bool)) or (
+            isinstance(item, int) and not isinstance(item, bool)
+        )
+
+    for key, item in value.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("sandbox receipt keys must be non-empty strings")
+        if _scalar(item):
+            continue
+        if isinstance(item, list) and all(isinstance(entry, str) for entry in item):
+            continue
+        if isinstance(item, dict) and all(
+            isinstance(entry_key, str) and _scalar(entry)
+            for entry_key, entry in item.items()
+        ):
+            continue
+        raise ValueError(f"sandbox receipt field {key!r} has an unsupported shape")
+    return json.loads(json.dumps(value))
+
+
+def read_run_sandbox(
+    conn: sqlite3.Connection, task_id: str, *, run_id: int
+) -> dict:
+    """Fold one run's sandbox events into its current reservation.
+
+    Returns ``{"generation", "state", "sandbox_id", "receipt"}``. ``state``
+    is ``absent`` before the first reservation, then ``reserved`` (being
+    provisioned), ``active`` (a machine exists and its receipt is durable),
+    or ``released`` (the generation was abandoned or retired). Only events
+    carrying this exact ``run_id`` are folded, so a later run always starts
+    from ``absent`` and can never adopt a previous run's machine.
+    """
+    run_id = int(run_id)
+    record = {
+        "generation": 0,
+        "state": "absent",
+        "sandbox_id": None,
+        "receipt": None,
+    }
+    placeholders = ", ".join("?" for _ in RUN_SANDBOX_EVENTS)
+    rows = conn.execute(
+        f"SELECT kind, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        f"AND kind IN ({placeholders}) ORDER BY id ASC",
+        (task_id, run_id, *RUN_SANDBOX_EVENTS),
+    ).fetchall()
+    for row in rows:
+        kind = str(row["kind"])
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        generation = payload.get("generation")
+        if not isinstance(generation, int) or isinstance(generation, bool):
+            # An unparseable transition is not evidence of a live machine;
+            # fail closed by treating the reservation as still open.
+            record["state"] = "reserved"
+            continue
+        record["generation"] = generation
+        record["state"] = _RUN_SANDBOX_STATES[kind]
+        if kind == "sandbox_provisioned":
+            sandbox_id = payload.get("sandbox_id")
+            receipt = payload.get("receipt")
+            record["sandbox_id"] = (
+                sandbox_id if isinstance(sandbox_id, str) and sandbox_id else None
+            )
+            record["receipt"] = receipt if isinstance(receipt, dict) else None
+            if record["sandbox_id"] is None or record["receipt"] is None:
+                # A provisioned event we cannot read is not reusable, but it
+                # does mean a machine may exist: keep the generation open so
+                # the caller must retire it before creating another.
+                record["state"] = "reserved"
+        else:
+            record["sandbox_id"] = None
+            record["receipt"] = None
+    return record
+
+
+def advance_run_sandbox(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    transition: str,
+    expected_generation: int,
+    sandbox_id: Optional[str] = None,
+    receipt: Optional[dict] = None,
+    reason: Optional[str] = None,
+) -> dict:
+    """Append one sandbox reservation transition, or refuse on drift.
+
+    The fold and the append share one ``BEGIN IMMEDIATE`` transaction, so at
+    most one concurrent caller can move a given generation forward.
+    ``expected_generation`` is the generation the caller last observed;
+    ``RunSandboxConflict`` means another attempt already advanced it and the
+    caller must re-read instead of creating a second machine.
+
+    ``sandbox_reserved`` opens ``expected_generation + 1``.
+    ``sandbox_provisioned`` records the durable receipt for the open
+    generation. ``sandbox_released`` closes it (an abandoned attempt, or a
+    machine whose liveness evidence says it is gone).
+    """
+    if transition not in _RUN_SANDBOX_STATES:
+        raise ValueError(f"unknown sandbox transition {transition!r}")
+    run_id = int(run_id)
+    if isinstance(expected_generation, bool) or not isinstance(
+        expected_generation, int
+    ):
+        raise ValueError("expected_generation must be an integer")
+    payload: dict[str, Any] = {}
+    if transition == "sandbox_provisioned":
+        if not isinstance(sandbox_id, str) or not _RUN_SANDBOX_ID_RE.fullmatch(
+            sandbox_id
+        ):
+            raise ValueError("sandbox_id must be a printable sandbox identifier")
+        payload["sandbox_id"] = sandbox_id
+        payload["receipt"] = _run_sandbox_receipt(receipt)
+    elif sandbox_id is not None or receipt is not None:
+        raise ValueError(f"{transition} does not carry a sandbox_id or receipt")
+    if reason is not None:
+        cleaned = str(reason).strip()
+        if not cleaned or len(cleaned) > 100:
+            raise ValueError("reason must be a short non-empty code")
+        payload["reason"] = cleaned
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks "
+            "WHERE id = ? AND task_kind = 'work'",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise RunSandboxConflict(f"unknown task {task_id}")
+        if row["status"] != "running" or int(row["current_run_id"] or 0) != run_id:
+            # The reservation is only meaningful for the board's own active
+            # run; a stale worker must not keep writing to it.
+            raise RunSandboxConflict("this run is no longer the task's active run")
+        current = read_run_sandbox(conn, task_id, run_id=run_id)
+        if current["generation"] != expected_generation:
+            raise RunSandboxConflict(
+                "this run's sandbox reservation advanced concurrently"
+            )
+        if current["state"] not in _RUN_SANDBOX_FROM[transition]:
+            raise RunSandboxConflict(
+                f"cannot {transition} from state {current['state']!r}"
+            )
+        generation = (
+            expected_generation + 1
+            if transition == "sandbox_reserved"
+            else expected_generation
+        )
+        payload["generation"] = generation
+        _append_event(conn, task_id, transition, payload, run_id=run_id)
+        return read_run_sandbox(conn, task_id, run_id=run_id)
 
 
 def _path_is_owned(path: str, owned_paths: list[str]) -> bool:
