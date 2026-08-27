@@ -6372,9 +6372,13 @@ def _insert_legacy_receipt(
     return digest
 
 
-def _legacy_graph_project(ctx, *, key: str, plan_key: str) -> dict:
+def _legacy_graph_project(
+    ctx, *, key: str, plan_key: str, graph_mode: str = "new",
+) -> dict:
     """Build the exact persisted shape left by a pre-anchor release."""
-    project_id = "p_" + ow._derive_id(ctx, key, "graph-project")
+    assert graph_mode in {"new", "existing"}
+    project_salt = "graph-project" if graph_mode == "new" else "existing-project"
+    project_id = "p_" + ow._derive_id(ctx, key, project_salt)
     board = "legacy-" + ow._derive_id(ctx, key, "board")[:24]
     name = "Pre-anchor Project"
     description = "Built by the release immediately before anchor authority."
@@ -6407,6 +6411,7 @@ def _legacy_graph_project(ctx, *, key: str, plan_key: str) -> dict:
             idempotency_key="owgraph_" + ow._derive_id(ctx, key, "graph-root"),
             board=board,
             project_id=project_id,
+            receipt_owned=(graph_mode == "existing"),
         )
         first_id = kanban_db.create_task(
             conn,
@@ -6451,7 +6456,7 @@ def _legacy_graph_project(ctx, *, key: str, plan_key: str) -> dict:
         assert root is not None and all(child is not None for child in children)
         graph_result = {
             "ok": True,
-            "mode": "new",
+            "mode": graph_mode,
             "project_id": project_id,
             "project_slug": project.slug,
             "board": board,
@@ -6572,6 +6577,71 @@ def test_a_legacy_project_migrates_its_anchor_on_one_approved_plan(ctx):
         None, None, None,
     )
     assert added.status != kanban_db.PARKED_STATUS
+
+
+def test_a_legacy_existing_project_migrates_from_its_receipt_bound_root(ctx):
+    created = _legacy_graph_project(
+        ctx,
+        key="legacy-existing-anchor",
+        plan_key="legacy-existing-old-plan",
+        graph_mode="existing",
+    )
+
+    plan = _project_plan_args(
+        created,
+        [dict(_LEGACY_PLAN_CHANGE)],
+        idempotency_key="legacy-existing-plan",
+    )
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        root = conn.execute(
+            "SELECT project_id, task_kind, created_by, idempotency_key, "
+            "owner_receipt_bound FROM tasks WHERE id = ?",
+            (created["root_task_id"],),
+        ).fetchone()
+    assert root is not None
+    assert dict(root) == {
+        "project_id": created["project_id"],
+        "task_kind": "work",
+        "created_by": ctx.actor,
+        "idempotency_key": "owgraph_"
+        + ow._derive_id(ctx, "legacy-existing-anchor", "graph-root"),
+        "owner_receipt_bound": 1,
+    }
+    approver = _with_approver(ctx.session)
+    applied = _commit_project_plan(ctx, **plan)
+    approver.join()
+
+    assert applied["ok"] is True
+    assert _control_rows(created["board"], created["project_id"]) == [
+        applied["anchor_task_id"]
+    ]
+
+
+def test_a_legacy_existing_project_rejects_an_unrelated_root_identity(ctx):
+    created = _legacy_graph_project(
+        ctx,
+        key="legacy-existing-wrong-root",
+        plan_key="legacy-existing-wrong-root-old-plan",
+        graph_mode="existing",
+    )
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        with ow.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+                ("unrelated-owner-root", created["root_task_id"]),
+            )
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        _commit_project_plan(
+            ctx,
+            **_project_plan_args(
+                created,
+                [dict(_LEGACY_PLAN_CHANGE)],
+                idempotency_key="legacy-existing-wrong-root-plan",
+            ),
+        )
+    assert excinfo.value.code == "project_not_owned"
+    assert _control_rows(created["board"], created["project_id"]) == []
 
 
 def test_a_denied_plan_never_migrates_a_legacy_anchor(ctx):

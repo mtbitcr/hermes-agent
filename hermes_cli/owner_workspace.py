@@ -4287,6 +4287,7 @@ def _receipt_bound_control_anchor(
 
 def _legacy_anchor_migration_key(
     pconn: sqlite3.Connection,
+    kconn: sqlite3.Connection,
     ctx: OwnerContext,
     project_id: str,
     *,
@@ -4294,7 +4295,7 @@ def _legacy_anchor_migration_key(
     board_slug: str,
 ) -> Optional[str]:
     """Return a stable migration key only for the known pre-anchor receipt shape."""
-    creations: list[tuple[str, dict]] = []
+    graphs: list[tuple[str, dict]] = []
     for row in pconn.execute(
         "SELECT idempotency_key, operation, project_id, board_slug, task_id, "
         "result_json FROM owner_workspace_receipts "
@@ -4359,8 +4360,7 @@ def _legacy_anchor_migration_key(
                 or task_count != len(task_ids)
             ):
                 return None
-            if result["mode"] == "new":
-                creations.append((str(row["idempotency_key"]), result))
+            graphs.append((str(row["idempotency_key"]), result))
             continue
 
         created_task_ids = result.get("created_task_ids")
@@ -4391,13 +4391,28 @@ def _legacy_anchor_migration_key(
             )
         ):
             return None
-    if len(creations) != 1:
+    if len(graphs) != 1:
         return None
-    creation_key, creation = creations[0]
-    if (
-        project_id != "p_" + _derive_id(ctx, creation_key, "graph-project")
-    ):
-        return None
+    graph_key, graph = graphs[0]
+    if graph["mode"] == "new":
+        if project_id != "p_" + _derive_id(ctx, graph_key, "graph-project"):
+            return None
+    else:
+        root = kconn.execute(
+            "SELECT project_id, task_kind, created_by, idempotency_key, "
+            "owner_receipt_bound FROM tasks WHERE id = ?",
+            (graph["root_task_id"],),
+        ).fetchone()
+        expected_root_key = "owgraph_" + _derive_id(ctx, graph_key, "graph-root")
+        if (
+            root is None
+            or root["project_id"] != project_id
+            or root["task_kind"] != "work"
+            or root["created_by"] != ctx.actor
+            or root["idempotency_key"] != expected_root_key
+            or root["owner_receipt_bound"] != 1
+        ):
+            return None
     return "owanchor_" + _derive_id(
         ctx, project_id, _LEGACY_ANCHOR_MIGRATION_SALT,
     )
@@ -4437,6 +4452,7 @@ def _classify_project_anchor(
     if not _receipt_named_anchors(pconn, ctx, project_id):
         migration_key = _legacy_anchor_migration_key(
             pconn,
+            kconn,
             ctx,
             project_id,
             project_slug=project_slug,
