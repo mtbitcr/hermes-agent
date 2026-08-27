@@ -13,6 +13,9 @@ Tests cover:
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -301,6 +304,123 @@ class TestOwnerWorkspaceRunContext:
             assert read == [
                 ("default", conversation, "resp_older_run_proposal"),
             ]
+        finally:
+            store.close()
+
+    def test_stored_replace_proposal_derives_exact_native_run_payload(self):
+        conversation = "raphael-owner-" + "4" * 32
+        response_id = "resp_native_replace_proposal"
+        idempotency_key = "conversation-" + hashlib.sha256(
+            response_id.encode("utf-8")
+        ).hexdigest()
+        secret = "owner-executor-test-key"
+        task = {
+            "id": "task_old_implementation",
+            "title": "Repair the stopped implementation",
+            "status": "triage",
+            "event_revision": 7,
+            "parent_ids": ["task_parent"],
+            "child_ids": ["task_verifier"],
+        }
+        canonical = json.dumps({
+            "version": 1,
+            "project_id": "project_raphael",
+            "task_id": task["id"],
+            "title": task["title"],
+            "status": task["status"],
+            "event_revision": task["event_revision"],
+            "parent_ids": task["parent_ids"],
+            "child_ids": task["child_ids"],
+        }, separators=(",", ":"), ensure_ascii=False)
+        target_ref = "tr_" + base64.urlsafe_b64encode(
+            hmac.new(
+                secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256,
+            ).digest()
+        ).decode("ascii").rstrip("=")
+        replacement = {
+            "title": "Complete the bounded recovery",
+            "body": "Preserve the findings and complete the same delivery chain.",
+            "assignee": "raphael-claude-worker",
+            "responsibility": "R07",
+            "execution_tier": "deep",
+        }
+        proposal = _owner_existing_proposal(changes=[{
+            "action": "replace",
+            "reason": "The earlier attempt stopped before producing a result.",
+            "target_ref": target_ref,
+            "replacement": replacement,
+        }])
+        payload = {
+            "idempotency_key": idempotency_key,
+            "project_id": "project_raphael",
+            "trigger": "owner_request",
+            "request_title": proposal["request_title"],
+            "summary": proposal["summary"],
+            "specification": proposal["specification"],
+            "current_milestone": proposal["current_milestone"],
+            "owner_visible_result": proposal["owner_visible_result"],
+            "later_milestones": proposal["later_milestones"],
+            "changes": [{
+                "action": "replace",
+                "reason": proposal["changes"][0]["reason"],
+                "target": {
+                    "task_id": task["id"],
+                    "expected_status": task["status"],
+                    "expected_revision": task["event_revision"],
+                },
+                "replacement": replacement,
+            }],
+        }
+        authority = {
+            "proposal_profile": "default",
+            "conversation": conversation,
+            "response_id": response_id,
+            "claim_id": "claim_" + "6" * 32,
+            "operation": "owner_project_plan_commit",
+            "idempotency_key": idempotency_key,
+            "payload": payload,
+        }
+        context = {
+            "profile": "default",
+            "mode": "existing",
+            "project_slug": "raphael-workspace",
+            "project_name": "Raphael Workspace",
+        }
+        snapshot = {
+            "project": {"id": "project_raphael"},
+            "columns": [{"name": "triage", "tasks": [task]}],
+        }
+        store = ResponseStore(max_size=10)
+        adapter = APIServerAdapter.__new__(APIServerAdapter)
+        adapter._response_store = store
+        adapter._expected_api_key = lambda: secret
+        try:
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": "Continue the stopped work."},
+                    {"role": "assistant", "content": json.dumps(proposal)},
+                ],
+            })
+            assert store.set_conversation(
+                conversation, response_id, owner_proposal=True,
+            ) is True
+            with (
+                patch(
+                    "hermes_cli.owner_workspace.resolve_owner_context",
+                    return_value=object(),
+                ),
+                patch(
+                    "hermes_cli.owner_workspace.read_project_snapshot",
+                    return_value=snapshot,
+                ),
+            ):
+                binding = adapter._validated_owner_proposal_authority(
+                    authority, context, "default",
+                )
+
+            assert binding["operation"] == "owner_project_plan_commit"
+            assert binding["idempotency_key"] == idempotency_key
         finally:
             store.close()
 

@@ -3000,7 +3000,7 @@ def test_project_plan_resolves_and_locks_a_new_task_model_route(ctx):
     )
 
 
-@pytest.mark.parametrize("action", ["add", "split", "merge"])
+@pytest.mark.parametrize("action", ["add", "replace", "split", "merge"])
 def test_project_plan_requires_an_execution_tier_for_every_created_task(ctx, action):
     setup = _bootstrap_board(ctx)
     with kanban_db.connect(board=setup["board"]) as conn:
@@ -3028,6 +3028,13 @@ def test_project_plan_requires_an_execution_tier_for_every_created_task(ctx, act
             **spec,
             "existing_parents": [],
             "new_parents": [],
+        }
+    elif action == "replace":
+        change = {
+            "action": "replace",
+            "reason": "Replace with untiered work.",
+            "target": target,
+            "replacement": spec,
         }
     elif action == "split":
         change = {
@@ -3223,6 +3230,71 @@ def test_project_plan_approval_cannot_mutate_a_project_archived_while_waiting(ct
             task.title != "Must not land after archive"
             for task in kanban_db.list_tasks(conn)
         )
+
+
+def test_project_plan_replace_preserves_history_edges_and_replays(ctx):
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        source_id = kanban_db.create_task(
+            conn,
+            title="Stopped implementation",
+            assignee="default",
+            parents=[setup["task_id"]],
+            project_id=setup["project_id"],
+        )
+        downstream_id = kanban_db.create_task(
+            conn,
+            title="Review the repaired implementation",
+            assignee="default",
+            parents=[source_id],
+            project_id=setup["project_id"],
+        )
+        source_ref = _project_task_ref(conn, source_id)
+
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "replace",
+            "reason": "The earlier attempt stopped before producing a result.",
+            "target": source_ref,
+            "replacement": {
+                "title": "Repair the stopped implementation",
+                "body": "Preserve the findings and continue the same bounded delivery chain.",
+                "assignee": "default",
+                "execution_tier": "deep",
+                "responsibility": "R07",
+            },
+        }],
+        idempotency_key="steward-replace-stopped-work",
+    )
+    approver = _with_approver(ctx.session)
+    first = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert first["ok"] is True
+    assert first["change_count"] == 1
+    assert len(first["created_task_ids"]) == 1
+    replacement_id = first["created_task_ids"][0]
+
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert kanban_db.get_task(conn, source_id).status == "archived"
+        assert kanban_db.parent_ids(conn, replacement_id) == [setup["task_id"]]
+        assert replacement_id in kanban_db.parent_ids(conn, downstream_id)
+        replacement = kanban_db.get_task(conn, replacement_id)
+        assert replacement.responsibility == "R07"
+        assert replacement.execution_tier == "deep"
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id IN (?, ?)",
+            (source_id, replacement_id),
+        ).fetchone()[0]
+
+    replay = _commit_project_plan(ctx, **args)
+    assert replay == first
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id IN (?, ?)",
+            (source_id, replacement_id),
+        ).fetchone()[0] == event_count
 
 
 def test_project_plan_split_is_atomic_preserves_history_and_replays(ctx):

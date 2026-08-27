@@ -12564,6 +12564,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         "existing_parents": [native(ref) for ref in raw["existing_parent_refs"]],
                         "new_parents": clean(raw.get("new_parents")),
                     })
+                elif action == "replace" and set(raw) == {
+                    "action", "reason", "target_ref", "replacement",
+                }:
+                    changes.append({
+                        "action": "replace", "reason": reason,
+                        "target": native(raw.get("target_ref")),
+                        "replacement": clean(raw.get("replacement")),
+                    })
                 elif action == "split" and set(raw) == {
                     "action", "reason", "target_ref", "replacements",
                 }:
