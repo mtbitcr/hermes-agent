@@ -3496,6 +3496,7 @@ def test_project_plan_stale_snapshot_changes_nothing(ctx):
         "project_id": setup["project_id"],
         "project_slug": "board-setup",
         "change_count": 0,
+        "anchor_task_id": setup["task_id"],
     }
     with kanban_db.connect(board=setup["board"]) as conn:
         assert kanban_db.get_task(conn, target_id).status == "ready"
@@ -6301,3 +6302,720 @@ def test_the_control_anchor_never_appears_in_any_owner_or_task_only_surface(ctx)
         assert anchor not in {task.id for task in kanban_db.list_tasks(conn)}
         assert kanban_db.get_task(conn, anchor) is None
         assert kanban_db.get_task(conn, anchor, include_control=True) is not None
+
+
+# ---------------------------------------------------------------------------
+# A Project created before Projects carried an anchor is migrated, once,
+# and only on an owner-approved plan
+# ---------------------------------------------------------------------------
+
+
+_LEGACY_PLAN_CHANGE = {
+    "action": "add",
+    "reason": "The owner approved one more bounded step.",
+    "title": "Ship the migrated step",
+    "body": "Deliver the newly approved milestone step.",
+    "assignee": "default",
+    "execution_tier": "routine",
+    "existing_parents": [],
+    "new_parents": [],
+}
+
+
+def _receipt_result(ctx, key: str) -> dict:
+    with projects_db.connect_closing() as pconn:
+        row = pconn.execute(
+            "SELECT result_json FROM owner_workspace_receipts "
+            "WHERE actor = ? AND profile = ? AND idempotency_key = ?",
+            (ctx.actor, ctx.profile, key),
+        ).fetchone()
+    assert row is not None
+    return json.loads(row["result_json"])
+
+
+def _insert_legacy_receipt(
+    ctx,
+    *,
+    key: str,
+    operation: str,
+    result: dict,
+    project_id: str,
+    board: str,
+    task_id: str,
+) -> str:
+    """Insert the exact durable row shape written before anchor authority."""
+    digest = ow._digest({"legacy_receipt": key})
+    now = int(time.time())
+    with projects_db.connect_closing() as pconn:
+        ow._ensure_schema(pconn)
+        with ow.write_txn(pconn):
+            pconn.execute(
+                "INSERT INTO owner_workspace_receipts "
+                "(actor, profile, idempotency_key, operation, request_digest, "
+                "status, project_id, board_slug, task_id, result_json, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'committed', ?, ?, ?, ?, ?, ?)",
+                (
+                    ctx.actor,
+                    ctx.profile,
+                    key,
+                    operation,
+                    digest,
+                    project_id,
+                    board,
+                    task_id,
+                    json.dumps(result),
+                    now,
+                    now,
+                ),
+            )
+    return digest
+
+
+def _legacy_graph_project(ctx, *, key: str, plan_key: str) -> dict:
+    """Build the exact persisted shape left by a pre-anchor release."""
+    project_id = "p_" + ow._derive_id(ctx, key, "graph-project")
+    board = "legacy-" + ow._derive_id(ctx, key, "board")[:24]
+    name = "Pre-anchor Project"
+    description = "Built by the release immediately before anchor authority."
+
+    with projects_db.connect_closing() as pconn:
+        projects_db.create_project(
+            pconn,
+            id=project_id,
+            slug=board,
+            board_slug=board,
+            name=name,
+            description=description,
+        )
+        project = projects_db.get_project(pconn, project_id)
+    assert project is not None
+    kanban_db.create_board(
+        board,
+        name=name,
+        description=description,
+        project_id=project_id,
+    )
+
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        root_id = kanban_db.create_task(
+            conn,
+            title="Plan the first milestone",
+            body="The original owner-visible milestone.",
+            created_by=ctx.actor,
+            triage=True,
+            idempotency_key="owgraph_" + ow._derive_id(ctx, key, "graph-root"),
+            board=board,
+            project_id=project_id,
+        )
+        first_id = kanban_db.create_task(
+            conn,
+            title="Prepare the first deliverable",
+            body="The first pre-anchor task.",
+            created_by=ctx.actor,
+            board=board,
+            project_id=project_id,
+        )
+        second_id = kanban_db.create_task(
+            conn,
+            title="Verify the first deliverable",
+            body="The second pre-anchor task.",
+            created_by=ctx.actor,
+            parents=[first_id],
+            board=board,
+            project_id=project_id,
+        )
+        earlier_id = kanban_db.create_task(
+            conn,
+            title="Ship the earlier step",
+            body="A task added by the old Project plan path.",
+            created_by=ctx.actor,
+            idempotency_key="owplan_" + ow._derive_id(ctx, plan_key, "plan-task"),
+            board=board,
+            project_id=project_id,
+        )
+        with ow.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (root_id,))
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (first_id,))
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (second_id,))
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (earlier_id,))
+            for child_id in (first_id, second_id):
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                    "VALUES (?, ?)",
+                    (child_id, root_id),
+                )
+
+        root = kanban_db.get_task(conn, root_id)
+        children = [kanban_db.get_task(conn, first_id), kanban_db.get_task(conn, second_id)]
+        assert root is not None and all(child is not None for child in children)
+        graph_result = {
+            "ok": True,
+            "mode": "new",
+            "project_id": project_id,
+            "project_slug": project.slug,
+            "board": board,
+            "root_task_id": root_id,
+            "root_status": root.status,
+            "task_ids": [first_id, second_id],
+            "task_statuses": [child.status for child in children],
+            "task_count": 2,
+        }
+        assert set(graph_result) == set(ow._LEGACY_GRAPH_RESULT_FIELDS)
+        graph_digest = _insert_legacy_receipt(
+            ctx,
+            key=key,
+            operation="owner_task_graph_commit",
+            result=graph_result,
+            project_id=project_id,
+            board=board,
+            task_id=root_id,
+        )
+        assert graph_digest
+
+        executable_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks "
+            "WHERE project_id = ? AND task_kind = 'work' "
+            "AND status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'review')",
+            (project_id,),
+        ).fetchone()["n"]
+        plan_result = {
+            "applied": True,
+            "change_count": 1,
+            "created_task_ids": [earlier_id],
+            "affected_task_ids": [earlier_id],
+            "executable_task_count": int(executable_count),
+        }
+        plan_receipt = {
+            "ok": True,
+            "project_id": project_id,
+            "project_slug": project.slug,
+            "board": board,
+            "risk_level": "standard",
+            **plan_result,
+        }
+        assert set(plan_receipt) == set(ow._LEGACY_PLAN_RESULT_FIELDS)
+        plan_digest = _insert_legacy_receipt(
+            ctx,
+            key=plan_key,
+            operation="owner_project_plan_commit",
+            result=plan_receipt,
+            project_id=project_id,
+            board=board,
+            task_id=root_id,
+        )
+        with ow.write_txn(conn):
+            kanban_db._append_event(
+                conn,
+                root_id,
+                "owner_project_plan_applied",
+                {
+                    "actor": ctx.actor,
+                    "profile": ctx.profile,
+                    "idempotency_key": plan_key,
+                    "request_digest": plan_digest,
+                    "trigger": "owner_request",
+                    "plan_summary": "The approved pre-anchor plan.",
+                    "current_milestone": "Ship the earlier step.",
+                    "later_milestones": [],
+                    "result": plan_result,
+                },
+            )
+
+    created = {
+        "project_id": project_id,
+        "project_slug": project.slug,
+        "board": board,
+        "root_task_id": root_id,
+        "task_ids": [first_id, second_id],
+    }
+    assert _control_rows(board, project_id) == []
+    return created
+
+
+def test_a_legacy_project_migrates_its_anchor_on_one_approved_plan(ctx):
+    created = _legacy_graph_project(
+        ctx, key="legacy-anchor", plan_key="legacy-anchor-old-plan",
+    )
+    before = ow.read_project_snapshot(ctx, created["project_slug"])
+    before_ids = {
+        task["id"] for column in before["columns"] for task in column["tasks"]
+    }
+
+    plan = _project_plan_args(
+        created, [dict(_LEGACY_PLAN_CHANGE)], idempotency_key="legacy-anchor-plan",
+    )
+    approver = _with_approver(ctx.session)
+    applied = _commit_project_plan(ctx, **plan)
+    approver.join()
+
+    assert applied["ok"] is True
+    assert applied["change_count"] == 1
+    assert _control_rows(created["board"], created["project_id"]) == [
+        applied["anchor_task_id"]
+    ]
+
+    after = ow.read_project_snapshot(ctx, created["project_slug"])
+    after_ids = {
+        task["id"] for column in after["columns"] for task in column["tasks"]
+    }
+    assert after_ids == before_ids | set(applied["created_task_ids"])
+    assert applied["anchor_task_id"] not in after_ids
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        anchor = kanban_db.get_task(
+            conn, applied["anchor_task_id"], include_control=True,
+        )
+        assert kanban_db.get_task(conn, applied["anchor_task_id"]) is None
+        added = kanban_db.get_task(conn, applied["created_task_ids"][0])
+    assert anchor.status == _ANCHOR_STATUS
+    assert (anchor.assignee, anchor.execution_tier, anchor.model_policy_lock) == (
+        None, None, None,
+    )
+    assert added.status != kanban_db.PARKED_STATUS
+
+
+def test_a_denied_plan_never_migrates_a_legacy_anchor(ctx):
+    created = _legacy_graph_project(
+        ctx, key="legacy-denied", plan_key="legacy-denied-old-plan",
+    )
+    board, project_id = created["board"], created["project_id"]
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        before = (
+            conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"],
+            conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"],
+        )
+
+    plan = _project_plan_args(
+        created, [dict(_LEGACY_PLAN_CHANGE)], idempotency_key="legacy-denied-plan",
+    )
+    with _temporarily_patch(
+        ow, "_confirm", lambda *a, **k: {"approved": False, "reason": "denied"},
+    ):
+        denied = _commit_project_plan(ctx, **plan)
+
+    assert denied == {
+        "ok": False, "error": "confirmation_denied", "reason": "denied",
+    }
+    assert _control_rows(board, project_id) == []
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        assert before == (
+            conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"],
+            conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"],
+        )
+
+
+@pytest.mark.parametrize("crash_point", ["before_apply", "before_finalize"])
+def test_a_crashed_legacy_migration_adopts_its_staged_anchor(ctx, crash_point):
+    created = _legacy_graph_project(
+        ctx,
+        key=f"legacy-crash-{crash_point}",
+        plan_key=f"legacy-crash-old-plan-{crash_point}",
+    )
+    plan_key = f"legacy-crash-plan-{crash_point}"
+    plan = _project_plan_args(
+        created, [dict(_LEGACY_PLAN_CHANGE)], idempotency_key=plan_key,
+    )
+
+    def crash(*_args, **_kwargs):
+        raise _CrashInjected(crash_point)
+
+    target, attr = (
+        (kanban_db, "apply_owner_project_plan")
+        if crash_point == "before_apply"
+        else (ow, "_finalize_receipt")
+    )
+    approver = _with_approver(ctx.session)
+    with _temporarily_patch(target, attr, crash):
+        with pytest.raises(_CrashInjected):
+            _commit_project_plan(ctx, **plan)
+    approver.join()
+
+    staged = _control_rows(created["board"], created["project_id"])
+    assert len(staged) == 1
+
+    _expire_lock(ctx, plan_key)
+    if crash_point == "before_apply":
+        approver = _with_approver(ctx.session)
+        replayed = _commit_project_plan(ctx, **plan)
+        approver.join()
+    else:
+        with _temporarily_patch(
+            ow, "_confirm",
+            lambda *a, **k: pytest.fail("a recovered plan asked again"),
+        ):
+            replayed = _commit_project_plan(ctx, **plan)
+
+    assert replayed["ok"] is True
+    assert replayed["anchor_task_id"] == staged[0]
+    assert _control_rows(created["board"], created["project_id"]) == staged
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        matching = [
+            task for task in kanban_db.list_tasks(conn)
+            if task.title == _LEGACY_PLAN_CHANGE["title"]
+        ]
+    assert len(matching) == 1
+    assert matching[0].status != kanban_db.PARKED_STATUS
+
+
+def test_a_migrated_anchor_is_durable_authority_for_every_later_plan(ctx):
+    created = _legacy_graph_project(
+        ctx, key="legacy-durable", plan_key="legacy-durable-old-plan",
+    )
+    approver = _with_approver(ctx.session)
+    migrated = _commit_project_plan(
+        ctx,
+        **_project_plan_args(
+            created,
+            [dict(_LEGACY_PLAN_CHANGE)],
+            idempotency_key="legacy-durable-plan-1",
+        ),
+    )
+    approver.join()
+    assert migrated["ok"] is True
+
+    assert "anchor_task_id" not in _receipt_result(ctx, "legacy-durable")
+    assert "anchor_task_id" not in _receipt_result(
+        ctx, "legacy-durable-old-plan",
+    )
+
+    approver = _with_approver(ctx.session)
+    later = _commit_project_plan(
+        ctx,
+        **_project_plan_args(
+            created,
+            [dict(_LEGACY_PLAN_CHANGE, title="Ship the next step")],
+            idempotency_key="legacy-durable-plan-2",
+        ),
+    )
+    approver.join()
+
+    assert later["ok"] is True
+    assert later["anchor_task_id"] == migrated["anchor_task_id"]
+    assert _control_rows(created["board"], created["project_id"]) == [
+        migrated["anchor_task_id"]
+    ]
+
+
+@pytest.mark.parametrize("controls", [1, 2])
+def test_a_legacy_project_with_unaccounted_controls_refuses_a_plan(ctx, controls):
+    created = _legacy_graph_project(
+        ctx,
+        key=f"legacy-foreign-{controls}",
+        plan_key=f"legacy-foreign-old-plan-{controls}",
+    )
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        for index in range(controls):
+            kanban_db.create_task(
+                conn,
+                title=f"a control row nobody approved {index}",
+                control=True,
+                triage=True,
+                board=created["board"],
+                project_id=created["project_id"],
+            )
+
+    plan = _project_plan_args(
+        created,
+        [dict(_LEGACY_PLAN_CHANGE)],
+        idempotency_key=f"legacy-foreign-plan-{controls}",
+    )
+    with _temporarily_patch(
+        ow, "_confirm",
+        lambda *a, **k: pytest.fail("an unprovable anchor reached the owner"),
+    ):
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            _commit_project_plan(ctx, **plan)
+    assert excinfo.value.code == "project_not_owned"
+    assert len(_control_rows(created["board"], created["project_id"])) == controls
+
+
+def test_a_corrupted_modern_receipt_is_never_treated_as_legacy(ctx):
+    _args, created = _graph_created_project(ctx, key="modern-anchor-corrupt")
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        conn.execute("DELETE FROM tasks WHERE id = ?", (created["anchor_task_id"],))
+        conn.commit()
+    result = _receipt_result(ctx, "modern-anchor-corrupt")
+    result.pop("anchor_task_id")
+    assert "park_generation" in result and "parked_task_ids" in result
+    with projects_db.connect_closing() as pconn:
+        with ow.write_txn(pconn):
+            pconn.execute(
+                "UPDATE owner_workspace_receipts SET result_json = ? "
+                "WHERE actor = ? AND profile = ? AND idempotency_key = ?",
+                (
+                    json.dumps(result),
+                    ctx.actor,
+                    ctx.profile,
+                    "modern-anchor-corrupt",
+                ),
+            )
+
+    plan = _project_plan_args(
+        created,
+        [dict(_LEGACY_PLAN_CHANGE)],
+        idempotency_key="modern-anchor-corrupt-plan",
+    )
+    with _temporarily_patch(
+        ow, "_confirm",
+        lambda *a, **k: pytest.fail("a corrupted modern receipt reached the owner"),
+    ):
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            _commit_project_plan(ctx, **plan)
+    assert excinfo.value.code == "project_not_owned"
+    assert _control_rows(created["board"], created["project_id"]) == []
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "modern_marker",
+        "missing_field",
+        "wrong_slug",
+        "wrong_board",
+        "invalid_risk",
+        "not_applied",
+    ],
+)
+def test_every_legacy_plan_receipt_must_match_the_exact_old_contract(
+    ctx, corruption,
+):
+    graph_key = f"legacy-plan-shape-{corruption}"
+    old_plan_key = f"legacy-plan-shape-old-{corruption}"
+    created = _legacy_graph_project(ctx, key=graph_key, plan_key=old_plan_key)
+    receipt = _receipt_result(ctx, old_plan_key)
+    if corruption == "modern_marker":
+        receipt["anchor_task_id"] = "t_unproven"
+    elif corruption == "missing_field":
+        receipt.pop("executable_task_count")
+    elif corruption == "wrong_slug":
+        receipt["project_slug"] = "another-project"
+    elif corruption == "wrong_board":
+        receipt["board"] = "another-board"
+    elif corruption == "invalid_risk":
+        receipt["risk_level"] = "low"
+    else:
+        receipt["applied"] = False
+    with projects_db.connect_closing() as pconn:
+        with ow.write_txn(pconn):
+            pconn.execute(
+                "UPDATE owner_workspace_receipts SET result_json = ? "
+                "WHERE actor = ? AND profile = ? AND idempotency_key = ?",
+                (json.dumps(receipt), ctx.actor, ctx.profile, old_plan_key),
+            )
+
+    plan = _project_plan_args(
+        created,
+        [dict(_LEGACY_PLAN_CHANGE)],
+        idempotency_key=f"legacy-plan-shape-new-{corruption}",
+    )
+    with _temporarily_patch(
+        ow,
+        "_confirm",
+        lambda *a, **k: pytest.fail("an unproven legacy Project reached approval"),
+    ):
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            _commit_project_plan(ctx, **plan)
+    assert excinfo.value.code == "project_not_owned"
+    assert _control_rows(created["board"], created["project_id"]) == []
+
+
+def test_a_concurrent_identical_legacy_migration_adopts_one_anchor(ctx):
+    created = _legacy_graph_project(
+        ctx,
+        key="legacy-concurrent",
+        plan_key="legacy-concurrent-old-plan",
+    )
+    migration_key = "owanchor_" + ow._derive_id(
+        ctx,
+        created["project_id"],
+        ow._LEGACY_ANCHOR_MIGRATION_SALT,
+    )
+    raced: dict[str, str] = {}
+
+    def approve_after_identical_migration(*_args, **_kwargs):
+        with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+            raced["anchor"] = kanban_db.create_task(
+                conn,
+                title="Pre-anchor Project",
+                body="Built by the release immediately before anchor authority.",
+                created_by=ctx.actor,
+                triage=True,
+                control=True,
+                idempotency_key=migration_key,
+                board=created["board"],
+                project_id=created["project_id"],
+            )
+        return {"approved": True}
+
+    with _temporarily_patch(ow, "_confirm", approve_after_identical_migration):
+        applied = _commit_project_plan(
+            ctx,
+            **_project_plan_args(
+                created,
+                [dict(_LEGACY_PLAN_CHANGE)],
+                idempotency_key="legacy-concurrent-new-plan",
+            ),
+        )
+
+    assert applied["ok"] is True
+    assert applied["anchor_task_id"] == raced["anchor"]
+    assert _control_rows(created["board"], created["project_id"]) == [
+        raced["anchor"]
+    ]
+
+
+def test_a_different_anchor_committed_during_confirmation_is_rejected(ctx):
+    created = _legacy_graph_project(
+        ctx,
+        key="legacy-authority-race",
+        plan_key="legacy-authority-race-old-plan",
+    )
+    raced: dict[str, str] = {}
+
+    def approve_after_authority_changed(*_args, **_kwargs):
+        with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+            raced["anchor"] = kanban_db.create_task(
+                conn,
+                title="A different control authority",
+                created_by=ctx.actor,
+                triage=True,
+                control=True,
+                idempotency_key="owanchor_foreign",
+                board=created["board"],
+                project_id=created["project_id"],
+            )
+        receipt = {
+            "ok": True,
+            "project_id": created["project_id"],
+            "project_slug": created["project_slug"],
+            "board": created["board"],
+            "anchor_task_id": raced["anchor"],
+            "risk_level": "standard",
+            "applied": True,
+            "change_count": 0,
+            "created_task_ids": [],
+            "affected_task_ids": [],
+            "parked_task_ids": [],
+            "parked_dependents": [],
+            "park_generation": "race-generation",
+        }
+        _insert_legacy_receipt(
+            ctx,
+            key="legacy-authority-race-other-plan",
+            operation="owner_project_plan_commit",
+            result=receipt,
+            project_id=created["project_id"],
+            board=created["board"],
+            task_id=raced["anchor"],
+        )
+        return {"approved": True}
+
+    with _temporarily_patch(ow, "_confirm", approve_after_authority_changed):
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            _commit_project_plan(
+                ctx,
+                **_project_plan_args(
+                    created,
+                    [dict(_LEGACY_PLAN_CHANGE)],
+                    idempotency_key="legacy-authority-race-new-plan",
+                ),
+            )
+    assert excinfo.value.code == "crash_recovery_failed"
+    assert _control_rows(created["board"], created["project_id"]) == [
+        raced["anchor"]
+    ]
+
+
+def test_a_modern_anchor_cannot_change_during_confirmation(ctx):
+    graph_key = "modern-authority-race"
+    _args, created = _graph_created_project(ctx, key=graph_key)
+    original_anchor = created["anchor_task_id"]
+    raced: dict[str, str] = {}
+
+    def approve_after_authority_changed(*_args, **_kwargs):
+        with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+            conn.execute("DELETE FROM tasks WHERE id = ?", (original_anchor,))
+            conn.commit()
+            raced["anchor"] = kanban_db.create_task(
+                conn,
+                title="A replacement control authority",
+                created_by=ctx.actor,
+                triage=True,
+                control=True,
+                idempotency_key="owanchor_modern_foreign",
+                board=created["board"],
+                project_id=created["project_id"],
+            )
+        receipt = _receipt_result(ctx, graph_key)
+        receipt["anchor_task_id"] = raced["anchor"]
+        with projects_db.connect_closing() as pconn:
+            with ow.write_txn(pconn):
+                pconn.execute(
+                    "UPDATE owner_workspace_receipts SET result_json = ?, task_id = ? "
+                    "WHERE actor = ? AND profile = ? AND idempotency_key = ?",
+                    (
+                        json.dumps(receipt),
+                        raced["anchor"],
+                        ctx.actor,
+                        ctx.profile,
+                        graph_key,
+                    ),
+                )
+        return {"approved": True}
+
+    with _temporarily_patch(ow, "_confirm", approve_after_authority_changed):
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            _commit_project_plan(
+                ctx,
+                **_project_plan_args(
+                    created,
+                    [dict(_LEGACY_PLAN_CHANGE)],
+                    idempotency_key="modern-authority-race-new-plan",
+                ),
+            )
+    assert excinfo.value.code == "crash_recovery_failed"
+    assert _control_rows(created["board"], created["project_id"]) == [
+        raced["anchor"]
+    ]
+
+
+def test_a_legacy_migration_that_loses_its_lease_mints_no_anchor(ctx):
+    created = _legacy_graph_project(
+        ctx,
+        key="legacy-lease-loss",
+        plan_key="legacy-lease-loss-old-plan",
+    )
+    new_plan_key = "legacy-lease-loss-new-plan"
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        before = (
+            conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"],
+            conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"],
+        )
+
+    def approve_after_lease_loss(*_args, **_kwargs):
+        with projects_db.connect_closing() as pconn:
+            with ow.write_txn(pconn):
+                pconn.execute(
+                    "UPDATE owner_workspace_receipts SET lock_token = ? "
+                    "WHERE actor = ? AND profile = ? AND idempotency_key = ?",
+                    ("stolen", ctx.actor, ctx.profile, new_plan_key),
+                )
+        return {"approved": True}
+
+    with _temporarily_patch(ow, "_confirm", approve_after_lease_loss):
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            _commit_project_plan(
+                ctx,
+                **_project_plan_args(
+                    created,
+                    [dict(_LEGACY_PLAN_CHANGE)],
+                    idempotency_key=new_plan_key,
+                ),
+            )
+    assert excinfo.value.code == "lease_lost"
+    assert _control_rows(created["board"], created["project_id"]) == []
+    with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+        assert before == (
+            conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"],
+            conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"],
+        )
