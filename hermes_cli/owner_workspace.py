@@ -4194,39 +4194,42 @@ def _resolve_existing_project_board(
     return project, project.board_slug
 
 
-def _receipt_bound_control_anchor(
-    pconn: sqlite3.Connection,
-    kconn: sqlite3.Connection,
-    ctx: OwnerContext,
-    project_id: str,
-) -> str:
-    """Resolve the Project's one canonical, receipt-bound control anchor.
+_OWNER_ANCHOR_RECEIPT_FIELDS = {
+    "owner_workspace_bootstrap": "task_id",
+    "owner_task_graph_commit": "anchor_task_id",
+    "owner_project_plan_commit": "anchor_task_id",
+}
+_LEGACY_GRAPH_RESULT_FIELDS = frozenset({
+    "ok", "mode", "project_id", "project_slug", "board",
+    "root_task_id", "root_status", "task_ids", "task_statuses", "task_count",
+})
+_LEGACY_PLAN_RESULT_FIELDS = frozenset({
+    "ok", "project_id", "project_slug", "board", "risk_level", "applied",
+    "change_count", "created_task_ids", "affected_task_ids",
+    "executable_task_count",
+})
+_LEGACY_PLAN_RISK_LEVELS = frozenset({"standard", "significant_removal"})
+_LEGACY_ANCHOR_MIGRATION_SALT = "legacy-project-anchor-v1"
 
-    The anchor is never supplied by the caller. An owner-facing snapshot
-    contains only executable work rows, so a caller-supplied id could only ever
-    be a work row — and a plan that hung new work off a dispatchable task would
-    defeat the whole point of the anchor. It is instead derived here from the
-    durable receipt that recorded creating it (a ``owner_workspace_bootstrap``
-    receipt records it as ``task_id``, a graph-created Project's
-    ``owner_task_graph_commit`` receipt as ``anchor_task_id``), and then
-    confirmed against the board.
 
-    Both creation paths must converge on exactly ONE anchor per Project, so
-    every committed receipt for this Project has to name the same row. Fails
-    closed on every ambiguity: no committed receipt names an anchor, a
-    bootstrap receipt that does not record which task it created, more than one
-    distinct anchor across receipts, a board that holds no control row for this
-    Project, or a board that holds more than one. Each of those means ownership
-    of the anchor cannot be proven, which is not a licence to pick one — the
-    recovery path is to re-derive the anchor explicitly, never to guess.
-    """
+@dataclass(frozen=True)
+class _ProjectAnchorResolution:
+    task_id: Optional[str]
+    migration_key: Optional[str] = None
+
+
+def _receipt_named_anchors(
+    pconn: sqlite3.Connection, ctx: OwnerContext, project_id: str,
+) -> set[str]:
     anchors: set[str] = set()
-    for row in pconn.execute(
+    placeholders = ", ".join("?" for _ in _OWNER_ANCHOR_RECEIPT_FIELDS)
+    rows = pconn.execute(
         "SELECT operation, result_json FROM owner_workspace_receipts "
         "WHERE actor = ? AND profile = ? AND status = 'committed' "
-        "AND operation IN ('owner_workspace_bootstrap', 'owner_task_graph_commit')",
-        (ctx.actor, ctx.profile),
-    ).fetchall():
+        f"AND operation IN ({placeholders})",
+        (ctx.actor, ctx.profile, *_OWNER_ANCHOR_RECEIPT_FIELDS),
+    ).fetchall()
+    for row in rows:
         try:
             result = json.loads(row["result_json"] or "null")
         except (TypeError, ValueError) as exc:
@@ -4236,35 +4239,326 @@ def _receipt_bound_control_anchor(
             ) from exc
         if not isinstance(result, dict) or result.get("project_id") != project_id:
             continue
-        bootstrap = row["operation"] == "owner_workspace_bootstrap"
-        task_id = result.get("task_id") if bootstrap else result.get("anchor_task_id")
+        operation = str(row["operation"])
+        task_id = result.get(_OWNER_ANCHOR_RECEIPT_FIELDS[operation])
         if not isinstance(task_id, str) or not task_id.strip():
-            if bootstrap:
+            if operation == "owner_workspace_bootstrap":
                 raise OwnerWorkspaceError(
                     "crash_recovery_failed",
                     "an owner Project receipt does not record its Project anchor",
                 )
-            # A graph receipt written before Projects carried their own anchor.
-            # It proves ownership of the Project but names no anchor, so it
-            # neither supplies nor contradicts one.
             continue
         anchors.add(task_id.strip())
+    return anchors
+
+
+def _board_control_rows(kconn: sqlite3.Connection, project_id: str) -> list[str]:
+    return [
+        str(row["id"])
+        for row in kconn.execute(
+            "SELECT id FROM tasks WHERE project_id = ? AND task_kind = 'control' "
+            "ORDER BY id",
+            (project_id,),
+        ).fetchall()
+    ]
+
+
+def _receipt_bound_control_anchor(
+    pconn: sqlite3.Connection,
+    kconn: sqlite3.Connection,
+    ctx: OwnerContext,
+    project_id: str,
+) -> str:
+    """Resolve the Project's one canonical, receipt-bound control anchor."""
+    anchors = _receipt_named_anchors(pconn, ctx, project_id)
     if len(anchors) != 1:
         raise OwnerWorkspaceError(
             "project_not_owned",
             "this Project has no single receipt-bound anchor to apply a plan to",
         )
     anchor_task_id = next(iter(anchors))
-    rows = kconn.execute(
-        "SELECT id FROM tasks WHERE project_id = ? AND task_kind = 'control'",
-        (project_id,),
-    ).fetchall()
-    if len(rows) != 1 or str(rows[0]["id"]) != anchor_task_id:
+    if _board_control_rows(kconn, project_id) != [anchor_task_id]:
         raise OwnerWorkspaceError(
             "project_not_owned",
             "this Project's anchor could not be confirmed on its board",
         )
     return anchor_task_id
+
+
+def _legacy_anchor_migration_key(
+    pconn: sqlite3.Connection,
+    ctx: OwnerContext,
+    project_id: str,
+    *,
+    project_slug: str,
+    board_slug: str,
+) -> Optional[str]:
+    """Return a stable migration key only for the known pre-anchor receipt shape."""
+    creations: list[tuple[str, dict]] = []
+    for row in pconn.execute(
+        "SELECT idempotency_key, operation, project_id, board_slug, task_id, "
+        "result_json FROM owner_workspace_receipts "
+        "WHERE actor = ? AND profile = ? AND status = 'committed' "
+        "AND operation IN ('owner_task_graph_commit', 'owner_project_plan_commit')",
+        (ctx.actor, ctx.profile),
+    ).fetchall():
+        try:
+            result = json.loads(row["result_json"] or "null")
+        except (TypeError, ValueError) as exc:
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                "an owner Project receipt could not be read",
+            ) from exc
+        if not isinstance(result, dict):
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                "an owner Project receipt could not be read",
+            )
+        result_project_id = result.get("project_id")
+        row_project_id = row["project_id"]
+        result_project_id = (
+            result_project_id.strip()
+            if isinstance(result_project_id, str)
+            else ""
+        )
+        row_project_id = row_project_id.strip() if isinstance(row_project_id, str) else ""
+        if result_project_id != project_id and row_project_id != project_id:
+            continue
+        if (
+            result_project_id != project_id
+            or row_project_id != project_id
+            or row["board_slug"] != board_slug
+            or result.get("ok") is not True
+        ):
+            return None
+
+        operation = str(row["operation"])
+        if operation == "owner_task_graph_commit":
+            task_ids = result.get("task_ids")
+            task_statuses = result.get("task_statuses")
+            task_count = result.get("task_count")
+            if (
+                set(result) != _LEGACY_GRAPH_RESULT_FIELDS
+                or result.get("mode") not in {"new", "existing"}
+                or result.get("project_slug") != project_slug
+                or result.get("board") != board_slug
+                or not isinstance(result.get("root_task_id"), str)
+                or not result["root_task_id"].strip()
+                or row["task_id"] != result["root_task_id"]
+                or not isinstance(result.get("root_status"), str)
+                or not result["root_status"].strip()
+                or not isinstance(task_ids, list)
+                or not all(isinstance(task_id, str) and task_id for task_id in task_ids)
+                or not isinstance(task_statuses, list)
+                or not all(
+                    isinstance(status, str) and status for status in task_statuses
+                )
+                or len(task_statuses) != len(task_ids)
+                or isinstance(task_count, bool)
+                or not isinstance(task_count, int)
+                or task_count != len(task_ids)
+            ):
+                return None
+            if result["mode"] == "new":
+                creations.append((str(row["idempotency_key"]), result))
+            continue
+
+        created_task_ids = result.get("created_task_ids")
+        affected_task_ids = result.get("affected_task_ids")
+        change_count = result.get("change_count")
+        executable_count = result.get("executable_task_count")
+        if (
+            set(result) != _LEGACY_PLAN_RESULT_FIELDS
+            or result.get("project_slug") != project_slug
+            or result.get("board") != board_slug
+            or result.get("applied") is not True
+            or result.get("risk_level") not in _LEGACY_PLAN_RISK_LEVELS
+            or not isinstance(row["task_id"], str)
+            or not row["task_id"].strip()
+            or isinstance(change_count, bool)
+            or not isinstance(change_count, int)
+            or change_count < 0
+            or isinstance(executable_count, bool)
+            or not isinstance(executable_count, int)
+            or executable_count < 0
+            or not isinstance(created_task_ids, list)
+            or not all(
+                isinstance(task_id, str) and task_id for task_id in created_task_ids
+            )
+            or not isinstance(affected_task_ids, list)
+            or not all(
+                isinstance(task_id, str) and task_id for task_id in affected_task_ids
+            )
+        ):
+            return None
+    if len(creations) != 1:
+        return None
+    creation_key, creation = creations[0]
+    if (
+        project_id != "p_" + _derive_id(ctx, creation_key, "graph-project")
+    ):
+        return None
+    return "owanchor_" + _derive_id(
+        ctx, project_id, _LEGACY_ANCHOR_MIGRATION_SALT,
+    )
+
+
+def _is_legacy_migration_anchor(
+    kconn: sqlite3.Connection,
+    ctx: OwnerContext,
+    task_id: str,
+    *,
+    project_id: str,
+    migration_key: str,
+) -> bool:
+    anchor = kanban_db.get_control_task(kconn, task_id)
+    return (
+        anchor is not None
+        and anchor.project_id == project_id
+        and anchor.idempotency_key == migration_key
+        and anchor.created_by == ctx.actor
+        and anchor.assignee is None
+        and anchor.execution_tier is None
+        and anchor.model_policy_lock is None
+        and anchor.status == "triage"
+    )
+
+
+def _classify_project_anchor(
+    pconn: sqlite3.Connection,
+    kconn: sqlite3.Connection,
+    ctx: OwnerContext,
+    project_id: str,
+    *,
+    project_slug: str,
+    board_slug: str,
+) -> _ProjectAnchorResolution:
+    """Classify the strict modern or known legacy shape without mutating it."""
+    if not _receipt_named_anchors(pconn, ctx, project_id):
+        migration_key = _legacy_anchor_migration_key(
+            pconn,
+            ctx,
+            project_id,
+            project_slug=project_slug,
+            board_slug=board_slug,
+        )
+        controls = _board_control_rows(kconn, project_id)
+        if migration_key is not None and not controls:
+            return _ProjectAnchorResolution(None, migration_key)
+        if (
+            migration_key is not None
+            and len(controls) == 1
+            and _is_legacy_migration_anchor(
+                kconn,
+                ctx,
+                controls[0],
+                project_id=project_id,
+                migration_key=migration_key,
+            )
+        ):
+            return _ProjectAnchorResolution(controls[0], migration_key)
+    return _ProjectAnchorResolution(
+        _receipt_bound_control_anchor(pconn, kconn, ctx, project_id)
+    )
+
+
+def _migrate_legacy_project_anchor(
+    kconn: sqlite3.Connection,
+    ctx: OwnerContext,
+    *,
+    project_id: str,
+    board_slug: str,
+    migration_key: str,
+    name: str,
+    description: Optional[str],
+) -> str:
+    anchor_id = kanban_db.create_task(
+        kconn,
+        title=name,
+        body=description,
+        created_by=ctx.actor,
+        triage=True,
+        control=True,
+        board=board_slug,
+        project_id=project_id,
+        idempotency_key=migration_key,
+    )
+    if (
+        _board_control_rows(kconn, project_id) != [anchor_id]
+        or not _is_legacy_migration_anchor(
+            kconn,
+            ctx,
+            anchor_id,
+            project_id=project_id,
+            migration_key=migration_key,
+        )
+    ):
+        raise OwnerWorkspaceError(
+            "crash_recovery_failed",
+            "the legacy Project anchor does not match its migration identity",
+        )
+    return anchor_id
+
+
+def _confirmed_project_anchor(
+    pconn: sqlite3.Connection,
+    kconn: sqlite3.Connection,
+    ctx: OwnerContext,
+    project_id: str,
+    *,
+    project,
+    board_slug: str,
+    classified: _ProjectAnchorResolution,
+) -> str:
+    current = _classify_project_anchor(
+        pconn,
+        kconn,
+        ctx,
+        project_id,
+        project_slug=project.slug,
+        board_slug=board_slug,
+    )
+    if classified.migration_key is None:
+        if (
+            current.migration_key is not None
+            or current.task_id is None
+            or current.task_id != classified.task_id
+        ):
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                "this Project's anchor changed after owner confirmation",
+            )
+        return current.task_id
+    if current.migration_key is None:
+        if (
+            current.task_id is None
+            or not _is_legacy_migration_anchor(
+                kconn,
+                ctx,
+                current.task_id,
+                project_id=project_id,
+                migration_key=classified.migration_key,
+            )
+        ):
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                "this Project's anchor changed after owner confirmation",
+            )
+        return current.task_id
+    if current.migration_key != classified.migration_key:
+        raise OwnerWorkspaceError(
+            "crash_recovery_failed",
+            "this Project's anchor migration changed after owner confirmation",
+        )
+    return _migrate_legacy_project_anchor(
+        kconn,
+        ctx,
+        project_id=project_id,
+        board_slug=board_slug,
+        migration_key=current.migration_key,
+        name=project.name,
+        description=project.description,
+    )
 
 
 def _committed_project_plan_result(
@@ -4303,10 +4597,9 @@ def commit_project_plan(
 ) -> dict:
     """Commit one approved Project Steward plan to the existing native board.
 
-    The Project's control anchor is resolved internally from its committed
-    bootstrap receipt (see :func:`_receipt_bound_control_anchor`) — it is
-    deliberately not part of the request, so no caller can name the row a plan
-    hangs its work under.
+    The Project's control anchor is resolved internally from committed receipts.
+    A strictly proven pre-anchor Project may create its one hidden anchor only
+    after this plan's owner confirmation; callers can never name that row.
     """
     from agent.redact import redact_sensitive_text
 
@@ -4383,15 +4676,25 @@ def commit_project_plan(
         project, board_slug = _resolve_existing_project_board(pconn, project_id)
         kconn = kanban_db.connect(board=board_slug)
         try:
-            anchor_task_id = _receipt_bound_control_anchor(
-                pconn, kconn, ctx, project_id,
-            )
-            recovered = _committed_project_plan_result(
+            anchor = _classify_project_anchor(
+                pconn,
                 kconn,
-                anchor_task_id=anchor_task_id,
-                digest=digest,
-                idempotency_key=idempotency_key,
-                ctx=ctx,
+                ctx,
+                project_id,
+                project_slug=project.slug,
+                board_slug=board_slug,
+            )
+            anchor_task_id = anchor.task_id
+            recovered = (
+                _committed_project_plan_result(
+                    kconn,
+                    anchor_task_id=anchor_task_id,
+                    digest=digest,
+                    idempotency_key=idempotency_key,
+                    ctx=ctx,
+                )
+                if anchor_task_id is not None
+                else None
             )
             if recovered is not None:
                 result = {
@@ -4399,6 +4702,7 @@ def commit_project_plan(
                     "project_id": project_id,
                     "project_slug": project.slug,
                     "board": board_slug,
+                    "anchor_task_id": anchor_task_id,
                     "risk_level": risk_level,
                     **recovered,
                 }
@@ -4446,6 +4750,15 @@ def commit_project_plan(
                         applied = {"applied": False}
                     else:
                         _assert_board_ownership(board_slug, project_id)
+                        anchor_task_id = _confirmed_project_anchor(
+                            pconn,
+                            kconn,
+                            ctx,
+                            project_id,
+                            project=current_project,
+                            board_slug=board_slug,
+                            classified=anchor,
+                        )
                         applied = kanban_db.apply_owner_project_plan(
                             kconn,
                             project_id=project_id,
@@ -4470,12 +4783,15 @@ def commit_project_plan(
                         "project_slug": project.slug,
                         "change_count": 0,
                     }
+                    if anchor_task_id is not None:
+                        result["anchor_task_id"] = anchor_task_id
                 else:
                     result = {
                         "ok": True,
                         "project_id": project_id,
                         "project_slug": project.slug,
                         "board": board_slug,
+                        "anchor_task_id": anchor_task_id,
                         "risk_level": risk_level,
                         **applied,
                     }
