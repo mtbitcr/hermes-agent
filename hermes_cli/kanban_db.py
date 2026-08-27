@@ -10989,6 +10989,34 @@ def apply_owner_project_plan(
                 archived_task_ids.append(source_id)
                 continue
 
+            if action == "replace":
+                source_id = change["target"]["task_id"]
+                replacement_id = create_planned_task(
+                    change["replacement"],
+                    parent_task_ids=parent_ids(conn, source_id),
+                    change_index=change_index,
+                    replacement_index=0,
+                )
+                for child_id in child_ids(conn, source_id):
+                    if _link_tasks_in_txn(conn, replacement_id, child_id):
+                        affected_task_ids.add(child_id)
+                snapshot = _cas_transition_task_in_txn(
+                    conn,
+                    source_id,
+                    expected_status=change["target"]["expected_status"],
+                    expected_revision=change["target"]["expected_revision"],
+                    to_status="archived",
+                    event_kind="owner_project_plan_change",
+                    event_payload={**event_base, "replacement_task_id": replacement_id},
+                )
+                if not snapshot["moved"]:
+                    raise RuntimeError(
+                        "preflighted replacement target changed inside transaction"
+                    )
+                affected_task_ids.add(source_id)
+                archived_task_ids.append(source_id)
+                continue
+
             if action == "merge":
                 source_ids = [ref["task_id"] for ref in change["targets"]]
                 source_set = set(source_ids)

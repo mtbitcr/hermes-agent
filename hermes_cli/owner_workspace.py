@@ -4104,6 +4104,23 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
             created_count += len(replacements)
             continue
 
+        if action == "replace":
+            raw = _require_exact_keys(
+                item, field, {"action", "reason", "target", "replacement"},
+            )
+            normalized.append({
+                "action": action,
+                "reason": reason,
+                "target": _normalize_project_task_ref(
+                    raw["target"], f"{field}.target", mutating=True,
+                ),
+                "replacement": _normalize_project_task_spec(
+                    raw["replacement"], f"{field}.replacement", parent_limit=None,
+                ),
+            })
+            created_count += 1
+            continue
+
         if action == "merge":
             raw = _require_exact_keys(item, field, {"action", "reason", "targets", "replacement"})
             targets = raw["targets"]
@@ -4153,7 +4170,8 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
             continue
 
         raise OwnerWorkspaceError(
-            "invalid_argument", f"{field}.action must be add, split, merge, move, postpone, or cancel",
+            "invalid_argument",
+            f"{field}.action must be add, replace, split, merge, move, postpone, or cancel",
         )
 
     for index, change in enumerate(normalized):

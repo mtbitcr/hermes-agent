@@ -428,8 +428,8 @@ registry.register(
         "name": "owner_project_plan_commit",
         "description": (
             "Atomically apply one owner-approved Project Steward plan to an "
-            "existing native Project board. Supports bounded add, split, merge, "
-            "move, postpone, and cancel changes. Every referenced task carries "
+            "existing native Project board. Supports bounded add, replace, split, "
+            "merge, move, postpone, and cancel changes. Every referenced task carries "
             "the exact status and event revision last observed; any drift leaves "
             "the whole plan unchanged. Running, completed, and archived tasks "
             "cannot be rewritten. Merge or cancel must be approved alone."
@@ -538,6 +538,17 @@ registry.register(
                                     "target": _PROJECT_TASK_REF,
                                 },
                                 "required": ["action", "reason", "target"],
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "action": {"const": "replace"},
+                                    "reason": {"type": "string"},
+                                    "target": _PROJECT_TASK_REF,
+                                    "replacement": _PROJECT_TASK_SPEC,
+                                },
+                                "required": ["action", "reason", "target", "replacement"],
                             },
                         ],
                     },

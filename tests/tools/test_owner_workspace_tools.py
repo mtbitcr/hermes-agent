@@ -153,9 +153,14 @@ class TestSchemas:
             "owner_project_plan_commit"
         ).schema["parameters"]["properties"]["changes"]["items"]["oneOf"]
         add, split, merge = changes[0], changes[1], changes[2]
+        replace = next(
+            change for change in changes
+            if change["properties"]["action"] == {"const": "replace"}
+        )
 
         specs = [
             add,
+            replace["properties"]["replacement"],
             split["properties"]["replacements"]["items"],
             merge["properties"]["replacement"],
         ]
@@ -192,11 +197,26 @@ class TestSchemas:
         }
         assert "anchor_task_id" not in params["properties"]
         assert params["properties"]["changes"]["maxItems"] == 12
-        assert len(params["properties"]["changes"]["items"]["oneOf"]) == 5
+        assert len(params["properties"]["changes"]["items"]["oneOf"]) == 6
 
         move_schema = params["properties"]["changes"]["items"]["oneOf"][3]
         assert move_schema["properties"]["action"] == {"const": "move"}
         assert move_schema["properties"]["to_status"]["enum"] == ["ready"]
+
+    def test_project_plan_exposes_a_closed_one_to_one_replace_change(self):
+        changes = registry.get_entry(
+            "owner_project_plan_commit"
+        ).schema["parameters"]["properties"]["changes"]["items"]["oneOf"]
+        replace = next(
+            change for change in changes
+            if change["properties"]["action"] == {"const": "replace"}
+        )
+
+        assert replace["additionalProperties"] is False
+        assert set(replace["required"]) == {
+            "action", "reason", "target", "replacement",
+        }
+        assert "execution_tier" in replace["properties"]["replacement"]["required"]
 
     def test_task_comment_requires_task_id_and_body(self):
         entry = registry.get_entry("owner_task_comment")
