@@ -11113,27 +11113,18 @@ def apply_owner_project_plan(
         )
         affected_task_ids.update(task_id for task_id, _ in parked_dependents)
 
-        # Work parked for activation counts as executable: it becomes so the
-        # moment the receipt commits. Deliberately postponed work also sits in
-        # ``scheduled`` and still does not count, which is why this matches the
-        # exact parked ids rather than the column.
-        counted_parked = [
-            *parked_task_ids, *(task_id for task_id, _ in parked_dependents),
-        ]
-        parked_placeholders = ", ".join("?" for _ in counted_parked) or "NULL"
-        executable_count = conn.execute(
-            "SELECT COUNT(*) AS n FROM tasks "
-            "WHERE project_id = ? AND task_kind = 'work' "
-            "AND (status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'review') "
-            f"     OR id IN ({parked_placeholders}))",
-            (project_id, *counted_parked),
-        ).fetchone()["n"]
-        if executable_count > 12:
-            raise ValueError(
-                "project plan would leave more than 12 executable tasks; "
-                "keep future work in Next/Later"
-            )
-
+        # Deliberately NO project-wide executable total is enforced here. A
+        # large Project may hold an evidence-backed backlog and later
+        # milestones, and refusing an approved plan because the Project already
+        # holds enough planned work failed the owner's approval for an internal
+        # slot count they can neither see nor manage. What must stay bounded is
+        # SIMULTANEOUS work, and every bound on that already lives where the
+        # work actually becomes runnable: one plan's own size (the owner
+        # kernel's ``_MAX_GRAPH_TASKS``), the dependency edges written above (an
+        # unfinished parent keeps its child out of ``ready``), the parking this
+        # function performs until the receipt is durable, and the dispatcher's
+        # claim budget (``max_in_progress`` / ``max_in_progress_per_profile`` /
+        # ``max_spawn`` in :func:`dispatch_once`).
         result = {
             "applied": True,
             "change_count": len(changes),
@@ -11144,7 +11135,6 @@ def apply_owner_project_plan(
             # The receipt carries the generation so a replay activates exactly
             # what this plan parked and nothing the owner parked since.
             "park_generation": generation,
-            "executable_task_count": int(executable_count),
         }
         _append_event(
             conn,

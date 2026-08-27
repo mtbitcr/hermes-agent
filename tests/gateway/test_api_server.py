@@ -38,6 +38,7 @@ from gateway.platforms.api_server import (
     _make_request_fingerprint,
     OwnerAuthorityBroken,
     OwnerAuthorityUnavailable,
+    OwnerTurnNotRecoverable,
     _redact_api_error_text,
     _resolve_owner_workspace_run_context,
     _request_reasoning_config,
@@ -238,6 +239,71 @@ class TestOwnerWorkspaceRunContext:
         assert existing["project_name"] == projected
         assert at_bound["project_name"] == "n" * 160
 
+    def test_an_unanswered_owner_request_authorizes_no_run(self, monkeypatch):
+        """Item 32TK, finding 2: the request-level door, before the store's.
+
+        ``/v1/runs`` derives owner mutation authority here, long before it
+        reserves anything, so a conversation carrying a request that ended
+        without a turn is refused at this end too. Reading the stored proposal
+        at all is already work done for an approval that cannot be granted, so
+        the refusal comes first — and once the record is acknowledged this
+        validation carries on exactly as it always did.
+        """
+        conversation = "raphael-owner-" + "4" * 32
+        authority = {
+            "proposal_profile": "default",
+            "conversation": conversation,
+            "response_id": "resp_older_run_proposal",
+            "claim_id": "claim_" + "6" * 32,
+            "operation": "owner_task_graph_commit",
+            "idempotency_key": "conversation-" + "a" * 64,
+            "payload": {},
+        }
+        context = {
+            "profile": "default",
+            "mode": "new",
+            "project_slug": None,
+            "project_name": "Workshop pilot",
+        }
+        store = ResponseStore(max_size=10)
+        adapter = APIServerAdapter.__new__(APIServerAdapter)
+        adapter._response_store = store
+        read = []
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_unanswered_run_request",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(
+                store, conversation, "resp_unanswered_run_request",
+            )
+            monkeypatch.setattr(
+                store,
+                "owner_proposal_record",
+                lambda *args: read.append(args),
+            )
+
+            with pytest.raises(ValueError, match="unanswered"):
+                adapter._validated_owner_proposal_authority(
+                    authority, context, "default",
+                )
+            assert read == []
+
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_unanswered_run_request",
+            ) == "retired"
+            # Past that door, and refused for what it actually is: this
+            # conversation has no such proposal on it.
+            with pytest.raises(ValueError, match="not current"):
+                adapter._validated_owner_proposal_authority(
+                    authority, context, "default",
+                )
+            assert read == [
+                ("default", conversation, "resp_older_run_proposal"),
+            ]
+        finally:
+            store.close()
+
     @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
     def test_new_mode_still_requires_a_name(self, blank):
         config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
@@ -286,6 +352,34 @@ class TestRedactApiErrorText:
 # ---------------------------------------------------------------------------
 # ResponseStore
 # ---------------------------------------------------------------------------
+
+
+def _interrupt_owner_turn(store, conversation, response_id, profile="default"):
+    """End one accepted owner turn the way a background failure really does.
+
+    Exactly the call the background path makes: the terminal body, this turn's
+    fence becoming the record that carries the owner's request, the outcome its
+    idempotency key replays, and the retirement of its recovery job, as ONE
+    transaction. Tests set the state up through the production entry point so
+    they cannot drift from it.
+    """
+    store.store_terminal_owner_response(
+        profile=profile,
+        response_id=response_id,
+        data={
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "status": "failed",
+                "output": [],
+                "error": {"code": "server_error", "message": "stopped"},
+            },
+            "conversation_history": [],
+        },
+        release_job=True,
+        conversation=conversation,
+        interrupted=True,
+    )
 
 
 class TestResponseStore:
@@ -472,6 +566,10 @@ class TestResponseStore:
             "conversation_closed": False,
             "truncated": False,
             "incomplete": False,
+            # Nothing is being planned on this conversation right now, and
+            # nothing it planned before was left interrupted.
+            "pending": None,
+            "recovery": None,
             "data": history,
         }
         assert "resp_owner_history" not in json.dumps(snapshot["data"])
@@ -923,6 +1021,874 @@ class TestResponseStore:
             conversation, profile="secondary",
         )["proposal_claimed"] is False
 
+    def test_a_reserved_owner_turn_projects_the_request_it_is_still_planning(self):
+        """Item 32TK: the owner's own words survive a lost accept response.
+
+        The reservation is taken before any model runs, so the request it is
+        planning is durable from that moment. Projecting it is what lets a
+        refreshed page show the message the owner actually sent — and recover
+        the SAME response id rather than planning their words a second time.
+        """
+        conversation = "raphael-owner-" + "b" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            # Nothing has been published on this conversation yet: the very
+            # first turn of a new Project is exactly the case that lost the
+            # owner's request.
+            assert store.reserve_owner_conversation(
+                "default",
+                conversation,
+                "resp_pending_first_turn",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+
+            snapshot = store.owner_history_snapshot(conversation)
+
+            assert snapshot["data"] == []
+            assert snapshot["pending"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_pending_first_turn",
+            }
+
+            # Publishing the turn releases the reservation, and the owner's
+            # words are then carried by the durable turn itself.
+            store.put("resp_pending_first_turn", {
+                "response": {"id": "resp_pending_first_turn", "created_at": 1},
+                "conversation_history": [
+                    {
+                        "role": "user",
+                        "content": "Prepare a private 60-minute workshop",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "schema_version": 1,
+                            "kind": "question",
+                            "message": "Who is the workshop for?",
+                        }),
+                    },
+                ],
+            })
+            assert store.set_conversation(
+                conversation,
+                "resp_pending_first_turn",
+                profile="default",
+                reservation_id="resp_pending_first_turn",
+            ) is True
+
+            published = store.owner_history_snapshot(conversation)
+            assert published["pending"] is None
+            assert published["data"] == [{
+                "owner": "Prepare a private 60-minute workshop",
+                "raphael": ANY,
+            }]
+        finally:
+            store.close()
+
+    def test_a_pending_owner_turn_is_projected_on_a_conversation_with_turns(self):
+        """A follow-up message is recoverable while its plan is still running."""
+        conversation = "raphael-owner-" + "c" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            store.put("resp_answered_turn", {
+                "response": {"id": "resp_answered_turn", "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": "Add a weekly report"},
+                    {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "schema_version": 1,
+                            "kind": "question",
+                            "message": "Who should receive it?",
+                        }),
+                    },
+                ],
+            })
+            assert store.set_conversation(
+                conversation, "resp_answered_turn", profile="default",
+            ) is True
+            assert store.reserve_owner_conversation(
+                "default",
+                conversation,
+                "resp_pending_follow_up",
+                owner_message="Send it to me every Friday",
+            ) is True
+
+            snapshot = store.owner_history_snapshot(conversation)
+
+            assert len(snapshot["data"]) == 1
+            assert snapshot["pending"] == {
+                "owner": "Send it to me every Friday",
+                "response_id": "resp_pending_follow_up",
+            }
+
+            # An expired reservation is not a pending request: nothing is
+            # planning it any more, so projecting it would tell the owner their
+            # words are still being worked on when they are not.
+            store._conn.execute(
+                "UPDATE owner_conversation_reservations SET expires_at = ? "
+                "WHERE profile = ? AND name = ?",
+                (time.time() - 1, "default", conversation),
+            )
+            store._conn.commit()
+            assert store.owner_history_snapshot(conversation)["pending"] is None
+        finally:
+            store.close()
+
+    def test_a_terminal_failure_survives_the_reservation_it_releases(self):
+        """Item 32TK: the fence is dropped, the owner's request is not.
+
+        A turn that fails releases its reservation, so the pending projection
+        goes with it. Without this record a browser that never received the
+        accept response has nothing left to find: no words, and no failure
+        either. The record replaces the fence in ONE write, so a caller can
+        still reach the same response id and read the same terminal outcome.
+        """
+        conversation = "raphael-owner-" + "e" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            assert store.reserve_owner_conversation(
+                "default",
+                conversation,
+                "resp_failed_first_turn",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+
+            _interrupt_owner_turn(store, conversation, "resp_failed_first_turn")
+
+            snapshot = store.owner_history_snapshot(conversation)
+            # Nothing is being planned any more...
+            assert snapshot["pending"] is None
+            # ...and the request that was is still recoverable.
+            assert snapshot["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_failed_first_turn",
+            }
+            # It is a way back to a decided outcome, never an approvable turn.
+            assert snapshot["head_response_id"] is None
+            assert snapshot["latest_response_id"] is None
+            assert snapshot["proposal_claimed"] is False
+            assert snapshot["data"] == []
+        finally:
+            store.close()
+
+    def test_only_a_live_fence_can_become_a_recovery_record(self):
+        """A published turn is never restated as an unfinished one.
+
+        The reservation is released inside the transaction that publishes the
+        turn, so a failure handler arriving afterwards finds no fence to
+        convert and writes nothing. That is what keeps this record from
+        becoming a second, contradicting account of a turn that really did
+        complete.
+        """
+        conversation = "raphael-owner-" + "f" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_published_turn",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            store.put("resp_published_turn", {
+                "response": {"id": "resp_published_turn", "created_at": 1},
+                "conversation_history": [
+                    {
+                        "role": "user",
+                        "content": "Prepare a private 60-minute workshop",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "schema_version": 1,
+                            "kind": "question",
+                            "message": "Who is the workshop for?",
+                        }),
+                    },
+                ],
+            })
+            assert store.set_conversation(
+                conversation, "resp_published_turn", profile="default",
+                reservation_id="resp_published_turn",
+            ) is True
+
+            _interrupt_owner_turn(store, conversation, "resp_published_turn")
+            assert store.owner_history_snapshot(conversation)["recovery"] is None
+        finally:
+            store.close()
+
+    def test_a_recovery_record_is_retired_only_by_an_acknowledgement(self):
+        """Reading it can never be what erases it.
+
+        The answer carrying it can be lost exactly like the one that started
+        all this, so it stands until a caller says it has the words and the
+        outcome. Saying so twice is the same as saying it once.
+        """
+        conversation = "raphael-owner-" + "1" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_unacknowledged",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_unacknowledged")
+
+            # Read as often as a browser needs to; it is still there.
+            for _ in range(3):
+                assert store.owner_history_snapshot(conversation)["recovery"] == {
+                    "owner": "Prepare a private 60-minute workshop",
+                    "response_id": "resp_unacknowledged",
+                }
+
+            # A different response id is not this record and does not retire it.
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_someone_elses",
+            ) == "mismatch"
+            assert store.owner_history_snapshot(conversation)["recovery"] is not None
+
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_unacknowledged",
+            ) == "retired"
+            assert store.owner_history_snapshot(conversation)["recovery"] is None
+            # Idempotent: a repeated acknowledgement is not an error.
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_unacknowledged",
+            ) == "absent"
+            assert store.owner_history_snapshot(conversation)["recovery"] is None
+        finally:
+            store.close()
+
+    def test_a_recovery_record_survives_restart_and_any_age(self, tmp_path):
+        """Only an acknowledgement retires it — never a restart, never age.
+
+        The Founder's request is the thing this record carries. An owner who
+        comes back next week, or after the gateway was restarted, still gets
+        told what became of what they sent, because nothing else can tell them:
+        the browser holds no handle, and no turn was ever published.
+        """
+        database = str(tmp_path / "response_store.db")
+        store = ResponseStore(max_size=10, db_path=database)
+        conversation = "raphael-owner-" + "2" * 32
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_first_attempt",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_first_attempt")
+        finally:
+            store.close()
+
+        # The gateway restarts. The record is durable state, so it is still
+        # there — and no legacy expiry column is consulted to decide that.
+        store = ResponseStore(max_size=10, db_path=database)
+        try:
+            assert store.owner_history_snapshot(conversation)["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_first_attempt",
+            }
+
+            # An arbitrarily old record, written by a build that stamped a
+            # bounded lease onto it, is still the owner's unanswered request.
+            store._conn.execute(
+                "UPDATE owner_conversation_recovery SET created_at = ?, "
+                "expires_at = ? WHERE profile = ? AND name = ?",
+                (0.0, 1.0, "default", conversation),
+            )
+            store._conn.commit()
+            assert store.owner_history_snapshot(conversation)["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_first_attempt",
+            }
+
+            # Acknowledging it is still the one and only way it ends.
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_first_attempt",
+            ) == "retired"
+            assert store.owner_history_snapshot(conversation)["recovery"] is None
+        finally:
+            store.close()
+
+    def test_a_new_turn_is_refused_while_a_recovery_is_unacknowledged(self):
+        """A newer request may not bury the one that was never answered.
+
+        Superseding it deleted the only account of an interrupted request the
+        moment a second browser sent anything, so the Founder's words were lost
+        by another tab simply being used. The fence refuses instead, and only an
+        acknowledgement opens the conversation again.
+        """
+        conversation = "raphael-owner-" + "2" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_first_attempt",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_first_attempt")
+
+            # A different message, from a browser that knows nothing about the
+            # first: refused, and the record it would have replaced still reads.
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_second_attempt",
+                owner_message="Prepare a private 90-minute workshop",
+            ) is False
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["pending"] is None
+            assert snapshot["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_first_attempt",
+            }
+            # Not even the interrupted turn's own id may take the fence back:
+            # that turn is over, and its outcome is what there is to read.
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_first_attempt",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is False
+
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_first_attempt",
+            ) == "retired"
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_second_attempt",
+                owner_message="Prepare a private 90-minute workshop",
+            ) is True
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["recovery"] is None
+            assert snapshot["pending"] == {
+                "owner": "Prepare a private 90-minute workshop",
+                "response_id": "resp_second_attempt",
+            }
+        finally:
+            store.close()
+
+    def test_a_terminal_ending_without_a_fence_leaves_the_work_recoverable(self):
+        """Item 32TK round 3: no turn and no record is not an ending.
+
+        The conversion is what turns this turn's fence into the account of what
+        the owner sent. Ignoring a conversion that found nothing let the
+        terminal body, the replay record and the job retirement all land while
+        the request itself simply vanished: no published turn, no recovery, and
+        nothing left saying anybody must finish it. The ending is refused
+        instead, and everything it would have written rolls back together.
+        """
+        conversation = "raphael-owner-" + "7" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            store.reserve_owner_job(
+                "response", "resp_no_fence_left", "default",
+                {"conversation": conversation},
+            )
+            with pytest.raises(OwnerTurnNotRecoverable):
+                _interrupt_owner_turn(store, conversation, "resp_no_fence_left")
+
+            # Nothing moved: no terminal body, no recovery, and the job row
+            # still says somebody must finish this.
+            assert store.get("resp_no_fence_left") is None
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["pending"] is None
+            assert snapshot["recovery"] is None
+            assert store._conn.execute(
+                "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+                ("resp_no_fence_left",),
+            ).fetchone()[0] == 1
+        finally:
+            store.close()
+
+    def test_an_expired_fence_is_kept_while_its_work_is_unresolved(self):
+        """Item 32TK round 3: expiry alone may not destroy the way back.
+
+        A lease that runs out says the executor stopped renewing it, not that
+        the work it fenced is finished. While the job row still says somebody
+        must finish this response, the fence stays: every other caller is
+        refused by it, and the ending that eventually arrives still has
+        something to convert into the record carrying the owner's request.
+        """
+        conversation = "raphael-owner-" + "8" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_expired_but_queued",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            store.reserve_owner_job(
+                "response", "resp_expired_but_queued", "default",
+                {"conversation": conversation},
+            )
+            store._conn.execute(
+                "UPDATE owner_conversation_reservations SET expires_at = ? "
+                "WHERE profile = ? AND name = ?",
+                (time.time() - 1, "default", conversation),
+            )
+            store._conn.commit()
+
+            # Every fence-reading caller still sees it, so nothing takes this
+            # conversation over and nothing closes it out from under the work.
+            assert store.close_owner_conversation(
+                "default", conversation, None,
+            ) is False
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_competing_turn",
+            ) is False
+
+            # And the ending, when it comes, still has a fence to convert.
+            _interrupt_owner_turn(store, conversation, "resp_expired_but_queued")
+            assert store.owner_history_snapshot(conversation)["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_expired_but_queued",
+            }
+        finally:
+            store.close()
+
+    def test_a_conversation_with_an_unanswered_request_cannot_be_closed(self):
+        """Item 32TK round 3: closing is not an answer either.
+
+        The fence is released the moment a plan ends, so a conversation whose
+        last request ended without a turn has no live reservation to refuse a
+        close. Closing it there orphaned the durable record: the owner's
+        request stayed unanswered forever on a conversation nothing would ever
+        read again. Only an acknowledgement opens this.
+        """
+        conversation = "raphael-owner-" + "9" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_unanswered",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_unanswered")
+
+            assert store.close_owner_conversation(
+                "default", conversation, None,
+            ) is False
+            assert store.owner_history_snapshot(
+                conversation,
+            )["conversation_closed"] is False
+
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_unanswered",
+            ) == "retired"
+            assert store.close_owner_conversation(
+                "default", conversation, None,
+            ) is True
+        finally:
+            store.close()
+
+    def test_an_unanswered_request_refuses_both_owner_proposal_claims(self):
+        """Item 32TK, finding 2: a claim is not an answer either.
+
+        The fence is released the moment a plan ends, so a conversation
+        carrying a request that ended without a turn has no live reservation.
+        Both claim transactions refused a live reservation and nothing else, so
+        an OLDER proposal on that conversation could still be claimed and run
+        while the later request stood unanswered behind it — and the run that
+        followed consumed the proposal, which is not something an
+        acknowledgement can undo. Only an acknowledgement opens either claim.
+        """
+        conversation = "raphael-owner-" + "5" * 32
+        response_id = "resp_older_proposal"
+        claim_id = "claim_" + "6" * 32
+        run_id = "run_" + "7" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1_000},
+                "conversation_history": [{
+                    "role": "assistant",
+                    "content": json.dumps(_owner_new_proposal()),
+                }],
+            })
+            assert store.set_conversation(
+                conversation, response_id, owner_proposal=True,
+            ) is True
+
+            # A LATER request, sent after that proposal, that ended without
+            # ever becoming a turn. Its fence is already gone.
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_later_request",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_later_request")
+            # Nothing is fencing this conversation any more: that is exactly
+            # the state both claims used to walk straight through.
+            assert store.owner_history_snapshot(conversation)["pending"] is None
+
+            assert store.claim_owner_proposal(
+                "default", conversation, response_id, claim_id,
+            ) is False
+            assert store.claim_and_attach_owner_run(
+                "default", conversation, response_id, claim_id, run_id,
+                operation="owner_task_graph_commit",
+                payload_digest="a" * 64,
+            ) is False
+            # Nothing was claimed, nothing was bound, nothing was consumed.
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["proposal_claimed"] is False
+            assert snapshot["active_run_id"] is None
+            assert snapshot["proposal_consumed"] is False
+            assert snapshot["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_later_request",
+            }
+
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_later_request",
+            ) == "retired"
+            assert store.claim_and_attach_owner_run(
+                "default", conversation, response_id, claim_id, run_id,
+                operation="owner_task_graph_commit",
+                payload_digest="a" * 64,
+            ) is True
+            assert store.owner_history_snapshot(
+                conversation,
+            )["active_run_id"] == run_id
+        finally:
+            store.close()
+
+    @staticmethod
+    def _owner_run_binding(store, conversation, response_id):
+        """One approvable proposal, and the exact owner authority a run binds.
+
+        The same dictionary ``/v1/runs`` passes to
+        :meth:`ResponseStore.reserve_run_idempotency` once it has validated the
+        request, so these tests reserve through the production entry point
+        rather than restating what it writes.
+        """
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1_000},
+            "conversation_history": [
+                {"role": "user", "content": "Prepare the workshop"},
+                {
+                    "role": "assistant",
+                    "content": json.dumps(_owner_new_proposal()),
+                },
+            ],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        return {
+            "proposal_profile": "default",
+            "conversation": conversation,
+            "response_id": response_id,
+            "claim_id": "claim_" + "3" * 32,
+            "operation": "owner_task_graph_commit",
+            "payload_digest": "b" * 64,
+        }
+
+    @staticmethod
+    def _run_rows(store, run_id):
+        """The durable traces a reserved run leaves: its key's row, and its job.
+
+        The row is read by the one idempotency key these tests reserve under,
+        so it reports which run that key currently names — nothing, the run
+        that was already there, or a newly bound one.
+        """
+        return {
+            "idempotency": store._conn.execute(
+                "SELECT run_id FROM run_idempotency "
+                "WHERE profile = ? AND session_scope = ? AND idempotency_key = ?",
+                ("default", "scope", "commit-key"),
+            ).fetchone(),
+            "job": store._conn.execute(
+                "SELECT 1 FROM owner_executor_jobs WHERE kind = 'run' AND job_key = ?",
+                (run_id,),
+            ).fetchone(),
+        }
+
+    def test_an_unanswered_request_refuses_a_fresh_run_reservation(self):
+        """Item 32TK, finding 2: reserving a run is not an answer either.
+
+        The reservation a plan holds is released the moment that plan ENDS, so
+        a conversation carrying a request that ended without a turn looks
+        completely idle to this transaction. Checking only that reservation let
+        a direct ``/v1/runs`` call claim the OLDER proposal, bind a run to it
+        and queue that run's executor job while the later request stood
+        unanswered behind it — and the run that follows consumes the proposal,
+        which is not something an acknowledgement can undo.
+        """
+        conversation = "raphael-owner-" + "c" * 32
+        response_id = "resp_older_run_proposal"
+        run_id = "run_" + "1" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            owner = self._owner_run_binding(store, conversation, response_id)
+            head = store.owner_history_snapshot(conversation)["head_response_id"]
+
+            # A LATER request, sent after that proposal, that ended without
+            # ever becoming a turn. Its fence is already gone.
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_later_request",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_later_request")
+            assert store.owner_history_snapshot(conversation)["pending"] is None
+
+            assert store.reserve_run_idempotency(
+                "default", "scope", "commit-key", "fingerprint", run_id,
+                owner=owner, job_payload={"owner": dict(owner)},
+            ) == ("authority_conflict", None)
+
+            # Nothing was claimed, bound, recorded or queued, and the
+            # conversation still ends exactly where it did.
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["proposal_claimed"] is False
+            assert snapshot["active_run_id"] is None
+            assert snapshot["proposal_consumed"] is False
+            assert snapshot["head_response_id"] == head
+            assert [turn["owner"] for turn in snapshot["data"]] == [
+                "Prepare the workshop",
+            ]
+            assert snapshot["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_later_request",
+            }
+            assert self._run_rows(store, run_id) == {"idempotency": None, "job": None}
+
+            # Acknowledged, the same reservation is exactly what it always was.
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_later_request",
+            ) == "retired"
+            assert store.reserve_run_idempotency(
+                "default", "scope", "commit-key", "fingerprint", run_id,
+                owner=owner, job_payload={"owner": dict(owner)},
+            ) == ("new", run_id)
+            assert store.owner_history_snapshot(
+                conversation,
+            )["active_run_id"] == run_id
+            assert self._run_rows(store, run_id) == {
+                "idempotency": (run_id,), "job": (1,),
+            }
+        finally:
+            store.close()
+
+    def test_an_unanswered_request_refuses_a_released_run_retry(self):
+        """Item 32TK, finding 2: the released-retry branch is the same door.
+
+        A run that failed releases its claim, and an exact retry of the same
+        approval re-binds that released claim to a new run. This branch checked
+        the live reservation too, so a retry arriving while a LATER request
+        stood unanswered rebound the older proposal, rewrote the run its
+        idempotency key names and queued a second executor job — every one of
+        them a mutation made on a conversation nobody had answered for.
+        """
+        conversation = "raphael-owner-" + "e" * 32
+        response_id = "resp_released_run_proposal"
+        first_run = "run_" + "2" * 32
+        retry_run = "run_" + "4" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            owner = self._owner_run_binding(store, conversation, response_id)
+            assert store.reserve_run_idempotency(
+                "default", "scope", "commit-key", "fingerprint", first_run,
+                owner=owner, job_payload={"owner": dict(owner)},
+            ) == ("new", first_run)
+            assert store.release_owner_claim(
+                "default", conversation, response_id,
+                owner["claim_id"], first_run,
+            ) is True
+            head = store.owner_history_snapshot(conversation)["head_response_id"]
+
+            # ...and only then does a later request end without a turn.
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_later_request",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_later_request")
+
+            assert store.reserve_run_idempotency(
+                "default", "scope", "commit-key", "fingerprint", retry_run,
+                owner=owner, job_payload={"owner": dict(owner)},
+            ) == ("authority_conflict", None)
+
+            # The released claim is still released, still bound to the run that
+            # failed, and nothing was written for the retry.
+            assert store._conn.execute(
+                "SELECT claim_state, owner_run_id FROM conversations "
+                "WHERE profile = ? AND name = ?",
+                ("default", conversation),
+            ).fetchone() == ("released", first_run)
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["proposal_claimed"] is False
+            assert snapshot["active_run_id"] is None
+            assert snapshot["proposal_consumed"] is False
+            assert snapshot["head_response_id"] == head
+            assert [turn["owner"] for turn in snapshot["data"]] == [
+                "Prepare the workshop",
+            ]
+            assert self._run_rows(store, retry_run) == {
+                "idempotency": (first_run,), "job": None,
+            }
+
+            # Acknowledged, the retry re-binds exactly as it always did.
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_later_request",
+            ) == "retired"
+            assert store.reserve_run_idempotency(
+                "default", "scope", "commit-key", "fingerprint", retry_run,
+                owner=owner, job_payload={"owner": dict(owner)},
+            ) == ("new", retry_run)
+            assert store.owner_history_snapshot(
+                conversation,
+            )["active_run_id"] == retry_run
+            assert self._run_rows(store, retry_run) == {
+                "idempotency": (retry_run,), "job": (1,),
+            }
+        finally:
+            store.close()
+
+    def test_the_draft_that_created_a_project_takes_no_further_turn(self):
+        """Item 32TK, finding 1: a spent New Project draft is terminal.
+
+        Its proposal is consumed, the run that consumed it is bound to it, and
+        the receipt naming the Project the owner is about to be sent to is
+        replayed from exactly that pair. A turn published here takes the head
+        that pair is read from, so the receipt, the redirect and the visible
+        conversation all become unreachable while the Project sits there. The
+        Workspace refuses this, and so does Raphael: only the acknowledgement
+        closes this draft, and the group moves on to a successor in the same
+        write.
+        """
+        group = "raphael-owner-" + "d" * 32
+        conversation = group + "-" + "1" * 32
+        response_id = "resp_created_project_proposal"
+        run_id = "run_" + "5" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            owner = self._owner_run_binding(store, conversation, response_id)
+            assert store.claim_and_attach_owner_run(
+                "default", conversation, response_id,
+                owner["claim_id"], run_id,
+                operation="owner_task_graph_commit",
+                payload_digest=owner["payload_digest"],
+            ) is True
+            assert store.complete_owner_claim(
+                "default", conversation, response_id, owner["claim_id"], run_id,
+            ) is True
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["proposal_consumed"] is True
+            head = snapshot["head_response_id"]
+
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_stale_tab_turn",
+                owner_message="Actually, make it 90 minutes",
+            ) is False
+            settled = store.owner_history_snapshot(conversation)
+            assert settled["pending"] is None
+            assert settled["recovery"] is None
+            assert settled["head_response_id"] == head
+            assert settled["latest_response_id"] == response_id
+            assert settled["conversation_closed"] is False
+
+            # The acknowledgement is what advances this owner, and the clean
+            # successor it names plans exactly as any new draft does.
+            assert store.close_owner_conversation(
+                "default", conversation, response_id,
+                expected_head_response_id=head, next_session_id="6" * 32,
+            ) is True
+            successor = group + "-" + "6" * 32
+            assert store.owner_session_index(
+                "default", group,
+            )["current_session_id"] == "6" * 32
+            assert store.reserve_owner_conversation(
+                "default", successor, "resp_successor_turn",
+                owner_message="Prepare a different workshop",
+            ) is True
+        finally:
+            store.close()
+
+    def test_a_project_change_session_is_not_spent_by_its_own_run(self):
+        """The other half of the same fence: a Project keeps its conversation.
+
+        A change session's proposal is consumed by the run that applies it
+        exactly as a draft's is, and the owner goes on talking about the same
+        Project afterwards. The refusal above is about the draft that CREATED a
+        Project — the one whose receipt is still owed to a browser — so it must
+        read the operation that consumed the proposal rather than the fact that
+        one was consumed.
+        """
+        conversation = "raphael-owner-" + "f" * 32
+        response_id = "resp_project_change_proposal"
+        run_id = "run_" + "8" * 32
+        claim_id = "claim_" + "9" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1_000},
+                "conversation_history": [{
+                    "role": "assistant",
+                    "content": json.dumps(_owner_existing_proposal()),
+                }],
+            })
+            assert store.set_conversation(
+                conversation, response_id, owner_proposal=True,
+            ) is True
+            assert store.claim_and_attach_owner_run(
+                "default", conversation, response_id, claim_id, run_id,
+                operation="owner_project_plan_commit",
+                payload_digest="c" * 64,
+            ) is True
+            assert store.complete_owner_claim(
+                "default", conversation, response_id, claim_id, run_id,
+            ) is True
+            assert store.owner_history_snapshot(
+                conversation,
+            )["proposal_consumed"] is True
+
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_next_change_turn",
+                owner_message="Now add the weekly report",
+            ) is True
+            assert store.owner_history_snapshot(conversation)["pending"] == {
+                "owner": "Now add the weekly report",
+                "response_id": "resp_next_change_turn",
+            }
+        finally:
+            store.close()
+
+    def test_closing_a_conversation_moves_the_group_to_its_next_session(self):
+        """Item 32TK round 3: which draft is current is a server-side fact.
+
+        A caller that states the session this group moves on to gets that
+        pointer advanced inside the closing transaction. Without it the durable
+        pointer still named the conversation that was just closed, so a browser
+        holding no cookie at all came back to the retired one.
+        """
+        group = "raphael-owner-" + "a" * 32
+        successor = "b" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            store.put("resp_first_draft_turn", {
+                "response": {"id": "resp_first_draft_turn", "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": "Prepare a workshop"},
+                    {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "schema_version": 1,
+                            "kind": "question",
+                            "message": "Who is the workshop for?",
+                        }),
+                    },
+                ],
+            })
+            assert store.set_conversation(
+                group, "resp_first_draft_turn", profile="default",
+            ) is True
+            assert store.owner_session_index(
+                "default", group,
+            )["current_session_id"] == "legacy"
+
+            assert store.close_owner_conversation(
+                "default", group, None,
+                expected_head_response_id="resp_first_draft_turn",
+                next_session_id=successor,
+            ) is True
+
+            index = store.owner_session_index("default", group)
+            assert index["current_session_id"] == successor
+            # The retired draft is still readable as a past one, and the
+            # successor carries no turns yet, so it lists none.
+            assert [entry["session_id"] for entry in index["data"]] == ["legacy"]
+        finally:
+            store.close()
+
     def test_owner_turn_reservation_fences_claim_close_and_competing_turn(self):
         conversation = "raphael-owner-" + "5" * 32
         response_id = "resp_reserved_source"
@@ -1206,6 +2172,8 @@ class TestResponseStore:
             "conversation_closed": False,
             "truncated": False,
             "incomplete": False,
+            "pending": None,
+            "recovery": None,
             "data": [],
         }
 
@@ -1791,6 +2759,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post(
         "/v1/responses/conversations/{conversation}/authority",
         adapter._handle_owner_conversation_authority,
+    )
+    app.router.add_post(
+        "/v1/responses/conversations/{conversation}/recovery",
+        adapter._handle_acknowledge_owner_recovery,
     )
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
@@ -3065,6 +4037,147 @@ class TestDeriveChatSessionId:
 
 class TestResponsesEndpoint:
 
+    @pytest.mark.asyncio
+    async def test_owner_history_projects_the_turn_being_planned_right_now(
+        self, adapter,
+    ):
+        """Item 32TK: the request survives at the boundary, not just in the store.
+
+        The Workspace reads this endpoint. A browser that never received the
+        accept response has no handle to the plan at all, so this projection is
+        the only thing that can give the owner back their own words — and the
+        response id that is already planning them.
+        """
+        conversation = "raphael-owner-" + "d" * 32
+        assert adapter._response_store.reserve_owner_conversation(
+            "default",
+            conversation,
+            "resp_pending_at_the_boundary",
+            owner_message="Prepare a private 60-minute workshop",
+        ) is True
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            history_response = await cli.get(
+                f"/v1/responses/conversations/{conversation}",
+            )
+            assert history_response.status == 200
+            history = await history_response.json()
+
+        assert history["data"] == []
+        assert history["pending"] == {
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": "resp_pending_at_the_boundary",
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_failed_turn_is_recoverable_and_acknowledged_at_the_boundary(
+        self, adapter,
+    ):
+        """Item 32TK: the whole way back, over HTTP, with no caller-held handle.
+
+        The Workspace reads and retires this record across the same public
+        boundary it plans turns on. Reading is repeatable because the answer
+        carrying it can be lost too; retiring it is a separate, explicit,
+        repeatable act.
+        """
+        conversation = "raphael-owner-" + "3" * 32
+        assert adapter._response_store.reserve_owner_conversation(
+            "default",
+            conversation,
+            "resp_failed_at_the_boundary",
+            owner_message="Prepare a private 60-minute workshop",
+        ) is True
+        _interrupt_owner_turn(
+            adapter._response_store, conversation, "resp_failed_at_the_boundary",
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.get(f"/v1/responses/conversations/{conversation}")
+            assert first.status == 200
+            recovery = (await first.json())["recovery"]
+            assert recovery == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_failed_at_the_boundary",
+            }
+
+            # Reading again still finds it: the answer above may never have
+            # arrived, which is the whole reason this record exists.
+            again = await cli.get(f"/v1/responses/conversations/{conversation}")
+            assert (await again.json())["recovery"] == recovery
+
+            acknowledged = await cli.post(
+                f"/v1/responses/conversations/{conversation}/recovery",
+                json={"response_id": "resp_failed_at_the_boundary"},
+            )
+            assert acknowledged.status == 200
+            assert (await acknowledged.json())["acknowledged"] is True
+
+            # Retired, and saying so a second time is not an error.
+            after = await cli.get(f"/v1/responses/conversations/{conversation}")
+            assert (await after.json())["recovery"] is None
+            repeated = await cli.post(
+                f"/v1/responses/conversations/{conversation}/recovery",
+                json={"response_id": "resp_failed_at_the_boundary"},
+            )
+            assert repeated.status == 200
+            assert (await repeated.json())["acknowledged"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_recovery_route_says_what_it_actually_did(self, adapter):
+        """Item 32TK round 3: "acknowledged" was said even when nothing was.
+
+        A caller cannot verify an answer that is the same whatever happened. It
+        now distinguishes the record it really retired, a conversation that has
+        nothing outstanding, and a request that names a DIFFERENT outstanding
+        record — which is refused outright, because answering it as success
+        would tell a caller an unanswered request had been dealt with.
+        """
+        conversation = "raphael-owner-" + "b" * 32
+        store = adapter._response_store
+        assert store.reserve_owner_conversation(
+            "default", conversation, "resp_truthful_recovery",
+            owner_message="Prepare a private 60-minute workshop",
+        ) is True
+        _interrupt_owner_turn(store, conversation, "resp_truthful_recovery")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            path = f"/v1/responses/conversations/{conversation}/recovery"
+
+            # Another request entirely: refused, and it changes nothing.
+            mismatched = await cli.post(
+                path, json={"response_id": "resp_some_other_request"},
+            )
+            assert mismatched.status == 409
+            body = await mismatched.json()
+            assert body["acknowledged"] is False
+            assert body["outcome"] == "mismatch"
+            assert (await (await cli.get(
+                f"/v1/responses/conversations/{conversation}"
+            )).json())["recovery"] is not None
+
+            retired = await cli.post(
+                path, json={"response_id": "resp_truthful_recovery"},
+            )
+            assert retired.status == 200
+            assert await retired.json() == {
+                "object": "hermes.response.owner_recovery_acknowledgement",
+                "acknowledged": True,
+                "outcome": "retired",
+            }
+
+            # Saying it twice is still safe, and now says which it was.
+            again = await cli.post(
+                path, json={"response_id": "resp_truthful_recovery"},
+            )
+            assert again.status == 200
+            assert await again.json() == {
+                "object": "hermes.response.owner_recovery_acknowledgement",
+                "acknowledged": True,
+                "outcome": "absent",
+            }
 
     @pytest.mark.asyncio
     async def test_owner_session_index_and_consumption_routes(self, adapter):
@@ -3286,6 +4399,51 @@ class TestResponsesEndpoint:
         assert store.owner_history_snapshot(
             conversation,
         )["conversation_closed"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_close_route_can_state_the_session_this_group_moves_to(
+        self, adapter,
+    ):
+        """Item 32TK round 3: retiring a draft says which one is current now.
+
+        The caller states the successor, and the durable pointer moves with the
+        close. A caller that states nothing keeps the previous behaviour, and a
+        malformed successor is refused rather than quietly ignored.
+        """
+        group = "raphael-owner-" + "c" * 32
+        successor = "d" * 32
+        store = adapter._response_store
+        store.put("resp_group_head", {
+            "response": {"id": "resp_group_head", "created_at": 100},
+            "conversation_history": [],
+        })
+        assert store.set_conversation(group, "resp_group_head") is True
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            path = f"/v1/responses/conversations/{group}/authority"
+            malformed = await cli.post(path, json={
+                "action": "close",
+                "response_id": None,
+                "head_response_id": "resp_group_head",
+                "next_session_id": "not-a-session",
+            })
+            assert malformed.status == 409
+            assert store.owner_session_index(
+                "default", group,
+            )["current_session_id"] == "legacy"
+
+            moved = await cli.post(path, json={
+                "action": "close",
+                "response_id": None,
+                "head_response_id": "resp_group_head",
+                "next_session_id": successor,
+            })
+            assert moved.status == 200
+
+        assert store.owner_session_index(
+            "default", group,
+        )["current_session_id"] == successor
 
     @pytest.mark.asyncio
     async def test_owner_authority_reconciles_only_an_orphaned_exact_run(self, adapter):
@@ -3557,6 +4715,122 @@ class TestResponsesEndpoint:
                 )
             assert resp.status == 400
             run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_owner_request_is_durable_before_the_model_answers(
+        self, adapter,
+    ):
+        """Item 32TK: recorded by the fence, so a lost accept response is not lost work.
+
+        The reservation is taken before ``_run_agent`` is reached, so reading the
+        projection from inside the model call is the exact moment that matters:
+        a browser whose POST came back as a proxy's HTML document is sitting
+        here with nothing, and this is what it can recover from.
+        """
+        conversation = "raphael-owner-" + "9" * 32
+        seen: "list[Any]" = []
+
+        async def _run(**_kwargs):
+            seen.append(
+                adapter._response_store.owner_history_snapshot(
+                    conversation, profile="default",
+                )["pending"]
+            )
+            return (
+                {
+                    "final_response": json.dumps({
+                        "schema_version": 1,
+                        "kind": "question",
+                        "message": "Who is the workshop for?",
+                    }),
+                    "messages": [],
+                    "api_calls": 1,
+                },
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_run):
+                accepted = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Prepare a private 60-minute workshop",
+                        "conversation": conversation,
+                        "store": True,
+                        "expected_previous_response_id": None,
+                    },
+                    headers={"Idempotency-Key": f"response-{uuid.uuid4().hex}"},
+                )
+            assert accepted.status == 200
+            accepted_id = (await accepted.json())["id"]
+
+        assert seen == [{
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": accepted_id,
+        }]
+        # Published: the durable turn now carries the same words, so nothing is
+        # left pending.
+        assert adapter._response_store.owner_history_snapshot(
+            conversation, profile="default",
+        )["pending"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_background_turn_that_fails_leaves_the_owner_a_way_back(
+        self, adapter,
+    ):
+        """Item 32TK: a failure the browser never saw is still findable.
+
+        The accepted turn fails, which releases its fence. If that were all,
+        a browser holding no handle to this response would find an empty
+        conversation and never learn either the request or its outcome.
+        """
+        conversation = "raphael-owner-" + "8" * 32
+
+        async def _fail(**_kwargs):
+            raise RuntimeError("planner unavailable")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_fail):
+                accepted = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Prepare a private 60-minute workshop",
+                        "conversation": conversation,
+                        "background": True,
+                        "store": True,
+                        "expected_previous_response_id": None,
+                    },
+                    headers={"Idempotency-Key": f"response-{uuid.uuid4().hex}"},
+                )
+                assert accepted.status == 200
+                response_id = (await accepted.json())["id"]
+
+                for _ in range(100):
+                    polled = await cli.get(f"/v1/responses/{response_id}")
+                    if (await polled.json())["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    pytest.fail("the background response never became terminal")
+
+            history = await cli.get(
+                f"/v1/responses/conversations/{conversation}",
+            )
+            snapshot = await history.json()
+
+        # The fence is gone with the turn that failed...
+        assert snapshot["pending"] is None
+        # ...and the request, and the response id that decided it, are not.
+        assert snapshot["recovery"] == {
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": response_id,
+        }
+        assert snapshot["head_response_id"] is None
+        assert snapshot["data"] == []
 
     @pytest.mark.asyncio
     async def test_an_exact_retry_against_the_unchanged_predecessor_replays(
@@ -4422,20 +5696,8 @@ class TestResponsesEndpoint:
                         break
                     await asyncio.sleep(0.01)
 
-                with patch.object(
-                    adapter,
-                    "_run_agent",
-                    new_callable=AsyncMock,
-                    return_value=(
-                        {
-                            "final_response": "A fresh plan can start.",
-                            "messages": [],
-                            "api_calls": 1,
-                        },
-                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-                    ),
-                ):
-                    retry = await cli.post(
+                def _send_a_different_message():
+                    return cli.post(
                         "/v1/responses",
                         json={
                             "model": "hermes-agent",
@@ -4449,6 +5711,49 @@ class TestResponsesEndpoint:
                             "Idempotency-Key": f"response-{uuid.uuid4().hex}",
                         },
                     )
+
+                with patch.object(
+                    adapter,
+                    "_run_agent",
+                    new_callable=AsyncMock,
+                    return_value=(
+                        {
+                            "final_response": "A fresh plan can start.",
+                            "messages": [],
+                            "api_calls": 1,
+                        },
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    ),
+                ) as fresh_plan:
+                    # The failed turn left an interrupted request nobody has
+                    # answered for yet. Until it is acknowledged this
+                    # conversation takes nothing new — a second message must not
+                    # be able to bury the first — and no model runs.
+                    refused = await _send_a_different_message()
+                    assert refused.status == 409
+                    assert (await refused.json())["error"]["code"] == (
+                        "owner_conversation_locked"
+                    )
+                    assert fresh_plan.await_count == 0
+                    history = await cli.get(
+                        f"/v1/responses/conversations/{conversation}",
+                    )
+                    # The request itself came through the ordinary background
+                    # failure path, in the same write that made the turn
+                    # terminal. It is all a browser that never received the
+                    # accept response has left to find.
+                    assert (await history.json())["recovery"] == {
+                        "owner": "Plan the milestone",
+                        "response_id": response_id,
+                    }
+
+                    acknowledged = await cli.post(
+                        f"/v1/responses/conversations/{conversation}/recovery",
+                        json={"response_id": response_id},
+                    )
+                    assert acknowledged.status == 200
+
+                    retry = await _send_a_different_message()
                     assert retry.status == 200
 
         assert failed is not None
@@ -4680,7 +5985,12 @@ class TestResponsesEndpoint:
             "conversation_history": [],
         })
         # Exactly what the 202 leaves behind, attributed to a process that is
-        # gone: a pid that cannot be running, aged past the reap floor.
+        # gone: the fence this turn took before any model ran, the job row, a
+        # pid that cannot be running, and an age past the reap floor.
+        assert store.reserve_owner_conversation(
+            "default", conversation, response_id,
+            owner_message="Prepare a private 60-minute workshop",
+        ) is True
         store.reserve_owner_job(
             "response", response_id, "default", {"conversation": conversation},
         )
@@ -4698,6 +6008,12 @@ class TestResponsesEndpoint:
         assert "restarted" in recovered["response"]["error"]["message"]
         # And nothing is left claiming an executor.
         assert store.claim_orphaned_owner_jobs("response") == []
+        # The request is not lost with the executor that was driving it: the
+        # fence became the way back to this exact outcome.
+        assert store.owner_history_snapshot(conversation)["recovery"] == {
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": response_id,
+        }
 
     @pytest.mark.asyncio
     async def test_a_completed_owner_response_is_never_recovered_as_failed(
@@ -4858,6 +6174,96 @@ class TestResponsesEndpoint:
             (response_id,),
         ).fetchone()[0] == 0
 
+    @staticmethod
+    def _failed_body(response_id):
+        return {
+            "id": response_id, "object": "response", "status": "failed",
+            "output": [], "error": {"code": "server_error", "message": "stopped"},
+        }
+
+    def test_a_terminal_owner_failure_and_its_recovery_commit_together(
+        self, adapter,
+    ):
+        """Item 32TK, finding 3: the request cannot fall between two commits.
+
+        Storing the terminal body and turning this turn's fence into the record
+        that carries the owner's request were separate transactions. A crash
+        between them left a turn that had failed with nothing left to say what
+        the owner had sent — the exact way the Founder's request was lost.
+        """
+        store = adapter._response_store
+        conversation = "raphael-owner-" + "6" * 32
+        response_id = "resp_" + "6" * 28
+        scope, queued = self._accepted_background_response(
+            store, conversation=conversation, response_id=response_id,
+            key="idem-atomic-failure",
+        )
+        assert store.reserve_owner_conversation(
+            "default", conversation, response_id,
+            owner_message="Prepare a private 60-minute workshop",
+        ) is True
+
+        # The last write of the transaction fails, which is the crash this is
+        # about: everything before it is already staged.
+        with patch.object(
+            store, "_release_owner_job_locked",
+            side_effect=RuntimeError("power lost"),
+        ):
+            with pytest.raises(RuntimeError):
+                store.store_terminal_owner_response(
+                    profile="default",
+                    response_id=response_id,
+                    data={"response": self._failed_body(response_id)},
+                    release_job=True,
+                    conversation=conversation,
+                    interrupted=True,
+                )
+
+        # Nothing moved. The turn is still queued, still fenced, and its job row
+        # still says somebody must finish it — so the whole thing is recoverable
+        # exactly as it was.
+        assert store.get(response_id)["response"] == queued
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["pending"] == {
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": response_id,
+        }
+        assert snapshot["recovery"] is None
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+            (response_id,),
+        ).fetchone()[0] == 1
+        assert store.lookup_owner_response(
+            "default", scope, "idem-atomic-failure", "fingerprint", conversation,
+        ) == ("replay", queued, "sess-1")
+
+        store.store_terminal_owner_response(
+            profile="default",
+            response_id=response_id,
+            data={"response": self._failed_body(response_id)},
+            release_job=True,
+            conversation=conversation,
+            interrupted=True,
+        )
+
+        # And now all four facts about this ending landed together.
+        assert store.get(response_id)["response"]["status"] == "failed"
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["pending"] is None
+        assert snapshot["recovery"] == {
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": response_id,
+        }
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+            (response_id,),
+        ).fetchone()[0] == 0
+        outcome, replay, _session = store.lookup_owner_response(
+            "default", scope, "idem-atomic-failure", "fingerprint", conversation,
+        )
+        assert outcome == "replay"
+        assert replay["status"] == "failed"
+
     def test_an_exact_retry_replays_a_recovered_failure_instead_of_a_new_turn(
         self, adapter,
     ):
@@ -4866,6 +6272,10 @@ class TestResponsesEndpoint:
         store = adapter._response_store
         conversation = "raphael-owner-" + "4" * 32
         response_id = "resp_" + "4" * 28
+        assert store.reserve_owner_conversation(
+            "default", conversation, response_id,
+            owner_message="Prepare a private 60-minute workshop",
+        ) is True
         scope, _queued = self._accepted_background_response(
             store, conversation=conversation, response_id=response_id,
             key="idem-recovered",
@@ -4888,6 +6298,11 @@ class TestResponsesEndpoint:
         assert "restarted" in replay["error"]["message"]
         # The key stayed immutable: the same response id, never a new one.
         assert replay["id"] == response_id
+        # And the replay landed together with the way back to it.
+        assert store.owner_history_snapshot(conversation)["recovery"] == {
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": response_id,
+        }
 
 
 class TestResponsesStreaming:
@@ -6183,6 +7598,11 @@ def _owner_authority_probes(store):
         "proposal_record": lambda: store.owner_proposal_record(
             "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
         ),
+        # A run is refused while this answers "yes", so a store that cannot
+        # answer at all must refuse rather than report "nothing outstanding".
+        "request_is_unanswered": lambda: store.owner_request_is_unanswered(
+            "default", _AUTHORITY_CONVERSATION,
+        ),
         "proposal_consumed": lambda: store.mark_owner_proposal_consumed(
             "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
         ),
@@ -6309,7 +7729,29 @@ class TestOwnerAuthorityRequiresDurableStorage:
             db_path.unlink()
 
             _assert_no_owner_authority(store)
-            # ...while the non-authoritative cache keeps serving.
+            # ...while the non-authoritative cache keeps serving. SQLite refuses
+            # to write a file it has seen disappear, so this only holds because
+            # the store demoted itself to memory when it lost durability.
+            _assert_generic_traffic_still_works(store)
+            assert store._db_path is None
+        finally:
+            store.close()
+
+    def test_a_vanished_store_never_regains_authority_from_a_new_file(
+        self, tmp_path,
+    ):
+        """A path that already lost this store's data is not authority again."""
+        db_path = tmp_path / "response-store.db"
+        store = ResponseStore(max_size=10, db_path=str(db_path))
+        try:
+            db_path.unlink()
+            with pytest.raises(OwnerAuthorityUnavailable):
+                store.owner_history_snapshot(_AUTHORITY_CONVERSATION)
+
+            # A new file at the same path is a different inode this connection
+            # was never attached to, so nothing it holds became durable.
+            db_path.write_bytes(b"")
+            _assert_no_owner_authority(store)
             _assert_generic_traffic_still_works(store)
         finally:
             store.close()

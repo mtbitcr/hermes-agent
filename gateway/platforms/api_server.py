@@ -1329,6 +1329,15 @@ _OWNER_HISTORY_TURN_LIMIT = 40
 _OWNER_CLAIM_LEASE_SECONDS = 300
 _OWNER_CONVERSATION_RESERVATION_LEASE_SECONDS = 300
 _OWNER_CONVERSATION_RESERVATION_RENEW_SECONDS = 60
+# An interrupted request is recoverable until its caller acknowledges it, and
+# for no shorter a time than that. Nothing else can tell the owner what became
+# of what they sent: the turn was never published, and the browser holds no
+# handle to it. A bounded lease meant an owner who came back late — or after a
+# restart — found the request gone instead of answered, so the record simply
+# does not expire. ``owner_conversation_recovery.expires_at`` is a NOT NULL
+# column an older schema left behind: it is written so those rows stay valid,
+# never read, and never used to hide or purge a record.
+_OWNER_CONVERSATION_RECOVERY_NO_EXPIRY = float("inf")
 _OWNER_PROPOSAL_MAX_MUTATIONS = 12
 # The exact proposal schema versions that carry approval authority. Every
 # created task must now name its ``execution_tier``, so only these versions can
@@ -1370,6 +1379,18 @@ class OwnerAuthorityBroken(RuntimeError):
     not the same answer. The first is genuinely empty; the second is a service
     failure, and projecting it as "no history" invites a caller to plan a first
     turn against a conversation that already has turns nobody can read.
+    """
+
+
+class OwnerTurnNotRecoverable(RuntimeError):
+    """One ending would have left neither a published turn nor a way back.
+
+    A turn that stops without publishing has exactly two honest endings: it
+    took the conversation's head, or its fence became the record carrying the
+    owner's request. An ending that can do neither is not an ending at all —
+    committing it would retire the durable job that says somebody must finish
+    this response while destroying the only account of what was sent. The whole
+    transaction rolls back instead, so the work stays queued and recoverable.
     """
 
 
@@ -1494,6 +1515,24 @@ def _owner_history_has_actionable_final_proposal(
 ) -> bool:
     """Return whether the exact final assistant reply grants approval authority."""
     return _owner_final_proposal(history) is not None
+
+
+def _pending_owner_message(value: Any) -> Optional[str]:
+    """The plain-text request a reservation may carry, or nothing.
+
+    Held to exactly the bound the projected owner turns are held to, so a
+    request that is recorded here can also be shown. Anything else — a
+    multimodal input, an empty message, one too long to project — records
+    nothing rather than a partial or unprojectable request: the fence itself
+    must never be refused over this, and a pending projection that is missing
+    is honest, while one that is truncated is not.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > _OWNER_HISTORY_OWNER_MAX_CHARS:
+        return None
+    return text
 
 
 class ResponseStore:
@@ -1639,6 +1678,36 @@ class ResponseStore:
                 "WHERE expires_at IS NULL",
                 (_OWNER_CONVERSATION_RESERVATION_LEASE_SECONDS,),
             )
+        if "owner_message" not in reservation_columns:
+            # The request this reservation is planning, durable from before any
+            # model runs. A row written by an older build carries none, which
+            # reads as "not projectable" rather than as an empty request.
+            self._conn.execute(
+                "ALTER TABLE owner_conversation_reservations "
+                "ADD COLUMN owner_message TEXT"
+            )
+        # What is left of a turn that ended without ever publishing one. The
+        # reservation above is released by that ending, so it cannot be what a
+        # caller recovers from; this row replaces it in the same write and
+        # stands until the caller says it holds both the request and the
+        # outcome. One row per conversation, because while it stands the fence
+        # refuses to start another turn here at all: a second request must not
+        # be able to bury the one that was never answered.
+        #
+        # ``expires_at`` is legacy. It is still written so a database created by
+        # an older build keeps satisfying its NOT NULL, and it is read nowhere:
+        # nothing about this record's age may hide or purge it.
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS owner_conversation_recovery (
+                profile TEXT NOT NULL,
+                name TEXT NOT NULL,
+                response_id TEXT NOT NULL,
+                owner_message TEXT,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                PRIMARY KEY (profile, name)
+            )"""
+        )
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS run_idempotency (
                 profile TEXT NOT NULL,
@@ -2003,9 +2072,9 @@ class ResponseStore:
 
         Checked per call for a second reason: a store that WAS durable can stop
         being so while the process runs. If the file is unlinked underneath us,
-        SQLite keeps serving the open inode, so reads and writes still appear to
-        succeed — and vanish at the next restart. An owner claim, closure or run
-        identity recorded there is not durable, so the same refusal applies.
+        SQLite keeps serving the open inode for reads — and vanishes at the next
+        restart. An owner claim, closure or run identity recorded there is not
+        durable, so the same refusal applies.
         """
         if self._db_path is None:
             raise OwnerAuthorityUnavailable(
@@ -2016,9 +2085,36 @@ class ResponseStore:
                 "Response store %s is no longer on disk; owner workspace "
                 "authority is unavailable in this process", self._db_path,
             )
+            self._demote_to_memory()
             raise OwnerAuthorityUnavailable(
                 "the owner workspace store is unavailable"
             )
+
+    def _demote_to_memory(self) -> None:
+        """Enter the same no-durable-authority state the constructor falls back to.
+
+        The connection is still attached to the vanished inode, and SQLite
+        refuses to write a database file it has seen move or disappear
+        (``SQLITE_READONLY_DBMOVED`` — "attempt to write a readonly database").
+        Left as-is that breaks the generic Responses cache too, which is not
+        authority and has no reason to fail. Rebinding to ``:memory:`` keeps
+        that traffic serving and makes the owner refusal permanent for this
+        store: a path that has already proven it does not persist never regains
+        authority just because a new file appears there.
+        """
+        with self._conversation_lock:
+            if self._db_path is None:
+                return
+            self._db_path = None
+            try:
+                self._conn.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close the vanished response store connection",
+                    exc_info=True,
+                )
+            self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._initialize_schema()
 
     def _profile(self, profile: Optional[str]) -> str:
         selected = str(profile or self._default_profile).strip().lower()
@@ -2206,6 +2302,8 @@ class ResponseStore:
             "conversation_closed": False,
             "truncated": False,
             "incomplete": False,
+            "pending": None,
+            "recovery": None,
             "data": [],
         }
         profile = self._profile(profile)
@@ -2214,6 +2312,15 @@ class ResponseStore:
             or _OWNER_CONVERSATION_RE.fullmatch(name) is None
         ):
             return empty
+        # The turn that is being planned right now, if one is, and the last one
+        # that ended without ever becoming a turn. Read first and for every
+        # outcome below — including the empty snapshot, which is the very first
+        # turn of a new Project and therefore exactly the case whose lost accept
+        # response left the owner with nothing.
+        pending = self._pending_owner_turn(profile, name)
+        recovery = self._owner_conversation_recovery(profile, name)
+        empty["pending"] = pending
+        empty["recovery"] = recovery
         mapping = self._conn.execute(
             "SELECT response_id FROM conversations WHERE profile = ? AND name = ?",
             (profile, name),
@@ -2400,6 +2507,15 @@ class ResponseStore:
             # ``truncated`` is: a caller must not present what is left as the
             # complete conversation.
             "incomplete": incomplete,
+            # The request this conversation is planning right now: the owner's
+            # own words and the response id planning them, both durable since
+            # before the model started. Null once the turn is published, at
+            # which point ``data`` carries the same words.
+            "pending": pending,
+            # The last request that ended without becoming a turn at all, and
+            # the response id that decided it. It outlives the fence it was
+            # made from, and only an explicit acknowledgement retires it.
+            "recovery": recovery,
             "data": data,
         }
 
@@ -2455,33 +2571,242 @@ class ResponseStore:
             )
         )
 
+    def _pending_owner_turn(
+        self, profile: str, name: str,
+    ) -> "Optional[Dict[str, str]]":
+        """Project the request one live reservation is still planning.
+
+        Read-only, and deliberately non-destructive: an expired row is simply
+        not pending — nothing is planning it any more, and saying otherwise
+        would tell the owner their words are still being worked on when they
+        are not. Sweeping it belongs to the fence, which holds the write lock.
+
+        The response id is service-to-service, like every other opaque handle
+        in this projection: it is what lets a caller resume THIS turn instead of
+        planning the same words again.
+        """
+        row = self._conn.execute(
+            "SELECT response_id, owner_message FROM "
+            "owner_conversation_reservations "
+            "WHERE profile = ? AND name = ? AND expires_at > ?",
+            (profile, name, time.time()),
+        ).fetchone()
+        if row is None:
+            return None
+        message = _pending_owner_message(row[1])
+        if message is None:
+            return None
+
+        from agent.redact import redact_sensitive_text
+
+        return {
+            "owner": redact_sensitive_text(message, force=True),
+            "response_id": str(row[0]),
+        }
+
+    def _owner_conversation_recovery(
+        self, profile: str, name: str,
+    ) -> "Optional[Dict[str, Optional[str]]]":
+        """Project the interrupted request this conversation has not answered.
+
+        Read-only and repeatable, for the same reason the record exists at all:
+        the answer carrying it can be lost exactly like the one that started
+        this. Only :meth:`acknowledge_owner_conversation_recovery` retires it.
+
+        ``owner`` is null when the request was never projectable. That still
+        matters: the response id alone is what lets a caller read the outcome
+        this conversation ended a turn on, which is the fact a browser holding
+        no handle at all would otherwise never learn.
+
+        Age is deliberately not consulted. A record that has waited a week, or
+        that a restart carried across, is still an unanswered request.
+        """
+        row = self._conn.execute(
+            "SELECT response_id, owner_message FROM owner_conversation_recovery "
+            "WHERE profile = ? AND name = ?",
+            (profile, name),
+        ).fetchone()
+        if row is None:
+            return None
+        message = _pending_owner_message(row[1])
+        if message is None:
+            return {"owner": None, "response_id": str(row[0])}
+
+        from agent.redact import redact_sensitive_text
+
+        return {
+            "owner": redact_sensitive_text(message, force=True),
+            "response_id": str(row[0]),
+        }
+
+    def _convert_owner_reservation_to_recovery_locked(
+        self, profile: str, name: str, response_id: str,
+    ) -> bool:
+        """Replace one turn's fence with the way back to its outcome.
+
+        The caller holds ``_conversation_lock`` and an open transaction, so the
+        release and the record are ONE write, and the record is minted only
+        FROM a live fence. A turn that published released its reservation inside
+        the transaction that took the head, so a failure handler arriving
+        afterwards finds nothing to convert and writes nothing: this can never
+        become a second, contradicting account of a completed turn.
+        """
+        reserved = self._conn.execute(
+            "SELECT owner_message FROM owner_conversation_reservations "
+            "WHERE profile = ? AND name = ? AND response_id = ?",
+            (profile, name, response_id),
+        ).fetchone()
+        if reserved is None:
+            return False
+        self._conn.execute(
+            "DELETE FROM owner_conversation_reservations "
+            "WHERE profile = ? AND name = ? AND response_id = ?",
+            (profile, name, response_id),
+        )
+        now = time.time()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO owner_conversation_recovery "
+            "(profile, name, response_id, owner_message, created_at, "
+            "expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                profile, name, response_id, reserved[0], now,
+                _OWNER_CONVERSATION_RECOVERY_NO_EXPIRY,
+            ),
+        )
+        return True
+
+    @_owner_authority
+    def acknowledge_owner_conversation_recovery(
+        self, profile: str, name: str, response_id: str,
+    ) -> str:
+        """Retire one recovery record, once its caller holds what it carried.
+
+        Exact and idempotent: it retires THIS turn's record and nothing else,
+        and a caller that says so twice is not in error — its first answer may
+        have been the one that never arrived.
+
+        Says which of three things happened, because a caller cannot verify an
+        answer that is the same whatever it did. ``"retired"`` deleted this
+        exact record. ``"absent"`` found nothing outstanding on this
+        conversation at all, which is what a repeated acknowledgement sees.
+        ``"mismatch"`` found a DIFFERENT unanswered request, and wrote nothing:
+        reporting that as success would tell a caller a request it has never
+        shown anyone had been dealt with.
+        """
+        profile = self._profile(profile)
+        if not self._valid_owner_authority_ids(profile, name, response_id):
+            return "mismatch"
+        with self._conversation_lock:
+            cursor = self._conn.execute(
+                "DELETE FROM owner_conversation_recovery "
+                "WHERE profile = ? AND name = ? AND response_id = ?",
+                (profile, name, response_id),
+            )
+            if cursor.rowcount == 1:
+                self._conn.commit()
+                return "retired"
+            outstanding = self._conn.execute(
+                "SELECT 1 FROM owner_conversation_recovery "
+                "WHERE profile = ? AND name = ?",
+                (profile, name),
+            ).fetchone()
+            self._conn.commit()
+            return "absent" if outstanding is None else "mismatch"
+
+    def _owner_response_work_is_unresolved_locked(
+        self, profile: str, response_id: str,
+    ) -> bool:
+        """Whether a durable job row still says somebody must finish this.
+
+        The job row is dropped only by the transaction that makes the response
+        terminal, so while it exists the work behind that response has not been
+        resolved either way.
+        """
+        return self._conn.execute(
+            "SELECT 1 FROM owner_executor_jobs "
+            "WHERE kind = 'response' AND job_key = ? AND profile = ?",
+            (response_id, profile),
+        ).fetchone() is not None
+
     def _active_owner_conversation_reservation_locked(
         self, profile: str, name: str,
     ) -> "sqlite3.Row | None":
-        """Return one live reservation and discard crash-left expired rows.
+        """Return the fence on this conversation, discarding only dead ones.
 
         Callers hold ``_conversation_lock`` and an active ``BEGIN IMMEDIATE``
         transaction, so expiry and the following authority decision are one
         atomic fence.
+
+        An expired lease says the executor stopped renewing it, NOT that the
+        work it fenced is over. While that response's durable job row still
+        says somebody must finish it, the reservation is kept and still
+        returned: discarding it left the ending that eventually arrives with
+        nothing to convert into the record carrying the owner's request, and
+        let another caller take or close the conversation in the meantime.
         """
         now = time.time()
         self._conn.execute(
             "DELETE FROM owner_conversation_reservations "
             "WHERE profile = ? AND name = ? "
-            "AND (expires_at IS NULL OR expires_at <= ?)",
-            (profile, name, now),
+            "AND (expires_at IS NULL OR expires_at <= ?) "
+            "AND response_id NOT IN ("
+            "SELECT job_key FROM owner_executor_jobs "
+            "WHERE kind = 'response' AND profile = ?)",
+            (profile, name, now, profile),
         )
         return self._conn.execute(
             "SELECT response_id, expires_at FROM owner_conversation_reservations "
-            "WHERE profile = ? AND name = ? AND expires_at > ?",
-            (profile, name, now),
+            "WHERE profile = ? AND name = ?",
+            (profile, name),
         ).fetchone()
+
+    def _unanswered_owner_request_locked(self, profile: str, name: str) -> bool:
+        """Whether a request that ended without a turn is still standing here.
+
+        Callers hold ``_conversation_lock`` and an active ``BEGIN IMMEDIATE``,
+        so this and the authority decision that follows are one atomic fence.
+
+        Deliberately separate from the reservation above. The reservation is
+        released the moment a plan ENDS, so a conversation carrying an
+        interrupted request looks completely idle — which is how an older
+        proposal on it could still be claimed and run while the later request
+        stood unanswered behind it, consuming that proposal in a way no
+        acknowledgement can undo. Only an acknowledgement retires this.
+        """
+        return self._conn.execute(
+            "SELECT 1 FROM owner_conversation_recovery "
+            "WHERE profile = ? AND name = ?",
+            (profile, name),
+        ).fetchone() is not None
+
+    @_owner_authority
+    @_response_store_locked
+    def owner_request_is_unanswered(self, profile: str, name: str) -> bool:
+        """The same fence, for a caller deciding BEFORE it opens a transaction.
+
+        Exactly :meth:`_unanswered_owner_request_locked`, so a request-level
+        refusal and the transaction that would otherwise mutate this
+        conversation can never drift apart. It is a read: a caller that acts on
+        it still meets the transactional fence, which is the one that decides.
+        """
+        profile = self._profile(profile)
+        if (
+            not isinstance(name, str)
+            or _OWNER_CONVERSATION_RE.fullmatch(name) is None
+        ):
+            return False
+        return self._unanswered_owner_request_locked(profile, name)
 
     @_owner_authority
     def claim_owner_proposal(
         self, profile: str, name: str, response_id: str, claim_id: str,
     ) -> bool:
-        """Atomically reserve the exact current proposal for one owner approval."""
+        """Atomically reserve the exact current proposal for one owner approval.
+
+        Refused while an interrupted request is standing unanswered on this
+        conversation: an approval is not an answer to it, and the run behind
+        one consumes the proposal for good.
+        """
         profile = self._profile(profile)
         if not self._valid_owner_authority_ids(profile, name, response_id, claim_id):
             return False
@@ -2503,6 +2828,7 @@ class ResponseStore:
                     or row[1] == response_id
                     or bool(row[5])
                     or reserved is not None
+                    or self._unanswered_owner_request_locked(profile, name)
                 ):
                     self._conn.rollback()
                     return False
@@ -2586,6 +2912,9 @@ class ResponseStore:
         ``job_payload`` puts the durable executor recovery job in the SAME
         transaction as the claim, so a crash between them can never leave a
         proposal claimed by a run nobody is driving.
+
+        Refused, like :meth:`claim_owner_proposal`, while an interrupted
+        request is standing unanswered on this conversation.
         """
         profile = self._profile(profile)
         if (
@@ -2617,6 +2946,7 @@ class ResponseStore:
                     or row[1] == response_id
                     or bool(row[6])
                     or reserved is not None
+                    or self._unanswered_owner_request_locked(profile, name)
                 ):
                     self._conn.rollback()
                     return False
@@ -2814,8 +3144,9 @@ class ResponseStore:
         response_id: Optional[str],
         *,
         expected_head_response_id: Any = _UNSTATED,
+        next_session_id: Any = None,
     ) -> bool:
-        """Close one exact conversation only while it has no approved work.
+        """Close one exact conversation only while it has no unanswered work.
 
         ``expected_head_response_id`` is the caller's assertion about the turn
         this conversation currently ENDS at, compared inside the closing
@@ -2825,6 +3156,18 @@ class ResponseStore:
         closed the conversation — hiding a newer turn the owner had already
         been shown. ``None`` asserts "no turn yet"; :data:`_UNSTATED` preserves
         the previous behaviour for a caller that states no head.
+
+        An unacknowledged interrupted request refuses this outright. The fence
+        is released the moment a plan ends, so a live reservation cannot speak
+        for a request that already ended without publishing; closing there left
+        that record orphaned on a conversation nothing would read again.
+
+        ``next_session_id`` is the change session this group moves on to, given
+        its durable place in the group inside the SAME transaction as the
+        close. Without it the group's current-session pointer still named the
+        conversation just retired, so a browser holding no cookie came back to
+        it. A malformed one is refused rather than ignored, since a caller that
+        believes it moved the group on must not be told it did.
         """
         profile = self._profile(profile)
         if (
@@ -2845,14 +3188,47 @@ class ResponseStore:
                     or _OWNER_RESPONSE_RE.fullmatch(expected_head_response_id) is None
                 )
             )
+            or (
+                next_session_id is not None
+                and (
+                    not isinstance(next_session_id, str)
+                    or re.fullmatch(r"[a-f0-9]{32}", next_session_id) is None
+                )
+            )
         ):
             return False
+        group, _session = _owner_conversation_group(name)
+        if next_session_id is not None and group is None:
+            return False
         with self._conversation_lock:
+
+            def _commit_retired() -> bool:
+                """Record the closure and where this group goes next, together."""
+                self._conn.execute(
+                    "INSERT INTO owner_conversation_closures "
+                    "(profile, name, closed_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(profile, name) DO NOTHING",
+                    (profile, name, time.time()),
+                )
+                if next_session_id is not None and group is not None:
+                    self._record_owner_session_locked(
+                        profile, group, f"{group}-{next_session_id}",
+                    )
+                self._conn.commit()
+                return True
+
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 if self._active_owner_conversation_reservation_locked(
                     profile, name,
                 ) is not None:
+                    self._conn.rollback()
+                    return False
+                if self._conn.execute(
+                    "SELECT 1 FROM owner_conversation_recovery "
+                    "WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone() is not None:
                     self._conn.rollback()
                     return False
                 row = self._conn.execute(
@@ -2868,14 +3244,7 @@ class ResponseStore:
                     ):
                         self._conn.rollback()
                         return False
-                    self._conn.execute(
-                        "INSERT INTO owner_conversation_closures "
-                        "(profile, name, closed_at) VALUES (?, ?, ?) "
-                        "ON CONFLICT(profile, name) DO NOTHING",
-                        (profile, name, time.time()),
-                    )
-                    self._conn.commit()
-                    return True
+                    return _commit_retired()
                 if row[0] != response_id:
                     self._conn.rollback()
                     return False
@@ -2886,14 +3255,7 @@ class ResponseStore:
                     self._conn.rollback()
                     return False
                 if bool(row[4]):
-                    self._conn.execute(
-                        "INSERT INTO owner_conversation_closures "
-                        "(profile, name, closed_at) VALUES (?, ?, ?) "
-                        "ON CONFLICT(profile, name) DO NOTHING",
-                        (profile, name, time.time()),
-                    )
-                    self._conn.commit()
-                    return True
+                    return _commit_retired()
                 if row[2] == row[0] and row[3] == "claimed" and row[1] != row[0]:
                     self._conn.rollback()
                     return False
@@ -2906,14 +3268,7 @@ class ResponseStore:
                 if cursor.rowcount != 1:
                     self._conn.rollback()
                     return False
-                self._conn.execute(
-                    "INSERT INTO owner_conversation_closures "
-                    "(profile, name, closed_at) VALUES (?, ?, ?) "
-                    "ON CONFLICT(profile, name) DO NOTHING",
-                    (profile, name, time.time()),
-                )
-                self._conn.commit()
-                return True
+                return _commit_retired()
             except Exception:
                 self._conn.rollback()
                 raise
@@ -3062,6 +3417,7 @@ class ResponseStore:
         response_id: str,
         *,
         expected_previous_response_id: Any = _UNSTATED,
+        owner_message: Optional[str] = None,
     ) -> bool:
         """Fence one owner turn before any model or tool is allowed to run.
 
@@ -3072,6 +3428,28 @@ class ResponseStore:
         predecessor B. ``None`` asserts "no turn yet"; :data:`_UNSTATED` (the
         default) asserts nothing and preserves the previous behaviour for every
         caller that does not state one.
+
+        ``owner_message`` is the request this turn is planning, recorded in the
+        same write that takes the fence — that is, before any model runs. It is
+        what :meth:`owner_history_snapshot` projects as ``pending``, so a browser
+        that never received the accept response can still show the owner exactly
+        what they sent and resume THIS response id instead of planning the same
+        words a second time.
+
+        An unacknowledged interrupted request refuses this outright. Deleting it
+        to make room for a newer turn destroyed the only account of what the
+        owner sent, and it took nothing more than a second browser being used to
+        do it. Nothing here plans anything until that record has been
+        acknowledged.
+
+        So does the draft that CREATED a Project: its proposal is consumed, the
+        run that consumed it is still bound to it, and the receipt naming that
+        Project is replayed from exactly that pair until a browser says it holds
+        it. A turn taken here moves the head that pair is read from, so the
+        receipt and the redirect to the Project became unreachable while the
+        Project itself sat there — and a stale tab was all it took. Only the
+        acknowledgement closes this conversation, and the group moves on to a
+        successor in the same write.
         """
         profile = self._profile(profile)
         if not self._valid_owner_authority_ids(profile, name, response_id):
@@ -3086,9 +3464,17 @@ class ResponseStore:
                 ).fetchone() is not None:
                     self._conn.rollback()
                     return False
+                if self._conn.execute(
+                    "SELECT 1 FROM owner_conversation_recovery "
+                    "WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone() is not None:
+                    self._conn.rollback()
+                    return False
                 row = self._conn.execute(
                     "SELECT proposal_response_id, consumed_response_id, "
-                    "claimed_response_id, claim_state, closed, response_id "
+                    "claimed_response_id, claim_state, closed, response_id, "
+                    "owner_run_id, bound_operation "
                     "FROM conversations WHERE profile = ? AND name = ?",
                     (profile, name),
                 ).fetchone()
@@ -3105,6 +3491,18 @@ class ResponseStore:
                         and row[2] == row[0]
                         and row[3] == "claimed"
                         and row[1] != row[0]
+                    )
+                    # The spent New Project draft, named by the one durable fact
+                    # that distinguishes it from a Project's change session: the
+                    # operation the consuming run was bound to. A change session
+                    # is not spent by the run it started and goes on taking
+                    # turns; a draft that created a Project owes exactly one
+                    # receipt and then retires.
+                    or (
+                        row[0] is not None
+                        and row[1] == row[0]
+                        and row[6] is not None
+                        and row[7] == "owner_task_graph_commit"
                     )
                 ):
                     self._conn.rollback()
@@ -3131,11 +3529,12 @@ class ResponseStore:
                 now = time.time()
                 self._conn.execute(
                     "INSERT INTO owner_conversation_reservations "
-                    "(profile, name, response_id, created_at, expires_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "(profile, name, response_id, created_at, expires_at, "
+                    "owner_message) VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         profile, name, response_id, now,
                         now + _OWNER_CONVERSATION_RESERVATION_LEASE_SECONDS,
+                        _pending_owner_message(owner_message),
                     ),
                 )
                 self._conn.commit()
@@ -3148,8 +3547,18 @@ class ResponseStore:
     def release_owner_conversation_reservation(
         self, profile: str, name: str, response_id: str,
     ) -> None:
+        """Drop this turn's fence, unless its work is still unresolved.
+
+        Called when a turn is over, including from a task-done callback that
+        runs whatever the turn did. A response whose durable job row still says
+        somebody must finish it is NOT over: dropping its fence there would
+        leave the recovery pass nothing to convert, so the request itself could
+        never be recovered.
+        """
         profile = self._profile(profile)
         with self._conversation_lock:
+            if self._owner_response_work_is_unresolved_locked(profile, response_id):
+                return
             self._conn.execute(
                 "DELETE FROM owner_conversation_reservations "
                 "WHERE profile = ? AND name = ? AND response_id = ?",
@@ -3199,6 +3608,15 @@ class ResponseStore:
         gap left a durable queued run and a claimed proposal with no executor:
         polling reported working forever and the owner could not approve the same
         proposal again.
+
+        Both owner branches below — the fresh claim and the retry that re-binds
+        a released one — are refused while an interrupted request is standing
+        unanswered on that conversation, exactly as
+        :meth:`claim_and_attach_owner_run` is. The reservation they already
+        checked is released the moment a plan ENDS, so it cannot speak for a
+        request that ended without publishing: binding a run there consumed the
+        older proposal behind the standing record, which no acknowledgement can
+        undo. The refusal is decided before either branch writes anything.
         """
         profile = self._profile(profile)
         with self._conversation_lock:
@@ -3242,6 +3660,11 @@ class ResponseStore:
                             and row[8] == owner["payload_digest"]
                             and reserved is None
                         ):
+                            if self._unanswered_owner_request_locked(
+                                owner_profile, owner["conversation"],
+                            ):
+                                self._conn.rollback()
+                                return "authority_conflict", None
                             created_at = time.time()
                             queued_json = self._queued_run_status_json(
                                 run_id, created_at,
@@ -3292,6 +3715,9 @@ class ResponseStore:
                         or row[1] == owner["response_id"]
                         or bool(row[6])
                         or reserved is not None
+                        or self._unanswered_owner_request_locked(
+                            owner_profile, owner["conversation"],
+                        )
                         or (
                             row[5] == "claimed"
                             and not (
@@ -4127,26 +4553,80 @@ class ResponseStore:
             })
             record["response"] = failed
             self._put_response_locked(response_id, record, profile)
-            self._conn.execute(
-                "DELETE FROM owner_conversation_reservations "
-                "WHERE profile = ? AND name = ? AND response_id = ?",
-                (profile, conversation, response_id),
-            )
-            self._conn.execute(
-                "UPDATE owner_response_idempotency SET state = 'completed', "
-                "replay_json = ? "
-                "WHERE profile = ? AND conversation = ? AND response_id = ?",
-                (
-                    json.dumps(failed, sort_keys=True, separators=(",", ":")),
-                    profile, conversation, response_id,
-                ),
+            self._retire_interrupted_owner_turn_locked(
+                profile, conversation, response_id, failed,
             )
             self._release_owner_job_locked("response", response_id)
             self._conn.commit()
             return True
+        except OwnerTurnNotRecoverable:
+            # Not an error, and not a decision either: this pass cannot end the
+            # turn without losing the request behind it. Everything rolls back,
+            # the job row stays, and the next sweep tries again.
+            self._conn.rollback()
+            return False
         except Exception:
             self._conn.rollback()
             raise
+
+    def _retire_interrupted_owner_turn_locked(
+        self,
+        profile: str,
+        conversation: str,
+        response_id: str,
+        terminal_response: Dict[str, Any],
+    ) -> bool:
+        """Leave one turn that ended without publishing fully recoverable.
+
+        Inside the CALLER's transaction, so this lands with the terminal body it
+        describes and never separately from it: the fence becomes the record
+        carrying the owner's request, and this exact terminal outcome becomes
+        what the turn's own idempotency key replays.
+
+        A turn that DID take the head is answered, and nothing here may
+        contradict that: it returns ``False`` having written nothing.
+
+        Otherwise this ending MUST leave a way back. The conversion is what
+        produces it, and a conversion that finds no fence produces nothing — so
+        unless this exact request is already recorded as recoverable, the whole
+        transaction is refused with :class:`OwnerTurnNotRecoverable`. Ignoring
+        that let the terminal body, the replay record and the job retirement
+        land while the owner's request itself vanished.
+
+        The idempotency record is UPDATED, never deleted. An owner turn's key is
+        immutable authority: it already minted this response id, so deleting the
+        record let an exact retry mint a SECOND turn for the same submission
+        instead of being told what happened to the first.
+        """
+        head = self._conn.execute(
+            "SELECT response_id FROM conversations WHERE profile = ? AND name = ?",
+            (profile, conversation),
+        ).fetchone()
+        if head is not None and head[0] == response_id:
+            return False
+        if not self._convert_owner_reservation_to_recovery_locked(
+            profile, conversation, response_id,
+        ) and self._conn.execute(
+            "SELECT 1 FROM owner_conversation_recovery "
+            "WHERE profile = ? AND name = ? AND response_id = ?",
+            (profile, conversation, response_id),
+        ).fetchone() is None:
+            raise OwnerTurnNotRecoverable(
+                "owner turn would end with neither a published turn nor a "
+                "recovery record",
+            )
+        self._conn.execute(
+            "UPDATE owner_response_idempotency SET state = 'completed', "
+            "replay_json = ? "
+            "WHERE profile = ? AND conversation = ? AND response_id = ?",
+            (
+                json.dumps(
+                    terminal_response, sort_keys=True, separators=(",", ":"),
+                ),
+                profile, conversation, response_id,
+            ),
+        )
+        return True
 
     @_owner_authority
     @_response_store_locked
@@ -4318,19 +4798,32 @@ class ResponseStore:
         response_id: str,
         data: Dict[str, Any],
         release_job: bool,
+        conversation: Optional[str] = None,
+        interrupted: bool = False,
     ) -> None:
-        """Persist one terminal background response, retiring its job with it.
+        """Persist one terminal background response and everything it ends.
 
         The job row is the ONLY record that says "somebody must finish this
         response". It may therefore be dropped only in the same transaction that
         makes the response terminal: if this write fails the row survives and a
         later sweep recovers the work, instead of the response being left queued
         forever with its recovery authority already deleted.
+
+        ``interrupted`` marks the endings that produced a terminal response and
+        no turn. For those, this turn's fence becoming the record that carries
+        the owner's request — and this outcome becoming what its idempotency key
+        replays — are facts about the SAME ending, committed here with it. They
+        were a second transaction, and a crash in between left a failed turn
+        with nothing left to say what the owner had sent.
         """
         profile = self._profile(profile)
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             self._put_response_locked(response_id, data, profile)
+            if interrupted and conversation is not None:
+                self._retire_interrupted_owner_turn_locked(
+                    profile, conversation, response_id, data.get("response") or {},
+                )
             if release_job:
                 self._release_owner_job_locked("response", response_id)
             self._conn.commit()
@@ -5829,6 +6322,10 @@ class APIServerAdapter(BasePlatformAdapter):
             (
                 "POST", "/v1/responses/conversations/{conversation}/authority",
                 self._handle_owner_conversation_authority,
+            ),
+            (
+                "POST", "/v1/responses/conversations/{conversation}/recovery",
+                self._handle_acknowledge_owner_recovery,
             ),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -9546,6 +10043,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 expected_previous_response_id=(
                     expected_predecessor if expected_predecessor_stated else _UNSTATED
                 ),
+                # Recorded by the same write that takes the fence, so the
+                # owner's own request is durable from before the model starts.
+                # A caller whose accept response never arrived has no handle to
+                # this turn at all; the pending projection is the only thing
+                # that can give it back both the words and this response id.
+                owner_message=user_message,
             ):
                 _release_owner_response_reservation()
                 if (
@@ -9615,18 +10118,31 @@ class APIServerAdapter(BasePlatformAdapter):
                     "[api_server] owner conversation reservation renewal failed"
                 )
 
-        def _release_owner_conversation_reservation() -> None:
+        def _stop_reservation_heartbeat() -> None:
+            """Stop renewing a fence this turn has finished with."""
             nonlocal reservation_heartbeat_task
             heartbeat = reservation_heartbeat_task
             reservation_heartbeat_task = None
             if heartbeat is not None and not heartbeat.done():
                 heartbeat.cancel()
-            if conversation_reservation_id is not None:
-                self._response_store.release_owner_conversation_reservation(
-                    response_profile,
-                    str(conversation),
-                    conversation_reservation_id,
-                )
+
+        def _release_owner_conversation_reservation() -> None:
+            """Drop this turn's fence, leaving nothing behind.
+
+            For the endings that produced a terminal response and no turn, the
+            fence is not dropped here at all: it becomes the record that carries
+            the owner's request, inside the same transaction that stores the
+            terminal body (see ``store_terminal_owner_response``). Doing it here
+            as a second write meant a crash in between lost the request.
+            """
+            _stop_reservation_heartbeat()
+            if conversation_reservation_id is None:
+                return
+            self._response_store.release_owner_conversation_reservation(
+                response_profile,
+                str(conversation),
+                conversation_reservation_id,
+            )
 
         if conversation_reservation_id is not None:
             reservation_heartbeat_task = asyncio.create_task(
@@ -9767,8 +10283,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_id": session_id,
             }
 
-            def _store_terminal_background(response: dict) -> None:
-                """Persist a terminal background body, retiring its job with it.
+            def _store_terminal_background(
+                response: dict, *, interrupted: bool = False,
+            ) -> None:
+                """Persist a terminal background body and everything it ends.
 
                 For an owner conversation the recovery job row is the only
                 record that says this response still needs finishing, so it is
@@ -9776,6 +10294,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 terminal. A separate release ran even when the terminal write
                 itself failed, which left the response queued forever with
                 nobody left to recover it.
+
+                ``interrupted`` says this ending produced no turn, so the same
+                transaction also leaves behind the one thing a browser that
+                never received the accept response has left to find: the
+                request, and the response id whose outcome it can read.
                 """
                 if is_owner_conversation:
                     self._response_store.store_terminal_owner_response(
@@ -9783,7 +10306,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         response_id=response_id,
                         data={**pending_store_data, "response": response},
                         release_job=True,
+                        conversation=str(conversation),
+                        interrupted=interrupted,
                     )
+                    _stop_reservation_heartbeat()
                     return
                 self._response_store.put(response_id, {
                     **pending_store_data,
@@ -9805,8 +10331,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "status": "incomplete",
                         "incomplete_details": {"reason": "cancelled"},
                     })
-                    _store_terminal_background(incomplete)
-                    _release_owner_conversation_reservation()
+                    _store_terminal_background(incomplete, interrupted=True)
                     raise
                 except Exception as exc:
                     safe_error = _redact_api_error_text(exc)
@@ -9823,8 +10348,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             "message": safe_error,
                         },
                     })
-                    _store_terminal_background(failed)
-                    _release_owner_conversation_reservation()
+                    _store_terminal_background(failed, interrupted=True)
                     return
 
                 response_data, full_history, effective_session_id = (
@@ -9898,7 +10422,10 @@ class APIServerAdapter(BasePlatformAdapter):
                                 "session_id": effective_session_id,
                             },
                             release_job=True,
+                            conversation=str(conversation),
+                            interrupted=True,
                         )
+                        _stop_reservation_heartbeat()
                     else:
                         self._response_store.put(response_id, {
                             "response": failed,
@@ -9906,7 +10433,6 @@ class APIServerAdapter(BasePlatformAdapter):
                             "instructions": instructions,
                             "session_id": effective_session_id,
                         }, profile=response_profile)
-                    _release_owner_conversation_reservation()
 
             async def _start_background_response():
                 if is_owner_conversation:
@@ -10192,6 +10718,52 @@ class APIServerAdapter(BasePlatformAdapter):
             "consumed": True,
         })
 
+    async def _handle_acknowledge_owner_recovery(
+        self, request: "web.Request",
+    ) -> "web.Response":
+        """Retire one interrupted request, once its caller holds what it said.
+
+        Deliberately separate from the proposal authority endpoint: this grants
+        nothing and consumes nothing. It only says "I have the words and the
+        outcome", which is the one thing reading the projection must not be
+        allowed to say on the caller's behalf — that read can be lost too.
+        Repeating it is not an error, for exactly the same reason.
+
+        The answer says which of three things happened. Always reporting
+        success made this endpoint unverifiable: a caller could not tell a
+        record it really retired from one that was never here, and a request
+        naming a DIFFERENT unanswered record was told it had been dealt with.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if (
+            not isinstance(body, dict)
+            or set(body) != {"response_id"}
+            or not isinstance(body["response_id"], str)
+        ):
+            return web.json_response(
+                _openai_error("Invalid owner recovery acknowledgement"),
+                status=400,
+            )
+        outcome = self._response_store.acknowledge_owner_conversation_recovery(
+            _active_owner_profile(),
+            request.match_info["conversation"],
+            body["response_id"],
+        )
+        return web.json_response(
+            {
+                "object": "hermes.response.owner_recovery_acknowledgement",
+                "acknowledged": outcome != "mismatch",
+                "outcome": outcome,
+            },
+            status=409 if outcome == "mismatch" else 200,
+        )
+
     async def _handle_owner_conversation_authority(
         self, request: "web.Request",
     ) -> "web.Response":
@@ -10220,7 +10792,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # ``head_response_id`` is optional so an older caller still works,
             # but a caller that states it gets its close compare-and-swapped
             # against the conversation's actual durable head.
-            "close": ({"action", "response_id"}, {"head_response_id"}),
+            #
+            # ``next_session_id`` is likewise optional, and names the change
+            # session this group moves on to. Stating it makes the group's
+            # durable current-session pointer move with the close.
+            "close": (
+                {"action", "response_id"},
+                {"head_response_id", "next_session_id"},
+            ),
         }
         if action not in expected_keys:
             return web.json_response(
@@ -10288,6 +10867,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     body["head_response_id"] if "head_response_id" in body
                     else _UNSTATED
                 ),
+                next_session_id=body.get("next_session_id"),
             )
         if not applied:
             return web.json_response(
@@ -11695,10 +12275,22 @@ class APIServerAdapter(BasePlatformAdapter):
         context: "dict[str, Any]",
         profile: str,
     ) -> "dict[str, str]":
-        """Derive mutation authority from the stored proposal and live Project."""
+        """Derive mutation authority from the stored proposal and live Project.
+
+        A conversation carrying a request that ended without a turn authorizes
+        nothing here, which is the same fence the reservation transaction takes
+        (see :meth:`ResponseStore.reserve_run_idempotency`). Refused at this end
+        as well, before the stored proposal is read and long before anything is
+        bound: an approval is not an answer to that request, and the run behind
+        one consumes the proposal for good.
+        """
         if context.get("profile") != profile:
             raise ValueError("owner profile mismatch")
         proposal_profile = authority["proposal_profile"]
+        if self._response_store.owner_request_is_unanswered(
+            proposal_profile, authority["conversation"],
+        ):
+            raise ValueError("an owner request on this conversation is unanswered")
         record = self._response_store.owner_proposal_record(
             proposal_profile, authority["conversation"], authority["response_id"],
         )
