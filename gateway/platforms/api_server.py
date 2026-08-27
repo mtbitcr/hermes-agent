@@ -1314,6 +1314,10 @@ _OWNER_ORPHAN_RESPONSE_MESSAGE = (
     "This stopped before it finished because Raphael restarted. Please send "
     "your message again."
 )
+_OWNER_INTERRUPTED_TURN_MESSAGE = (
+    "Raphael could not prepare a safe plan for this request. Nothing was "
+    "changed. You can send it again."
+)
 _OWNER_RUN_STOPPED_MESSAGE = (
     "This stopped before it finished. Nothing was changed. You can ask for it "
     "again."
@@ -1533,6 +1537,19 @@ def _pending_owner_message(value: Any) -> Optional[str]:
     if not text or len(text) > _OWNER_HISTORY_OWNER_MAX_CHARS:
         return None
     return text
+
+
+def _owner_failure_reply_is_projectable(value: Any) -> bool:
+    """Whether one structured failure is safe to show as a complete turn."""
+    return (
+        isinstance(value, dict)
+        and set(value) == {"schema_version", "kind", "message"}
+        and value.get("schema_version") == 1
+        and value.get("kind") == "failure"
+        and isinstance(value.get("message"), str)
+        and bool(value["message"].strip())
+        and len(value["message"]) <= 240
+    )
 
 
 class ResponseStore:
@@ -2428,8 +2445,11 @@ class ResponseStore:
                 not isinstance(candidate, dict)
                 or candidate.get("schema_version")
                 not in _OWNER_HISTORY_SCHEMA_VERSIONS
-                or candidate.get("kind")
-                not in {"question", "proposal", "project_change_proposal"}
+                or (
+                    candidate.get("kind")
+                    not in {"question", "proposal", "project_change_proposal"}
+                    and not _owner_failure_reply_is_projectable(candidate)
+                )
             ):
                 continue
             # Last valid structured assistant message before the next owner
@@ -2679,15 +2699,18 @@ class ResponseStore:
     def acknowledge_owner_conversation_recovery(
         self, profile: str, name: str, response_id: str,
     ) -> str:
-        """Retire one recovery record, once its caller holds what it carried.
+        """Seal one recovery as a durable failure turn, then retire its fence.
 
-        Exact and idempotent: it retires THIS turn's record and nothing else,
-        and a caller that says so twice is not in error — its first answer may
-        have been the one that never arrived.
+        Exact and idempotent: it seals THIS turn and nothing else, and a caller
+        that says so twice is not in error — its first answer may have been the
+        one that never arrived.  The response becomes the conversation head in
+        the same transaction that removes recovery, so a reload cannot erase
+        the owner's words or reveal an older proposal as approvable again.
 
         Says which of three things happened, because a caller cannot verify an
-        answer that is the same whatever it did. ``"retired"`` deleted this
-        exact record. ``"absent"`` found nothing outstanding on this
+        answer that is the same whatever it did. ``"retired"`` sealed this
+        exact record as a non-actionable failure turn. ``"absent"`` found
+        nothing outstanding on this
         conversation at all, which is what a repeated acknowledgement sees.
         ``"mismatch"`` found a DIFFERENT unanswered request, and wrote nothing:
         reporting that as success would tell a caller a request it has never
@@ -2697,21 +2720,125 @@ class ResponseStore:
         if not self._valid_owner_authority_ids(profile, name, response_id):
             return "mismatch"
         with self._conversation_lock:
-            cursor = self._conn.execute(
-                "DELETE FROM owner_conversation_recovery "
-                "WHERE profile = ? AND name = ? AND response_id = ?",
-                (profile, name, response_id),
-            )
-            if cursor.rowcount == 1:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                recovery = self._conn.execute(
+                    "SELECT response_id, owner_message "
+                    "FROM owner_conversation_recovery "
+                    "WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchone()
+                if recovery is None:
+                    self._conn.commit()
+                    return "absent"
+                if recovery[0] != response_id:
+                    self._conn.rollback()
+                    return "mismatch"
+
+                owner_message = _pending_owner_message(recovery[1])
+                if owner_message is not None:
+                    terminal_row = self._conn.execute(
+                        "SELECT data FROM responses "
+                        "WHERE profile = ? AND response_id = ?",
+                        (profile, response_id),
+                    ).fetchone()
+                    if terminal_row is None:
+                        raise OwnerAuthorityBroken(
+                            "owner recovery maps a response that is missing"
+                        )
+                    try:
+                        terminal_data = json.loads(terminal_row[0])
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        raise OwnerAuthorityBroken(
+                            "owner recovery maps an unreadable response"
+                        ) from exc
+                    terminal_response = (
+                        terminal_data.get("response")
+                        if isinstance(terminal_data, dict) else None
+                    )
+                    if (
+                        not isinstance(terminal_response, dict)
+                        or terminal_response.get("status")
+                        not in {"failed", "incomplete"}
+                    ):
+                        raise OwnerAuthorityBroken(
+                            "owner recovery maps a response that is not terminal"
+                        )
+
+                    head = self._conn.execute(
+                        "SELECT response_id FROM conversations "
+                        "WHERE profile = ? AND name = ?",
+                        (profile, name),
+                    ).fetchone()
+                    previous_response_id = head[0] if head is not None else None
+                    previous_history: List[Dict[str, Any]] = []
+                    if previous_response_id is not None:
+                        previous_row = self._conn.execute(
+                            "SELECT data FROM responses "
+                            "WHERE profile = ? AND response_id = ?",
+                            (profile, previous_response_id),
+                        ).fetchone()
+                        if previous_row is None:
+                            raise OwnerAuthorityBroken(
+                                "owner conversation maps a response that is missing"
+                            )
+                        try:
+                            previous_data = json.loads(previous_row[0])
+                        except (json.JSONDecodeError, TypeError) as exc:
+                            raise OwnerAuthorityBroken(
+                                "owner conversation maps an unreadable response"
+                            ) from exc
+                        previous_history = (
+                            previous_data.get("conversation_history")
+                            if isinstance(previous_data, dict) else None
+                        )
+                        if not isinstance(previous_history, list):
+                            raise OwnerAuthorityBroken(
+                                "owner conversation has no readable transcript"
+                            )
+
+                    failure_reply = json.dumps(
+                        {
+                            "schema_version": 1,
+                            "kind": "failure",
+                            "message": _OWNER_INTERRUPTED_TURN_MESSAGE,
+                        },
+                        ensure_ascii=False,
+                    )
+                    terminal_data["conversation_history"] = [
+                        *previous_history,
+                        {"role": "user", "content": owner_message},
+                        {"role": "assistant", "content": failure_reply},
+                    ]
+                    self._put_response_locked(
+                        response_id, terminal_data, profile,
+                    )
+                    if not self._set_conversation_locked(
+                        name,
+                        response_id,
+                        owner_proposal=False,
+                        profile=profile,
+                        reservation_id=None,
+                        expected_previous_response_id=previous_response_id,
+                    ):
+                        raise OwnerAuthorityBroken(
+                            "owner recovery could not seal its conversation turn"
+                        )
+
+                cursor = self._conn.execute(
+                    "DELETE FROM owner_conversation_recovery "
+                    "WHERE profile = ? AND name = ? AND response_id = ?",
+                    (profile, name, response_id),
+                )
+                if cursor.rowcount != 1:
+                    raise OwnerAuthorityBroken(
+                        "owner recovery changed while it was being sealed"
+                    )
                 self._conn.commit()
                 return "retired"
-            outstanding = self._conn.execute(
-                "SELECT 1 FROM owner_conversation_recovery "
-                "WHERE profile = ? AND name = ?",
-                (profile, name),
-            ).fetchone()
-            self._conn.commit()
-            return "absent" if outstanding is None else "mismatch"
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def _owner_response_work_is_unresolved_locked(
         self, profile: str, response_id: str,
@@ -10721,13 +10848,15 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_acknowledge_owner_recovery(
         self, request: "web.Request",
     ) -> "web.Response":
-        """Retire one interrupted request, once its caller holds what it said.
+        """Seal one interrupted request, once its caller holds what it said.
 
         Deliberately separate from the proposal authority endpoint: this grants
-        nothing and consumes nothing. It only says "I have the words and the
-        outcome", which is the one thing reading the projection must not be
-        allowed to say on the caller's behalf — that read can be lost too.
-        Repeating it is not an error, for exactly the same reason.
+        no action. It records the request and its failure as the new durable,
+        non-actionable turn, so any proposal from an earlier turn stays
+        superseded, then says "I have the words and the outcome". Reading the
+        projection must not be allowed to say that on the caller's behalf —
+        that read can be lost too. Repeating it is not an error, for exactly
+        the same reason.
 
         The answer says which of three things happened. Always reporting
         success made this endpoint unverifiable: a caller could not tell a

@@ -1256,6 +1256,95 @@ class TestResponseStore:
         finally:
             store.close()
 
+    def test_an_acknowledged_recovery_becomes_a_durable_failure_turn(
+        self, tmp_path,
+    ):
+        """Reload keeps the request and closes every stale approval path.
+
+        A browser acknowledges only after it holds the interrupted request and
+        its terminal outcome.  That acknowledgement used to delete the sole
+        recovery record, so the turn disappeared on reload and the older
+        proposal underneath it could become approvable again.  The exact
+        interrupted response must instead become the durable, non-actionable
+        conversation head in the same transaction that retires recovery.
+        """
+        database = str(tmp_path / "response_store.db")
+        conversation = "raphael-owner-" + "a" * 32
+        proposal_response_id = "resp_older_proposal"
+        failed_response_id = "resp_failed_revision"
+        failure_message = (
+            "Raphael could not prepare a safe plan for this request. "
+            "Nothing was changed. You can send it again."
+        )
+        store = ResponseStore(max_size=10, db_path=database)
+        try:
+            store.put(proposal_response_id, {
+                "response": {"id": proposal_response_id, "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": "Add a weekly report"},
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(_owner_existing_proposal()),
+                    },
+                ],
+            })
+            assert store.set_conversation(
+                conversation, proposal_response_id, owner_proposal=True,
+            ) is True
+            assert store.reserve_owner_conversation(
+                "default",
+                conversation,
+                failed_response_id,
+                expected_previous_response_id=proposal_response_id,
+                owner_message="Make the report easier to understand",
+            ) is True
+            _interrupt_owner_turn(store, conversation, failed_response_id)
+
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, failed_response_id,
+            ) == "retired"
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["recovery"] is None
+            assert snapshot["head_response_id"] == failed_response_id
+            assert snapshot["latest_response_id"] is None
+            assert snapshot["proposal_consumed"] is False
+            assert snapshot["proposal_claimed"] is False
+            assert snapshot["incomplete"] is False
+            assert [turn["owner"] for turn in snapshot["data"]] == [
+                "Add a weekly report",
+                "Make the report easier to understand",
+            ]
+            assert json.loads(snapshot["data"][-1]["raphael"]) == {
+                "schema_version": 1,
+                "kind": "failure",
+                "message": failure_message,
+            }
+            # The later failed request superseded the older proposal.  A stale
+            # tab cannot approve it after the recovery acknowledgement.
+            assert store.claim_owner_proposal(
+                "default",
+                conversation,
+                proposal_response_id,
+                "claim_" + "b" * 32,
+            ) is False
+        finally:
+            store.close()
+
+        store = ResponseStore(max_size=10, db_path=database)
+        try:
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["head_response_id"] == failed_response_id
+            assert snapshot["recovery"] is None
+            assert json.loads(snapshot["data"][-1]["raphael"])["kind"] == "failure"
+            # Retrying the acknowledgement neither errors nor duplicates the
+            # durable turn.
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, failed_response_id,
+            ) == "absent"
+            assert len(store.owner_history_snapshot(conversation)["data"]) == 2
+        finally:
+            store.close()
+
     def test_a_recovery_record_survives_restart_and_any_age(self, tmp_path):
         """Only an acknowledgement retires it — never a restart, never age.
 
@@ -1479,7 +1568,8 @@ class TestResponseStore:
         an OLDER proposal on that conversation could still be claimed and run
         while the later request stood unanswered behind it — and the run that
         followed consumed the proposal, which is not something an
-        acknowledgement can undo. Only an acknowledgement opens either claim.
+        acknowledgement can undo. Acknowledgement therefore seals the later
+        failure as the new head instead of reopening the older proposal.
         """
         conversation = "raphael-owner-" + "5" * 32
         response_id = "resp_older_proposal"
@@ -1534,10 +1624,11 @@ class TestResponseStore:
                 "default", conversation, response_id, claim_id, run_id,
                 operation="owner_task_graph_commit",
                 payload_digest="a" * 64,
-            ) is True
-            assert store.owner_history_snapshot(
-                conversation,
-            )["active_run_id"] == run_id
+            ) is False
+            sealed = store.owner_history_snapshot(conversation)
+            assert sealed["head_response_id"] == "resp_later_request"
+            assert sealed["latest_response_id"] is None
+            assert json.loads(sealed["data"][-1]["raphael"])["kind"] == "failure"
         finally:
             store.close()
 
@@ -1641,19 +1732,20 @@ class TestResponseStore:
             }
             assert self._run_rows(store, run_id) == {"idempotency": None, "job": None}
 
-            # Acknowledged, the same reservation is exactly what it always was.
+            # Acknowledgement seals the later failure. The older proposal is
+            # superseded rather than quietly reactivated behind it.
             assert store.acknowledge_owner_conversation_recovery(
                 "default", conversation, "resp_later_request",
             ) == "retired"
             assert store.reserve_run_idempotency(
                 "default", "scope", "commit-key", "fingerprint", run_id,
                 owner=owner, job_payload={"owner": dict(owner)},
-            ) == ("new", run_id)
-            assert store.owner_history_snapshot(
-                conversation,
-            )["active_run_id"] == run_id
+            ) == ("authority_conflict", None)
+            sealed = store.owner_history_snapshot(conversation)
+            assert sealed["head_response_id"] == "resp_later_request"
+            assert sealed["active_run_id"] is None
             assert self._run_rows(store, run_id) == {
-                "idempotency": (run_id,), "job": (1,),
+                "idempotency": None, "job": None,
             }
         finally:
             store.close()
@@ -1716,19 +1808,21 @@ class TestResponseStore:
                 "idempotency": (first_run,), "job": None,
             }
 
-            # Acknowledged, the retry re-binds exactly as it always did.
+            # Acknowledgement seals the later failure, so the released older
+            # approval is never rebound behind it. Its original idempotency
+            # result remains readable without creating new work.
             assert store.acknowledge_owner_conversation_recovery(
                 "default", conversation, "resp_later_request",
             ) == "retired"
             assert store.reserve_run_idempotency(
                 "default", "scope", "commit-key", "fingerprint", retry_run,
                 owner=owner, job_payload={"owner": dict(owner)},
-            ) == ("new", retry_run)
-            assert store.owner_history_snapshot(
-                conversation,
-            )["active_run_id"] == retry_run
+            ) == ("existing", first_run)
+            assert store.owner_history_snapshot(conversation)[
+                "head_response_id"
+            ] == "resp_later_request"
             assert self._run_rows(store, retry_run) == {
-                "idempotency": (retry_run,), "job": (1,),
+                "idempotency": (first_run,), "job": None,
             }
         finally:
             store.close()
@@ -5696,7 +5790,7 @@ class TestResponsesEndpoint:
                         break
                     await asyncio.sleep(0.01)
 
-                def _send_a_different_message():
+                def _send_a_different_message(previous_response_id=None):
                     return cli.post(
                         "/v1/responses",
                         json={
@@ -5705,7 +5799,7 @@ class TestResponsesEndpoint:
                             "conversation": conversation,
                             "background": True,
                             "store": True,
-                            "expected_previous_response_id": None,
+                            "expected_previous_response_id": previous_response_id,
                         },
                         headers={
                             "Idempotency-Key": f"response-{uuid.uuid4().hex}",
@@ -5753,7 +5847,22 @@ class TestResponsesEndpoint:
                     )
                     assert acknowledged.status == 200
 
-                    retry = await _send_a_different_message()
+                    sealed_history = await cli.get(
+                        f"/v1/responses/conversations/{conversation}",
+                    )
+                    sealed = await sealed_history.json()
+                    assert sealed["head_response_id"] == response_id
+                    assert sealed["recovery"] is None
+                    assert sealed["latest_response_id"] is None
+                    assert sealed["data"][0]["owner"] == "Plan the milestone"
+                    assert json.loads(sealed["data"][0]["raphael"])["kind"] == (
+                        "failure"
+                    )
+
+                    # The acknowledged failure is now a real conversation
+                    # turn. A fresh request follows that exact revision rather
+                    # than pretending this is still an empty conversation.
+                    retry = await _send_a_different_message(response_id)
                     assert retry.status == 200
 
         assert failed is not None
