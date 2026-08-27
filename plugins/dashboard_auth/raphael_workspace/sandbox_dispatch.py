@@ -548,7 +548,7 @@ def _read_connection_secret_file(raw_path: str) -> str:
                 _SECRET_FILE_REFUSAL, code="connection_secret_file"
             )
         if not sys.platform.startswith("win"):
-            if info.st_uid != os.geteuid():
+            if info.st_uid != os.geteuid():  # windows-footgun: ok -- POSIX-gated above
                 raise SandboxDispatchError(
                     _SECRET_FILE_REFUSAL, code="connection_secret_file"
                 )
