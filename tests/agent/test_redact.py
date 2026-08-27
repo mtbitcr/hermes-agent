@@ -500,7 +500,46 @@ class TestStrictUrlCredentialRedaction:
             (
                 "//user:NET_SECRET@x.test/path",
                 "NET_SECRET",
-                "//user:***@x.test/path",
+                "//***@x.test/path",
+            ),
+            # The credential is routinely the USERNAME: git's
+            # ``<token>:x-oauth-basic@`` form masks nothing if only the
+            # password side is replaced.
+            (
+                "https://TOKEN_AS_USERNAME:x-oauth-basic@github.test/o/r.git",
+                "TOKEN_AS_USERNAME",
+                "https://***@github.test/o/r.git",
+            ),
+            # A hyphenated vendor name has to match its own canonical
+            # (``-`` folded to ``_``) spelling, or a pre-signed URL's
+            # signature survives verbatim.
+            (
+                "https://b.s3.x.test/o?X-Amz-Expires=900&X-Amz-Signature=PRESIGN_SECRET",
+                "PRESIGN_SECRET",
+                "https://b.s3.x.test/o?X-Amz-Expires=900&X-Amz-Signature=***",
+            ),
+            # The other signed-URL families carry bearer authority in a
+            # query parameter too: the AWS SigV4 session token, the GCS V4
+            # signature, and the Azure SAS ``sig``.
+            (
+                "https://b.s3.x.test/o?X-Amz-Security-Token=STS_SESSION&X-Amz-Expires=900",
+                "STS_SESSION",
+                "https://b.s3.x.test/o?X-Amz-Security-Token=***&X-Amz-Expires=900",
+            ),
+            (
+                "https://s.x.test/o?X-Goog-Expires=900&X-Goog-Signature=GOOG_PRESIGN",
+                "GOOG_PRESIGN",
+                "https://s.x.test/o?X-Goog-Expires=900&X-Goog-Signature=***",
+            ),
+            (
+                "https://a.blob.x.test/c/o?sp=r&sr=b&sig=AZURE_SAS",
+                "AZURE_SAS",
+                "https://a.blob.x.test/c/o?sp=r&sr=b&sig=***",
+            ),
+            (
+                "https://b.s3.x.test/o?X%2DAmz%2DSecurity%2DToken=ENC_STS&sr=b",
+                "ENC_STS",
+                "https://b.s3.x.test/o?X%2DAmz%2DSecurity%2DToken=***&sr=b",
             ),
         ],
     )
@@ -517,6 +556,76 @@ class TestStrictUrlCredentialRedaction:
     def test_similarly_named_public_params_remain_unchanged(self):
         text = "/metrics?token_count=17&session_id=public"
         assert redact_sensitive_text(text, redact_url_credentials=True) == text
+
+    def test_percent_encoded_invisible_cannot_split_a_sensitive_key(self):
+        text = "/callback?to%E2%80%8Bken=opaque-value&state=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            "/callback?to%E2%80%8Bken=***&state=public"
+        )
+
+    def test_literal_invisible_cannot_split_a_sensitive_key(self):
+        text = f"/callback?to{chr(0x200B)}ken=opaque-value&state=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            f"/callback?to{chr(0x200B)}ken=***&state=public"
+        )
+
+    @pytest.mark.parametrize(
+        "separator", ["\x00", "\t", "\n", "\r", "\x1b", "\x85", "\u2028"]
+    )
+    def test_literal_nonprinting_character_cannot_split_a_sensitive_key(
+        self, separator
+    ):
+        text = f"/callback?to{separator}ken=opaque-value&state=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            f"/callback?to{separator}ken=***&state=public"
+        )
+
+    @pytest.mark.parametrize("separator", ["%00", "%1B", "%C2%85", "%E2%80%A8"])
+    def test_encoded_nonprinting_character_cannot_split_a_sensitive_key(
+        self, separator
+    ):
+        text = f"/callback?to{separator}ken=opaque-value&state=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            f"/callback?to{separator}ken=***&state=public"
+        )
+
+    def test_malformed_query_and_fragment_routes_still_redact_credentials(self):
+        assert redact_sensitive_text(
+            "/callback?route?token=opaque-value&state=public",
+            redact_url_credentials=True,
+        ) == "/callback?route?token=***&state=public"
+        assert redact_sensitive_text(
+            "https://app.example/#/callback?x-amz-signature=opaque-value&x=1",
+            redact_url_credentials=True,
+        ) == "https://app.example/#/callback?x-amz-signature=***&x=1"
+
+    def test_long_invisible_sensitive_key_is_not_skipped(self):
+        hidden = chr(0x200B) * 513
+        text = f"/callback?to{hidden}ken=opaque-value&state=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            f"/callback?to{hidden}ken=***&state=public"
+        )
+
+    def test_nested_percent_encoding_cannot_hide_a_sensitive_key(self):
+        text = "/callback?to%252525E2%25252580%2525258Bken=opaque-value&state=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            "/callback?to%252525E2%25252580%2525258Bken=***&state=public"
+        )
+
+    def test_excessive_nested_encoding_fails_closed(self):
+        key = "token"
+        for _ in range(12):
+            key = key.replace("%", "%25").replace("t", "%74", 1)
+        text = f"/callback?{key}=opaque-value&state=public"
+        result = redact_sensitive_text(text, redact_url_credentials=True)
+        assert "opaque-value" not in result
+        assert result.endswith("=***&state=public")
+
+    def test_strict_userinfo_masks_through_the_last_at_sign(self):
+        text = "https://public@credential-value@example.com/repo.git"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == (
+            "https://***@example.com/repo.git"
+        )
 
 
 class TestBareTokenUserinfoRedaction:

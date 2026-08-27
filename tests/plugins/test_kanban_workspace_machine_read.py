@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import owner_workspace as ow
 from hermes_cli import projects_db as pdb
 from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth import token_auth
@@ -28,6 +29,7 @@ def workspace_surface(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb._INITIALIZED_PATHS.clear()
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid or 0) == 4242)
 
     repo = tmp_path / "workspace-repo"
     repo.mkdir()
@@ -51,7 +53,11 @@ def workspace_surface(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         running_id = kb.create_task(
             conn, title="Running work", assignee="coder", board=BOARD
         )
-        claimed = kb.claim_task(conn, running_id, claimer="test:worker")
+        claimed = kb.claim_task(
+            conn,
+            running_id,
+            claimer=f"{kb._claimer_id().split(':', 1)[0]}:worker",
+        )
         assert claimed is not None and claimed.current_run_id is not None
         run_id = claimed.current_run_id
         conn.execute(
@@ -350,6 +356,225 @@ def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_su
     assert all("secret" not in json.dumps(entry).lower() for entry in request_entries)
 
 
+def test_native_project_response_projects_an_unsafe_project_name(workspace_surface):
+    """This builder only ever serves the owner reader, so it always projects.
+
+    Unlike the board/worker titles, the native Project response has no
+    interactive caller to preserve a raw shape for — a browser falls through
+    to the ordinary handler — so the name is sanitized, credential-masked and
+    bounded at 160 code points unconditionally, with no capability to ask for.
+    """
+    s = workspace_surface
+    zero_width, annotation_anchor = chr(0x200B), chr(0xFFF9)
+    unsafe = (
+        f"Rap{zero_width}hael\x00 \x1b[31mWorkspace{annotation_anchor}"
+        " https://deploy:hunter2verylongpassword@git.example.com/repo.git"
+    )
+    with pdb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE projects SET name = ? WHERE id = ?", (unsafe, s["project_id"])
+        )
+        conn.commit()
+
+    project = _get(s, "/api/plugins/kanban/projects")
+
+    assert project.status_code == 200
+    assert project.json() == {
+        "projects": [{
+            "id": s["project_id"],
+            "slug": PROJECT,
+            "name": "Raphael Workspace https://***@git.example.com/repo.git",
+        }]
+    }
+    name = project.json()["projects"][0]["name"]
+    assert name == ow.owner_project_name(unsafe)
+    # Asserted on the string, not on serialized JSON, which would render a
+    # NUL as an escape and pass whether or not the control survived.
+    for forbidden in (
+        "hunter2verylongpassword", "\x00", "\x1b", zero_width, annotation_anchor,
+    ):
+        assert forbidden not in name
+
+
+def test_native_boards_response_projects_an_unsafe_board_name(workspace_surface):
+    """The board's display name is stored text and gets the same projection.
+
+    ``/boards`` served this builder's ``meta["name"]`` straight off the board
+    metadata file, which ordinary board creation and rename write — so an
+    escape sequence, an invisible reordering character or a URL credential in
+    a board name reached the owner reader verbatim.
+    """
+    s = workspace_surface
+    zero_width, right_to_left_mark = chr(0x200B), chr(0x200F)
+    unsafe = (
+        f"Rap{zero_width}hael\x00 \x1b[31mBoard{right_to_left_mark}"
+        " https://deploy:hunter2verylongpassword@git.example.com/repo.git"
+    )
+    kb.write_board_metadata(BOARD, name=unsafe)
+
+    boards = _get(s, "/api/plugins/kanban/boards")
+
+    assert boards.status_code == 200
+    board_item = boards.json()["boards"][0]
+    assert board_item["slug"] == BOARD
+    assert (
+        board_item["name"]
+        == "Raphael Board https://***@git.example.com/repo.git"
+    )
+    assert board_item["name"] == ow.owner_project_name(unsafe)
+    for forbidden in (
+        "hunter2verylongpassword", "\x00", "\x1b",
+        zero_width, right_to_left_mark,
+    ):
+        assert forbidden not in board_item["name"]
+
+
+def test_owner_title_capability_projects_board_and_worker_titles(workspace_surface):
+    s = workspace_surface
+    raw_ready = "B03 — db.password=hunter2verylongpassword"
+    raw_running = (
+        'R07: curl -H "Authorization: Bearer sk-abcdef1234567890"'
+    )
+    conn = kb.connect(board=BOARD)
+    try:
+        conn.execute(
+            "UPDATE tasks SET title = ? WHERE id = ?", (raw_ready, s["ready_id"])
+        )
+        conn.execute(
+            "UPDATE tasks SET title = ? WHERE id = ?",
+            (raw_running, s["running_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    query = (
+        f"?board={BOARD}&capabilities="
+        f"{plugin_api.WORKSPACE_OWNER_TITLES_CAPABILITY}"
+    )
+    board = _get(s, "/api/plugins/kanban/board", query=query)
+    workers = _get(s, "/api/plugins/kanban/workers/active", query=query)
+
+    assert board.status_code == 200
+    assert workers.status_code == 200
+    task_titles = {
+        task["id"]: task["title"]
+        for column in board.json()["columns"]
+        for task in column["tasks"]
+    }
+    assert task_titles == {
+        s["ready_id"]: ow.owner_title(raw_ready),
+        s["running_id"]: ow.owner_title(raw_running),
+    }
+    assert workers.json()["workers"][0]["task_title"] == ow.owner_title(
+        raw_running
+    )
+    serialized = json.dumps({"board": board.json(), "workers": workers.json()})
+    assert "hunter2verylongpassword" not in serialized
+    assert "sk-abcdef1234567890" not in serialized
+    assert all(not title.startswith("B03") for title in task_titles.values())
+
+    assert all(not title.startswith("R07") for title in task_titles.values())
+
+    # No capability means the legacy response shape and semantics remain
+    # unchanged for an older Workspace during a Hermes-first rollout.
+    legacy = _get(s, "/api/plugins/kanban/board", query=f"?board={BOARD}")
+    legacy_titles = {
+        task["id"]: task["title"]
+        for column in legacy.json()["columns"]
+        for task in column["tasks"]
+    }
+    assert legacy_titles[s["ready_id"]] == raw_ready
+    assert legacy_titles[s["running_id"]] == raw_running
+
+
+def test_owner_worker_projection_omits_a_recorded_run_without_live_process_proof(
+    workspace_surface, monkeypatch,
+):
+    s = workspace_surface
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    query = (
+        f"?board={BOARD}&capabilities="
+        f"{plugin_api.WORKSPACE_OWNER_TITLES_CAPABILITY}"
+    )
+
+    workers = _get(s, "/api/plugins/kanban/workers/active", query=query)
+
+    assert workers.status_code == 200
+    assert workers.json() == {"workers": []}
+
+
+def _machine_audit_entries(surface) -> list[dict]:
+    log = surface["home"] / "logs" / "dashboard-auth.log"
+    if not log.exists():
+        return []
+    return [
+        entry
+        for entry in (
+            json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()
+        )
+        if entry.get("source") == "raphael-workspace-machine"
+    ]
+
+
+def test_capability_read_is_audited_from_the_validated_query(workspace_surface):
+    """The audit records the granted board and a fixed capability marker.
+
+    The capability parameter is part of an admitted query, not a reason to
+    stop recording which board was asked for, and what gets recorded is this
+    module's own constant — never a value echoed back out of the query.
+    """
+    s = workspace_surface
+    capability = plugin_api.WORKSPACE_OWNER_TITLES_CAPABILITY
+
+    before = len(_machine_audit_entries(s))
+    assert _get(
+        s,
+        "/api/plugins/kanban/board",
+        query=f"?board={BOARD}&capabilities={capability}",
+    ).status_code == 200
+    granted = _machine_audit_entries(s)[before:]
+    assert granted and all(
+        entry["decision"] == "allow"
+        and entry["requested_board"] == BOARD
+        and entry["applied_capability"] == capability
+        for entry in granted
+    )
+
+    # A legacy call names no capability, so none is recorded — the board it
+    # asked for still is.
+    before = len(_machine_audit_entries(s))
+    assert _get(
+        s, "/api/plugins/kanban/board", query=f"?board={BOARD}"
+    ).status_code == 200
+    legacy = _machine_audit_entries(s)[before:]
+    assert legacy and all(
+        entry["decision"] == "allow"
+        and entry["requested_board"] == BOARD
+        and entry["applied_capability"] is None
+        for entry in legacy
+    )
+
+    # A rejected capability is admitted nowhere: not into the response, not
+    # into the audit record, and not as a board this caller asked for.
+    before = len(_machine_audit_entries(s))
+    assert _get(
+        s,
+        "/api/plugins/kanban/board",
+        query=f"?board={BOARD}&capabilities={capability},run_task_context",
+    ).status_code == 400
+    denied = _machine_audit_entries(s)[before:]
+    assert denied and all(
+        entry["decision"] == "deny"
+        and entry["requested_board"] is None
+        and entry["applied_capability"] is None
+        for entry in denied
+    )
+    assert all(
+        "run_task_context" not in json.dumps(entry) for entry in _machine_audit_entries(s)
+    )
+
+
 @pytest.mark.parametrize(
     ("path", "query"),
     [
@@ -360,6 +585,27 @@ def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_su
         ("/api/plugins/kanban/board", "?board=other-board"),
         ("/api/plugins/kanban/board", f"?board={BOARD}&extra=1"),
         ("/api/plugins/kanban/board", f"?board={BOARD}&board={BOARD}"),
+        ("/api/plugins/kanban/board", f"?board={BOARD}&capabilities=unknown"),
+        # The /v1 receipt-snapshot capability is a different contract on a
+        # different surface and is never admitted here.
+        ("/api/plugins/kanban/board", f"?board={BOARD}&capabilities=run_task_context"),
+        # A repeated capability has no single admitted value, in either order.
+        (
+            "/api/plugins/kanban/board",
+            f"?board={BOARD}"
+            f"&capabilities={plugin_api.WORKSPACE_OWNER_TITLES_CAPABILITY}"
+            "&capabilities=unknown",
+        ),
+        (
+            "/api/plugins/kanban/board",
+            f"?board={BOARD}&capabilities=unknown"
+            f"&capabilities={plugin_api.WORKSPACE_OWNER_TITLES_CAPABILITY}",
+        ),
+        (
+            "/api/plugins/kanban/assignees",
+            f"?board={BOARD}&capabilities="
+            f"{plugin_api.WORKSPACE_OWNER_TITLES_CAPABILITY}",
+        ),
     ],
 )
 def test_query_contract_fails_closed(workspace_surface, path, query):
@@ -488,12 +734,57 @@ def test_revocation_is_effective_on_the_next_request(workspace_surface):
     assert response.json() == {"error": "unauthenticated", "detail": "Unauthorized"}
 
 
-def test_broken_scope_binding_fails_closed(workspace_surface):
+def test_a_mismatched_binding_is_an_authority_failure_not_an_absence(
+    workspace_surface,
+):
+    """Both halves of the grant still exist; only their binding disagrees. A 404
+    there told the owner their Project does not exist."""
     s = workspace_surface
     kb.write_board_metadata(BOARD, project_id="p_wrong")
     response = _get(s, "/api/plugins/kanban/projects")
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Not Found"}
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+def test_a_project_row_with_no_board_is_an_authority_failure(workspace_surface):
+    """Half the grant is gone and half is still there, which is not absence."""
+    s = workspace_surface
+    import shutil
+
+    shutil.rmtree(kb.board_dir(BOARD))
+    assert kb.board_exists(BOARD) is False
+    response = _get(s, "/api/plugins/kanban/projects")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+def test_a_board_with_no_project_row_is_an_authority_failure(workspace_surface):
+    s = workspace_surface
+    conn = pdb.connect()
+    try:
+        with ow.write_txn(conn):
+            conn.execute("DELETE FROM projects")
+    finally:
+        conn.close()
+    response = _get(s, "/api/plugins/kanban/projects")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+def test_malformed_board_ownership_metadata_blocks_the_machine_read(
+    workspace_surface,
+):
+    """A ``board.json`` that parses but publishes an unusable authority field is
+    unread ownership, not verified ownership."""
+    s = workspace_surface
+    path = kb.board_metadata_path(BOARD)
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    meta["dispatch_enabled"] = "yes"
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    assert kb.read_board_metadata(BOARD)["ownership_verified"] is False
+    response = _get(s, "/api/plugins/kanban/projects")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
 
 
 def test_process_path_overrides_cannot_widen_the_fixed_board(
@@ -519,3 +810,178 @@ def test_process_path_overrides_cannot_widen_the_fixed_board(
         query=f"?board={BOARD}",
     )
     assert attachment.content == s["attachment_body"]
+
+
+# An existing board database that cannot be OPENED is not a board with no work
+# on it. Answering an empty 200 (or a per-object 404) for it hands Workspace a
+# complete, zero-task plan it can then plan against, so every machine read that
+# touches board state must fail closed with 503 instead. A board file that is
+# genuinely absent keeps its own, different answer.
+def _break_board_open(monkeypatch):
+    real_connect = plugin_api.sqlite3.connect
+
+    def refuse(target, *args, **kwargs):
+        if isinstance(target, str) and "kanban.db" in target:
+            raise plugin_api.sqlite3.OperationalError("unable to open database file")
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(plugin_api.sqlite3, "connect", refuse)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/plugins/kanban/board",
+        "/api/plugins/kanban/boards",
+        "/api/plugins/kanban/assignees",
+        "/api/plugins/kanban/workers/active",
+        "/api/plugins/kanban/tasks/{ready_id}",
+        "/api/plugins/kanban/tasks/{ready_id}/attachments",
+        "/api/plugins/kanban/attachments/{attachment_id}",
+        "/api/plugins/kanban/runs/{run_id}",
+    ],
+)
+def test_unreadable_board_is_unavailable_not_empty_or_missing(
+    workspace_surface, monkeypatch, path
+):
+    s = workspace_surface
+    board_query = "" if path.endswith("/boards") else f"?board={BOARD}"
+    _break_board_open(monkeypatch)
+
+    response = _get(s, path.format(**s), query=board_query)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+def test_unreadable_board_read_is_audited_as_a_denied_read(
+    workspace_surface, monkeypatch
+):
+    s = workspace_surface
+    _break_board_open(monkeypatch)
+
+    assert _get(
+        s, "/api/plugins/kanban/board", query=f"?board={BOARD}"
+    ).status_code == 503
+    denials = [
+        entry
+        for entry in _machine_audit_entries(s)
+        if entry.get("decision") == "deny" and entry.get("status") == 503
+    ]
+    assert denials and denials[-1]["reason"] == "read_unavailable"
+    assert all("kanban.db" not in json.dumps(entry) for entry in denials)
+
+
+def test_absent_board_database_still_projects_as_no_board_state(
+    workspace_surface, monkeypatch
+):
+    """Absence keeps its own answer: an empty board, not an outage."""
+    s = workspace_surface
+    kb.kanban_db_path(BOARD).unlink()
+
+    board = _get(s, "/api/plugins/kanban/board", query=f"?board={BOARD}")
+    assert board.status_code == 200
+    assert all(column["tasks"] == [] for column in board.json()["columns"])
+    assert _get(
+        s, f"/api/plugins/kanban/runs/{s['run_id']}", query=f"?board={BOARD}"
+    ).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Item 32TK: an existing Project must not disappear during an outage, and a
+# storage fault behind an authorized attachment is not proven absence
+# ---------------------------------------------------------------------------
+
+
+def test_an_unreadable_projects_db_is_unavailable_not_a_missing_scope(
+    workspace_surface, monkeypatch
+):
+    """Collapsing an open failure to an inactive scope made existing Projects
+    disappear behind a 404 whenever projects.db could not be read."""
+    s = workspace_surface
+    real_connect = plugin_api.sqlite3.connect
+
+    def refuse(target, *args, **kwargs):
+        if isinstance(target, str) and "projects.db" in target:
+            raise plugin_api.sqlite3.OperationalError("unable to open database file")
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(plugin_api.sqlite3, "connect", refuse)
+
+    response = _get(s, "/api/plugins/kanban/projects")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+def test_an_absent_projects_db_still_projects_as_no_scope(workspace_surface):
+    """Absence keeps its own answer."""
+    s = workspace_surface
+    pdb.projects_db_path().unlink()
+
+    response = _get(s, "/api/plugins/kanban/projects")
+    assert response.status_code == 404
+
+
+def test_unreadable_board_ownership_is_unavailable_not_a_missing_scope(
+    workspace_surface
+):
+    s = workspace_surface
+    kb.board_metadata_path(BOARD).write_text("{not json", encoding="utf-8")
+
+    response = _get(s, "/api/plugins/kanban/projects")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+@pytest.mark.parametrize(
+    "break_it", ["missing_file", "short_file", "trailing_bytes", "unreadable"],
+)
+def test_a_storage_fault_behind_an_authorized_attachment_is_not_a_404(
+    workspace_surface, break_it
+):
+    """Once the authority row is found, "not found" is off the table: a short
+    read, a size race or an I/O error is a fault, not proven absence."""
+    s = workspace_surface
+    conn = kb.connect(board=BOARD)
+    try:
+        stored = Path(
+            conn.execute(
+                "SELECT stored_path FROM task_attachments WHERE id = ?",
+                (s["attachment_id"],),
+            ).fetchone()["stored_path"]
+        )
+    finally:
+        conn.close()
+
+    if break_it == "missing_file":
+        stored.unlink()
+    elif break_it == "short_file":
+        stored.write_bytes(s["attachment_body"][:2])
+    elif break_it == "trailing_bytes":
+        stored.write_bytes(s["attachment_body"] + b"extra")
+    else:
+        stored.chmod(0o000)
+
+    try:
+        response = _get(
+            s,
+            f"/api/plugins/kanban/attachments/{s['attachment_id']}",
+            query=f"?board={BOARD}",
+        )
+    finally:
+        if break_it == "unreadable":
+            stored.chmod(0o600)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Service Unavailable"}
+
+
+def test_an_attachment_id_with_no_row_is_still_indistinguishable_from_missing(
+    workspace_surface
+):
+    """The adjacent success path: proven absence keeps its 404."""
+    s = workspace_surface
+    response = _get(
+        s, "/api/plugins/kanban/attachments/987654", query=f"?board={BOARD}",
+    )
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}

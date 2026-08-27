@@ -135,14 +135,39 @@ _PATTERNS: List[Tuple[str, str, str]] = [
 ]
 
 # Invisible / bidirectional unicode characters used in injection attacks.
-# Aligned with skills_guard.py INVISIBLE_CHARS — directional isolates
-# (U+2066-U+2069) and invisible math operators (U+2062-U+2064) are real
-# attack tools.
+# Originally aligned with skills_guard.py INVISIBLE_CHARS — directional
+# isolates (U+2066-U+2069) and invisible math operators (U+2062-U+2064) are
+# real attack tools.  The remaining invisible math operator (U+2061) and the
+# deprecated format characters (U+206A-U+206F) close the gaps in that original
+# set: every one of them is invisible, and every one can reorder or disguise
+# what a reader is shown.
+#
+# The interlinear annotation controls (U+FFF9-U+FFFB) and the object
+# replacement character (U+FFFC) close the last gap: each renders as nothing
+# in a terminal and in every chat/web UI, and the annotation frame in
+# particular lets a payload sit between an ANCHOR and a TERMINATOR where a
+# reader sees only the annotated base text.
+#
+# The plain bidi MARKS — U+061C ARABIC LETTER MARK, U+200E LRM, U+200F RLM —
+# are deliberately NOT in this set.  They carry no override state and cannot
+# nest; they are ordinary punctuation-disambiguation characters that correctly
+# written Arabic and Hebrew prose contains, so scanning for them as an
+# unconditional injection marker blocks legitimate multilingual content
+# wherever this scanner runs on real text (memory entries, AGENTS.md, skills).
+# The characters that actually reorder what a reader sees — the embeddings and
+# overrides U+202A-U+202E and the isolates U+2066-U+2069 — stay listed and
+# stay blocked.
+#
+# A DISPLAY boundary asks a narrower question than a threat scan and answers it
+# for itself: ``hermes_cli.owner_workspace`` strips a superset of this set —
+# the bidi marks included — from owner-visible text, because there a string is
+# a short label rather than prose.  That superset lives at the owner egress,
+# not here.
 INVISIBLE_CHARS = frozenset({
     '\u200b',  # zero-width space
-    '\u200c',  # zero-width non-joiner
     '\u200d',  # zero-width joiner
     '\u2060',  # word joiner
+    '\u2061',  # function application
     '\u2062',  # invisible times
     '\u2063',  # invisible separator
     '\u2064',  # invisible plus
@@ -156,6 +181,16 @@ INVISIBLE_CHARS = frozenset({
     '\u2067',  # right-to-left isolate
     '\u2068',  # first strong isolate
     '\u2069',  # pop directional isolate
+    '\u206a',  # inhibit symmetric swapping (deprecated)
+    '\u206b',  # activate symmetric swapping (deprecated)
+    '\u206c',  # inhibit arabic form shaping (deprecated)
+    '\u206d',  # activate arabic form shaping (deprecated)
+    '\u206e',  # national digit shapes (deprecated)
+    '\u206f',  # nominal digit shapes (deprecated)
+    '\ufff9',  # interlinear annotation anchor
+    '\ufffa',  # interlinear annotation separator
+    '\ufffb',  # interlinear annotation terminator
+    '\ufffc',  # object replacement character
 })
 
 
@@ -228,13 +263,21 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
 
     content = content[:MAX_SCAN_CHARS]
 
-    # Invisible unicode — single pass through the content set, not 17
-    # ``in`` lookups.  Run this on the RAW content before NFKC normalisation,
-    # since normalisation can strip some of these codepoints.
+    # Invisible unicode — single pass through the content set, not one ``in``
+    # lookup per entry.  Run this on the RAW content before NFKC
+    # normalisation, since normalisation can strip some of these codepoints.
     char_set = set(content)
     invisible_hits = char_set & INVISIBLE_CHARS
     for ch in invisible_hits:
         findings.append(f"invisible_unicode_U+{ord(ch):04X}")
+    if "\u200c" in content:
+        from tools.ansi_strip import is_contextual_zwnj
+
+        if any(
+            char == "\u200c" and not is_contextual_zwnj(content, index)
+            for index, char in enumerate(content)
+        ):
+            findings.append("invisible_unicode_U+200C")
 
     # Normalise to NFKC so full-width / compatibility Unicode variants
     # (e.g. ｃａｔ → cat, Ａ → A) are folded to their ASCII counterparts before
@@ -242,7 +285,7 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     # bypassing keyword checks (e.g. ``ｃａｔ ~/.hermes/.env``).  NOTE: this
     # does NOT defend against cross-script confusables (Cyrillic ``а`` U+0430),
     # which NFKC leaves untouched — that needs a TR#39 confusable database.
-    normalised = unicodedata.normalize("NFKC", content)
+    normalised = unicodedata.normalize("NFKC", content.replace("\u200c", ""))
 
     # Threat patterns
     patterns = _COMPILED.get(scope)

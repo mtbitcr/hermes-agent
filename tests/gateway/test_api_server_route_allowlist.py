@@ -389,6 +389,7 @@ class TestExactMethodRouteRules:
         app.router.add_get("/v1/responses/{response_id}", ok)
         app.router.add_get("/v1/responses/conversations/{conversation}", ok)
         app.router.add_post("/v1/responses/conversations/{conversation}/consume", ok)
+        app.router.add_post("/v1/responses/conversations/{conversation}/authority", ok)
         app.router.add_delete("/v1/responses/{response_id}", ok)
         app.router.add_post("/p/{profile}/v1/responses", ok)
         app.router.add_post("/v1/runs", ok)
@@ -411,6 +412,7 @@ class TestExactMethodRouteRules:
                         "GET /v1/responses/{response_id}",
                         "GET /v1/responses/conversations/{conversation}",
                         "POST /v1/responses/conversations/{conversation}/consume",
+                        "POST /v1/responses/conversations/{conversation}/authority",
                     ],
                 },
             },
@@ -420,6 +422,7 @@ class TestExactMethodRouteRules:
             assert (await client.get("/v1/responses/resp_1")).status == 200
             assert (await client.get("/v1/responses/conversations/raphael-owner-1")).status == 200
             assert (await client.post("/v1/responses/conversations/raphael-owner-1/consume")).status == 200
+            assert (await client.post("/v1/responses/conversations/raphael-owner-1/authority")).status == 200
             assert (await client.delete("/v1/responses/resp_1")).status == 403
 
     @pytest.mark.asyncio

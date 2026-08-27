@@ -15,8 +15,10 @@ Tests cover:
 import asyncio
 import json
 import os
+import sqlite3
 import stat
 import sys
+import threading
 import time
 import types
 import uuid
@@ -33,6 +35,10 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _derive_chat_session_id,
     _hermes_version,
+    _make_request_fingerprint,
+    OwnerAuthorityBroken,
+    OwnerAuthorityUnavailable,
+    OwnerTurnNotRecoverable,
     _redact_api_error_text,
     _resolve_owner_workspace_run_context,
     _request_reasoning_config,
@@ -41,6 +47,65 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+
+
+def _owner_new_proposal(**overrides):
+    proposal = {
+        # v3 is the first new-project schema carrying execution_tier, and
+        # therefore the first that can grant commit authority.
+        "schema_version": 3,
+        "kind": "proposal",
+        "mode": "new",
+        "project_name": "Workshop pilot",
+        "project_description": "A private workshop pilot.",
+        "request_title": "Prepare the workshop",
+        "summary": "Prepare the first private milestone.",
+        "project_size": "small",
+        "specification": "Create one owner-visible workshop milestone.",
+        "current_milestone": "Prepare the workshop",
+        "owner_visible_result": "A reviewed workshop plan.",
+        "impact": ["Adds one private milestone."],
+        "later_milestones": [],
+        "tasks": [{
+            "title": "Draft the workshop plan",
+            "body": "Prepare the private workshop plan.",
+            "assignee": "default",
+            "responsibility": "B03",
+            "execution_tier": "routine",
+            "parents": [],
+        }],
+    }
+    proposal.update(overrides)
+    return proposal
+
+
+def _owner_existing_proposal(**overrides):
+    proposal = {
+        "schema_version": 4,
+        "kind": "project_change_proposal",
+        "mode": "existing",
+        "request_title": "Add the approved milestone",
+        "summary": "Add one owner-visible milestone.",
+        "project_size": "small",
+        "specification": "Add and verify the approved milestone.",
+        "current_milestone": "Add the approved milestone",
+        "owner_visible_result": "The owner can review the finished milestone.",
+        "impact": ["Keeps completed work intact."],
+        "later_milestones": [],
+        "changes": [{
+            "action": "add",
+            "reason": "The approved milestone needs one task.",
+            "title": "Prepare the milestone",
+            "body": "Prepare the owner-visible milestone.",
+            "assignee": "default",
+            "responsibility": "B03",
+            "execution_tier": "routine",
+            "existing_parent_refs": [],
+            "new_parents": [],
+        }],
+    }
+    proposal.update(overrides)
+    return proposal
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +167,162 @@ class TestOwnerWorkspaceRunContext:
             "profile": "default",
         }
 
+    def test_retained_name_goes_through_the_canonical_project_projection(self):
+        """The name kept for the Decisions inbox is owner-facing display text.
+
+        It is the same string ``/v1`` hands back on an approval, so it must
+        leave here already sanitized and credential-masked, not merely
+        length-checked. Both modes are covered: a client-supplied new name
+        and a stored name read back off the receipt-backed Project list.
+
+        Projecting is not the same as accepting: a *new* name over the
+        160-code-point bound ``commit_task_graph`` enforces is still rejected
+        fail-fast rather than truncated into a name the client never asked
+        for.
+        """
+        from hermes_cli.owner_workspace import owner_project_name
+
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        zero_width, annotation_anchor = chr(0x200B), chr(0xFFF9)
+        unsafe = (
+            f"Wo{zero_width}rkshop\x00 \x1b[31mpilot{annotation_anchor}"
+            " https://deploy:hunter2verylongpassword@git.example.com/repo.git"
+        )
+        projected = (
+            "Workshop pilot https://***@git.example.com/repo.git"
+        )
+        assert owner_project_name(unsafe) == projected
+
+        projects = [{
+            "project_id": "p_unsafe",
+            "slug": "stored-project",
+            "name": unsafe,
+            "description": "",
+            "board": "stored-project",
+            "archived": False,
+        }]
+
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch(
+                "hermes_cli.owner_workspace.resolve_owner_context",
+                return_value=types.SimpleNamespace(profile="default"),
+            ),
+            patch(
+                "hermes_cli.owner_workspace.list_committed_projects",
+                return_value=projects,
+            ),
+        ):
+            new = _resolve_owner_workspace_run_context({
+                "mode": "new",
+                "project_slug": None,
+                "project_name": unsafe,
+            })
+            existing = _resolve_owner_workspace_run_context({
+                "mode": "existing",
+                "project_slug": "stored-project",
+                "project_name": None,
+            })
+            at_bound = _resolve_owner_workspace_run_context({
+                "mode": "new",
+                "project_slug": None,
+                "project_name": "n" * 160,
+            })
+            with pytest.raises(ValueError):
+                _resolve_owner_workspace_run_context({
+                    "mode": "new",
+                    "project_slug": None,
+                    "project_name": "n" * 161,
+                })
+
+        assert new["project_name"] == projected
+        assert existing["project_name"] == projected
+        assert at_bound["project_name"] == "n" * 160
+
+    def test_an_unanswered_owner_request_authorizes_no_run(self, monkeypatch):
+        """Item 32TK, finding 2: the request-level door, before the store's.
+
+        ``/v1/runs`` derives owner mutation authority here, long before it
+        reserves anything, so a conversation carrying a request that ended
+        without a turn is refused at this end too. Reading the stored proposal
+        at all is already work done for an approval that cannot be granted, so
+        the refusal comes first — and once the record is acknowledged this
+        validation carries on exactly as it always did.
+        """
+        conversation = "raphael-owner-" + "4" * 32
+        authority = {
+            "proposal_profile": "default",
+            "conversation": conversation,
+            "response_id": "resp_older_run_proposal",
+            "claim_id": "claim_" + "6" * 32,
+            "operation": "owner_task_graph_commit",
+            "idempotency_key": "conversation-" + "a" * 64,
+            "payload": {},
+        }
+        context = {
+            "profile": "default",
+            "mode": "new",
+            "project_slug": None,
+            "project_name": "Workshop pilot",
+        }
+        store = ResponseStore(max_size=10)
+        adapter = APIServerAdapter.__new__(APIServerAdapter)
+        adapter._response_store = store
+        read = []
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_unanswered_run_request",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(
+                store, conversation, "resp_unanswered_run_request",
+            )
+            monkeypatch.setattr(
+                store,
+                "owner_proposal_record",
+                lambda *args: read.append(args),
+            )
+
+            with pytest.raises(ValueError, match="unanswered"):
+                adapter._validated_owner_proposal_authority(
+                    authority, context, "default",
+                )
+            assert read == []
+
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_unanswered_run_request",
+            ) == "retired"
+            # Past that door, and refused for what it actually is: this
+            # conversation has no such proposal on it.
+            with pytest.raises(ValueError, match="not current"):
+                adapter._validated_owner_proposal_authority(
+                    authority, context, "default",
+                )
+            assert read == [
+                ("default", conversation, "resp_older_run_proposal"),
+            ]
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+    def test_new_mode_still_requires_a_name(self, blank):
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch(
+                "hermes_cli.owner_workspace.resolve_owner_context",
+                return_value=types.SimpleNamespace(profile="default"),
+            ),
+            patch(
+                "hermes_cli.owner_workspace.list_committed_projects",
+                return_value=[],
+            ),
+            pytest.raises(ValueError),
+        ):
+            _resolve_owner_workspace_run_context({
+                "mode": "new", "project_slug": None, "project_name": blank,
+            })
+
 
 # ---------------------------------------------------------------------------
 # _redact_api_error_text — guards every outward error site (envelopes, SSE
@@ -133,6 +354,34 @@ class TestRedactApiErrorText:
 # ---------------------------------------------------------------------------
 
 
+def _interrupt_owner_turn(store, conversation, response_id, profile="default"):
+    """End one accepted owner turn the way a background failure really does.
+
+    Exactly the call the background path makes: the terminal body, this turn's
+    fence becoming the record that carries the owner's request, the outcome its
+    idempotency key replays, and the retirement of its recovery job, as ONE
+    transaction. Tests set the state up through the production entry point so
+    they cannot drift from it.
+    """
+    store.store_terminal_owner_response(
+        profile=profile,
+        response_id=response_id,
+        data={
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "status": "failed",
+                "output": [],
+                "error": {"code": "server_error", "message": "stopped"},
+            },
+            "conversation_history": [],
+        },
+        release_job=True,
+        conversation=conversation,
+        interrupted=True,
+    )
+
+
 class TestResponseStore:
     def test_put_and_get(self):
         store = ResponseStore(max_size=10)
@@ -142,6 +391,34 @@ class TestResponseStore:
     def test_get_missing_returns_none(self):
         store = ResponseStore(max_size=10)
         assert store.get("resp_missing") is None
+
+    def test_get_waits_for_the_shared_response_store_transaction_lock(self):
+        store = ResponseStore(max_size=10)
+        store.put("resp_locked", {"output": "safe"})
+        started = threading.Event()
+        finished = threading.Event()
+        result = []
+
+        def read_response():
+            started.set()
+            try:
+                result.append(store.get("resp_locked"))
+            finally:
+                finished.set()
+
+        reader = threading.Thread(target=read_response, daemon=True)
+        with store._conversation_lock:
+            reader.start()
+            assert started.wait(1)
+            blocked_while_transaction_lock_is_held = not finished.wait(0.1)
+
+        reader.join(timeout=1)
+        try:
+            assert blocked_while_transaction_lock_is_held is True
+            assert finished.is_set()
+            assert result == [{"output": "safe"}]
+        finally:
+            store.close()
 
     def test_lru_eviction(self):
         store = ResponseStore(max_size=3)
@@ -164,6 +441,69 @@ class TestResponseStore:
         store.delete("resp_1")
         assert store.get_conversation("chat-a") is None
 
+    def test_owner_authority_survives_lru_pressure_and_direct_delete(self):
+        """Owner approval state is durable workflow data, not an LRU entry."""
+        conversation = "raphael-owner-" + "f" * 32
+        response_id = "resp_owner_lru_anchor"
+        claim_id = "claim_" + "a" * 32
+        run_id = "run_" + "b" * 32
+        store = ResponseStore(max_size=1)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [
+                {"role": "user", "content": "Apply the approved milestone."},
+                {"role": "assistant", "content": json.dumps(
+                    _owner_existing_proposal(
+                        request_title="Apply the approved milestone",
+                    )
+                )},
+            ],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, claim_id,
+        ) is True
+        assert store.attach_owner_run(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
+
+        # The insertion itself may become the next owner response, so put()
+        # leaves it available while retaining the current owner authority.
+        store.put("resp_lru_pressure", {"response": {"id": "resp_lru_pressure"}})
+
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["latest_response_id"] == response_id
+        assert snapshot["proposal_claimed"] is True
+        assert snapshot["active_run_id"] == run_id
+        assert store.get(response_id) is not None
+        assert store.delete(response_id) is False
+        assert store.owner_history_snapshot(conversation)["active_run_id"] == run_id
+
+    def test_incomplete_proposal_never_grants_approval_authority(self):
+        conversation = "raphael-owner-" + "0" * 32
+        response_id = "resp_incomplete_proposal"
+        store = ResponseStore(max_size=10)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps({
+                    "schema_version": 2,
+                    "kind": "proposal",
+                    "mode": "new",
+                }),
+            }],
+        })
+
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is False
+        assert store.owner_proposal_record(
+            "default", conversation, response_id,
+        ) is None
+
     def test_owner_history_projects_only_final_structured_turns(self):
         secret = "sk-ant-api03-" + "a" * 80
         conversation = "raphael-owner-" + "a" * 32
@@ -179,12 +519,9 @@ class TestResponseStore:
             "kind": "question",
             "message": "Which week should it run?",
         })
-        final_change = json.dumps({
-            "schema_version": 3,
-            "kind": "project_change_proposal",
-            "mode": "existing",
-            "request_title": "Add a weekly summary",
-        })
+        final_change = json.dumps(_owner_existing_proposal(
+            request_title="Add a weekly summary",
+        ))
         store.put("resp_owner_history", {
             "response": {"id": "resp_owner_history"},
             "conversation_history": [
@@ -205,7 +542,9 @@ class TestResponseStore:
             ],
             "instructions": "private instructions",
         })
-        store.set_conversation(conversation, "resp_owner_history")
+        store.set_conversation(
+            conversation, "resp_owner_history", owner_proposal=True,
+        )
 
         history = store.owner_history(conversation)
         assert [item["owner"] for item in history] == [
@@ -218,8 +557,19 @@ class TestResponseStore:
 
         snapshot = store.owner_history_snapshot(conversation)
         assert snapshot == {
+            "head_response_id": "resp_owner_history",
             "latest_response_id": "resp_owner_history",
             "proposal_consumed": False,
+            "proposal_claimed": False,
+            "active_run_id": None,
+            "completed_run_id": None,
+            "conversation_closed": False,
+            "truncated": False,
+            "incomplete": False,
+            # Nothing is being planned on this conversation right now, and
+            # nothing it planned before was left interrupted.
+            "pending": None,
+            "recovery": None,
             "data": history,
         }
         assert "resp_owner_history" not in json.dumps(snapshot["data"])
@@ -227,20 +577,15 @@ class TestResponseStore:
     def test_owner_history_keeps_reply_within_native_response_limit(self):
         conversation = "raphael-owner-" + "b" * 32
         store = ResponseStore(max_size=10)
-        proposal = {
-            "schema_version": 3,
-            "kind": "project_change_proposal",
-            "mode": "existing",
-            "request_title": "Add the next private milestone",
-            "summary": "Prepare the next owner-visible milestone for review.",
-            "project_size": "large",
-            "specification": "Readable milestone detail. " * 500,
-            "current_milestone": "Prepare the next private milestone.",
-            "owner_visible_result": "The owner can review one complete proposal.",
-            "impact": ["Keeps the current project history intact."],
-            "later_milestones": [],
-            "changes": [],
-        }
+        proposal = _owner_existing_proposal(
+            request_title="Add the next private milestone",
+            summary="Prepare the next owner-visible milestone for review.",
+            project_size="large",
+            specification="Readable milestone detail. " * 500,
+            current_milestone="Prepare the next private milestone.",
+            owner_visible_result="The owner can review one complete proposal.",
+            impact=["Keeps the current project history intact."],
+        )
         structured_reply = json.dumps(proposal)
         assert 12_000 < len(structured_reply) < 50_000
         store.put(
@@ -256,7 +601,9 @@ class TestResponseStore:
                 ],
             },
         )
-        store.set_conversation(conversation, "resp_large_owner_history")
+        store.set_conversation(
+            conversation, "resp_large_owner_history", owner_proposal=True,
+        )
 
         snapshot = store.owner_history_snapshot(conversation)
 
@@ -272,12 +619,9 @@ class TestResponseStore:
         group = "raphael-owner-" + "c" * 32
         conversation = group + "-" + "d" * 32
         store = ResponseStore(max_size=10)
-        reply = json.dumps({
-            "schema_version": 3,
-            "kind": "project_change_proposal",
-            "mode": "existing",
-            "request_title": "Add owner summaries",
-        })
+        reply = json.dumps(_owner_existing_proposal(
+            request_title="Add owner summaries",
+        ))
         store.put("resp_scoped_history", {
             "response": {"id": "resp_scoped_history", "created_at": 200},
             "conversation_history": [
@@ -285,7 +629,9 @@ class TestResponseStore:
                 {"role": "assistant", "content": reply},
             ],
         })
-        store.set_conversation(conversation, "resp_scoped_history")
+        store.set_conversation(
+            conversation, "resp_scoped_history", owner_proposal=True,
+        )
 
         assert store.owner_history_snapshot(conversation)["data"] == [{
             "owner": "Add a weekly summary.",
@@ -363,30 +709,45 @@ class TestResponseStore:
             "private intermediate reasoning",
         )
 
-        index = store.owner_session_index(group)
+        index = store.owner_session_index("default", group)
 
+        # Ordered by each session's own immutable sequence, newest first, and
+        # the session with no owner-visible reply yet is RETAINED with a zero
+        # turn count rather than dropped: dropping it made a caller select an
+        # older change as if the real current one did not exist.
         assert index == {
             "data": [
+                {
+                    "session_id": "3" * 32,
+                    "updated_at": 500,
+                    "preview": "",
+                    "visible_turn_count": 0,
+                    "available": True,
+                },
                 {
                     "session_id": newer,
                     "updated_at": 300,
                     "preview": "Improve the mobile review flow.",
                     "visible_turn_count": 1,
+                    "available": True,
                 },
                 {
                     "session_id": older,
                     "updated_at": 200,
                     "preview": "Add the owner summary.",
                     "visible_turn_count": 1,
+                    "available": True,
                 },
                 {
                     "session_id": "legacy",
                     "updated_at": 100,
                     "preview": "Plan the first change.",
                     "visible_turn_count": 1,
+                    "available": True,
                 },
             ],
             "truncated": False,
+            "current_session_id": "3" * 32,
         }
         serialized = json.dumps(index)
         assert "resp_" not in serialized
@@ -400,15 +761,18 @@ class TestResponseStore:
         store = ResponseStore(max_size=10, db_path=db_path)
         store.put(response_id, {
             "response": {"id": response_id, "created_at": 600},
-            "conversation_history": [],
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
         })
-        store.set_conversation(group, response_id)
+        store.set_conversation(group, response_id, owner_proposal=True)
 
         assert store.owner_history_snapshot(group)["proposal_consumed"] is False
         assert store.mark_owner_proposal_consumed(
-            group, "resp_wrong_proposal",
+            "default", group, "resp_wrong_proposal",
         ) is False
-        assert store.mark_owner_proposal_consumed(group, response_id) is True
+        assert store.mark_owner_proposal_consumed("default", group, response_id) is True
         assert store.owner_history_snapshot(group)["proposal_consumed"] is True
 
         store.set_conversation(group, response_id)
@@ -425,6 +789,1365 @@ class TestResponseStore:
         assert reopened.owner_history_snapshot(group)["proposal_consumed"] is False
         reopened.close()
 
+    def test_owner_proposal_claim_is_atomic_durable_and_exact(self, tmp_path):
+        db_path = str(tmp_path / "response-store.db")
+        conversation = "raphael-owner-" + "a" * 32 + "-" + "b" * 32
+        response_id = "resp_claimed_proposal"
+        claim_id = "claim_" + "c" * 32
+        run_id = "run_" + "d" * 32
+        store = ResponseStore(max_size=10, db_path=db_path)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 900},
+            "conversation_history": [
+                {"role": "user", "content": "Build the approved milestone."},
+                {"role": "assistant", "content": json.dumps(
+                    _owner_existing_proposal(
+                        request_title="Build the approved milestone",
+                    )
+                )},
+            ],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+
+        assert store.claim_owner_proposal("default", conversation, response_id, claim_id) is True
+        assert store.claim_owner_proposal("default", conversation, response_id, claim_id) is True
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, "claim_" + "e" * 32,
+        ) is False
+        assert store.set_conversation(conversation, "resp_newer_proposal") is False
+        assert store.close_owner_conversation("default", conversation, response_id) is False
+        assert store.attach_owner_run("default", conversation, response_id, claim_id, run_id) is True
+        assert store.complete_owner_claim(
+            "default", conversation, response_id, claim_id, "run_" + "f" * 32,
+        ) is False
+        assert store.complete_owner_claim(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
+        assert store.complete_owner_claim(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["proposal_consumed"] is True
+        assert snapshot["proposal_claimed"] is False
+        assert snapshot["active_run_id"] is None
+        store.close()
+
+        reopened = ResponseStore(max_size=10, db_path=db_path)
+        assert reopened.owner_history_snapshot(conversation)["proposal_consumed"] is True
+        reopened.close()
+
+    def test_unattached_owner_claim_can_be_abandoned_without_releasing_a_run(self):
+        conversation = "raphael-owner-" + "9" * 32
+        response_id = "resp_unattached_claim"
+        claim_id = "claim_" + "8" * 32
+        run_id = "run_" + "7" * 32
+        store = ResponseStore(max_size=10)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 950},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, claim_id,
+        ) is True
+        assert store.abandon_unattached_owner_claim(
+            "default", conversation, response_id, claim_id,
+        ) is True
+        assert store.owner_history_snapshot(conversation)["proposal_claimed"] is False
+
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, claim_id,
+        ) is True
+        assert store.attach_owner_run(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
+        assert store.abandon_unattached_owner_claim(
+            "default", conversation, response_id, claim_id,
+        ) is False
+        assert store.owner_run_is_attached(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
+        store.close()
+
+    def test_owner_proposal_release_and_close_fence_new_responses(self):
+        conversation = "raphael-owner-" + "1" * 32
+        response_id = "resp_releasable_proposal"
+        claim_id = "claim_" + "2" * 32
+        run_id = "run_" + "3" * 32
+        store = ResponseStore(max_size=10)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1_000},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert store.claim_owner_proposal("default", conversation, response_id, claim_id) is True
+        assert store.attach_owner_run("default", conversation, response_id, claim_id, run_id) is True
+        assert store.release_owner_claim("default", conversation, response_id, claim_id, run_id) is True
+        assert store.close_owner_conversation("default", conversation, response_id) is True
+        assert store.close_owner_conversation("default", conversation, response_id) is True
+        assert store.set_conversation(conversation, "resp_after_close") is False
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["proposal_consumed"] is False
+        assert snapshot["conversation_closed"] is True
+        assert snapshot["proposal_claimed"] is False
+        assert snapshot["conversation_closed"] is True
+
+    def test_close_missing_owner_conversation_persists_a_tombstone(self, tmp_path):
+        """Clear wins even when an in-flight response has not been stored yet."""
+        db_path = str(tmp_path / "response-store.db")
+        conversation = "raphael-owner-" + "7" * 32 + "-" + "8" * 32
+        store = ResponseStore(max_size=10, db_path=db_path)
+
+        assert store.close_owner_conversation("default", conversation, None) is True
+        assert store.owner_history_snapshot(conversation)["conversation_closed"] is True
+        store.close()
+
+        reopened = ResponseStore(max_size=10, db_path=db_path)
+        reopened.put("resp_late_background", {
+            "response": {"id": "resp_late_background", "created_at": 1},
+            "conversation_history": [],
+        })
+        assert reopened.set_conversation(
+            conversation, "resp_late_background",
+        ) is False
+        assert reopened.owner_history_snapshot(conversation)["conversation_closed"] is True
+        reopened.close()
+
+    def test_latest_question_cannot_inherit_an_older_proposal_handle(self):
+        conversation = "raphael-owner-" + "9" * 32
+        proposal_response = "resp_actionable_proposal"
+        question_response = "resp_followup_question"
+        proposal = json.dumps(_owner_existing_proposal(
+            request_title="Add a weekly summary",
+        ))
+        question = json.dumps({
+            "schema_version": 1,
+            "kind": "question",
+            "message": "Which day should it arrive?",
+        })
+        store = ResponseStore(max_size=10)
+        store.put(proposal_response, {
+            "response": {"id": proposal_response, "created_at": 1},
+            "conversation_history": [
+                {"role": "user", "content": "Add a weekly summary."},
+                {"role": "assistant", "content": proposal},
+            ],
+        })
+        assert store.set_conversation(
+            conversation, proposal_response, owner_proposal=True,
+        ) is True
+        assert store.mark_owner_proposal_consumed(
+            "default", conversation, proposal_response,
+        )
+
+        store.put(question_response, {
+            "response": {"id": question_response, "created_at": 2},
+            "conversation_history": [
+                {"role": "user", "content": "Add a weekly summary."},
+                {"role": "assistant", "content": proposal},
+                {"role": "user", "content": "Change the delivery time."},
+                {"role": "assistant", "content": question},
+            ],
+        })
+        assert store.set_conversation(
+            conversation, question_response, owner_proposal=False,
+        ) is True
+
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["latest_response_id"] is None
+        assert snapshot["proposal_consumed"] is False
+        assert snapshot["proposal_claimed"] is False
+        assert store.claim_owner_proposal(
+            "default", conversation, proposal_response, "claim_" + "a" * 32,
+        ) is False
+        consumed = store._conn.execute(
+            "SELECT consumed_response_id FROM conversations WHERE name = ?",
+            (conversation,),
+        ).fetchone()
+        assert consumed[0] == proposal_response
+
+    def test_owner_state_isolated_by_profile_even_with_same_ids(self):
+        conversation = "raphael-owner-" + "4" * 32
+        response_id = "resp_shared_profile_id"
+        store = ResponseStore(max_size=10, default_profile="default")
+        for profile, owner_text in (
+            ("default", "Default owner request."),
+            ("secondary", "Secondary owner request."),
+        ):
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": owner_text},
+                    {"role": "assistant", "content": json.dumps(
+                        _owner_new_proposal()
+                    )},
+                ],
+            }, profile=profile)
+            assert store.set_conversation(
+                conversation,
+                response_id,
+                owner_proposal=True,
+                profile=profile,
+            ) is True
+
+        assert store.get(response_id, profile="default")["conversation_history"][0][
+            "content"
+        ] == "Default owner request."
+        assert store.get(response_id, profile="secondary")["conversation_history"][0][
+            "content"
+        ] == "Secondary owner request."
+        assert store.claim_owner_proposal(
+            "default",
+            conversation,
+            response_id,
+            "claim_" + "5" * 32,
+        ) is True
+        assert store.owner_history_snapshot(
+            conversation, profile="default",
+        )["proposal_claimed"] is True
+        assert store.owner_history_snapshot(
+            conversation, profile="secondary",
+        )["proposal_claimed"] is False
+
+    def test_a_reserved_owner_turn_projects_the_request_it_is_still_planning(self):
+        """Item 32TK: the owner's own words survive a lost accept response.
+
+        The reservation is taken before any model runs, so the request it is
+        planning is durable from that moment. Projecting it is what lets a
+        refreshed page show the message the owner actually sent — and recover
+        the SAME response id rather than planning their words a second time.
+        """
+        conversation = "raphael-owner-" + "b" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            # Nothing has been published on this conversation yet: the very
+            # first turn of a new Project is exactly the case that lost the
+            # owner's request.
+            assert store.reserve_owner_conversation(
+                "default",
+                conversation,
+                "resp_pending_first_turn",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+
+            snapshot = store.owner_history_snapshot(conversation)
+
+            assert snapshot["data"] == []
+            assert snapshot["pending"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_pending_first_turn",
+            }
+
+            # Publishing the turn releases the reservation, and the owner's
+            # words are then carried by the durable turn itself.
+            store.put("resp_pending_first_turn", {
+                "response": {"id": "resp_pending_first_turn", "created_at": 1},
+                "conversation_history": [
+                    {
+                        "role": "user",
+                        "content": "Prepare a private 60-minute workshop",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "schema_version": 1,
+                            "kind": "question",
+                            "message": "Who is the workshop for?",
+                        }),
+                    },
+                ],
+            })
+            assert store.set_conversation(
+                conversation,
+                "resp_pending_first_turn",
+                profile="default",
+                reservation_id="resp_pending_first_turn",
+            ) is True
+
+            published = store.owner_history_snapshot(conversation)
+            assert published["pending"] is None
+            assert published["data"] == [{
+                "owner": "Prepare a private 60-minute workshop",
+                "raphael": ANY,
+            }]
+        finally:
+            store.close()
+
+    def test_a_pending_owner_turn_is_projected_on_a_conversation_with_turns(self):
+        """A follow-up message is recoverable while its plan is still running."""
+        conversation = "raphael-owner-" + "c" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            store.put("resp_answered_turn", {
+                "response": {"id": "resp_answered_turn", "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": "Add a weekly report"},
+                    {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "schema_version": 1,
+                            "kind": "question",
+                            "message": "Who should receive it?",
+                        }),
+                    },
+                ],
+            })
+            assert store.set_conversation(
+                conversation, "resp_answered_turn", profile="default",
+            ) is True
+            assert store.reserve_owner_conversation(
+                "default",
+                conversation,
+                "resp_pending_follow_up",
+                owner_message="Send it to me every Friday",
+            ) is True
+
+            snapshot = store.owner_history_snapshot(conversation)
+
+            assert len(snapshot["data"]) == 1
+            assert snapshot["pending"] == {
+                "owner": "Send it to me every Friday",
+                "response_id": "resp_pending_follow_up",
+            }
+
+            # An expired reservation is not a pending request: nothing is
+            # planning it any more, so projecting it would tell the owner their
+            # words are still being worked on when they are not.
+            store._conn.execute(
+                "UPDATE owner_conversation_reservations SET expires_at = ? "
+                "WHERE profile = ? AND name = ?",
+                (time.time() - 1, "default", conversation),
+            )
+            store._conn.commit()
+            assert store.owner_history_snapshot(conversation)["pending"] is None
+        finally:
+            store.close()
+
+    def test_a_terminal_failure_survives_the_reservation_it_releases(self):
+        """Item 32TK: the fence is dropped, the owner's request is not.
+
+        A turn that fails releases its reservation, so the pending projection
+        goes with it. Without this record a browser that never received the
+        accept response has nothing left to find: no words, and no failure
+        either. The record replaces the fence in ONE write, so a caller can
+        still reach the same response id and read the same terminal outcome.
+        """
+        conversation = "raphael-owner-" + "e" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            assert store.reserve_owner_conversation(
+                "default",
+                conversation,
+                "resp_failed_first_turn",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+
+            _interrupt_owner_turn(store, conversation, "resp_failed_first_turn")
+
+            snapshot = store.owner_history_snapshot(conversation)
+            # Nothing is being planned any more...
+            assert snapshot["pending"] is None
+            # ...and the request that was is still recoverable.
+            assert snapshot["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_failed_first_turn",
+            }
+            # It is a way back to a decided outcome, never an approvable turn.
+            assert snapshot["head_response_id"] is None
+            assert snapshot["latest_response_id"] is None
+            assert snapshot["proposal_claimed"] is False
+            assert snapshot["data"] == []
+        finally:
+            store.close()
+
+    def test_only_a_live_fence_can_become_a_recovery_record(self):
+        """A published turn is never restated as an unfinished one.
+
+        The reservation is released inside the transaction that publishes the
+        turn, so a failure handler arriving afterwards finds no fence to
+        convert and writes nothing. That is what keeps this record from
+        becoming a second, contradicting account of a turn that really did
+        complete.
+        """
+        conversation = "raphael-owner-" + "f" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_published_turn",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            store.put("resp_published_turn", {
+                "response": {"id": "resp_published_turn", "created_at": 1},
+                "conversation_history": [
+                    {
+                        "role": "user",
+                        "content": "Prepare a private 60-minute workshop",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "schema_version": 1,
+                            "kind": "question",
+                            "message": "Who is the workshop for?",
+                        }),
+                    },
+                ],
+            })
+            assert store.set_conversation(
+                conversation, "resp_published_turn", profile="default",
+                reservation_id="resp_published_turn",
+            ) is True
+
+            _interrupt_owner_turn(store, conversation, "resp_published_turn")
+            assert store.owner_history_snapshot(conversation)["recovery"] is None
+        finally:
+            store.close()
+
+    def test_a_recovery_record_is_retired_only_by_an_acknowledgement(self):
+        """Reading it can never be what erases it.
+
+        The answer carrying it can be lost exactly like the one that started
+        all this, so it stands until a caller says it has the words and the
+        outcome. Saying so twice is the same as saying it once.
+        """
+        conversation = "raphael-owner-" + "1" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_unacknowledged",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_unacknowledged")
+
+            # Read as often as a browser needs to; it is still there.
+            for _ in range(3):
+                assert store.owner_history_snapshot(conversation)["recovery"] == {
+                    "owner": "Prepare a private 60-minute workshop",
+                    "response_id": "resp_unacknowledged",
+                }
+
+            # A different response id is not this record and does not retire it.
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_someone_elses",
+            ) == "mismatch"
+            assert store.owner_history_snapshot(conversation)["recovery"] is not None
+
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_unacknowledged",
+            ) == "retired"
+            assert store.owner_history_snapshot(conversation)["recovery"] is None
+            # Idempotent: a repeated acknowledgement is not an error.
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_unacknowledged",
+            ) == "absent"
+            assert store.owner_history_snapshot(conversation)["recovery"] is None
+        finally:
+            store.close()
+
+    def test_a_recovery_record_survives_restart_and_any_age(self, tmp_path):
+        """Only an acknowledgement retires it — never a restart, never age.
+
+        The Founder's request is the thing this record carries. An owner who
+        comes back next week, or after the gateway was restarted, still gets
+        told what became of what they sent, because nothing else can tell them:
+        the browser holds no handle, and no turn was ever published.
+        """
+        database = str(tmp_path / "response_store.db")
+        store = ResponseStore(max_size=10, db_path=database)
+        conversation = "raphael-owner-" + "2" * 32
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_first_attempt",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_first_attempt")
+        finally:
+            store.close()
+
+        # The gateway restarts. The record is durable state, so it is still
+        # there — and no legacy expiry column is consulted to decide that.
+        store = ResponseStore(max_size=10, db_path=database)
+        try:
+            assert store.owner_history_snapshot(conversation)["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_first_attempt",
+            }
+
+            # An arbitrarily old record, written by a build that stamped a
+            # bounded lease onto it, is still the owner's unanswered request.
+            store._conn.execute(
+                "UPDATE owner_conversation_recovery SET created_at = ?, "
+                "expires_at = ? WHERE profile = ? AND name = ?",
+                (0.0, 1.0, "default", conversation),
+            )
+            store._conn.commit()
+            assert store.owner_history_snapshot(conversation)["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_first_attempt",
+            }
+
+            # Acknowledging it is still the one and only way it ends.
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_first_attempt",
+            ) == "retired"
+            assert store.owner_history_snapshot(conversation)["recovery"] is None
+        finally:
+            store.close()
+
+    def test_a_new_turn_is_refused_while_a_recovery_is_unacknowledged(self):
+        """A newer request may not bury the one that was never answered.
+
+        Superseding it deleted the only account of an interrupted request the
+        moment a second browser sent anything, so the Founder's words were lost
+        by another tab simply being used. The fence refuses instead, and only an
+        acknowledgement opens the conversation again.
+        """
+        conversation = "raphael-owner-" + "2" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_first_attempt",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_first_attempt")
+
+            # A different message, from a browser that knows nothing about the
+            # first: refused, and the record it would have replaced still reads.
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_second_attempt",
+                owner_message="Prepare a private 90-minute workshop",
+            ) is False
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["pending"] is None
+            assert snapshot["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_first_attempt",
+            }
+            # Not even the interrupted turn's own id may take the fence back:
+            # that turn is over, and its outcome is what there is to read.
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_first_attempt",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is False
+
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_first_attempt",
+            ) == "retired"
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_second_attempt",
+                owner_message="Prepare a private 90-minute workshop",
+            ) is True
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["recovery"] is None
+            assert snapshot["pending"] == {
+                "owner": "Prepare a private 90-minute workshop",
+                "response_id": "resp_second_attempt",
+            }
+        finally:
+            store.close()
+
+    def test_a_terminal_ending_without_a_fence_leaves_the_work_recoverable(self):
+        """Item 32TK round 3: no turn and no record is not an ending.
+
+        The conversion is what turns this turn's fence into the account of what
+        the owner sent. Ignoring a conversion that found nothing let the
+        terminal body, the replay record and the job retirement all land while
+        the request itself simply vanished: no published turn, no recovery, and
+        nothing left saying anybody must finish it. The ending is refused
+        instead, and everything it would have written rolls back together.
+        """
+        conversation = "raphael-owner-" + "7" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            store.reserve_owner_job(
+                "response", "resp_no_fence_left", "default",
+                {"conversation": conversation},
+            )
+            with pytest.raises(OwnerTurnNotRecoverable):
+                _interrupt_owner_turn(store, conversation, "resp_no_fence_left")
+
+            # Nothing moved: no terminal body, no recovery, and the job row
+            # still says somebody must finish this.
+            assert store.get("resp_no_fence_left") is None
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["pending"] is None
+            assert snapshot["recovery"] is None
+            assert store._conn.execute(
+                "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+                ("resp_no_fence_left",),
+            ).fetchone()[0] == 1
+        finally:
+            store.close()
+
+    def test_an_expired_fence_is_kept_while_its_work_is_unresolved(self):
+        """Item 32TK round 3: expiry alone may not destroy the way back.
+
+        A lease that runs out says the executor stopped renewing it, not that
+        the work it fenced is finished. While the job row still says somebody
+        must finish this response, the fence stays: every other caller is
+        refused by it, and the ending that eventually arrives still has
+        something to convert into the record carrying the owner's request.
+        """
+        conversation = "raphael-owner-" + "8" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_expired_but_queued",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            store.reserve_owner_job(
+                "response", "resp_expired_but_queued", "default",
+                {"conversation": conversation},
+            )
+            store._conn.execute(
+                "UPDATE owner_conversation_reservations SET expires_at = ? "
+                "WHERE profile = ? AND name = ?",
+                (time.time() - 1, "default", conversation),
+            )
+            store._conn.commit()
+
+            # Every fence-reading caller still sees it, so nothing takes this
+            # conversation over and nothing closes it out from under the work.
+            assert store.close_owner_conversation(
+                "default", conversation, None,
+            ) is False
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_competing_turn",
+            ) is False
+
+            # And the ending, when it comes, still has a fence to convert.
+            _interrupt_owner_turn(store, conversation, "resp_expired_but_queued")
+            assert store.owner_history_snapshot(conversation)["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_expired_but_queued",
+            }
+        finally:
+            store.close()
+
+    def test_a_conversation_with_an_unanswered_request_cannot_be_closed(self):
+        """Item 32TK round 3: closing is not an answer either.
+
+        The fence is released the moment a plan ends, so a conversation whose
+        last request ended without a turn has no live reservation to refuse a
+        close. Closing it there orphaned the durable record: the owner's
+        request stayed unanswered forever on a conversation nothing would ever
+        read again. Only an acknowledgement opens this.
+        """
+        conversation = "raphael-owner-" + "9" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_unanswered",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_unanswered")
+
+            assert store.close_owner_conversation(
+                "default", conversation, None,
+            ) is False
+            assert store.owner_history_snapshot(
+                conversation,
+            )["conversation_closed"] is False
+
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_unanswered",
+            ) == "retired"
+            assert store.close_owner_conversation(
+                "default", conversation, None,
+            ) is True
+        finally:
+            store.close()
+
+    def test_an_unanswered_request_refuses_both_owner_proposal_claims(self):
+        """Item 32TK, finding 2: a claim is not an answer either.
+
+        The fence is released the moment a plan ends, so a conversation
+        carrying a request that ended without a turn has no live reservation.
+        Both claim transactions refused a live reservation and nothing else, so
+        an OLDER proposal on that conversation could still be claimed and run
+        while the later request stood unanswered behind it — and the run that
+        followed consumed the proposal, which is not something an
+        acknowledgement can undo. Only an acknowledgement opens either claim.
+        """
+        conversation = "raphael-owner-" + "5" * 32
+        response_id = "resp_older_proposal"
+        claim_id = "claim_" + "6" * 32
+        run_id = "run_" + "7" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1_000},
+                "conversation_history": [{
+                    "role": "assistant",
+                    "content": json.dumps(_owner_new_proposal()),
+                }],
+            })
+            assert store.set_conversation(
+                conversation, response_id, owner_proposal=True,
+            ) is True
+
+            # A LATER request, sent after that proposal, that ended without
+            # ever becoming a turn. Its fence is already gone.
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_later_request",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_later_request")
+            # Nothing is fencing this conversation any more: that is exactly
+            # the state both claims used to walk straight through.
+            assert store.owner_history_snapshot(conversation)["pending"] is None
+
+            assert store.claim_owner_proposal(
+                "default", conversation, response_id, claim_id,
+            ) is False
+            assert store.claim_and_attach_owner_run(
+                "default", conversation, response_id, claim_id, run_id,
+                operation="owner_task_graph_commit",
+                payload_digest="a" * 64,
+            ) is False
+            # Nothing was claimed, nothing was bound, nothing was consumed.
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["proposal_claimed"] is False
+            assert snapshot["active_run_id"] is None
+            assert snapshot["proposal_consumed"] is False
+            assert snapshot["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_later_request",
+            }
+
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_later_request",
+            ) == "retired"
+            assert store.claim_and_attach_owner_run(
+                "default", conversation, response_id, claim_id, run_id,
+                operation="owner_task_graph_commit",
+                payload_digest="a" * 64,
+            ) is True
+            assert store.owner_history_snapshot(
+                conversation,
+            )["active_run_id"] == run_id
+        finally:
+            store.close()
+
+    @staticmethod
+    def _owner_run_binding(store, conversation, response_id):
+        """One approvable proposal, and the exact owner authority a run binds.
+
+        The same dictionary ``/v1/runs`` passes to
+        :meth:`ResponseStore.reserve_run_idempotency` once it has validated the
+        request, so these tests reserve through the production entry point
+        rather than restating what it writes.
+        """
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1_000},
+            "conversation_history": [
+                {"role": "user", "content": "Prepare the workshop"},
+                {
+                    "role": "assistant",
+                    "content": json.dumps(_owner_new_proposal()),
+                },
+            ],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        return {
+            "proposal_profile": "default",
+            "conversation": conversation,
+            "response_id": response_id,
+            "claim_id": "claim_" + "3" * 32,
+            "operation": "owner_task_graph_commit",
+            "payload_digest": "b" * 64,
+        }
+
+    @staticmethod
+    def _run_rows(store, run_id):
+        """The durable traces a reserved run leaves: its key's row, and its job.
+
+        The row is read by the one idempotency key these tests reserve under,
+        so it reports which run that key currently names — nothing, the run
+        that was already there, or a newly bound one.
+        """
+        return {
+            "idempotency": store._conn.execute(
+                "SELECT run_id FROM run_idempotency "
+                "WHERE profile = ? AND session_scope = ? AND idempotency_key = ?",
+                ("default", "scope", "commit-key"),
+            ).fetchone(),
+            "job": store._conn.execute(
+                "SELECT 1 FROM owner_executor_jobs WHERE kind = 'run' AND job_key = ?",
+                (run_id,),
+            ).fetchone(),
+        }
+
+    def test_an_unanswered_request_refuses_a_fresh_run_reservation(self):
+        """Item 32TK, finding 2: reserving a run is not an answer either.
+
+        The reservation a plan holds is released the moment that plan ENDS, so
+        a conversation carrying a request that ended without a turn looks
+        completely idle to this transaction. Checking only that reservation let
+        a direct ``/v1/runs`` call claim the OLDER proposal, bind a run to it
+        and queue that run's executor job while the later request stood
+        unanswered behind it — and the run that follows consumes the proposal,
+        which is not something an acknowledgement can undo.
+        """
+        conversation = "raphael-owner-" + "c" * 32
+        response_id = "resp_older_run_proposal"
+        run_id = "run_" + "1" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            owner = self._owner_run_binding(store, conversation, response_id)
+            head = store.owner_history_snapshot(conversation)["head_response_id"]
+
+            # A LATER request, sent after that proposal, that ended without
+            # ever becoming a turn. Its fence is already gone.
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_later_request",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_later_request")
+            assert store.owner_history_snapshot(conversation)["pending"] is None
+
+            assert store.reserve_run_idempotency(
+                "default", "scope", "commit-key", "fingerprint", run_id,
+                owner=owner, job_payload={"owner": dict(owner)},
+            ) == ("authority_conflict", None)
+
+            # Nothing was claimed, bound, recorded or queued, and the
+            # conversation still ends exactly where it did.
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["proposal_claimed"] is False
+            assert snapshot["active_run_id"] is None
+            assert snapshot["proposal_consumed"] is False
+            assert snapshot["head_response_id"] == head
+            assert [turn["owner"] for turn in snapshot["data"]] == [
+                "Prepare the workshop",
+            ]
+            assert snapshot["recovery"] == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_later_request",
+            }
+            assert self._run_rows(store, run_id) == {"idempotency": None, "job": None}
+
+            # Acknowledged, the same reservation is exactly what it always was.
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_later_request",
+            ) == "retired"
+            assert store.reserve_run_idempotency(
+                "default", "scope", "commit-key", "fingerprint", run_id,
+                owner=owner, job_payload={"owner": dict(owner)},
+            ) == ("new", run_id)
+            assert store.owner_history_snapshot(
+                conversation,
+            )["active_run_id"] == run_id
+            assert self._run_rows(store, run_id) == {
+                "idempotency": (run_id,), "job": (1,),
+            }
+        finally:
+            store.close()
+
+    def test_an_unanswered_request_refuses_a_released_run_retry(self):
+        """Item 32TK, finding 2: the released-retry branch is the same door.
+
+        A run that failed releases its claim, and an exact retry of the same
+        approval re-binds that released claim to a new run. This branch checked
+        the live reservation too, so a retry arriving while a LATER request
+        stood unanswered rebound the older proposal, rewrote the run its
+        idempotency key names and queued a second executor job — every one of
+        them a mutation made on a conversation nobody had answered for.
+        """
+        conversation = "raphael-owner-" + "e" * 32
+        response_id = "resp_released_run_proposal"
+        first_run = "run_" + "2" * 32
+        retry_run = "run_" + "4" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            owner = self._owner_run_binding(store, conversation, response_id)
+            assert store.reserve_run_idempotency(
+                "default", "scope", "commit-key", "fingerprint", first_run,
+                owner=owner, job_payload={"owner": dict(owner)},
+            ) == ("new", first_run)
+            assert store.release_owner_claim(
+                "default", conversation, response_id,
+                owner["claim_id"], first_run,
+            ) is True
+            head = store.owner_history_snapshot(conversation)["head_response_id"]
+
+            # ...and only then does a later request end without a turn.
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_later_request",
+                owner_message="Prepare a private 60-minute workshop",
+            ) is True
+            _interrupt_owner_turn(store, conversation, "resp_later_request")
+
+            assert store.reserve_run_idempotency(
+                "default", "scope", "commit-key", "fingerprint", retry_run,
+                owner=owner, job_payload={"owner": dict(owner)},
+            ) == ("authority_conflict", None)
+
+            # The released claim is still released, still bound to the run that
+            # failed, and nothing was written for the retry.
+            assert store._conn.execute(
+                "SELECT claim_state, owner_run_id FROM conversations "
+                "WHERE profile = ? AND name = ?",
+                ("default", conversation),
+            ).fetchone() == ("released", first_run)
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["proposal_claimed"] is False
+            assert snapshot["active_run_id"] is None
+            assert snapshot["proposal_consumed"] is False
+            assert snapshot["head_response_id"] == head
+            assert [turn["owner"] for turn in snapshot["data"]] == [
+                "Prepare the workshop",
+            ]
+            assert self._run_rows(store, retry_run) == {
+                "idempotency": (first_run,), "job": None,
+            }
+
+            # Acknowledged, the retry re-binds exactly as it always did.
+            assert store.acknowledge_owner_conversation_recovery(
+                "default", conversation, "resp_later_request",
+            ) == "retired"
+            assert store.reserve_run_idempotency(
+                "default", "scope", "commit-key", "fingerprint", retry_run,
+                owner=owner, job_payload={"owner": dict(owner)},
+            ) == ("new", retry_run)
+            assert store.owner_history_snapshot(
+                conversation,
+            )["active_run_id"] == retry_run
+            assert self._run_rows(store, retry_run) == {
+                "idempotency": (retry_run,), "job": (1,),
+            }
+        finally:
+            store.close()
+
+    def test_the_draft_that_created_a_project_takes_no_further_turn(self):
+        """Item 32TK, finding 1: a spent New Project draft is terminal.
+
+        Its proposal is consumed, the run that consumed it is bound to it, and
+        the receipt naming the Project the owner is about to be sent to is
+        replayed from exactly that pair. A turn published here takes the head
+        that pair is read from, so the receipt, the redirect and the visible
+        conversation all become unreachable while the Project sits there. The
+        Workspace refuses this, and so does Raphael: only the acknowledgement
+        closes this draft, and the group moves on to a successor in the same
+        write.
+        """
+        group = "raphael-owner-" + "d" * 32
+        conversation = group + "-" + "1" * 32
+        response_id = "resp_created_project_proposal"
+        run_id = "run_" + "5" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            owner = self._owner_run_binding(store, conversation, response_id)
+            assert store.claim_and_attach_owner_run(
+                "default", conversation, response_id,
+                owner["claim_id"], run_id,
+                operation="owner_task_graph_commit",
+                payload_digest=owner["payload_digest"],
+            ) is True
+            assert store.complete_owner_claim(
+                "default", conversation, response_id, owner["claim_id"], run_id,
+            ) is True
+            snapshot = store.owner_history_snapshot(conversation)
+            assert snapshot["proposal_consumed"] is True
+            head = snapshot["head_response_id"]
+
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_stale_tab_turn",
+                owner_message="Actually, make it 90 minutes",
+            ) is False
+            settled = store.owner_history_snapshot(conversation)
+            assert settled["pending"] is None
+            assert settled["recovery"] is None
+            assert settled["head_response_id"] == head
+            assert settled["latest_response_id"] == response_id
+            assert settled["conversation_closed"] is False
+
+            # The acknowledgement is what advances this owner, and the clean
+            # successor it names plans exactly as any new draft does.
+            assert store.close_owner_conversation(
+                "default", conversation, response_id,
+                expected_head_response_id=head, next_session_id="6" * 32,
+            ) is True
+            successor = group + "-" + "6" * 32
+            assert store.owner_session_index(
+                "default", group,
+            )["current_session_id"] == "6" * 32
+            assert store.reserve_owner_conversation(
+                "default", successor, "resp_successor_turn",
+                owner_message="Prepare a different workshop",
+            ) is True
+        finally:
+            store.close()
+
+    def test_a_project_change_session_is_not_spent_by_its_own_run(self):
+        """The other half of the same fence: a Project keeps its conversation.
+
+        A change session's proposal is consumed by the run that applies it
+        exactly as a draft's is, and the owner goes on talking about the same
+        Project afterwards. The refusal above is about the draft that CREATED a
+        Project — the one whose receipt is still owed to a browser — so it must
+        read the operation that consumed the proposal rather than the fact that
+        one was consumed.
+        """
+        conversation = "raphael-owner-" + "f" * 32
+        response_id = "resp_project_change_proposal"
+        run_id = "run_" + "8" * 32
+        claim_id = "claim_" + "9" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1_000},
+                "conversation_history": [{
+                    "role": "assistant",
+                    "content": json.dumps(_owner_existing_proposal()),
+                }],
+            })
+            assert store.set_conversation(
+                conversation, response_id, owner_proposal=True,
+            ) is True
+            assert store.claim_and_attach_owner_run(
+                "default", conversation, response_id, claim_id, run_id,
+                operation="owner_project_plan_commit",
+                payload_digest="c" * 64,
+            ) is True
+            assert store.complete_owner_claim(
+                "default", conversation, response_id, claim_id, run_id,
+            ) is True
+            assert store.owner_history_snapshot(
+                conversation,
+            )["proposal_consumed"] is True
+
+            assert store.reserve_owner_conversation(
+                "default", conversation, "resp_next_change_turn",
+                owner_message="Now add the weekly report",
+            ) is True
+            assert store.owner_history_snapshot(conversation)["pending"] == {
+                "owner": "Now add the weekly report",
+                "response_id": "resp_next_change_turn",
+            }
+        finally:
+            store.close()
+
+    def test_closing_a_conversation_moves_the_group_to_its_next_session(self):
+        """Item 32TK round 3: which draft is current is a server-side fact.
+
+        A caller that states the session this group moves on to gets that
+        pointer advanced inside the closing transaction. Without it the durable
+        pointer still named the conversation that was just closed, so a browser
+        holding no cookie at all came back to the retired one.
+        """
+        group = "raphael-owner-" + "a" * 32
+        successor = "b" * 32
+        store = ResponseStore(max_size=10)
+        try:
+            store.put("resp_first_draft_turn", {
+                "response": {"id": "resp_first_draft_turn", "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": "Prepare a workshop"},
+                    {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "schema_version": 1,
+                            "kind": "question",
+                            "message": "Who is the workshop for?",
+                        }),
+                    },
+                ],
+            })
+            assert store.set_conversation(
+                group, "resp_first_draft_turn", profile="default",
+            ) is True
+            assert store.owner_session_index(
+                "default", group,
+            )["current_session_id"] == "legacy"
+
+            assert store.close_owner_conversation(
+                "default", group, None,
+                expected_head_response_id="resp_first_draft_turn",
+                next_session_id=successor,
+            ) is True
+
+            index = store.owner_session_index("default", group)
+            assert index["current_session_id"] == successor
+            # The retired draft is still readable as a past one, and the
+            # successor carries no turns yet, so it lists none.
+            assert [entry["session_id"] for entry in index["data"]] == ["legacy"]
+        finally:
+            store.close()
+
+    def test_owner_turn_reservation_fences_claim_close_and_competing_turn(self):
+        conversation = "raphael-owner-" + "5" * 32
+        response_id = "resp_reserved_source"
+        reserved_id = "resp_reserved_next_turn"
+        store = ResponseStore(max_size=10)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert store.reserve_owner_conversation(
+            "default", conversation, reserved_id,
+        ) is True
+        assert store.reserve_owner_conversation(
+            "default", conversation, "resp_competing_turn",
+        ) is False
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, "claim_" + "6" * 32,
+        ) is False
+        assert store.close_owner_conversation(
+            "default", conversation, response_id,
+        ) is False
+
+        store.put(reserved_id, {
+            "response": {"id": reserved_id, "created_at": 2},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps({"schema_version": 1, "kind": "question"}),
+            }],
+        })
+        assert store.set_conversation(
+            conversation,
+            reserved_id,
+            profile="default",
+            reservation_id=reserved_id,
+        ) is True
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, "claim_" + "6" * 32,
+        ) is False
+
+    def test_expired_owner_turn_reservation_is_reclaimed_after_restart(
+        self, tmp_path,
+    ):
+        conversation = "raphael-owner-" + "e" * 32
+        db_path = tmp_path / "response-store.db"
+        first = ResponseStore(db_path=db_path, max_size=10)
+        assert first.reserve_owner_conversation(
+            "default", conversation, "resp_crash_left_turn",
+        ) is True
+        assert first.renew_owner_conversation_reservation(
+            "default", conversation, "resp_crash_left_turn",
+        ) is True
+        first._conn.execute(
+            "UPDATE owner_conversation_reservations SET expires_at = ? "
+            "WHERE profile = ? AND name = ?",
+            (time.time() - 1, "default", conversation),
+        )
+        first._conn.commit()
+        first.close()
+
+        restarted = ResponseStore(db_path=db_path, max_size=10)
+        try:
+            assert restarted.reserve_owner_conversation(
+                "default", conversation, "resp_recovered_turn",
+            ) is True
+            assert restarted.reserve_owner_conversation(
+                "default", conversation, "resp_competing_turn",
+            ) is False
+            assert restarted.set_conversation(
+                conversation,
+                "resp_recovered_turn",
+                profile="default",
+                reservation_id="resp_recovered_turn",
+            ) is True
+            assert restarted.set_conversation(
+                conversation,
+                "resp_crash_left_turn",
+                profile="default",
+                reservation_id="resp_crash_left_turn",
+            ) is False
+            assert restarted.get_conversation(
+                conversation, profile="default",
+            ) == "resp_recovered_turn"
+        finally:
+            restarted.close()
+
+    def test_expired_unattached_claim_can_be_recovered(self):
+        conversation = "raphael-owner-" + "6" * 32
+        response_id = "resp_expired_owner_claim"
+        store = ResponseStore(max_size=10)
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
+        })
+        assert store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, "claim_" + "7" * 32,
+        ) is True
+        store._conn.execute(
+            "UPDATE conversations SET claim_expires_at = ? "
+            "WHERE profile = ? AND name = ?",
+            (time.time() - 1, "default", conversation),
+        )
+        store._conn.commit()
+        assert store.claim_owner_proposal(
+            "default", conversation, response_id, "claim_" + "8" * 32,
+        ) is True
+
+    def test_run_idempotency_and_owner_proposal_backfill_survive_restart(
+        self, tmp_path,
+    ):
+        db_path = str(tmp_path / "legacy-response-store.db")
+        conversation = "raphael-owner-" + "9" * 32
+        response_id = "resp_legacy_owner_proposal"
+        raw = {
+            "response": {"id": response_id, "created_at": 1},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
+        }
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE responses (response_id TEXT PRIMARY KEY, data TEXT NOT NULL, "
+            "accessed_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE conversations (name TEXT PRIMARY KEY, response_id TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
+            (response_id, json.dumps(raw), 1.0),
+        )
+        conn.execute(
+            "INSERT INTO conversations (name, response_id) VALUES (?, ?)",
+            (conversation, response_id),
+        )
+        conn.commit()
+        conn.close()
+
+        store = ResponseStore(
+            max_size=10, db_path=db_path, default_profile="default",
+        )
+        assert store.owner_proposal_record(
+            "default", conversation, response_id,
+        ) is not None
+        assert store.reserve_run_idempotency(
+            "default", "scope", "key", "fingerprint", "run_" + "a" * 32,
+        ) == ("new", "run_" + "a" * 32)
+        store.close()
+
+        reopened = ResponseStore(
+            max_size=10, db_path=db_path, default_profile="default",
+        )
+        assert reopened.lookup_run_idempotency(
+            "default", "scope", "key", "fingerprint",
+        ) == ("existing", "run_" + "a" * 32)
+        assert reopened.lookup_run_idempotency(
+            "secondary", "scope", "key", "fingerprint",
+        ) == ("missing", None)
+        response_pk = [
+            row[1]
+            for row in sorted(
+                reopened._conn.execute("PRAGMA table_info(responses)").fetchall(),
+                key=lambda row: row[5],
+            )
+            if row[5]
+        ]
+        assert response_pk == ["profile", "response_id"]
+
+    def test_schema_upgrade_is_serialized_across_connections(
+        self, tmp_path, monkeypatch,
+    ):
+        db_path = str(tmp_path / "concurrent-legacy-response-store.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE responses (response_id TEXT PRIMARY KEY, data TEXT NOT NULL, "
+            "accessed_at REAL NOT NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        original = ResponseStore._initialize_schema_locked
+        first_inside = threading.Event()
+        second_started = threading.Event()
+        call_lock = threading.Lock()
+        call_count = 0
+
+        def delayed_first_migration(store):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                first = call_count == 1
+            if first:
+                first_inside.set()
+                assert second_started.wait(1)
+                time.sleep(0.1)
+            return original(store)
+
+        monkeypatch.setattr(
+            ResponseStore, "_initialize_schema_locked", delayed_first_migration,
+        )
+        errors = []
+
+        def open_store(*, second=False):
+            if second:
+                second_started.set()
+            try:
+                store = ResponseStore(db_path=db_path, max_size=10)
+                store.close()
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        first_thread = threading.Thread(target=open_store, daemon=True)
+        first_thread.start()
+        assert first_inside.wait(1)
+        second_thread = threading.Thread(
+            target=lambda: open_store(second=True), daemon=True,
+        )
+        second_thread.start()
+        first_thread.join(timeout=3)
+        second_thread.join(timeout=3)
+
+        assert not first_thread.is_alive()
+        assert not second_thread.is_alive()
+        assert errors == []
+        reopened = ResponseStore(db_path=db_path, max_size=10)
+        try:
+            response_pk = [
+                row[1]
+                for row in sorted(
+                    reopened._conn.execute(
+                        "PRAGMA table_info(responses)"
+                    ).fetchall(),
+                    key=lambda row: row[5],
+                )
+                if row[5]
+            ]
+            run_columns = {
+                row[1]
+                for row in reopened._conn.execute(
+                    "PRAGMA table_info(run_idempotency)"
+                )
+            }
+            assert response_pk == ["profile", "response_id"]
+            assert {"status_json", "terminal_json"} <= run_columns
+        finally:
+            reopened.close()
+
     def test_owner_history_missing_or_invalid_conversation_is_empty(self):
         store = ResponseStore(max_size=10)
         store.put("resp_invalid_history", {
@@ -440,19 +2163,386 @@ class TestResponseStore:
         assert store.owner_history("invalid-history") == []
 
         assert store.owner_history_snapshot("missing-history") == {
+            "head_response_id": None,
             "latest_response_id": None,
             "proposal_consumed": False,
+            "proposal_claimed": False,
+            "active_run_id": None,
+            "completed_run_id": None,
+            "conversation_closed": False,
+            "truncated": False,
+            "incomplete": False,
+            "pending": None,
+            "recovery": None,
             "data": [],
         }
 
 
+    # -----------------------------------------------------------------------
+    # Item 32TK: absent authority, BROKEN authority, and honest truncation
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _owner_store(history, *, name="raphael-owner-" + "9" * 32):
+        store = ResponseStore(max_size=10)
+        store.put("resp_broken_authority", {
+            "response": {"id": "resp_broken_authority"},
+            "conversation_history": history,
+        })
+        assert store.set_conversation(name, "resp_broken_authority") is True
+        return store, name
+
+    @staticmethod
+    def _question(text):
+        return json.dumps(
+            {"schema_version": 1, "kind": "question", "message": text}
+        )
+
+    def test_a_conversation_with_no_mapping_is_empty_not_broken(self):
+        store = ResponseStore(max_size=10)
+        snapshot = store.owner_history_snapshot("raphael-owner-" + "8" * 32)
+        assert snapshot["head_response_id"] is None
+        assert snapshot["data"] == []
+
+    def test_a_mapped_response_that_is_gone_is_a_service_failure(self):
+        """Absent authority and broken authority are not the same answer."""
+        store, name = self._owner_store([
+            {"role": "user", "content": "Plan it."},
+            {"role": "assistant", "content": self._question("Which first?")},
+        ])
+        # The head still names it, but the row it names is gone.
+        store._conn.execute("DELETE FROM responses WHERE response_id = ?",
+                            ("resp_broken_authority",))
+        store._conn.commit()
+
+        with pytest.raises(OwnerAuthorityBroken):
+            store.owner_history_snapshot(name)
+
+    def test_a_corrupt_stored_response_is_a_service_failure(self):
+        store, name = self._owner_store([
+            {"role": "user", "content": "Plan it."},
+            {"role": "assistant", "content": self._question("Which first?")},
+        ])
+        store._conn.execute(
+            "UPDATE responses SET data = ? WHERE response_id = ?",
+            ("{not json", "resp_broken_authority"),
+        )
+        store._conn.commit()
+
+        with pytest.raises(OwnerAuthorityBroken):
+            store.owner_history_snapshot(name)
+
+    def test_a_transcript_that_is_not_a_list_is_a_service_failure(self):
+        store, name = self._owner_store("not a transcript")
+        with pytest.raises(OwnerAuthorityBroken):
+            store.owner_history_snapshot(name)
+
+    @pytest.mark.parametrize(
+        "owner_message",
+        [
+            {"role": "user", "content": None},
+            {"role": "user", "content": ["multimodal"]},
+            {"role": "user", "content": "   "},
+            {"role": "user", "content": "x" * 12_001},
+        ],
+    )
+    def test_a_malformed_owner_turn_fails_instead_of_merging_turns(
+        self, owner_message,
+    ):
+        """An owner message is a turn boundary, so dropping one would show a
+        transcript that never happened."""
+        store, name = self._owner_store([
+            {"role": "user", "content": "First ask."},
+            {"role": "assistant", "content": self._question("First reply?")},
+            owner_message,
+            {"role": "assistant", "content": self._question("Second reply?")},
+        ])
+        with pytest.raises(OwnerAuthorityBroken):
+            store.owner_history_snapshot(name)
+
+    def test_an_unprojectable_final_reply_fails_instead_of_showing_an_older_one(
+        self,
+    ):
+        store, name = self._owner_store([
+            {"role": "user", "content": "Plan it."},
+            {"role": "assistant", "content": self._question("An early reply?")},
+            {"role": "assistant", "content": self._question("y" * 50_001)},
+        ])
+        with pytest.raises(OwnerAuthorityBroken):
+            store.owner_history_snapshot(name)
+
+    def test_tool_traffic_and_excluded_reply_kinds_are_still_skipped(self):
+        """Not every unprojectable message is a defect: the projection
+        deliberately carries neither tool traffic nor an Automations reply."""
+        store, name = self._owner_store([
+            {"role": "user", "content": "Plan it."},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+            {"role": "tool", "content": "private tool output"},
+            {"role": "assistant", "content": self._question("Which first?")},
+            {"role": "user", "content": "Automate it."},
+            {"role": "assistant", "content": json.dumps({
+                "schema_version": 1, "kind": "automation_proposal",
+            })},
+        ])
+        snapshot = store.owner_history_snapshot(name)
+
+        # One projected turn, and the head is reported regardless.
+        assert [turn["owner"] for turn in snapshot["data"]] == ["Plan it."]
+        assert snapshot["head_response_id"] == "resp_broken_authority"
+        assert snapshot["truncated"] is False
+
+    def test_a_head_with_no_projectable_turn_is_still_reported(self):
+        """An Automations conversation projects zero turns and still has a head.
+
+        Nulling it made every later turn on that conversation either conflict
+        as stale or replay the old proposal.
+        """
+        store, name = self._owner_store([
+            {"role": "user", "content": "Automate it."},
+            {"role": "assistant", "content": json.dumps({
+                "schema_version": 1, "kind": "automation_proposal",
+            })},
+        ])
+        snapshot = store.owner_history_snapshot(name)
+
+        assert snapshot["data"] == []
+        assert snapshot["head_response_id"] == "resp_broken_authority"
+
+    def test_history_past_the_window_is_reported_as_truncated(self):
+        history = []
+        for index in range(45):
+            history.append({"role": "user", "content": f"Ask {index}."})
+            history.append(
+                {"role": "assistant", "content": self._question(f"Reply {index}?")}
+            )
+        store, name = self._owner_store(history)
+        snapshot = store.owner_history_snapshot(name)
+
+        assert len(snapshot["data"]) == 40
+        assert snapshot["truncated"] is True
+        assert snapshot["data"][0]["owner"] == "Ask 5."
+
+    # -----------------------------------------------------------------------
+    # Item 32TK round 2: malformed alternation is reported, never hidden
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.parametrize("record", [None, "a bare string", 7, ["nested"]])
+    def test_a_non_object_transcript_record_is_a_service_failure(self, record):
+        """Skipping one would merge the owner turns on either side of it."""
+        store, name = self._owner_store([
+            {"role": "user", "content": "First ask."},
+            record,
+            {"role": "assistant", "content": self._question("First reply?")},
+        ])
+        with pytest.raises(OwnerAuthorityBroken):
+            store.owner_history_snapshot(name)
+
+    def test_consecutive_owner_turns_are_reported_as_incomplete(self):
+        """The first owner message really happened, so the projection says it
+        is not the whole conversation instead of silently dropping it."""
+        store, name = self._owner_store([
+            {"role": "user", "content": "Automate it."},
+            {"role": "assistant", "content": json.dumps({
+                "schema_version": 1, "kind": "automation_proposal",
+            })},
+            {"role": "user", "content": "Now plan it."},
+            {"role": "assistant", "content": self._question("Which first?")},
+        ])
+        snapshot = store.owner_history_snapshot(name)
+
+        assert [turn["owner"] for turn in snapshot["data"]] == ["Now plan it."]
+        assert snapshot["incomplete"] is True
+
+    def test_a_trailing_owner_turn_is_reported_as_incomplete(self):
+        store, name = self._owner_store([
+            {"role": "user", "content": "Plan it."},
+            {"role": "assistant", "content": self._question("Which first?")},
+            {"role": "user", "content": "The second one."},
+        ])
+        snapshot = store.owner_history_snapshot(name)
+
+        assert [turn["owner"] for turn in snapshot["data"]] == ["Plan it."]
+        assert snapshot["incomplete"] is True
+
+    def test_a_clean_alternation_is_not_marked_incomplete(self):
+        store, name = self._owner_store([
+            {"role": "user", "content": "Plan it."},
+            {"role": "assistant", "content": self._question("Which first?")},
+        ])
+        assert store.owner_history_snapshot(name)["incomplete"] is False
+
+    # -----------------------------------------------------------------------
+    # Item 32TK round 2: the session index cannot lose the current session
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _session_group_store():
+        group = "raphael-owner-" + "a" * 32
+        store = ResponseStore(max_size=20)
+
+        def add(name, response_id, created_at, owner):
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": created_at},
+                "conversation_history": [
+                    {"role": "user", "content": owner},
+                    {"role": "assistant", "content": json.dumps({
+                        "schema_version": 1, "kind": "question",
+                        "message": "Which first?",
+                    })},
+                ],
+            })
+            assert store.set_conversation(name, response_id) is True
+
+        return store, group, add
+
+    def test_reading_an_old_session_cannot_make_it_current(self):
+        """Ordering by the mapped response's LRU access time meant opening an
+        old change promoted it past the real current one."""
+        store, group, add = self._session_group_store()
+        older = "1" * 32
+        newer = "2" * 32
+        add(f"{group}-{older}", "resp_session_older", 100, "The older change.")
+        add(f"{group}-{newer}", "resp_session_newer", 200, "The newer change.")
+
+        # Exactly what opening the older change does: it touches accessed_at.
+        assert store.get("resp_session_older") is not None
+
+        index = store.owner_session_index("default", group)
+        assert [item["session_id"] for item in index["data"]] == [newer, older]
+        assert index["current_session_id"] == newer
+
+    def test_the_current_session_survives_the_index_bound(self):
+        store, group, add = self._session_group_store()
+        for index_number in range(105):
+            add(
+                f"{group}-{index_number:032x}",
+                f"resp_session_{index_number}",
+                100 + index_number,
+                f"Change {index_number}.",
+            )
+        newest = f"{104:032x}"
+
+        index = store.owner_session_index("default", group)
+        assert index["truncated"] is True
+        assert index["data"][0]["session_id"] == newest
+        assert index["current_session_id"] == newest
+
+    def test_a_session_whose_mapped_response_is_gone_is_reported_unavailable(self):
+        """An inner join dropped it silently, which could remove the real
+        current session before anything validated it."""
+        store, group, add = self._session_group_store()
+        broken = "3" * 32
+        add(f"{group}-{broken}", "resp_session_broken", 300, "The current change.")
+        store._conn.execute(
+            "DELETE FROM responses WHERE response_id = ?", ("resp_session_broken",),
+        )
+        store._conn.commit()
+
+        index = store.owner_session_index("default", group)
+        assert [item["session_id"] for item in index["data"]] == [broken]
+        assert index["data"][0]["available"] is False
+        assert index["current_session_id"] == broken
+
+    def test_a_pre_upgrade_store_is_seeded_with_durable_sequences(self):
+        """A store written before the sequence existed still has to answer
+        "which session is current" without consulting access order again."""
+        store, group, add = self._session_group_store()
+        older = "5" * 32
+        newer = "6" * 32
+        add(f"{group}-{older}", "resp_seed_older", 100, "The older change.")
+        add(f"{group}-{newer}", "resp_seed_newer", 200, "The newer change.")
+        # Exactly a pre-upgrade store: mapped conversations, no sequence table.
+        store._conn.execute("DROP TABLE owner_conversation_sessions")
+        store._conn.commit()
+
+        store._initialize_schema()
+
+        # Seeded oldest-access-first, so the newest sibling is current — and
+        # reading the older one afterwards cannot move it.
+        assert store.get("resp_seed_older") is not None
+        index = store.owner_session_index("default", group)
+        assert [item["session_id"] for item in index["data"]] == [newer, older]
+        assert index["current_session_id"] == newer
+
+    def test_a_session_with_a_corrupt_stored_head_is_reported_unavailable(self):
+        store, group, add = self._session_group_store()
+        broken = "4" * 32
+        add(f"{group}-{broken}", "resp_session_corrupt", 400, "The current change.")
+        store._conn.execute(
+            "UPDATE responses SET data = ? WHERE response_id = ?",
+            ("{not json", "resp_session_corrupt"),
+        )
+        store._conn.commit()
+
+        index = store.owner_session_index("default", group)
+        assert index["data"][0]["available"] is False
+        assert index["current_session_id"] == broken
+
+    # -----------------------------------------------------------------------
+    # Item 32TK round 2: closing compares the conversation's REAL head
+    # -----------------------------------------------------------------------
+
+    def test_closing_refuses_when_the_head_moved_under_a_stale_tab(self):
+        """An ordinary question does not change the outstanding proposal, so
+        comparing only that let a stale tab close and hide the newer turn."""
+        group = "raphael-owner-" + "b" * 32
+        store = ResponseStore(max_size=10)
+        store.put("resp_close_first", {
+            "response": {"id": "resp_close_first"},
+            "conversation_history": [],
+        })
+        assert store.set_conversation(group, "resp_close_first") is True
+        # A concurrent question lands: the head moves, the proposal does not.
+        store.put("resp_close_second", {
+            "response": {"id": "resp_close_second"},
+            "conversation_history": [],
+        })
+        assert store.set_conversation(group, "resp_close_second") is True
+
+        assert store.close_owner_conversation(
+            "default", group, None,
+            expected_head_response_id="resp_close_first",
+        ) is False
+        assert store.owner_history_snapshot(group)["conversation_closed"] is False
+
+        assert store.close_owner_conversation(
+            "default", group, None,
+            expected_head_response_id="resp_close_second",
+        ) is True
+        assert store.owner_history_snapshot(group)["conversation_closed"] is True
+
+    def test_closing_a_conversation_with_no_mapping_refuses_a_stated_head(self):
+        store = ResponseStore(max_size=10)
+        group = "raphael-owner-" + "c" * 32
+        assert store.close_owner_conversation(
+            "default", group, None,
+            expected_head_response_id="resp_never_existed",
+        ) is False
+        assert store.close_owner_conversation(
+            "default", group, None, expected_head_response_id=None,
+        ) is True
+
+
 # ---------------------------------------------------------------------------
 # _IdempotencyCache
-        assert store.owner_history("raphael-owner-safe") == []
 # ---------------------------------------------------------------------------
 
 
 class TestIdempotencyCache:
+    def test_request_fingerprint_canonicalizes_nested_maps(self):
+        first = {
+            "input": "Apply it.",
+            "owner_proposal_authority": {"payload": {"a": 1, "b": 2}},
+        }
+        reordered = {
+            "input": "Apply it.",
+            "owner_proposal_authority": {"payload": {"b": 2, "a": 1}},
+        }
+
+        assert _make_request_fingerprint(
+            first, sorted(first),
+        ) == _make_request_fingerprint(reordered, sorted(reordered))
+
     @pytest.mark.asyncio
     async def test_concurrent_same_key_and_fingerprint_runs_once(self):
         cache = _IdempotencyCache()
@@ -665,6 +2755,14 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post(
         "/v1/responses/conversations/{conversation}/consume",
         adapter._handle_consume_owner_proposal,
+    )
+    app.router.add_post(
+        "/v1/responses/conversations/{conversation}/authority",
+        adapter._handle_owner_conversation_authority,
+    )
+    app.router.add_post(
+        "/v1/responses/conversations/{conversation}/recovery",
+        adapter._handle_acknowledge_owner_recovery,
     )
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
@@ -1322,7 +3420,56 @@ class TestOwnerWorkspaceProjectSnapshotEndpoint:
             "object": "hermes.owner_workspace.project_snapshot",
             "data": expected,
         }
-        read.assert_called_once_with(ANY, "shoe-shop")
+        read.assert_called_once_with(ANY, "shoe-shop", run_context=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query,expected_run_context",
+        [
+            ("", False),
+            ("?capabilities=", False),
+            ("?capabilities=something_else", False),
+            ("?capabilities=run_task_context", True),
+            ("?capabilities=something_else,run_task_context", True),
+            ("?capabilities=run_task_context_extra", False),
+            ("?capabilities=" + "x" * 300 + ",run_task_context", False),
+            # A repeated key has no single negotiated answer, so BOTH orders
+            # fail closed to the legacy shape rather than granting whichever
+            # occurrence happens to be read first.
+            ("?capabilities=run_task_context&capabilities=something_else", False),
+            ("?capabilities=something_else&capabilities=run_task_context", False),
+            ("?capabilities=run_task_context&capabilities=run_task_context", False),
+            # The native board/workers capability is a different contract on a
+            # different surface; naming it here grants nothing.
+            ("?capabilities=owner_titles_v1", False),
+        ],
+    )
+    async def test_run_context_is_served_only_to_a_reader_that_asks_for_it(
+        self, adapter, query, expected_run_context,
+    ):
+        """The /v1 run shape stays what its oldest reader validates.
+
+        A reader that predates the added run keys never sends
+        ``capabilities``, so deploying this Hermes first cannot hand that
+        reader a snapshot its closed schema rejects. An oversized, repeated,
+        or foreign-surface parameter grants nothing rather than being parsed.
+        """
+        app = _create_app(adapter)
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch("hermes_cli.owner_workspace.resolve_owner_context", return_value=object()),
+            patch("hermes_cli.owner_workspace.read_project_snapshot", return_value={}) as read,
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get(
+                    f"/v1/owner-workspace/projects/shoe-shop/snapshot{query}"
+                )
+
+        assert resp.status == 200
+        read.assert_called_once_with(
+            ANY, "shoe-shop", run_context=expected_run_context
+        )
 
     @pytest.mark.asyncio
     async def test_non_receipt_project_is_indistinguishable_from_missing(self, adapter):
@@ -1414,7 +3561,10 @@ class TestOwnerWorkspaceDecisionsEndpoint:
                 "hermes_cli.owner_workspace.resolve_owner_context",
                 return_value=types.SimpleNamespace(profile="default"),
             ),
-            patch("hermes_cli.owner_workspace.list_owner_decisions", return_value=durable),
+            patch(
+                "hermes_cli.owner_workspace.list_owner_decisions",
+                return_value={"data": durable, "truncated": False},
+            ),
         ):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/v1/owner-workspace/decisions")
@@ -1422,6 +3572,7 @@ class TestOwnerWorkspaceDecisionsEndpoint:
 
         assert resp.status == 200
         assert data["object"] == "hermes.owner_workspace.decision_list"
+        assert data["truncated"] is False
         assert data["data"][0] == durable[0]
         assert data["data"][1] == {
             "decision_ref": data["data"][1]["decision_ref"],
@@ -1886,6 +4037,147 @@ class TestDeriveChatSessionId:
 
 class TestResponsesEndpoint:
 
+    @pytest.mark.asyncio
+    async def test_owner_history_projects_the_turn_being_planned_right_now(
+        self, adapter,
+    ):
+        """Item 32TK: the request survives at the boundary, not just in the store.
+
+        The Workspace reads this endpoint. A browser that never received the
+        accept response has no handle to the plan at all, so this projection is
+        the only thing that can give the owner back their own words — and the
+        response id that is already planning them.
+        """
+        conversation = "raphael-owner-" + "d" * 32
+        assert adapter._response_store.reserve_owner_conversation(
+            "default",
+            conversation,
+            "resp_pending_at_the_boundary",
+            owner_message="Prepare a private 60-minute workshop",
+        ) is True
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            history_response = await cli.get(
+                f"/v1/responses/conversations/{conversation}",
+            )
+            assert history_response.status == 200
+            history = await history_response.json()
+
+        assert history["data"] == []
+        assert history["pending"] == {
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": "resp_pending_at_the_boundary",
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_failed_turn_is_recoverable_and_acknowledged_at_the_boundary(
+        self, adapter,
+    ):
+        """Item 32TK: the whole way back, over HTTP, with no caller-held handle.
+
+        The Workspace reads and retires this record across the same public
+        boundary it plans turns on. Reading is repeatable because the answer
+        carrying it can be lost too; retiring it is a separate, explicit,
+        repeatable act.
+        """
+        conversation = "raphael-owner-" + "3" * 32
+        assert adapter._response_store.reserve_owner_conversation(
+            "default",
+            conversation,
+            "resp_failed_at_the_boundary",
+            owner_message="Prepare a private 60-minute workshop",
+        ) is True
+        _interrupt_owner_turn(
+            adapter._response_store, conversation, "resp_failed_at_the_boundary",
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.get(f"/v1/responses/conversations/{conversation}")
+            assert first.status == 200
+            recovery = (await first.json())["recovery"]
+            assert recovery == {
+                "owner": "Prepare a private 60-minute workshop",
+                "response_id": "resp_failed_at_the_boundary",
+            }
+
+            # Reading again still finds it: the answer above may never have
+            # arrived, which is the whole reason this record exists.
+            again = await cli.get(f"/v1/responses/conversations/{conversation}")
+            assert (await again.json())["recovery"] == recovery
+
+            acknowledged = await cli.post(
+                f"/v1/responses/conversations/{conversation}/recovery",
+                json={"response_id": "resp_failed_at_the_boundary"},
+            )
+            assert acknowledged.status == 200
+            assert (await acknowledged.json())["acknowledged"] is True
+
+            # Retired, and saying so a second time is not an error.
+            after = await cli.get(f"/v1/responses/conversations/{conversation}")
+            assert (await after.json())["recovery"] is None
+            repeated = await cli.post(
+                f"/v1/responses/conversations/{conversation}/recovery",
+                json={"response_id": "resp_failed_at_the_boundary"},
+            )
+            assert repeated.status == 200
+            assert (await repeated.json())["acknowledged"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_recovery_route_says_what_it_actually_did(self, adapter):
+        """Item 32TK round 3: "acknowledged" was said even when nothing was.
+
+        A caller cannot verify an answer that is the same whatever happened. It
+        now distinguishes the record it really retired, a conversation that has
+        nothing outstanding, and a request that names a DIFFERENT outstanding
+        record — which is refused outright, because answering it as success
+        would tell a caller an unanswered request had been dealt with.
+        """
+        conversation = "raphael-owner-" + "b" * 32
+        store = adapter._response_store
+        assert store.reserve_owner_conversation(
+            "default", conversation, "resp_truthful_recovery",
+            owner_message="Prepare a private 60-minute workshop",
+        ) is True
+        _interrupt_owner_turn(store, conversation, "resp_truthful_recovery")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            path = f"/v1/responses/conversations/{conversation}/recovery"
+
+            # Another request entirely: refused, and it changes nothing.
+            mismatched = await cli.post(
+                path, json={"response_id": "resp_some_other_request"},
+            )
+            assert mismatched.status == 409
+            body = await mismatched.json()
+            assert body["acknowledged"] is False
+            assert body["outcome"] == "mismatch"
+            assert (await (await cli.get(
+                f"/v1/responses/conversations/{conversation}"
+            )).json())["recovery"] is not None
+
+            retired = await cli.post(
+                path, json={"response_id": "resp_truthful_recovery"},
+            )
+            assert retired.status == 200
+            assert await retired.json() == {
+                "object": "hermes.response.owner_recovery_acknowledgement",
+                "acknowledged": True,
+                "outcome": "retired",
+            }
+
+            # Saying it twice is still safe, and now says which it was.
+            again = await cli.post(
+                path, json={"response_id": "resp_truthful_recovery"},
+            )
+            assert again.status == 200
+            assert await again.json() == {
+                "object": "hermes.response.owner_recovery_acknowledgement",
+                "acknowledged": True,
+                "outcome": "absent",
+            }
 
     @pytest.mark.asyncio
     async def test_owner_session_index_and_consumption_routes(self, adapter):
@@ -1893,12 +4185,9 @@ class TestResponsesEndpoint:
         session_id = "8" * 32
         conversation = f"{group}-{session_id}"
         response_id = "resp_route_proposal"
-        reply = json.dumps({
-            "schema_version": 3,
-            "kind": "project_change_proposal",
-            "mode": "existing",
-            "request_title": "Finish the owner flow",
-        })
+        reply = json.dumps(_owner_existing_proposal(
+            request_title="Finish the owner flow",
+        ))
         adapter._response_store.put(response_id, {
             "response": {"id": response_id, "created_at": 800},
             "conversation_history": [
@@ -1906,7 +4195,9 @@ class TestResponsesEndpoint:
                 {"role": "assistant", "content": reply},
             ],
         })
-        adapter._response_store.set_conversation(conversation, response_id)
+        adapter._response_store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        )
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -1921,8 +4212,10 @@ class TestResponsesEndpoint:
                     "updated_at": 800,
                     "preview": "Finish the owner flow.",
                     "visible_turn_count": 1,
+                    "available": True,
                 }],
                 "truncated": False,
+                "current_session_id": session_id,
             }
 
             consumed_response = await cli.post(
@@ -1942,6 +4235,103 @@ class TestResponsesEndpoint:
             history = await history_response.json()
             assert history["proposal_consumed"] is True
             assert history["latest_response_id"] == response_id
+            retained = await cli.delete(f"/v1/responses/{response_id}")
+            assert retained.status == 409
+            assert (await retained.json())["error"]["code"] == "owner_conversation_active"
+
+            authority_response_id = "resp_route_authority"
+            adapter._response_store.put(authority_response_id, {
+                "response": {"id": authority_response_id, "created_at": 801},
+                "conversation_history": [
+                    {"role": "user", "content": "Apply the exact plan."},
+                    {"role": "assistant", "content": reply},
+                ],
+            })
+            assert adapter._response_store.set_conversation(
+                conversation, authority_response_id, owner_proposal=True,
+            ) is True
+            authority_path = (
+                f"/v1/responses/conversations/{conversation}/authority"
+            )
+            claim_id = "claim_" + "a" * 32
+            run_id = "run_" + "b" * 32
+            claim_payload = {
+                "action": "claim",
+                "response_id": authority_response_id,
+                "claim_id": claim_id,
+            }
+            authority_response = await cli.post(authority_path, json=claim_payload)
+            assert authority_response.status == 200
+
+            abandon_payload = {
+                "action": "abandon",
+                "response_id": authority_response_id,
+                "claim_id": claim_id,
+            }
+            abandoned = await cli.post(authority_path, json=abandon_payload)
+            assert abandoned.status == 200
+            assert await abandoned.json() == {
+                "object": "hermes.response.owner_authority",
+                "action": "abandon",
+                "applied": True,
+            }
+            authority_response = await cli.post(authority_path, json=claim_payload)
+            assert authority_response.status == 200
+
+            # The native /v1/runs path, not this transition endpoint, owns the
+            # initial binding and live run state.
+            adapter._set_run_status(run_id, "running")
+            assert adapter._response_store.attach_owner_run(
+                "default", conversation, authority_response_id, claim_id, run_id,
+            ) is True
+            attach_payload = {
+                "action": "attach",
+                "response_id": authority_response_id,
+                "claim_id": claim_id,
+                "run_id": run_id,
+            }
+            authority_response = await cli.post(authority_path, json=attach_payload)
+            assert authority_response.status == 200
+
+            for premature_action in ("complete", "release"):
+                premature = await cli.post(authority_path, json={
+                    "action": premature_action,
+                    "response_id": authority_response_id,
+                    "claim_id": claim_id,
+                    "run_id": run_id,
+                })
+                assert premature.status == 409
+
+            adapter._set_run_status(run_id, "completed")
+            complete_payload = {
+                "action": "complete",
+                "response_id": authority_response_id,
+                "claim_id": claim_id,
+                "run_id": run_id,
+            }
+            # Generic terminal status is not mutation proof. The endpoint is
+            # verification-only until the native tool callback closes the
+            # exact claim server-side.
+            premature_complete = await cli.post(
+                authority_path, json=complete_payload,
+            )
+            assert premature_complete.status == 409
+            assert adapter._response_store.complete_owner_claim(
+                "default", conversation, authority_response_id, claim_id, run_id,
+            ) is True
+            authority_response = await cli.post(authority_path, json=complete_payload)
+            assert authority_response.status == 200
+            assert await authority_response.json() == {
+                "object": "hermes.response.owner_authority",
+                "action": "complete",
+                "applied": True,
+            }
+            authority_history = await (
+                await cli.get(f"/v1/responses/conversations/{conversation}")
+            ).json()
+            assert authority_history["proposal_consumed"] is True
+            assert authority_history["proposal_claimed"] is False
+            assert authority_history["active_run_id"] is None
 
     @pytest.mark.asyncio
     async def test_owner_session_routes_reject_invalid_shapes(self, adapter):
@@ -1959,6 +4349,148 @@ class TestResponsesEndpoint:
                     json={"response_id": "resp_safe_value", "extra": True},
                 )
             ).status == 400
+            assert (
+                await cli.post(
+                    f"/v1/responses/conversations/{group}/authority",
+                    json={"action": "claim", "response_id": "resp_safe_value"},
+                )
+            ).status == 400
+
+    @pytest.mark.asyncio
+    async def test_the_close_route_compares_the_conversations_real_head(
+        self, adapter,
+    ):
+        """A stale tab used to close and hide a newer turn, because an ordinary
+        question leaves the outstanding proposal untouched."""
+        conversation = "raphael-owner-" + "5" * 32
+        store = adapter._response_store
+        for response_id, created_at in (("resp_close_one", 100), ("resp_close_two", 200)):
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": created_at},
+                "conversation_history": [],
+            })
+            assert store.set_conversation(conversation, response_id) is True
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            stale = await cli.post(
+                f"/v1/responses/conversations/{conversation}/authority",
+                json={
+                    "action": "close",
+                    "response_id": None,
+                    "head_response_id": "resp_close_one",
+                },
+            )
+            assert stale.status == 409
+            assert store.owner_history_snapshot(
+                conversation,
+            )["conversation_closed"] is False
+
+            current = await cli.post(
+                f"/v1/responses/conversations/{conversation}/authority",
+                json={
+                    "action": "close",
+                    "response_id": None,
+                    "head_response_id": "resp_close_two",
+                },
+            )
+            assert current.status == 200
+
+        assert store.owner_history_snapshot(
+            conversation,
+        )["conversation_closed"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_close_route_can_state_the_session_this_group_moves_to(
+        self, adapter,
+    ):
+        """Item 32TK round 3: retiring a draft says which one is current now.
+
+        The caller states the successor, and the durable pointer moves with the
+        close. A caller that states nothing keeps the previous behaviour, and a
+        malformed successor is refused rather than quietly ignored.
+        """
+        group = "raphael-owner-" + "c" * 32
+        successor = "d" * 32
+        store = adapter._response_store
+        store.put("resp_group_head", {
+            "response": {"id": "resp_group_head", "created_at": 100},
+            "conversation_history": [],
+        })
+        assert store.set_conversation(group, "resp_group_head") is True
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            path = f"/v1/responses/conversations/{group}/authority"
+            malformed = await cli.post(path, json={
+                "action": "close",
+                "response_id": None,
+                "head_response_id": "resp_group_head",
+                "next_session_id": "not-a-session",
+            })
+            assert malformed.status == 409
+            assert store.owner_session_index(
+                "default", group,
+            )["current_session_id"] == "legacy"
+
+            moved = await cli.post(path, json={
+                "action": "close",
+                "response_id": None,
+                "head_response_id": "resp_group_head",
+                "next_session_id": successor,
+            })
+            assert moved.status == 200
+
+        assert store.owner_session_index(
+            "default", group,
+        )["current_session_id"] == successor
+
+    @pytest.mark.asyncio
+    async def test_owner_authority_reconciles_only_an_orphaned_exact_run(self, adapter):
+        conversation = "raphael-owner-" + "4" * 32
+        response_id = "resp_orphaned_owner_run"
+        claim_id = "claim_" + "5" * 32
+        run_id = "run_" + "6" * 32
+        adapter._response_store.put(response_id, {
+            "response": {"id": response_id, "created_at": 900},
+            "conversation_history": [
+                {"role": "assistant", "content": json.dumps(_owner_new_proposal())},
+            ],
+        })
+        assert adapter._response_store.set_conversation(
+            conversation, response_id, owner_proposal=True,
+        ) is True
+        assert adapter._response_store.claim_owner_proposal(
+            "default", conversation, response_id, claim_id,
+        ) is True
+        assert adapter._response_store.attach_owner_run(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
+        payload = {
+            "action": "reconcile",
+            "response_id": response_id,
+            "claim_id": claim_id,
+            "run_id": run_id,
+        }
+        adapter._set_run_status(run_id, "running")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            live = await cli.post(
+                f"/v1/responses/conversations/{conversation}/authority",
+                json=payload,
+            )
+            assert live.status == 409
+            adapter._run_statuses.pop(run_id)
+            recovered = await cli.post(
+                f"/v1/responses/conversations/{conversation}/authority",
+                json=payload,
+            )
+
+        assert recovered.status == 200
+        assert adapter._response_store.owner_claim_is_released(
+            "default", conversation, response_id, claim_id, run_id,
+        ) is True
 
     @pytest.mark.asyncio
     async def test_successful_response_with_string_input(self, adapter):
@@ -1991,6 +4523,658 @@ class TestResponsesEndpoint:
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
 
+    @pytest.mark.asyncio
+    async def test_idempotent_owner_response_replays_original_authority(self, adapter):
+        conversation = "raphael-owner-" + "d" * 32
+        body = {
+            "model": "hermes-agent",
+            "input": "Prepare the private milestone",
+            "conversation": conversation,
+            "store": True,
+            "expected_previous_response_id": None,
+        }
+        headers = {"Idempotency-Key": f"response-{uuid.uuid4().hex}"}
+        mock_result = {
+            "final_response": json.dumps(_owner_new_proposal()),
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+                return_value=(
+                    mock_result,
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                ),
+            ) as mock_run:
+                first = await cli.post(
+                    "/v1/responses", json=body, headers=headers,
+                )
+                assert first.status == 200
+                first_body = await first.json()
+                assert adapter._response_store.mark_owner_proposal_consumed(
+                    "default", conversation, first_body["id"],
+                ) is True
+
+                replay = await cli.post(
+                    "/v1/responses", json=body, headers=headers,
+                )
+                assert replay.status == 200
+                replay_body = await replay.json()
+
+        assert replay_body == first_body
+        assert replay_body["id"] == first_body["id"]
+        snapshot = adapter._response_store.owner_history_snapshot(conversation)
+        assert snapshot["latest_response_id"] == first_body["id"]
+        assert snapshot["proposal_consumed"] is True
+        mock_run.assert_awaited_once()
+
+
+    async def _owner_turn(
+        self, cli, adapter, conversation, *, text, headers=None, **extra,
+    ):
+        """One complete owner turn, with a stubbed structured reply.
+
+        Both owner-conversation contracts are mandatory, so every turn states
+        its predecessor and carries an Idempotency-Key unless the caller is
+        deliberately testing one of them.
+        """
+        result = {
+            "final_response": json.dumps(
+                {"schema_version": 1, "kind": "question", "message": text}
+            ),
+            "messages": [],
+            "api_calls": 1,
+        }
+        with patch.object(
+            adapter,
+            "_run_agent",
+            new_callable=AsyncMock,
+            return_value=(result, {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
+        ):
+            return await cli.post(
+                "/v1/responses",
+                json={
+                    "model": "hermes-agent",
+                    "input": text,
+                    "conversation": conversation,
+                    "store": True,
+                    **extra,
+                },
+                headers=headers or {
+                    "Idempotency-Key": f"response-{uuid.uuid4().hex}",
+                },
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_turn_planned_against_a_superseded_predecessor_is_refused(
+        self, adapter,
+    ):
+        """A delayed request must never append to, or displace, a newer turn."""
+        conversation = "raphael-owner-" + "1" * 32
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await self._owner_turn(
+                cli, adapter, conversation,
+                text="First ask",
+                expected_previous_response_id=None,
+            )
+            assert first.status == 200
+            head = (await first.json())["id"]
+
+            second = await self._owner_turn(
+                cli, adapter, conversation,
+                text="Second ask",
+                expected_previous_response_id=head,
+            )
+            assert second.status == 200
+            newer_head = (await second.json())["id"]
+
+            # Request A, planned against the first turn, arrives late.
+            delayed = await self._owner_turn(
+                cli, adapter, conversation,
+                text="Delayed ask",
+                expected_previous_response_id=head,
+            )
+            assert delayed.status == 409
+            assert (await delayed.json())["error"]["code"] == (
+                "owner_conversation_stale"
+            )
+
+        # Nothing was appended and nothing was overwritten.
+        snapshot = adapter._response_store.owner_history_snapshot(conversation)
+        assert snapshot["head_response_id"] == newer_head
+        assert [turn["owner"] for turn in snapshot["data"]] == [
+            "First ask", "Second ask",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_first_turn_asserting_no_predecessor_is_refused_once_one_exists(
+        self, adapter,
+    ):
+        conversation = "raphael-owner-" + "2" * 32
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await self._owner_turn(
+                cli, adapter, conversation,
+                text="First ask",
+                expected_previous_response_id=None,
+            )
+            assert first.status == 200
+            repeat = await self._owner_turn(
+                cli, adapter, conversation,
+                text="Another first ask",
+                expected_previous_response_id=None,
+            )
+            assert repeat.status == 409
+
+    @pytest.mark.asyncio
+    async def test_a_background_turn_is_bound_to_its_predecessor_too(self, adapter):
+        conversation = "raphael-owner-" + "3" * 32
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            queued = await self._owner_turn(
+                cli, adapter, conversation,
+                text="Background ask",
+                background=True,
+                expected_previous_response_id=None,
+            )
+            assert queued.status == 200
+            await asyncio.sleep(0)
+            stale = await self._owner_turn(
+                cli, adapter, conversation,
+                text="Stale background ask",
+                background=True,
+                expected_previous_response_id="resp_" + "b" * 28,
+            )
+            assert stale.status == 409
+            assert (await stale.json())["error"]["code"] == (
+                "owner_conversation_stale"
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_predecessor_is_refused_before_anything_runs(
+        self, adapter,
+    ):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Plan it",
+                        "conversation": "raphael-owner-" + "4" * 32,
+                        "store": True,
+                        "expected_previous_response_id": "../../etc/passwd",
+                    },
+                )
+            assert resp.status == 400
+            run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_owner_request_is_durable_before_the_model_answers(
+        self, adapter,
+    ):
+        """Item 32TK: recorded by the fence, so a lost accept response is not lost work.
+
+        The reservation is taken before ``_run_agent`` is reached, so reading the
+        projection from inside the model call is the exact moment that matters:
+        a browser whose POST came back as a proxy's HTML document is sitting
+        here with nothing, and this is what it can recover from.
+        """
+        conversation = "raphael-owner-" + "9" * 32
+        seen: "list[Any]" = []
+
+        async def _run(**_kwargs):
+            seen.append(
+                adapter._response_store.owner_history_snapshot(
+                    conversation, profile="default",
+                )["pending"]
+            )
+            return (
+                {
+                    "final_response": json.dumps({
+                        "schema_version": 1,
+                        "kind": "question",
+                        "message": "Who is the workshop for?",
+                    }),
+                    "messages": [],
+                    "api_calls": 1,
+                },
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_run):
+                accepted = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Prepare a private 60-minute workshop",
+                        "conversation": conversation,
+                        "store": True,
+                        "expected_previous_response_id": None,
+                    },
+                    headers={"Idempotency-Key": f"response-{uuid.uuid4().hex}"},
+                )
+            assert accepted.status == 200
+            accepted_id = (await accepted.json())["id"]
+
+        assert seen == [{
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": accepted_id,
+        }]
+        # Published: the durable turn now carries the same words, so nothing is
+        # left pending.
+        assert adapter._response_store.owner_history_snapshot(
+            conversation, profile="default",
+        )["pending"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_background_turn_that_fails_leaves_the_owner_a_way_back(
+        self, adapter,
+    ):
+        """Item 32TK: a failure the browser never saw is still findable.
+
+        The accepted turn fails, which releases its fence. If that were all,
+        a browser holding no handle to this response would find an empty
+        conversation and never learn either the request or its outcome.
+        """
+        conversation = "raphael-owner-" + "8" * 32
+
+        async def _fail(**_kwargs):
+            raise RuntimeError("planner unavailable")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_fail):
+                accepted = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Prepare a private 60-minute workshop",
+                        "conversation": conversation,
+                        "background": True,
+                        "store": True,
+                        "expected_previous_response_id": None,
+                    },
+                    headers={"Idempotency-Key": f"response-{uuid.uuid4().hex}"},
+                )
+                assert accepted.status == 200
+                response_id = (await accepted.json())["id"]
+
+                for _ in range(100):
+                    polled = await cli.get(f"/v1/responses/{response_id}")
+                    if (await polled.json())["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    pytest.fail("the background response never became terminal")
+
+            history = await cli.get(
+                f"/v1/responses/conversations/{conversation}",
+            )
+            snapshot = await history.json()
+
+        # The fence is gone with the turn that failed...
+        assert snapshot["pending"] is None
+        # ...and the request, and the response id that decided it, are not.
+        assert snapshot["recovery"] == {
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": response_id,
+        }
+        assert snapshot["head_response_id"] is None
+        assert snapshot["data"] == []
+
+    @pytest.mark.asyncio
+    async def test_an_exact_retry_against_the_unchanged_predecessor_replays(
+        self, adapter,
+    ):
+        conversation = "raphael-owner-" + "5" * 32
+        headers = {"Idempotency-Key": f"response-{uuid.uuid4().hex}"}
+        body = {
+            "model": "hermes-agent",
+            "input": "Prepare the private milestone",
+            "conversation": conversation,
+            "store": True,
+            "expected_previous_response_id": None,
+        }
+        result = {
+            "final_response": json.dumps(_owner_new_proposal()),
+            "messages": [],
+            "api_calls": 1,
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_run_agent", new_callable=AsyncMock,
+                return_value=(result, {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
+            ) as run:
+                first = await cli.post("/v1/responses", json=body, headers=headers)
+                assert first.status == 200
+                first_body = await first.json()
+                # The in-process cache is not what makes this work.
+                adapter_module = sys.modules[APIServerAdapter.__module__]
+                adapter_module._idem_cache = _IdempotencyCache()
+                replay = await cli.post("/v1/responses", json=body, headers=headers)
+            assert replay.status == 200
+            assert await replay.json() == first_body
+            run.assert_awaited_once()
+
+    async def _owner_stream(self, cli, adapter, body, headers, *, text):
+        """One streamed owner turn, with a stubbed structured reply."""
+        result = {
+            "final_response": json.dumps(
+                {"schema_version": 1, "kind": "question", "message": text}
+            ),
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        async def _run(**kwargs):
+            callback = kwargs.get("stream_delta_callback")
+            if callback:
+                callback(result["final_response"])
+            return (
+                result,
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        with patch.object(adapter, "_run_agent", side_effect=_run) as run:
+            resp = await cli.post("/v1/responses", json=body, headers=headers)
+            payload = await resp.text()
+        return resp, payload, run
+
+    @staticmethod
+    def _sse_terminal(payload: str, event: str) -> dict:
+        for block in payload.split("\n\n"):
+            if f"event: {event}\n" in block:
+                for line in block.splitlines():
+                    if line.startswith("data: "):
+                        return json.loads(line[len("data: "):])["response"]
+        raise AssertionError(f"no {event} event in stream")
+
+    @pytest.mark.asyncio
+    async def test_a_successful_owner_stream_replays_instead_of_replanning(
+        self, adapter,
+    ):
+        """A streamed owner turn that really completed is a durable record.
+
+        Without the durable completion, an exact retry is refused as superseded
+        by the very reply it is retrying — never answered.
+        """
+        conversation = "raphael-owner-" + "e" * 32
+        headers = {"Idempotency-Key": f"response-{uuid.uuid4().hex}"}
+        body = {
+            "model": "hermes-agent",
+            "input": "Prepare the private milestone",
+            "conversation": conversation,
+            "store": True,
+            "stream": True,
+            "expected_previous_response_id": None,
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first, payload, run = await self._owner_stream(
+                cli, adapter, body, headers, text="Which outcome first?",
+            )
+            assert first.status == 200
+            completed = self._sse_terminal(payload, "response.completed")
+            assert completed["status"] == "completed"
+            run.assert_awaited_once()
+
+            # The exact retry is answered from the durable record, as JSON:
+            # the turn already happened, so it is replayed, not replanned.
+            adapter_module = sys.modules[APIServerAdapter.__module__]
+            adapter_module._idem_cache = _IdempotencyCache()
+            retry, retry_payload, retry_run = await self._owner_stream(
+                cli, adapter, body, headers, text="Which outcome first?",
+            )
+            assert retry.status == 200
+            assert retry.headers["Content-Type"].startswith("application/json")
+            replayed = json.loads(retry_payload)
+            retry_run.assert_not_awaited()
+
+        assert replayed == completed
+        snapshot = adapter._response_store.owner_history_snapshot(conversation)
+        assert snapshot["head_response_id"] == completed["id"]
+        assert len(snapshot["data"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_owner_stream_that_never_completed_stays_retryable(
+        self, adapter,
+    ):
+        """No durable stored terminal response means no durable replay record.
+
+        The agent dies mid-stream, so nothing was mapped into the
+        conversation and no proposal could have gained authority. The key is
+        released rather than stranded, and the retry plans the turn.
+        """
+        conversation = "raphael-owner-" + "f" * 32
+        headers = {"Idempotency-Key": f"response-{uuid.uuid4().hex}"}
+        body = {
+            "model": "hermes-agent",
+            "input": "Prepare the private milestone",
+            "conversation": conversation,
+            "store": True,
+            "stream": True,
+            "expected_previous_response_id": None,
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_run_agent", new_callable=AsyncMock,
+                side_effect=RuntimeError("agent died mid-stream"),
+            ):
+                crashed = await cli.post(
+                    "/v1/responses", json=body, headers=headers,
+                )
+                crashed_payload = await crashed.text()
+            assert crashed.status == 200
+            failed = self._sse_terminal(crashed_payload, "response.failed")
+            assert failed["status"] == "failed"
+
+            # Nothing became this conversation's head, so nothing is replayed.
+            assert adapter._response_store.owner_history_snapshot(
+                conversation,
+            )["head_response_id"] is None
+
+            adapter_module = sys.modules[APIServerAdapter.__module__]
+            adapter_module._idem_cache = _IdempotencyCache()
+            retry, payload, run = await self._owner_stream(
+                cli, adapter, body, headers, text="Which outcome first?",
+            )
+            assert retry.status == 200
+            completed = self._sse_terminal(payload, "response.completed")
+            run.assert_awaited_once()
+
+        assert completed["id"] != failed["id"]
+        snapshot = adapter._response_store.owner_history_snapshot(conversation)
+        assert snapshot["head_response_id"] == completed["id"]
+
+    @pytest.mark.asyncio
+    async def test_an_owner_stream_records_nothing_before_the_mapping_is_durable(
+        self, adapter,
+    ):
+        """A reply the conversation refuses is not a turn, so it is not a record."""
+        conversation = "raphael-owner-" + "0" * 31 + "1"
+        headers = {"Idempotency-Key": f"response-{uuid.uuid4().hex}"}
+        body = {
+            "model": "hermes-agent",
+            "input": "Prepare the private milestone",
+            "conversation": conversation,
+            "store": True,
+            "stream": True,
+            "expected_previous_response_id": None,
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter._response_store, "publish_owner_turn", return_value=False,
+            ):
+                refused, refused_payload, _run = await self._owner_stream(
+                    cli, adapter, body, headers, text="Which outcome first?",
+                )
+            assert refused.status == 200
+            assert "event: response.failed\n" in refused_payload
+
+            # No durable replay record was written for a turn that never
+            # became this conversation's head.
+            adapter_module = sys.modules[APIServerAdapter.__module__]
+            adapter_module._idem_cache = _IdempotencyCache()
+            retry, payload, run = await self._owner_stream(
+                cli, adapter, body, headers, text="Which outcome first?",
+            )
+            assert retry.status == 200
+            assert self._sse_terminal(payload, "response.completed")["status"] == (
+                "completed"
+            )
+            run.assert_awaited_once()
+
+    def test_an_owner_response_key_replays_across_a_restart(self, tmp_path):
+        """The turn that minted a proposal is replayed, never planned twice."""
+        db_path = str(tmp_path / "owner-response-store.db")
+        conversation = "raphael-owner-" + "7" * 32
+        response_id = "resp_owner_first_attempt"
+        store = ResponseStore(db_path=db_path, max_size=10)
+        try:
+            assert store.reserve_owner_response(
+                "default", "scope", "key", "fp", conversation, response_id,
+            ) == ("new", None, None)
+            store.put(response_id, {"response": {"id": response_id, "created_at": 1}})
+            store.complete_owner_response(
+                "default", "scope", "key", response_id,
+                {"id": response_id, "status": "completed"}, "sess-1",
+            )
+        finally:
+            store.close()
+
+        reopened = ResponseStore(db_path=db_path, max_size=10)
+        try:
+            outcome, replay, session = reopened.reserve_owner_response(
+                "default", "scope", "key", "fp", conversation, "resp_second_attempt",
+            )
+            assert outcome == "replay"
+            assert replay == {"id": response_id, "status": "completed"}
+            assert session == "sess-1"
+            # A different request under the same key is a conflict, not a replay.
+            assert reopened.reserve_owner_response(
+                "default", "scope", "key", "other-fp", conversation,
+                "resp_third_attempt",
+            )[0] == "conflict"
+            # So is the same request against a different conversation.
+            assert reopened.reserve_owner_response(
+                "default", "scope", "key", "fp",
+                "raphael-owner-" + "8" * 32, "resp_fourth_attempt",
+            )[0] == "conflict"
+        finally:
+            reopened.close()
+
+    def test_a_crashed_owner_turn_never_mints_a_second_proposal(self, tmp_path):
+        db_path = str(tmp_path / "crashed-owner-response-store.db")
+        conversation = "raphael-owner-" + "9" * 32
+        minted = "resp_owner_minted_then_died"
+        store = ResponseStore(db_path=db_path, max_size=10)
+        try:
+            assert store.reserve_owner_response(
+                "default", "scope", "key", "fp", conversation, minted,
+            )[0] == "new"
+            # The response was minted; the process died before recording the
+            # body to replay.
+            store.put(minted, {"response": {"id": minted, "created_at": 1}})
+        finally:
+            store.close()
+
+        reopened = ResponseStore(db_path=db_path, max_size=10)
+        try:
+            assert reopened.reserve_owner_response(
+                "default", "scope", "key", "fp", conversation, "resp_retry",
+            )[0] == "incomplete"
+        finally:
+            reopened.close()
+
+    def test_a_reservation_that_minted_nothing_is_adopted_not_stranded(self, tmp_path):
+        db_path = str(tmp_path / "stranded-owner-response-store.db")
+        conversation = "raphael-owner-" + "a" * 32
+        store = ResponseStore(db_path=db_path, max_size=10)
+        try:
+            assert store.reserve_owner_response(
+                "default", "scope", "key", "fp", conversation, "resp_never_stored",
+            )[0] == "new"
+        finally:
+            store.close()
+
+        reopened = ResponseStore(db_path=db_path, max_size=10)
+        try:
+            assert reopened.reserve_owner_response(
+                "default", "scope", "key", "fp", conversation, "resp_retry",
+            ) == ("new", None, None)
+        finally:
+            reopened.close()
+
+    def test_retention_bounds_the_table_without_evicting_live_authority(self):
+        conversation = "raphael-owner-" + "b" * 32
+        live = "resp_live_owner_proposal"
+        store = ResponseStore(max_size=10)
+        store.put(live, {
+            "response": {"id": live, "created_at": 1},
+            "conversation_history": [{
+                "role": "assistant",
+                "content": json.dumps(_owner_new_proposal()),
+            }],
+        })
+        assert store.reserve_owner_response(
+            "default", "scope", "live-key", "fp", conversation, live,
+        )[0] == "new"
+        assert store.set_conversation(
+            conversation, live, owner_proposal=True, profile="default",
+        ) is True
+        store.complete_owner_response(
+            "default", "scope", "live-key", live, {"id": live}, None,
+        )
+        assert store.reserve_owner_response(
+            "default", "scope", "old-key", "fp",
+            conversation, "resp_long_finished_turn",
+        )[0] == "new"
+
+        store.purge_owner_response_idempotency(time.time() + 1)
+
+        assert store.reserve_owner_response(
+            "default", "scope", "live-key", "fp", conversation, "resp_retry",
+        )[0] == "replay"
+        assert store.reserve_owner_response(
+            "default", "scope", "old-key", "fp", conversation, "resp_retry",
+        )[0] == "new"
+
+    def test_mapping_refuses_a_predecessor_that_moved_while_the_turn_ran(self):
+        """The same assertion is re-compared when the reply is finally mapped."""
+        conversation = "raphael-owner-" + "c" * 32
+        store = ResponseStore(max_size=10)
+        assert store.set_conversation(
+            conversation, "resp_head_a", profile="default",
+        ) is True
+        assert store.set_conversation(
+            conversation, "resp_head_b", profile="default",
+        ) is True
+        assert store.set_conversation(
+            conversation,
+            "resp_delayed_turn",
+            profile="default",
+            expected_previous_response_id="resp_head_a",
+        ) is False
+        assert store.get_conversation(conversation, profile="default") == "resp_head_b"
+        assert store.set_conversation(
+            conversation,
+            "resp_next_turn",
+            profile="default",
+            expected_previous_response_id="resp_head_b",
+        ) is True
 
     @pytest.mark.asyncio
     async def test_previous_response_id_stores_compressed_transcript_directly(self, adapter):
@@ -2266,10 +5450,30 @@ class TestResponsesEndpoint:
                         "conversation": "raphael-owner-" + "a" * 32,
                         "background": True,
                         "store": True,
+                        "expected_previous_response_id": None,
                     },
+                    headers={"Idempotency-Key": f"response-{uuid.uuid4().hex}"},
                 ))
                 await asyncio.wait_for(started.wait(), timeout=1)
                 try:
+                    competing = await cli.post(
+                        "/v1/responses",
+                        json={
+                            "model": "hermes-agent",
+                            "input": "Replace the in-flight request",
+                            "conversation": "raphael-owner-" + "a" * 32,
+                            "background": True,
+                            "store": True,
+                            "expected_previous_response_id": None,
+                        },
+                        headers={
+                            "Idempotency-Key": f"response-{uuid.uuid4().hex}",
+                        },
+                    )
+                    assert competing.status == 409
+                    assert (await competing.json())["error"]["code"] == (
+                        "owner_conversation_locked"
+                    )
                     resp = await asyncio.wait_for(
                         asyncio.shield(post_task), timeout=0.2,
                     )
@@ -2311,8 +5515,153 @@ class TestResponsesEndpoint:
         mock_run.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_lost_owner_reservation_interrupts_background_agent(self, adapter):
+        started = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        class Agent:
+            def interrupt(self, _message=None):
+                interrupted.set()
+
+        async def _slow_run(**kwargs):
+            kwargs["agent_ref"][0] = Agent()
+            started.set()
+            await interrupted.wait()
+            return (
+                {"final_response": "Must not commit.", "messages": [], "api_calls": 1},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        conversation = "raphael-owner-" + "f" * 32
+        app = _create_app(adapter)
+        with (
+            patch(
+                "gateway.platforms.api_server."
+                "_OWNER_CONVERSATION_RESERVATION_RENEW_SECONDS",
+                0.01,
+            ),
+            patch.object(
+                adapter._response_store,
+                "renew_owner_conversation_reservation",
+                return_value=False,
+            ),
+            patch.object(adapter, "_run_agent", side_effect=_slow_run),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Plan the milestone",
+                        "conversation": conversation,
+                        "background": True,
+                        "store": True,
+                        "expected_previous_response_id": None,
+                    },
+                    headers={
+                        "Idempotency-Key": f"response-{uuid.uuid4().hex}",
+                    },
+                )
+                queued = await response.json()
+                await asyncio.wait_for(started.wait(), timeout=1)
+                await asyncio.wait_for(interrupted.wait(), timeout=1)
+
+                terminal = None
+                for _ in range(100):
+                    polled = await cli.get(f"/v1/responses/{queued['id']}")
+                    terminal = await polled.json()
+                    if terminal["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.01)
+
+        assert response.status == 200
+        assert terminal is not None
+        assert terminal["status"] == "failed"
+        assert adapter._response_store.get_conversation(conversation) is None
+
+    @pytest.mark.asyncio
+    async def test_lost_owner_reservation_stops_agent_created_after_heartbeat(self, adapter):
+        creation_started = threading.Event()
+        release_creation = threading.Event()
+        interrupted = threading.Event()
+        ran = threading.Event()
+
+        class Agent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+
+            def interrupt(self, _message=None):
+                interrupted.set()
+
+            def run_conversation(self, **_kwargs):
+                ran.set()
+                return {"final_response": "Must not commit."}
+
+        def _delayed_create(**_kwargs):
+            creation_started.set()
+            assert release_creation.wait(timeout=1)
+            return Agent()
+
+        conversation = "raphael-owner-" + "e" * 32
+        app = _create_app(adapter)
+        try:
+            with (
+                patch(
+                    "gateway.platforms.api_server."
+                    "_OWNER_CONVERSATION_RESERVATION_RENEW_SECONDS",
+                    0.01,
+                ),
+                patch.object(
+                    adapter._response_store,
+                    "renew_owner_conversation_reservation",
+                    return_value=False,
+                ),
+                patch.object(adapter, "_create_agent", side_effect=_delayed_create),
+            ):
+                async with TestClient(TestServer(app)) as cli:
+                    response = await cli.post(
+                        "/v1/responses",
+                        json={
+                            "model": "hermes-agent",
+                            "input": "Plan the milestone",
+                            "conversation": conversation,
+                            "background": True,
+                            "store": True,
+                            "expected_previous_response_id": None,
+                        },
+                        headers={
+                            "Idempotency-Key": f"response-{uuid.uuid4().hex}",
+                        },
+                    )
+                    queued = await response.json()
+                    assert await asyncio.to_thread(
+                        creation_started.wait, 1,
+                    ) is True
+                    await asyncio.sleep(0.05)
+                    release_creation.set()
+
+                    terminal = None
+                    for _ in range(100):
+                        polled = await cli.get(f"/v1/responses/{queued['id']}")
+                        terminal = await polled.json()
+                        if terminal["status"] == "failed":
+                            break
+                        await asyncio.sleep(0.01)
+        finally:
+            release_creation.set()
+
+        assert response.status == 200
+        assert terminal is not None
+        assert terminal["status"] == "failed"
+        assert interrupted.is_set()
+        assert not ran.is_set()
+        assert adapter._response_store.get_conversation(conversation) is None
+
+    @pytest.mark.asyncio
     async def test_background_failure_is_pollable_and_redacted(self, adapter):
         raw_secret = "sk-background-leak-1234567890"
+        conversation = "raphael-owner-" + "b" * 32
 
         async def _failing_run(**kwargs):
             await asyncio.sleep(0)
@@ -2326,8 +5675,13 @@ class TestResponsesEndpoint:
                     json={
                         "model": "hermes-agent",
                         "input": "Plan the milestone",
+                        "conversation": conversation,
                         "background": True,
                         "store": True,
+                        "expected_previous_response_id": None,
+                    },
+                    headers={
+                        "Idempotency-Key": f"response-{uuid.uuid4().hex}",
                     },
                 )
                 assert resp.status == 200
@@ -2341,6 +5695,66 @@ class TestResponsesEndpoint:
                     if failed["status"] == "failed":
                         break
                     await asyncio.sleep(0.01)
+
+                def _send_a_different_message():
+                    return cli.post(
+                        "/v1/responses",
+                        json={
+                            "model": "hermes-agent",
+                            "input": "Try the plan again",
+                            "conversation": conversation,
+                            "background": True,
+                            "store": True,
+                            "expected_previous_response_id": None,
+                        },
+                        headers={
+                            "Idempotency-Key": f"response-{uuid.uuid4().hex}",
+                        },
+                    )
+
+                with patch.object(
+                    adapter,
+                    "_run_agent",
+                    new_callable=AsyncMock,
+                    return_value=(
+                        {
+                            "final_response": "A fresh plan can start.",
+                            "messages": [],
+                            "api_calls": 1,
+                        },
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    ),
+                ) as fresh_plan:
+                    # The failed turn left an interrupted request nobody has
+                    # answered for yet. Until it is acknowledged this
+                    # conversation takes nothing new — a second message must not
+                    # be able to bury the first — and no model runs.
+                    refused = await _send_a_different_message()
+                    assert refused.status == 409
+                    assert (await refused.json())["error"]["code"] == (
+                        "owner_conversation_locked"
+                    )
+                    assert fresh_plan.await_count == 0
+                    history = await cli.get(
+                        f"/v1/responses/conversations/{conversation}",
+                    )
+                    # The request itself came through the ordinary background
+                    # failure path, in the same write that made the turn
+                    # terminal. It is all a browser that never received the
+                    # accept response has left to find.
+                    assert (await history.json())["recovery"] == {
+                        "owner": "Plan the milestone",
+                        "response_id": response_id,
+                    }
+
+                    acknowledged = await cli.post(
+                        f"/v1/responses/conversations/{conversation}/recovery",
+                        json={"response_id": response_id},
+                    )
+                    assert acknowledged.status == 200
+
+                    retry = await _send_a_different_message()
+                    assert retry.status == 200
 
         assert failed is not None
         assert failed["status"] == "failed"
@@ -2373,6 +5787,522 @@ class TestResponsesEndpoint:
 
         assert resp.status == 400
         assert data["error"]["type"] == "invalid_request_error"
+
+    # -----------------------------------------------------------------------
+    # Item 32TK: the owner-conversation request contract, and one commit
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body_extra,headers,param",
+        [
+            ({}, {"Idempotency-Key": "k-1"}, "expected_previous_response_id"),
+            ({"expected_previous_response_id": None}, {}, "Idempotency-Key"),
+        ],
+    )
+    async def test_an_owner_turn_without_both_contracts_is_refused(
+        self, adapter, body_extra, headers, param,
+    ):
+        """Optional, these let an older or direct caller append to whatever the
+        head happens to be and duplicate an answered turn after a restart."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Plan it",
+                        "conversation": "raphael-owner-" + "5" * 32,
+                        "store": True,
+                        **body_extra,
+                    },
+                    headers=headers,
+                )
+                body = await resp.json()
+                run.assert_not_awaited()
+
+        assert resp.status == 400
+        assert body["error"]["param"] == param
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "forbidden",
+        [
+            {"conversation_history": [{"role": "user", "content": "fabricated"}]},
+            {"conversation_history": []},
+            {"previous_response_id": "resp_" + "c" * 28},
+        ],
+    )
+    async def test_an_owner_turn_cannot_supply_its_own_history(
+        self, adapter, forbidden,
+    ):
+        """A direct caller must not be able to publish a fabricated or
+        truncated transcript as the conversation's new authority."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Plan it",
+                        "conversation": "raphael-owner-" + "6" * 32,
+                        "store": True,
+                        "expected_previous_response_id": None,
+                        **forbidden,
+                    },
+                    headers={"Idempotency-Key": f"response-{uuid.uuid4().hex}"},
+                )
+                body = await resp.json()
+                run.assert_not_awaited()
+
+        assert resp.status == 400
+        assert body["error"]["param"] in {
+            "conversation_history", "previous_response_id",
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_generic_conversation_keeps_its_optional_contracts(
+        self, adapter,
+    ):
+        """The whole contract is owner-conversation-only."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+                return_value=(
+                    {"final_response": "Fine.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                ),
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Plan it",
+                        "conversation": "ordinary-conversation",
+                        "store": True,
+                        "conversation_history": [
+                            {"role": "user", "content": "earlier"},
+                        ],
+                    },
+                )
+
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["standard", "background", "stream"])
+    async def test_an_owner_turn_publishes_in_one_commit(self, adapter, mode):
+        """The response, the head, the reservation and the replay record are
+        one event; a partial commit left a turn that could not be replayed."""
+        conversation = "raphael-owner-" + "7" * 32
+        key = f"response-{uuid.uuid4().hex}"
+        result = {
+            "final_response": json.dumps(_owner_new_proposal()),
+            "messages": [],
+            "api_calls": 1,
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter,
+                    "_run_agent",
+                    new_callable=AsyncMock,
+                    return_value=(
+                        result,
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    ),
+                ),
+                patch.object(
+                    adapter._response_store, "publish_owner_turn",
+                    side_effect=adapter._response_store.publish_owner_turn,
+                ) as publish,
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Prepare the private milestone",
+                        "conversation": conversation,
+                        "store": True,
+                        "expected_previous_response_id": None,
+                        **(
+                            {"background": True} if mode == "background"
+                            else {"stream": True} if mode == "stream"
+                            else {}
+                        ),
+                    },
+                    headers={"Idempotency-Key": key},
+                )
+                assert resp.status == 200
+                await resp.read()
+                for _ in range(200):
+                    if publish.call_count:
+                        break
+                    await asyncio.sleep(0.01)
+
+            # Every path publishes through the one transactional method.
+            assert publish.call_count == 1
+            published_id = publish.call_args.kwargs["response_id"]
+
+        snapshot = adapter._response_store.owner_history_snapshot(conversation)
+        assert snapshot["head_response_id"] == published_id
+        # The head and the durable replay record landed together.
+        outcome, replay, _session = (
+            adapter._response_store.lookup_owner_response(
+                "default",
+                publish.call_args.kwargs["session_scope"],
+                key,
+                adapter._response_store._conn.execute(
+                    "SELECT fingerprint FROM owner_response_idempotency "
+                    "WHERE idempotency_key = ?", (key,),
+                ).fetchone()[0],
+                conversation,
+            )
+        )
+        assert outcome == "replay"
+        assert replay["id"] == published_id
+
+    @pytest.mark.asyncio
+    async def test_a_queued_owner_response_is_recovered_after_a_restart(
+        self, adapter,
+    ):
+        """A background owner turn's executor is an in-memory task, so a
+        restart must close the durable queued state instead of leaving normal
+        Project chat queued for good."""
+        conversation = "raphael-owner-" + "c" * 32
+        store = adapter._response_store
+        response_id = "resp_" + "a" * 28
+        store.put(response_id, {
+            "response": {
+                "id": response_id, "object": "response", "status": "queued",
+                "background": True, "output": [],
+            },
+            "conversation_history": [],
+        })
+        # Exactly what the 202 leaves behind, attributed to a process that is
+        # gone: the fence this turn took before any model ran, the job row, a
+        # pid that cannot be running, and an age past the reap floor.
+        assert store.reserve_owner_conversation(
+            "default", conversation, response_id,
+            owner_message="Prepare a private 60-minute workshop",
+        ) is True
+        store.reserve_owner_job(
+            "response", response_id, "default", {"conversation": conversation},
+        )
+        store._conn.execute(
+            "UPDATE owner_executor_jobs SET executor_id = 'dead', "
+            "executor_pid = 2147483646, created_at = ? WHERE job_key = ?",
+            (time.time() - 3600, response_id),
+        )
+        store._conn.commit()
+
+        adapter._recover_orphaned_owner_jobs()
+
+        recovered = store.get(response_id)
+        assert recovered["response"]["status"] == "failed"
+        assert "restarted" in recovered["response"]["error"]["message"]
+        # And nothing is left claiming an executor.
+        assert store.claim_orphaned_owner_jobs("response") == []
+        # The request is not lost with the executor that was driving it: the
+        # fence became the way back to this exact outcome.
+        assert store.owner_history_snapshot(conversation)["recovery"] == {
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": response_id,
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_completed_owner_response_is_never_recovered_as_failed(
+        self, adapter,
+    ):
+        """The job row can outlive a turn that DID complete; recovery must
+        leave the published authority alone."""
+        conversation = "raphael-owner-" + "d" * 31 + "e"
+        store = adapter._response_store
+        response_id = "resp_" + "b" * 28
+        store.put(response_id, {
+            "response": {"id": response_id, "status": "completed"},
+            "conversation_history": [],
+        })
+        assert store.set_conversation(conversation, response_id) is True
+        store.reserve_owner_job(
+            "response", response_id, "default", {"conversation": conversation},
+        )
+        store._conn.execute(
+            "UPDATE owner_executor_jobs SET executor_id = 'dead', "
+            "executor_pid = 2147483646, created_at = ? WHERE job_key = ?",
+            (time.time() - 3600, response_id),
+        )
+        store._conn.commit()
+
+        adapter._recover_orphaned_owner_jobs()
+
+        assert store.get(response_id)["response"]["status"] == "completed"
+
+    def test_a_live_siblings_job_is_never_reaped(self, adapter):
+        store = adapter._response_store
+        store.reserve_owner_job(
+            "run", "run_" + "f" * 32, "default", {},
+        )
+        store._conn.execute(
+            "UPDATE owner_executor_jobs SET executor_id = 'sibling', "
+            "executor_pid = ?, created_at = ?",
+            (os.getpid(), time.time() - 3600),
+        )
+        store._conn.commit()
+
+        assert store.claim_orphaned_owner_jobs("run") == []
+
+    # -----------------------------------------------------------------------
+    # Item 32TK round 2: everything a 202 promises commits together
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _accepted_background_response(store, *, conversation, response_id, key):
+        scope = "scope-" + key
+        queued = {
+            "id": response_id, "object": "response", "status": "queued",
+            "background": True, "output": [],
+        }
+        assert store.reserve_owner_response(
+            "default", scope, key, "fingerprint", conversation, response_id,
+        )[0] == "new"
+        store.accept_owner_background_response(
+            profile="default",
+            response_id=response_id,
+            data={"response": queued, "conversation_history": []},
+            conversation=conversation,
+            replay=queued,
+            session_scope=scope,
+            idempotency_key=key,
+            session_id="sess-1",
+        )
+        return scope, queued
+
+    def test_a_failed_acceptance_leaves_no_half_accepted_owner_turn(self, adapter):
+        """The queued body, the recovery job and the replay record are three
+        facts about one acceptance; a crash between them left an accepted turn
+        with no executor, or a key that could never record a body."""
+        store = adapter._response_store
+        conversation = "raphael-owner-" + "1" * 32
+        response_id = "resp_" + "1" * 28
+        scope = "scope-atomic"
+        key = "idem-atomic"
+        assert store.reserve_owner_response(
+            "default", scope, key, "fingerprint", conversation, response_id,
+        )[0] == "new"
+        with patch.object(
+            store, "_complete_owner_response_locked",
+            side_effect=RuntimeError("disk full"),
+        ):
+            with pytest.raises(RuntimeError):
+                store.accept_owner_background_response(
+                    profile="default",
+                    response_id=response_id,
+                    data={"response": {"id": response_id}, "conversation_history": []},
+                    conversation=conversation,
+                    replay={"id": response_id},
+                    session_scope=scope,
+                    idempotency_key=key,
+                    session_id=None,
+                )
+
+        # Nothing landed: no queued body, and no job claiming an executor.
+        assert store.get(response_id) is None
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+            (response_id,),
+        ).fetchone()[0] == 0
+
+    def test_an_accepted_background_turn_commits_body_job_and_replay(self, adapter):
+        store = adapter._response_store
+        conversation = "raphael-owner-" + "2" * 32
+        response_id = "resp_" + "2" * 28
+        scope, queued = self._accepted_background_response(
+            store, conversation=conversation, response_id=response_id,
+            key="idem-accepted",
+        )
+
+        assert store.get(response_id)["response"] == queued
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+            (response_id,),
+        ).fetchone()[0] == 1
+        outcome, replay, session = store.lookup_owner_response(
+            "default", scope, "idem-accepted", "fingerprint", conversation,
+        )
+        assert (outcome, replay, session) == ("replay", queued, "sess-1")
+
+    def test_a_terminal_write_that_fails_keeps_the_recovery_job(self, adapter):
+        """Releasing the job separately ran even when the terminal write failed,
+        which left the response queued forever with nobody to recover it."""
+        store = adapter._response_store
+        conversation = "raphael-owner-" + "3" * 32
+        response_id = "resp_" + "3" * 28
+        self._accepted_background_response(
+            store, conversation=conversation, response_id=response_id,
+            key="idem-terminal",
+        )
+        with patch.object(
+            store, "_put_response_locked", side_effect=RuntimeError("disk full"),
+        ):
+            with pytest.raises(RuntimeError):
+                store.store_terminal_owner_response(
+                    profile="default",
+                    response_id=response_id,
+                    data={"response": {"id": response_id, "status": "failed"}},
+                    release_job=True,
+                )
+
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+            (response_id,),
+        ).fetchone()[0] == 1
+
+        store.store_terminal_owner_response(
+            profile="default",
+            response_id=response_id,
+            data={"response": {"id": response_id, "status": "failed"}},
+            release_job=True,
+        )
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+            (response_id,),
+        ).fetchone()[0] == 0
+
+    @staticmethod
+    def _failed_body(response_id):
+        return {
+            "id": response_id, "object": "response", "status": "failed",
+            "output": [], "error": {"code": "server_error", "message": "stopped"},
+        }
+
+    def test_a_terminal_owner_failure_and_its_recovery_commit_together(
+        self, adapter,
+    ):
+        """Item 32TK, finding 3: the request cannot fall between two commits.
+
+        Storing the terminal body and turning this turn's fence into the record
+        that carries the owner's request were separate transactions. A crash
+        between them left a turn that had failed with nothing left to say what
+        the owner had sent — the exact way the Founder's request was lost.
+        """
+        store = adapter._response_store
+        conversation = "raphael-owner-" + "6" * 32
+        response_id = "resp_" + "6" * 28
+        scope, queued = self._accepted_background_response(
+            store, conversation=conversation, response_id=response_id,
+            key="idem-atomic-failure",
+        )
+        assert store.reserve_owner_conversation(
+            "default", conversation, response_id,
+            owner_message="Prepare a private 60-minute workshop",
+        ) is True
+
+        # The last write of the transaction fails, which is the crash this is
+        # about: everything before it is already staged.
+        with patch.object(
+            store, "_release_owner_job_locked",
+            side_effect=RuntimeError("power lost"),
+        ):
+            with pytest.raises(RuntimeError):
+                store.store_terminal_owner_response(
+                    profile="default",
+                    response_id=response_id,
+                    data={"response": self._failed_body(response_id)},
+                    release_job=True,
+                    conversation=conversation,
+                    interrupted=True,
+                )
+
+        # Nothing moved. The turn is still queued, still fenced, and its job row
+        # still says somebody must finish it — so the whole thing is recoverable
+        # exactly as it was.
+        assert store.get(response_id)["response"] == queued
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["pending"] == {
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": response_id,
+        }
+        assert snapshot["recovery"] is None
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+            (response_id,),
+        ).fetchone()[0] == 1
+        assert store.lookup_owner_response(
+            "default", scope, "idem-atomic-failure", "fingerprint", conversation,
+        ) == ("replay", queued, "sess-1")
+
+        store.store_terminal_owner_response(
+            profile="default",
+            response_id=response_id,
+            data={"response": self._failed_body(response_id)},
+            release_job=True,
+            conversation=conversation,
+            interrupted=True,
+        )
+
+        # And now all four facts about this ending landed together.
+        assert store.get(response_id)["response"]["status"] == "failed"
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["pending"] is None
+        assert snapshot["recovery"] == {
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": response_id,
+        }
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM owner_executor_jobs WHERE job_key = ?",
+            (response_id,),
+        ).fetchone()[0] == 0
+        outcome, replay, _session = store.lookup_owner_response(
+            "default", scope, "idem-atomic-failure", "fingerprint", conversation,
+        )
+        assert outcome == "replay"
+        assert replay["status"] == "failed"
+
+    def test_an_exact_retry_replays_a_recovered_failure_instead_of_a_new_turn(
+        self, adapter,
+    ):
+        """Deleting the idempotency record made an exact retry a SECOND turn
+        instead of replaying the accepted response's terminal outcome."""
+        store = adapter._response_store
+        conversation = "raphael-owner-" + "4" * 32
+        response_id = "resp_" + "4" * 28
+        assert store.reserve_owner_conversation(
+            "default", conversation, response_id,
+            owner_message="Prepare a private 60-minute workshop",
+        ) is True
+        scope, _queued = self._accepted_background_response(
+            store, conversation=conversation, response_id=response_id,
+            key="idem-recovered",
+        )
+        store._conn.execute(
+            "UPDATE owner_executor_jobs SET executor_id = 'dead', "
+            "executor_pid = 2147483646, created_at = ?, lease_expires_at = ? "
+            "WHERE job_key = ?",
+            (time.time() - 3600, time.time() - 1, response_id),
+        )
+        store._conn.commit()
+
+        adapter._recover_orphaned_owner_jobs()
+
+        outcome, replay, _session = store.lookup_owner_response(
+            "default", scope, "idem-recovered", "fingerprint", conversation,
+        )
+        assert outcome == "replay"
+        assert replay["status"] == "failed"
+        assert "restarted" in replay["error"]["message"]
+        # The key stayed immutable: the same response id, never a new one.
+        assert replay["id"] == response_id
+        # And the replay landed together with the way back to it.
+        assert store.owner_history_snapshot(conversation)["recovery"] == {
+            "owner": "Prepare a private 60-minute workshop",
+            "response_id": response_id,
+        }
 
 
 class TestResponsesStreaming:
@@ -3643,3 +7573,268 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
+
+
+# ---------------------------------------------------------------------------
+# Owner authority requires durable storage
+# ---------------------------------------------------------------------------
+
+
+_AUTHORITY_CONVERSATION = "raphael-owner-" + "d" * 32
+_AUTHORITY_RESPONSE = "resp_authority_probe"
+_AUTHORITY_CLAIM = "claim_" + "e" * 32
+_AUTHORITY_RUN = "run_" + "f" * 32
+
+
+def _owner_authority_probes(store):
+    """One call per owner-authoritative surface the store is the authority for.
+
+    Named after the four the guard's docstring calls out: proposal, claim,
+    conversation closure and run idempotency.
+    """
+    return {
+        "history": lambda: store.owner_history_snapshot(_AUTHORITY_CONVERSATION),
+        "history_compat": lambda: store.owner_history(_AUTHORITY_CONVERSATION),
+        "proposal_record": lambda: store.owner_proposal_record(
+            "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
+        ),
+        # A run is refused while this answers "yes", so a store that cannot
+        # answer at all must refuse rather than report "nothing outstanding".
+        "request_is_unanswered": lambda: store.owner_request_is_unanswered(
+            "default", _AUTHORITY_CONVERSATION,
+        ),
+        "proposal_consumed": lambda: store.mark_owner_proposal_consumed(
+            "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
+        ),
+        "claim": lambda: store.claim_owner_proposal(
+            "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE, _AUTHORITY_CLAIM,
+        ),
+        "claim_and_attach": lambda: store.claim_and_attach_owner_run(
+            "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
+            _AUTHORITY_CLAIM, _AUTHORITY_RUN,
+        ),
+        "attach_run": lambda: store.attach_owner_run(
+            "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
+            _AUTHORITY_CLAIM, _AUTHORITY_RUN,
+        ),
+        "complete_claim": lambda: store.complete_owner_claim(
+            "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
+            _AUTHORITY_CLAIM, _AUTHORITY_RUN,
+        ),
+        "release_claim": lambda: store.release_owner_claim(
+            "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
+            _AUTHORITY_CLAIM, _AUTHORITY_RUN,
+        ),
+        "close_conversation": lambda: store.close_owner_conversation(
+            "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
+        ),
+        "reserve_turn": lambda: store.reserve_owner_conversation(
+            "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
+        ),
+        "reserve_run_idempotency": lambda: store.reserve_run_idempotency(
+            "default", "scope", "idem-1", "fingerprint", _AUTHORITY_RUN,
+        ),
+        "lookup_run_idempotency": lambda: store.lookup_run_idempotency(
+            "default", "scope", "idem-1", "fingerprint",
+        ),
+        "run_completion": lambda: store.owner_run_completion("default", _AUTHORITY_RUN),
+        "session_index": lambda: store.owner_session_index("default", "group"),
+        "map_owner_conversation": lambda: store.set_conversation(
+            _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
+        ),
+    }
+
+
+def _assert_no_owner_authority(store):
+    unguarded = []
+    for name, probe in _owner_authority_probes(store).items():
+        try:
+            probe()
+        except OwnerAuthorityUnavailable:
+            continue
+        except Exception as exc:
+            unguarded.append(f"{name}: raised {type(exc).__name__} instead")
+            continue
+        unguarded.append(f"{name}: answered instead of refusing")
+    assert unguarded == []
+
+
+def _assert_generic_traffic_still_works(store):
+    """Generic Responses traffic is explicitly NOT authority — memory is fine."""
+    store.put("resp_generic", {"output": "hello"})
+    assert store.get("resp_generic") == {"output": "hello"}
+    assert store.set_conversation("chat-session-1", "resp_generic") is True
+    assert store.get_conversation("chat-session-1") == "resp_generic"
+
+
+class TestOwnerAuthorityRequiresDurableStorage:
+    def test_an_unresolvable_store_path_grants_no_owner_authority(self, monkeypatch):
+        import hermes_cli.config as hermes_config
+
+        def _no_home():
+            raise RuntimeError("HERMES_HOME cannot be resolved")
+
+        monkeypatch.setattr(hermes_config, "get_hermes_home", _no_home)
+        store = ResponseStore(max_size=10)
+        try:
+            assert store._db_path is None
+            _assert_no_owner_authority(store)
+            _assert_generic_traffic_still_works(store)
+        finally:
+            store.close()
+
+    def test_an_unopenable_store_grants_no_owner_authority(self, tmp_path):
+        unwritable = tmp_path / "read-only"
+        unwritable.mkdir()
+        unwritable.chmod(0o500)
+        try:
+            store = ResponseStore(max_size=10, db_path=str(unwritable / "s.db"))
+        finally:
+            unwritable.chmod(0o700)
+        try:
+            assert store._db_path is None
+            _assert_no_owner_authority(store)
+            _assert_generic_traffic_still_works(store)
+        finally:
+            store.close()
+
+    def test_a_corrupt_store_file_is_refused_outright(self, tmp_path):
+        """No store is built at all, so no authority can be handed out."""
+        corrupt = tmp_path / "corrupt.db"
+        corrupt.write_bytes(b"this is definitely not a sqlite database" * 64)
+
+        with pytest.raises(sqlite3.DatabaseError):
+            ResponseStore(max_size=10, db_path=str(corrupt))
+
+    def test_owner_authority_stops_when_the_durable_file_disappears(self, tmp_path):
+        """SQLite keeps serving an unlinked inode; that is not durability."""
+        db_path = tmp_path / "response-store.db"
+        store = ResponseStore(max_size=10, db_path=str(db_path))
+        try:
+            store.put(_AUTHORITY_RESPONSE, {
+                "response": {"id": _AUTHORITY_RESPONSE, "created_at": 10},
+                "conversation_history": [
+                    {"role": "user", "content": "Build the approved milestone."},
+                    {"role": "assistant",
+                     "content": json.dumps(_owner_new_proposal())},
+                ],
+            })
+            assert store.set_conversation(
+                _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE, owner_proposal=True,
+            ) is True
+            assert store.owner_history_snapshot(
+                _AUTHORITY_CONVERSATION
+            )["latest_response_id"] == _AUTHORITY_RESPONSE
+
+            db_path.unlink()
+
+            _assert_no_owner_authority(store)
+            # ...while the non-authoritative cache keeps serving. SQLite refuses
+            # to write a file it has seen disappear, so this only holds because
+            # the store demoted itself to memory when it lost durability.
+            _assert_generic_traffic_still_works(store)
+            assert store._db_path is None
+        finally:
+            store.close()
+
+    def test_a_vanished_store_never_regains_authority_from_a_new_file(
+        self, tmp_path,
+    ):
+        """A path that already lost this store's data is not authority again."""
+        db_path = tmp_path / "response-store.db"
+        store = ResponseStore(max_size=10, db_path=str(db_path))
+        try:
+            db_path.unlink()
+            with pytest.raises(OwnerAuthorityUnavailable):
+                store.owner_history_snapshot(_AUTHORITY_CONVERSATION)
+
+            # A new file at the same path is a different inode this connection
+            # was never attached to, so nothing it holds became durable.
+            db_path.write_bytes(b"")
+            _assert_no_owner_authority(store)
+            _assert_generic_traffic_still_works(store)
+        finally:
+            store.close()
+
+    def test_a_broken_connection_never_fabricates_empty_owner_history(
+        self, tmp_path
+    ):
+        """Unreadable is not the same answer as "this owner has no history"."""
+        db_path = tmp_path / "response-store.db"
+        store = ResponseStore(max_size=10, db_path=str(db_path))
+        store._conn.close()
+
+        with pytest.raises(sqlite3.Error):
+            store.owner_history_snapshot(_AUTHORITY_CONVERSATION)
+        with pytest.raises(sqlite3.Error):
+            store.claim_owner_proposal(
+                "default", _AUTHORITY_CONVERSATION,
+                _AUTHORITY_RESPONSE, _AUTHORITY_CLAIM,
+            )
+
+    def test_owner_authority_persists_and_replays_across_a_restart(self, tmp_path):
+        db_path = tmp_path / "response-store.db"
+        store = ResponseStore(max_size=10, db_path=str(db_path))
+        store.put(_AUTHORITY_RESPONSE, {
+            "response": {"id": _AUTHORITY_RESPONSE, "created_at": 11},
+            "conversation_history": [
+                {"role": "user", "content": "Build the approved milestone."},
+                {"role": "assistant", "content": json.dumps(_owner_new_proposal())},
+            ],
+        })
+        assert store.set_conversation(
+            _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE, owner_proposal=True,
+        ) is True
+        assert store.claim_owner_proposal(
+            "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE, _AUTHORITY_CLAIM,
+        ) is True
+        assert store.attach_owner_run(
+            "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
+            _AUTHORITY_CLAIM, _AUTHORITY_RUN,
+        ) is True
+        store.close()
+
+        restarted = ResponseStore(max_size=10, db_path=str(db_path))
+        try:
+            # The spent approval survives the restart: replaying the same claim
+            # is recognized, and a different claimer is still refused.
+            assert restarted.owner_run_is_attached(
+                "default", _AUTHORITY_CONVERSATION, _AUTHORITY_RESPONSE,
+                _AUTHORITY_CLAIM, _AUTHORITY_RUN,
+            ) is True
+            assert restarted.claim_owner_proposal(
+                "default", _AUTHORITY_CONVERSATION,
+                _AUTHORITY_RESPONSE, _AUTHORITY_CLAIM,
+            ) is True
+            assert restarted.claim_owner_proposal(
+                "default", _AUTHORITY_CONVERSATION,
+                _AUTHORITY_RESPONSE, "claim_" + "9" * 32,
+            ) is False
+            assert restarted.owner_history_snapshot(
+                _AUTHORITY_CONVERSATION
+            )["proposal_claimed"] is True
+        finally:
+            restarted.close()
+
+    @pytest.mark.asyncio
+    async def test_unavailable_owner_storage_answers_one_stable_503(self):
+        """The refusal reaches the caller as a retryable 503, and starts nothing."""
+        adapter = APIServerAdapter.__new__(APIServerAdapter)
+        middleware = adapter._make_owner_authority_middleware()
+        reached = []
+
+        async def handler(_request):
+            reached.append("ran")
+            raise OwnerAuthorityUnavailable("the owner workspace store is unavailable")
+
+        request = types.SimpleNamespace(method="POST", path="/v1/owner/runs")
+        response = await middleware(request, handler)
+
+        assert response.status == 503
+        body = json.loads(response.body.decode("utf-8"))
+        assert body["error"]["code"] == "owner_workspace_unavailable"
+        assert body["error"]["type"] == "server_error"
+        # Nothing about the storage failure leaks to the caller.
+        assert "sqlite" not in response.body.decode("utf-8").lower()
+        # The handler raised before doing any work; the middleware added none.
+        assert reached == ["ran"]

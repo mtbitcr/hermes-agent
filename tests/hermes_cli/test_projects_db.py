@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import os
+import time
+from pathlib import Path
 
 import pytest
 
-from hermes_cli import projects_db as pdb
+from hermes_cli import projects_db as pdb, sqlite_util
+
+# "fork" keeps the already-imported, already-sandboxed interpreter state (the
+# children only need the explicit db path); "spawn" is a correct fallback where
+# fork is unavailable.
+_MP = multiprocessing.get_context(
+    "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+)
+
+_INIT_LOCK_NAME = "projects.db.init.lock"
 
 
 @pytest.fixture
@@ -18,7 +30,151 @@ def conn(tmp_path):
         c.close()
 
 
+def _run_projects_workers(procs, queue, expected_messages):
+    """Start, drain and join child processes with bounded waits."""
+    for proc in procs:
+        proc.start()
+    try:
+        messages = [queue.get(timeout=120) for _ in range(expected_messages)]
+    finally:
+        for proc in procs:
+            proc.join(timeout=120)
+            if proc.is_alive():  # pragma: no cover - only on a real hang
+                proc.terminate()
+                proc.join(timeout=30)
+    for proc in procs:
+        assert proc.exitcode == 0, f"child exited {proc.exitcode}"
+    return messages
 
+
+def _first_open_worker(db_path, barrier, lock, active, peak, queue):
+    """Race a fresh Projects DB open and report the widest observed overlap."""
+    import hermes_state
+
+    real_apply = hermes_state.apply_wal_with_fallback
+
+    def observed_apply(connection, **kwargs):
+        with lock:
+            active.value += 1
+            peak.value = max(peak.value, active.value)
+        try:
+            # Widen the first-open window so an unserialized implementation
+            # deterministically overlaps another process's WAL setup.
+            time.sleep(0.05)
+            return real_apply(connection, **kwargs)
+        finally:
+            with lock:
+                active.value -= 1
+
+    hermes_state.apply_wal_with_fallback = observed_apply
+    connection = None
+    try:
+        barrier.wait(timeout=60)
+        connection = pdb.connect(db_path=Path(db_path))
+        queue.put(bool(connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects'"
+        ).fetchone()))
+    except BaseException as exc:  # reported as a failure, never a silent hang
+        queue.put(repr(exc))
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def test_concurrent_first_open_serializes_wal_and_schema_across_processes(tmp_path):
+    """First open is single-writer HOST-wide, not just inside one process.
+
+    Every child has its own empty ``_INITIALIZED_PATHS``, so each one believes
+    it is the first opener — exactly the burst the file lock exists for, and a
+    burst an in-process thread lock cannot order. The barrier releases them
+    together and no attempt is retried.
+    """
+    db_path = tmp_path / "concurrent" / "projects.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    pdb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    workers = 6
+    barrier = _MP.Barrier(workers)
+    lock = _MP.Lock()
+    active = _MP.Value("i", 0)
+    peak = _MP.Value("i", 0)
+    queue = _MP.Queue()
+    procs = [
+        _MP.Process(
+            target=_first_open_worker,
+            args=(str(db_path), barrier, lock, active, peak, queue),
+        )
+        for _ in range(workers)
+    ]
+
+    results = _run_projects_workers(procs, queue, workers)
+
+    assert results == [True] * workers
+    assert peak.value == 1
+    # One stable sibling lock file; nothing per-run is left behind.
+    assert {p.name for p in db_path.parent.iterdir()} <= {
+        "projects.db", "projects.db-wal", "projects.db-shm", _INIT_LOCK_NAME,
+    }
+
+
+def _init_lock_holder_worker(db_path, acquired, release, queue):
+    """Hold the Projects init lock through the production helper."""
+    from hermes_cli.sqlite_util import cross_process_init_lock
+
+    try:
+        with cross_process_init_lock(Path(db_path)):
+            acquired.set()
+            release.wait(timeout=120)
+        queue.put("released")
+    except BaseException as exc:  # pragma: no cover - reported below
+        queue.put(repr(exc))
+
+
+def test_first_open_fails_closed_when_the_init_lock_cannot_be_taken(
+    tmp_path, monkeypatch
+):
+    """Reaching the deadline is an error, not a licence to skip the lock.
+
+    The Projects store holds the owner receipts every route change and plan is
+    proven against, so a connection whose first open was never serialized is
+    itself the failure. The wait stays bounded — this must not hang behind a
+    wedged holder either.
+    """
+    db_path = tmp_path / "fenced" / "projects.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved = str(db_path.resolve())
+    pdb._INITIALIZED_PATHS.discard(resolved)
+    monkeypatch.setattr(pdb, "_INIT_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    acquired, release, queue = _MP.Event(), _MP.Event(), _MP.Queue()
+    holder = _MP.Process(
+        target=_init_lock_holder_worker,
+        args=(str(db_path), acquired, release, queue),
+    )
+    holder.start()
+    try:
+        assert acquired.wait(timeout=60)
+        started = time.monotonic()
+        with pytest.raises(sqlite_util.InitLockUnavailable):
+            pdb.connect(db_path=db_path)
+        waited = time.monotonic() - started
+    finally:
+        release.set()
+        holder.join(timeout=60)
+        if holder.is_alive():  # pragma: no cover - only on a real hang
+            holder.terminate()
+            holder.join(timeout=30)
+
+    assert queue.get(timeout=60) == "released"
+    assert holder.exitcode == 0
+    # It gave up on its own deadline instead of waiting the holder out.
+    assert waited < 30
+    # Fail closed: nothing was initialized behind a lock it never held.
+    assert resolved not in pdb._INITIALIZED_PATHS
+    # One stable sibling lock file; nothing per-run is left behind.
+    assert {p.name for p in db_path.parent.iterdir()} <= {
+        "projects.db", _INIT_LOCK_NAME,
+    }
 
 
 
@@ -142,5 +298,4 @@ def test_per_profile_isolation(tmp_path):
     finally:
         a.close()
         b.close()
-
 

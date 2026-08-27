@@ -549,7 +549,6 @@ SUSPICIOUS_BINARY_EXTENSIONS = {
 # Zero-width and invisible unicode characters used for injection
 INVISIBLE_CHARS = {
     '\u200b',  # zero-width space
-    '\u200c',  # zero-width non-joiner
     '\u200d',  # zero-width joiner
     '\u2060',  # word joiner
     '\u2062',  # invisible times
@@ -598,12 +597,14 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     lines = content.split('\n')
     seen = set()  # (pattern_id, line_number) for deduplication
 
-    # Regex pattern matching
+    # Regex matching strips every ZWNJ so it cannot split an attack keyword.
+    # The separate invisible check below still permits genuine Persian/Urdu
+    # orthography while rejecting non-contextual token hiding.
     for pattern, pid, severity, category, description in _COMPILED_THREAT_PATTERNS:
         for i, line in enumerate(lines, start=1):
             if (pid, i) in seen:
                 continue
-            if pattern.search(line):
+            if pattern.search(line.replace("\u200c", "")):
                 seen.add((pid, i))
                 matched_text = line.strip()
                 if len(matched_text) > 120:
@@ -633,6 +634,23 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
                     description=f"invisible unicode character {char_name} (possible text hiding/injection)",
                 ))
                 break  # one finding per line for invisible chars
+        if "\u200c" in line:
+            from tools.ansi_strip import is_contextual_zwnj
+
+            if any(
+                char == "\u200c" and not is_contextual_zwnj(line, index)
+                for index, char in enumerate(line)
+            ):
+                char_name = _unicode_char_name("\u200c")
+                findings.append(Finding(
+                    pattern_id="invisible_unicode",
+                    severity="high",
+                    category="injection",
+                    file=rel_path,
+                    line=i,
+                    match=f"U+200C ({char_name})",
+                    description=f"invisible unicode character {char_name} (possible text hiding/injection)",
+                ))
 
     return findings
 

@@ -90,7 +90,10 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
-from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.sqlite_util import (
+    add_column_if_missing as _add_column_if_missing,
+    cross_process_init_lock as _shared_cross_process_init_lock,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -208,6 +211,139 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     raise ValueError(
         f"reasoning_effort must be one of {allowed}, got {effort!r}"
     )
+
+
+# Durable owner-approved model-route lock. ``tasks.model_policy_lock`` holds a
+# versioned, digest-bound authority string minted by the canonical model
+# policy; the digest covers the task's assignee, provider, model, effort and
+# execution tier together, so no single one of those columns can be edited
+# without the lock ceasing to validate. A locked task is immutable: the route
+# mutators refuse it, role transitions must re-derive a separately approved
+# route, and the dispatcher runs it with fallbacks off. NULL (every
+# pre-existing, manual, and CLI task) keeps the historical mutable behaviour;
+# a NON-NULL value that does not validate is never equivalent to NULL — it
+# fails closed everywhere.
+
+
+def _model_policy():
+    """The single canonical model-policy owner (imported lazily, cached)."""
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    return model_policy
+
+
+def mint_policy_lock(
+    assignee: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    effort: Optional[str],
+    execution_tier: Optional[str],
+) -> str:
+    """Mint the durable lock for one exact admitted route (raises otherwise)."""
+    return _model_policy().mint_policy_lock(
+        assignee, provider, model, effort, execution_tier
+    )
+
+
+def policy_lock_error(
+    lock: Optional[str],
+    assignee: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    effort: Optional[str],
+    execution_tier: Optional[str],
+) -> Optional[str]:
+    """Return why ``lock`` does not authorize this exact route, else None.
+
+    Checked before a pin is persisted, again on every route/role mutation, and
+    again at dispatch, so a hand-edited, partially migrated, or stale row can
+    never run.
+    """
+    return _model_policy().policy_lock_error(
+        lock, assignee, provider, model, effort, execution_tier
+    )
+
+
+def _task_kinds(include_control: bool) -> str:
+    """SQL tuple of the task kinds a reader is willing to resolve.
+
+    ``('work')`` — the default everywhere — is what keeps a non-executable
+    control anchor invisible to every executable path. Only the owner-workspace
+    kernel, which owns anchors, widens it.
+    """
+    return "('work', 'control')" if include_control else "('work')"
+
+
+# Which kinds count when asking whether a task's PARENTS are satisfied. A
+# control anchor is never executable, but it is a real dependency gate: an
+# owner-approved plan hangs new work under its Project's anchor, and that work
+# must stay parked until the owner moves the anchor to done/archived. Excluding
+# the anchor here would promote its children the moment they are created.
+# Recommendation rows are still never dependencies.
+_DEPENDENCY_PARENT_KINDS = "('work', 'control')"
+
+
+def assert_claimable_route(conn: sqlite3.Connection, task_id: str) -> None:
+    """Refuse to start a run on a task whose route authority does not hold.
+
+    Called from every claim path, so a row that carries a lock this build
+    cannot validate against its own assignee/provider/model/effort/tier — a
+    hand-edited column, a partially migrated schema, a foreign or stale
+    authority — never starts a run, whichever surface pulls it. An unlocked
+    ordinary/manual/CLI task is unaffected: those legitimately carry no lock.
+
+    A row that is owner-GOVERNED (it carries an execution tier or a lock) but
+    unlocked is refused too. The readiness guard
+    (:func:`authorize_executable_transition`) mints or parks such a row before
+    it can reach an executable column; this is the backstop for a row that got
+    there under an older build, so no path at all can start a run on
+    receipt-owned work whose route nobody approved.
+    """
+    row = conn.execute(
+        "SELECT assignee, provider_override, model_override, reasoning_effort, "
+        "execution_tier, model_policy_lock, owner_receipt_bound FROM tasks "
+        "WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    error = task_policy_lock_error(row)
+    if not error and task_is_policy_governed(row) and not row["model_policy_lock"]:
+        error = (
+            "owner-governed task carries no approved route lock; it must be "
+            "approved again before it can run"
+        )
+    if error:
+        raise RuntimeError(f"task {task_id}: {error}")
+
+
+def task_policy_lock_error(row: Any) -> Optional[str]:
+    """Return why a locked task row is invalid, else None (incl. unlocked).
+
+    A row projected without the lock column cannot carry a lock and is
+    genuinely unlocked. A row that HAS a lock but is missing any column the
+    digest binds is unprovable, so it fails closed.
+    """
+    try:
+        lock = row["model_policy_lock"]
+    except (IndexError, KeyError, TypeError):
+        return None
+    if not lock:
+        return None
+    try:
+        bound = tuple(
+            row[column]
+            for column in (
+                "assignee",
+                "provider_override",
+                "model_override",
+                "reasoning_effort",
+                "execution_tier",
+            )
+        )
+    except (IndexError, KeyError, TypeError):
+        return "policy lock cannot be checked against an incomplete task row"
+    return policy_lock_error(lock, *bound)
 
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -886,6 +1022,25 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+# The ownership/admission fields dispatch and every machine read decide on,
+# and the exact shape each one must have to be believed. A ``board.json`` is a
+# durable authority document, so a field of the wrong TYPE is as unreadable as
+# a file that will not parse: ``project_id: 123`` names no Project this build
+# can resolve, and ``dispatch_enabled: "yes"`` is not the owner's admission bit.
+# Validated after the file's own fields are merged, so the file cannot smuggle
+# a malformed authority value past the defaults it overrides.
+def _board_authority_fields_valid(meta: Mapping[str, Any]) -> bool:
+    project_id = meta.get("project_id")
+    if project_id is not None and (
+        not isinstance(project_id, str) or not project_id.strip()
+    ):
+        return False
+    for field in ("dispatch_enabled", "dispatch_paused_by_owner", "archived"):
+        if not isinstance(meta.get(field), bool):
+            return False
+    return True
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """Return ``board.json`` contents (or synthesized defaults).
 
@@ -893,6 +1048,23 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     synthesised entry so the dashboard always has something to render.
     Includes the canonical ``slug`` and ``db_path`` so the caller
     doesn't need to reconstruct them.
+
+    It also reports, as ``ownership_verified``, whether the ownership metadata
+    in that entry was actually READ or merely defaulted. The two are not the
+    same fact: an absent ``board.json`` genuinely publishes no owner, while one
+    that exists and cannot be parsed may publish any owner at all — and a
+    synthesised ``project_id: None`` for the second case is what let a legacy
+    owner board's work stay unbound and claimable with no route authority. The
+    flag is written after the file's own fields are merged, so the file can
+    never claim its own metadata is verified.
+
+    "Could not be parsed" is not the only way ownership goes unread. A file that
+    IS valid JSON can still carry an authority field of a shape this build
+    cannot act on, and merging it left ``ownership_verified: True`` on metadata
+    whose owner nobody could resolve — the same unbound-legacy-work and
+    unproven-dispatch-admission failure, reached through a well-formed file. So
+    every authority field is type-checked too (see
+    :func:`_board_authority_fields_valid`).
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta: dict[str, Any] = {
@@ -915,6 +1087,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "created_at": None,
         "archived": False,
     }
+    verified = True
     try:
         p = board_metadata_path(slug)
         if p.exists():
@@ -924,9 +1097,14 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 # its directory — trust the filesystem.
                 raw["slug"] = slug
                 meta.update(raw)
+            else:
+                verified = False
     except (OSError, json.JSONDecodeError):
-        pass
+        verified = False
+    if verified and not _board_authority_fields_valid(meta):
+        verified = False
     meta["db_path"] = str(kanban_db_path(slug))
+    meta["ownership_verified"] = verified
     return meta
 
 
@@ -955,6 +1133,15 @@ def write_board_metadata(
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
+    if meta.pop("ownership_verified", True) is False:
+        # Rewriting a board.json this process could not read would overwrite
+        # whatever ownership it published with a synthesised "no owner". A
+        # well-formed file carrying a malformed authority field is the same
+        # hazard: this call would preserve that value verbatim for every field
+        # it was not asked to change.
+        raise ValueError(
+            f"board {slug!r} has unreadable metadata; refusing to overwrite it"
+        )
     # Preserve existing DB-derived fields — they get re-computed each
     # read but shouldn't be written into board.json.
     meta.pop("db_path", None)
@@ -991,7 +1178,43 @@ def board_dispatch_allowed(metadata: Mapping[str, Any]) -> bool:
         metadata.get("dispatch_enabled") is True
         and metadata.get("dispatch_paused_by_owner") is not True
         and metadata.get("archived") is not True
+        and board_ownership_verified(metadata)
     )
+
+
+def board_ownership_verified(metadata: Mapping[str, Any]) -> bool:
+    """Whether this board's published ownership was read rather than guessed.
+
+    ``False`` for a ``board.json`` that exists and could not be parsed, and for
+    one that parsed but carries an authority field of a shape this build cannot
+    act on. Unreadable ownership metadata cannot be shown to be absent, so it
+    cannot be shown NOT to name an owner Project — and owner work whose route
+    nobody can prove must not be dispatched. A board with no metadata file at
+    all is verified: it genuinely publishes no owner.
+    """
+    return metadata.get("ownership_verified") is not False
+
+
+@contextlib.contextmanager
+def board_dispatch_lock(board: Optional[str], *, wait_seconds: float = 5.0):
+    """Hold one board's native dispatch lock, failing closed when it is busy.
+
+    The public form of the guard the dispatcher tick takes, for the owner-side
+    operations that must be ordered against a claim: while this is held no
+    dispatcher tick on this board can be inside its critical section, so no new
+    claim can start and no spawn can launch. Raises ``TimeoutError`` rather than
+    proceeding unlocked — a caller that answers the owner about execution state
+    must not race a claim and then report a state that was never true.
+    """
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    with _dispatch_tick_lock(
+        kanban_db_path(board=slug),
+        wait_seconds=wait_seconds,
+        fail_open=False,
+    ) as held:
+        if not held:
+            raise TimeoutError(f"board {slug!r} dispatch lock is busy")
+        yield slug
 
 
 def write_board_dispatch_state(
@@ -1007,15 +1230,7 @@ def write_board_dispatch_state(
     section and every later tick must observe the new metadata before it may
     claim work. Running workers are deliberately untouched.
     """
-    slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    db_path = kanban_db_path(board=slug)
-    with _dispatch_tick_lock(
-        db_path,
-        wait_seconds=wait_seconds,
-        fail_open=False,
-    ) as held:
-        if not held:
-            raise TimeoutError("board dispatch state lock is busy")
+    with board_dispatch_lock(board, wait_seconds=wait_seconds) as slug:
         return write_board_metadata(
             slug,
             dispatch_enabled=dispatch_enabled,
@@ -1246,6 +1461,14 @@ class Task:
     # worker runs at that depth regardless of the profile's
     # ``agent.reasoning_effort``. NULL = the worker profile's own setting.
     reasoning_effort: Optional[str] = None
+    # Owner-approved semantic task class (``routine``/``deep``) the model
+    # policy resolves the route from. NULL for every ordinary/manual task.
+    execution_tier: Optional[str] = None
+    # Versioned, digest-bound owner-approved model-route lock, or NULL for
+    # every ordinary/manual task. When set, the assignee, the three fields
+    # above and this task's tier are the immutable authority the owner
+    # approved; see ``policy_lock_error``.
+    model_policy_lock: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1375,6 +1598,16 @@ class Task:
             reasoning_effort=(
                 row["reasoning_effort"]
                 if "reasoning_effort" in keys and row["reasoning_effort"]
+                else None
+            ),
+            execution_tier=(
+                row["execution_tier"]
+                if "execution_tier" in keys and row["execution_tier"]
+                else None
+            ),
+            model_policy_lock=(
+                row["model_policy_lock"]
+                if "model_policy_lock" in keys and row["model_policy_lock"]
                 else None
             ),
             max_retries=(
@@ -1561,6 +1794,33 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- passes --reasoning <level> so the worker runs at that depth regardless
     -- of the profile's agent.reasoning_effort. NULL = profile setting.
     reasoning_effort     TEXT,
+    -- Owner-approved semantic task class (routine/deep) the model policy
+    -- resolves this task's route from. NULL for ordinary/manual tasks.
+    execution_tier       TEXT,
+    -- Versioned, digest-bound owner-approved model-route lock, or NULL for
+    -- every ordinary/manual task. When set, the assignee, the three columns
+    -- above and execution_tier are the immutable authority approved for this
+    -- exact task: the route mutators refuse it, a role transition must
+    -- re-derive a separately approved route, and the dispatcher disables
+    -- fallbacks for it. A non-NULL value that fails policy_lock_error() is
+    -- never treated as NULL — it fails closed.
+    model_policy_lock    TEXT,
+    -- 1 when a committed owner receipt owns this work row. Receipt ownership
+    -- is the durable fact that makes a task's route the owner's to approve,
+    -- so it must live on the row itself: a legacy owner task carries NULL
+    -- execution_tier AND NULL model_policy_lock, and without this column it
+    -- is indistinguishable from an ordinary manual card and would dispatch on
+    -- whatever route the profile happens to hold. 0 (the default) is every
+    -- ordinary/manual/CLI task, which keeps its historical behaviour.
+    owner_receipt_bound  INTEGER NOT NULL DEFAULT 0,
+    -- Which parking operation put this row in ``scheduled``, when one did.
+    -- ``scheduled`` is a shared column: an owner approval parks work there
+    -- until its receipt is durable, and an owner ALSO postpones work there
+    -- deliberately. Activation therefore cannot match on the column — it
+    -- compare-and-swaps this exact generation, so replaying a receipt whose
+    -- work was already released (and has since been postponed again) matches
+    -- nothing. Cleared back to NULL the moment the row is released.
+    park_generation      TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -1815,64 +2075,22 @@ def _cross_process_init_lock(path: Path):
     is redundant work, not corruption. A bounded "proceed anyway" beats an
     unbounded hang that silently stops the board.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name(path.name + ".init.lock")
-    handle = lock_path.open("a+b")
-    acquired = False
-    try:
-        deadline = time.monotonic() + _INIT_LOCK_TIMEOUT_SECONDS
-        if _IS_WINDOWS:
-            import msvcrt
+    def _warn(lock_path, timeout_seconds):
+        _log.warning(
+            "kanban init lock for %s not acquired within %.0fs — proceeding "
+            "without the cross-process lock (in-process lock + idempotent "
+            "init are the correctness backstop). A stuck holder is no longer "
+            "able to block this connect indefinitely (#36644).",
+            lock_path, timeout_seconds,
+        )
 
-            locking = getattr(msvcrt, "locking")
-            nb_lock = getattr(msvcrt, "LK_NBLCK")
-            while True:
-                try:
-                    handle.seek(0)
-                    locking(handle.fileno(), nb_lock, 1)
-                    acquired = True
-                    break
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        break
-                    time.sleep(_INIT_LOCK_POLL_SECONDS)
-        else:
-            import fcntl
-
-            while True:
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                    break
-                except (BlockingIOError, OSError):
-                    if time.monotonic() >= deadline:
-                        break
-                    time.sleep(_INIT_LOCK_POLL_SECONDS)
-        if not acquired:
-            _log.warning(
-                "kanban init lock for %s not acquired within %.0fs — proceeding "
-                "without the cross-process lock (in-process lock + idempotent "
-                "init are the correctness backstop). A stuck holder is no longer "
-                "able to block this connect indefinitely (#36644).",
-                lock_path, _INIT_LOCK_TIMEOUT_SECONDS,
-            )
+    with _shared_cross_process_init_lock(
+        path,
+        timeout_seconds=_INIT_LOCK_TIMEOUT_SECONDS,
+        poll_seconds=_INIT_LOCK_POLL_SECONDS,
+        on_timeout=_warn,
+    ):
         yield
-    finally:
-        try:
-            if acquired:
-                if _IS_WINDOWS:
-                    import msvcrt
-
-                    handle.seek(0)
-                    locking = getattr(msvcrt, "locking")
-                    unlock_mode = getattr(msvcrt, "LK_UNLCK")
-                    locking(handle.fileno(), unlock_mode, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            handle.close()
 
 
 @contextlib.contextmanager
@@ -2673,7 +2891,15 @@ def connect(
                     # threads from racing through the additive ALTER TABLE pass with
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
-                    _migrate_add_optional_columns(conn)
+                    # Which board this file IS, so the migration can read its
+                    # published owner metadata. An explicit ``db_path`` with no
+                    # board named resolves to None, which simply skips that
+                    # extra proof rather than guessing a slug.
+                    _migrate_add_optional_columns(
+                        conn,
+                        _normalize_board_slug(board)
+                        or (get_current_board() if db_path is None else None),
+                    )
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -2741,15 +2967,21 @@ def init_db(
     # schema + migration pass unconditionally.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(resolved)
-    with contextlib.closing(connect(path)):
+    # Carry the board through: the migration reads this board's published
+    # owner metadata to recover receipt ownership on a pre-upgrade board.
+    with contextlib.closing(connect(path, board=board)):
         pass
     return path
 
 
-def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+def _migrate_add_optional_columns(
+    conn: sqlite3.Connection, board_slug: Optional[str] = None,
+) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
-    Called by ``init_db`` so opening an old DB is always safe.
+    Called by ``init_db`` so opening an old DB is always safe. ``board_slug``
+    lets the receipt-ownership reconciliation below read THIS board's published
+    owner metadata; omitted, it falls back to the control-anchor proof alone.
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
@@ -2873,6 +3105,42 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # own agent.reasoning_effort, which is what existing rows were getting.
         _add_column_if_missing(
             conn, "tasks", "reasoning_effort", "reasoning_effort TEXT"
+        )
+
+    if "execution_tier" not in cols:
+        # Owner-approved semantic task class. NULL on every existing row: those
+        # tasks were never classified, so no route can be re-derived for them.
+        _add_column_if_missing(
+            conn, "tasks", "execution_tier", "execution_tier TEXT"
+        )
+
+    if "model_policy_lock" not in cols:
+        # Owner-approved model-route lock. NULL on every existing row, which
+        # is the correct default: those tasks keep the mutable, profile-driven
+        # routing they already had.
+        _add_column_if_missing(
+            conn, "tasks", "model_policy_lock", "model_policy_lock TEXT"
+        )
+
+    if "owner_receipt_bound" not in cols:
+        # Durable receipt ownership. 0 for every pre-existing row; the
+        # reconciliation below re-derives it from the board's own control
+        # anchors, so legacy owner work created before this column existed
+        # still becomes governed instead of dispatching as ordinary work.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "owner_receipt_bound",
+            "owner_receipt_bound INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "park_generation" not in cols:
+        # Which parking operation owns a row sitting in ``scheduled``. NULL on
+        # every existing row, which is correct: nothing already there was
+        # parked by a receipt this build can identify, so no activation may
+        # claim it.
+        _add_column_if_missing(
+            conn, "tasks", "park_generation", "park_generation TEXT"
         )
 
     if "goal_mode" not in cols:
@@ -3164,6 +3432,120 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    _reconcile_receipt_owned_tasks(conn, board_slug)
+
+
+def _board_owner_project_id(board_slug: Optional[str]) -> Optional[str]:
+    """The Project id this board itself publishes as its owner, or None.
+
+    ``board.json``'s ``project_id`` is written only by the owner kernel (see
+    ``owner_workspace._assert_board_ownership``), and it has been written that
+    way since before this build added ``task_kind='control'``. It is therefore
+    the one piece of durable, board-local, owner-exclusive evidence available on
+    a board created by an OLDER build, whose Project anchor is still an ordinary
+    work row.
+    """
+    if not board_slug:
+        return None
+    try:
+        metadata = read_board_metadata(board_slug)
+    except Exception:  # pragma: no cover - read_board_metadata never raises
+        return None
+    if not board_ownership_verified(metadata):
+        # Unverifiable ownership binds nothing HERE — a guess would either
+        # claim another Project's work or leave real owner work unbound. The
+        # fail-closed half of this is in ``board_dispatch_allowed``, which
+        # refuses to dispatch such a board at all.
+        _log.warning(
+            "kanban board %s: board.json could not be read; its published "
+            "Project ownership cannot be verified and dispatch stays closed",
+            board_slug,
+        )
+        return None
+    published = metadata.get("project_id")
+    if not isinstance(published, str):
+        return None
+    return published.strip() or None
+
+
+def _reconcile_receipt_owned_tasks(
+    conn: sqlite3.Connection, board_slug: Optional[str] = None,
+) -> None:
+    """Bind receipt ownership onto legacy owner work, then park what it cannot prove.
+
+    The owner kernel stamps ``owner_receipt_bound`` on every task it creates,
+    but a board upgraded from an older build carries owner work with the
+    column defaulted to 0, NULL ``execution_tier`` and NULL
+    ``model_policy_lock`` — indistinguishable, to every dispatch path, from an
+    ordinary manual card. Two durable proofs of owner ownership are recovered
+    here, because neither covers the other's boards:
+
+    * the Project's non-executable control anchor — only the owner kernel
+      creates ``task_kind='control'`` rows, and it creates exactly one per
+      Project, so every work row sharing a Project with an anchor is
+      receipt-owned;
+    * the board's own published ``project_id`` (:func:`_board_owner_project_id`)
+      — a board created BEFORE this build has no control row at all (its anchor
+      is a work row), so the anchor test alone would bind nothing there and its
+      owner work would keep dispatching as ordinary work.
+
+    Either way the fact is persisted here rather than re-derived on each read.
+
+    Anything the binding catches that is ALREADY sitting in an executable
+    column is then re-proved through the ordinary readiness guard, which mints
+    the exact admitted lock for a row genuinely on an approved route and parks
+    the rest for re-approval. Upgrading a board therefore cannot leave
+    receipt-owned work runnable on a route nobody approved.
+
+    Binding and reconciliation are ONE transaction, and the reconciliation
+    scan runs on every migration pass rather than only when this pass bound a
+    row. Committing the binding first and then skipping the scan whenever a
+    later startup bound nothing left work stranded for good: a crash in that
+    gap produced rows that are receipt-bound, unlocked and already sitting in
+    an executable column, which every claim path refuses and no later pass
+    ever looked at again.
+
+    Idempotent, and a no-op (two cheap indexed reads) on every board that has
+    no owner Project at all.
+
+    ``allow_nested`` because this runs at the tail of the additive migration
+    pass, which its callers legitimately drive from inside their own open
+    transaction; the savepoint keeps the binding and the reconciliation
+    inseparable either way.
+    """
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    if not {
+        "status", "task_kind", "project_id", "owner_receipt_bound",
+        "model_policy_lock",
+    } <= columns:
+        # A tasks table that cannot express a status, a kind or receipt
+        # ownership cannot hold owner work in an executable column, so there
+        # is provably nothing to bind or re-prove. This is genuine absence,
+        # not a skipped scan.
+        return
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            "UPDATE tasks SET owner_receipt_bound = 1 "
+            "WHERE task_kind = 'work' AND owner_receipt_bound = 0 "
+            "AND project_id IS NOT NULL AND (project_id IN ("
+            "  SELECT project_id FROM tasks "
+            "  WHERE task_kind = 'control' AND project_id IS NOT NULL) "
+            "OR project_id = ?)",
+            (_board_owner_project_id(board_slug),),
+        )
+        unproven = [
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE task_kind = 'work' "
+                "AND owner_receipt_bound = 1 AND model_policy_lock IS NULL "
+                f"AND status IN ({', '.join('?' * len(EXECUTABLE_STATUSES))})",
+                tuple(sorted(EXECUTABLE_STATUSES)),
+            ).fetchall()
+        ]
+        for task_id in unproven:
+            authorize_executable_transition(conn, task_id)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -3585,6 +3967,8 @@ def create_task(
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    execution_tier: Optional[str] = None,
+    model_policy_lock: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -3594,6 +3978,8 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     owned_paths: Optional[Iterable[str]] = None,
     integrates_parent_heads: bool = False,
+    control: bool = False,
+    receipt_owned: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3602,6 +3988,18 @@ def create_task(
     If ``triage=True``, status is forced to ``triage`` regardless of
     parents — a specifier/triager is expected to promote the task to
     ``todo`` once the spec is fleshed out.
+
+    ``control=True`` creates the row with ``task_kind='control'`` instead of
+    ``'work'``: a permanently NON-EXECUTABLE anchor. Every dispatcher,
+    claim, specify, decompose and route-mutation query in this module positively
+    requires ``task_kind = 'work'``, so a control row can never be promoted,
+    assigned, claimed or spawned by any of them — only owner-approved graph
+    creation makes executable tasks, and those carry exact route authority.
+
+    ``receipt_owned=True`` records that a committed owner receipt owns this
+    work row. Only the owner-workspace kernel passes it, and it is what keeps
+    the row governed even if its route columns are ever cleared — see
+    :func:`task_is_policy_governed`.
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
@@ -3628,6 +4026,12 @@ def create_task(
     ``--reasoning <level>``. It is independent of ``model_override``: a task
     can run the profile's own model at a different depth.
 
+    ``model_policy_lock`` marks the assignee, the three fields above and
+    ``execution_tier`` as an owner-approved immutable route: the route mutators
+    refuse the task, a role transition must re-derive a separately approved
+    route, and the dispatcher runs it with fallbacks disabled. It must be a
+    lock this build's model policy still admits for exactly that authority.
+
     ``project_source_task_id`` is an internal cross-profile fallback for a
     worker-created child. When the active profile cannot resolve ``project_id``
     in its own projects.db, a matching canonical project-linked task in this
@@ -3646,7 +4050,26 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    execution_tier = (execution_tier or "").strip().lower() or None
+    model_policy_lock = (model_policy_lock or "").strip() or None
     assignee = _canonical_assignee(assignee)
+    if model_policy_lock is not None:
+        route_error = policy_lock_error(
+            model_policy_lock,
+            assignee,
+            provider_override,
+            model_override,
+            reasoning_effort,
+            execution_tier,
+        )
+        if route_error:
+            raise ValueError(route_error)
+    if control and (assignee or model_policy_lock or execution_tier):
+        # A control anchor is non-executable by construction, so it must not
+        # carry any of the fields that only mean something for executable work.
+        raise ValueError(
+            "a control task cannot carry an assignee or a route"
+        )
     responsibility = normalize_responsibility(responsibility)
     owned_paths_list = normalize_owned_paths(owned_paths)
     if not isinstance(integrates_parent_heads, bool):
@@ -3782,6 +4205,11 @@ def create_task(
         )
 
     parents = tuple(p for p in parents if p)
+    if control and parents:
+        # Same asymmetry the link path enforces (see _assert_dependency_child):
+        # an anchor gates work, it is never itself gated, so it may not be
+        # created as a dependency child either.
+        raise ValueError("a control task cannot depend on another task")
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3836,9 +4264,9 @@ def create_task(
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' AND task_kind = 'work' "
+            "AND status != 'archived' AND task_kind = ? "
             "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
+            (idempotency_key, "control" if control else "work"),
         ).fetchone()
         if row:
             return row["id"]
@@ -3894,7 +4322,7 @@ def create_task(
                         rows = conn.execute(
                             "SELECT status FROM tasks WHERE id IN "
                             "(" + ",".join("?" * len(parents)) + ") "
-                            "AND task_kind = 'work'",
+                            f"AND task_kind IN {_DEPENDENCY_PARENT_KINDS}",
                             parents,
                         ).fetchall()
                         if any(r["status"] != "done" for r in rows):
@@ -3933,9 +4361,10 @@ def create_task(
                         tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        reasoning_effort, execution_tier, model_policy_lock,
+                        goal_mode, goal_max_turns, session_id, task_kind,
+                        owner_receipt_bound
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3961,9 +4390,13 @@ def create_task(
                         model_override,
                         provider_override,
                         reasoning_effort,
+                        execution_tier,
+                        model_policy_lock,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        "control" if control else "work",
+                        1 if receipt_owned else 0,
                     ),
                 )
                 for pid in parents:
@@ -3994,6 +4427,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "execution_tier": execution_tier,
+                        "model_route_pinned": bool(model_policy_lock) or None,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4934,11 +5369,37 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
         return []
     placeholders = ",".join("?" * len(parents))
     rows = conn.execute(
-        f"SELECT id FROM tasks WHERE id IN ({placeholders}) AND task_kind = 'work'",
+        f"SELECT id FROM tasks WHERE id IN ({placeholders}) "
+        f"AND task_kind IN {_DEPENDENCY_PARENT_KINDS}",
         parents,
     ).fetchall()
     present = {r["id"] for r in rows}
     return [p for p in parents if p not in present]
+
+
+def _assert_dependency_child(conn: sqlite3.Connection, child_id: str) -> None:
+    """A dependency edge's CHILD must be an executable work row.
+
+    The two ends of an edge are not symmetric. A control anchor is a legitimate
+    dependency PARENT — owner-approved work hangs under its Project's anchor
+    and stays parked until the owner moves the anchor — but it is
+    non-executable by construction, so it can never be the thing a parent
+    releases. Validating both ends with the parent predicate admitted
+    work-to-control and control-to-control edges, which would attach
+    ``linked`` events and inherited notification subscriptions to a row no
+    executable path is allowed to see. Checked BEFORE any row, event or
+    subscription is written.
+    """
+    row = conn.execute(
+        "SELECT task_kind FROM tasks WHERE id = ?", (child_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"unknown task(s): {child_id}")
+    if row["task_kind"] != "work":
+        raise ValueError(
+            f"task {child_id} is a {row['task_kind']} row and cannot depend on "
+            "another task; only executable work can be a dependency child"
+        )
 
 
 def _inherit_notify_subs(
@@ -4992,9 +5453,27 @@ def _inherit_notify_subs(
     )
 
 
-def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
+def get_task(
+    conn: sqlite3.Connection, task_id: str, *, include_control: bool = False
+) -> Optional[Task]:
+    """Read one task. Executable ``work`` rows only, unless asked otherwise.
+
+    ``include_control=True`` also resolves a non-executable ``control`` anchor.
+    Only the owner-workspace kernel passes it, because only that kernel owns
+    anchors; every executable path (dispatch, claim, spawn, specify, decompose,
+    reassign) uses the default and therefore cannot see one.
+    """
     row = conn.execute(
-        "SELECT * FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
+        f"SELECT * FROM tasks WHERE id = ? AND task_kind IN {_task_kinds(include_control)}",
+        (task_id,),
+    ).fetchone()
+    return Task.from_row(row) if row else None
+
+
+def get_control_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
+    """Read a non-executable control anchor (``task_kind='control'``) only."""
+    row = conn.execute(
+        "SELECT * FROM tasks WHERE id = ? AND task_kind = 'control'", (task_id,)
     ).fetchone()
     return Task.from_row(row) if row else None
 
@@ -5065,11 +5544,176 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def role_transition_route(
+    conn: sqlite3.Connection,
+    task_id: str,
+    new_assignee: Optional[str],
+    *,
+    approved_route: Optional[dict] = None,
+) -> tuple[list[tuple[str, Any]], Optional[dict]]:
+    """Authorize one assignee write on a possibly policy-locked task.
+
+    Every path that writes ``assignee`` — direct reassignment, unassignment,
+    review handoff, rework handback (``request_changes``), specify, decompose,
+    and the dispatcher's default assignee — goes through here rather than
+    writing the column on its own, because a locked task's route authority is
+    bound to the role that holds it. Centralising it is the point: a direct
+    ``UPDATE tasks SET assignee`` elsewhere would mint nothing and leave the
+    lock describing a role the task no longer has.
+
+    Returns ``(assignments, repin)``: the extra ``(column, value)`` pairs the
+    caller must include in the SAME ``UPDATE`` as its own ``assignee`` write,
+    and the event payload to record when they are non-empty. For an unlocked
+    task (every pre-existing, manual and CLI task) both are empty and nothing
+    changes.
+
+    For a LOCKED task every assignee change is refused. A task's approved
+    assignee, provider, model, effort and tier are immutable for its whole run:
+    re-deriving a route for whichever role happens to receive it would be
+    exactly the silent re-pin the owner approval exists to prevent — including
+    the internal review handoff and rework handback, which must be represented
+    as separately approved review work instead. Unassigning a locked task is
+    refused for the same reason: it would leave the lock bound to a role the
+    row no longer names.
+
+    An owner-GOVERNED row that carries no lock is refused just as hard. That is
+    migrated owner work — receipt-owned on a board upgraded from a build with
+    no route columns — and it can sit in ``scheduled``/``todo``, where the
+    readiness guard and the rollout fence (both of which only look at
+    executable rows) never reach it. Treating "no lock" as "ordinary card"
+    there would let it be reassigned, unassigned or rerouted before anyone
+    approved it again. Only ``approved_route`` gets it moving, and that
+    installs its exact lock in the same write.
+
+    ``approved_route`` is the one exception, and it is not a re-derivation: a
+    fresh owner-approved mutation supplies the exact replacement
+    ``{"assignee", "provider", "model", "reasoning_effort", "execution_tier",
+    "model_policy_lock"}``, which is validated against the policy and installed
+    atomically with the assignee write.
+
+    Fails closed by raising ``RuntimeError`` on an unreadable, foreign, stale
+    or incomplete lock, and on any replacement route that is not exactly
+    authorized.
+    """
+    row = conn.execute(
+        "SELECT assignee, execution_tier, model_policy_lock, model_override, "
+        "provider_override, reasoning_effort, owner_receipt_bound FROM tasks "
+        "WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
+    ).fetchone()
+    if row is None or not task_is_policy_governed(row):
+        return [], None
+    if not row["model_policy_lock"]:
+        target = _canonical_assignee(new_assignee)
+        if target == row["assignee"]:
+            return [], None
+        if approved_route is not None:
+            return _approved_route_assignments(task_id, target, approved_route)
+        raise RuntimeError(
+            f"cannot change the role of owner-governed task {task_id}: it "
+            "carries no approved route lock, so it must be approved again "
+            "before any role change. A new owner-approved mutation must supply "
+            "the exact replacement route."
+        )
+    lock_error = task_policy_lock_error(row)
+    if lock_error:
+        raise RuntimeError(f"task {task_id}: {lock_error}")
+    target = _canonical_assignee(new_assignee)
+    if target == row["assignee"]:
+        return [], None
+
+    if approved_route is not None:
+        return _approved_route_assignments(task_id, target, approved_route)
+
+    if target is None:
+        raise RuntimeError(
+            f"cannot unassign policy-locked task {task_id}: its owner-approved "
+            "route names that role, so removing it would strand the lock. "
+            "Approve a replacement route instead."
+        )
+    raise RuntimeError(
+        f"cannot move policy-locked task {task_id} from "
+        f"{row['assignee']!r} to {target!r}: the owner approved that exact "
+        "assignee/provider/model/effort/tier for this task's whole run. A new "
+        "owner-approved mutation must supply the exact replacement route, or "
+        "the work must be represented as a separately approved task."
+    )
+
+
+def _approved_route_assignments(
+    task_id: str, target: Optional[str], approved_route: dict
+) -> tuple[list[tuple[str, Any]], Optional[dict]]:
+    """Validate one owner-approved replacement route for a locked task."""
+    required = {
+        "assignee", "provider", "model", "reasoning_effort", "execution_tier",
+        "model_policy_lock",
+    }
+    if not isinstance(approved_route, dict) or set(approved_route) != required:
+        raise RuntimeError(
+            f"task {task_id}: a replacement route must state exactly "
+            f"{sorted(required)}"
+        )
+    approved_assignee = _canonical_assignee(approved_route["assignee"])
+    if approved_assignee is None or approved_assignee != target:
+        raise RuntimeError(
+            f"task {task_id}: the replacement route names assignee "
+            f"{approved_route['assignee']!r}, not {target!r}"
+        )
+    error = policy_lock_error(
+        approved_route["model_policy_lock"],
+        approved_assignee,
+        approved_route["provider"],
+        approved_route["model"],
+        approved_route["reasoning_effort"],
+        approved_route["execution_tier"],
+    )
+    if error:
+        raise RuntimeError(f"task {task_id}: {error}")
+    return (
+        [
+            ("model_override", approved_route["model"]),
+            ("provider_override", approved_route["provider"]),
+            ("reasoning_effort", approved_route["reasoning_effort"]),
+            ("execution_tier", approved_route["execution_tier"]),
+            ("model_policy_lock", approved_route["model_policy_lock"]),
+        ],
+        {
+            "assignee": approved_assignee,
+            "model": approved_route["model"],
+            "provider": approved_route["provider"],
+            "reasoning_effort": approved_route["reasoning_effort"],
+            "execution_tier": approved_route["execution_tier"],
+            "source": "owner_approved_replacement_route",
+        },
+    )
+
+
+def _route_assignment_sql(
+    assignments: list[tuple[str, Any]]
+) -> tuple[str, tuple[Any, ...]]:
+    """Render :func:`role_transition_route` pairs as a trailing SET fragment."""
+    return (
+        "".join(f", {column} = ?" for column, _ in assignments),
+        tuple(value for _, value in assignments),
+    )
+
+
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    approved_route: Optional[dict] = None,
+) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
+
+    A policy-locked task refuses every assignee change unless
+    ``approved_route`` carries the exact owner-approved replacement route and
+    lock, which are then installed in the SAME write — see
+    :func:`role_transition_route`.
     """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
@@ -5085,18 +5729,27 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        assignments, repin = role_transition_route(
+            conn, task_id, profile, approved_route=approved_route
+        )
+        route_sql, route_params = _route_assignment_sql(assignments)
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
             # human reassigning the task is an explicit recovery action, so the
             # new profile should not inherit the previous profile's streak.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?",
-                (profile, task_id),
+                "last_failure_error = NULL" + route_sql + " WHERE id = ?",
+                (profile, *route_params, task_id),
             )
         else:
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
+            conn.execute(
+                "UPDATE tasks SET assignee = ?" + route_sql + " WHERE id = ?",
+                (profile, *route_params, task_id),
+            )
         _append_event(conn, task_id, "assigned", {"assignee": profile})
+        if repin is not None:
+            _append_event(conn, task_id, "model_route_repinned", repin)
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
     # has committed so subscribers always observe durable board state.
     notify_task_updated(conn, task_id, ("assignee",))
@@ -5122,6 +5775,12 @@ def set_model_override(
     override only takes effect on the NEXT dispatch, so setting it on a
     running task that's about to be reclaimed/retried is the primary
     rate-limit-recovery flow. Returns True on success.
+
+    An owner-governed task is refused: its route was approved by the owner for
+    that exact task and must never change under it. That covers a task carrying
+    ``model_policy_lock`` and migrated owner work that carries none — rerouting
+    the latter would silently redefine the route its re-approval is supposed to
+    install.
     """
     model = (model or "").strip() or None
     provider = (provider or "").strip() or None
@@ -5131,12 +5790,18 @@ def set_model_override(
         provider = None
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
+            "SELECT status, execution_tier, model_policy_lock, owner_receipt_bound "
+            "FROM tasks WHERE id = ? AND task_kind = 'work'",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
         if row["status"] == "archived":
             raise RuntimeError(f"cannot set model override on archived task {task_id}")
+        if task_is_policy_governed(row):
+            raise RuntimeError(
+                f"cannot change the model override of owner-governed task {task_id}"
+            )
         conn.execute(
             "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
             (model, provider, task_id),
@@ -5166,17 +5831,26 @@ def set_reasoning_effort(
     must not silently reset the depth the operator chose. Like the model
     override, it takes effect on the NEXT dispatch, so it is settable on a
     running task. Returns True on success.
+
+    Like :func:`set_model_override`, an owner-governed task is refused: the
+    owner approved that exact depth alongside the model.
     """
     effort = normalize_reasoning_effort(effort)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
+            "SELECT status, execution_tier, model_policy_lock, owner_receipt_bound "
+            "FROM tasks WHERE id = ? AND task_kind = 'work'",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
         if row["status"] == "archived":
             raise RuntimeError(
                 f"cannot set reasoning effort on archived task {task_id}"
+            )
+        if task_is_policy_governed(row):
+            raise RuntimeError(
+                f"cannot change the reasoning effort of owner-governed task {task_id}"
             )
         conn.execute(
             "UPDATE tasks SET reasoning_effort = ? WHERE id = ?",
@@ -5188,6 +5862,501 @@ def set_reasoning_effort(
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
     notify_task_updated(conn, task_id, ("reasoning_effort",))
     return True
+
+
+def _exposed_task_filter(task_ids: Iterable[str]) -> Optional[tuple[str, tuple]]:
+    """WHERE clause for named executable tasks that carry no route lock.
+
+    Every executable owner task without a lock is exposed, whether or not it
+    already names a model, provider and effort: naming all three makes a route
+    fixed, but not owner-approved, and an unlocked owner task must never be
+    dispatchable as ordinary work. Already locked, finished, archived and
+    non-``work`` rows are excluded, so the caller's candidate list can only
+    ever narrow.
+    """
+    ids = [str(task_id) for task_id in task_ids if str(task_id or "").strip()]
+    if not ids:
+        return None
+    placeholders = ",".join("?" for _ in ids)
+    return (
+        f"id IN ({placeholders}) AND task_kind = 'work' "
+        "AND status NOT IN ('done', 'archived') "
+        "AND model_policy_lock IS NULL",
+        tuple(ids),
+    )
+
+
+def count_unpinned_owner_tasks(
+    conn: sqlite3.Connection, *, task_ids: Iterable[str]
+) -> int:
+    """Count named executable tasks that carry no owner-approved route lock."""
+    selector = _exposed_task_filter(task_ids)
+    if selector is None:
+        return 0
+    predicate, params = selector
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM tasks WHERE {predicate}", params
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def list_active_unpinned_owner_tasks(
+    conn: sqlite3.Connection, *, task_ids: Iterable[str]
+) -> list[str]:
+    """Exposed owner tasks that are already claimed, running, or mid-run.
+
+    A settings change cannot safely re-pin one of these: a worker is already
+    executing (or about to execute) under the authority the row carries right
+    now, and neither rewriting its route columns underneath it nor releasing
+    its claim would stop the process that is already running. The fence
+    therefore refuses the change while any of them is active, rather than
+    letting a stale claim continue under changed authority.
+
+    Deliberately conservative — an expired-but-unreleased claim lock and a
+    dangling ``current_run_id`` both count, because either one can still be
+    adopted or reported against.
+    """
+    selector = _exposed_task_filter(task_ids)
+    if selector is None:
+        return []
+    predicate, params = selector
+    rows = conn.execute(
+        f"SELECT id FROM tasks WHERE {predicate} AND ("
+        "status = 'running' OR claim_lock IS NOT NULL "
+        "OR worker_pid IS NOT NULL OR current_run_id IS NOT NULL) "
+        "ORDER BY id",
+        params,
+    ).fetchall()
+    return [str(row["id"]) for row in rows]
+
+
+# The block reason a fenced-but-unpinnable owner task lands on, and the comment
+# the board shows for it. ``needs_input`` is the native kind that means "a human
+# decision is required before this can run again" — exactly the state of a task
+# whose route nobody can prove was approved.
+_UNPINNABLE_BLOCK_KIND = "needs_input"
+_UNPINNABLE_BLOCK_REASON = (
+    "This work is paused because its approved model route cannot be confirmed. "
+    "It needs to be approved again before it can run."
+)
+
+
+def pin_effective_task_routes(
+    conn: sqlite3.Connection,
+    *,
+    task_ids: Iterable[str],
+    model: str,
+    provider: str,
+    reasoning_effort: str,
+) -> list[str]:
+    """Pin exposed owner tasks onto an exact owner-approved route, or pause them.
+
+    For each exposed task the effective route is completed from the profile's
+    current route only where the task itself declares nothing: an explicit
+    model, provider or effort the operator already set is preserved exactly.
+    The result is written per task, so a settings change afterwards cannot
+    move any of them.
+
+    A task whose completed route IS an admitted authority for its assignee and
+    tier gets the durable policy lock. A task whose route the policy does not
+    admit — a legacy row that was never classified, a partial pin, a hand-set
+    override, or a forbidden route — cannot be given authority at all, so it is
+    parked in the native ``blocked`` column with ``block_kind='needs_input'``
+    and a plain-English re-approval requirement. Leaving it runnable would let
+    receipt-owned work dispatch as ordinary work on a route nobody approved.
+
+    Returns the ids that were pinned (locked); paused ids are reported through
+    the task's own state and audit trail.
+    """
+    selector = _exposed_task_filter(task_ids)
+    if selector is None:
+        return []
+    predicate, params = selector
+    profile_effort = normalize_reasoning_effort(reasoning_effort)
+    profile_model = (model or "").strip()
+    profile_provider = (provider or "").strip()
+    if not profile_model or not profile_provider or not profile_effort:
+        raise ValueError(
+            "cannot fence tasks onto an incomplete profile route "
+            f"(model={profile_model or None!r}, provider={profile_provider or None!r}, "
+            f"reasoning_effort={profile_effort or None!r})"
+        )
+
+    pinned: list[str] = []
+    paused: list[str] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id, status, assignee, execution_tier, model_override, "
+            f"provider_override, reasoning_effort FROM tasks WHERE {predicate}",
+            params,
+        ).fetchall()
+        for row in rows:
+            task_id = str(row["id"])
+            effective_model = row["model_override"] or profile_model
+            effective_provider = row["provider_override"] or profile_provider
+            effective_effort = row["reasoning_effort"] or profile_effort
+            try:
+                lock = mint_policy_lock(
+                    row["assignee"],
+                    effective_provider,
+                    effective_model,
+                    effective_effort,
+                    row["execution_tier"],
+                )
+            except ValueError as exc:
+                _pause_unpinnable_task(conn, task_id, str(exc))
+                paused.append(task_id)
+                continue
+            conn.execute(
+                "UPDATE tasks SET model_override = ?, provider_override = ?, "
+                "reasoning_effort = ?, model_policy_lock = ? WHERE id = ?",
+                (
+                    effective_model,
+                    effective_provider,
+                    effective_effort,
+                    lock,
+                    task_id,
+                ),
+            )
+            pinned.append(task_id)
+            _append_event(
+                conn,
+                task_id,
+                "model_route_pinned",
+                {
+                    "model": effective_model,
+                    "provider": effective_provider,
+                    "reasoning_effort": effective_effort,
+                    "execution_tier": row["execution_tier"],
+                    "policy_locked": True,
+                    "source": "effective_route_rollout_fence",
+                },
+            )
+    for task_id in pinned:
+        notify_task_updated(
+            conn,
+            task_id,
+            ("model_override", "provider_override", "reasoning_effort"),
+        )
+    for task_id in paused:
+        notify_task_updated(conn, task_id, ("status",))
+    return pinned
+
+
+def _pause_unpinnable_task(
+    conn: sqlite3.Connection, task_id: str, detail: str
+) -> None:
+    """Park one receipt-owned task that has no provable approved route.
+
+    Writes the native blocked state directly (rather than through
+    :func:`block_task`) because the fence must be able to pause a task in ANY
+    pre-run column — ``triage``, ``todo``, ``ready`` — while it already holds
+    the fence's write transaction, and because the run bookkeeping
+    ``block_task`` performs only applies to a task that was actually running.
+    A running task's claim is released so its worker cannot report back into a
+    route that was never approved.
+    """
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', block_kind = ?, "
+        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+        "WHERE id = ? AND task_kind = 'work'",
+        (_UNPINNABLE_BLOCK_KIND, task_id),
+    )
+    payload = {
+        "kind": _UNPINNABLE_BLOCK_KIND,
+        "reason": _UNPINNABLE_BLOCK_REASON,
+        "reapproval_required": True,
+        "source": "effective_route_rollout_fence",
+    }
+    # A ``blocked`` event is what makes the pause STICKY: ``recompute_ready``
+    # refuses to auto-promote a task whose latest block event is an explicit
+    # one (see ``_has_sticky_block``), so nothing puts this back in the work
+    # pool until the route is approved again.
+    _append_event(conn, task_id, "blocked", payload)
+    _append_event(
+        conn, task_id, "model_route_unapproved", {**payload, "detail": detail},
+    )
+
+
+# Columns the readiness guard needs to prove one task's route authority.
+_ROUTE_AUTHORITY_SELECT = (
+    "SELECT id, assignee, provider_override, model_override, reasoning_effort, "
+    "execution_tier, model_policy_lock, owner_receipt_bound FROM tasks "
+    "WHERE id = ? AND task_kind = 'work'"
+)
+
+# Statuses from which the dispatcher will actually start a run.
+EXECUTABLE_STATUSES = frozenset({"ready", "review"})
+
+# Where work waits while an owner approval is still writing its durable
+# receipt. ``scheduled`` is the one native non-terminal column that neither
+# ``recompute_ready`` (which only ever scans ``todo``/``blocked``) nor any
+# claim path will move on its own, so a row parked here cannot be promoted or
+# claimed by a live dispatcher tick, and no new state machine is needed.
+PARKED_STATUS = "scheduled"
+
+
+def park_generation(*, actor: str, profile: str, idempotency_key: str) -> str:
+    """The durable identity of one owner operation's parking.
+
+    A pure function of the operation's own identity, so a replay of the exact
+    same receipt recomputes the exact same generation and can finish an
+    activation that was interrupted. Two different operations — including two
+    parkings of the same task — never share one.
+    """
+    raw = f"{actor}\0{profile}\0{idempotency_key}".encode("utf-8")
+    return "owpark_" + hashlib.sha256(raw).hexdigest()[:40]
+
+
+def _require_park_generation(generation: Any) -> str:
+    """Reject a parking generation that could match the wrong rows."""
+    text = str(generation or "").strip()
+    if not text or len(text) > 64:
+        raise ValueError("a parking generation is required")
+    return text
+
+
+def activate_owner_work(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    *,
+    generation: str,
+    restore_statuses: Optional[dict[str, str]] = None,
+) -> list[str]:
+    """Release exactly this receipt's parked work, then recompute readiness.
+
+    The single transition an owner approval performs AFTER its terminal
+    receipt is durable. It is driven by the exact task ids the committed
+    receipt records AND by ``generation`` — the durable identity of the
+    parking that receipt performed (:func:`park_generation`).
+
+    The generation is what makes replay exact rather than merely idempotent.
+    :data:`PARKED_STATUS` is a SHARED column: an owner also postpones work
+    there deliberately. Matching on the column alone meant that replaying an
+    already-completed receipt after the owner postponed one of its tasks
+    reactivated that task — and, through ``recompute_ready``, could enable its
+    dependents. Activation clears the generation as it releases the row, so a
+    replay compare-and-swaps a generation no row carries any more and changes
+    nothing.
+
+    Landing on ``todo`` rather than ``ready`` is deliberate: promotion into an
+    executable column must go through :func:`recompute_ready`, which proves
+    each task's route authority and honours dependency order, instead of this
+    function writing an executable status directly.
+
+    ``restore_statuses`` names the exact column a task must return to when
+    ``todo`` is not where it came from. A dependent that this plan parked out
+    of ``blocked`` goes back to ``blocked``, so ``recompute_ready`` re-applies
+    the sticky-block and circuit-breaker guards it would have applied all
+    along; parking must never launder a blocked row into the work pool.
+    """
+    generation = _require_park_generation(generation)
+    ids = [str(task_id) for task_id in task_ids if str(task_id or "").strip()]
+    if not ids:
+        return []
+    restore = dict(restore_statuses or {})
+    released: list[str] = []
+    with write_txn(conn):
+        for task_id in ids:
+            target = restore.get(task_id, "todo")
+            if target not in VALID_STATUSES or target == PARKED_STATUS:
+                raise ValueError(f"cannot restore {task_id} to status {target!r}")
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, park_generation = NULL "
+                "WHERE id = ? AND task_kind = 'work' AND status = ? "
+                "AND park_generation = ?",
+                (target, task_id, PARKED_STATUS, generation),
+            )
+            if cur.rowcount == 1:
+                released.append(task_id)
+                _append_event(conn, task_id, "owner_work_activated", None)
+    recompute_ready(conn)
+    return released
+
+
+def _park_newly_enabled_dependents(
+    conn: sqlite3.Connection,
+    *,
+    parent_ids_made_terminal: Iterable[str],
+    already_parked: set[str],
+    generation: str,
+) -> list[list[str]]:
+    """Park the work a plan just unblocked, inside the plan's own transaction.
+
+    Archiving or merging a parent satisfies its children's dependency the
+    instant the plan transaction commits — which is BEFORE the owner receipt
+    that authorizes the plan is durable. Recomputing readiness there, or a
+    dispatcher tick landing in that gap, would promote an already pinned child
+    into a claimable column for a plan whose receipt may still fail to
+    finalize. So every dependent the plan newly enables is moved into
+    :data:`PARKED_STATUS` here, in the same transaction as the archive, and
+    reported so the committed receipt can name it.
+
+    Only a child whose parents are now ALL terminal is touched: one still
+    waiting on the plan's own parked replacements is not newly enabled and is
+    left exactly as it is. A sticky-blocked child is left alone too — nothing
+    auto-promotes it, and parking would drop an explicit operator hold.
+
+    Returns ``[[task_id, status_to_restore], ...]``, JSON-shaped so it round
+    trips through the receipt unchanged. ``generation`` is stamped on each
+    parked row so only this operation's own activation can release it (see
+    :func:`activate_owner_work`).
+    """
+    generation = _require_park_generation(generation)
+    parked: dict[str, str] = {}
+    for parent_id in dict.fromkeys(str(pid) for pid in parent_ids_made_terminal):
+        for child_id in child_ids(conn, parent_id):
+            if child_id in already_parked or child_id in parked:
+                continue
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'",
+                (child_id,),
+            ).fetchone()
+            if row is None or row["status"] not in ("todo", "blocked"):
+                continue
+            if not _parents_satisfied(conn, child_id):
+                continue
+            if row["status"] == "blocked" and _has_sticky_block(conn, child_id):
+                continue
+            conn.execute(
+                "UPDATE tasks SET status = ?, park_generation = ? "
+                "WHERE id = ? AND task_kind = 'work' AND status = ?",
+                (PARKED_STATUS, generation, child_id, row["status"]),
+            )
+            _append_event(
+                conn, child_id, "owner_work_parked",
+                {"restore_status": row["status"], "unblocked_by": parent_id},
+            )
+            parked[child_id] = row["status"]
+    return [[task_id, status] for task_id, status in sorted(parked.items())]
+
+
+def task_is_policy_governed(row: Any) -> bool:
+    """Whether this row's route is owned by the owner model policy.
+
+    ``execution_tier`` and ``model_policy_lock`` are written only by the
+    owner-approved creation paths and by the route fence; an ordinary, manual
+    or CLI task carries neither, which is why it keeps its historical
+    unrestricted behaviour. A row that carries one but not a valid other is a
+    partially pinned owner row — governed, but not yet provable.
+
+    ``owner_receipt_bound`` is the third, and the one that closes the
+    pre-upgrade hole: work a committed owner receipt owns is governed by that
+    ownership alone, even when it carries NEITHER a tier nor a lock because it
+    was created before those columns existed. Inferring "safe to run as
+    ordinary work" from those NULLs is exactly what must not happen.
+    """
+    for column in ("execution_tier", "model_policy_lock", "owner_receipt_bound"):
+        try:
+            if row[column]:
+                return True
+        except (IndexError, KeyError, TypeError):
+            continue
+    return False
+
+
+def route_authority_error(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[str]:
+    """Why this task's approved route cannot be proven, or ``None``.
+
+    The read-only half of :func:`authorize_executable_transition`: it answers
+    the same question against the same five bound columns, but writes nothing
+    — no minted lock, no parking, no event. That is what a dry run and a
+    pre-claim screen need, so a caller can report or defer a task whose route
+    authority does not hold instead of discovering it by having the real
+    operation raise mid-tick.
+    """
+    row = conn.execute(_ROUTE_AUTHORITY_SELECT, (task_id,)).fetchone()
+    if row is None or not task_is_policy_governed(row):
+        return None
+    if row["model_policy_lock"]:
+        return task_policy_lock_error(row) or None
+    try:
+        mint_policy_lock(
+            row["assignee"],
+            row["provider_override"],
+            row["model_override"],
+            row["reasoning_effort"],
+            row["execution_tier"],
+        )
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def authorize_executable_transition(
+    conn: sqlite3.Connection, task_id: str, *, park: bool = True
+) -> bool:
+    """Prove a task's exact admitted route before it becomes runnable.
+
+    An owner-governed work row must be EXACTLY locked before it can sit in a
+    column the dispatcher spawns from. Reaching ``ready``/``review`` without a
+    lock — a legacy row created before locks existed, a partial pin, a row the
+    route fence never saw because no settings change happened — would let
+    receipt-owned work run as ordinary work on a route nobody approved.
+
+    So, inside the caller's own write transaction (atomic with the status
+    write it is about to make):
+
+    * an ordinary/manual/CLI task, which carries no owner route fields at all,
+      is allowed through unchanged;
+    * a locked row is re-validated against this build's policy, and passes only
+      when the lock still binds its exact assignee/provider/model/effort/tier;
+    * an unlocked governed row has its exact admitted lock MINTED from its own
+      completed route, so a legacy row that is genuinely on an approved route
+      simply becomes provable (replaying this is a no-op: the digest is a pure
+      function of the same five fields);
+    * anything that cannot be proven or minted is refused, and — when ``park``
+      is set — parked in the native ``blocked`` column with
+      ``block_kind='needs_input'`` and a plain-English re-approval requirement,
+      exactly as the route fence parks an unpinnable task.
+
+    ``park=False`` is for a caller that reports a conflict snapshot and may
+    itself abort the transaction; parking there would be rolled back anyway.
+    Returns whether the transition may proceed.
+    """
+    row = conn.execute(_ROUTE_AUTHORITY_SELECT, (task_id,)).fetchone()
+    if row is None or not task_is_policy_governed(row):
+        return True
+    if row["model_policy_lock"]:
+        error = task_policy_lock_error(row)
+        if not error:
+            return True
+    else:
+        try:
+            lock = mint_policy_lock(
+                row["assignee"],
+                row["provider_override"],
+                row["model_override"],
+                row["reasoning_effort"],
+                row["execution_tier"],
+            )
+        except ValueError as exc:
+            error = str(exc)
+        else:
+            conn.execute(
+                "UPDATE tasks SET model_policy_lock = ? "
+                "WHERE id = ? AND task_kind = 'work' AND model_policy_lock IS NULL",
+                (lock, task_id),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "model_route_pinned",
+                {
+                    "model": row["model_override"],
+                    "provider": row["provider_override"],
+                    "reasoning_effort": row["reasoning_effort"],
+                    "execution_tier": row["execution_tier"],
+                    "policy_locked": True,
+                    "source": "executable_readiness_guard",
+                },
+            )
+            return True
+    if park:
+        _pause_unpinnable_task(conn, task_id, error)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -5209,9 +6378,10 @@ def _link_tasks_in_txn(conn: sqlite3.Connection, parent_id: str, child_id: str) 
     """
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
-    missing = _find_missing_parents(conn, [parent_id, child_id])
+    missing = _find_missing_parents(conn, [parent_id])
     if missing:
         raise ValueError(f"unknown task(s): {', '.join(missing)}")
+    _assert_dependency_child(conn, child_id)
     if _would_cycle(conn, parent_id, child_id):
         raise ValueError(
             f"linking {parent_id} -> {child_id} would create a cycle"
@@ -5224,7 +6394,8 @@ def _link_tasks_in_txn(conn: sqlite3.Connection, parent_id: str, child_id: str) 
         return False
     # If child was ready but parent is not yet done, demote child to todo.
     parent_status = conn.execute(
-        "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'", (parent_id,)
+        f"SELECT status FROM tasks WHERE id = ? AND task_kind IN {_DEPENDENCY_PARENT_KINDS}",
+        (parent_id,),
     ).fetchone()["status"]
     if parent_status not in {"done", "archived"}:
         conn.execute(
@@ -5366,7 +6537,7 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 
 def add_comment(
     conn: sqlite3.Connection, task_id: str, author: str, body: str,
-    *, operation_key: Optional[str] = None,
+    *, operation_key: Optional[str] = None, include_control: bool = False,
 ) -> int:
     """Append a comment (+ a ``"commented"`` event) and return the comment id.
 
@@ -5393,7 +6564,9 @@ def add_comment(
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
         if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
+            "SELECT 1 FROM tasks WHERE id = ? AND task_kind IN "
+            f"{_task_kinds(include_control)}",
+            (task_id,),
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
         if operation_key:
@@ -5418,10 +6591,21 @@ def add_comment(
         return int(cur.lastrowid or 0)
 
 
-def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
+def list_comments(
+    conn: sqlite3.Connection, task_id: str, *, include_control: bool = False
+) -> list[Comment]:
+    """List a task's comments. Executable ``work`` rows only, unless asked.
+
+    ``include_control=True`` mirrors :func:`add_comment` / :func:`list_events`:
+    the owner-workspace kernel comments on a Project's control anchor, so the
+    same kernel (and its tests) must be able to read that thread back. Every
+    executable surface — the dashboard, the CLI, the worker bridge — uses the
+    default and therefore never sees an anchor's comments.
+    """
     rows = conn.execute(
         "SELECT * FROM task_comments WHERE task_id = ? "
-        "AND task_id IN (SELECT id FROM tasks WHERE task_kind = 'work') "
+        "AND task_id IN (SELECT id FROM tasks WHERE task_kind IN "
+        f"{_task_kinds(include_control)}) "
         "ORDER BY created_at ASC",
         (task_id,),
     ).fetchall()
@@ -5696,13 +6880,18 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
     return att
 
 
-def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
+def list_events(
+    conn: sqlite3.Connection, task_id: str, *, include_control: bool = False
+) -> list[Event]:
     # Ordinary public accessor: positively requires task_kind='work' so a
     # recommendation's typed audit event is never exposed here. Inspecting
-    # it is test-only, via direct SQL against task_events.
+    # it is test-only, via direct SQL against task_events. ``include_control``
+    # additionally admits an owner-workspace control anchor's own audit trail,
+    # which that kernel needs for crash-safe replay recognition.
     rows = conn.execute(
         "SELECT * FROM task_events WHERE task_id = ? "
-        "AND task_id IN (SELECT id FROM tasks WHERE task_kind = 'work') "
+        "AND task_id IN (SELECT id FROM tasks WHERE task_kind IN "
+        f"{_task_kinds(include_control)}) "
         "ORDER BY created_at ASC, id ASC",
         (task_id,),
     ).fetchall()
@@ -6026,10 +7215,16 @@ def recompute_ready(
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ? AND t.task_kind = 'work'",
+                f"WHERE l.child_id = ? AND t.task_kind IN {_DEPENDENCY_PARENT_KINDS}",
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                # Automatic promotion is a transition INTO an executable
+                # column, so it must prove this task's route authority first;
+                # an owner-governed row that cannot be proven is parked here
+                # instead of joining the work pool.
+                if not authorize_executable_transition(conn, task_id):
+                    continue
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
@@ -6077,7 +7272,8 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.task_kind = 'work' AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        f"AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS} "
+        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
         (task_id,),
     ).fetchone() is None
 
@@ -6238,6 +7434,7 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        assert_claimable_route(conn, task_id)
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -6249,7 +7446,7 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.task_kind = 'work' "
+            f"WHERE l.child_id = ? AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS} "
             "AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
@@ -6373,6 +7570,7 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        assert_claimable_route(conn, task_id)
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -8295,17 +9493,20 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        # The independent reviewer is a different role, so this is a role
+        # transition and goes through the one authority helper. A policy-locked
+        # task refuses the handoff: its route was approved for one assignee for
+        # its whole run, so independent review has to be separately approved
+        # work rather than a silent re-pin of this task.
+        role_transition_route(conn, task_id, reviewer)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
+        lead: tuple[Any, ...] = (reviewer,) if reviewer is not None else ()
         params: tuple[Any, ...]
         if expected_run_id is None:
-            params = (reviewer, task_id) if reviewer is not None else (task_id,)
+            params = (*lead, task_id)
             run_guard = ""
         else:
-            params = (
-                (reviewer, task_id, int(expected_run_id))
-                if reviewer is not None
-                else (task_id, int(expected_run_id))
-            )
+            params = (*lead, task_id, int(expected_run_id))
             run_guard = " AND current_run_id = ?"
         cur = conn.execute(
             """
@@ -8438,6 +9639,12 @@ def request_changes(
             reviewer = None
 
         new_status = _landing_status_after_parents(conn, task_id)
+        # Handing the work back to the implementer is a role transition, so it
+        # goes through the one authority helper rather than writing `assignee`
+        # itself. A policy-locked task refuses the handback: its route was
+        # approved for one assignee for its whole run, and rework has to be
+        # separately approved work.
+        role_transition_route(conn, task_id, implementer)
         # NOTE: consecutive_failures is deliberately PRESERVED (neither
         # reset nor incremented). Review transitions are not evidence the
         # pathology cleared — only complete_task's success path resets the
@@ -8514,7 +9721,7 @@ def promote_task(
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ? AND t.task_kind = 'work'",
+            f"WHERE l.child_id = ? AND t.task_kind IN {_DEPENDENCY_PARENT_KINDS}",
             (task_id,),
         ).fetchall()
         unsatisfied = [
@@ -8528,9 +9735,23 @@ def promote_task(
             )
 
     if dry_run:
+        # The same authority question the real promotion asks, answered
+        # without minting a lock, parking the row or writing an event. Without
+        # it a dry run reported an unpinnable owner task as promotable while
+        # the real operation refuses it.
+        if route_authority_error(conn, task_id) is not None:
+            return False, (
+                f"task {task_id} cannot be promoted: its approved model route "
+                "cannot be confirmed, so it is parked for re-approval"
+            )
         return True, None
 
     with write_txn(conn):
+        if not authorize_executable_transition(conn, task_id):
+            return False, (
+                f"task {task_id} cannot be promoted: its approved model route "
+                "cannot be confirmed, so it is parked for re-approval"
+            )
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked') AND task_kind = 'work'",
@@ -8592,7 +9813,8 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.task_kind = 'work' AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        f"AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS} "
+        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
         (task_id,),
     ).fetchone()
     return "todo" if undone_parents else "ready"
@@ -8630,6 +9852,11 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
+        if new_status in EXECUTABLE_STATUSES and not authorize_executable_transition(
+            conn, task_id
+        ):
+            # Parked for re-approval instead of unblocked into the work pool.
+            return False
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -8698,6 +9925,15 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         implementer = handoff.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             implementer = None
+        # Handing the work back to the implementer is a role transition too, so
+        # it goes through the same authority helper; a policy-locked task
+        # refuses it rather than being silently re-pinned.
+        role_transition_route(conn, task_id, implementer)
+        if new_status in EXECUTABLE_STATUSES and not authorize_executable_transition(
+            conn, task_id
+        ):
+            # Parked for re-approval rather than handed back into the pool.
+            return False
         assignee_sql = ", assignee = ?" if implementer else ""
         params: tuple[Any, ...] = (
             (new_status, implementer, task_id)
@@ -8947,6 +10183,10 @@ def specify_triage_task(
             params.append(body)
             changed_fields.append("body")
         if assignee is not None and assignee != (existing["assignee"] or None):
+            # Specifying a triage task can move it to a different role, which is
+            # a role transition: the authority helper refuses it outright on a
+            # policy-locked task.
+            role_transition_route(conn, task_id, assignee)
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
@@ -9000,6 +10240,9 @@ def decompose_triage_task(
     author: Optional[str] = None,
     auto_promote: bool = True,
     event_metadata: Optional[dict] = None,
+    receipt_owned: bool = False,
+    parked: bool = False,
+    park_generation: Optional[str] = None,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -9015,6 +10258,11 @@ def decompose_triage_task(
             "body": "...",                     # optional
             "assignee": "profile-name",        # optional, None -> default fallback
             "parents": [0, 2],                 # indices into this same children list
+            "model_override": "...",           # optional immutable task route
+            "provider_override": "...",        # requires model_override
+            "reasoning_effort": "max",          # optional task effort
+            "execution_tier": "deep",          # semantic class the route came from
+            "model_policy_lock": "raphael:v1:<digest>",   # owner-approved pin
         }
 
     Returns the list of created child task ids (in input order) on
@@ -9028,12 +10276,22 @@ def decompose_triage_task(
     canonical ``child_ids`` and ``root_assignee`` keys always win, so metadata
     cannot falsify the graph that actually committed.
 
+    ``receipt_owned`` marks the children as owned by a committed owner receipt
+    (see :func:`create_task`). ``parked`` lands them in :data:`PARKED_STATUS`
+    instead of ``todo``, in the SAME insert — so an approval that is still
+    writing its durable receipt can never leave claimable work behind, and no
+    dispatcher tick can promote them in a gap. ``park_generation`` — required
+    whenever ``parked`` is set — is the durable identity
+    :func:`activate_owner_work` compare-and-swaps against, so only this
+    operation's own activation releases them afterwards.
+
     Validation of titles/assignees happens inside the same write_txn as
     the inserts so a malformed entry aborts the whole decomposition
     cleanly (no orphan children).
     """
     if not children:
         return None
+    generation = _require_park_generation(park_generation) if parked else None
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
     if event_metadata is not None and not isinstance(event_metadata, dict):
@@ -9066,6 +10324,25 @@ def decompose_triage_task(
             raise ValueError(
                 f"child[{idx}].integrates_parent_heads requires mutating owned_paths"
             )
+        model_override = str(child.get("model_override") or "").strip() or None
+        provider_override = str(child.get("provider_override") or "").strip() or None
+        effort = normalize_reasoning_effort(child.get("reasoning_effort"))
+        if provider_override and not model_override:
+            raise ValueError(
+                f"child[{idx}].provider_override requires model_override"
+            )
+        policy_lock = str(child.get("model_policy_lock") or "").strip() or None
+        if policy_lock is not None:
+            route_error = policy_lock_error(
+                policy_lock,
+                _canonical_assignee(child.get("assignee")),
+                provider_override,
+                model_override,
+                effort,
+                child.get("execution_tier"),
+            )
+            if route_error:
+                raise ValueError(f"child[{idx}]: {route_error}")
 
     # Detect cycles in the sibling parent graph (Kahn's topological sort).
     # link_tasks() calls _would_cycle() for every new edge; here we check
@@ -9128,6 +10405,17 @@ def decompose_triage_task(
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
             responsibility = normalize_responsibility(child.get("responsibility"))
+            model_override = str(child.get("model_override") or "").strip() or None
+            provider_override = str(child.get("provider_override") or "").strip() or None
+            reasoning_effort = normalize_reasoning_effort(
+                child.get("reasoning_effort")
+            )
+            execution_tier = (
+                str(child.get("execution_tier") or "").strip().lower() or None
+            )
+            model_policy_lock = (
+                str(child.get("model_policy_lock") or "").strip() or None
+            )
             owned_paths = normalize_owned_paths(child.get("owned_paths"))
             integrates_parent_heads = child.get("integrates_parent_heads", False)
             # Per-child override wins; otherwise inherit the root's
@@ -9171,20 +10459,30 @@ def decompose_triage_task(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, responsibility, status, workspace_kind, "
                 " workspace_path, tenant, project_id, owned_paths, "
-                " integrates_parent_heads, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?)",
+                " integrates_parent_heads, model_override, provider_override, "
+                " reasoning_effort, execution_tier, model_policy_lock, "
+                " owner_receipt_bound, park_generation, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
                     body if isinstance(body, str) else None,
                     assignee,
                     responsibility,
+                    PARKED_STATUS if parked else "todo",
                     child_ws_kind,
                     child_ws_path,
                     tenant,
                     project_id,
                     json.dumps(owned_paths) if owned_paths is not None else None,
                     1 if integrates_parent_heads else 0,
+                    model_override,
+                    provider_override,
+                    reasoning_effort,
+                    execution_tier,
+                    model_policy_lock,
+                    1 if receipt_owned else 0,
+                    generation,
                     now,
                     (author or "decomposer"),
                 ),
@@ -9196,6 +10494,9 @@ def decompose_triage_task(
                     "from_decompose_of": task_id,
                     "owned_paths": owned_paths,
                     "integrates_parent_heads": integrates_parent_heads or None,
+                    "execution_tier": execution_tier,
+                    "model_route_pinned": bool(model_policy_lock),
+                    "parked_for_activation": True if parked else None,
                 },
             )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
@@ -9228,9 +10529,12 @@ def decompose_triage_task(
             )
 
         # Flip the root: triage -> todo, set assignee to the orchestrator.
+        # Moving the root to a different role is a role transition, so it goes
+        # through the authority helper; a policy-locked root refuses it.
         sets = ["status = 'todo'"]
         params: list[Any] = []
         if root_assignee is not None:
+            role_transition_route(conn, task_id, root_assignee)
             sets.append("assignee = ?")
             params.append(root_assignee)
         params.append(task_id)
@@ -9295,6 +10599,8 @@ def cas_transition_task(
     to_status: str,
     event_kind: str = "cas_transition",
     event_payload: Optional[dict] = None,
+    park_newly_enabled_dependents: bool = False,
+    park_generation: Optional[str] = None,
 ) -> dict:
     """Generic compare-and-swap status move, guarded by BOTH status and
     event-revision, in the existing write transaction.
@@ -9315,6 +10621,18 @@ def cas_transition_task(
     reflect the CURRENT row so the caller can hand back an authoritative
     snapshot instead of guessing. Never raises for a plain conflict; raises
     ``ValueError`` only for an unknown task id.
+
+    ``park_newly_enabled_dependents`` makes a move INTO a terminal column
+    carry its own dependency release: every dependent this transition newly
+    unblocks is moved to :data:`PARKED_STATUS` in the SAME transaction and
+    reported back — and recorded in the event payload — as
+    ``parked_dependents``. An owner caller whose authority is only durable
+    once its receipt is written needs exactly that, because the instant the
+    parent commits as terminal a live dispatcher tick could otherwise claim a
+    dependent for an operation that may still fail to finalize.
+    ``park_generation`` — required whenever parking is requested — is the
+    durable identity :func:`activate_owner_work` compare-and-swaps against, so
+    only this operation's own activation can release what it parked.
     """
     with write_txn(conn):
         return _cas_transition_task_in_txn(
@@ -9325,6 +10643,8 @@ def cas_transition_task(
             to_status=to_status,
             event_kind=event_kind,
             event_payload=event_payload,
+            park_newly_enabled_dependents=park_newly_enabled_dependents,
+            park_generation=park_generation,
         )
 
 
@@ -9337,6 +10657,8 @@ def _cas_transition_task_in_txn(
     to_status: str,
     event_kind: str,
     event_payload: Optional[dict],
+    park_newly_enabled_dependents: bool = False,
+    park_generation: Optional[str] = None,
 ) -> dict:
     """CAS helper for callers already holding the Kanban write transaction."""
     row = conn.execute(
@@ -9352,15 +10674,32 @@ def _cas_transition_task_in_txn(
             "status": current_status,
             "revision": current_revision,
         }
+    if to_status in EXECUTABLE_STATUSES and not authorize_executable_transition(
+        conn, task_id, park=False
+    ):
+        # Generic CAS callers report an authoritative snapshot and may abort
+        # the whole transaction, so this refuses without parking (which would
+        # be rolled back) — the row keeps its current, non-executable state.
+        return {
+            "moved": False,
+            "status": current_status,
+            "revision": current_revision,
+        }
+    # Any move THROUGH this generic path — including an owner's deliberate
+    # postpone into ``scheduled`` — drops whatever parking generation the row
+    # carried: it is no longer sitting where some earlier receipt left it, so
+    # that receipt's activation must not be able to pick it up again.
     if to_status == "archived":
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "UPDATE tasks SET status = ?, park_generation = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, "
             "worker_pid = NULL WHERE id = ? AND status = ?",
             (to_status, task_id, expected_status),
         )
     else:
         cur = conn.execute(
-            "UPDATE tasks SET status = ? WHERE id = ? AND status = ?",
+            "UPDATE tasks SET status = ?, park_generation = NULL "
+            "WHERE id = ? AND status = ?",
             (to_status, task_id, expected_status),
         )
     if cur.rowcount != 1:
@@ -9379,11 +10718,26 @@ def _cas_transition_task_in_txn(
             summary=(event_payload or {}).get("summary")
             or "task archived via cas_transition_task",
         )
+    parked_dependents: list[list[str]] = []
+    if park_newly_enabled_dependents and to_status in ("done", "archived"):
+        parked_dependents = _park_newly_enabled_dependents(
+            conn,
+            parent_ids_made_terminal=[task_id],
+            already_parked=set(),
+            generation=park_generation,
+        )
+        # The exact parked set belongs in the transition's OWN event, so a
+        # replay that recognizes this event as its own can reconstruct the
+        # release without re-deriving it from a board that has since moved.
+        event_payload = {
+            **(event_payload or {}), "parked_dependents": parked_dependents,
+        }
     _append_event(conn, task_id, event_kind, event_payload, run_id=run_id)
     return {
         "moved": True,
         "status": to_status,
         "revision": task_event_revision(conn, task_id),
+        "parked_dependents": parked_dependents,
     }
 
 
@@ -9413,6 +10767,7 @@ def apply_owner_project_plan(
     current_milestone: str,
     later_milestones: list[str],
     board: Optional[str] = None,
+    parked: bool = True,
 ) -> dict:
     """Atomically apply one bounded, already-normalized Project Steward plan.
 
@@ -9421,7 +10776,22 @@ def apply_owner_project_plan(
     with zero changes. Replacements preserve source rows and old links, add
     the new blocking edges, and archive superseded rows instead of deleting
     history.
+
+    ``parked`` (the default) lands every task this plan creates — and every
+    task it reactivates — in :data:`PARKED_STATUS` inside the same
+    transaction, and reports them under ``parked_task_ids``. The dependents an
+    archive or a merge newly unblocks are parked in that same transaction and
+    reported under ``parked_dependents`` as ``[task_id, status_to_restore]``
+    pairs. The owner kernel releases both with :func:`activate_owner_work`
+    only after its terminal receipt is durable, so a plan whose later durable
+    writes fail can never have left claimable work behind. Deliberately
+    postponed tasks also sit in ``scheduled`` and are NOT reported, and every
+    row this plan parks carries this plan's own parking generation, so
+    activation can only ever release what this exact receipt parked.
     """
+    generation = park_generation(
+        actor=actor, profile=profile, idempotency_key=idempotency_key,
+    )
     expected: dict[str, tuple[str, int]] = {}
     mutation_targets: set[str] = set()
 
@@ -9449,13 +10819,17 @@ def apply_owner_project_plan(
             remember(change["target"], mutating=True)
 
     with write_txn(conn):
+        # The anchor is the Project's non-executable control row, never a work
+        # task: it carries no assignee and no approved route, so admitting a
+        # 'work' anchor here would let a plan hang owner work off a task that
+        # could itself be dispatched.
         anchor = conn.execute(
             "SELECT project_id, task_kind FROM tasks WHERE id = ?",
             (anchor_task_id,),
         ).fetchone()
         if (
             anchor is None
-            or anchor["task_kind"] != "work"
+            or anchor["task_kind"] != "control"
             or anchor["project_id"] != project_id
         ):
             raise ValueError("project plan anchor is outside the bound Project")
@@ -9466,11 +10840,17 @@ def apply_owner_project_plan(
                 "SELECT status, project_id, task_kind FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
+            # A plan may hang new work under the Project's control anchor, so
+            # a referenced task may be either kind. Mutating one is separately
+            # rejected below: only 'work' rows are ever changed.
             if (
                 row is None
-                or row["task_kind"] != "work"
+                or row["task_kind"] not in ("work", "control")
                 or row["project_id"] != project_id
             ):
+                conflicts.append({"task_id": task_id, "status": None, "revision": None})
+                continue
+            if task_id in mutation_targets and row["task_kind"] != "work":
                 conflicts.append({"task_id": task_id, "status": None, "revision": None})
                 continue
             revision = task_event_revision(conn, task_id)
@@ -9484,6 +10864,7 @@ def apply_owner_project_plan(
         created_task_ids: list[str] = []
         archived_task_ids: list[str] = []
         affected_task_ids: set[str] = set()
+        parked_task_ids: list[str] = []
         add_output_by_change: dict[int, str] = {}
 
         def create_planned_task(
@@ -9499,6 +10880,11 @@ def apply_owner_project_plan(
                 body=spec["body"],
                 assignee=spec["assignee"],
                 responsibility=spec["responsibility"],
+                model_override=spec.get("model_override"),
+                provider_override=spec.get("provider_override"),
+                reasoning_effort=spec.get("reasoning_effort"),
+                execution_tier=spec.get("execution_tier"),
+                model_policy_lock=spec.get("model_policy_lock"),
                 created_by=actor,
                 parents=parent_task_ids,
                 idempotency_key=_owner_plan_task_key(
@@ -9510,9 +10896,19 @@ def apply_owner_project_plan(
                 ),
                 board=board,
                 project_id=project_id,
+                receipt_owned=True,
             )
             created_task_ids.append(task_id)
             affected_task_ids.add(task_id)
+            if parked:
+                # Same transaction as the insert: there is no instant at which
+                # a freshly approved task exists in a claimable column.
+                conn.execute(
+                    "UPDATE tasks SET status = ?, park_generation = ? "
+                    "WHERE id = ? AND task_kind = 'work' AND status != ?",
+                    (PARKED_STATUS, generation, task_id, PARKED_STATUS),
+                )
+                parked_task_ids.append(task_id)
             return task_id
 
         for change_index, change in enumerate(changes):
@@ -9638,12 +11034,21 @@ def apply_owner_project_plan(
                 continue
 
             ref = change["target"]
-            if (
-                action == "move"
-                and change["to_status"] == "ready"
-                and not _parents_satisfied(conn, ref["task_id"])
-            ):
-                raise ValueError("cannot move a task to ready while a parent is unfinished")
+            if action == "move" and change["to_status"] == "ready":
+                if not _parents_satisfied(conn, ref["task_id"]):
+                    raise ValueError(
+                        "cannot move a task to ready while a parent is unfinished"
+                    )
+                # Refuse the WHOLE plan rather than park inside a transaction
+                # that is about to be rolled back: nothing changes, and the
+                # task keeps its current non-executable state.
+                if not authorize_executable_transition(
+                    conn, ref["task_id"], park=False
+                ):
+                    raise ValueError(
+                        "cannot move a task to ready while its approved model "
+                        "route cannot be confirmed"
+                    )
             to_status = (
                 change["to_status"]
                 if action == "move"
@@ -9651,6 +11056,10 @@ def apply_owner_project_plan(
                 if action == "postpone"
                 else "archived"
             )
+            reactivating = action == "move" and to_status == "ready"
+            if reactivating and parked:
+                to_status = PARKED_STATUS
+                parked_task_ids.append(ref["task_id"])
             snapshot = _cas_transition_task_in_txn(
                 conn,
                 ref["task_id"],
@@ -9664,7 +11073,15 @@ def apply_owner_project_plan(
                 raise RuntimeError(
                     "preflighted Project Steward target changed inside transaction"
                 )
-            if action == "move" and to_status == "ready":
+            if reactivating and parked:
+                # The generic CAS above cleared any stale generation; stamp
+                # this plan's own so only its activation releases the row.
+                conn.execute(
+                    "UPDATE tasks SET park_generation = ? "
+                    "WHERE id = ? AND task_kind = 'work' AND status = ?",
+                    (generation, ref["task_id"], PARKED_STATUS),
+                )
+            if reactivating:
                 # A needs-input worker receives task comments, not raw plan
                 # events. Persist the approved owner answer as an idempotent
                 # comment so the resumed specialist can actually use it.
@@ -9681,24 +11098,43 @@ def apply_owner_project_plan(
             if to_status == "archived":
                 archived_task_ids.append(ref["task_id"])
 
-        executable_count = conn.execute(
-            "SELECT COUNT(*) AS n FROM tasks "
-            "WHERE project_id = ? AND task_kind = 'work' "
-            "AND status IN ('triage', 'todo', 'ready', 'running', 'blocked', 'review')",
-            (project_id,),
-        ).fetchone()["n"]
-        if executable_count > 12:
-            raise ValueError(
-                "project plan would leave more than 12 executable tasks; "
-                "keep future work in Next/Later"
+        # Archiving a parent is what releases its dependents, so those are
+        # parked here too — in the same transaction, never by a later readiness
+        # recompute that could land before this plan's receipt is durable.
+        parked_dependents = (
+            _park_newly_enabled_dependents(
+                conn,
+                parent_ids_made_terminal=archived_task_ids,
+                already_parked=set(parked_task_ids),
+                generation=generation,
             )
+            if parked and archived_task_ids
+            else []
+        )
+        affected_task_ids.update(task_id for task_id, _ in parked_dependents)
 
+        # Deliberately NO project-wide executable total is enforced here. A
+        # large Project may hold an evidence-backed backlog and later
+        # milestones, and refusing an approved plan because the Project already
+        # holds enough planned work failed the owner's approval for an internal
+        # slot count they can neither see nor manage. What must stay bounded is
+        # SIMULTANEOUS work, and every bound on that already lives where the
+        # work actually becomes runnable: one plan's own size (the owner
+        # kernel's ``_MAX_GRAPH_TASKS``), the dependency edges written above (an
+        # unfinished parent keeps its child out of ``ready``), the parking this
+        # function performs until the receipt is durable, and the dispatcher's
+        # claim budget (``max_in_progress`` / ``max_in_progress_per_profile`` /
+        # ``max_spawn`` in :func:`dispatch_once`).
         result = {
             "applied": True,
             "change_count": len(changes),
             "created_task_ids": created_task_ids,
             "affected_task_ids": sorted(affected_task_ids),
-            "executable_task_count": int(executable_count),
+            "parked_task_ids": sorted(set(parked_task_ids)),
+            "parked_dependents": parked_dependents,
+            # The receipt carries the generation so a replay activates exactly
+            # what this plan parked and nothing the owner parked since.
+            "park_generation": generation,
         }
         _append_event(
             conn,
@@ -9717,7 +11153,13 @@ def apply_owner_project_plan(
             },
         )
 
-    recompute_ready(conn)
+    # No readiness recompute here when the plan parked its work: everything
+    # this plan enabled — its own new/reactivated tasks AND the dependents the
+    # archives released — is sitting in ``scheduled``, where neither this call
+    # nor a concurrent dispatcher tick can promote it. ``activate_owner_work``
+    # runs the recompute once the terminal receipt is durable.
+    if not parked:
+        recompute_ready(conn)
     for task_id in archived_task_ids:
         _cleanup_workspace(conn, task_id)
     return result
@@ -10825,6 +12267,16 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    skipped_route_unproven: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks this tick refused to start because their approved model route
+    could not be proven, as ``(task_id, reason)`` pairs.
+
+    These are owner-governed rows whose lock cannot be validated or minted.
+    Each is parked for re-approval and skipped INDIVIDUALLY: the route check
+    used to run inside ``claim_task``, outside every per-task boundary, so one
+    such row raised out of the whole tick and starved every unrelated task
+    behind it. Reported in dry runs too, where the same rows used to come back
+    as spawnable."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -11007,6 +12459,81 @@ def _pid_alive(pid: Optional[int]) -> bool:
             # If the secondary probe fails, keep the kill(0) answer.
             pass
     return True
+
+
+def verified_active_worker_rows(
+    conn: sqlite3.Connection,
+    *,
+    project_id: Optional[str] = None,
+    now: Optional[int] = None,
+) -> list[sqlite3.Row]:
+    """Return only running workers whose native claim is live on this host.
+
+    A persisted ``running`` row is historical state, not proof that a process
+    is doing work now.  Owner-facing surfaces may say "Working now" only when
+    the task and run still point at each other, their claim/PID agree, the
+    claim has not expired, the heartbeat is not stale, and that exact local
+    PID is alive.  A remote or otherwise unverifiable worker is omitted rather
+    than upgraded from recorded state to a live claim.
+    """
+    observed_at = int(time.time()) if now is None else int(now)
+    where = [
+        "t.task_kind = 'work'",
+        "t.status = 'running'",
+        "r.status = 'running'",
+        "r.ended_at IS NULL",
+        "r.profile IS NOT NULL",
+        "r.worker_pid IS NOT NULL",
+        "t.current_run_id = r.id",
+        "t.worker_pid = r.worker_pid",
+        "t.claim_lock = r.claim_lock",
+        "t.claim_expires = r.claim_expires",
+    ]
+    params: list[Any] = []
+    if project_id is not None:
+        where.append("t.project_id = ?")
+        params.append(str(project_id))
+    rows = conn.execute(
+        "SELECT r.id AS run_id, r.profile, t.title AS task_title, "
+        "r.started_at, r.worker_pid, r.claim_lock, r.claim_expires, "
+        "r.last_heartbeat_at AS run_heartbeat, "
+        "t.last_heartbeat_at AS task_heartbeat "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE "
+        + " AND ".join(where)
+        + " ORDER BY r.started_at ASC, r.id ASC",
+        params,
+    ).fetchall()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    verified: list[sqlite3.Row] = []
+    for row in rows:
+        claim_lock = str(row["claim_lock"] or "")
+        claim_expires = row["claim_expires"]
+        if (
+            not claim_lock.startswith(host_prefix)
+            or claim_expires is None
+            or int(claim_expires) < observed_at
+            or not _pid_alive(row["worker_pid"])
+        ):
+            continue
+        task_heartbeat = row["task_heartbeat"]
+        run_heartbeat = row["run_heartbeat"]
+        if task_heartbeat != run_heartbeat:
+            continue
+        if task_heartbeat is None:
+            # A worker can be visible before its first activity callback, but
+            # only for a short launch window.  Beyond that, PID state alone is
+            # not evidence of useful work.
+            if observed_at - int(row["started_at"]) > 120:
+                continue
+        else:
+            heartbeat_age = observed_at - int(task_heartbeat)
+            if (
+                heartbeat_age < 0
+                or heartbeat_age > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+            ):
+                continue
+        verified.append(row)
+    return verified
 
 
 def _terminate_reclaimed_worker(
@@ -12628,10 +14155,21 @@ def dispatch_once(
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _dispatch_tick_lock(db_path) as held:
+        board_metadata = read_board_metadata(board)
         if not held:
             result = DispatchResult(skipped_locked=True)
+        elif not board_ownership_verified(board_metadata):
+            # Independent of ``require_board_activation``: a board whose
+            # metadata cannot be read cannot be shown NOT to be an owner
+            # Project's board, and owner work whose route authority nobody can
+            # prove must never be claimed.
+            _log.warning(
+                "kanban dispatch: board %s has unreadable board.json; skipping "
+                "the tick until its ownership can be verified", board,
+            )
+            result = DispatchResult(skipped_inactive=True)
         elif require_board_activation and not board_dispatch_allowed(
-            read_board_metadata(board)
+            board_metadata
         ):
             result = DispatchResult(skipped_inactive=True)
         else:
@@ -12907,8 +14445,16 @@ def _dispatch_once_locked(
                 if not dry_run:
                     try:
                         with write_txn(conn):
+                            # The default assignee is a role transition like any
+                            # other, so it goes through the authority helper: a
+                            # policy-locked task refuses to be adopted onto a
+                            # route the owner did not approve for it.
+                            role_transition_route(
+                                conn, row["id"], _default_assignee
+                            )
                             conn.execute(
-                                "UPDATE tasks SET assignee = ? WHERE id = ? "
+                                "UPDATE tasks SET assignee = ?"
+                                " WHERE id = ? "
                                 "AND (assignee IS NULL OR assignee = '')",
                                 (_default_assignee, row["id"]),
                             )
@@ -12998,6 +14544,16 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        # Route authority, proved per task and BEFORE the claim. The claim
+        # path re-checks it and raises; letting that raise reach here aborted
+        # the whole tick over one unpinnable row.
+        route_error = route_authority_error(conn, row["id"])
+        if route_error is not None:
+            result.skipped_route_unproven.append((row["id"], route_error))
+            if not dry_run:
+                with write_txn(conn):
+                    authorize_executable_transition(conn, row["id"])
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
@@ -13010,7 +14566,14 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        try:
+            claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        except RuntimeError as exc:
+            # A route the screen above could not see (a concurrent edit, a
+            # schema this build cannot validate). One task's problem stays one
+            # task's problem.
+            result.skipped_route_unproven.append((row["id"], str(exc)))
+            continue
         if claimed is None:
             continue
         try:
@@ -13148,6 +14711,13 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        route_error = route_authority_error(conn, row["id"])
+        if route_error is not None:
+            result.skipped_route_unproven.append((row["id"], route_error))
+            if not dry_run:
+                with write_txn(conn):
+                    authorize_executable_transition(conn, row["id"])
+            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
@@ -13156,7 +14726,11 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        try:
+            claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        except RuntimeError as exc:
+            result.skipped_route_unproven.append((row["id"], str(exc)))
+            continue
         if claimed is None:
             continue
         try:
@@ -13540,6 +15114,26 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
+    # A policy-locked task may only run on the exact authority the owner
+    # approved for it: this assignee, provider, model, effort and tier, under a
+    # lock version this build still mints. Anything else — a corrupt or foreign
+    # authority string, a stale version, an incomplete row, a route the policy
+    # no longer admits, or a single hand-edited column — refuses the spawn
+    # rather than letting the worker resolve anything from the profile. The
+    # failure is recorded on the task and the circuit breaker pauses it, so the
+    # board shows why.
+    if task.model_policy_lock:
+        route_error = policy_lock_error(
+            task.model_policy_lock,
+            task.assignee,
+            task.provider_override,
+            task.model_override,
+            task.reasoning_effort,
+            task.execution_tier,
+        )
+        if route_error:
+            raise RuntimeError(f"task {task.id}: {route_error}")
+
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
@@ -13610,6 +15204,16 @@ def _default_spawn(
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
         if task.goal_max_turns is not None:
             env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
+    # Owner-approved route: disable the fallback chain for this worker. The env
+    # var is set so anything the worker itself spawns inherits the policy, but
+    # it is NOT the authority — the profile's own ``.env`` is loaded with
+    # override=True during startup and could reset it. The authority is the
+    # ``--no-fallbacks`` flag added to the worker's argv below, which the CLI
+    # latches into process state after all dotenv loading.
+    if task.model_policy_lock:
+        from hermes_cli.fallback_config import FALLBACKS_DISABLED_ENV
+
+        env[FALLBACKS_DISABLED_ENV] = "1"
     terminal_timeout = _worker_terminal_timeout_env(
         task.max_runtime_seconds,
         env.get("TERMINAL_TIMEOUT"),
@@ -13660,6 +15264,13 @@ def _default_spawn(
         # profile-local worker sessions still register configured hooks.
         "--accept-hooks",
     ]
+    if task.model_policy_lock:
+        # The non-user-overridable channel for this task's no-fallback
+        # authority: argv, latched after dotenv, so neither the profile's .env
+        # nor its config.yaml can restore a fallback chain under a pinned run.
+        from hermes_cli.fallback_config import NO_FALLBACK_FLAG
+
+        cmd.append(NO_FALLBACK_FLAG)
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but

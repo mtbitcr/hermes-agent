@@ -956,8 +956,15 @@ _FAST_MODEL_TASKS: frozenset = frozenset({"title_generation"})
 
 
 def _task_prefers_fast_model(task: Optional[str]) -> bool:
-    """Return whether an eligible task explicitly opts into fast-model routing."""
+    """Return whether an eligible task explicitly opts into fast-model routing.
+
+    Never on a pinned run: swapping in the provider's cheap/fast model is a
+    model substitution like any other, and this run is bound to one exact
+    owner-approved model.
+    """
     if task not in _FAST_MODEL_TASKS:
+        return False
+    if _locked_main_route() is not None:
         return False
     task_config = _get_auxiliary_task_config(task)
     return is_truthy_value(task_config.get("prefer_fast_model"), default=False)
@@ -3023,6 +3030,31 @@ def _read_main_provider() -> str:
     return ""
 
 
+def _read_main_reasoning_effort() -> str:
+    """Read the live main reasoning depth, runtime override first.
+
+    Mirrors ``_read_main_model`` / ``_read_main_provider`` for the third
+    component of an owner-approved route. The worker's depth arrives on argv
+    (``--reasoning``) and is recorded per turn by ``set_runtime_main``;
+    ``agent.reasoning_effort`` in config.yaml is the persisted default behind
+    it. Returns "" when no depth is stated at all.
+    """
+    override = _runtime_main_value("reasoning_effort")
+    if isinstance(override, str) and override.strip():
+        return override.strip().lower()
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+        agent_cfg = cfg.get("agent", {})
+        if isinstance(agent_cfg, dict):
+            effort = agent_cfg.get("reasoning_effort", "")
+            if isinstance(effort, str) and effort.strip():
+                return effort.strip().lower()
+    except Exception:
+        pass
+    return ""
+
+
 def _read_main_api_key() -> str:
     """Read the user's main model API key from the runtime override or config.
 
@@ -3388,6 +3420,7 @@ def set_runtime_main(
     api_key: Any = "",
     api_mode: str = "",
     auth_mode: str = "",
+    reasoning_effort: str = "",
     session_id: str = "",
     cache_scope: str = "",
 ) -> contextvars.Token:
@@ -3416,6 +3449,10 @@ def set_runtime_main(
         ),
         "api_mode": (api_mode or "").strip(),
         "auth_mode": (auth_mode or "").strip().lower(),
+        # The depth the run was approved at, carried alongside provider/model
+        # so a pinned run's whole route — including how hard it may think — is
+        # one authority instead of two half-authorities.
+        "reasoning_effort": (reasoning_effort or "").strip().lower(),
         "session_id": (session_id or "").strip(),
         "cache_scope": (cache_scope or "").strip(),
     }
@@ -3891,7 +3928,12 @@ _AUTO_PROVIDER_LABELS = {
 }
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
-_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
+# ``reasoning_effort`` is context-only on purpose: the legacy module-global
+# mirrors are a fixed six-tuple that other code reads positionally, and the
+# depth is new authority rather than a legacy field.
+_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
+    "requested_provider", "reasoning_effort",
+)
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3922,11 +3964,326 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
             continue
         if isinstance(value, str) and value.strip():
             normalized[field] = value.strip()
-    for identity_field in ("provider", "requested_provider"):
+    for identity_field in ("provider", "requested_provider", "reasoning_effort"):
         identity = normalized.get(identity_field)
         if isinstance(identity, str):
             normalized[identity_field] = identity.lower()
     return normalized
+
+
+def _fallbacks_killed(task: Optional[str], path: str) -> bool:
+    """True when this process must not substitute any other provider/model.
+
+    The no-fallback latch is the single kill switch the kanban dispatcher sets
+    for a model-policy-locked worker: that run is pinned to one exact
+    owner-approved route, so EVERY auxiliary substitution path — the per-task
+    configured chain, the main agent's chain, the built-in discovery chain
+    reached after a payment error, and the main-agent-model safety net — must
+    report "no fallback available" rather than quietly pick something else.
+    Checked per call (not cached) so the switch is honoured on both the sync and
+    async call paths.
+    """
+    from hermes_cli.fallback_config import fallbacks_disabled
+
+    if not fallbacks_disabled():
+        return False
+    logger.info(
+        "Auxiliary %s: %s suppressed — this run is pinned to one exact route",
+        task or "call", path,
+    )
+    return True
+
+
+class AuxiliaryRouteLocked(RuntimeError):
+    """An auxiliary call asked for a route this pinned run may not take.
+
+    A subclass of ``RuntimeError`` so the existing "no provider configured"
+    handling in every auxiliary caller treats it the same way: the call fails,
+    nothing is substituted.
+    """
+
+
+def _locked_main_route(
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """The one exact route every auxiliary surface must use, or ``None``.
+
+    ``None`` means this process is not pinned and everything behaves exactly as
+    before. When it IS pinned (the kanban dispatcher launched this worker for a
+    task with an owner-approved route, so the no-fallback latch is set), the
+    ONLY admissible auxiliary route is the main agent's own provider/model.
+    Suppressing the fallback chains is not enough on its own: an explicit
+    argument, an ``auxiliary.<task>`` override, a fast-model preference or the
+    vision auto-detect chain all resolve a route BEFORE any fallback would be
+    consulted, so each is a substitution the kill switch has to cover too.
+
+    Raises when the pinned route cannot be resolved at all — silence there
+    would mean falling through to ordinary resolution, which is the exact
+    substitution being prevented.
+    """
+    from hermes_cli.fallback_config import fallbacks_disabled
+
+    if not fallbacks_disabled():
+        return None
+    runtime = _normalize_main_runtime(main_runtime)
+    provider = str(runtime.get("provider") or _read_main_provider() or "").strip()
+    model = str(runtime.get("model") or _read_main_model() or "").strip()
+    if not provider or not model:
+        raise AuxiliaryRouteLocked(
+            "this run is pinned to one exact model route, but that route could "
+            "not be resolved; refusing to substitute another provider or model"
+        )
+    effort = str(
+        runtime.get("reasoning_effort") or _read_main_reasoning_effort() or ""
+    ).strip().lower()
+    if effort in _FORBIDDEN_LOCKED_EFFORTS:
+        raise AuxiliaryRouteLocked(
+            f"this run's approved reasoning effort resolved to {effort!r}, which "
+            "is never admissible; refusing to make the call"
+        )
+    return {
+        "provider": provider,
+        "model": model,
+        "base_url": runtime.get("base_url") or None,
+        "api_key": runtime.get("api_key") or None,
+        "api_mode": runtime.get("api_mode") or None,
+        # "" means the approved route states no depth at all. That is not an
+        # invitation to let a caller state one — it is the absence of any
+        # approval for a depth, so every depth control is rejected below.
+        "reasoning_effort": effort,
+    }
+
+
+# Depths that are never admissible on a pinned run, independent of what the
+# route happens to resolve to. Mirrors the canonical model policy's own
+# forbidden set; duplicated here (rather than imported) so the auxiliary layer
+# keeps its narrow dependency surface and still fails closed on its own.
+_FORBIDDEN_LOCKED_EFFORTS = frozenset({"ultra"})
+
+# Wire-level keys that carry reasoning depth or otherwise reshape the API
+# contract. On a pinned run these may only be present when they say exactly
+# what the approved route already says.
+_REASONING_BODY_KEYS = (
+    "reasoning", "reasoning_effort", "thinking", "thinking_config",
+    "extra_reasoning", "reasoning_config",
+)
+
+# The ONLY ``extra_body`` keys a pinned run may still send. A pinned request is
+# assembled FROM the approved route, so what survives from a caller or from
+# ``auxiliary.<task>.extra_body`` has to be an explicit allowlist rather than a
+# deny list: an OpenAI-compatible client merges ``extra_body`` verbatim into the
+# request body, so an unexpected ``model``/``provider``/``base_url`` key there
+# outranks the pinned one on the wire while the audit still reports the approved
+# route. These two are the transport details the pin carries no opinion about —
+# a sticky routing id and portal tags — and they name no provider, no model, no
+# endpoint and no reasoning depth.
+_LOCKED_TRANSPORT_BODY_KEYS = frozenset({"session_id", "tags"})
+
+
+def _locked_transport_body(extra_body: Any) -> Dict[str, Any]:
+    """Keep only the transport fields a pinned run is allowed to send."""
+    if not isinstance(extra_body, dict):
+        return {}
+    return {
+        key: value
+        for key, value in extra_body.items()
+        if key in _LOCKED_TRANSPORT_BODY_KEYS
+    }
+
+
+def _stated_effort(value: Any) -> Optional[str]:
+    """Normalize any wire shape of "how hard to think" into one comparable value.
+
+    Returns ``None`` when the value states nothing. ``"off"`` is the canonical
+    spelling of an explicit "do not reason", which is as much a depth change as
+    naming a level.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "off" if value is False else None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        return text or None
+    if isinstance(value, dict):
+        if value.get("enabled") is False:
+            return "off"
+        for key in ("effort", "reasoning_effort", "thinking_budget", "budget_tokens"):
+            if key in value:
+                nested = _stated_effort(value.get(key))
+                if nested is not None:
+                    return nested
+        # A reasoning object with no recognizable depth field still reshapes
+        # the request, so treat it as an unstated-but-present control.
+        return "unrecognized"
+    return "unrecognized"
+
+
+def _locked_effort_conflicts(stated: Optional[str], approved: str) -> bool:
+    """Whether a stated depth is anything other than the approved one."""
+    if stated is None:
+        return False
+    if stated in _FORBIDDEN_LOCKED_EFFORTS:
+        return True
+    return bool(approved) is False or stated != approved
+
+
+def _assert_locked_depth_request(
+    locked: Dict[str, Any],
+    *,
+    task: Optional[str],
+    source: str,
+    reasoning_config: Any = None,
+    extra_body: Any = None,
+    api_mode: Any = None,
+) -> None:
+    """Reject caller controls that change or obscure the approved depth/API.
+
+    Pinning provider and model is only half of an owner-approved route: a
+    ``reasoning_config``, a nested ``extra_body`` reasoning field, a
+    provider-specific effort key, or an ``api_mode`` switch each changes what
+    the model actually does with the request. Exactly matching values are
+    accepted idempotently so a caller that faithfully echoes the approved route
+    still works; anything else fails closed.
+
+    ``extra_body`` is held to the allowlist as a whole
+    (:data:`_LOCKED_TRANSPORT_BODY_KEYS`), not just to its known reasoning
+    keys. The body is merged verbatim into the wire request, so any other field
+    is a way to reshape a pinned request — ``model`` being the sharpest case,
+    since it silently outranks the pinned model while the audit still reports
+    the approved route.
+    """
+    approved = str(locked.get("reasoning_effort") or "")
+    conflicts: list[str] = []
+
+    stated = _stated_effort(reasoning_config)
+    if _locked_effort_conflicts(stated, approved):
+        conflicts.append(f"reasoning_config effort={stated!r}")
+
+    if isinstance(extra_body, dict):
+        for key in _REASONING_BODY_KEYS:
+            if key not in extra_body:
+                continue
+            nested = _stated_effort(extra_body.get(key))
+            if _locked_effort_conflicts(nested, approved):
+                conflicts.append(f"extra_body[{key!r}] effort={nested!r}")
+        for key in sorted(extra_body):
+            if key in _REASONING_BODY_KEYS or key in _LOCKED_TRANSPORT_BODY_KEYS:
+                continue
+            conflicts.append(f"extra_body[{key!r}]")
+
+    locked_api_mode = str(locked.get("api_mode") or "").strip().lower()
+    requested_api_mode = str(api_mode or "").strip().lower()
+    if requested_api_mode and requested_api_mode != locked_api_mode:
+        conflicts.append(f"api_mode={requested_api_mode!r}")
+
+    if not conflicts:
+        return
+    raise AuxiliaryRouteLocked(
+        f"auxiliary {task or 'call'}: the {source} sets {', '.join(conflicts)}, "
+        f"but this run is pinned to {locked['provider']}/{locked['model']} at "
+        f"effort {approved or 'the route default'!r}"
+        + (f" over {locked_api_mode}" if locked_api_mode else "")
+        + "; refusing to change the approved contract"
+    )
+
+
+def _locked_request_controls(
+    locked: Dict[str, Any],
+    *,
+    task: Optional[str],
+    reasoning_config: Any,
+    extra_body: Any,
+    api_mode: Any,
+) -> tuple:
+    """Build one pinned call's depth/API controls FROM the locked route.
+
+    The caller's own controls are validated (see
+    :func:`_assert_locked_depth_request`) and then discarded rather than merged:
+    the request that goes out is assembled from the approved route first, so no
+    untrusted control can survive by being merged over it. Only the allowlisted
+    ``extra_body`` transport details (portal tags, sticky session ids) are
+    preserved — those carry no approval authority. Filtering here as well as
+    asserting above is deliberate: the assertion is the honest error, the
+    filter is what guarantees nothing outside the allowlist can reach the wire.
+
+    Returns ``(reasoning_config, extra_body, api_mode)``.
+    """
+    _assert_locked_depth_request(
+        locked,
+        task=task,
+        source="caller",
+        reasoning_config=reasoning_config,
+        extra_body=extra_body,
+        api_mode=api_mode,
+    )
+    if task:
+        task_config = _get_auxiliary_task_config(task)
+        _assert_locked_depth_request(
+            locked,
+            task=task,
+            source=f"auxiliary.{task} configuration",
+            reasoning_config=None,
+            extra_body=task_config.get("extra_body"),
+            api_mode=task_config.get("api_mode"),
+        )
+        _assert_locked_depth_request(
+            locked,
+            task=task,
+            source=f"auxiliary.{task} configuration",
+            reasoning_config=task_config.get("reasoning_effort"),
+        )
+    approved = str(locked.get("reasoning_effort") or "")
+    body = _locked_transport_body(extra_body)
+    return (
+        {"enabled": True, "effort": approved} if approved else None,
+        body,
+        locked.get("api_mode") or None,
+    )
+
+
+def _locked_value_conflicts(requested: Any, allowed: Any, *, provider: bool) -> bool:
+    """Whether a caller-stated route component names something else.
+
+    Empty and the ``auto`` sentinel both mean "inherit", which is exactly what
+    a pinned run wants; anything else has to match the pinned route.
+    """
+    text = str(requested or "").strip()
+    if not text or text.lower() == "auto":
+        return False
+    if provider:
+        return _normalize_aux_provider(text) != _normalize_aux_provider(allowed)
+    return text.lower() != str(allowed or "").strip().lower()
+
+
+def _assert_locked_route_request(
+    locked: Dict[str, Any],
+    *,
+    task: Optional[str],
+    source: str,
+    provider: Any = None,
+    model: Any = None,
+    base_url: Any = None,
+) -> None:
+    """Reject a request that names a provider/model/endpoint off the pin."""
+    conflicts = []
+    if _locked_value_conflicts(provider, locked["provider"], provider=True):
+        conflicts.append(f"provider={str(provider).strip()!r}")
+    if _locked_value_conflicts(model, locked["model"], provider=False):
+        conflicts.append(f"model={str(model).strip()!r}")
+    if str(base_url or "").strip() and _locked_value_conflicts(
+        str(base_url).strip().rstrip("/"),
+        str(locked["base_url"] or "").strip().rstrip("/"),
+        provider=False,
+    ):
+        conflicts.append(f"base_url={str(base_url).strip()!r}")
+    if not conflicts:
+        return
+    raise AuxiliaryRouteLocked(
+        f"auxiliary {task or 'call'}: the {source} names {', '.join(conflicts)}, "
+        f"but this run is pinned to {locked['provider']}/{locked['model']}; "
+        "refusing to substitute"
+    )
 
 
 def _get_provider_chain() -> List[tuple]:
@@ -5257,6 +5614,8 @@ def _try_payment_fallback(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
+    if _fallbacks_killed(task, "built-in provider discovery"):
+        return None, None, ""
     # Normalise the failed provider label for matching.
     skip = failed_provider.lower().strip()
     # Also skip Step-1 main-provider path if it maps to the same backend.
@@ -5329,6 +5688,8 @@ def _try_main_agent_model_fallback(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
+    if _fallbacks_killed(task, "main-agent-model safety net"):
+        return None, None, ""
     main_provider = (_read_main_provider() or "").strip()
     main_model = (_read_main_model() or "").strip()
     if main_provider.lower() == "moa":
@@ -5499,6 +5860,8 @@ def _try_configured_fallback_chain(
     """
     if not task:
         return None, None, ""
+    if _fallbacks_killed(task, "configured per-task fallback chain"):
+        return None, None, ""
 
     task_config = _get_auxiliary_task_config(task)
     chain = task_config.get("fallback_chain")
@@ -5655,6 +6018,8 @@ def _try_main_fallback_chain(
     both modern ``fallback_providers`` and legacy ``fallback_model`` entries
     participate in the same order as the main agent.
     """
+    if _fallbacks_killed(task, "main agent fallback chain"):
+        return None, None, ""
     try:
         from hermes_cli.config import load_config_readonly
         from hermes_cli.fallback_config import get_fallback_chain
@@ -5917,6 +6282,10 @@ def _resolve_auto_route(
         return fb_client, fb_model, fb_label
 
     # ── Step 3: aggregator / fallback chain ──────────────────────────────
+    # Reached only because the main provider could not serve this call, so it
+    # is a substitution like any other and the kill switch applies.
+    if _fallbacks_killed(task, "built-in provider discovery"):
+        return None, None, ""
     tried = []
     for label, try_fn in _get_provider_chain():
         if _is_provider_unhealthy(label):
@@ -6926,7 +7295,9 @@ def get_text_auxiliary_client(
     Callers may override the returned model via config.yaml
     (e.g. auxiliary.compression.model, auxiliary.web_extract.model).
     """
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
+    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+        task or None, main_runtime=main_runtime,
+    )
     return resolve_provider_client(
         provider,
         model=model,
@@ -6944,7 +7315,9 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     (AsyncCodexAuxiliaryClient, model) which wraps the Responses API.
     Returns (None, None) when no provider is available.
     """
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
+    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+        task or None, main_runtime=main_runtime,
+    )
     return resolve_provider_client(
         provider,
         model=model,
@@ -7083,11 +7456,35 @@ def resolve_vision_provider_client(
     provider overrides still use the generic provider router for non-standard
     backends, so users can intentionally force experimental providers. Auto mode
     stays conservative and only tries vision backends known to work today.
+
+    On a pinned run the whole selection above is bypassed: the vision call uses
+    the run's exact owner-approved provider/model, and an unavailable client is
+    an error rather than an invitation to walk the auto-detect chain.
     """
     runtime = _normalize_main_runtime(main_runtime)
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        "vision", provider, model, base_url, api_key
+        "vision", provider, model, base_url, api_key, main_runtime=main_runtime,
     )
+    locked = _locked_main_route(main_runtime)
+    if locked is not None:
+        client, final_model = resolve_provider_client(
+            locked["provider"],
+            model=locked["model"],
+            async_mode=async_mode,
+            explicit_base_url=locked["base_url"],
+            explicit_api_key=locked["api_key"],
+            api_mode=locked["api_mode"],
+            main_runtime=runtime,
+            is_vision=True,
+            task="vision",
+        )
+        if client is None:
+            raise AuxiliaryRouteLocked(
+                "auxiliary vision: this run is pinned to "
+                f"{locked['provider']}/{locked['model']}, which is not "
+                "available right now; refusing to substitute another backend"
+            )
+        return locked["provider"], client, final_model
     requested = _normalize_vision_provider(requested)
 
     def _finalize(resolved_provider: str, sync_client: Any, default_model: Optional[str]):
@@ -7849,6 +8246,7 @@ def _resolve_task_provider_model(
     model: str = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Determine provider + model for a call.
 
@@ -7862,7 +8260,42 @@ def _resolve_task_provider_model(
     a first-class provider plus base_url keeps the provider identity so its
     auth, transport, and request-shaping behavior still apply. api_mode is one
     of "chat_completions", "codex_responses", or None (auto-detect).
+
+    When the process is pinned to one exact owner-approved route (see
+    :func:`_locked_main_route`) this whole priority order is replaced by that
+    route: an explicit argument or an ``auxiliary.<task>`` entry naming a
+    different provider, model or endpoint is REJECTED rather than honoured or
+    silently dropped, and one naming the pinned route (or nothing at all)
+    resolves to it exactly.
     """
+    locked = _locked_main_route(main_runtime)
+    if locked is not None:
+        _assert_locked_route_request(
+            locked,
+            task=task,
+            source="explicit auxiliary override",
+            provider=provider,
+            model=model,
+            base_url=base_url,
+        )
+        if task:
+            task_config = _get_auxiliary_task_config(task)
+            _assert_locked_route_request(
+                locked,
+                task=task,
+                source=f"auxiliary.{task} configuration",
+                provider=task_config.get("provider"),
+                model=task_config.get("model"),
+                base_url=task_config.get("base_url"),
+            )
+        return (
+            locked["provider"],
+            locked["model"],
+            locked["base_url"],
+            locked["api_key"],
+            locked["api_mode"],
+        )
+
     cfg_provider = None
     cfg_model = None
     cfg_base_url = None
@@ -8130,6 +8563,15 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
     task_config = _get_auxiliary_task_config(task)
     raw = task_config.get("extra_body")
     result = dict(raw) if isinstance(raw, dict) else {}
+    if _locked_main_route() is not None:
+        # A pinned run is bound to the main route's provider, model AND depth,
+        # so only the allowlisted transport fields survive from config. Dropping
+        # just the known reasoning keys was not enough: this dict becomes the
+        # BASE the request body is merged from, so an ``auxiliary.<task>``
+        # entry carrying ``model`` (or any other request field) would land on
+        # the wire over the pinned route while the audit still reported the
+        # approved one.
+        return _locked_transport_body(result)
     if "reasoning" not in result:
         effort = task_config.get("reasoning_effort")
         if effort is not None and effort != "":
@@ -9215,11 +9657,27 @@ def _call_llm_impl(
     # another.
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key)
-    if api_mode:
+        task, provider, model, base_url, api_key, main_runtime=main_runtime)
+    locked = _locked_main_route(main_runtime)
+    if locked is not None:
+        # Assemble the request FROM the pin, never by merging caller controls
+        # over it: depth and API mode are part of the approved route.
+        reasoning_config, extra_body, resolved_api_mode = _locked_request_controls(
+            locked,
+            task=task,
+            reasoning_config=reasoning_config,
+            extra_body=extra_body,
+            api_mode=api_mode,
+        )
+    elif api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    if locked is not None:
+        # Last line of defence for the pin: whatever the two sources above
+        # merged to, the body that goes on the wire holds nothing but the
+        # allowlisted transport fields.
+        effective_extra_body = _locked_transport_body(effective_extra_body)
     effective_provider = resolved_provider
 
     if task == "vision":
@@ -9261,6 +9719,15 @@ def _call_llm_impl(
         effective_provider = _effective_provider_for_client(
             client, resolved_provider,
         )
+        if client is None and _locked_main_route(main_runtime) is not None:
+            # The exact pinned route could not be built. Every recovery below
+            # this point resolves a DIFFERENT provider or model, which is the
+            # substitution this run is not allowed to make.
+            raise AuxiliaryRouteLocked(
+                f"auxiliary {task or 'call'}: this run is pinned to "
+                f"{resolved_provider}/{resolved_model}, which is not available "
+                "right now; refusing to substitute another provider or model"
+            )
         if client is None:
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
@@ -9532,6 +9999,15 @@ def _call_llm_impl(
             or base_url_host_matches(_base_info, "inference-api.nousresearch.com")
         )
         if _is_model_not_found_error(first_err) and _heal_is_nous:
+            if locked is not None:
+                # The pinned model is what 404'd. Every recommendation this
+                # heal could reach is a DIFFERENT model, which is the exact
+                # substitution a pinned run may not make.
+                raise AuxiliaryRouteLocked(
+                    f"auxiliary {task or 'call'}: this run is pinned to "
+                    f"{locked['provider']}/{locked['model']}, which the provider "
+                    "no longer serves; refusing to substitute another model"
+                ) from first_err
             healed_model = _refresh_nous_recommended_model(
                 vision=(task == "vision"), stale_model=kwargs.get("model"))
             if healed_model and healed_model != kwargs.get("model"):
@@ -9578,6 +10054,15 @@ def _call_llm_impl(
                     task or "call",
                 )
                 if refreshed_model and refreshed_model != kwargs.get("model"):
+                    if locked is not None:
+                        # Refreshing credentials is legitimate on a pinned run;
+                        # taking the refreshed route's model with them is not.
+                        raise AuxiliaryRouteLocked(
+                            f"auxiliary {task or 'call'}: refreshed credentials "
+                            f"resolve {refreshed_model!r}, but this run is pinned "
+                            f"to {locked['provider']}/{locked['model']}; refusing "
+                            "to substitute another model"
+                        ) from first_err
                     kwargs["model"] = refreshed_model
                 try:
                     return _validate_llm_response(
@@ -9612,6 +10097,15 @@ def _call_llm_impl(
                 logger.info("Auxiliary %s: refreshed Nous runtime credentials after 401, retrying",
                             task or "call")
                 if refreshed_model and refreshed_model != kwargs.get("model"):
+                    if locked is not None:
+                        # Refreshing credentials is legitimate on a pinned run;
+                        # taking the refreshed route's model with them is not.
+                        raise AuxiliaryRouteLocked(
+                            f"auxiliary {task or 'call'}: refreshed credentials "
+                            f"resolve {refreshed_model!r}, but this run is pinned "
+                            f"to {locked['provider']}/{locked['model']}; refusing "
+                            "to substitute another model"
+                        ) from first_err
                     kwargs["model"] = refreshed_model
                 return _validate_llm_response(
                     _relay_sync_completion(
@@ -10007,9 +10501,24 @@ async def _async_call_llm_impl(
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key)
+        task, provider, model, base_url, api_key, main_runtime=main_runtime)
+    locked = _locked_main_route(main_runtime)
+    if locked is not None:
+        # Same contract as the sync path: the pinned route is the request.
+        reasoning_config, extra_body, resolved_api_mode = _locked_request_controls(
+            locked,
+            task=task,
+            reasoning_config=reasoning_config,
+            extra_body=extra_body,
+            api_mode=None,
+        )
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    if locked is not None:
+        # Last line of defence for the pin: whatever the two sources above
+        # merged to, the body that goes on the wire holds nothing but the
+        # allowlisted transport fields.
+        effective_extra_body = _locked_transport_body(effective_extra_body)
     effective_provider = resolved_provider
 
     if task == "vision":
@@ -10052,6 +10561,13 @@ async def _async_call_llm_impl(
         effective_provider = _effective_provider_for_client(
             client, resolved_provider,
         )
+        if client is None and _locked_main_route(main_runtime) is not None:
+            # Same on the async path: no substitute for the pinned route.
+            raise AuxiliaryRouteLocked(
+                f"auxiliary {task or 'call'}: this run is pinned to "
+                f"{resolved_provider}/{resolved_model}, which is not available "
+                "right now; refusing to substitute another provider or model"
+            )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
@@ -10243,6 +10759,15 @@ async def _async_call_llm_impl(
             or base_url_host_matches(_client_base, "inference-api.nousresearch.com")
         )
         if _is_model_not_found_error(first_err) and _heal_is_nous:
+            if locked is not None:
+                # The pinned model is what 404'd. Every recommendation this
+                # heal could reach is a DIFFERENT model, which is the exact
+                # substitution a pinned run may not make.
+                raise AuxiliaryRouteLocked(
+                    f"auxiliary {task or 'call'}: this run is pinned to "
+                    f"{locked['provider']}/{locked['model']}, which the provider "
+                    "no longer serves; refusing to substitute another model"
+                ) from first_err
             healed_model = _refresh_nous_recommended_model(
                 vision=(task == "vision"), stale_model=kwargs.get("model"))
             if healed_model and healed_model != kwargs.get("model"):
@@ -10288,6 +10813,15 @@ async def _async_call_llm_impl(
                     task or "call",
                 )
                 if refreshed_model and refreshed_model != kwargs.get("model"):
+                    if locked is not None:
+                        # Refreshing credentials is legitimate on a pinned run;
+                        # taking the refreshed route's model with them is not.
+                        raise AuxiliaryRouteLocked(
+                            f"auxiliary {task or 'call'}: refreshed credentials "
+                            f"resolve {refreshed_model!r}, but this run is pinned "
+                            f"to {locked['provider']}/{locked['model']}; refusing "
+                            "to substitute another model"
+                        ) from first_err
                     kwargs["model"] = refreshed_model
                 try:
                     return _validate_llm_response(
@@ -10321,6 +10855,15 @@ async def _async_call_llm_impl(
                 logger.info("Auxiliary %s (async): refreshed Nous runtime credentials after 401, retrying",
                             task or "call")
                 if refreshed_model and refreshed_model != kwargs.get("model"):
+                    if locked is not None:
+                        # Refreshing credentials is legitimate on a pinned run;
+                        # taking the refreshed route's model with them is not.
+                        raise AuxiliaryRouteLocked(
+                            f"auxiliary {task or 'call'}: refreshed credentials "
+                            f"resolve {refreshed_model!r}, but this run is pinned "
+                            f"to {locked['provider']}/{locked['model']}; refusing "
+                            "to substitute another model"
+                        ) from first_err
                     kwargs["model"] = refreshed_model
                 return _validate_llm_response(
                     await _relay_async_completion(

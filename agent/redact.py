@@ -432,7 +432,7 @@ _URL_USERINFO_RE = re.compile(
 # the key is decoded separately for classification. Values stop at query or
 # fragment pair separators; both ``&`` and ``;`` are valid in deployed URLs.
 _STRICT_URL_PARAM_RE = re.compile(
-    r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]*)"
+    r"([?#&;])([^?#&;=\x20\"'<>]+)=([^#&;\s\"'<>]*)"
 )
 
 # Match userinfo in both absolute (``scheme://user:pass@host``) and
@@ -448,7 +448,7 @@ _STRICT_URL_PARAM_RE = re.compile(
 # Output-equivalence to the old pattern was fuzz-verified (20k random strings
 # plus targeted URL forms).
 _STRICT_URL_USERINFO_RE = re.compile(
-    r"(//)([^/\s?#@]+)@"
+    r"(//)([^/\s?#]+)@"
 )
 
 # HTTP access logs often use a relative request target rather than a full URL:
@@ -659,14 +659,55 @@ def _redact_url_userinfo(text: str) -> str:
     )
 
 
-def _canonical_url_param_name(name: str) -> str:
-    """Decode a URL parameter name for bounded, case-insensitive matching."""
+# Signed-URL credential keys that ONLY the strict pass masks. Display/log
+# redaction deliberately leaves a pre-signed URL clickable (see the web-URL
+# note in `redact_sensitive_text`), but at a non-navigation egress boundary
+# the signature and the session token in one are pure credentials: a leaked
+# `X-Amz-Security-Token` replays the whole STS session, and `sig` alone is
+# bearer authority over an Azure Blob SAS URL.
+_STRICT_ONLY_SENSITIVE_QUERY_PARAMS = frozenset({
+    "x-amz-security-token",   # AWS SigV4 pre-signed session token
+    "x-goog-signature",       # GCS V4 pre-signed signature
+    "sig",                    # Azure Blob / Service Bus SAS signature
+})
+
+# The canonical form folds ``-`` to ``_`` so ``client-secret`` matches
+# ``client_secret``. Fold the configured names the same way, or a name that is
+# spelled with hyphens (``x-amz-signature``) could never match its own
+# canonical spelling and a pre-signed URL's signature would survive strict
+# redaction verbatim.
+_CANONICAL_SENSITIVE_QUERY_PARAMS = frozenset(
+    name.replace("-", "_")
+    for name in (_SENSITIVE_QUERY_PARAMS | _STRICT_ONLY_SENSITIVE_QUERY_PARAMS)
+)
+
+
+def _canonical_url_param_name(name: str) -> str | None:
+    """Decode a URL parameter name for bounded, case-insensitive matching.
+
+    Nested percent encoding is decoded to a fixed point.  Eight passes cover
+    legitimate double-encoding with ample margin; a name that still changes
+    after that is deliberately treated as ambiguous so the strict egress
+    boundary can fail closed without doing attacker-controlled unbounded work.
+    """
+    from tools.ansi_strip import strip_default_ignorables
+
     decoded = name
-    for _ in range(3):
+    for _ in range(8):
         next_value = unquote_plus(decoded)
         if next_value == decoded:
             break
         decoded = next_value
+    else:
+        if unquote_plus(decoded) != decoded:
+            return None
+    # Percent decoding can reveal control/separator characters that split a
+    # sensitive ASCII key without being visible in the egress text. Remove
+    # every non-printing code point after the maintained Unicode-ignorable
+    # pass, then classify the key. The original spelling is still preserved in
+    # output; only the value is masked.
+    decoded = strip_default_ignorables(decoded)
+    decoded = "".join(char for char in decoded if char.isprintable())
     return decoded.casefold().replace("-", "_")
 
 
@@ -676,18 +717,27 @@ def _redact_strict_url_credentials(text: str) -> str:
     This is intentionally stricter than display/log redaction and is used only
     at explicit secret-egress boundaries. It preserves original keys,
     separators, public parameters, hosts, and paths while masking sensitive
-    values and URL userinfo.
+    values and the WHOLE of any URL userinfo. The sensitive key set is the
+    shared one plus :data:`_STRICT_ONLY_SENSITIVE_QUERY_PARAMS`, matched on
+    the percent-decoded, case-folded, hyphen-folded spelling of the key.
     """
     def _redact_param(match: re.Match) -> str:
-        if _canonical_url_param_name(match.group(2)) not in _SENSITIVE_QUERY_PARAMS:
+        canonical_name = _canonical_url_param_name(match.group(2))
+        if (
+            canonical_name is not None
+            and canonical_name not in _CANONICAL_SENSITIVE_QUERY_PARAMS
+        ):
             return match.group(0)
         return f"{match.group(1)}{match.group(2)}=***"
 
     def _redact_userinfo(match: re.Match) -> str:
-        userinfo = match.group(2)
-        if ":" in userinfo:
-            username, _, _password = userinfo.partition(":")
-            return f"{match.group(1)}{username}:***@"
+        # Mask the COMPLETE userinfo, username included. The credential is
+        # routinely the username in these forms — GitHub's
+        # ``https://<token>:x-oauth-basic@github.com/...``, GitLab's
+        # ``https://<token>:@gitlab.com/...`` — so preserving the username
+        # would publish the token itself and mask only the constant marker
+        # beside it. Nothing downstream of this boundary navigates the URL,
+        # so there is no flow that needs the username preserved.
         return f"{match.group(1)}***@"
 
     text = _STRICT_URL_PARAM_RE.sub(_redact_param, text)

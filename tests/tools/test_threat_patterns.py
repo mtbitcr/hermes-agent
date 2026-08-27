@@ -196,6 +196,77 @@ class TestInvisibleUnicode:
         assert any(f.startswith("invisible_unicode_U+200B") for f in findings)
 
 
+    def test_deprecated_format_controls_are_detected(self):
+        # The remaining invisible math operator (U+2061) and the deprecated
+        # format characters (U+206A-U+206F) round out the set. Each is
+        # invisible, so each is reported with its own code point for the
+        # caller to log.
+        for codepoint in (0x2061, *range(0x206A, 0x2070)):
+            assert chr(codepoint) in INVISIBLE_CHARS
+            findings = scan_for_threats(f"normal text{chr(codepoint)}", scope="all")
+            assert f"invisible_unicode_U+{codepoint:04X}" in findings
+
+
+    def test_plain_bidi_marks_are_not_threats(self):
+        """U+061C / U+200E / U+200F are prose punctuation, not injection.
+
+        Real Arabic and Hebrew text is written with these marks to
+        disambiguate the direction of neighbouring punctuation and digits.
+        Scanning for them unconditionally blocked legitimate multilingual
+        content everywhere this scanner runs on real prose — memory entries,
+        AGENTS.md, skills — so they are not classified as threats here.
+        Whether a DISPLAY boundary strips them is a separate question that
+        ``hermes_cli.owner_workspace`` answers for itself.
+        """
+        alm, lrm, rlm = chr(0x061C), chr(0x200E), chr(0x200F)
+        for mark in (alm, lrm, rlm):
+            assert mark not in INVISIBLE_CHARS
+            for scope in ("all", "context", "strict"):
+                assert scan_for_threats(f"normal text{mark}", scope=scope) == []
+
+
+    def test_multilingual_memory_and_context_entries_are_not_blocked(self):
+        """The regression this reverts: real RTL memory/AGENTS content.
+
+        Each entry below is ordinary prose a user or an AGENTS.md file can
+        legitimately contain, with the direction marks a correct renderer
+        needs. None of them may produce a finding at any scope, and
+        ``first_threat_message`` — the helper the memory write path and the
+        skills installer block on — must return None for all of them.
+        """
+        alm, lrm, rlm = chr(0x061C), chr(0x200E), chr(0x200F)
+        entries = (
+            # Arabic prose whose trailing latin term needs an LRM.
+            f"المستخدم يفضل الردود القصيرة{lrm} (Hermes){rlm}",
+            # Hebrew prose with a bracketed number needing a mark.
+            f"המשתמש עובד בשעות הערב{rlm} [17:00-23:00]{lrm}",
+            # An AGENTS.md-style line mixing an RTL heading with a path.
+            f"## قواعد المشروع{alm}: see `hermes_cli/owner_workspace.py`",
+        )
+        for entry in entries:
+            for scope in ("all", "context", "strict"):
+                assert scan_for_threats(entry, scope=scope) == []
+            assert first_threat_message(entry, scope="strict") is None
+
+
+    def test_dangerous_bidi_overrides_and_isolates_are_still_blocked(self):
+        """Reverting the marks must not weaken the real bidi protections.
+
+        The embeddings/overrides (U+202A-U+202E) and the isolates
+        (U+2066-U+2069) open a directional scope that reorders everything
+        inside it — that is the filename/command spoofing channel, and it
+        stays a threat even when it sits inside otherwise legitimate RTL text.
+        """
+        rlm = chr(0x200F)
+        for codepoint in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)):
+            assert chr(codepoint) in INVISIBLE_CHARS
+            entry = f"المستخدم يفضل الردود{rlm} {chr(codepoint)}hidden"
+            findings = scan_for_threats(entry, scope="strict")
+            assert f"invisible_unicode_U+{codepoint:04X}" in findings
+            # ...and the legitimate mark beside it is still not a finding.
+            assert "invisible_unicode_U+200F" not in findings
+
+
     def test_invisible_chars_set_is_frozenset(self):
         # Pin: should be immutable so callers can't accidentally mutate the
         # shared set.

@@ -134,6 +134,13 @@ _register_recommendations_machine_route()
 # routes are always at least this scoped even if that plugin were disabled.
 WORKSPACE_ROUTE_METHOD = "GET"
 _WORKSPACE_API_PREFIX = "/api/plugins/kanban"
+# The named response capability a machine reader opts into to receive
+# owner-safe task titles from the native board/workers reads. Deliberately
+# NOT the same name as the ``/v1`` receipt-snapshot run capability
+# (``owner_workspace.OWNER_PROJECT_RUN_CONTEXT_CAPABILITY``): the two gate
+# different response contracts on different surfaces, so each must be asked
+# for by its own name and neither is admitted on the other's routes.
+WORKSPACE_OWNER_TITLES_CAPABILITY = "owner_titles_v1"
 _WORKSPACE_LITERAL_ROUTE_PATHS = (
     f"{_WORKSPACE_API_PREFIX}/profiles",
     f"{_WORKSPACE_API_PREFIX}/projects",
@@ -520,9 +527,13 @@ def get_board(
     _workspace_response = _workspace_maybe_respond(
         request,
         require_board=True,
-        builder=_workspace_board_response,
+        builder=lambda: _workspace_board_response(
+            owner_titles=_workspace_applied_capability(request)
+            == WORKSPACE_OWNER_TITLES_CAPABILITY
+        ),
         object_kind="board",
         object_id=WORKSPACE_BOARD,
+        allowed_capability=WORKSPACE_OWNER_TITLES_CAPABILITY,
     )
     if _workspace_response is not None:
         return _workspace_response
@@ -1740,9 +1751,13 @@ def list_active_workers(
     _workspace_response = _workspace_maybe_respond(
         request,
         require_board=True,
-        builder=_workspace_workers_response,
+        builder=lambda: _workspace_workers_response(
+            owner_titles=_workspace_applied_capability(request)
+            == WORKSPACE_OWNER_TITLES_CAPABILITY
+        ),
         object_kind="board",
         object_id=WORKSPACE_BOARD,
+        allowed_capability=WORKSPACE_OWNER_TITLES_CAPABILITY,
     )
     if _workspace_response is not None:
         return _workspace_response
@@ -3193,11 +3208,14 @@ def _workspace_audit_fields(
     object_id: Optional[object] = None,
 ) -> dict[str, Any]:
     principal = request.state.token_principal
-    items = request.query_params.multi_items()
-    requested_board = (
-        WORKSPACE_BOARD
-        if len(items) == 1 and items[0] == ("board", WORKSPACE_BOARD)
-        else None
+    # Both facts come from the ALREADY-VALIDATED query structure recorded by
+    # ``_workspace_require_board_only`` — never from re-reading the raw query
+    # here. A call whose query has not passed that check (routes 1-2, or a
+    # denial raised from inside it) records neither.
+    granted = getattr(request.state, "workspace_board_granted", False)
+    requested_board = WORKSPACE_BOARD if granted else None
+    applied_capability = (
+        _workspace_applied_capability(request) if granted else None
     )
     bounded_object_id = None
     if object_id is not None:
@@ -3216,6 +3234,7 @@ def _workspace_audit_fields(
             request.state, "token_route_template", request.url.path
         ),
         "requested_board": requested_board,
+        "applied_capability": applied_capability,
         "object_kind": object_kind,
         "object_id": bounded_object_id,
         "decision": decision,
@@ -3280,19 +3299,58 @@ def _workspace_require_no_query(request: Request) -> None:
         raise HTTPException(status_code=400, detail="Bad Request")
 
 
-def _workspace_require_board_only(request: Request) -> None:
-    """Routes 3-9: exactly one query param named 'board', value exactly the granted board.
+def _workspace_applied_capability(request: Request) -> Optional[str]:
+    """The exact capability marker this call's validated query admitted.
 
-    A single check covers missing / duplicate / extra / wrong / wildcard /
-    malformed / encoded-alias board values: after FastAPI/Starlette's
-    standard single-pass percent-decoding, anything other than the one
-    literal granted board string fails a plain ``==`` comparison. No
-    special-casing is needed for any one of those shapes.
+    ``None`` for a legacy call that named none, and for any call whose query
+    has not passed :func:`_workspace_require_board_only`. The value is always
+    one of this module's own constants — the raw query value is compared for
+    equality by the validator and then discarded — so neither the response
+    projection nor the audit record can be steered by caller-supplied text.
+    """
+    return getattr(request.state, "workspace_applied_capability", None)
+
+
+def _workspace_require_board_only(
+    request: Request, *, allowed_capability: Optional[str] = None
+) -> None:
+    """Routes 3-9: the granted board and, when allowed, one exact capability.
+
+    Missing, duplicate, extra, wrong, wildcard, malformed, or encoded-alias
+    values all fail closed after Starlette's standard single-pass decoding.
+    Capabilities are route-specific: a caller cannot use an admitted option
+    on a sibling route whose response contract does not implement it.
+
+    On success — and only on success — the admitted structure is recorded on
+    the request so the response projection and the audit record read THIS
+    decision instead of re-deriving one from the raw query.
     """
     items = request.query_params.multi_items()
-    if len(items) != 1 or items[0][0] != "board" or items[0][1] != WORKSPACE_BOARD:
+    values: dict[str, str] = {}
+    invalid = False
+    for key, value in items:
+        if key in values:
+            invalid = True
+            break
+        values[key] = value
+    expected_keys = {"board"}
+    if allowed_capability is not None:
+        expected_keys.add("capabilities")
+    if (
+        invalid
+        or set(values) not in ({"board"}, expected_keys)
+        or values.get("board") != WORKSPACE_BOARD
+        or (
+            "capabilities" in values
+            and values["capabilities"] != allowed_capability
+        )
+    ):
         _workspace_audit_deny(request, reason="board_query_invalid", status=400)
         raise HTTPException(status_code=400, detail="Bad Request")
+    request.state.workspace_board_granted = True
+    request.state.workspace_applied_capability = (
+        allowed_capability if "capabilities" in values else None
+    )
 
 
 def _workspace_deny_not_found(
@@ -3325,6 +3383,7 @@ def _workspace_maybe_respond(
     not_found_reason: str = "not_found",
     object_kind: Optional[str] = None,
     object_id: Optional[object] = None,
+    allowed_capability: Optional[str] = None,
 ):
     """The one call each of the nine handlers makes to opt into machine auth.
 
@@ -3343,10 +3402,25 @@ def _workspace_maybe_respond(
     if not _is_workspace_machine_call(request):
         return None
     if require_board:
-        _workspace_require_board_only(request)
+        _workspace_require_board_only(
+            request, allowed_capability=allowed_capability
+        )
     else:
         _workspace_require_no_query(request)
-    if not _workspace_scope_is_active():
+    try:
+        scope_active = _workspace_scope_is_active()
+    except (KeyError, OSError, TypeError, ValueError, sqlite3.Error):
+        # Existing-state failure, not proven absence: 503, so an authority
+        # outage never reads as "this Project is gone".
+        _workspace_audit_deny(
+            request,
+            reason="scope_binding_unreadable",
+            status=503,
+            object_kind=object_kind,
+            object_id=object_id,
+        )
+        raise HTTPException(status_code=503, detail="Service Unavailable")
+    if not scope_active:
         raise _workspace_deny_not_found(
             request,
             reason="scope_binding_unavailable",
@@ -3355,7 +3429,17 @@ def _workspace_maybe_respond(
         )
     try:
         result = builder()
-    except (KeyError, OSError, TypeError, ValueError, sqlite3.Error):
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        sqlite3.Error,
+        # A projection that cannot decide whether a task is route-locked (an
+        # unreadable pin schema) is unavailable, not "unlocked" — same
+        # fail-closed 503 as any other unreadable read.
+        owner_workspace.OwnerWorkspaceError,
+    ):
         _workspace_audit_deny(
             request,
             reason="read_unavailable",
@@ -3385,6 +3469,18 @@ def _workspace_maybe_respond(
 def _workspace_ro_conn() -> Optional[sqlite3.Connection]:
     """Open the granted board's kanban.db read-only, or None if absent yet.
 
+    ``None`` means one thing only: the board file is genuinely NOT THERE, so
+    there is no board state yet and every caller may project that as nothing.
+    A board file that exists but cannot be opened — permissions, corruption, a
+    filesystem fault — is a different fact, and returning ``None`` for it made
+    every reader answer with an authoritative empty 200 (or a per-object 404)
+    that Workspace reads as a complete, zero-task plan. So that case raises,
+    and ``_workspace_maybe_respond`` turns it into this boundary's ordinary
+    fail-closed 503.
+
+    Existence is checked only AFTER a failed open, so the answer describes the
+    open that actually failed rather than a state that may have changed since.
+
     Mirrors ``_recommendations_ro_conn`` exactly: ``mode=ro`` + ``PRAGMA
     query_only=ON`` is belt-and-suspenders so even a bug in the SQL below
     cannot write, and this never calls ``kanban_db.connect()``/``init_db()``
@@ -3399,59 +3495,97 @@ def _workspace_ro_conn() -> Optional[sqlite3.Connection]:
     # dispatcher-to-worker handoff, while this credential is permanently
     # bound to one named board.
     path = kanban_db.board_dir(WORKSPACE_BOARD) / "kanban.db"
-    if not path.exists():
-        return None
+    conn: Optional[sqlite3.Connection] = None
     try:
         conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only = ON")
         return conn
     except (OSError, sqlite3.Error):
-        return None
+        if conn is not None:
+            conn.close()
+        if not path.exists():
+            return None
+        raise
 
 
 def _workspace_projects_ro_conn() -> Optional[sqlite3.Connection]:
+    """Open projects.db read-only, or None when it is genuinely NOT THERE.
+
+    Same distinction ``_workspace_ro_conn`` makes: a database that exists and
+    cannot be opened is a fault, not an absence, and answering ``None`` for it
+    made every reader project an existing Project as gone.
+    """
     from hermes_cli import projects_db
 
     path = projects_db.projects_db_path()
-    if not path.exists():
-        return None
+    conn: Optional[sqlite3.Connection] = None
     try:
         conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only = ON")
         return conn
     except (OSError, sqlite3.Error):
-        return None
+        if conn is not None:
+            conn.close()
+        if not path.exists():
+            return None
+        raise
 
 
 def _workspace_scope_snapshot():
-    """Resolve the fixed project/board grant without writable helpers."""
+    """Resolve the fixed project/board grant without writable helpers.
+
+    ``None`` means the granted state is genuinely absent or deliberately
+    inactive: no projects.db, neither half of the binding present, or an
+    archived Project/board. Anything that means "the state may well be there
+    and this process cannot read it" — a query fault, a ``board.json`` that
+    cannot be parsed — raises instead, so the boundary answers 503 rather than
+    making an existing Project disappear behind a 404 during an authority
+    outage.
+
+    A HALF binding raises for the same reason. A Project row with no board, a
+    board with no Project row, and a board bound to a different Project id are
+    not absence: one side of the grant is still there, so the grant can be
+    neither confirmed nor ruled out, and collapsing that into 404 told the owner
+    their Project does not exist whenever its counterpart was mid-repair.
+    """
     from hermes_cli import projects_db
 
     conn = _workspace_projects_ro_conn()
     if conn is None:
         return None
     try:
-        try:
-            project = projects_db.get_project(conn, WORKSPACE_PROJECT)
-        except (KeyError, TypeError, ValueError, sqlite3.Error):
-            return None
+        project = projects_db.get_project(conn, WORKSPACE_PROJECT)
     finally:
         conn.close()
-    if project is None or project.slug != WORKSPACE_PROJECT or project.archived:
+    board_present = kanban_db.board_exists(WORKSPACE_BOARD)
+    if project is None or project.slug != WORKSPACE_PROJECT:
+        if board_present:
+            raise OSError(
+                f"board {WORKSPACE_BOARD} exists with no matching Project row"
+            )
         return None
-    if not kanban_db.board_exists(WORKSPACE_BOARD):
-        return None
-    try:
-        meta = kanban_db.read_board_metadata(WORKSPACE_BOARD)
-    except (OSError, TypeError, ValueError):
-        return None
+    if not board_present:
+        raise OSError(
+            f"Project {WORKSPACE_PROJECT} exists with no board {WORKSPACE_BOARD}"
+        )
+    meta = kanban_db.read_board_metadata(WORKSPACE_BOARD)
+    if not kanban_db.board_ownership_verified(meta):
+        # The board exists and its published ownership cannot be read, so this
+        # grant can be neither confirmed nor ruled out.
+        raise OSError(
+            f"board {WORKSPACE_BOARD} metadata could not be verified"
+        )
     if (
         meta.get("slug") != WORKSPACE_BOARD
-        or bool(meta.get("archived"))
         or meta.get("project_id") != project.id
     ):
+        raise OSError(
+            f"board {WORKSPACE_BOARD} is not bound to Project {WORKSPACE_PROJECT}"
+        )
+    if project.archived or bool(meta.get("archived")):
+        # Deliberate owner state on a consistent binding, not a corrupt one.
         return None
     return project, meta
 
@@ -3516,9 +3650,17 @@ def _workspace_projects_response() -> Optional[dict]:
     if snapshot is None:
         return None
     project, _ = snapshot
+    # This builder only ever serves the machine-authenticated owner reader
+    # (the interactive dashboard falls through to its own handler), so the
+    # name is projected unconditionally — unlike the board/worker titles,
+    # which stay raw for the browser and are gated on the owner capability.
     return {
         "projects": [
-            {"id": project.id, "slug": project.slug, "name": project.name}
+            {
+                "id": project.id,
+                "slug": project.slug,
+                "name": owner_workspace.owner_project_name(project.name),
+            }
         ]
     }
 
@@ -3540,6 +3682,10 @@ def _workspace_boards_response() -> Optional[dict]:
     if snapshot is None:
         return None
     _, meta = snapshot
+    # Same unconditional projection as the project name above: this builder
+    # only ever serves the machine-authenticated owner reader, and a board's
+    # display name is stored text like any other.
+    board_name = owner_workspace.owner_project_name(meta["name"])
     counts = {name: 0 for name in (*BOARD_COLUMNS, "archived")}
     conn = _workspace_ro_conn()
     if conn is not None:
@@ -3556,7 +3702,7 @@ def _workspace_boards_response() -> Optional[dict]:
         "boards": [
             {
                 "slug": meta["slug"],
-                "name": meta["name"],
+                "name": board_name,
                 "project_id": meta.get("project_id"),
                 "counts": counts,
                 "total": sum(counts[name] for name in BOARD_COLUMNS),
@@ -3565,7 +3711,7 @@ def _workspace_boards_response() -> Optional[dict]:
     }
 
 
-def _workspace_board_response() -> dict:
+def _workspace_board_response(*, owner_titles: bool = False) -> dict:
     empty_columns = {"columns": [{"name": name, "tasks": []} for name in BOARD_COLUMNS]}
     conn = _workspace_ro_conn()
     if conn is None:
@@ -3590,7 +3736,11 @@ def _workspace_board_response() -> dict:
             columns[col].append(
                 {
                     "id": t.id,
-                    "title": t.title,
+                    "title": (
+                        owner_workspace.owner_title(t.title)
+                        if owner_titles
+                        else t.title
+                    ),
                     "assignee_name": t.assignee,
                     "responsibility": t.responsibility,
                     "updated_at": _workspace_iso_timestamp(
@@ -3606,29 +3756,37 @@ def _workspace_board_response() -> dict:
         conn.close()
 
 
-def _workspace_workers_response() -> dict:
+def _workspace_workers_response(*, owner_titles: bool = False) -> dict:
     conn = _workspace_ro_conn()
     if conn is None:
         return {"workers": []}
     try:
-        rows = conn.execute(
-            """
-            SELECT r.profile, t.title AS task_title, r.started_at
-            FROM task_runs r
-            JOIN tasks t ON t.id = r.task_id
-            WHERE r.ended_at IS NULL
-              AND r.worker_pid IS NOT NULL
-              AND r.profile IS NOT NULL
-              AND t.status = 'running'
-              AND t.task_kind = 'work'
-            ORDER BY r.started_at ASC
-            """
-        ).fetchall()
+        rows = (
+            kanban_db.verified_active_worker_rows(conn)
+            if owner_titles
+            else conn.execute(
+                """
+                SELECT r.profile, t.title AS task_title, r.started_at
+                FROM task_runs r
+                JOIN tasks t ON t.id = r.task_id
+                WHERE r.ended_at IS NULL
+                  AND r.worker_pid IS NOT NULL
+                  AND r.profile IS NOT NULL
+                  AND t.status = 'running'
+                  AND t.task_kind = 'work'
+                ORDER BY r.started_at ASC
+                """
+            ).fetchall()
+        )
         return {
             "workers": [
                 {
                     "profile": row["profile"],
-                    "task_title": row["task_title"],
+                    "task_title": (
+                        owner_workspace.owner_title(row["task_title"])
+                        if owner_titles
+                        else row["task_title"]
+                    ),
                     "started_at": int(row["started_at"]),
                 }
                 for row in rows
@@ -3692,8 +3850,27 @@ def _workspace_task_attachments_response(task_id: str) -> Optional[dict]:
         conn.close()
 
 
+class _WorkspaceAttachmentUnavailable(OSError):
+    """The attachment IS authorized and its bytes could not be served.
+
+    An ``OSError`` subclass, so ``_workspace_maybe_respond``'s existing
+    fail-closed arm turns it into this boundary's ordinary 503. It exists
+    because "the authority row is not there" and "the authority row is there
+    and the file behind it is short, racing, or unreadable" are different
+    facts: reporting the second as 404 told the owner a file they uploaded
+    does not exist, and hid a real storage fault.
+    """
+
+
 def _workspace_attachment_bytes(attachment_id: int):
-    """Return bounded bytes for a regular granted-board attachment, or None."""
+    """Return bounded bytes for a regular granted-board attachment, or None.
+
+    ``None`` means one thing: no authority row for this id on the granted
+    board. Everything after that row is found — a stored path outside the
+    board's own attachment root, a failed open, a size mismatch, a short read,
+    trailing bytes, an I/O error — raises
+    :class:`_WorkspaceAttachmentUnavailable`.
+    """
     conn = _workspace_ro_conn()
     if conn is None:
         return None
@@ -3709,35 +3886,52 @@ def _workspace_attachment_bytes(attachment_id: int):
         try:
             stored = Path(att.stored_path).resolve()
             stored.relative_to(root)
-        except (ValueError, OSError):
-            return None
+        except (ValueError, OSError) as exc:
+            raise _WorkspaceAttachmentUnavailable(
+                "the attachment record could not be verified"
+            ) from exc
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
             fd = os.open(stored, flags)
-        except OSError:
-            return None
+        except OSError as exc:
+            raise _WorkspaceAttachmentUnavailable(
+                "the attachment could not be opened"
+            ) from exc
         try:
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                return None
             size = int(info.st_size)
-            if size < 0 or size > KANBAN_ATTACHMENT_MAX_BYTES or size != int(att.size):
-                return None
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or size < 0
+                or size > KANBAN_ATTACHMENT_MAX_BYTES
+                or size != int(att.size)
+            ):
+                raise _WorkspaceAttachmentUnavailable(
+                    "the stored attachment does not match its record"
+                )
             chunks: list[bytes] = []
             remaining = size
             while remaining:
                 chunk = os.read(fd, min(remaining, 1024 * 1024))
                 if not chunk:
-                    return None
+                    raise _WorkspaceAttachmentUnavailable(
+                        "the stored attachment does not match its record"
+                    )
                 chunks.append(chunk)
                 remaining -= len(chunk)
             if os.read(fd, 1):
-                return None
+                raise _WorkspaceAttachmentUnavailable(
+                    "the stored attachment does not match its record"
+                )
             return att, b"".join(chunks)
-        except OSError:
-            return None
+        except _WorkspaceAttachmentUnavailable:
+            raise
+        except OSError as exc:
+            raise _WorkspaceAttachmentUnavailable(
+                "the attachment could not be read"
+            ) from exc
         finally:
             os.close(fd)
     finally:
@@ -3755,8 +3949,15 @@ def _workspace_run_response(run_id: int) -> Optional[dict]:
         # dispatcher never spawns/transitions a recommendation so this is
         # not reachable in practice, but this credential's read path does
         # not rely on that being true elsewhere.
+        # The task's persisted owner-approved route travels with the run so the
+        # receipt is validated against that exact pin, not against any route
+        # the role admits. Selected schema-aware: this connection is read-only,
+        # so a board that predates the pin columns must project as "unlocked"
+        # rather than fail — and a GET must never migrate a schema.
         row = conn.execute(
-            "SELECT r.* FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            "SELECT r.*"
+            + owner_workspace.owner_task_pin_select(conn, "t")
+            + " FROM task_runs r JOIN tasks t ON t.id = r.task_id "
             "WHERE r.id = ? AND t.task_kind = 'work'",
             (run_id,),
         ).fetchone()
@@ -3767,7 +3968,9 @@ def _workspace_run_response(run_id: int) -> Optional[dict]:
             "run": {
                 "started_at": _workspace_iso_timestamp(r.started_at),
                 "finished_at": _workspace_iso_timestamp(r.ended_at),
-                "receipt": owner_workspace._owner_project_run_receipt(r),
+                "receipt": owner_workspace._owner_project_run_receipt(
+                    r, owner_workspace.owner_task_route_pin(row)
+                ),
             }
         }
     finally:
@@ -4009,7 +4212,12 @@ def _enforce_managed_recommendations_scope(
     """Bind the managed owner inbox to the native Workspace project/board."""
     if not _is_managed_recommendations_call(request):
         return
-    snapshot = _workspace_scope_snapshot()
+    try:
+        snapshot = _workspace_scope_snapshot()
+    except (KeyError, OSError, TypeError, ValueError, sqlite3.Error) as exc:
+        raise HTTPException(
+            status_code=503, detail="Service Unavailable"
+        ) from exc
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Not Found")
     project, board_meta = snapshot

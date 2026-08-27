@@ -102,7 +102,7 @@ _ALLOWED_PARAM_NAMES = {
     "body", "mode", "project_name", "project_description", "project_id",
     "request_title", "specification", "current_milestone",
     "owner_visible_result", "root_assignee", "tasks", "later_milestones",
-    "anchor_task_id", "trigger", "summary", "changes", "action",
+    "trigger", "summary", "changes", "action",
 }
 
 
@@ -140,30 +140,57 @@ class TestSchemas:
         assert tasks["maxItems"] == 12
         assert tasks["items"]["additionalProperties"] is False
         assert set(tasks["items"]["required"]) == {
-            "title", "body", "assignee", "responsibility", "parents",
+            "title", "body", "assignee", "responsibility", "execution_tier",
+            "parents",
         }
+        assert tasks["items"]["properties"]["execution_tier"]["enum"] == [
+            "routine", "deep",
+        ]
+
+    def test_every_created_task_schema_requires_an_admitted_execution_tier(self):
+        """No closed planner schema may leave the task class optional."""
+        changes = registry.get_entry(
+            "owner_project_plan_commit"
+        ).schema["parameters"]["properties"]["changes"]["items"]["oneOf"]
+        add, split, merge = changes[0], changes[1], changes[2]
+
+        specs = [
+            add,
+            split["properties"]["replacements"]["items"],
+            merge["properties"]["replacement"],
+        ]
+        for spec in specs:
+            assert "execution_tier" in spec["required"]
+            assert spec["properties"]["execution_tier"]["enum"] == ["routine", "deep"]
+            # The planner classifies risk; it never names a runtime route.
+            assert not {"model", "provider", "reasoning_effort"} & set(
+                spec["properties"]
+            )
 
     def test_task_move_requires_full_cas_precondition(self):
         entry = registry.get_entry("owner_task_move")
         required = set(entry.schema["parameters"]["required"])
         assert required == {
-            "idempotency_key", "task_id", "to_status",
+            "idempotency_key", "project_id", "task_id", "to_status",
             "expected_status", "expected_revision",
         }
         assert set(entry.schema["parameters"]["properties"]) == {
             "idempotency_key", "task_id", "to_status",
-            "expected_status", "expected_revision", "board",
+            "expected_status", "expected_revision", "project_id",
         }
 
     def test_project_plan_requires_bounded_exact_changes(self):
         entry = registry.get_entry("owner_project_plan_commit")
         params = entry.schema["parameters"]
         assert params["additionalProperties"] is False
+        # No caller-named anchor: the Project's hidden control row is resolved
+        # inside the kernel from its committed receipt.
         assert set(params["required"]) == {
-            "idempotency_key", "project_id", "anchor_task_id", "trigger",
+            "idempotency_key", "project_id", "trigger",
             "request_title", "summary", "specification", "current_milestone",
             "owner_visible_result", "later_milestones", "changes",
         }
+        assert "anchor_task_id" not in params["properties"]
         assert params["properties"]["changes"]["maxItems"] == 12
         assert len(params["properties"]["changes"]["items"]["oneOf"]) == 5
 
@@ -174,9 +201,9 @@ class TestSchemas:
     def test_task_comment_requires_task_id_and_body(self):
         entry = registry.get_entry("owner_task_comment")
         required = set(entry.schema["parameters"]["required"])
-        assert required == {"idempotency_key", "task_id", "body"}
+        assert required == {"idempotency_key", "project_id", "task_id", "body"}
         assert set(entry.schema["parameters"]["properties"]) == {
-            "idempotency_key", "task_id", "body", "board",
+            "idempotency_key", "project_id", "task_id", "body",
         }
 
 
@@ -269,7 +296,7 @@ class TestTrustedContextResolution:
         kernel = _RecordingKernel()
         monkeypatch.setattr(owt._kernel, "commit_project_plan", kernel)
         owt._handle_project_plan({
-            "idempotency_key": "p1", "project_id": "project", "anchor_task_id": "anchor",
+            "idempotency_key": "p1", "project_id": "project",
             "trigger": "owner_request", "request_title": "Adapt", "summary": "Summary",
             "specification": "Spec", "current_milestone": "Now",
             "owner_visible_result": "Visible", "later_milestones": [], "changes": [],
@@ -392,14 +419,14 @@ class TestFieldDelegation:
         monkeypatch.setattr(owt._kernel, "move_task", kernel)
 
         owt._handle_task_move({
-            "idempotency_key": "k2", "task_id": "t1", "to_status": "done",
-            "expected_status": "review", "expected_revision": 3, "board": "b1",
+            "idempotency_key": "k2", "project_id": "p1", "task_id": "t1", "to_status": "done",
+            "expected_status": "review", "expected_revision": 3,
         })
 
         _, kwargs = kernel.calls[0]
         assert kwargs == {
-            "idempotency_key": "k2", "task_id": "t1", "to_status": "done",
-            "expected_status": "review", "expected_revision": 3, "board": "b1",
+            "idempotency_key": "k2", "project_id": "p1", "task_id": "t1", "to_status": "done",
+            "expected_status": "review", "expected_revision": 3,
         }
 
     def test_project_plan_passes_through_exact_fields(self, monkeypatch, trusted_ctx):
@@ -407,7 +434,7 @@ class TestFieldDelegation:
         kernel = _RecordingKernel()
         monkeypatch.setattr(owt._kernel, "commit_project_plan", kernel)
         args = {
-            "idempotency_key": "p1", "project_id": "project", "anchor_task_id": "anchor",
+            "idempotency_key": "p1", "project_id": "project",
             "trigger": "owner_request", "request_title": "Adapt", "summary": "Summary",
             "specification": "Spec", "current_milestone": "Now",
             "owner_visible_result": "Visible", "later_milestones": [],
@@ -428,6 +455,7 @@ class TestFieldDelegation:
         owt._handle_project_lifecycle({
             "idempotency_key": "lifecycle-1",
             "project_id": "p1",
+            "expected_revision": 4,
             "action": "archive",
         })
 
@@ -436,6 +464,7 @@ class TestFieldDelegation:
         assert kwargs == {
             "idempotency_key": "lifecycle-1",
             "project_id": "p1",
+            "expected_revision": 4,
             "action": "archive",
         }
 
@@ -445,12 +474,12 @@ class TestFieldDelegation:
         monkeypatch.setattr(owt._kernel, "comment_task", kernel)
 
         owt._handle_task_comment({
-            "idempotency_key": "k3", "task_id": "t1", "body": "hi there", "board": "b1",
+            "idempotency_key": "k3", "project_id": "p1", "task_id": "t1", "body": "hi there",
         })
 
         _, kwargs = kernel.calls[0]
         assert kwargs == {
-            "idempotency_key": "k3", "task_id": "t1", "body": "hi there", "board": "b1",
+            "idempotency_key": "k3", "project_id": "p1", "task_id": "t1", "body": "hi there",
         }
 
     def test_successful_result_is_returned_verbatim_as_json(self, monkeypatch, trusted_ctx):
@@ -459,7 +488,7 @@ class TestFieldDelegation:
         monkeypatch.setattr(owt._kernel, "move_task", _RecordingKernel(return_value=result))
 
         out = owt._handle_task_move({
-            "idempotency_key": "k2", "task_id": "t1", "to_status": "done",
+            "idempotency_key": "k2", "project_id": "p1", "task_id": "t1", "to_status": "done",
             "expected_status": "review", "expected_revision": 3,
         })
 

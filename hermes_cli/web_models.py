@@ -640,6 +640,29 @@ class ProfileModelUpdate(BaseModel):
     model: str
     reasoning_effort: Optional[str] = None
     disable_fallbacks: bool = False
+    # Hermes-owned revision of this profile's effective route, as read by the
+    # caller. Sent back on write so a multi-role selection cannot half-apply
+    # over a concurrent change; omitted keeps the historical unconditional write.
+    expected_revision: Optional[str] = None
+
+
+class ProfileModelBatchEntry(BaseModel):
+    profile: str
+    provider: str
+    model: str
+    reasoning_effort: Optional[str] = None
+    expected_revision: Optional[str] = None
+
+
+class ProfileModelBatchUpdate(BaseModel):
+    """One all-or-nothing multi-role route selection.
+
+    Fallbacks are always disabled for every entry: a batch exists to put the
+    whole team on exact approved routes, and a route that can still switch
+    silently is not one of those.
+    """
+
+    assignments: List[ProfileModelBatchEntry]
 
 
 class ProfileDescribeAuto(BaseModel):

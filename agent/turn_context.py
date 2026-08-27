@@ -497,6 +497,16 @@ def build_turn_context(
         # never-raising variant OUTSIDE the argument list, so a resolution
         # failure can only lose the scope — never the whole runtime binding.
         _cache_scope = resolve_prompt_cache_scope_safe(agent) or ""
+        # The depth this turn actually runs at. On an owner-approved pinned
+        # run it is part of the route authority, so the auxiliary layer must
+        # be able to see it rather than re-deriving it from config.
+        _reasoning = getattr(agent, "reasoning_config", None)
+        _effort = ""
+        if isinstance(_reasoning, dict):
+            _effort = (
+                "none" if _reasoning.get("enabled") is False
+                else str(_reasoning.get("effort") or "")
+            )
         set_runtime_main(
             getattr(agent, "provider", "") or "",
             getattr(agent, "model", "") or "",
@@ -505,6 +515,7 @@ def build_turn_context(
             api_key=getattr(agent, "api_key", "") or "",
             api_mode=getattr(agent, "api_mode", "") or "",
             auth_mode=getattr(agent, "auth_mode", "") or "",
+            reasoning_effort=_effort,
             session_id=getattr(agent, "session_id", "") or "",
             cache_scope=_cache_scope,
         )
