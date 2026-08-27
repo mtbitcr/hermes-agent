@@ -258,16 +258,22 @@ class ModelsManageTokenProvider(WorkspaceReadTokenProvider):
 
 
 def register(ctx) -> None:
-    """Plugin entry — registers the provider and the CLI command tree.
+    """Plugin entry — registers the provider, worker tool, and CLI command tree.
 
     Always registers (see module docstring): there is no weak-secret gate to
-    fail here because there is no operator-supplied secret at all.
+    fail here because there is no operator-supplied secret at all. The sandbox
+    tool carries its own fail-closed ``check_fn``, so it stays out of every
+    schema except the dispatcher-owned Claude coding worker's.
     """
     from plugins.dashboard_auth.raphael_workspace.model_policy import (
         register_models_machine_routes,
     )
+    from plugins.dashboard_auth.raphael_workspace.sandbox_dispatch import (
+        register_sandbox_tool,
+    )
 
     register_models_machine_routes()
+    register_sandbox_tool(ctx)
     ctx.register_dashboard_auth_provider(WorkspaceReadTokenProvider())
     ctx.register_dashboard_auth_provider(RecommendationsReadTokenProvider())
     ctx.register_dashboard_auth_provider(ConnectionsManageTokenProvider())

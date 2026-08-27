@@ -172,6 +172,49 @@ class TestSchemas:
                 spec["properties"]
             )
 
+    def test_every_created_task_schema_states_the_ownership_scope_rule(self):
+        """The planner must hold the scope rule before it asks for approval.
+
+        Tool schemas arrive with the tool list, so the ``owned_paths``
+        description is what puts the rule in front of the main Raphael planner
+        while it is still drafting — not after an owner has already approved a
+        task whose NULL scope the trusted Server 2 dispatch would then refuse
+        to provision a coding sandbox for. One shared definition means the
+        rule cannot drift between the two planner tools.
+        """
+        graph_task = registry.get_entry(
+            "owner_task_graph_commit"
+        ).schema["parameters"]["properties"]["tasks"]["items"]
+        changes = registry.get_entry(
+            "owner_project_plan_commit"
+        ).schema["parameters"]["properties"]["changes"]["items"]["oneOf"]
+        add, split, merge = changes[0], changes[1], changes[2]
+        replace = next(
+            change for change in changes
+            if change["properties"]["action"] == {"const": "replace"}
+        )
+
+        specs = [
+            graph_task,
+            add,
+            replace["properties"]["replacement"],
+            split["properties"]["replacements"]["items"],
+            merge["properties"]["replacement"],
+        ]
+        for spec in specs:
+            assert spec["properties"]["owned_paths"] is owt._OWNED_PATHS
+            # Still optional: a proposal committed before the field existed
+            # replays unchanged rather than failing validation.
+            assert "owned_paths" not in spec["required"]
+
+        text = owt._OWNED_PATHS["description"]
+        assert "repository-executing or coding task MUST state its scope" in text
+        assert "[] only for genuinely read-only repository work" in text
+        assert (
+            "['.'] only when whole-repository mutation is actually approved" in text
+        )
+        assert "cannot provision a coding sandbox" in text
+
     def test_task_move_requires_full_cas_precondition(self):
         entry = registry.get_entry("owner_task_move")
         required = set(entry.schema["parameters"]["required"])

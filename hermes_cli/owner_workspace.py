@@ -1084,6 +1084,48 @@ def _graph_root_route(tasks: list[dict], root_assignee: str) -> dict:
     return _resolved_route_pin(root_assignee, tier, "root_assignee")
 
 
+def _normalize_ownership_scope(value: Any, field: str) -> Optional[list[str]]:
+    """Canonicalise one task's explicit repository write boundary.
+
+    Absent (``None``) keeps the historical, fail-closed whole-repository
+    ownership every owner-created task had before this field existed, so no
+    committed proposal changes shape. A present value is the owner-approved
+    boundary and goes through the native
+    :func:`kanban_db.normalize_owned_paths` contract — literal canonical
+    relative POSIX paths, no globs, no ``..``, no ``.git`` — so a malformed
+    scope is refused here rather than reaching a worktree. The scope is never
+    inferred from an assignee, responsibility or tier.
+    """
+    if value is None:
+        return None
+    try:
+        return kanban_db.normalize_owned_paths(value)
+    except ValueError as exc:
+        raise OwnerWorkspaceError(
+            "invalid_ownership_scope", f"{field}.owned_paths: {exc}",
+        ) from exc
+
+
+def _assert_ownership_scope_repository(
+    specs: list[Optional[list[str]]], *, project_repo: Optional[str], field: str,
+) -> None:
+    """A mutating scope is only meaningful inside a Project repository.
+
+    ``create_task`` anchors a scoped task's isolated worktree under the
+    Project's primary repo; without one it would have to fall back to a
+    scratch workspace, which the native contract refuses. Checking here means
+    the owner is never asked to approve a plan that cannot be applied.
+    """
+    if not any(scope for scope in specs):
+        return
+    if not project_repo:
+        raise OwnerWorkspaceError(
+            "ownership_scope_unavailable",
+            f"{field} declares repository ownership, but this Project has no "
+            "primary repository folder to scope a worktree in",
+        )
+
+
 def _normalize_graph_tasks(tasks: Any) -> list[dict]:
     """Validate one executable milestone, never a fake whole-project backlog."""
     if not isinstance(tasks, list) or not tasks:
@@ -1147,14 +1189,21 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
             if parent not in clean_parents:
                 clean_parents.append(parent)
 
-        normalized.append({
+        entry = {
             "title": title,
             "body": redact_sensitive_text(body, force=True),
             "assignee": assignee,
             "responsibility": responsibility,
             "parents": clean_parents,
             **route_pin,
-        })
+        }
+        if "owned_paths" in raw:
+            # Only carried when the approved proposal states it, so a task
+            # committed without the field keeps its historical NULL scope.
+            entry["owned_paths"] = _normalize_ownership_scope(
+                raw.get("owned_paths"), f"tasks[{index}]",
+            )
+        normalized.append(entry)
 
     # Reject the whole request before approval or persistence when sibling
     # dependencies cycle. decompose_triage_task repeats this at the DB boundary.
@@ -1523,6 +1572,21 @@ def commit_task_graph(
                 "project_not_owned",
                 "the Project is not owned by this trusted owner receipt",
             )
+        # mode='new' creates a Project with no folders at all (see
+        # :func:`bootstrap`), so a mutating scope can only be honored against a
+        # Project whose repository the operator already attached.
+        existing_project = (
+            projects_db.get_project(pconn, canonical_project_id)
+            if mode == "existing"
+            else None
+        )
+        _assert_ownership_scope_repository(
+            [task["owned_paths"] for task in normalized_tasks if "owned_paths" in task],
+            project_repo=(
+                existing_project.primary_path if existing_project is not None else None
+            ),
+            field="tasks",
+        )
         state, row, token = _acquire_or_replay(
             pconn, ctx, idempotency_key, operation, digest,
         )
@@ -3954,11 +4018,12 @@ def _normalize_project_task_spec(
     required = {
         "title", "body", "assignee", "execution_tier",
     } | ({"parents"} if parent_limit is not None else set())
-    allowed = required | {"responsibility"}
+    allowed = required | {"responsibility", "owned_paths"}
     if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(allowed):
         raise OwnerWorkspaceError(
             "invalid_argument",
-            f"{field} must contain {sorted(required)} and only optional responsibility",
+            f"{field} must contain {sorted(required)} and only optional "
+            "responsibility and owned_paths",
         )
     raw = value
     from agent.redact import redact_sensitive_text
@@ -3976,6 +4041,8 @@ def _normalize_project_task_spec(
         )
     except ValueError as exc:
         raise OwnerWorkspaceError("invalid_argument", str(exc)) from exc
+    if "owned_paths" in raw:
+        result["owned_paths"] = _normalize_ownership_scope(raw["owned_paths"], field)
     result.update(
         _resolved_route_pin(
             result["assignee"], raw["execution_tier"], f"{field}.execution_tier",
@@ -4025,12 +4092,12 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
                 "action", "reason", "title", "body", "assignee", "execution_tier",
                 "existing_parents", "new_parents",
             }
-            allowed = required | {"responsibility"}
+            allowed = required | {"responsibility", "owned_paths"}
             if not required.issubset(item) or not set(item).issubset(allowed):
                 raise OwnerWorkspaceError(
                     "invalid_argument",
                     f"{field} must contain {sorted(required)} and only optional "
-                    "responsibility",
+                    "responsibility and owned_paths",
                 )
             raw = item
             existing = raw["existing_parents"]
@@ -4059,6 +4126,11 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
                         for key in ("title", "body", "assignee", "execution_tier")
                     },
                     "responsibility": raw.get("responsibility"),
+                    **(
+                        {"owned_paths": raw["owned_paths"]}
+                        if "owned_paths" in raw
+                        else {}
+                    ),
                 },
                 field,
                 parent_limit=None,
@@ -4194,6 +4266,20 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
         if normalized[0]["action"] in {"merge", "cancel"}
         else "standard"
     )
+
+
+def _plan_ownership_scopes(changes: list[dict]) -> list[Optional[list[str]]]:
+    """Every explicit ownership scope one normalized plan would persist."""
+    scopes: list[Optional[list[str]]] = []
+    for change in changes:
+        for spec in (
+            *([change] if change["action"] == "add" else []),
+            *([change["replacement"]] if "replacement" in change else []),
+            *change.get("replacements", []),
+        ):
+            if "owned_paths" in spec:
+                scopes.append(spec["owned_paths"])
+    return scopes
 
 
 def _resolve_existing_project_board(
@@ -4708,6 +4794,11 @@ def commit_project_plan(
             _activate_committed_owner_work(committed)
             return committed
         project, board_slug = _resolve_existing_project_board(pconn, project_id)
+        _assert_ownership_scope_repository(
+            _plan_ownership_scopes(normalized_changes),
+            project_repo=project.primary_path,
+            field="changes",
+        )
         kconn = kanban_db.connect(board=board_slug)
         try:
             anchor = _classify_project_anchor(
