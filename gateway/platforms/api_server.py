@@ -2382,6 +2382,7 @@ class ResponseStore:
         owner_text: Optional[str] = None
         raphael_text: Optional[str] = None
         incomplete = False
+        owner_turn_truncated = False
 
         def _flush() -> None:
             nonlocal owner_text, raphael_text, incomplete
@@ -2424,10 +2425,12 @@ class ResponseStore:
                 text = content.strip()
                 _flush()
                 if len(text) > _OWNER_HISTORY_OWNER_MAX_CHARS:
-                    raise OwnerAuthorityBroken(
-                        f"owner conversation {name} has an owner turn that "
-                        "cannot be projected"
+                    text = (
+                        "[Earlier owner message omitted from this view because it "
+                        "exceeded the safe display limit. The native record remains "
+                        "unchanged.]"
                     )
+                    owner_turn_truncated = True
                 owner_text = redact_sensitive_text(text, force=True)
                 continue
             if role != "assistant" or owner_text is None:
@@ -2472,7 +2475,9 @@ class ResponseStore:
                 )
             raphael_text = projected_text
         _flush()
-        truncated = len(turns) > _OWNER_HISTORY_TURN_LIMIT
+        truncated = (
+            owner_turn_truncated or len(turns) > _OWNER_HISTORY_TURN_LIMIT
+        )
         data = turns[-_OWNER_HISTORY_TURN_LIMIT:]
         proposal_response_id = row[1]
         proposal_consumed = (

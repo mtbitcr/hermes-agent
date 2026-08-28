@@ -2457,7 +2457,6 @@ class TestResponseStore:
             {"role": "user", "content": None},
             {"role": "user", "content": ["multimodal"]},
             {"role": "user", "content": "   "},
-            {"role": "user", "content": "x" * 12_001},
         ],
     )
     def test_a_malformed_owner_turn_fails_instead_of_merging_turns(
@@ -2473,6 +2472,31 @@ class TestResponseStore:
         ])
         with pytest.raises(OwnerAuthorityBroken):
             store.owner_history_snapshot(name)
+
+    def test_an_oversized_owner_turn_preserves_its_boundary_and_reports_truncation(
+        self,
+    ):
+        oversized = "x" * 12_001
+        first_reply = self._question("First reply?")
+        second_reply = self._question("Second reply?")
+        store, name = self._owner_store([
+            {"role": "user", "content": "First ask."},
+            {"role": "assistant", "content": first_reply},
+            {"role": "user", "content": oversized},
+            {"role": "assistant", "content": second_reply},
+        ])
+
+        snapshot = store.owner_history_snapshot(name)
+
+        assert [turn["raphael"] for turn in snapshot["data"]] == [
+            first_reply, second_reply,
+        ]
+        assert snapshot["data"][1]["owner"] == (
+            "[Earlier owner message omitted from this view because it exceeded "
+            "the safe display limit. The native record remains unchanged.]"
+        )
+        assert oversized not in json.dumps(snapshot["data"])
+        assert snapshot["truncated"] is True
 
     def test_an_unprojectable_final_reply_fails_instead_of_showing_an_older_one(
         self,
