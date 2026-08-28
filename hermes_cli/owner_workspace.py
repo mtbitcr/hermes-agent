@@ -4282,6 +4282,48 @@ def _plan_ownership_scopes(changes: list[dict]) -> list[Optional[list[str]]]:
     return scopes
 
 
+def _inherit_replaced_ownership_scopes(
+    kconn: sqlite3.Connection, changes: list[dict], *, project_id: str,
+) -> None:
+    """Carry a superseded task's own boundary onto its one-to-one successor.
+
+    A ``replace`` is the only one-to-one change: exactly one existing task is
+    archived and exactly one successor continues its work, its parents and its
+    children. When the approved replacement states no scope, the successor
+    therefore keeps the boundary the source already had, resolved from
+    committed board state — never guessed from the assignee, responsibility or
+    tier, and never applied to ``add``/``split``/``merge``, whose successors
+    are not one-to-one continuations of a single source.
+
+    A source carrying ``owned_paths IS NULL`` on a repository worktree is the
+    legacy spelling of exclusive whole-repository ownership. Only a literal
+    boundary can be provisioned — the trusted sandbox provisioner fails closed
+    rather than infer one — so that same meaning is written out as ``["."]``.
+    That is a representation repair, not additional authority: the claim-time
+    scope arithmetic already treats both spellings as whole-repository and
+    exclusive. An unscoped scratch (non-repository) source has no repository
+    authority to carry, so its successor stays unscoped.
+    """
+    for change in changes:
+        if change["action"] != "replace":
+            continue
+        replacement = change["replacement"]
+        if "owned_paths" in replacement:
+            # An explicitly approved boundary is the owner's decision and is
+            # never overridden by what the superseded task happened to hold.
+            continue
+        source = kanban_db.get_task(kconn, change["target"]["task_id"])
+        if source is None or source.project_id != project_id:
+            # Not a resolvable work task of this Project: the plan's atomic
+            # snapshot check refuses it, so infer nothing here.
+            continue
+        scope = _normalize_ownership_scope(source.owned_paths, "changes")
+        if scope is None and source.workspace_kind == "worktree":
+            scope = kanban_db.normalize_owned_paths(["."])
+        if scope is not None:
+            replacement["owned_paths"] = scope
+
+
 def _resolve_existing_project_board(
     pconn: sqlite3.Connection, project_id: str, *, allow_archived: bool = False,
 ):
@@ -4794,13 +4836,20 @@ def commit_project_plan(
             _activate_committed_owner_work(committed)
             return committed
         project, board_slug = _resolve_existing_project_board(pconn, project_id)
-        _assert_ownership_scope_repository(
-            _plan_ownership_scopes(normalized_changes),
-            project_repo=project.primary_path,
-            field="changes",
-        )
         kconn = kanban_db.connect(board=board_slug)
         try:
+            # Before the scope check, so a boundary inherited from a superseded
+            # task is held to exactly the same repository requirement as an
+            # explicitly approved one and the owner is never asked to approve a
+            # plan that cannot be applied.
+            _inherit_replaced_ownership_scopes(
+                kconn, normalized_changes, project_id=project_id,
+            )
+            _assert_ownership_scope_repository(
+                _plan_ownership_scopes(normalized_changes),
+                project_repo=project.primary_path,
+                field="changes",
+            )
             anchor = _classify_project_anchor(
                 pconn,
                 kconn,
