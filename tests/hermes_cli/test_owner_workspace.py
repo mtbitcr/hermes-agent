@@ -3400,6 +3400,265 @@ def test_project_plan_replace_carries_an_explicit_ownership_scope(ctx, tmp_path)
     assert replay == result
 
 
+@pytest.mark.parametrize(
+    ("case", "source_scope"),
+    [("mutating", ["src/api", "tests/api"]), ("read-only", [])],
+    ids=["mutating", "read-only"],
+)
+def test_project_plan_replace_inherits_an_explicit_source_boundary(
+    ctx, tmp_path, case, source_scope
+):
+    """A replacement that states no scope inherits the source's exact one.
+
+    The source already carries an owner-approved canonical boundary, so the
+    one-to-one successor continues its work under precisely that boundary —
+    neither narrowed nor widened. In particular an explicitly read-only
+    ``[]`` source stays read-only: it is a stated boundary, not the absent
+    (``None``) legacy spelling that resolves to whole-repository ``["."]``.
+    """
+    setup = _bootstrap_board(ctx)
+    repo = _project_repo(tmp_path, ctx, setup["project_id"])
+    with kanban_db.connect(board=setup["board"]) as conn:
+        source_id = kanban_db.create_task(
+            conn,
+            title="Bounded implementation",
+            assignee="default",
+            parents=[setup["task_id"]],
+            project_id=setup["project_id"],
+            owned_paths=source_scope,
+        )
+        source = kanban_db.get_task(conn, source_id)
+        # The canonical boundary as the board actually stored it, which is
+        # what the successor has to end up holding.
+        stored_scope = source.owned_paths
+        assert stored_scope == source_scope
+        assert source.workspace_kind == "worktree"
+        source_ref = _project_task_ref(conn, source_id)
+
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "replace",
+            "reason": "Retry the same bounded work after it stalled.",
+            "target": source_ref,
+            "replacement": {
+                "title": "Retry of the bounded implementation",
+                "body": "Continue within the boundary already approved.",
+                "assignee": "default",
+                "execution_tier": "deep",
+                "responsibility": "R09",
+            },
+        }],
+        idempotency_key=f"steward-replace-inherit-{case}",
+    )
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result["ok"] is True
+    replacement_id = result["created_task_ids"][0]
+    with kanban_db.connect(board=setup["board"]) as conn:
+        replacement = kanban_db.get_task(conn, replacement_id)
+        # Exactly the source's boundary, with no fail-closed widening to
+        # whole-repository ownership and no silent unscoping.
+        assert replacement.owned_paths == stored_scope
+        assert replacement.owned_paths != ["."]
+        assert replacement.workspace_kind == "worktree"
+        assert replacement.workspace_path == str(
+            repo / ".worktrees" / replacement_id
+        )
+        assert kanban_db.get_task(conn, source_id).status == "archived"
+
+    replay = _commit_project_plan(ctx, **args)
+    assert replay == result
+    with kanban_db.connect(board=setup["board"]) as conn:
+        # Replay neither re-inherits into a second task nor rewrites the scope.
+        assert kanban_db.get_task(conn, replacement_id).owned_paths == stored_scope
+
+
+def test_project_plan_replace_inherits_a_legacy_worktree_boundary(ctx, tmp_path):
+    """A one-to-one replacement of a legacy task keeps that task's boundary.
+
+    ``owned_paths IS NULL`` on a repository worktree task already means
+    exclusive whole-repository ownership, but only the literal ``["."]`` can
+    be provisioned: the trusted sandbox provisioner refuses to infer a
+    boundary. Omitting the scope on the replacement therefore normalizes the
+    representation of the boundary the source task already had — it does not
+    widen it.
+    """
+    setup = _bootstrap_board(ctx)
+    repo = _project_repo(tmp_path, ctx, setup["project_id"])
+    with kanban_db.connect(board=setup["board"]) as conn:
+        source_id = kanban_db.create_task(
+            conn,
+            title="Legacy unscoped implementation",
+            assignee="default",
+            parents=[setup["task_id"]],
+            project_id=setup["project_id"],
+        )
+        downstream_id = kanban_db.create_task(
+            conn,
+            title="Review the repaired implementation",
+            assignee="default",
+            parents=[source_id],
+            project_id=setup["project_id"],
+        )
+        source = kanban_db.get_task(conn, source_id)
+        # The reproduced failure's exact source shape.
+        assert source.owned_paths is None
+        assert source.workspace_kind == "worktree"
+        source_ref = _project_task_ref(conn, source_id)
+
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "replace",
+            "reason": "The earlier attempt stopped before producing a result.",
+            "target": source_ref,
+            "replacement": {
+                "title": "Repair the stopped implementation",
+                "body": "Continue the same bounded delivery chain.",
+                "assignee": "default",
+                "execution_tier": "deep",
+                "responsibility": "R07",
+            },
+        }],
+        idempotency_key="steward-replace-legacy-scope",
+    )
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result["ok"] is True
+    replacement_id = result["created_task_ids"][0]
+    with kanban_db.connect(board=setup["board"]) as conn:
+        replacement = kanban_db.get_task(conn, replacement_id)
+        # The source's own exclusive whole-repository boundary, made literal.
+        assert replacement.owned_paths == ["."]
+        assert replacement.workspace_kind == "worktree"
+        assert replacement.workspace_path == str(
+            repo / ".worktrees" / replacement_id
+        )
+        # History and dependency edges survive the one-to-one replacement.
+        assert kanban_db.get_task(conn, source_id).status == "archived"
+        assert kanban_db.parent_ids(conn, replacement_id) == [setup["task_id"]]
+        assert replacement_id in kanban_db.parent_ids(conn, downstream_id)
+
+    replay = _commit_project_plan(ctx, **args)
+    assert replay == result
+    with kanban_db.connect(board=setup["board"]) as conn:
+        assert kanban_db.get_task(conn, replacement_id).owned_paths == ["."]
+
+
+def test_project_plan_replace_of_a_scratch_task_invents_no_boundary(ctx):
+    """An unscoped non-repository source stays unscoped — no repo authority."""
+    setup = _bootstrap_board(ctx)  # bootstrap attaches no repository folder
+    with kanban_db.connect(board=setup["board"]) as conn:
+        source_id = kanban_db.create_task(
+            conn,
+            title="Scratch investigation",
+            assignee="default",
+            parents=[setup["task_id"]],
+            project_id=setup["project_id"],
+        )
+        source = kanban_db.get_task(conn, source_id)
+        assert source.owned_paths is None
+        assert source.workspace_kind == "scratch"
+        source_ref = _project_task_ref(conn, source_id)
+
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(
+        ctx, **_project_plan_args(
+            setup,
+            [{
+                "action": "replace",
+                "reason": "Retry the investigation with a sharper question.",
+                "target": source_ref,
+                "replacement": {
+                    "title": "Retry the investigation",
+                    "body": "Report findings; there is no repository here.",
+                    "assignee": "default",
+                    "execution_tier": "routine",
+                    "responsibility": "R07",
+                },
+            }],
+            idempotency_key="steward-replace-scratch-scope",
+        )
+    )
+    approver.join()
+
+    assert result["ok"] is True
+    with kanban_db.connect(board=setup["board"]) as conn:
+        replacement = kanban_db.get_task(conn, result["created_task_ids"][0])
+        assert replacement.owned_paths is None
+        assert replacement.workspace_kind == "scratch"
+
+
+@pytest.mark.parametrize("action", ["split", "merge"])
+def test_only_a_one_to_one_replace_inherits_a_source_boundary(ctx, tmp_path, action):
+    """Split and merge are not one-to-one, so nothing is inherited for them."""
+    setup = _bootstrap_board(ctx)
+    _project_repo(tmp_path, ctx, setup["project_id"])
+    spec = {
+        "title": "Successor work item",
+        "body": "No boundary is declared for this successor.",
+        "assignee": "default",
+        "execution_tier": "routine",
+        "responsibility": "R07",
+    }
+    with kanban_db.connect(board=setup["board"]) as conn:
+        target = _project_task_ref(
+            conn,
+            kanban_db.create_task(
+                conn,
+                title="First legacy item",
+                assignee="default",
+                parents=[setup["task_id"]],
+                project_id=setup["project_id"],
+            ),
+        )
+        sibling = _project_task_ref(
+            conn,
+            kanban_db.create_task(
+                conn,
+                title="Second legacy item",
+                assignee="default",
+                parents=[setup["task_id"]],
+                project_id=setup["project_id"],
+            ),
+        )
+    if action == "split":
+        change = {
+            "action": "split", "reason": "Split the legacy item in two.",
+            "target": target,
+            "replacements": [
+                {**spec, "parents": []},
+                {**spec, "parents": []},
+            ],
+        }
+    else:
+        change = {
+            "action": "merge", "reason": "Merge the legacy items into one.",
+            "targets": [target, sibling], "replacement": spec,
+        }
+
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(
+        ctx, **_project_plan_args(
+            setup, [change], idempotency_key=f"steward-no-inherit-{action}",
+        )
+    )
+    approver.join()
+
+    assert result["ok"] is True
+    with kanban_db.connect(board=setup["board"]) as conn:
+        scopes = [
+            kanban_db.get_task(conn, task_id).owned_paths
+            for task_id in result["created_task_ids"]
+        ]
+    assert scopes == [None] * len(scopes)
+
+
 @pytest.mark.parametrize("action", ["add", "replace", "split", "merge"])
 def test_every_plan_action_that_creates_a_task_can_carry_a_scope(
     ctx, tmp_path, action
