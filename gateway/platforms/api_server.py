@@ -5626,6 +5626,20 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
+class _AgentTurnInactivityTimeout(RuntimeError):
+    """One API-server turn the inactivity watchdog abandoned.
+
+    Raised by ``_run_agent`` when ``gateway.run``'s existing
+    ``agent.gateway_timeout`` watchdog fired and the executor worker still has
+    not returned.  Without it the ``await`` on that worker is unbounded: a
+    wedged ``run_conversation`` parks the background owner-response task
+    forever, so the response stays ``in_progress``, its job lease keeps being
+    heartbeated, and only a restart sweep ever makes it terminal.  Surfacing
+    the abandonment as an ordinary exception is what lets the background task
+    reach a terminal state on its own.
+    """
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -10448,6 +10462,29 @@ class APIServerAdapter(BasePlatformAdapter):
                     "response": response,
                 }, profile=response_profile)
 
+            def _terminalize_background(response: dict) -> None:
+                """Record ONE interrupted terminal ending, or leave it recoverable.
+
+                Every ending that produced no turn — the inactivity timeout, a
+                cancellation, a failed compute, and a finalizer or publication
+                that raised — funnels through the same single transaction, so a
+                response can never be made terminal twice or half-terminal. If
+                that transaction itself fails there is nothing more this task
+                can safely do: the job row deliberately survives, and a later
+                recovery sweep is what finishes the response. Raising instead
+                would kill this task with the response still ``in_progress``,
+                which is the very ending this guard exists to prevent.
+                """
+                try:
+                    _store_terminal_background(response, interrupted=True)
+                except Exception:
+                    logger.exception(
+                        "[api_server] could not store the terminal body for "
+                        "background response %s; its recovery job survives for "
+                        "a later sweep",
+                        response_id,
+                    )
+
             async def _run_background_response() -> None:
                 in_progress = dict(queued_response)
                 in_progress["status"] = "in_progress"
@@ -10455,15 +10492,104 @@ class APIServerAdapter(BasePlatformAdapter):
                     **pending_store_data,
                     "response": in_progress,
                 }, profile=response_profile)
+                # Everything after the compute — finalizing the result,
+                # publishing the owner turn, the non-owner head swap and the
+                # unpublished handling — is inside the guard too. Unguarded, an
+                # exception from any of them escaped this coroutine with no
+                # terminal state recorded at all, leaving the response
+                # ``in_progress`` forever: the same symptom as a wedged worker,
+                # reached from the other side of the await.
                 try:
                     result, usage = await _compute_response()
+                    response_data, full_history, effective_session_id = (
+                        self._finalize_response_result(
+                            response_id=response_id,
+                            created_at=created_at,
+                            model=model_name,
+                            conversation_history=conversation_history,
+                            user_message=user_message,
+                            session_id=session_id,
+                            result=result,
+                            usage=usage,
+                            background=True,
+                        )
+                    )
+                    published = True
+                    if is_owner_conversation:
+                        # ONE commit for the whole publication, exactly as the
+                        # standard and streaming paths do — plus, on this path,
+                        # the retirement of the recovery job the 202 reserved.
+                        published = _publish_owner_turn(
+                            response_data, full_history, effective_session_id,
+                            release_job=True,
+                        )
+                    else:
+                        self._response_store.put(response_id, {
+                            "response": response_data,
+                            "conversation_history": full_history,
+                            "instructions": instructions,
+                            "session_id": effective_session_id,
+                        }, profile=response_profile)
+                        if conversation:
+                            published = self._response_store.set_conversation(
+                                conversation,
+                                response_id,
+                                owner_proposal=(
+                                    _owner_history_has_actionable_final_proposal(
+                                        full_history
+                                    )
+                                ),
+                                profile=response_profile,
+                                reservation_id=conversation_reservation_id,
+                                expected_previous_response_id=(
+                                    expected_predecessor
+                                    if expected_predecessor_stated
+                                    else _UNSTATED
+                                ),
+                            )
+                    if not published:
+                        failed = dict(response_data)
+                        failed.update({
+                            "status": "failed",
+                            "output": [],
+                            "error": {
+                                "code": "owner_conversation_locked",
+                                "message": "Owner conversation changed before this response completed",
+                            },
+                        })
+                        # Publication failure is still a terminal outcome for
+                        # THIS response, so its job retires with the terminal
+                        # body — and only with it. If this write fails the job
+                        # survives and a later sweep recovers the response.
+                        if is_owner_conversation:
+                            self._response_store.store_terminal_owner_response(
+                                profile=response_profile,
+                                response_id=response_id,
+                                data={
+                                    "response": failed,
+                                    "conversation_history": list(conversation_history),
+                                    "instructions": instructions,
+                                    "session_id": effective_session_id,
+                                },
+                                release_job=True,
+                                conversation=str(conversation),
+                                interrupted=True,
+                            )
+                            _stop_reservation_heartbeat()
+                        else:
+                            self._response_store.put(response_id, {
+                                "response": failed,
+                                "conversation_history": list(conversation_history),
+                                "instructions": instructions,
+                                "session_id": effective_session_id,
+                            }, profile=response_profile)
                 except asyncio.CancelledError:
                     incomplete = dict(queued_response)
                     incomplete.update({
                         "status": "incomplete",
                         "incomplete_details": {"reason": "cancelled"},
                     })
-                    _store_terminal_background(incomplete, interrupted=True)
+                    _terminalize_background(incomplete)
                     raise
                 except Exception as exc:
                     safe_error = _redact_api_error_text(exc)
@@ -10480,91 +10606,8 @@ class APIServerAdapter(BasePlatformAdapter):
                             "message": safe_error,
                         },
                     })
-                    _store_terminal_background(failed, interrupted=True)
+                    _terminalize_background(failed)
                     return
-
-                response_data, full_history, effective_session_id = (
-                    self._finalize_response_result(
-                        response_id=response_id,
-                        created_at=created_at,
-                        model=model_name,
-                        conversation_history=conversation_history,
-                        user_message=user_message,
-                        session_id=session_id,
-                        result=result,
-                        usage=usage,
-                        background=True,
-                    )
-                )
-                published = True
-                if is_owner_conversation:
-                    # ONE commit for the whole publication, exactly as the
-                    # standard and streaming paths do — plus, on this path, the
-                    # retirement of the recovery job the 202 reserved.
-                    published = _publish_owner_turn(
-                        response_data, full_history, effective_session_id,
-                        release_job=True,
-                    )
-                else:
-                    self._response_store.put(response_id, {
-                        "response": response_data,
-                        "conversation_history": full_history,
-                        "instructions": instructions,
-                        "session_id": effective_session_id,
-                    }, profile=response_profile)
-                    if conversation:
-                        published = self._response_store.set_conversation(
-                            conversation,
-                            response_id,
-                            owner_proposal=(
-                                _owner_history_has_actionable_final_proposal(
-                                    full_history
-                                )
-                            ),
-                            profile=response_profile,
-                            reservation_id=conversation_reservation_id,
-                            expected_previous_response_id=(
-                                expected_predecessor
-                                if expected_predecessor_stated
-                                else _UNSTATED
-                            ),
-                        )
-                if not published:
-                    failed = dict(response_data)
-                    failed.update({
-                        "status": "failed",
-                        "output": [],
-                        "error": {
-                            "code": "owner_conversation_locked",
-                            "message": "Owner conversation changed before this response completed",
-                        },
-                    })
-                    # Publication failure is still a terminal outcome for THIS
-                    # response, so its job retires with the terminal body — and
-                    # only with it. If this write fails the job survives and a
-                    # later sweep recovers the response.
-                    if is_owner_conversation:
-                        self._response_store.store_terminal_owner_response(
-                            profile=response_profile,
-                            response_id=response_id,
-                            data={
-                                "response": failed,
-                                "conversation_history": list(conversation_history),
-                                "instructions": instructions,
-                                "session_id": effective_session_id,
-                            },
-                            release_job=True,
-                            conversation=str(conversation),
-                            interrupted=True,
-                        )
-                        _stop_reservation_heartbeat()
-                    else:
-                        self._response_store.put(response_id, {
-                            "response": failed,
-                            "conversation_history": list(conversation_history),
-                            "instructions": instructions,
-                            "session_id": effective_session_id,
-                        }, profile=response_profile)
 
             async def _start_background_response():
                 if is_owner_conversation:
@@ -11804,6 +11847,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        # Inactivity-watchdog lifecycle for this turn (see the tail of this
+        # method).  The holders are filled by _run() the moment the agent
+        # exists, because only two callers pass ``agent_ref`` and the watchdog
+        # must be able to poll the live agent on every path.
+        turn_agent_holder: list = [None]
+        turn_process_epoch: list = [None]
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -11831,6 +11880,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
                     )
+                    # Publish the live agent to the inactivity watchdog before
+                    # anything can block: it reads seconds_since_activity off
+                    # this holder, and a turn that never publishes an agent can
+                    # never be judged inactive.
+                    turn_agent_holder[0] = agent
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if active_run_id:
@@ -11847,6 +11901,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     # runs its own agent lifecycle and doesn't go through
                     # TurnRunner, so it needs its own baseline.
                     _publish_turn_process_ownership(agent, effective_task_id)
+                    # Same epoch gate the disconnect reaper uses: a watchdog
+                    # reap that lands after a NEWER run claimed this task_id
+                    # must decline rather than kill that newer run's process.
+                    turn_process_epoch[0] = getattr(
+                        agent, "_gateway_turn_process_epoch", None,
+                    )
                     # Shutdown interrupt coverage (#63529).  Registering here,
                     # once, covers every _run_agent() caller — the same reason
                     # the _ProviderAuthResolutionError handler below lives here
@@ -11992,11 +12052,188 @@ class APIServerAdapter(BasePlatformAdapter):
                         self._shutdown_interruptible_agents.pop(id(agent), None)
                     clear_session_vars(tokens)
 
+        # Bound the executor await with the gateway's EXISTING inactivity
+        # lifecycle (agent.gateway_timeout / HERMES_AGENT_TIMEOUT).  Not a
+        # wall-clock limit: a turn that is actively streaming or calling tools
+        # runs as long as it likes; only genuine inactivity is abandoned.
+        # Without this the await is unbounded, so a never-returning worker
+        # parks _run_background_response at its `await _compute_response()`
+        # forever and the owner response never becomes terminal.
+        from gateway.run import _float_env, _watch_gateway_turn_inactivity
+        from tools.process_registry import process_registry
+
+        _raw_turn_timeout = _float_env("HERMES_AGENT_TIMEOUT", 1800)
+        # <= 0 is the operator opting into unbounded turns; the watchdog is
+        # disabled entirely, exactly as in gateway/run.py.
+        turn_timeout = _raw_turn_timeout if _raw_turn_timeout > 0 else None
+        # Session-scoped, like gateway/run.py's own turn task id. Blank for a
+        # sessionless caller, which makes the reap a documented no-op rather
+        # than a match against every empty-task process.
+        turn_task_id = session_id or ""
+        turn_worker_done = threading.Event()
+        turn_timeout_fired = threading.Event()
+        turn_cleanup_lock = threading.Lock()
+        # A production timeout (1800s) polls at gateway/run.py's own 5s; a
+        # small configured one has to poll proportionally faster or it could
+        # not observe its own inactivity window at all.
+        poll_interval = (
+            min(5.0, max(0.02, turn_timeout / 4.0))
+            if turn_timeout is not None else 5.0
+        )
+        # A background=true process intentionally survives a successful turn,
+        # so only children this turn created may ever be reaped.
+        turn_process_baseline = (
+            process_registry.snapshot_running_ids(turn_task_id)
+            if turn_timeout is not None else frozenset()
+        )
+
+        def _turn_is_still_current() -> bool:
+            epoch = turn_process_epoch[0]
+            if epoch is None:
+                # The turn never claimed the task_id (it wedged before the
+                # agent existed), so there is nothing of its own to protect.
+                return True
+            with _TURN_PROCESS_EPOCH_LOCK:
+                current = _TURN_PROCESS_EPOCHS.get(turn_task_id)
+            return current is None or current == epoch
+
+        def _run_with_timeout_lifecycle():
+            try:
+                return _run()
+            finally:
+                # The instant real work is done, under the same
+                # worker_done/timeout_fired/cleanup_lock protocol
+                # _abandon_timed_out_gateway_turn arbitrates with: a worker
+                # that finished can no longer be declared timed out.
+                turn_worker_done.set()
+
+        # Set from the watchdog thread once it has actually decided to abandon
+        # this turn, so the await below wakes on a decided abandonment rather
+        # than on a bare elapsed interval.
+        timeout_signal = asyncio.Event()
+
+        def _watch_turn() -> None:
+            try:
+                _watch_gateway_turn_inactivity(
+                    agent_holder=turn_agent_holder,
+                    task_id=turn_task_id,
+                    process_baseline=turn_process_baseline,
+                    timeout=turn_timeout,
+                    worker_done=turn_worker_done,
+                    timeout_fired=turn_timeout_fired,
+                    cleanup_lock=turn_cleanup_lock,
+                    poll_interval=poll_interval,
+                    is_still_current=_turn_is_still_current,
+                )
+            finally:
+                # Only a real fire wakes the awaiting turn. Losing the
+                # worker_done tiebreak inside _abandon_timed_out_gateway_turn
+                # leaves timeout_fired clear, and the worker keeps the floor.
+                if turn_timeout_fired.is_set():
+                    try:
+                        loop.call_soon_threadsafe(timeout_signal.set)
+                    except RuntimeError:  # pragma: no cover - loop closed
+                        pass
+
+        def _swallow_abandoned_result(future: "asyncio.Future") -> None:
+            """Retire an abandoned worker's late outcome without publishing it.
+
+            The turn already ended without this result, so it is fenced out by
+            construction — nothing reads the future any more. Consuming it only
+            keeps asyncio from reporting a never-retrieved exception for a turn
+            that was deliberately abandoned.
+            """
+            try:
+                future.result()
+            except BaseException:
+                pass
+            if turn_timeout_fired.is_set():
+                logger.warning(
+                    "[api_server] worker for session=%s returned after the "
+                    "inactivity watchdog abandoned its turn; the late result "
+                    "is discarded",
+                    session_id or "",
+                )
+            else:
+                # Ordinary cancellation (an SSE client disconnecting, a
+                # shutdown) also leaves a worker nobody reads any more.
+                logger.debug(
+                    "[api_server] worker for session=%s returned after its "
+                    "turn was already over",
+                    session_id or "",
+                )
+
+        watchdog: Optional[threading.Thread] = None
+        worker_future: "Optional[asyncio.Future]" = None
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
-            return await loop.run_in_executor(None, _run)
+            if turn_timeout is not None:
+                watchdog = threading.Thread(
+                    target=_watch_turn,
+                    name=f"api-turn-watchdog-{(turn_task_id or 'anon')[:12]}",
+                    daemon=True,
+                )
+                watchdog.start()
+
+            worker_future = loop.run_in_executor(None, _run_with_timeout_lifecycle)
+            if turn_timeout is None:
+                return await worker_future
+
+            fired_waiter = asyncio.ensure_future(timeout_signal.wait())
+            try:
+                await asyncio.wait(
+                    {worker_future, fired_waiter},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                fired_waiter.cancel()
+            if worker_future.done():
+                # Worker-result-wins: a real answer that landed in the same
+                # window as the watchdog's decision is still the answer, and is
+                # never thrown away for a racing timeout. This is the asyncio
+                # side of _abandon_timed_out_gateway_turn's own tiebreak.
+                return worker_future.result()
+            # The watchdog fired and the cooperative interrupt did not free the
+            # worker. Its thread cannot be killed, so abandon the future and
+            # surface the abandonment: the caller must reach a terminal state
+            # instead of waiting on a worker that may never return.
+            _idle_seconds = turn_timeout
+            _watchdog_agent = turn_agent_holder[0]
+            if _watchdog_agent is not None:
+                try:
+                    _idle_seconds = float(
+                        _watchdog_agent.get_activity_summary().get(
+                            "seconds_since_activity", turn_timeout,
+                        )
+                    )
+                except Exception:
+                    pass
+            logger.error(
+                "[api_server] abandoning wedged turn for session=%s after "
+                "%.0fs without activity (timeout %.0fs)",
+                session_id or "", _idle_seconds, turn_timeout,
+            )
+            raise _AgentTurnInactivityTimeout(
+                f"Agent was inactive for {int(turn_timeout)}s and the turn "
+                "was interrupted"
+            )
         finally:
+            # Settle the watchdog on every path — normal return, timeout,
+            # cancellation, crash — so no watchdog thread outlives its turn.
+            # Setting worker_done also closes the door on a late second fire.
+            turn_worker_done.set()
+            if watchdog is not None:
+                # It leaves worker_done.wait() the instant the event is set;
+                # the bound only covers a reap still in flight, which must not
+                # park the event loop.
+                watchdog.join(timeout=0.1)
+            if worker_future is not None and not worker_future.done():
+                # Timed out or cancelled: this turn is over and nobody will
+                # read the worker's eventual outcome again.
+                worker_future.add_done_callback(_swallow_abandoned_result)
+            # Exactly one decrement per increment above, on every path — an
+            # abandoned worker thread is not a second run to account for.
             self._inflight_agent_runs -= 1
 
     # ------------------------------------------------------------------

@@ -8091,3 +8091,534 @@ class TestOwnerAuthorityRequiresDurableStorage:
         assert "sqlite" not in response.body.decode("utf-8").lower()
         # The handler raised before doing any work; the middleware added none.
         assert reached == ["ran"]
+
+
+# ---------------------------------------------------------------------------
+# F12 — a background owner response always reaches a terminal state
+# ---------------------------------------------------------------------------
+
+
+# Small enough that the inactivity watchdog decides within a few polls. These
+# tests never wait on the real 1800s default.
+_F12_TIMEOUT = "0.2"
+_F12_REQUEST = "Prepare a private 60-minute workshop"
+_F12_RESULT = {
+    "final_response": "The workshop plan is ready.",
+    "messages": [],
+    "api_calls": 1,
+}
+_F12_USAGE = {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
+
+
+class _F12Agent:
+    """An agent whose turn does not return until the test lets it.
+
+    ``idle_seconds`` is exactly what the gateway's inactivity watchdog reads:
+    a large value is a genuinely wedged turn, ``0.0`` is a turn that is slow
+    but demonstrably still working and must therefore never be killed.  The
+    cooperative interrupt is recorded but deliberately does NOT free the
+    worker — that is the wedge that used to park the awaiting coroutine
+    forever, and the timeout has to survive it.
+    """
+
+    session_prompt_tokens = 2
+    session_completion_tokens = 3
+    session_total_tokens = 5
+
+    def __init__(
+        self,
+        release,
+        *,
+        idle_seconds: float = 9_999.0,
+        hold_seconds: float = 30.0,
+        final_response: str = "A late answer nobody is waiting for.",
+    ):
+        self._release = release
+        self._idle_seconds = idle_seconds
+        self._hold_seconds = hold_seconds
+        self._final_response = final_response
+        self.entered = threading.Event()
+        self.returned = threading.Event()
+        self.interrupts: list = []
+
+    def get_activity_summary(self):
+        return {
+            "seconds_since_activity": self._idle_seconds,
+            "last_activity_desc": "waiting for the test",
+            "api_call_count": 1,
+            "max_iterations": 10,
+            "current_tool": None,
+        }
+
+    def interrupt(self, message=None):
+        self.interrupts.append(message)
+
+    def run_conversation(self, **_kwargs):
+        self.entered.set()
+        try:
+            self._release.wait(timeout=self._hold_seconds)
+            return {
+                "final_response": self._final_response,
+                "messages": [],
+                "api_calls": 1,
+            }
+        finally:
+            self.returned.set()
+
+
+def _f12_post(cli, conversation, *, key=None, message=_F12_REQUEST):
+    """Accept one background owner turn through the public contract."""
+    return cli.post(
+        "/v1/responses",
+        json={
+            "model": "hermes-agent",
+            "input": message,
+            "conversation": conversation,
+            "background": True,
+            "store": True,
+            "expected_previous_response_id": None,
+        },
+        headers={"Idempotency-Key": key or f"response-{uuid.uuid4().hex}"},
+    )
+
+
+async def _f12_terminal(cli, response_id, *, tries=400, delay=0.01):
+    """Poll one background response until it stops being non-terminal."""
+    body = None
+    for _ in range(tries):
+        polled = await cli.get(f"/v1/responses/{response_id}")
+        assert polled.status == 200
+        body = await polled.json()
+        if body["status"] not in {"queued", "in_progress"}:
+            return body
+        await asyncio.sleep(delay)
+    pytest.fail(
+        f"{response_id} never became terminal (still "
+        f"{(body or {}).get('status')!r})"
+    )
+
+
+async def _f12_wait_until(predicate, *, tries=400, delay=0.01):
+    """Settle on an out-of-band condition without sleeping a fixed budget."""
+    for _ in range(tries):
+        if predicate():
+            return True
+        await asyncio.sleep(delay)
+    return False
+
+
+async def _f12_history(cli, conversation):
+    snapshot = await cli.get(f"/v1/responses/conversations/{conversation}")
+    assert snapshot.status == 200
+    return await snapshot.json()
+
+
+def _f12_count_terminal_writes(adapter, recorder):
+    """Wrap the one transaction every terminal owner ending must go through."""
+    real = adapter._response_store.store_terminal_owner_response
+
+    def _counting(**kwargs):
+        recorder.append(kwargs)
+        return real(**kwargs)
+
+    return patch.object(
+        adapter._response_store, "store_terminal_owner_response", _counting,
+    )
+
+
+class TestBackgroundOwnerResponseAlwaysTerminalizes:
+    """F12: the browser is owed a terminal answer on every ending.
+
+    Two ways an accepted owner turn used to end with no terminal state at all:
+    an executor worker that never returns (the await was unbounded), and an
+    exception from the finalizer or the publication that escaped the task
+    (only the compute was guarded).  Both left the response ``in_progress``
+    forever with its lease still heartbeated, so no sibling reclaimed it
+    either.  Every ending below must produce exactly ONE terminal owner
+    response and never a second turn.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_wedged_turn_becomes_terminal_instead_of_parking_forever(
+        self, adapter, monkeypatch,
+    ):
+        """The inactivity watchdog ends a worker that never returns."""
+        monkeypatch.setenv("HERMES_AGENT_TIMEOUT", _F12_TIMEOUT)
+        conversation = "raphael-owner-" + "c1" * 16
+        release = threading.Event()
+        agent = _F12Agent(release)
+        writes: list = []
+        app = _create_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with (
+                    _f12_count_terminal_writes(adapter, writes),
+                    patch.object(adapter, "_create_agent", return_value=agent),
+                ):
+                    accepted = await _f12_post(cli, conversation)
+                    assert accepted.status == 200
+                    queued = await accepted.json()
+                    assert queued["status"] == "queued"
+                    response_id = queued["id"]
+
+                    terminal = await _f12_terminal(cli, response_id)
+
+                    # Terminal, and reached without the worker ever returning.
+                    assert terminal["status"] == "failed"
+                    assert terminal["id"] == response_id
+                    assert agent.entered.is_set()
+                    assert not agent.returned.is_set()
+                    # Cooperative: the turn was asked to stop, not killed.
+                    assert agent.interrupts
+                    # Exactly one terminal write, and it says this ending
+                    # produced no turn.
+                    assert len(writes) == 1
+                    assert writes[0]["response_id"] == response_id
+                    assert writes[0]["interrupted"] is True
+                    assert writes[0]["release_job"] is True
+
+                    # Readback returns the same terminal result.
+                    readback = await cli.get(f"/v1/responses/{response_id}")
+                    assert (await readback.json()) == terminal
+
+                    # An abandoned turn publishes nothing, but leaves the
+                    # owner the whole way back to their own request.
+                    snapshot = await _f12_history(cli, conversation)
+                    assert snapshot["data"] == []
+                    assert snapshot["head_response_id"] is None
+                    assert snapshot["pending"] is None
+                    assert snapshot["recovery"] == {
+                        "owner": _F12_REQUEST,
+                        "response_id": response_id,
+                    }
+
+                    # Acknowledged, it is exactly ONE turn — never two.
+                    acknowledged = await cli.post(
+                        f"/v1/responses/conversations/{conversation}/recovery",
+                        json={"response_id": response_id},
+                    )
+                    assert acknowledged.status == 200
+                    sealed = await _f12_history(cli, conversation)
+                    assert len(sealed["data"]) == 1
+                    assert sealed["data"][0]["owner"] == _F12_REQUEST
+                    assert sealed["head_response_id"] == response_id
+
+                    release.set()
+                    assert await _f12_wait_until(agent.returned.is_set)
+        finally:
+            release.set()
+
+    @pytest.mark.asyncio
+    async def test_an_active_turn_is_never_killed_and_its_real_result_wins(
+        self, adapter, monkeypatch,
+    ):
+        """Inactivity, not elapsed time: a working turn outlives the window."""
+        monkeypatch.setenv("HERMES_AGENT_TIMEOUT", _F12_TIMEOUT)
+        conversation = "raphael-owner-" + "c9" * 16
+        release = threading.Event()
+        reply = json.dumps({
+            "schema_version": 1,
+            "kind": "question",
+            "message": "Who is the workshop for?",
+        })
+        # Reports activity throughout, and runs for several times the
+        # configured window before answering for real.
+        agent = _F12Agent(
+            release, idle_seconds=0.0, hold_seconds=0.4, final_response=reply,
+        )
+        app = _create_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent", return_value=agent):
+                    accepted = await _f12_post(cli, conversation)
+                    response_id = (await accepted.json())["id"]
+                    terminal = await _f12_terminal(cli, response_id)
+
+                assert terminal["status"] == "completed"
+                assert terminal["output"][0]["content"][0]["text"] == reply
+                assert agent.interrupts == []
+                # The real answer is the published turn.
+                snapshot = await _f12_history(cli, conversation)
+                assert snapshot["head_response_id"] == response_id
+                assert len(snapshot["data"]) == 1
+                assert snapshot["data"][0]["owner"] == _F12_REQUEST
+                assert json.loads(snapshot["data"][0]["raphael"])["kind"] == (
+                    "question"
+                )
+                assert snapshot["recovery"] is None
+        finally:
+            release.set()
+
+    @pytest.mark.asyncio
+    async def test_a_finalizer_that_raises_stores_one_terminal_owner_response(
+        self, adapter,
+    ):
+        """The post-compute finalizer is inside the terminal guard."""
+        conversation = "raphael-owner-" + "c2" * 16
+        writes: list = []
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                _f12_count_terminal_writes(adapter, writes),
+                patch.object(
+                    adapter, "_run_agent", new_callable=AsyncMock,
+                    return_value=(_F12_RESULT, _F12_USAGE),
+                ),
+                patch.object(
+                    adapter, "_finalize_response_result",
+                    side_effect=RuntimeError("finalizer exploded"),
+                ),
+            ):
+                accepted = await _f12_post(cli, conversation)
+                response_id = (await accepted.json())["id"]
+                terminal = await _f12_terminal(cli, response_id)
+
+            assert terminal["status"] == "failed"
+            assert len(writes) == 1
+            assert writes[0]["response_id"] == response_id
+            assert writes[0]["interrupted"] is True
+            # Nothing was published, and the request is still recoverable.
+            snapshot = await _f12_history(cli, conversation)
+            assert snapshot["data"] == []
+            assert snapshot["head_response_id"] is None
+            assert snapshot["recovery"] == {
+                "owner": _F12_REQUEST,
+                "response_id": response_id,
+            }
+
+    @pytest.mark.asyncio
+    async def test_a_publication_that_raises_stores_one_terminal_owner_response(
+        self, adapter,
+    ):
+        """The publication is inside the terminal guard too, and reads back."""
+        conversation = "raphael-owner-" + "c3" * 16
+        writes: list = []
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                _f12_count_terminal_writes(adapter, writes),
+                patch.object(
+                    adapter, "_run_agent", new_callable=AsyncMock,
+                    return_value=(_F12_RESULT, _F12_USAGE),
+                ),
+                patch.object(
+                    adapter._response_store, "publish_owner_turn",
+                    side_effect=RuntimeError("publication exploded"),
+                ),
+            ):
+                accepted = await _f12_post(cli, conversation)
+                response_id = (await accepted.json())["id"]
+                terminal = await _f12_terminal(cli, response_id)
+
+            assert terminal["status"] == "failed"
+            assert len(writes) == 1
+            assert writes[0]["interrupted"] is True
+
+            # Readback returns the terminal result...
+            readback = await cli.get(f"/v1/responses/{response_id}")
+            assert (await readback.json()) == terminal
+
+            # ...and the owner history carries exactly ONE turn for it.
+            assert (await _f12_history(cli, conversation))["data"] == []
+            acknowledged = await cli.post(
+                f"/v1/responses/conversations/{conversation}/recovery",
+                json={"response_id": response_id},
+            )
+            assert acknowledged.status == 200
+            sealed = await _f12_history(cli, conversation)
+            assert len(sealed["data"]) == 1
+            assert sealed["head_response_id"] == response_id
+
+    @pytest.mark.asyncio
+    async def test_an_exact_retry_replays_the_same_response_and_adds_no_turn(
+        self, adapter,
+    ):
+        """The key already minted this response; a retry is told what happened."""
+        conversation = "raphael-owner-" + "c4" * 16
+        key = f"response-{uuid.uuid4().hex}"
+        writes: list = []
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                _f12_count_terminal_writes(adapter, writes),
+                patch.object(
+                    adapter, "_run_agent", new_callable=AsyncMock,
+                    return_value=(_F12_RESULT, _F12_USAGE),
+                ) as run,
+                patch.object(
+                    adapter, "_finalize_response_result",
+                    side_effect=RuntimeError("finalizer exploded"),
+                ),
+            ):
+                accepted = await _f12_post(cli, conversation, key=key)
+                response_id = (await accepted.json())["id"]
+                await _f12_terminal(cli, response_id)
+
+                # Same key, same request: the same response comes back and no
+                # second turn is planned.
+                replayed = await _f12_post(cli, conversation, key=key)
+                assert replayed.status == 200
+                assert (await replayed.json())["id"] == response_id
+
+                # And again with the in-memory cache gone, so the answer comes
+                # from the durable record a restart would also read.
+                with patch(
+                    "gateway.platforms.api_server._idem_cache",
+                    _IdempotencyCache(),
+                ):
+                    durable = await _f12_post(cli, conversation, key=key)
+                assert durable.status == 200
+                durable_body = await durable.json()
+                assert durable_body["id"] == response_id
+                assert durable_body["status"] == "failed"
+
+                assert run.await_count == 1
+
+            assert len(writes) == 1
+            snapshot = await _f12_history(cli, conversation)
+            assert snapshot["data"] == []
+            assert snapshot["recovery"] == {
+                "owner": _F12_REQUEST,
+                "response_id": response_id,
+            }
+
+    @pytest.mark.asyncio
+    async def test_a_worker_that_finishes_after_the_timeout_publishes_nothing(
+        self, adapter, monkeypatch,
+    ):
+        """Fenced: the abandoned turn is terminal, and stays the only one."""
+        monkeypatch.setenv("HERMES_AGENT_TIMEOUT", _F12_TIMEOUT)
+        conversation = "raphael-owner-" + "c5" * 16
+        release = threading.Event()
+        agent = _F12Agent(release)
+        writes: list = []
+        publications: list = []
+        real_publish = adapter._response_store.publish_owner_turn
+
+        def _recording_publish(**kwargs):
+            publications.append(kwargs["response_id"])
+            return real_publish(**kwargs)
+
+        app = _create_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with (
+                    _f12_count_terminal_writes(adapter, writes),
+                    patch.object(
+                        adapter._response_store, "publish_owner_turn",
+                        _recording_publish,
+                    ),
+                    patch.object(adapter, "_create_agent", return_value=agent),
+                ):
+                    accepted = await _f12_post(cli, conversation)
+                    response_id = (await accepted.json())["id"]
+                    terminal = await _f12_terminal(cli, response_id)
+                    assert terminal["status"] == "failed"
+
+                    # The worker only now produces its answer.
+                    release.set()
+                    assert await _f12_wait_until(agent.returned.is_set)
+                    # Give any late publication every chance to land.
+                    for _ in range(20):
+                        await asyncio.sleep(0.01)
+
+                    assert publications == []
+                    assert len(writes) == 1
+                    readback = await cli.get(f"/v1/responses/{response_id}")
+                    assert (await readback.json()) == terminal
+                    snapshot = await _f12_history(cli, conversation)
+                    assert snapshot["data"] == []
+                    assert snapshot["head_response_id"] is None
+        finally:
+            release.set()
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_background_turn_stores_its_terminal_incomplete(
+        self, adapter,
+    ):
+        """The clean cancellation path still records one terminal ending."""
+        conversation = "raphael-owner-" + "c6" * 16
+        parked = asyncio.Event()
+        running: dict = {}
+        writes: list = []
+
+        async def _park(**_kwargs):
+            running["task"] = asyncio.current_task()
+            parked.set()
+            await asyncio.Event().wait()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                _f12_count_terminal_writes(adapter, writes),
+                patch.object(adapter, "_run_agent", side_effect=_park),
+            ):
+                accepted = await _f12_post(cli, conversation)
+                response_id = (await accepted.json())["id"]
+                await asyncio.wait_for(parked.wait(), timeout=2)
+                running["task"].cancel()
+                terminal = await _f12_terminal(cli, response_id)
+
+            assert terminal["status"] == "incomplete"
+            assert terminal["incomplete_details"] == {"reason": "cancelled"}
+            assert len(writes) == 1
+            assert writes[0]["interrupted"] is True
+            assert (await _f12_history(cli, conversation))["recovery"] == {
+                "owner": _F12_REQUEST,
+                "response_id": response_id,
+            }
+
+    @pytest.mark.asyncio
+    async def test_a_wedged_turn_leaves_no_residue_behind(
+        self, adapter, monkeypatch,
+    ):
+        """Nothing outlives the abandoned turn — including its watchdog."""
+        monkeypatch.setenv("HERMES_AGENT_TIMEOUT", _F12_TIMEOUT)
+        from gateway.platforms.api_server import _TURN_PROCESS_EPOCHS
+
+        conversation = "raphael-owner-" + "c7" * 16
+        release = threading.Event()
+        agent = _F12Agent(release)
+        before_threads = {t.ident for t in threading.enumerate()}
+        app = _create_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent", return_value=agent):
+                    accepted = await _f12_post(cli, conversation)
+                    session_id = accepted.headers.get("X-Hermes-Session-Id")
+                    response_id = (await accepted.json())["id"]
+                    assert (await _f12_terminal(cli, response_id))["status"] == (
+                        "failed"
+                    )
+                    release.set()
+                    assert await _f12_wait_until(agent.returned.is_set)
+                    assert await _f12_wait_until(
+                        lambda: not adapter._background_tasks
+                    )
+
+                # The job nobody is driving any more, and both heartbeats
+                # with it.
+                assert adapter._owner_response_jobs == set()
+                assert adapter._background_tasks == set()
+                assert adapter._inflight_agent_runs == 0
+                # The fence is gone: the request lives on as a recovery record
+                # instead, which is what an owner can act on.
+                assert (await _f12_history(cli, conversation))["pending"] is None
+                # Agent and turn-process registries.
+                assert adapter._shutdown_interruptible_agents == {}
+                assert adapter._active_run_agents == {}
+                assert session_id
+                assert await _f12_wait_until(
+                    lambda: session_id not in _TURN_PROCESS_EPOCHS
+                )
+
+            assert await _f12_wait_until(
+                lambda: not [
+                    t for t in threading.enumerate()
+                    if t.ident not in before_threads
+                    and t.name.startswith("api-turn-watchdog-")
+                    and t.is_alive()
+                ]
+            )
+        finally:
+            release.set()
