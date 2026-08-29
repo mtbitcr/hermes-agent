@@ -160,6 +160,169 @@ class TestHermesTokenStorage:
         import asyncio
         assert asyncio.run(storage.get_tokens()) is None
 
+    def test_set_tokens_survives_non_object_prior_file(self, tmp_path, monkeypatch):
+        """Regression: a prior file parsing to a truthy non-dict must not crash.
+
+        A rejected fix once called ``.get()`` on whatever ``_read_json``
+        returned whenever it was merely truthy, so a token file containing
+        the valid JSON document ``"not-an-object"`` (a truthy ``str``) blew
+        up with ``AttributeError: 'str' object has no attribute 'get'`` and
+        the fresh access token was never persisted.
+        """
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("weird-server")
+        token_dir = tmp_path / "mcp-tokens"
+        token_dir.mkdir(parents=True)
+        (token_dir / "weird-server.json").write_text(json.dumps("not-an-object"))
+
+        fresh = OAuthToken(access_token="fresh-access", token_type="Bearer")
+        asyncio.run(storage.set_tokens(fresh))
+
+        data = json.loads((token_dir / "weird-server.json").read_text())
+        assert data["access_token"] == "fresh-access"
+        assert "refresh_token" not in data
+
+    @pytest.mark.parametrize("prior_content", [42, ["a", "b"], 3.14])
+    def test_set_tokens_survives_other_non_object_prior_shapes(self, tmp_path, monkeypatch, prior_content):
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("weird-server")
+        token_dir = tmp_path / "mcp-tokens"
+        token_dir.mkdir(parents=True)
+        (token_dir / "weird-server.json").write_text(json.dumps(prior_content))
+
+        fresh = OAuthToken(access_token="fresh-access", token_type="Bearer")
+        asyncio.run(storage.set_tokens(fresh))
+
+        data = json.loads((token_dir / "weird-server.json").read_text())
+        assert data["access_token"] == "fresh-access"
+        assert "refresh_token" not in data
+
+    def test_set_tokens_omitted_refresh_token_retains_prior(self, tmp_path, monkeypatch):
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("carry-forward-server")
+
+        initial = OAuthToken(access_token="old-access", token_type="Bearer", refresh_token="old-refresh")
+        asyncio.run(storage.set_tokens(initial))
+
+        refreshed = OAuthToken(access_token="new-access", token_type="Bearer")
+        asyncio.run(storage.set_tokens(refreshed))
+
+        token_path = tmp_path / "mcp-tokens" / "carry-forward-server.json"
+        data = json.loads(token_path.read_text())
+        assert data["access_token"] == "new-access"
+        assert data["refresh_token"] == "old-refresh"
+
+    @pytest.mark.parametrize("empty_refresh", [None, ""])
+    def test_set_tokens_explicit_empty_refresh_token_retains_prior(self, tmp_path, monkeypatch, empty_refresh):
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("carry-forward-server")
+
+        initial = OAuthToken(access_token="old-access", token_type="Bearer", refresh_token="old-refresh")
+        asyncio.run(storage.set_tokens(initial))
+
+        refreshed = OAuthToken(access_token="new-access", token_type="Bearer", refresh_token=empty_refresh)
+        asyncio.run(storage.set_tokens(refreshed))
+
+        token_path = tmp_path / "mcp-tokens" / "carry-forward-server.json"
+        data = json.loads(token_path.read_text())
+        assert data["access_token"] == "new-access"
+        assert data["refresh_token"] == "old-refresh"
+
+    def test_set_tokens_supplied_refresh_token_replaces_prior(self, tmp_path, monkeypatch):
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("carry-forward-server")
+
+        initial = OAuthToken(access_token="old-access", token_type="Bearer", refresh_token="old-refresh")
+        asyncio.run(storage.set_tokens(initial))
+
+        refreshed = OAuthToken(access_token="new-access", token_type="Bearer", refresh_token="new-refresh")
+        asyncio.run(storage.set_tokens(refreshed))
+
+        token_path = tmp_path / "mcp-tokens" / "carry-forward-server.json"
+        data = json.loads(token_path.read_text())
+        assert data["access_token"] == "new-access"
+        assert data["refresh_token"] == "new-refresh"
+
+    def test_set_tokens_omitted_refresh_token_no_prior_file(self, tmp_path, monkeypatch):
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("fresh-server")
+
+        fresh = OAuthToken(access_token="fresh-access", token_type="Bearer")
+        asyncio.run(storage.set_tokens(fresh))
+
+        token_path = tmp_path / "mcp-tokens" / "fresh-server.json"
+        data = json.loads(token_path.read_text())
+        assert data["access_token"] == "fresh-access"
+        assert "refresh_token" not in data
+
+    def test_set_tokens_survives_invalid_json_prior_file(self, tmp_path, monkeypatch):
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("bad-server")
+        token_dir = tmp_path / "mcp-tokens"
+        token_dir.mkdir(parents=True)
+        (token_dir / "bad-server.json").write_text("NOT VALID JSON{{{")
+
+        fresh = OAuthToken(access_token="fresh-access", token_type="Bearer")
+        asyncio.run(storage.set_tokens(fresh))
+
+        data = json.loads((token_dir / "bad-server.json").read_text())
+        assert data["access_token"] == "fresh-access"
+        assert "refresh_token" not in data
+
+    @pytest.mark.parametrize("unusable_refresh_token", ["", 12345])
+    def test_set_tokens_prior_mapping_with_unusable_refresh_token_not_carried(
+        self, tmp_path, monkeypatch, unusable_refresh_token
+    ):
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("unusable-refresh-server")
+        token_dir = tmp_path / "mcp-tokens"
+        token_dir.mkdir(parents=True)
+        (token_dir / "unusable-refresh-server.json").write_text(json.dumps({
+            "access_token": "old-access",
+            "token_type": "Bearer",
+            "refresh_token": unusable_refresh_token,
+        }))
+
+        fresh = OAuthToken(access_token="fresh-access", token_type="Bearer")
+        asyncio.run(storage.set_tokens(fresh))
+
+        data = json.loads((token_dir / "unusable-refresh-server.json").read_text())
+        assert data["access_token"] == "fresh-access"
+        assert "refresh_token" not in data
+
+    @pytest.mark.linux_only
+    def test_set_tokens_carry_forward_keeps_0o600_permissions(self, tmp_path, monkeypatch):
+        from mcp.shared.auth import OAuthToken
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("perm-carry-forward-server")
+
+        initial = OAuthToken(access_token="old-access", token_type="Bearer", refresh_token="old-refresh")
+        asyncio.run(storage.set_tokens(initial))
+
+        refreshed = OAuthToken(access_token="new-access", token_type="Bearer")
+        asyncio.run(storage.set_tokens(refreshed))
+
+        token_path = tmp_path / "mcp-tokens" / "perm-carry-forward-server.json"
+        mode = stat.S_IMODE(token_path.stat().st_mode)
+        assert mode == 0o600, f"token file mode {oct(mode)} != 0o600 after carry-forward write"
+
 
 # ---------------------------------------------------------------------------
 # build_oauth_auth

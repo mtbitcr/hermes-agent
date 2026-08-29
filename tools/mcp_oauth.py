@@ -513,6 +513,20 @@ class HermesTokenStorage:
 
     async def set_tokens(self, tokens: "OAuthToken") -> None:
         payload = tokens.model_dump(mode="json", exclude_none=True)
+        # RFC 6749 section 6: if the authorization server's refresh response
+        # omits ``refresh_token``, the client must keep using the previously
+        # issued one rather than losing it. Only fall back to prior state
+        # when the fresh token doesn't already carry a usable refresh token.
+        if not isinstance(payload.get("refresh_token"), str) or not payload["refresh_token"]:
+            existing = _read_json(self._tokens_path())
+            # A corrupt or non-object token file (bad JSON, or valid JSON
+            # that isn't a mapping) has no refresh token to carry forward --
+            # fall through and persist the fresh token as-is rather than
+            # crashing on ``.get()`` or inventing a token that was never issued.
+            if isinstance(existing, dict):
+                prior_refresh_token = existing.get("refresh_token")
+                if isinstance(prior_refresh_token, str) and prior_refresh_token:
+                    payload["refresh_token"] = prior_refresh_token
         # Persist an absolute ``expires_at`` so a process restart can
         # reconstruct the correct remaining TTL. Without this the MCP SDK's
         # ``_initialize`` reloads a relative ``expires_in`` which has no
