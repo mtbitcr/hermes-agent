@@ -31,6 +31,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from agent.message_metadata import stamp_message_timestamp
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
@@ -39,6 +40,7 @@ from gateway.platforms.api_server import (
     _derive_chat_session_id,
     _hermes_version,
     _make_request_fingerprint,
+    _OWNER_INTERRUPTED_TURN_MESSAGE,
     OwnerAuthorityBroken,
     OwnerAuthorityUnavailable,
     OwnerTurnNotRecoverable,
@@ -822,6 +824,13 @@ class TestResponseStore:
             }),
         )
         add_session(
+            f"{group}-{'4' * 32}",
+            "resp_excluded_kind_session",
+            450,
+            "This one is an Automations request.",
+            json.dumps({"schema_version": 1, "kind": "automation_proposal"}),
+        )
+        add_session(
             f"{group}-{'3' * 32}",
             "resp_unstructured_session",
             500,
@@ -831,15 +840,25 @@ class TestResponseStore:
 
         index = store.owner_session_index("default", group)
 
-        # Ordered by each session's own immutable sequence, newest first, and
-        # the session with no owner-visible reply yet is RETAINED with a zero
-        # turn count rather than dropped: dropping it made a caller select an
-        # older change as if the real current one did not exist.
+        # Ordered by each session's own immutable sequence, newest first. The
+        # session whose trailing turn had no readable reply carries that turn
+        # with its terminal failure, so the owner's own words are visible
+        # instead of hidden; the session whose only reply is a kind this
+        # projection deliberately excludes is still RETAINED with a zero turn
+        # count rather than dropped, because dropping it made a caller select
+        # an older change as if the real current one did not exist.
         assert index == {
             "data": [
                 {
                     "session_id": "3" * 32,
                     "updated_at": 500,
+                    "preview": "This turn has no safe final reply.",
+                    "visible_turn_count": 1,
+                    "available": True,
+                },
+                {
+                    "session_id": "4" * 32,
+                    "updated_at": 450,
                     "preview": "",
                     "visible_turn_count": 0,
                     "available": True,
@@ -2412,6 +2431,18 @@ class TestResponseStore:
             {"schema_version": 1, "kind": "question", "message": text}
         )
 
+    @staticmethod
+    def _failure_reply():
+        """The exact reply a completed trailing turn is shown with."""
+        return json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "failure",
+                "message": _OWNER_INTERRUPTED_TURN_MESSAGE,
+            },
+            ensure_ascii=False,
+        )
+
     def test_a_conversation_with_no_mapping_is_empty_not_broken(self):
         store = ResponseStore(max_size=10)
         snapshot = store.owner_history_snapshot("raphael-owner-" + "8" * 32)
@@ -2608,6 +2639,269 @@ class TestResponseStore:
             {"role": "assistant", "content": self._question("Which first?")},
         ])
         assert store.owner_history_snapshot(name)["incomplete"] is False
+
+    # -----------------------------------------------------------------------
+    # A trailing turn nobody can read ends, it does not disappear
+    # -----------------------------------------------------------------------
+
+    def test_a_trailing_turn_answered_with_plain_text_is_shown_as_failed(self):
+        """The turn is over and it failed, so it is shown that way.
+
+        Dropping it hid the owner's own latest message and left the Workspace
+        waiting on a conversation that had already stopped, with no control to
+        recover from.
+        """
+        raw = "Sure — running `deploy_workshop --force` for you now."
+        store, name = self._owner_store([
+            {"role": "user", "content": "Plan it."},
+            {"role": "assistant", "content": self._question("Which first?")},
+            {"role": "user", "content": "The second one."},
+            {"role": "assistant", "content": raw},
+        ])
+
+        snapshot = store.owner_history_snapshot(name)
+
+        assert [turn["owner"] for turn in snapshot["data"]] == [
+            "Plan it.", "The second one.",
+        ]
+        assert snapshot["data"][-1]["raphael"] == self._failure_reply()
+        assert json.loads(snapshot["data"][-1]["raphael"])["message"] == (
+            _OWNER_INTERRUPTED_TURN_MESSAGE
+        )
+        # Shown with a terminal outcome, so it is no longer a HIDDEN turn.
+        assert snapshot["incomplete"] is False
+        assert snapshot["truncated"] is False
+        # Never the stored text itself, and never the command inside it.
+        projected = json.dumps(snapshot)
+        assert raw not in projected
+        assert "deploy_workshop" not in projected
+
+    def test_a_trailing_reply_imitating_a_tool_call_is_not_treated_as_execution(
+        self,
+    ):
+        """Structured JSON that is not a Raphael reply carries no outcome either,
+        and nothing about it may read as if it had run."""
+        imitation = json.dumps({
+            "tool": "run_command",
+            "arguments": {"command": "rm -rf /srv/workshop"},
+        })
+        store, name = self._owner_store([
+            {"role": "user", "content": "Plan it."},
+            {"role": "assistant", "content": self._question("Which first?")},
+            {"role": "user", "content": "The second one."},
+            {"role": "assistant", "content": imitation},
+        ])
+
+        snapshot = store.owner_history_snapshot(name)
+        projected = json.dumps(snapshot)
+
+        assert snapshot["data"][-1] == {
+            "owner": "The second one.",
+            "raphael": self._failure_reply(),
+        }
+        assert "run_command" not in projected
+        assert "rm -rf" not in projected
+        assert "srv/workshop" not in projected
+
+    def test_completing_a_trailing_turn_reactivates_no_older_proposal(self):
+        """A terminal failure is not a proposal, so nothing becomes approvable."""
+        proposal = json.dumps(_owner_new_proposal())
+        name = "raphael-owner-" + "b" * 32
+        store = ResponseStore(max_size=10)
+        store.put("resp_proposal_turn", {
+            "response": {"id": "resp_proposal_turn"},
+            "conversation_history": [
+                {"role": "user", "content": "Plan it."},
+                {"role": "assistant", "content": proposal},
+            ],
+        })
+        assert store.set_conversation(
+            name, "resp_proposal_turn", owner_proposal=True,
+        ) is True
+        assert store.owner_history_snapshot(name)["latest_response_id"] == (
+            "resp_proposal_turn"
+        )
+
+        store.put("resp_stranded_turn", {
+            "response": {"id": "resp_stranded_turn"},
+            "conversation_history": [
+                {"role": "user", "content": "Plan it."},
+                {"role": "assistant", "content": proposal},
+                {"role": "user", "content": "Actually, change it."},
+                {"role": "assistant", "content": "thinking out loud"},
+            ],
+        })
+        assert store.set_conversation(name, "resp_stranded_turn") is True
+
+        snapshot = store.owner_history_snapshot(name)
+
+        # The stranded turn is visible with its terminal failure...
+        assert snapshot["data"][-1] == {
+            "owner": "Actually, change it.",
+            "raphael": self._failure_reply(),
+        }
+        # ...and grants nothing the earlier proposal had.
+        assert snapshot["latest_response_id"] is None
+        assert snapshot["proposal_consumed"] is False
+        assert snapshot["proposal_claimed"] is False
+        assert snapshot["active_run_id"] is None
+        assert snapshot["completed_run_id"] is None
+        assert snapshot["head_response_id"] == "resp_stranded_turn"
+
+        # Same guarantee where the durable proposal handle SURVIVES, because
+        # the head itself was rewritten in place: a projection carrying nothing
+        # but the substituted failure still hands that handle to nobody.
+        rewritten = ResponseStore(max_size=10)
+        rewritten_name = "raphael-owner-" + "d" * 32
+        rewritten.put("resp_rewritten_head", {
+            "response": {"id": "resp_rewritten_head"},
+            "conversation_history": [{"role": "assistant", "content": proposal}],
+        })
+        assert rewritten.set_conversation(
+            rewritten_name, "resp_rewritten_head", owner_proposal=True,
+        ) is True
+        rewritten.put("resp_rewritten_head", {
+            "response": {"id": "resp_rewritten_head"},
+            "conversation_history": [
+                {"role": "assistant", "content": proposal},
+                {"role": "user", "content": "Actually, change it."},
+                {"role": "assistant", "content": "thinking out loud"},
+            ],
+        })
+        assert rewritten.set_conversation(
+            rewritten_name, "resp_rewritten_head",
+        ) is True
+
+        reprojected = rewritten.owner_history_snapshot(rewritten_name)
+
+        assert reprojected["data"] == [{
+            "owner": "Actually, change it.",
+            "raphael": self._failure_reply(),
+        }]
+        assert reprojected["latest_response_id"] is None
+
+    def test_only_the_trailing_turn_is_completed_this_way(self):
+        """An interior turn is already bounded by the owner turn after it, so
+        nothing there is stranded and today's reporting stands."""
+        store, name = self._owner_store([
+            {"role": "user", "content": "First ask."},
+            {"role": "assistant", "content": "unstructured private text"},
+            {"role": "user", "content": "Second ask."},
+            {"role": "assistant", "content": self._question("Which first?")},
+            {"role": "user", "content": "Third ask."},
+            {"role": "assistant", "content": "more unstructured text"},
+        ])
+
+        snapshot = store.owner_history_snapshot(name)
+
+        assert [turn["owner"] for turn in snapshot["data"]] == [
+            "Second ask.", "Third ask.",
+        ]
+        assert snapshot["data"][-1]["raphael"] == self._failure_reply()
+        # The interior one is still reported as missing, never substituted.
+        assert snapshot["incomplete"] is True
+        assert self._failure_reply() not in [
+            turn["raphael"] for turn in snapshot["data"][:-1]
+        ]
+
+    def test_completing_a_trailing_turn_never_hides_broken_authority(self):
+        """Completing one turn is a projection, not a repair of the store."""
+        trailing = {"role": "assistant", "content": "unstructured private text"}
+        sound, sound_name = self._owner_store(
+            [{"role": "user", "content": "Plan it."}, trailing],
+        )
+        assert sound.owner_history_snapshot(sound_name)["data"] == [{
+            "owner": "Plan it.",
+            "raphael": self._failure_reply(),
+        }]
+
+        # The same trailing reply over authority that is genuinely broken:
+        # an unreadable owner turn, a record that is not an object, a
+        # transcript that is not a list, an over-limit authoritative reply.
+        for index, history in enumerate([
+            [{"role": "user", "content": "   "}, trailing],
+            [{"role": "user", "content": "Plan it."}, "a bare string", trailing],
+            "not a transcript",
+            [
+                {"role": "user", "content": "Plan it."},
+                {"role": "assistant", "content": self._question("y" * 50_001)},
+                trailing,
+            ],
+        ]):
+            store, name = self._owner_store(
+                history, name=f"raphael-owner-{index:032x}",
+            )
+            with pytest.raises(OwnerAuthorityBroken):
+                store.owner_history_snapshot(name)
+
+        # A mapped response that is gone, and one whose stored JSON is corrupt.
+        missing, missing_name = self._owner_store(
+            [{"role": "user", "content": "Plan it."}, trailing],
+            name="raphael-owner-" + "5" * 32,
+        )
+        missing._conn.execute(
+            "DELETE FROM responses WHERE response_id = ?",
+            ("resp_broken_authority",),
+        )
+        missing._conn.commit()
+        with pytest.raises(OwnerAuthorityBroken):
+            missing.owner_history_snapshot(missing_name)
+
+        corrupt, corrupt_name = self._owner_store(
+            [{"role": "user", "content": "Plan it."}, trailing],
+            name="raphael-owner-" + "4" * 32,
+        )
+        corrupt._conn.execute(
+            "UPDATE responses SET data = ? WHERE response_id = ?",
+            ("{not json", "resp_broken_authority"),
+        )
+        corrupt._conn.commit()
+        with pytest.raises(OwnerAuthorityBroken):
+            corrupt.owner_history_snapshot(corrupt_name)
+
+    def test_a_valid_reply_after_a_completed_trailing_turn_projects_normally(
+        self,
+    ):
+        """The substitution belongs to one projection, not to the record: the
+        next real reply simply lands, and that turn goes back to interior."""
+        store, name = self._owner_store([
+            {"role": "user", "content": "Plan it."},
+            {"role": "assistant", "content": self._question("Which first?")},
+            {"role": "user", "content": "The second one."},
+            {"role": "assistant", "content": "unstructured private text"},
+        ])
+        stranded = store.owner_history_snapshot(name)
+        assert stranded["data"][-1] == {
+            "owner": "The second one.",
+            "raphael": self._failure_reply(),
+        }
+
+        store.put("resp_follow_up", {
+            "response": {"id": "resp_follow_up"},
+            "conversation_history": [
+                {"role": "user", "content": "Plan it."},
+                {"role": "assistant", "content": self._question("Which first?")},
+                {"role": "user", "content": "The second one."},
+                {"role": "assistant", "content": "unstructured private text"},
+                {"role": "user", "content": "Try again."},
+                {"role": "assistant", "content": self._question("Ready now?")},
+            ],
+        })
+        assert store.set_conversation(name, "resp_follow_up") is True
+
+        resumed = store.owner_history_snapshot(name)
+
+        assert resumed["data"][-1] == {
+            "owner": "Try again.",
+            "raphael": self._question("Ready now?"),
+        }
+        assert [turn["owner"] for turn in resumed["data"]] == [
+            "Plan it.", "Try again.",
+        ]
+        assert resumed["incomplete"] is True
+        assert self._failure_reply() not in [
+            turn["raphael"] for turn in resumed["data"]
+        ]
 
     # -----------------------------------------------------------------------
     # Item 32TK round 2: the session index cannot lose the current session
@@ -7005,6 +7299,220 @@ class TestToolCallsInOutput:
             assert output[1]["id"].startswith("fco_")
             assert output[2]["type"] == "message"
             assert output[2]["content"][0]["text"] == "The result is 42."
+
+
+# ---------------------------------------------------------------------------
+# Where a stored Responses transcript's current turn starts
+# ---------------------------------------------------------------------------
+
+
+class TestStoredTranscriptTurnStart:
+    """``result["messages"]`` IS the agent's live transcript.
+
+    The agent stamps durable bookkeeping onto every message it appends there,
+    so prefix detection that compared whole dicts never recognised the history
+    it had just been handed. It reported "no shared prefix" for an
+    already-complete transcript and the caller concatenated that transcript
+    onto itself — storing the owner's own message twice.
+    """
+
+    @staticmethod
+    def _stamped(role, content, *, at=None, **fields):
+        """One message exactly as the live transcript produces it."""
+        return stamp_message_timestamp(
+            {"role": role, "content": content, **fields}, timestamp=at,
+        )
+
+    def test_a_first_turn_stores_the_owner_message_exactly_once(self):
+        result = {"messages": [
+            self._stamped("user", "Plan the workshop.", at=100.0),
+            self._stamped("assistant", "Here is the plan.", at=101.0),
+        ]}
+
+        stored = APIServerAdapter._build_response_conversation_history(
+            [], "Plan the workshop.", result, "Here is the plan.",
+        )
+
+        assert [message["role"] for message in stored] == ["user", "assistant"]
+        assert [
+            message["content"] for message in stored
+            if message["role"] == "user"
+        ] == ["Plan the workshop."]
+        assert APIServerAdapter._response_messages_turn_start_index(
+            [], "Plan the workshop.", result,
+        ) == 1
+
+    def test_a_restamped_prior_prefix_is_recognised_not_reappended(self):
+        """The agent restamping its copies of prior is bookkeeping, not content."""
+        prior = [
+            self._stamped("user", "Goal one.", at=100.0),
+            self._stamped("assistant", "Understood.", at=101.0),
+        ]
+        result = {"messages": [
+            self._stamped("user", "Goal one.", at=200.0),
+            self._stamped("assistant", "Understood.", at=201.0),
+            self._stamped("user", "Correction.", at=202.0),
+            self._stamped("assistant", "Adjusted.", at=203.0),
+        ]}
+
+        stored = APIServerAdapter._build_response_conversation_history(
+            prior, "Correction.", result, "Adjusted.",
+        )
+
+        assert [
+            message["content"] for message in stored
+            if message["role"] == "user"
+        ] == ["Goal one.", "Correction."]
+        # The same index feeds the per-turn transcript, so this turn's output
+        # is neither dropped nor replayed with the previous turn's reply.
+        assert [
+            message["content"] for message in
+            APIServerAdapter._turn_transcript_messages(
+                prior, "Correction.", result,
+            )
+        ] == ["Adjusted."]
+
+    def test_two_identical_owner_requests_both_survive_as_two_turns(self):
+        """Sending the same words twice is two real turns, not one stored twice.
+
+        The prefix match is positional and greedy from index 0, so each copy
+        matches at its own position.
+        """
+        repeated = "Send it again."
+        prior = [
+            self._stamped("user", repeated, at=100.0),
+            self._stamped("assistant", "Sent once.", at=101.0),
+        ]
+        result = {"messages": [
+            self._stamped("user", repeated, at=200.0),
+            self._stamped("assistant", "Sent once.", at=201.0),
+            self._stamped("user", repeated, at=202.0),
+            self._stamped("assistant", "Sent twice.", at=203.0),
+        ]}
+
+        stored = APIServerAdapter._build_response_conversation_history(
+            prior, repeated, result, "Sent twice.",
+        )
+
+        assert [message["content"] for message in stored] == [
+            repeated, "Sent once.", repeated, "Sent twice.",
+        ]
+        owner_messages = [m for m in stored if m["role"] == "user"]
+        assert len(owner_messages) == 2
+        assert owner_messages[0] is not owner_messages[1]
+        assert owner_messages[0]["timestamp"] != owner_messages[1]["timestamp"]
+
+    def test_tool_call_fields_are_part_of_message_identity(self):
+        """Identity is the provider-visible message, not just role and content."""
+        call = {"id": "call_1", "function": {"name": "shell", "arguments": "{}"}}
+        prior = [
+            {"role": "user", "content": "Check it."},
+            {"role": "assistant", "content": None, "tool_calls": [call]},
+            {"role": "tool", "content": "ok", "tool_call_id": "call_1"},
+        ]
+        this_turn = [
+            self._stamped("user", "And again.", at=202.0),
+            self._stamped("assistant", "Checked.", at=203.0),
+        ]
+        restamped = [
+            self._stamped("user", "Check it.", at=200.0),
+            self._stamped("assistant", None, at=200.5, tool_calls=[dict(call)]),
+            self._stamped("tool", "ok", at=201.0, tool_call_id="call_1"),
+        ]
+
+        # Restamped copies of the same tool traffic ARE the same messages.
+        assert APIServerAdapter._build_response_conversation_history(
+            prior, "And again.", {"messages": restamped + this_turn}, "Checked.",
+        ) == restamped + this_turn
+        # ...so the output items carry this turn only: the earlier tool call is
+        # not replayed as if this turn had made it.
+        replayed = {"messages": restamped + this_turn, "final_response": "Checked."}
+        assert [
+            item["type"] for item in APIServerAdapter._extract_output_items(
+                replayed,
+                start_index=APIServerAdapter._response_messages_turn_start_index(
+                    prior, "And again.", replayed,
+                ),
+            )
+        ] == ["message"]
+
+        # A DIFFERENT tool call at the same position is a different message, so
+        # the transcript is not claimed to already carry the prior history.
+        divergent = [
+            self._stamped("user", "Check it.", at=200.0),
+            self._stamped("assistant", None, at=200.5, tool_calls=[
+                {"id": "call_2", "function": {"name": "shell", "arguments": "{}"}},
+            ]),
+            self._stamped("tool", "ok", at=201.0, tool_call_id="call_2"),
+        ]
+        assert APIServerAdapter._response_messages_turn_start_index(
+            prior, "And again.", {"messages": divergent + this_turn},
+        ) == 0
+
+    def test_a_compressed_transcript_is_used_directly_and_never_concatenated(
+        self,
+    ):
+        prior = [
+            self._stamped("user", "Goal one.", at=100.0),
+            self._stamped("assistant", "Understood.", at=101.0),
+        ]
+        compressed = [
+            {"role": "system", "content": "Summary of earlier turns."},
+            self._stamped("user", "Correction.", at=202.0),
+            self._stamped("assistant", "Adjusted.", at=203.0),
+        ]
+
+        # A compressed transcript shares no prefix with prior and is stored as
+        # it stands, or the uncompressed history rides back in on front.
+        assert APIServerAdapter._build_response_conversation_history(
+            prior, "Correction.",
+            {"messages": compressed, "_compressed": True},
+            "Adjusted.",
+        ) == compressed
+
+        # And that short circuit stays the compression path alone: a stamped
+        # transcript that DOES carry the prior prefix is recognised on its own,
+        # without needing the flag to avoid concatenation.
+        uncompressed = [
+            self._stamped("user", "Goal one.", at=200.0),
+            self._stamped("assistant", "Understood.", at=201.0),
+            self._stamped("user", "Correction.", at=202.0),
+            self._stamped("assistant", "Adjusted.", at=203.0),
+        ]
+        assert APIServerAdapter._build_response_conversation_history(
+            prior, "Correction.", {"messages": uncompressed}, "Adjusted.",
+        ) == uncompressed
+
+    def test_the_callers_prior_context_is_never_mutated(self):
+        prior = [
+            self._stamped("user", "Goal one.", at=100.0),
+            self._stamped("assistant", "Understood.", at=101.0),
+        ]
+        before = json.loads(json.dumps(prior))
+        member_ids = [id(message) for message in prior]
+
+        stored = APIServerAdapter._build_response_conversation_history(
+            prior,
+            "Correction.",
+            {"messages": [
+                self._stamped("user", "Goal one.", at=200.0),
+                self._stamped("assistant", "Understood.", at=201.0),
+                self._stamped("user", "Correction.", at=202.0),
+                self._stamped("assistant", "Adjusted.", at=203.0),
+            ]},
+            "Adjusted.",
+        )
+
+        # The turn is stored once...
+        assert [
+            message["content"] for message in stored
+            if message["role"] == "user"
+        ] == ["Goal one.", "Correction."]
+        # ...and the prior context the caller handed in is untouched: same
+        # list, same member dicts, same contents.
+        assert stored is not prior
+        assert prior == before
+        assert [id(message) for message in prior] == member_ids
 
 
 # ---------------------------------------------------------------------------
