@@ -555,6 +555,7 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
+from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
 from gateway.readiness import collect_runtime_readiness
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -2383,6 +2384,11 @@ class ResponseStore:
         raphael_text: Optional[str] = None
         incomplete = False
         owner_turn_truncated = False
+        # Whether the owner turn being read has assistant output that is not a
+        # Raphael reply at all. Reset at every owner boundary and read exactly
+        # once, for the trailing turn, below the loop.
+        unreadable_reply = False
+        substituted_failure_turn = False
 
         def _flush() -> None:
             nonlocal owner_text, raphael_text, incomplete
@@ -2424,6 +2430,7 @@ class ResponseStore:
                     )
                 text = content.strip()
                 _flush()
+                unreadable_reply = False
                 if len(text) > _OWNER_HISTORY_OWNER_MAX_CHARS:
                     text = (
                         "[Earlier owner message omitted from this view because it "
@@ -2436,6 +2443,9 @@ class ResponseStore:
             if role != "assistant" or owner_text is None:
                 continue
             if not isinstance(content, str):
+                # Output that is not text at all still answered this turn with
+                # something no reader can turn into an outcome.
+                unreadable_reply = unreadable_reply or bool(content)
                 continue
             text = content.strip()
             if not text:
@@ -2443,17 +2453,29 @@ class ResponseStore:
             try:
                 candidate = json.loads(text)
             except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+                # Raw model prose — a plain-text imitation of a tool call is the
+                # shape that stranded the Workspace. Only the FACT that it
+                # happened is carried forward; the text itself never is.
+                unreadable_reply = True
                 continue
             if (
                 not isinstance(candidate, dict)
                 or candidate.get("schema_version")
                 not in _OWNER_HISTORY_SCHEMA_VERSIONS
-                or (
-                    candidate.get("kind")
-                    not in {"question", "proposal", "project_change_proposal"}
-                    and not _owner_failure_reply_is_projectable(candidate)
-                )
+                or not isinstance(candidate.get("kind"), str)
             ):
+                # Structured, but not a versioned Raphael reply: it names no
+                # kind this service ever writes, so it carries no outcome.
+                unreadable_reply = True
+                continue
+            if (
+                candidate["kind"]
+                not in {"question", "proposal", "project_change_proposal"}
+                and not _owner_failure_reply_is_projectable(candidate)
+            ):
+                # A real reply of a kind this projection deliberately excludes
+                # (an Automations ``automation_proposal``). Recognised
+                # authority, just not owner-visible — not a turn to complete.
                 continue
             # Last valid structured assistant message before the next owner
             # turn is the authoritative final reply for that turn.
@@ -2474,11 +2496,42 @@ class ResponseStore:
                     "projected"
                 )
             raphael_text = projected_text
+
+        # The conversation ENDS on assistant output that carries no outcome. The
+        # turn was real, so dropping it hid the owner's own latest message and
+        # left the Workspace waiting on something that was already over, with no
+        # control to recover from. Complete it with the SAME structured failure
+        # an interrupted turn already gets, built from the fixed constant alone:
+        # the stored text is never shown, so a plain-text imitation of a tool
+        # call can neither reach the owner nor read as if it had run. Only the
+        # TRAILING turn — an interior one is already bounded by the owner turn
+        # after it, so nothing there is stranded — and only on the read side:
+        # the stored row keeps saying exactly what it said.
+        #
+        # ``incomplete`` is therefore left as the earlier turns set it. This
+        # turn is no longer a HIDDEN one: it is shown, with a terminal outcome
+        # the owner can act on, so reporting it as missing would tell the caller
+        # to warn about a turn it is already rendering.
+        if owner_text is not None and raphael_text is None and unreadable_reply:
+            raphael_text = json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "failure",
+                    "message": _OWNER_INTERRUPTED_TURN_MESSAGE,
+                },
+                ensure_ascii=False,
+            )
+            substituted_failure_turn = True
         _flush()
         truncated = (
             owner_turn_truncated or len(turns) > _OWNER_HISTORY_TURN_LIMIT
         )
         data = turns[-_OWNER_HISTORY_TURN_LIMIT:]
+        # ``latest_response_id`` below hands out an outstanding PROPOSAL handle.
+        # The substituted turn is a terminal failure and grants no approval
+        # authority, so a projection holding nothing else must not be what makes
+        # an older proposal approvable again.
+        proposal_bearing_turns = data[:-1] if substituted_failure_turn else data
         proposal_response_id = row[1]
         proposal_consumed = (
             proposal_response_id is not None and row[2] == proposal_response_id
@@ -2516,7 +2569,9 @@ class ResponseStore:
             # that conversation either conflict as stale or replay the old
             # proposal.
             "head_response_id": row[0],
-            "latest_response_id": proposal_response_id if data else None,
+            "latest_response_id": (
+                proposal_response_id if proposal_bearing_turns else None
+            ),
             "proposal_consumed": proposal_consumed,
             "proposal_claimed": proposal_claimed,
             "active_run_id": row[4] if proposal_claimed else None,
@@ -11545,6 +11600,43 @@ class APIServerAdapter(BasePlatformAdapter):
         return full_history
 
     @staticmethod
+    def _messages_open_with(
+        agent_messages: List[Dict[str, Any]],
+        prefix: List[Dict[str, Any]],
+    ) -> bool:
+        """Whether ``agent_messages`` opens with ``prefix``, message for message.
+
+        A message's identity here is everything a provider would see — role,
+        content, and every tool-call field such as ``tool_calls``,
+        ``tool_call_id``, ``name``, ``refusal`` or ``reasoning``. Only the
+        durable bookkeeping the live transcript stamps onto its own copies is
+        ignored, and ``PERSISTENCE_ONLY_MESSAGE_FIELDS`` is what names it: those
+        fields describe Hermes' record, not what was said.
+
+        Comparing whole dicts instead meant this turn's own user message never
+        equalled the one the request described, because the agent had stamped
+        it in the meantime. Prefix detection then reported "no shared prefix"
+        for an already-complete transcript and the caller concatenated it onto
+        itself, storing the owner's message twice.
+        """
+        if len(agent_messages) < len(prefix):
+            return False
+
+        def identity(message: Any) -> Any:
+            if not isinstance(message, dict):
+                return message
+            return {
+                key: value
+                for key, value in message.items()
+                if key not in PERSISTENCE_ONLY_MESSAGE_FIELDS
+            }
+
+        return all(
+            identity(actual) == identity(expected)
+            for actual, expected in zip(agent_messages, prefix)
+        )
+
+    @staticmethod
     def _response_messages_turn_start_index(
         conversation_history: List[Dict[str, Any]],
         user_message: Any,
@@ -11558,9 +11650,12 @@ class APIServerAdapter(BasePlatformAdapter):
         prior = list(conversation_history)
         current_user = {"role": "user", "content": user_message}
         expected_prefix = prior + [current_user]
-        if agent_messages[:len(expected_prefix)] == expected_prefix:
+        # Positional and greedy from index 0, so two legitimately identical
+        # owner requests sent as two real turns each match their own position
+        # and both survive.
+        if APIServerAdapter._messages_open_with(agent_messages, expected_prefix):
             return len(expected_prefix)
-        if prior and agent_messages[:len(prior)] == prior:
+        if prior and APIServerAdapter._messages_open_with(agent_messages, prior):
             return len(prior)
         return 0
 
