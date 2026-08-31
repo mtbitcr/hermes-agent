@@ -3298,6 +3298,70 @@ def test_project_plan_replace_preserves_history_edges_and_replays(ctx):
         ).fetchone()[0] == event_count
 
 
+def test_project_plan_replaces_a_dependency_chain_atomically(ctx):
+    """Internal relinking must not invalidate later targets in the same plan."""
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        stage_id = kanban_db.create_task(
+            conn, title="Stage candidate", assignee="default",
+            parents=[setup["task_id"]], project_id=setup["project_id"],
+        )
+        verify_id = kanban_db.create_task(
+            conn, title="Verify candidate", assignee="default",
+            parents=[stage_id], project_id=setup["project_id"],
+        )
+        release_id = kanban_db.create_task(
+            conn, title="Release candidate", assignee="default",
+            parents=[verify_id], project_id=setup["project_id"],
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id IN (?, ?)",
+            (verify_id, release_id),
+        )
+        refs = {
+            task_id: _project_task_ref(conn, task_id)
+            for task_id in (stage_id, verify_id, release_id)
+        }
+
+    changes = []
+    for task_id, title, responsibility in (
+        (stage_id, "Stage exact candidate", "R17"),
+        (verify_id, "Verify exact candidate", "R21"),
+        (release_id, "Release exact candidate", "R17"),
+    ):
+        changes.append({
+            "action": "replace",
+            "reason": "Retry the same step with the exact accepted candidate.",
+            "target": refs[task_id],
+            "replacement": {
+                "title": title,
+                "body": "Preserve the existing dependency chain and evidence.",
+                "assignee": "default",
+                "execution_tier": "deep",
+                "responsibility": responsibility,
+            },
+        })
+
+    args = _project_plan_args(
+        setup, changes, idempotency_key="steward-replace-dependency-chain",
+    )
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result["ok"] is True
+    assert result["change_count"] == 3
+    assert len(result["created_task_ids"]) == 3
+    new_stage, new_verify, new_release = result["created_task_ids"]
+    with kanban_db.connect(board=setup["board"]) as conn:
+        for task_id in (stage_id, verify_id, release_id):
+            assert kanban_db.get_task(conn, task_id).status == "archived"
+        assert new_stage in kanban_db.parent_ids(conn, new_verify)
+        assert new_verify in kanban_db.parent_ids(conn, new_release)
+
+    assert _commit_project_plan(ctx, **args) == result
+
+
 # ---------------------------------------------------------------------------
 # Explicit repository ownership scope on owner-created tasks
 # ---------------------------------------------------------------------------

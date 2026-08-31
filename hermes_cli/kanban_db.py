@@ -10866,6 +10866,22 @@ def apply_owner_project_plan(
         affected_task_ids: set[str] = set()
         parked_task_ids: list[str] = []
         add_output_by_change: dict[int, str] = {}
+        internal_targets: dict[str, tuple[str, int]] = {}
+
+        def expected_target(ref: dict) -> tuple[str, int]:
+            """Include only state changes made earlier by this transaction."""
+            return internal_targets.get(
+                ref["task_id"], (ref["expected_status"], ref["expected_revision"]),
+            )
+
+        def record_internal_link(task_id: str) -> None:
+            if task_id in mutation_targets:
+                row = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (task_id,),
+                ).fetchone()
+                internal_targets[task_id] = (
+                    row["status"], task_event_revision(conn, task_id),
+                )
 
         def create_planned_task(
             spec: dict,
@@ -10950,6 +10966,7 @@ def apply_owner_project_plan(
 
             if action == "split":
                 source_id = change["target"]["task_id"]
+                target_status, target_revision = expected_target(change["target"])
                 source_parents = parent_ids(conn, source_id)
                 source_children = child_ids(conn, source_id)
                 replacement_ids: list[str] = []
@@ -10979,11 +10996,12 @@ def apply_owner_project_plan(
                     for leaf_id in leaf_ids:
                         if _link_tasks_in_txn(conn, leaf_id, child_id):
                             affected_task_ids.add(child_id)
+                            record_internal_link(child_id)
                 snapshot = _cas_transition_task_in_txn(
                     conn,
                     source_id,
-                    expected_status=change["target"]["expected_status"],
-                    expected_revision=change["target"]["expected_revision"],
+                    expected_status=target_status,
+                    expected_revision=target_revision,
                     to_status="archived",
                     event_kind="owner_project_plan_change",
                     event_payload={**event_base, "replacement_task_ids": replacement_ids},
@@ -10996,6 +11014,7 @@ def apply_owner_project_plan(
 
             if action == "replace":
                 source_id = change["target"]["task_id"]
+                target_status, target_revision = expected_target(change["target"])
                 replacement_id = create_planned_task(
                     change["replacement"],
                     parent_task_ids=parent_ids(conn, source_id),
@@ -11005,11 +11024,12 @@ def apply_owner_project_plan(
                 for child_id in child_ids(conn, source_id):
                     if _link_tasks_in_txn(conn, replacement_id, child_id):
                         affected_task_ids.add(child_id)
+                        record_internal_link(child_id)
                 snapshot = _cas_transition_task_in_txn(
                     conn,
                     source_id,
-                    expected_status=change["target"]["expected_status"],
-                    expected_revision=change["target"]["expected_revision"],
+                    expected_status=target_status,
+                    expected_revision=target_revision,
                     to_status="archived",
                     event_kind="owner_project_plan_change",
                     event_payload={**event_base, "replacement_task_id": replacement_id},
@@ -11050,12 +11070,14 @@ def apply_owner_project_plan(
                 for child_id in merged_children:
                     if _link_tasks_in_txn(conn, replacement_id, child_id):
                         affected_task_ids.add(child_id)
+                        record_internal_link(child_id)
                 for ref in change["targets"]:
+                    target_status, target_revision = expected_target(ref)
                     snapshot = _cas_transition_task_in_txn(
                         conn,
                         ref["task_id"],
-                        expected_status=ref["expected_status"],
-                        expected_revision=ref["expected_revision"],
+                        expected_status=target_status,
+                        expected_revision=target_revision,
                         to_status="archived",
                         event_kind="owner_project_plan_change",
                         event_payload={**event_base, "replacement_task_id": replacement_id},
@@ -11067,6 +11089,7 @@ def apply_owner_project_plan(
                 continue
 
             ref = change["target"]
+            target_status, target_revision = expected_target(ref)
             if action == "move" and change["to_status"] == "ready":
                 if not _parents_satisfied(conn, ref["task_id"]):
                     raise ValueError(
@@ -11096,8 +11119,8 @@ def apply_owner_project_plan(
             snapshot = _cas_transition_task_in_txn(
                 conn,
                 ref["task_id"],
-                expected_status=ref["expected_status"],
-                expected_revision=ref["expected_revision"],
+                expected_status=target_status,
+                expected_revision=target_revision,
                 to_status=to_status,
                 event_kind="owner_project_plan_change",
                 event_payload=event_base,
