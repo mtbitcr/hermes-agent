@@ -6706,6 +6706,34 @@ def _collision_free_path(dest_dir: Path, safe_name: str) -> Path:
     return dest_dir / candidate
 
 
+def read_attachment_bytes(attachment: Attachment, *, board: Optional[str] = None) -> bytes:
+    """Read a bounded regular blob whose path and size match its native row."""
+    import stat
+
+    root = task_attachments_dir(attachment.task_id, board=board)
+    path = Path(attachment.stored_path)
+    if (
+        not path.is_absolute()
+        or path.name != attachment.filename
+        or path.parent.resolve() != root.resolve()
+        or any(p.is_symlink() for p in (path, *path.parents))
+    ):
+        raise ValueError("attachment storage identity is invalid")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size != attachment.size
+            or info.st_size > KANBAN_ATTACHMENT_MAX_BYTES
+        ):
+            raise ValueError("attachment size does not match its native record")
+        data = handle.read(KANBAN_ATTACHMENT_MAX_BYTES + 1)
+    if len(data) != attachment.size:
+        raise ValueError("attachment changed while it was being read")
+    return data
+
+
 def store_attachment_bytes(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6716,23 +6744,15 @@ def store_attachment_bytes(
     uploaded_by: Optional[str] = None,
     board: Optional[str] = None,
     max_bytes: Optional[int] = None,
+    expected_run_id: Optional[int] = None,
+    source_attachment_id: Optional[int] = None,
 ) -> int:
-    """Validate, size-check, persist a blob, and record its metadata row.
+    """Persist a blob, metadata and event through the one native write path.
 
-    This is the single write path shared by the dashboard endpoint, the
-    agent toolset (``kanban_attach`` / ``kanban_attach_url``), and the CLI
-    (``hermes kanban attach``) so name-sanitisation, the size cap, and the
-    collision-resolution all behave identically everywhere.
-
-    Steps: enforce ``max_bytes``, sanitise ``filename`` to a safe basename,
-    write the bytes under :func:`task_attachments_dir` with a
-    collision-free name, then insert the ``task_attachments`` row via
-    :func:`add_attachment`. Returns the new attachment id.
-
-    Raises :class:`AttachmentTooLarge` when ``data`` exceeds ``max_bytes``,
-    or :class:`ValueError` for a bad filename / unknown task. On any failure
-    after the blob is written (e.g. the task disappeared) the orphaned blob
-    is removed before re-raising.
+    An optional active-run identity makes a worker's exact-byte retry reuse its
+    existing attachment. The run check, duplicate check and metadata write share
+    one transaction. Ordinary uploads retain their collision-free filenames.
+    Any unsuccessful transaction removes only the new blob created here.
     """
     if max_bytes is None:
         max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
@@ -6740,28 +6760,73 @@ def store_attachment_bytes(
         raise AttachmentTooLarge(
             f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
         )
+    if expected_run_id is not None and (
+        isinstance(expected_run_id, bool) or not isinstance(expected_run_id, int)
+    ):
+        raise ValueError("expected_run_id must be an integer")
     safe_name = _safe_attachment_name(filename)
+    if source_attachment_id is not None and (
+        isinstance(source_attachment_id, bool)
+        or not isinstance(source_attachment_id, int)
+        or source_attachment_id < 1
+        or expected_run_id is None
+    ):
+        raise ValueError("an attachment copy requires an integer source and an active run")
     dest_dir = task_attachments_dir(task_id, board=board)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = _collision_free_path(dest_dir, safe_name)
-    dest_path.write_bytes(data)
+    dest_path = None
     try:
-        return add_attachment(
-            conn,
-            task_id,
-            filename=dest_path.name,
-            stored_path=str(dest_path.resolve()),
-            content_type=content_type,
-            size=len(data),
-            uploaded_by=uploaded_by,
-        )
+        with write_txn(conn):
+            source_attachment = None
+            if source_attachment_id is not None:
+                source_attachment = get_attachment(conn, source_attachment_id)
+                if source_attachment is None or read_attachment_bytes(source_attachment, board=board) != data:
+                    raise ValueError("attachment copy bytes do not match the native source")
+            if expected_run_id is not None:
+                task = get_task(conn, task_id)
+                run = conn.execute(
+                    "SELECT started_at FROM task_runs "
+                    "WHERE id=? AND task_id=? AND status='running' AND ended_at IS NULL",
+                    (expected_run_id, task_id),
+                ).fetchone()
+                if task is None or task.status != "running" or task.current_run_id != expected_run_id or run is None:
+                    raise ValueError("the producing run is no longer active")
+                receipts = {}
+                for row in conn.execute(
+                    "SELECT payload FROM task_events "
+                    "WHERE task_id=? AND run_id=? AND kind='attached' ORDER BY id",
+                    (task_id, expected_run_id),
+                ):
+                    receipt = json.loads(row["payload"] or "{}")
+                    if isinstance(receipt, dict) and isinstance(receipt.get("attachment_id"), int):
+                        receipts[receipt["attachment_id"]] = receipt
+                for item in list_attachments(conn, task_id):
+                    receipt = receipts.get(item.id, {})
+                    requested_name = receipt.get("requested_filename", item.filename)
+                    if (
+                        requested_name == safe_name and item.size == len(data)
+                        and item.uploaded_by == uploaded_by
+                        and receipt.get("source_attachment_id") == source_attachment_id
+                        and item.created_at >= run["started_at"]
+                        and read_attachment_bytes(item, board=board) == data
+                    ):
+                        return item.id
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = _collision_free_path(dest_dir, safe_name)
+            dest_path.write_bytes(data)
+            attachment_id = _add_attachment_row(
+                conn, task_id, filename=dest_path.name,
+                stored_path=str(dest_path.resolve()), content_type=content_type,
+                size=len(data), uploaded_by=uploaded_by,
+                requested_filename=safe_name, source_attachment=source_attachment,
+                run_id=expected_run_id,
+            )
+        return attachment_id
     except Exception:
-        # Don't leave an orphan blob if the metadata insert fails (most
-        # commonly: the task id doesn't exist).
-        try:
-            dest_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if dest_path is not None:
+            try:
+                dest_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise
 
 
@@ -6775,6 +6840,27 @@ def add_attachment(
     size: int = 0,
     uploaded_by: Optional[str] = None,
 ) -> int:
+    """Record one attachment and its event in a complete transaction."""
+    with write_txn(conn):
+        return _add_attachment_row(
+            conn, task_id, filename=filename, stored_path=stored_path,
+            content_type=content_type, size=size, uploaded_by=uploaded_by,
+        )
+
+
+def _add_attachment_row(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    filename: str,
+    stored_path: str,
+    content_type: Optional[str] = None,
+    size: int = 0,
+    uploaded_by: Optional[str] = None,
+    requested_filename: Optional[str] = None,
+    source_attachment: Optional[Attachment] = None,
+    run_id: Optional[int] = None,
+) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
 
     The caller is responsible for writing the blob to ``stored_path``
@@ -6786,32 +6872,38 @@ def add_attachment(
     if not stored_path or not stored_path.strip():
         raise ValueError("attachment stored_path is required")
     now = int(time.time())
-    with write_txn(conn):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
-        ).fetchone():
-            raise ValueError(f"unknown task {task_id}")
-        cur = conn.execute(
-            "INSERT INTO task_attachments "
-            "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                task_id,
-                filename.strip(),
-                stored_path,
-                content_type,
-                int(size),
-                uploaded_by,
-                now,
-            ),
-        )
-        _append_event(
-            conn,
+    if not conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
+    ).fetchone():
+        raise ValueError(f"unknown task {task_id}")
+    cur = conn.execute(
+        "INSERT INTO task_attachments "
+        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
             task_id,
-            "attached",
-            {"filename": filename.strip(), "size": int(size), "by": uploaded_by},
+            filename.strip(),
+            stored_path,
+            content_type,
+            int(size),
+            uploaded_by,
+            now,
+        ),
+    )
+    attachment_id = int(cur.lastrowid or 0)
+    receipt = {
+        "attachment_id": attachment_id, "filename": filename.strip(),
+        "requested_filename": requested_filename or filename.strip(),
+        "size": int(size), "by": uploaded_by,
+    }
+    if source_attachment is not None:
+        receipt.update(
+            source_attachment_id=source_attachment.id,
+            source_task_id=source_attachment.task_id,
+            source_uploaded_by=source_attachment.uploaded_by,
         )
-        return int(cur.lastrowid or 0)
+    _append_event(conn, task_id, "attached", receipt, run_id=run_id)
+    return attachment_id
 
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:

@@ -45,6 +45,7 @@ Requires:
 """
 
 import asyncio
+import copy
 import base64
 import errno
 import hashlib
@@ -12740,7 +12741,7 @@ class APIServerAdapter(BasePlatformAdapter):
         authority: "dict[str, Any]",
         context: "dict[str, Any]",
         profile: str,
-    ) -> "dict[str, str]":
+    ) -> "dict[str, Any]":
         """Derive mutation authority from the stored proposal and live Project.
 
         A conversation carrying a request that ended without a turn authorizes
@@ -12972,6 +12973,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "idempotency_key": idempotency_key,
             "payload_digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
             "proposal_digest": proposal_digest,
+            "payload": copy.deepcopy(expected_payload),
         }
 
     def _validated_owner_lifecycle_authority(
@@ -12979,7 +12981,7 @@ class APIServerAdapter(BasePlatformAdapter):
         authority: "dict[str, Any]",
         context: "dict[str, Any]",
         profile: str,
-    ) -> "dict[str, str]":
+    ) -> "dict[str, Any]":
         """Bind one lifecycle run to exact receipt-backed Project state."""
         if (
             context.get("profile") != profile
@@ -13022,6 +13024,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return {
             "operation": "owner_project_lifecycle",
+            "payload": copy.deepcopy(payload),
             "idempotency_key": authority["idempotency_key"],
             "payload_digest": hashlib.sha256(
                 canonical.encode("utf-8")
@@ -13983,20 +13986,22 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.cancelled",
                     )
                     return
-                with self._profile_scope(request_profile):
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=_text_cb,
-                        tool_progress_callback=event_cb,
-                        tool_complete_callback=_owner_tool_complete,
-                        gateway_session_key=gateway_session_key,
-                        requested_model=agent_overrides.get("requested_model"),
-                        requested_provider=agent_overrides.get("requested_provider"),
-                        model_options=agent_overrides.get("model_options"),
-                        route=route,
-                    )
-                self._active_run_agents[run_id] = agent
+                agent = None
+                if owner_mutation_authority is None:
+                    with self._profile_scope(request_profile):
+                        agent = self._create_agent(
+                            ephemeral_system_prompt=ephemeral_system_prompt,
+                            session_id=session_id,
+                            stream_delta_callback=_text_cb,
+                            tool_progress_callback=event_cb,
+                            tool_complete_callback=_owner_tool_complete,
+                            gateway_session_key=gateway_session_key,
+                            requested_model=agent_overrides.get("requested_model"),
+                            requested_provider=agent_overrides.get("requested_provider"),
+                            model_options=agent_overrides.get("model_options"),
+                            route=route,
+                        )
+                    self._active_run_agents[run_id] = agent
                 raw_runtime = dict(
                     getattr(agent, "_hermes_api_runtime", {}) or {}
                 )
@@ -14110,19 +14115,44 @@ class APIServerAdapter(BasePlatformAdapter):
                             # TurnRunner, no _run_agent) — record turn process
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
-                            _publish_turn_process_ownership(agent, effective_task_id)
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
-                            )
+                            if owner_mutation_authority is not None:
+                                # The authenticated proposal is already frozen.
+                                # Apply its exact payload through the existing
+                                # guarded kernel; never ask a model to copy it.
+                                from tools import owner_workspace_tools
+
+                                handlers = {
+                                    "owner_task_graph_commit":
+                                        owner_workspace_tools._handle_task_graph,
+                                    "owner_project_plan_commit":
+                                        owner_workspace_tools._handle_project_plan,
+                                    "owner_project_lifecycle":
+                                        owner_workspace_tools._handle_project_lifecycle,
+                                }
+                                operation = owner_mutation_authority["operation"]
+                                arguments = copy.deepcopy(
+                                    owner_mutation_authority["payload"]
+                                )
+                                result = handlers[operation](arguments)
+                                _owner_tool_complete(
+                                    run_id, operation, arguments, result,
+                                )
+                                r = {"final_response": result}
+                            else:
+                                _publish_turn_process_ownership(agent, effective_task_id)
+                                r = agent.run_conversation(
+                                    user_message=user_message,
+                                    conversation_history=conversation_history,
+                                    task_id=effective_task_id,
+                                )
                         finally:
                             # Worker finished (interrupted or complete) —
                             # clear turn ownership immediately so a later
                             # stop/cancel can't reap background work this
                             # run deliberately left running (same race-window
                             # guard as gateway/run.py and _run_agent above).
-                            _clear_turn_process_ownership(agent)
+                            if agent is not None:
+                                _clear_turn_process_ownership(agent)
                             try:
                                 unregister_gateway_notify(approval_session_key)
                             finally:

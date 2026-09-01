@@ -1,10 +1,11 @@
 name: raphael_workspace
 version: 1.1.0
-description: "Managed, mutually isolated machine credentials for Raphael Workspace, recommendations, Connections, Automations, and Models, plus the trusted Server 2 sandbox dispatch the Claude coding worker uses. Each fixed token family has one least-privilege scope and exact route contour; only token ids, SHA-256 digests, fixed grants, and lifecycle metadata are persisted. Plaintext bearer secrets are written once to explicit owner-only paths and never logged. Revocation and expiry are checked from disk on every request; an empty registry fails closed. The sandbox tool takes no arguments, resolves task/source/image/connection/credential from host-owned state, seeds Credential Vault behind CredentialProxy, and returns only a sanitized receipt."
+description: "Managed, isolated credentials for Raphael Workspace, recommendations, Connections, Automations and Models, plus scoped Server 2 execution and native artifact handoff. Fixed token families have least-privilege grants and exact route contours; plaintext credentials are never logged. Revocation and expiry are checked from disk. Provisioning resolves the active task and pinned source from host-owned state; only the coding profile receives a credential-vault binding. Artifact inspection and exact-byte copy use native task references without host paths or model-transcribed bytes, preserve source provenance and remain usable after the execution machine expires. Remote imports and exports stay bound to the active run's sandbox."
 author: NousResearch
 kind: backend
 provides_tools:
   - raphael_sandbox_provision
+  - raphael_sandbox_artifact
 python_dependencies:
   # 0.1.15 is the installed, live-proven SDK and publishes every API the
   # wrapper uses; 0.1.16 is admitted by the same bound but is newer than the

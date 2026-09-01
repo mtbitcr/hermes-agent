@@ -315,6 +315,8 @@ class TestStartRun:
             response_id.encode("utf-8")
         ).hexdigest()
         proposal = _new_owner_proposal()
+        proposal["specification"] = "Keep the literal hermes-agent repository name unchanged."
+        proposal["tasks"][0]["body"] = "Inspect hermes-agent without rewriting its name."
         adapter._response_store.put(response_id, {
             "response": {"id": response_id, "created_at": 1},
             "conversation_history": [
@@ -358,33 +360,7 @@ class TestStartRun:
                 return_value={"approved": True, "reason": None},
             ),
         ):
-            class NativeToolAgent:
-                session_prompt_tokens = 0
-                session_completion_tokens = 0
-                session_total_tokens = 0
-                _hermes_api_runtime = {}
-
-                def __init__(self, tool_complete_callback):
-                    self._tool_complete_callback = tool_complete_callback
-
-                def run_conversation(self, **_kwargs):
-                    from tools.owner_workspace_tools import _handle_task_graph
-
-                    result = _handle_task_graph(payload)
-                    self._tool_complete_callback(
-                        "tool-call-1",
-                        "owner_task_graph_commit",
-                        payload,
-                        result,
-                    )
-                    return {"final_response": "model prose is not the receipt"}
-
-                def interrupt(self, _message=None):
-                    return None
-
-            mock_create.side_effect = lambda **kwargs: NativeToolAgent(
-                kwargs["tool_complete_callback"]
-            )
+            mock_create.side_effect = RuntimeError("provider unavailable")
 
             async with TestClient(TestServer(app)) as cli:
                 mismatched_context_body = json.loads(json.dumps(body))
@@ -444,7 +420,7 @@ class TestStartRun:
             "project_slug": "workshop-pilot",
             "task_count": 1,
         }
-        assert mock_create.call_count == 1
+        mock_create.assert_not_called()
 
         from hermes_cli.owner_workspace import OwnerContext, list_committed_projects
 
@@ -632,30 +608,6 @@ class TestStartRun:
         }
         config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
 
-        class LifecycleAgent:
-            session_prompt_tokens = 0
-            session_completion_tokens = 0
-            session_total_tokens = 0
-            _hermes_api_runtime = {}
-
-            def __init__(self, tool_complete_callback):
-                self._tool_complete_callback = tool_complete_callback
-
-            def run_conversation(self, **_kwargs):
-                from tools.owner_workspace_tools import _handle_project_lifecycle
-
-                result = _handle_project_lifecycle(lifecycle_payload)
-                self._tool_complete_callback(
-                    "tool-call-lifecycle",
-                    "owner_project_lifecycle",
-                    lifecycle_payload,
-                    result,
-                )
-                return {"final_response": "model prose is not lifecycle proof"}
-
-            def interrupt(self, _message=None):
-                return None
-
         app = _create_runs_app(adapter)
         with (
             patch("gateway.run._load_gateway_config", return_value=config),
@@ -665,9 +617,7 @@ class TestStartRun:
                 return_value={"approved": True, "reason": None},
             ),
         ):
-            mock_create.side_effect = lambda **kwargs: LifecycleAgent(
-                kwargs["tool_complete_callback"]
-            )
+            mock_create.side_effect = RuntimeError("provider unavailable")
             async with TestClient(TestServer(app)) as cli:
                 stale_body = json.loads(json.dumps(body))
                 stale_body["owner_lifecycle_authority"]["payload"][
@@ -704,7 +654,7 @@ class TestStartRun:
             "execution_paused": True,
         }
         assert "model prose" not in status["output"]
-        assert mock_create.call_count == 1
+        mock_create.assert_not_called()
 
         db_path = adapter._response_store._db_path
         assert db_path is not None
@@ -798,39 +748,21 @@ class TestStartRun:
         config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
         attempts = []
 
-        class RetryAgent:
-            session_prompt_tokens = 0
-            session_completion_tokens = 0
-            session_total_tokens = 0
-            _hermes_api_runtime = {}
+        from hermes_cli import projects_db
+        real_connect = projects_db.connect
 
-            def __init__(self, tool_complete_callback, succeeds):
-                self._tool_complete_callback = tool_complete_callback
-                self._succeeds = succeeds
-
-            def run_conversation(self, **_kwargs):
-                if not self._succeeds:
-                    return {"failed": True, "error": "provider unavailable"}
-                from tools.owner_workspace_tools import _handle_task_graph
-
-                result = _handle_task_graph(payload)
-                self._tool_complete_callback(
-                    "tool-call-retry", "owner_task_graph_commit", payload, result,
-                )
-                return {"final_response": "done"}
-
-            def interrupt(self, _message=None):
-                return None
-
-        def create_agent(**kwargs):
+        def connect_once_recovered(*args, **kwargs):
             succeeds = bool(attempts)
             attempts.append(succeeds)
-            return RetryAgent(kwargs["tool_complete_callback"], succeeds)
+            if not succeeds:
+                raise OSError("native project store temporarily unavailable")
+            return real_connect(*args, **kwargs)
 
         app = _create_runs_app(adapter)
         with (
             patch("gateway.run._load_gateway_config", return_value=config),
-            patch.object(adapter, "_create_agent", side_effect=create_agent),
+            patch.object(projects_db, "connect", side_effect=connect_once_recovered),
+            patch.object(adapter, "_create_agent", side_effect=RuntimeError("provider unavailable")),
             patch(
                 "hermes_cli.profiles.list_profiles",
                 return_value=[SimpleNamespace(name="default")],
@@ -866,7 +798,8 @@ class TestStartRun:
 
         assert first.status == retry.status == 202
         assert retry_run_id != first_run_id
-        assert attempts == [False, True]
+        assert attempts[0] is False
+        assert len(attempts) >= 2 and all(attempts[1:])
         assert adapter._response_store.owner_history_snapshot(
             conversation, profile="raphael-planner",
         )["proposal_consumed"] is True

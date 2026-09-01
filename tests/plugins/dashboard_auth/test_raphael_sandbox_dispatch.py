@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import hashlib
 import logging
 import os
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -72,13 +73,80 @@ class FakeVault:
 
 
 class FakeFiles:
+    """Models the two measured, asymmetric facts the real SDK exposes.
+
+    ``write_file``/``read_bytes(_stream)`` FOLLOW every symlink in the path,
+    including intermediate directory components — exactly like any ordinary
+    filesystem call. ``get_file_info`` lstats: for a requested path it
+    resolves every component *except the last* (a symlinked ancestor still
+    redirects it there, matching the real kernel), then reports whatever sits
+    at that exact spot without dereferencing it — a symlink is reported as
+    ``"symlink"``, never silently followed.
+    """
+
     def __init__(self, box: "FakeSandbox") -> None:
         self._box = box
 
+    def _resolve(self, path, *, follow_leaf):
+        parts = PurePosixPath(path).parts
+        resolved = PurePosixPath(parts[0])
+        last_index = len(parts) - 1
+        for index, part in enumerate(parts[1:], start=1):
+            resolved = resolved / part
+            if index == last_index and not follow_leaf:
+                continue
+            seen = set()
+            while str(resolved) in self._box.symlinks:
+                if str(resolved) in seen:
+                    raise RuntimeError("symlink loop")
+                seen.add(str(resolved))
+                resolved = PurePosixPath(self._box.symlinks[str(resolved)])
+        return str(resolved)
+
     def write_file(self, path, data, **kwargs):
-        self._box.uploads.append((path, data))
         if self._box.behavior.get("upload_fails"):
             raise RuntimeError("upload failed")
+        resolved = self._resolve(path, follow_leaf=True)
+        self._box.uploads.append((path, data))
+        self._box.file_data[resolved] = data if isinstance(data, bytes) else data.encode()
+
+    def read_bytes(self, path, **kwargs):
+        return self._box.file_data[self._resolve(path, follow_leaf=True)]
+
+    def read_bytes_stream(self, path, **kwargs):
+        yield self.read_bytes(path)
+
+    def create_directories(self, entries):
+        for entry in entries:
+            node = PurePosixPath(self._resolve(entry.path, follow_leaf=True))
+            while True:
+                self._box.directories.add(str(node))
+                if node == node.parent:
+                    break
+                node = node.parent
+
+    def get_file_info(self, paths):
+        from opensandbox.models.filesystem import EntryInfo
+
+        now = datetime.now(timezone.utc)
+        info = {}
+        for requested in paths:
+            resolved = self._resolve(requested, follow_leaf=False)
+            if resolved in self._box.symlinks:
+                entry_type = "symlink"
+            elif resolved in self._box.directories:
+                entry_type = "directory"
+            elif resolved in self._box.file_data:
+                entry_type = "file"
+            else:
+                continue
+            info[requested] = EntryInfo(
+                path=requested, entry_type=entry_type, mode=0o644,
+                owner="root", group="root",
+                size=len(self._box.file_data.get(resolved, b"")),
+                modified_at=now, created_at=now,
+            )
+        return info
 
 
 class FakeCommands:
@@ -107,6 +175,12 @@ class FakeSandbox:
         self.create_kwargs = kwargs
         self.vault_calls: list[dict] = []
         self.uploads: list[tuple] = []
+        self.file_data = {}
+        # Directories the seeding shell step and prior imports would already
+        # have created on a real machine — pre-seeded here since FakeCommands
+        # doesn't touch this registry. path -> symlink target for planted links.
+        self.directories = {"/", "/workspace", "/tmp", sd.SANDBOX_WORKSPACE, sd.SANDBOX_BASELINE}
+        self.symlinks: dict = {}
         self.commands_log: list[str] = []
         self.connect_kwargs: dict = {}
         self.killed = False
@@ -346,8 +420,8 @@ class TestGates:
     def test_check_fn_true_only_for_the_coding_worker(self, host):
         assert sd.check_provision_available() is True
 
-    def test_check_fn_false_for_another_profile(self, host, monkeypatch):
-        monkeypatch.setenv("HERMES_PROFILE", "raphael-builder")
+    def test_check_fn_false_for_coordinator(self, host, monkeypatch):
+        monkeypatch.setenv("HERMES_PROFILE", "default")
         assert sd.check_provision_available() is False
 
     def test_check_fn_false_without_kanban_run(self, host, monkeypatch):
@@ -361,9 +435,9 @@ class TestGates:
             assert sd.check_provision_available() is False
 
     def test_handler_refuses_another_profile(self, host, sdk, monkeypatch):
-        monkeypatch.setenv("HERMES_PROFILE", "raphael-builder")
+        monkeypatch.setenv("HERMES_PROFILE", "default")
         out = _provision()
-        assert "raphael-claude-worker" in out["error"]
+        assert "scoped engineering" in out["error"]
         assert not FakeSandbox.created
 
     def test_handler_refuses_when_run_id_does_not_match_the_board(
@@ -1607,6 +1681,10 @@ class TestPluginRegistration:
                 calls.append(kwargs)
                 return None
 
+            def register_hook(self, name, callback):
+                assert name == "pre_tool_call"
+                assert callback is sd.maintain_sandbox_lease
+
         raphael_workspace.register(Ctx())
         (tool,) = [c for c in calls if c["name"] == sd.TOOL_NAME]
         assert tool["toolset"] == sd.TOOLSET
@@ -1650,3 +1728,563 @@ class TestPluginRegistration:
         # The floor is not aspirational: the SDK actually imported by the
         # module under test satisfies it.
         assert Version(importlib.metadata.version("opensandbox")) in spec
+
+
+def test_artifact_round_trip_moves_real_bytes_without_model_text(host, sdk):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    _provision()
+    box = FakeSandbox.created[-1]
+    data = bytes(range(256)) * 137
+    digest = hashlib.sha256(data).hexdigest()
+    box.files.write_file("/workspace/task/result.patch", data)
+    exported = json.loads(sa.handle_artifact({
+        "direction": "export", "path": "/workspace/task/result.patch",
+        "expected_sha256": digest,
+    }))
+    assert exported.get("sha256") == digest, exported
+    assert exported["size"] == len(data)
+    replay = json.loads(sa.handle_artifact({
+        "direction": "export", "path": "/workspace/task/result.patch",
+        "expected_sha256": digest,
+    }))
+    assert replay["attachment_id"] == exported["attachment_id"]
+    with kb.connect_closing() as conn:
+        stored = kb.get_attachment(conn, exported["attachment_id"])
+        assert Path(stored.stored_path).read_bytes() == data
+    imported = json.loads(sa.handle_artifact({
+        "direction": "import", "attachment_id": exported["attachment_id"],
+        "expected_sha256": digest,
+    }))
+    assert imported.get("sha256") == digest, imported
+    assert box.files.read_bytes(imported["path"]) == data
+
+
+def test_verification_role_gets_same_scoped_sandbox_without_coding_credentials(host, sdk, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "raphael-verifier")
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET assignee=? WHERE id=?", ("raphael-verifier", host.task_id))
+        conn.commit()
+    out = _provision()
+    assert "sandbox_id" in out, out
+    box = FakeSandbox.created[-1]
+    assert box.reported_metadata["hermes_profile"] == "raphael-verifier"
+    assert box.create_kwargs["env"] == {}
+    assert box.vault_calls == []
+
+
+def test_active_sandbox_is_renewed_before_the_lease_expires(host, sdk):
+    _provision()
+    box = FakeSandbox.created[-1]
+    box.expires_in_seconds = 120
+    box.renewals = []
+    box.renew = lambda timeout: box.renewals.append(timeout.total_seconds())
+    box.credential_vault.patch = lambda **kwargs: None
+    result = sd.maintain_sandbox_lease(
+        tool_name="mcp_opensandbox_agent_factory_sandbox_command_run",
+        args={"sandbox_id": box.id},
+    )
+    assert result is None, result
+    assert box.renewals == [sd.SANDBOX_TIMEOUT_SECONDS]
+
+
+@pytest.mark.parametrize("bad_input", [
+    {"direction": "export", "path": "/etc/passwd", "expected_sha256": "0" * 64},
+    {"direction": "export", "path": "/workspace/task/../secret", "expected_sha256": "0" * 64},
+    {"direction": "import", "attachment_id": True, "expected_sha256": "0" * 64},
+])
+def test_artifact_refuses_unscoped_inputs(host, sdk, bad_input):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+    _provision()
+    result = json.loads(sa.handle_artifact(bad_input))
+    assert "error" in result
+    with kb.connect_closing() as conn:
+        assert kb.list_attachments(conn, host.task_id) == []
+
+
+def test_artifact_refuses_wrong_checksum_and_stale_run(host, sdk):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+    _provision()
+    box = FakeSandbox.created[-1]
+    box.files.write_file("/workspace/task/result.patch", b"real bytes")
+    args = {"direction": "export", "path": "/workspace/task/result.patch",
+            "expected_sha256": "0" * 64}
+    assert "error" in json.loads(sa.handle_artifact(args))
+    with kb.connect_closing() as conn:
+        assert kb.list_attachments(conn, host.task_id) == []
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (host.task_id,))
+        conn.commit()
+    args["expected_sha256"] = hashlib.sha256(b"real bytes").hexdigest()
+    assert "error" in json.loads(sa.handle_artifact(args))
+
+
+def test_artifact_refuses_another_tasks_unrelated_input(host, sdk):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+    _provision()
+    data = b"other task data"
+    with kb.connect_closing() as conn:
+        foreign = kb.create_task(conn, title="Unrelated work", assignee="raphael-claude-worker")
+        aid = kb.store_attachment_bytes(conn, foreign, "foreign.patch", data, uploaded_by="agent")
+    result = json.loads(sa.handle_artifact({
+        "direction": "import", "attachment_id": aid,
+        "expected_sha256": hashlib.sha256(data).hexdigest(),
+    }))
+    assert "error" in result
+    assert not any(path.startswith("/workspace/inputs/") for path in FakeSandbox.created[-1].file_data)
+
+
+# ---------------------------------------------------------------------------
+# Remote symlink containment — get_file_info lstats and never follows, while
+# read_bytes_stream/write_file both follow every symlink in a path, including
+# an intermediate ancestor. A lexical-only check (absolute, no "..", inside
+# the root) cannot see that, so every ancestor must be proven a real
+# directory, and the leaf proven the right thing, with metadata before any
+# byte moves.
+# ---------------------------------------------------------------------------
+
+
+class TestArtifactRemoteSymlinkContainment:
+    def test_export_refuses_a_leaf_symlink_even_when_the_target_holds_the_expected_bytes(
+        self, host, sdk
+    ):
+        from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+        _provision()
+        box = FakeSandbox.created[-1]
+        secret = b"outside-the-workspace secret bytes"
+        box.file_data["/outside/secret.txt"] = secret
+        box.symlinks["/workspace/task/result.patch"] = "/outside/secret.txt"
+        result = json.loads(sa.handle_artifact({
+            "direction": "export", "path": "/workspace/task/result.patch",
+            "expected_sha256": hashlib.sha256(secret).hexdigest(),
+        }))
+        assert "error" in result
+        assert box.file_data["/outside/secret.txt"] == secret
+        with kb.connect_closing() as conn:
+            assert kb.list_attachments(conn, host.task_id) == []
+
+    def test_export_refuses_when_an_intermediate_directory_is_a_symlink(self, host, sdk):
+        from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+        _provision()
+        box = FakeSandbox.created[-1]
+        secret = b"reached only by walking through the redirected directory"
+        box.file_data["/outside/dir/result.patch"] = secret
+        box.symlinks["/workspace/task/sub"] = "/outside/dir"
+        result = json.loads(sa.handle_artifact({
+            "direction": "export", "path": "/workspace/task/sub/result.patch",
+            "expected_sha256": hashlib.sha256(secret).hexdigest(),
+        }))
+        assert "error" in result
+        assert box.file_data["/outside/dir/result.patch"] == secret
+        with kb.connect_closing() as conn:
+            assert kb.list_attachments(conn, host.task_id) == []
+
+    def test_export_still_succeeds_for_an_ordinary_regular_file(self, host, sdk):
+        from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+        _provision()
+        box = FakeSandbox.created[-1]
+        data = b"an ordinary file with no symlinks anywhere in its path"
+        box.files.write_file("/workspace/task/result.patch", data)
+        result = json.loads(sa.handle_artifact({
+            "direction": "export", "path": "/workspace/task/result.patch",
+            "expected_sha256": hashlib.sha256(data).hexdigest(),
+        }))
+        assert "error" not in result, result
+        with kb.connect_closing() as conn:
+            stored = kb.get_attachment(conn, result["attachment_id"])
+            assert kb.read_attachment_bytes(stored) == data
+
+    def test_import_refuses_a_pre_existing_symlink_at_the_destination(self, host, sdk):
+        from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+        _provision()
+        box = FakeSandbox.created[-1]
+        own_data = b"bytes this task is entitled to move to the sandbox"
+        with kb.connect_closing() as conn:
+            aid = kb.store_attachment_bytes(
+                conn, host.task_id, "own.bin", own_data, uploaded_by="agent",
+            )
+        untouched = b"whatever this external file already held"
+        box.file_data["/outside/target.bin"] = untouched
+        box.symlinks[f"/workspace/inputs/{aid}/own.bin"] = "/outside/target.bin"
+        result = json.loads(sa.handle_artifact({
+            "direction": "import", "attachment_id": aid,
+            "expected_sha256": hashlib.sha256(own_data).hexdigest(),
+        }))
+        assert "error" in result
+        assert box.file_data["/outside/target.bin"] == untouched
+        assert box.symlinks[f"/workspace/inputs/{aid}/own.bin"] == "/outside/target.bin"
+
+    def test_import_refuses_when_a_destination_ancestor_is_a_symlink(self, host, sdk):
+        from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+        _provision()
+        box = FakeSandbox.created[-1]
+        own_data = b"bytes redirected by a symlinked inputs root"
+        with kb.connect_closing() as conn:
+            aid = kb.store_attachment_bytes(
+                conn, host.task_id, "own.bin", own_data, uploaded_by="agent",
+            )
+        box.symlinks["/workspace/inputs"] = "/outside/inputs"
+        result = json.loads(sa.handle_artifact({
+            "direction": "import", "attachment_id": aid,
+            "expected_sha256": hashlib.sha256(own_data).hexdigest(),
+        }))
+        assert "error" in result
+        assert not any(path.startswith("/outside/inputs") for path in box.file_data)
+
+    def test_import_still_succeeds_on_a_clean_destination(self, host, sdk):
+        from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+        _provision()
+        box = FakeSandbox.created[-1]
+        own_data = b"bytes with nothing pre-planted at the destination"
+        with kb.connect_closing() as conn:
+            aid = kb.store_attachment_bytes(
+                conn, host.task_id, "own.bin", own_data, uploaded_by="agent",
+            )
+        result = json.loads(sa.handle_artifact({
+            "direction": "import", "attachment_id": aid,
+            "expected_sha256": hashlib.sha256(own_data).hexdigest(),
+        }))
+        assert "error" not in result, result
+        assert box.file_data[result["path"]] == own_data
+
+    def test_source_staging_write_refuses_a_pre_existing_symlink_at_the_archive_path(
+        self, host, sdk
+    ):
+        untouched = b"whatever already lived at the redirected archive target"
+
+        def _plant_symlink(box):
+            box.file_data["/outside/evil.tar"] = untouched
+            box.symlinks[sd.SANDBOX_ARCHIVE_PATH] = "/outside/evil.tar"
+
+        FakeSandbox.behavior = {"after_create": _plant_symlink}
+        out = _provision()
+        assert "error" in out
+        box = FakeSandbox.created[0]
+        assert box.file_data["/outside/evil.tar"] == untouched
+        assert box.killed is True
+
+
+def test_inspect_native_artifact_without_a_sandbox(host):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    data = json.dumps({"patch_sha256": "a" * 64}).encode("utf-8")
+    with kb.connect_closing() as conn:
+        aid = kb.store_attachment_bytes(
+            conn, host.task_id, "manifest.json", data,
+            content_type="application/json", uploaded_by="operator",
+        )
+
+    result = json.loads(sa.handle_artifact({
+        "direction": "inspect", "attachment_id": aid,
+    }))
+
+    assert "error" not in result, result
+    assert result["sha256"] == hashlib.sha256(data).hexdigest()
+    assert result["content_text"] == data.decode("utf-8")
+    assert result["source_uploaded_by"] == "operator"
+    assert _reservation(host)["state"] == "absent"
+
+def test_copy_native_artifact_preserves_bytes_and_retry_identity(host):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    data = bytes(range(256)) * 8192
+    with kb.connect_closing() as conn:
+        aid = kb.store_attachment_bytes(
+            conn, host.task_id, "recovered.patch", data,
+            content_type="application/octet-stream", uploaded_by="operator",
+        )
+    args = {"direction": "copy", "attachment_id": aid,
+            "expected_sha256": hashlib.sha256(data).hexdigest()}
+
+    result = json.loads(sa.handle_artifact(args))
+
+    assert "error" not in result, result
+    assert result["source_attachment_id"] == aid
+    assert result["source_uploaded_by"] == "operator"
+    assert result["attachment_id"] != aid
+    with kb.connect_closing() as conn:
+        copied = kb.get_attachment(conn, result["attachment_id"])
+        assert copied.uploaded_by == "agent"
+        assert kb.read_attachment_bytes(copied) == data
+    assert json.loads(sa.handle_artifact(args))["attachment_id"] == result["attachment_id"]
+    assert _reservation(host)["state"] == "absent"
+
+def _replacement_artifact_context(host, monkeypatch, profile, responsibility):
+    from hermes_cli import projects_db
+    from plugins.dashboard_auth.raphael_workspace.model_policy import task_assignment_for
+
+    with projects_db.connect_closing() as conn:
+        project_id = projects_db.create_project(
+            conn, name="Artifact recovery", primary_path=str(host.repo),
+        )
+    provider = "openai-codex" if profile == "raphael-verifier" else "anthropic"
+    route = task_assignment_for(profile, provider, "deep")
+    spec = {
+        "title": "Continue the saved artifact",
+        "body": "Reuse the exact saved input without reauthoring it.",
+        "assignee": profile, "responsibility": responsibility,
+        "execution_tier": "deep", "model_override": route.model,
+        "provider_override": route.provider, "reasoning_effort": route.reasoning_effort,
+        "model_policy_lock": kb.mint_policy_lock(
+            profile, route.provider, route.model, route.reasoning_effort, "deep",
+        ),
+        "owned_paths": ["."],
+    }
+    data = json.dumps({"original_input": "preserved exactly"}).encode()
+    with kb.connect_closing() as conn:
+        kb.block_task(conn, host.task_id, reason="Prepare the isolated replacement fixture.")
+        anchor = kb.create_task(conn, title="Fixture anchor", project_id=project_id, control=True)
+        source = kb.create_task(
+            conn, title="Stopped work", assignee=sd.WORKER_PROFILE,
+            project_id=project_id, initial_status="blocked",
+        )
+        aid = kb.store_attachment_bytes(
+            conn, source, "saved.json", data,
+            content_type="application/json", uploaded_by="operator",
+        )
+        plan = kb.apply_owner_project_plan(
+            conn, project_id=project_id, anchor_task_id=anchor,
+            changes=[{
+                "action": "replace", "reason": "Continue the saved work.",
+                "target": {"task_id": source, "expected_status": "blocked",
+                           "expected_revision": kb.task_event_revision(conn, source)},
+                "replacement": spec,
+            }],
+            actor="default", profile="default", idempotency_key="artifact-replacement",
+            request_digest=hashlib.sha256(b"artifact replacement").hexdigest(),
+            trigger="Continue", plan_summary="Recover the saved input.",
+            current_milestone="Verify artifact recovery", later_milestones=[], parked=False,
+        )
+        assert plan["applied"], plan
+        current = kb.claim_task(conn, plan["created_task_ids"][0])
+        assert current is not None
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", current.id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", current.workspace_path)
+    return source, aid, data, current, anchor
+
+
+@pytest.mark.parametrize(("profile", "responsibility"), [
+    ("raphael-builder", "R17"), ("raphael-verifier", "R13"),
+])
+def test_replacement_worker_recovers_native_predecessor_artifact(
+    host, monkeypatch, profile, responsibility,
+):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    source, aid, data, current, _ = _replacement_artifact_context(
+        host, monkeypatch, profile, responsibility,
+    )
+    from model_tools import handle_function_call
+    from tools.registry import invalidate_check_fn_cache, registry
+
+    invalidate_check_fn_cache()
+    definitions = registry.get_definitions({sa.TOOL_NAME}, quiet=True)
+    enabled = [definition["function"]["name"] for definition in definitions]
+    assert sa.TOOL_NAME in enabled
+    inspected = json.loads(handle_function_call(
+        sa.TOOL_NAME, {"direction": "inspect", "attachment_id": aid},
+        task_id=current.id, enabled_tools=enabled, enabled_toolsets=[sd.TOOLSET],
+    ))
+    assert "error" not in inspected, inspected
+    copied = json.loads(handle_function_call(
+        sa.TOOL_NAME,
+        {"direction": "copy", "attachment_id": aid, "expected_sha256": inspected["sha256"]},
+        task_id=current.id, enabled_tools=enabled, enabled_toolsets=[sd.TOOLSET],
+    ))
+    assert "error" not in copied, copied
+    assert copied["source_task_id"] == source
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, source).status == "archived"
+        attachment = kb.get_attachment(conn, copied["attachment_id"])
+        assert attachment.task_id == current.id
+        assert kb.read_attachment_bytes(attachment) == data
+
+@pytest.mark.parametrize("direction", ["inspect", "copy"])
+def test_native_artifact_recovery_does_not_require_a_live_sandbox(host, sdk, direction):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    _provision()
+    FakeSandbox.created[-1].expires_in_seconds = -1
+    data = b"saved before expiry"
+    with kb.connect_closing() as conn:
+        aid = kb.store_attachment_bytes(
+            conn, host.task_id, "saved.txt", data, content_type="text/plain",
+            uploaded_by="operator",
+        )
+    args = {"direction": direction, "attachment_id": aid}
+    if direction == "copy":
+        args["expected_sha256"] = hashlib.sha256(data).hexdigest()
+
+    gate = sd.maintain_sandbox_lease(tool_name="raphael_sandbox_artifact", args=args)
+
+    assert gate is None, gate
+    result = json.loads(sa.handle_artifact(args))
+    assert "error" not in result, result
+    assert result["sha256"] == hashlib.sha256(data).hexdigest()
+
+@pytest.mark.parametrize("direction", ["inspect", "copy"])
+def test_native_artifact_rejects_cancelled_source_and_forged_comment(host, monkeypatch, direction):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    _, _, _, current, anchor = _replacement_artifact_context(
+        host, monkeypatch, "raphael-builder", "R17",
+    )
+    data = b"unrelated private input"
+    with kb.connect_closing() as conn:
+        other = kb.create_task(
+            conn, title="Cancelled unrelated work", project_id=current.project_id,
+            assignee=sd.WORKER_PROFILE, initial_status="blocked",
+        )
+        aid = kb.store_attachment_bytes(conn, other, "private.txt", data, uploaded_by="operator")
+        kb.add_comment(conn, other, "operator", json.dumps({
+            "kind": "owner_project_plan_change", "action": "replace",
+            "replacement_task_id": current.id,
+        }))
+        result = kb.apply_owner_project_plan(
+            conn, project_id=current.project_id, anchor_task_id=anchor,
+            changes=[{"action": "cancel", "reason": "Cancel unrelated work.",
+                      "target": {"task_id": other, "expected_status": "blocked",
+                                 "expected_revision": kb.task_event_revision(conn, other)}}],
+            actor="default", profile="default", idempotency_key="cancel-unrelated-input",
+            request_digest=hashlib.sha256(b"cancel unrelated input").hexdigest(),
+            trigger="Cancel", plan_summary="Cancel only this work.",
+            current_milestone="Verify input boundaries", later_milestones=[], parked=False,
+        )
+        assert result["applied"]
+    args = {"direction": direction, "attachment_id": aid}
+    if direction == "copy":
+        args["expected_sha256"] = hashlib.sha256(data).hexdigest()
+    result = json.loads(sa.handle_artifact(args))
+    assert "error" in result
+    assert data.decode() not in json.dumps(result)
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, other).status == "archived"
+        assert kb.list_attachments(conn, current.id) == []
+
+
+@pytest.mark.parametrize("direction", ["inspect", "copy"])
+def test_native_artifact_rejects_other_project_and_stale_run(host, monkeypatch, direction):
+    from hermes_cli import projects_db
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    _, own_id, own_data, current, _ = _replacement_artifact_context(
+        host, monkeypatch, "raphael-verifier", "R13",
+    )
+    with projects_db.connect_closing() as conn:
+        foreign_project = projects_db.create_project(conn, name="Other project")
+    with kb.connect_closing() as conn:
+        other = kb.create_task(conn, title="Other project's work", project_id=foreign_project)
+        aid = kb.store_attachment_bytes(conn, other, "foreign.txt", b"foreign data", uploaded_by="operator")
+        assert kb.complete_task(conn, other, summary="Done", fire_lifecycle_hook=False)
+    args = {"direction": direction, "attachment_id": aid}
+    if direction == "copy":
+        args["expected_sha256"] = hashlib.sha256(b"foreign data").hexdigest()
+    assert "error" in json.loads(sa.handle_artifact(args))
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current.current_run_id + 1))
+    args["attachment_id"] = own_id
+    if direction == "copy":
+        args["expected_sha256"] = hashlib.sha256(own_data).hexdigest()
+    assert "error" in json.loads(sa.handle_artifact(args))
+    with kb.connect_closing() as conn:
+        assert kb.list_attachments(conn, current.id) == []
+
+
+@pytest.mark.parametrize("direction", ["inspect", "copy"])
+@pytest.mark.parametrize("caller", ["coordinator", "delegated", "scheduled"])
+def test_native_artifact_rejects_non_worker_callers(host, monkeypatch, direction, caller):
+    from contextlib import nullcontext
+    from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    with kb.connect_closing() as conn:
+        aid = kb.store_attachment_bytes(conn, host.task_id, "input.txt", b"private input", uploaded_by="operator")
+    args = {"direction": direction, "attachment_id": aid}
+    if direction == "copy":
+        args["expected_sha256"] = hashlib.sha256(b"private input").hexdigest()
+    if caller == "coordinator":
+        monkeypatch.setenv("HERMES_PROFILE", "default")
+        scope = nullcontext()
+    elif caller == "delegated":
+        scope = delegated_child_context("artifact-negative")
+    else:
+        scope = non_dispatcher_owned_context()
+    with scope:
+        result = json.loads(sa.handle_artifact(args))
+    assert "error" in result
+    assert "private input" not in json.dumps(result)
+    with kb.connect_closing() as conn:
+        assert [a.id for a in kb.list_attachments(conn, host.task_id)] == [aid]
+
+
+def test_native_copy_rejects_checksum_mismatch_without_writing(host):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    with kb.connect_closing() as conn:
+        aid = kb.store_attachment_bytes(conn, host.task_id, "input.txt", b"exact", uploaded_by="operator")
+    result = json.loads(sa.handle_artifact({
+        "direction": "copy", "attachment_id": aid, "expected_sha256": "0" * 64,
+    }))
+    assert "error" in result
+    with kb.connect_closing() as conn:
+        assert [a.id for a in kb.list_attachments(conn, host.task_id)] == [aid]
+
+
+@pytest.mark.parametrize(("data", "media_type"), [
+    (b"x" * 8193, "text/plain"), (b"binary", "application/octet-stream"),
+])
+def test_native_inspection_never_returns_partial_or_binary_text(host, data, media_type):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    with kb.connect_closing() as conn:
+        aid = kb.store_attachment_bytes(
+            conn, host.task_id, "input.dat", data, content_type=media_type, uploaded_by="operator",
+        )
+    result = json.loads(sa.handle_artifact({"direction": "inspect", "attachment_id": aid}))
+    assert "error" not in result
+    assert result["content_text_included"] is False
+    assert "content_text" not in result
+    assert result["sha256"] == hashlib.sha256(data).hexdigest()
+
+
+def test_active_run_retry_reuses_a_collision_renamed_export(host):
+    with kb.connect_closing() as conn:
+        kb.store_attachment_bytes(conn, host.task_id, "result.patch", b"old", uploaded_by="operator")
+        first = kb.store_attachment_bytes(
+            conn, host.task_id, "result.patch", b"new", uploaded_by="agent", expected_run_id=host.run_id,
+        )
+        again = kb.store_attachment_bytes(
+            conn, host.task_id, "result.patch", b"new", uploaded_by="agent", expected_run_id=host.run_id,
+        )
+        assert first == again
+        assert len(kb.list_attachments(conn, host.task_id)) == 2
+
+
+def test_copied_operator_patch_can_complete_the_native_worktree_handoff(host):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    patch = b"--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-print('hi')\n+print('recovered')\n"
+    with kb.connect_closing() as conn:
+        kb.set_branch_name(conn, host.task_id, _git(host.worktree, "branch", "--show-current"))
+        kb.record_worktree_base(conn, host.task_id, host.worktree)
+        aid = kb.store_attachment_bytes(conn, host.task_id, "recovered.patch", patch, uploaded_by="operator")
+    copied = json.loads(sa.handle_artifact({
+        "direction": "copy", "attachment_id": aid, "expected_sha256": hashlib.sha256(patch).hexdigest(),
+    }))
+    assert "error" not in copied, copied
+    with kb.connect_closing() as conn:
+        assert kb.complete_task(
+            conn, host.task_id, summary="Materialized the verified recovered input.",
+            patch_attachment_id=copied["attachment_id"], expected_run_id=host.run_id,
+            fire_lifecycle_hook=False,
+        )
+        task = kb.get_task(conn, host.task_id)
+        assert task.status == "done"
+        assert task.head_commit != task.base_commit
+    assert _git(host.repo, "show", f"{task.head_commit}:app.py") == "print('recovered')"
