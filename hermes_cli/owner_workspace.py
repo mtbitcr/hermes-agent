@@ -2455,6 +2455,15 @@ _OWNER_PROJECT_MAX_WORKERS = 100
 # snapshot unreadable. Only a client that asks for this capability by name
 # receives the wider run shape.
 OWNER_PROJECT_RUN_CONTEXT_CAPABILITY = "run_task_context"
+# A second, separately negotiated response contour for existing-Project
+# planning. The ordinary snapshot keeps its historical closed schema; only a
+# reader naming this capability receives the bounded planning DTO below.
+OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY = "planning_context_v1"
+_OWNER_PROJECT_PLANNING_STATUSES = (
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+)
+_OWNER_PROJECT_TERMINAL_STATUSES = ("done", "archived")
+_OWNER_PROJECT_MAX_VISIBLE_LINKS = _OWNER_PROJECT_MAX_TASKS * 64
 _OWNER_PROJECT_MEDIA_TYPE_RE = re.compile(
     r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$"
 )
@@ -2749,8 +2758,185 @@ def _owner_project_run_projection(
     }
 
 
+def owner_project_planning_context(
+    conn: sqlite3.Connection,
+    project_id: str,
+    counts: dict[str, int],
+) -> dict:
+    """Return one bounded, relation-aware DTO for owner planning.
+
+    All live work is selected first. Every same-Project work row directly
+    related to that live set is then retained before recent terminal history
+    fills the remaining capacity. SQL limits apply before materialization; a
+    live or relation overflow is reported and the Workspace refuses to plan.
+    """
+    status_slots = ",".join("?" for _ in _OWNER_PROJECT_PLANNING_STATUSES)
+    actionable_rows = conn.execute(
+        "SELECT * FROM tasks WHERE project_id = ? AND task_kind = 'work' "
+        f"AND status IN ({status_slots}) "
+        "ORDER BY priority DESC, created_at ASC, id ASC LIMIT ?",
+        (
+            project_id,
+            *_OWNER_PROJECT_PLANNING_STATUSES,
+            _OWNER_PROJECT_MAX_TASKS + 1,
+        ),
+    ).fetchall()
+    actionable_truncated = len(actionable_rows) > _OWNER_PROJECT_MAX_TASKS
+    selected_rows = list(actionable_rows[:_OWNER_PROJECT_MAX_TASKS])
+    selected_ids = [str(row["id"]) for row in selected_rows]
+    remaining = _OWNER_PROJECT_MAX_TASKS - len(selected_rows)
+    relations_truncated = False
+
+    if selected_ids:
+        selected_slots = ",".join("?" for _ in selected_ids)
+        related_rows = conn.execute(
+            "SELECT t.* FROM tasks t WHERE t.project_id = ? "
+            "AND t.task_kind = 'work' "
+            "AND t.id IN ("
+            f"SELECT parent_id FROM task_links WHERE child_id IN ({selected_slots}) "
+            "UNION "
+            f"SELECT child_id FROM task_links WHERE parent_id IN ({selected_slots})"
+            ") "
+            f"AND t.id NOT IN ({selected_slots}) "
+            "ORDER BY COALESCE((SELECT MAX(e.created_at) FROM task_events e "
+            "WHERE e.task_id = t.id), t.created_at) DESC, t.id DESC LIMIT ?",
+            (
+                project_id,
+                *selected_ids,
+                *selected_ids,
+                *selected_ids,
+                remaining + 1,
+            ),
+        ).fetchall()
+        if len(related_rows) > remaining:
+            relations_truncated = True
+        selected_rows.extend(related_rows[:remaining])
+        selected_ids = [str(row["id"]) for row in selected_rows]
+        remaining = _OWNER_PROJECT_MAX_TASKS - len(selected_rows)
+
+    if remaining > 0:
+        terminal_slots = ",".join("?" for _ in _OWNER_PROJECT_TERMINAL_STATUSES)
+        exclusion = ""
+        exclusion_params: tuple[object, ...] = ()
+        if selected_ids:
+            selected_slots = ",".join("?" for _ in selected_ids)
+            exclusion = f" AND t.id NOT IN ({selected_slots})"
+            exclusion_params = tuple(selected_ids)
+        terminal_rows = conn.execute(
+            "SELECT t.* FROM tasks t WHERE t.project_id = ? "
+            "AND t.task_kind = 'work' "
+            f"AND t.status IN ({terminal_slots})"
+            + exclusion
+            + " ORDER BY COALESCE((SELECT MAX(e.created_at) FROM task_events e "
+            "WHERE e.task_id = t.id), t.created_at) DESC, t.id DESC LIMIT ?",
+            (
+                project_id,
+                *_OWNER_PROJECT_TERMINAL_STATUSES,
+                *exclusion_params,
+                remaining,
+            ),
+        ).fetchall()
+        selected_rows.extend(terminal_rows)
+        selected_ids = [str(row["id"]) for row in selected_rows]
+
+    event_state: dict[str, dict[str, int]] = {}
+    parent_map = {task_id: [] for task_id in selected_ids}
+    child_map = {task_id: [] for task_id in selected_ids}
+    parent_total = {task_id: 0 for task_id in selected_ids}
+    child_total = {task_id: 0 for task_id in selected_ids}
+    if selected_ids:
+        selected_slots = ",".join("?" for _ in selected_ids)
+        for row in conn.execute(
+            f"SELECT task_id, MAX(created_at) AS latest, MAX(id) AS revision "
+            f"FROM task_events WHERE task_id IN ({selected_slots}) GROUP BY task_id",
+            selected_ids,
+        ):
+            event_state[str(row["task_id"])] = {
+                "latest": int(row["latest"]),
+                "revision": int(row["revision"]),
+            }
+        for row in conn.execute(
+            "SELECT l.child_id AS task_id, COUNT(*) AS n FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            f"WHERE l.child_id IN ({selected_slots}) "
+            "AND p.task_kind = 'work' GROUP BY l.child_id",
+            selected_ids,
+        ):
+            parent_total[str(row["task_id"])] = int(row["n"])
+        for row in conn.execute(
+            "SELECT l.parent_id AS task_id, COUNT(*) AS n FROM task_links l "
+            "JOIN tasks c ON c.id = l.child_id "
+            f"WHERE l.parent_id IN ({selected_slots}) "
+            "AND c.task_kind = 'work' GROUP BY l.parent_id",
+            selected_ids,
+        ):
+            child_total[str(row["task_id"])] = int(row["n"])
+        visible_links = conn.execute(
+            "SELECT parent_id, child_id FROM task_links "
+            f"WHERE parent_id IN ({selected_slots}) "
+            f"AND child_id IN ({selected_slots}) "
+            "ORDER BY parent_id, child_id LIMIT ?",
+            (*selected_ids, *selected_ids, _OWNER_PROJECT_MAX_VISIBLE_LINKS + 1),
+        ).fetchall()
+        if len(visible_links) > _OWNER_PROJECT_MAX_VISIBLE_LINKS:
+            relations_truncated = True
+        for row in visible_links[:_OWNER_PROJECT_MAX_VISIBLE_LINKS]:
+            parent_id, child_id = str(row["parent_id"]), str(row["child_id"])
+            child_map[parent_id].append(child_id)
+            parent_map[child_id].append(parent_id)
+
+    tasks: list[dict] = []
+    for row in selected_rows:
+        task = kanban_db.Task.from_row(row)
+        state = event_state.get(task.id)
+        omitted_parents = max(0, parent_total[task.id] - len(parent_map[task.id]))
+        omitted_children = max(0, child_total[task.id] - len(child_map[task.id]))
+        if (
+            task.status in _OWNER_PROJECT_PLANNING_STATUSES
+            and (omitted_parents or omitted_children)
+        ):
+            relations_truncated = True
+        tasks.append({
+            "id": task.id,
+            "title": owner_title(task.title),
+            "status": task.status,
+            "assignee_name": task.assignee,
+            "responsibility": task.responsibility,
+            "updated_at": _owner_timestamp(
+                state["latest"] if state else task.created_at
+            ),
+            "event_revision": state["revision"] if state else 0,
+            "parent_ids": parent_map[task.id],
+            "child_ids": child_map[task.id],
+            "omitted_parent_count": omitted_parents,
+            "omitted_child_count": omitted_children,
+        })
+
+    retained_terminal = sum(
+        1 for row in selected_rows
+        if str(row["status"]) in _OWNER_PROJECT_TERMINAL_STATUSES
+    )
+    return {
+        "schema_version": 1,
+        "actionable_count": sum(
+            counts[status] for status in _OWNER_PROJECT_PLANNING_STATUSES
+        ),
+        "omitted_terminal_count": max(
+            0,
+            counts["done"] + counts["archived"] - retained_terminal,
+        ),
+        "actionable_truncated": actionable_truncated,
+        "relations_truncated": relations_truncated,
+        "tasks": tasks,
+    }
+
+
 def read_project_snapshot(
-    ctx: OwnerContext, project_slug: str, *, run_context: bool = False,
+    ctx: OwnerContext,
+    project_slug: str,
+    *,
+    run_context: bool = False,
+    planning_context: bool = False,
 ) -> dict:
     """Return one bounded read-only surface for an exact receipt-owned Project.
 
@@ -2921,7 +3107,7 @@ def read_project_snapshot(
 
     steward = project_steward_snapshot(project_id=project_id, lookback_days=7)
 
-    return {
+    result = {
         "project": {
             "id": project_id,
             "slug": project_slug,
@@ -2955,6 +3141,25 @@ def read_project_snapshot(
             "runs": len(run_rows) > _OWNER_PROJECT_MAX_RUNS,
         },
     }
+    if planning_context:
+        # The main snapshot connection above was deliberately closed before
+        # this separately negotiated projection. Reopen the same verified
+        # board read-only; no GET may migrate or mutate it.
+        planning_conn = _open_read_only_sqlite(board_path, label="kanban.db")
+        try:
+            result["planning_context"] = owner_project_planning_context(
+                planning_conn, project_id, counts,
+            )
+        except OwnerWorkspaceError:
+            raise
+        except (KeyError, TypeError, ValueError, sqlite3.Error) as exc:
+            raise OwnerWorkspaceError(
+                "snapshot_unavailable",
+                "the Project planning context could not be read",
+            ) from exc
+        finally:
+            planning_conn.close()
+    return result
 
 
 def read_project_attachment(
