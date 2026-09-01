@@ -1,4 +1,4 @@
-"""Trusted Server 2 sandbox provisioning for the Raphael Claude coding worker.
+"""Trusted Server 2 sandbox provisioning for scoped Raphael workers.
 
 Why this exists
 ---------------
@@ -16,6 +16,11 @@ generic path let the model choose — source, image, endpoint, resources, egress
 policy, credentials — is resolved here from host-owned state and frozen
 constants. Ordinary command / file / kill work stays on the maintained official
 MCP tools; this tool is only the trusted create-and-seed step.
+
+The coding profile receives a scoped credential-vault binding. Builder and
+verification profiles receive no coding credentials. Reference-only inspection
+and copying of saved artifacts live in the sibling artifact module and do not
+require a live execution machine.
 
 Frozen policy contract
 ----------------------
@@ -82,6 +87,7 @@ import stat
 import subprocess
 import sys
 import time
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -99,6 +105,7 @@ logger = logging.getLogger(__name__)
 TOOL_NAME = "raphael_sandbox_provision"
 TOOLSET = "raphael_sandbox"
 WORKER_PROFILE = "raphael-claude-worker"
+SANDBOX_PROFILES = frozenset({WORKER_PROFILE, "raphael-builder", "raphael-verifier"})
 
 #: Where the task source is extracted inside the sandbox. Fixed so no caller
 #: — model or operator — picks a path on Server 2.
@@ -285,6 +292,7 @@ class _WorkerContext:
     run_id: int
     board: Optional[str]
     workspace_env: str
+    profile: str = WORKER_PROFILE
 
 
 def _active_profile() -> str:
@@ -313,7 +321,7 @@ def _dispatcher_owned() -> bool:
 
 
 def check_provision_available() -> bool:
-    """Registry gate: only the dispatcher-owned Claude coding worker sees it.
+    """Registry gate for dispatcher-owned engineering and verification workers.
 
     Deliberately cheap and env-only (the registry TTL-caches ``check_fn``
     results process-wide). Every gate here is re-checked, against host-owned
@@ -321,7 +329,7 @@ def check_provision_available() -> bool:
     """
     if not _dispatcher_owned():
         return False
-    if _active_profile() != WORKER_PROFILE:
+    if _active_profile() not in SANDBOX_PROFILES:
         return False
     if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
         return False
@@ -336,9 +344,9 @@ def _worker_context() -> _WorkerContext:
             code="not_dispatcher_owned",
         )
     profile = _active_profile()
-    if profile != WORKER_PROFILE:
+    if profile not in SANDBOX_PROFILES:
         raise SandboxDispatchError(
-            f"this capability belongs to the {WORKER_PROFILE} profile only; "
+            "this capability belongs to scoped engineering and verification workers; "
             f"this session is running as {profile or 'an unnamed profile'}.",
             code="wrong_profile",
         )
@@ -355,6 +363,7 @@ def _worker_context() -> _WorkerContext:
         run_id=int(run_raw),
         board=(os.environ.get("HERMES_KANBAN_BOARD") or "").strip() or None,
         workspace_env=(os.environ.get("HERMES_KANBAN_WORKSPACE") or "").strip(),
+        profile=profile,
     )
 
 
@@ -854,7 +863,7 @@ def _log_event(
     The durable record lives in ``task_events`` (see :func:`_read_reservation`);
     this is only the operator-readable trace of what this process decided.
     """
-    entry: dict[str, Any] = {"outcome": outcome, "profile": WORKER_PROFILE}
+    entry: dict[str, Any] = {"outcome": outcome, "profile": ctx.profile if ctx else _active_profile()}
     if ctx is not None:
         entry["task_id"] = ctx.task_id
         entry["run_id"] = ctx.run_id
@@ -950,9 +959,9 @@ def _resolve_task(ctx: _WorkerContext):
             "nothing to provision for.",
             code="task_unknown",
         )
-    if (task.assignee or "").strip() != WORKER_PROFILE:
+    if (task.assignee or "").strip() != ctx.profile:
         raise SandboxDispatchError(
-            "this task is not assigned to the Claude coding worker, so it "
+            "this task is not assigned to this worker profile, so it "
             "may not provision a build machine.",
             code="task_not_assigned",
         )
@@ -1071,7 +1080,10 @@ def _close_quietly(sandbox: Any) -> None:
         )
 
 
-def _receipt_still_holds(sandbox: Any, ctx: _WorkerContext, record: dict) -> str:
+def _receipt_still_holds(
+    sandbox: Any, ctx: _WorkerContext, record: dict, *,
+    minimum_remaining: int = SANDBOX_MIN_REMAINING_SECONDS,
+) -> str:
     """Compare a live machine against the immutable receipt already recorded.
 
     Returns ``"ok"`` when the machine exists, is running, is healthy, has
@@ -1090,7 +1102,7 @@ def _receipt_still_holds(sandbox: Any, ctx: _WorkerContext, record: dict) -> str
     if (
         metadata.get("hermes_task") != ctx.task_id
         or metadata.get("hermes_run") != str(ctx.run_id)
-        or metadata.get("hermes_profile") != WORKER_PROFILE
+        or metadata.get("hermes_profile") != ctx.profile
         or str(getattr(info, "id", "") or "") != recorded_id
     ):
         return "foreign"
@@ -1110,7 +1122,7 @@ def _receipt_still_holds(sandbox: Any, ctx: _WorkerContext, record: dict) -> str
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
-        if remaining < SANDBOX_MIN_REMAINING_SECONDS:
+        if remaining < minimum_remaining:
             return "retire"
     digest = str(receipt.get("image_digest") or "")
     image = str(getattr(getattr(info, "image", None), "image", "") or "")
@@ -1217,7 +1229,7 @@ def _provision(
     generation: int,
 ) -> dict:
     """Create, seed, and durably record exactly one machine for *generation*."""
-    secret = _prepare_host_credential()
+    secret = _prepare_host_credential() if ctx.profile == WORKER_PROFILE else None
 
     staging = _temp_root() / uuid.uuid4().hex
     staging.mkdir(parents=True, exist_ok=True)
@@ -1241,14 +1253,14 @@ def _provision(
                 timeout=timedelta(seconds=SANDBOX_TIMEOUT_SECONDS),
                 ready_timeout=timedelta(seconds=SANDBOX_READY_TIMEOUT_SECONDS),
                 resource=dict(SANDBOX_RESOURCES),
-                env=_sandbox_env(secret),
+                env=_sandbox_env(secret) if secret is not None else {},
                 metadata={
                     "hermes_task": ctx.task_id,
                     "hermes_run": str(ctx.run_id),
-                    "hermes_profile": WORKER_PROFILE,
+                    "hermes_profile": ctx.profile,
                 },
                 network_policy=network_policy,
-                credential_proxy=sdk.credential_proxy(enabled=True),
+                credential_proxy=(sdk.credential_proxy(enabled=True) if secret is not None else None),
                 connection_config=config,
             )
         except Exception as exc:
@@ -1258,20 +1270,32 @@ def _provision(
                 code="create_failed",
             ) from exc
 
-        credentials, bindings = _vault_payload(sdk, secret)
-        try:
-            sandbox.credential_vault.create(
-                credentials=credentials, bindings=bindings
-            )
-        except Exception as exc:
-            raise SandboxDispatchError(
-                "the build machine's sign-in vault could not be written, so "
-                "the machine was discarded. Ask the operator to check the "
-                "remote build service and retry.",
-                code="vault_failed",
-            ) from exc
+        if secret is not None:
+            credentials, bindings = _vault_payload(sdk, secret)
+            try:
+                sandbox.credential_vault.create(
+                    credentials=credentials, bindings=bindings
+                )
+            except Exception as exc:
+                raise SandboxDispatchError(
+                    "the build machine's sign-in vault could not be written, so "
+                    "the machine was discarded. Ask the operator to check the "
+                    "remote build service and retry.",
+                    code="vault_failed",
+                ) from exc
 
         try:
+            # Local imports: sandbox_artifacts imports this module at load
+            # time, so importing it back at module scope here would be
+            # circular.
+            from pathlib import PurePosixPath
+
+            from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+            sa._verify_remote_containment(
+                sandbox, PurePosixPath(SANDBOX_ARCHIVE_PATH), "/tmp", must_be_new=True,
+                message="the archive staging path is not safe to write",
+            )
             with open(archive, "rb") as handle:
                 sandbox.files.write_file(SANDBOX_ARCHIVE_PATH, handle.read())
         except Exception as exc:
@@ -1307,10 +1331,10 @@ def _provision(
             "baseline": SANDBOX_BASELINE,
             "ownership_scope": list(source.ownership_scope),
             "policy": {
-                "credential_vault": True,
-                "credential_proxy": True,
+                "credential_vault": secret is not None,
+                "credential_proxy": secret is not None,
                 "egress_default_deny": True,
-                "sandbox_token_is_placeholder": True,
+                "sandbox_token_is_placeholder": secret is not None,
                 "source_is_tracked_head_only": True,
                 "source_tree_clean": True,
                 # What the seeding command provably did — not a claim that the
@@ -1433,13 +1457,90 @@ def handle_provision(args: dict, **_kwargs) -> str:
         )
 
 
+# Native tool hooks maintain a live run's lease without model polling.
+# This is an in-process throttle, not a second sandbox authority.
+_lease_checked: dict[tuple, float] = {}
+_lease_lock = threading.Lock()
+
+
+def maintain_sandbox_lease(tool_name: str = "", args: Optional[dict] = None, **_kwargs):
+    # Saved native artifacts remain usable after the execution machine expires.
+    # Their handler still enforces the active task and input-authority checks.
+    if (
+        tool_name == "raphael_sandbox_artifact"
+        and isinstance(args, dict)
+        and args.get("direction") in {"inspect", "copy"}
+    ):
+        return None
+    if not (
+        "opensandbox" in tool_name
+        or tool_name in {"kanban_heartbeat", "raphael_sandbox_artifact"}
+    ) or not check_provision_available():
+        return None
+    sandbox = None
+    with _lease_lock:
+        try:
+            ctx = _worker_context()
+            _resolve_task(ctx)
+            record = _read_reservation(ctx)
+            if record.get("state") != "active":
+                return None
+            key = (ctx.board, ctx.task_id, ctx.run_id, record["sandbox_id"])
+            now = time.monotonic()
+            if now - _lease_checked.get(key, float("-inf")) < 60:
+                return None
+            sdk = _load_sdk()
+            connection = _resolve_connection()
+            sandbox = sdk.sandbox.connect(
+                record["sandbox_id"],
+                connection_config=_connection_config(sdk, connection),
+                connect_timeout=timedelta(seconds=SANDBOX_VERIFY_TIMEOUT_SECONDS),
+            )
+            if _receipt_still_holds(sandbox, ctx, record, minimum_remaining=0) != "ok":
+                raise SandboxDispatchError(
+                    "this task's sandbox is no longer available; preserve any "
+                    "recorded artifacts and report the failure instead of restarting blindly."
+                )
+            expiry = sandbox.get_info().expires_at
+            if isinstance(expiry, datetime):
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
+                if remaining < 2 * SANDBOX_MIN_REMAINING_SECONDS:
+                    _resolve_task(ctx)
+                    if ctx.profile == WORKER_PROFILE:
+                        secret = _prepare_host_credential()
+                        credentials, _bindings = _vault_payload(sdk, secret)
+                        sandbox.credential_vault.patch(credentials={"replace": credentials})
+                    sandbox.renew(timedelta(seconds=SANDBOX_TIMEOUT_SECONDS))
+                    _log_event(ctx, "lease_renewed")
+            _lease_checked[key] = now
+            return None
+        except SandboxDispatchError as exc:
+            return {"action": "block", "message": exc.message}
+        except Exception as exc:
+            logger.warning("sandbox lease check failed (%s)", type(exc).__name__)
+            return {
+                "action": "block",
+                "message": "The current build machine could not be checked. "
+                "Record a recoverable blocker; do not create another attempt blindly.",
+            }
+        finally:
+            if sandbox is not None:
+                _close_quietly(sandbox)
+
+
 # ---------------------------------------------------------------------------
 # Plugin edge
 # ---------------------------------------------------------------------------
 
 
 def register_sandbox_tool(ctx) -> None:
-    """Register the one trusted worker tool through the existing plugin edge."""
+    """Register the bounded provisioner, artifact operations and lease hook."""
+    from plugins.dashboard_auth.raphael_workspace.sandbox_artifacts import register_artifact_tool
+
+    register_artifact_tool(ctx)
+    ctx.register_hook("pre_tool_call", maintain_sandbox_lease)
     ctx.register_tool(
         name=TOOL_NAME,
         toolset=TOOLSET,
@@ -1447,7 +1548,7 @@ def register_sandbox_tool(ctx) -> None:
         handler=handle_provision,
         check_fn=check_provision_available,
         description=(
-            "Provision and seed the Raphael coding worker's Server 2 sandbox "
+            "Provision and seed a scoped Raphael worker's Server 2 sandbox "
             "from host-owned task state."
         ),
         emoji="📦",
