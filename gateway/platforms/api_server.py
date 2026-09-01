@@ -12516,6 +12516,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
             from hermes_cli.owner_workspace import (
+                OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY,
                 OWNER_PROJECT_RUN_CONTEXT_CAPABILITY,
                 read_project_snapshot,
                 resolve_owner_context,
@@ -12526,6 +12527,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 request.match_info.get("project_slug", ""),
                 run_context=_owner_workspace_capability_requested(
                     request, OWNER_PROJECT_RUN_CONTEXT_CAPABILITY
+                ),
+                planning_context=_owner_workspace_capability_requested(
+                    request, OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY
                 ),
             )
         except OwnerWorkspaceError as exc:
@@ -12828,16 +12832,22 @@ class APIServerAdapter(BasePlatformAdapter):
 
             snapshot = read_project_snapshot(
                 resolve_owner_context(), str(context["project_slug"]),
+                planning_context=True,
             )
             project = snapshot.get("project")
-            columns = snapshot.get("columns")
-            if not isinstance(project, dict) or not isinstance(columns, list):
+            planning = snapshot.get("planning_context")
+            if (
+                not isinstance(project, dict)
+                or not isinstance(planning, dict)
+                or planning.get("actionable_truncated") is not False
+                or planning.get("relations_truncated") is not False
+            ):
                 raise ValueError("owner Project snapshot is unavailable")
-            tasks = [
-                task
-                for column in columns if isinstance(column, dict)
-                for task in column.get("tasks", []) if isinstance(task, dict)
-            ]
+            tasks = planning.get("tasks")
+            if not isinstance(tasks, list) or not all(
+                isinstance(task, dict) for task in tasks
+            ):
+                raise ValueError("owner Project task authority is unavailable")
             if not tasks:
                 raise ValueError("owner Project has no task anchor")
             secret = self._expected_api_key()
@@ -12851,17 +12861,16 @@ class APIServerAdapter(BasePlatformAdapter):
                         "project_id": project.get("id"),
                         "task_id": task.get("id"),
                         "title": task.get("title"),
-                        "status": task.get("status") or next(
-                            (
-                                column.get("name") for column in columns
-                                if isinstance(column, dict)
-                                and task in column.get("tasks", [])
-                            ),
-                            None,
-                        ),
+                        "status": task.get("status"),
                         "event_revision": task.get("event_revision"),
                         "parent_ids": sorted(task.get("parent_ids") or []),
                         "child_ids": sorted(task.get("child_ids") or []),
+                        "omitted_parent_count": task.get(
+                            "omitted_parent_count"
+                        ),
+                        "omitted_child_count": task.get(
+                            "omitted_child_count"
+                        ),
                     },
                     separators=(",", ":"),
                     ensure_ascii=False,

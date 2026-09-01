@@ -321,8 +321,10 @@ class TestOwnerWorkspaceRunContext:
             "title": "Repair the stopped implementation",
             "status": "triage",
             "event_revision": 7,
-            "parent_ids": ["task_parent"],
-            "child_ids": ["task_verifier"],
+            "parent_ids": [],
+            "child_ids": [],
+            "omitted_parent_count": 0,
+            "omitted_child_count": 0,
         }
         canonical = json.dumps({
             "version": 1,
@@ -333,6 +335,8 @@ class TestOwnerWorkspaceRunContext:
             "event_revision": task["event_revision"],
             "parent_ids": task["parent_ids"],
             "child_ids": task["child_ids"],
+            "omitted_parent_count": task["omitted_parent_count"],
+            "omitted_child_count": task["omitted_child_count"],
         }, separators=(",", ":"), ensure_ascii=False)
         target_ref = "tr_" + base64.urlsafe_b64encode(
             hmac.new(
@@ -390,7 +394,14 @@ class TestOwnerWorkspaceRunContext:
         }
         snapshot = {
             "project": {"id": "project_raphael"},
-            "columns": [{"name": "triage", "tasks": [task]}],
+            "planning_context": {
+                "schema_version": 1,
+                "actionable_count": 1,
+                "omitted_terminal_count": 0,
+                "actionable_truncated": False,
+                "relations_truncated": False,
+                "tasks": [task],
+            },
         }
         store = ResponseStore(max_size=10)
         adapter = APIServerAdapter.__new__(APIServerAdapter)
@@ -3952,32 +3963,43 @@ class TestOwnerWorkspaceProjectSnapshotEndpoint:
             "object": "hermes.owner_workspace.project_snapshot",
             "data": expected,
         }
-        read.assert_called_once_with(ANY, "shoe-shop", run_context=False)
+        read.assert_called_once_with(
+            ANY,
+            "shoe-shop",
+            run_context=False,
+            planning_context=False,
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "query,expected_run_context",
+        "query,expected_run_context,expected_planning_context",
         [
-            ("", False),
-            ("?capabilities=", False),
-            ("?capabilities=something_else", False),
-            ("?capabilities=run_task_context", True),
-            ("?capabilities=something_else,run_task_context", True),
-            ("?capabilities=run_task_context_extra", False),
-            ("?capabilities=" + "x" * 300 + ",run_task_context", False),
+            ("", False, False),
+            ("?capabilities=", False, False),
+            ("?capabilities=something_else", False, False),
+            ("?capabilities=run_task_context", True, False),
+            ("?capabilities=planning_context_v1", False, True),
+            ("?capabilities=run_task_context,planning_context_v1", True, True),
+            ("?capabilities=something_else,run_task_context", True, False),
+            ("?capabilities=run_task_context_extra", False, False),
+            ("?capabilities=" + "x" * 300 + ",run_task_context", False, False),
             # A repeated key has no single negotiated answer, so BOTH orders
             # fail closed to the legacy shape rather than granting whichever
             # occurrence happens to be read first.
-            ("?capabilities=run_task_context&capabilities=something_else", False),
-            ("?capabilities=something_else&capabilities=run_task_context", False),
-            ("?capabilities=run_task_context&capabilities=run_task_context", False),
+            ("?capabilities=run_task_context&capabilities=something_else", False, False),
+            ("?capabilities=something_else&capabilities=run_task_context", False, False),
+            ("?capabilities=run_task_context&capabilities=run_task_context", False, False),
             # The native board/workers capability is a different contract on a
             # different surface; naming it here grants nothing.
-            ("?capabilities=owner_titles_v1", False),
+            ("?capabilities=owner_titles_v1", False, False),
         ],
     )
-    async def test_run_context_is_served_only_to_a_reader_that_asks_for_it(
-        self, adapter, query, expected_run_context,
+    async def test_contexts_are_served_only_to_a_reader_that_asks_for_them(
+        self,
+        adapter,
+        query,
+        expected_run_context,
+        expected_planning_context,
     ):
         """The /v1 run shape stays what its oldest reader validates.
 
@@ -4000,7 +4022,10 @@ class TestOwnerWorkspaceProjectSnapshotEndpoint:
 
         assert resp.status == 200
         read.assert_called_once_with(
-            ANY, "shoe-shop", run_context=expected_run_context
+            ANY,
+            "shoe-shop",
+            run_context=expected_run_context,
+            planning_context=expected_planning_context,
         )
 
     @pytest.mark.asyncio
