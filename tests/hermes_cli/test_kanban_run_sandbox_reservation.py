@@ -257,11 +257,17 @@ def test_ended_active_sandbox_is_a_bounded_durable_cleanup_intent(running_task):
                 (task_id,),
             )
 
-        assert kb.list_ended_run_sandboxes(conn) == [{
+        pending = kb.list_ended_run_sandboxes(conn)
+        assert len(pending) == 1
+        assert pending[0]["event_id"] > 0
+        assert {
+            key: pending[0][key]
+            for key in ("task_id", "run_id", "profile")
+        } == {
             "task_id": task_id,
             "run_id": run_id,
             "profile": "worker",
-        }]
+        }
         kb.release_ended_run_sandbox(
             conn,
             task_id,
@@ -270,6 +276,36 @@ def test_ended_active_sandbox_is_a_bounded_durable_cleanup_intent(running_task):
             reason="dispatcher_retry",
         )
         assert kb.list_ended_run_sandboxes(conn) == []
+
+
+def test_cleanup_intent_query_uses_only_the_partial_sandbox_index(running_task):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.executemany(
+                "INSERT INTO task_events "
+                "(task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, 'ordinary_history', NULL, ?)",
+                ((task_id, run_id, index) for index in range(2_000)),
+            )
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN WITH latest AS ("
+            " SELECT task_id, run_id, MAX(id) AS event_id FROM task_events"
+            " WHERE run_id IS NOT NULL AND kind IN ("
+            "'sandbox_reserved', 'sandbox_provisioned', 'sandbox_released'"
+            ") GROUP BY task_id, run_id"
+            ") SELECT e.id FROM latest l "
+            "JOIN task_events e ON e.id = l.event_id "
+            "JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
+            "WHERE e.kind = 'sandbox_provisioned' AND r.ended_at IS NOT NULL "
+            "AND e.id > ? ORDER BY e.id ASC LIMIT ?",
+            (0, 4),
+        ).fetchall()
+        details = [str(row["detail"]) for row in plan]
+        assert any(
+            "idx_events_sandbox_lifecycle" in detail
+            for detail in details
+        ), details
 
 
 def test_a_run_that_is_no_longer_active_cannot_reserve(running_task):

@@ -1423,21 +1423,30 @@ def cleanup_sandbox_on_stale_claim(**kwargs: Any) -> None:
 
 _CLEANUP_RETRY_BATCH = 4
 _cleanup_retry_lock = threading.Lock()
+_cleanup_retry_cursor: dict[str, int] = {}
+_cleanup_retry_thread: Optional[threading.Thread] = None
 
 
-def retry_ended_sandbox_cleanup(
-    *, board: Any = None, dry_run: bool = False, **_kwargs: Any,
-) -> None:
-    """Retry a bounded batch of durable ended-run cleanup intents."""
-    if dry_run or not _cleanup_retry_lock.acquire(blocking=False):
-        return
-    board_name = str(board).strip() if board else None
+def _cleanup_retry_worker(board_name: Optional[str], board_key: str) -> None:
+    """Run one rotating cleanup batch outside the dispatcher thread."""
     try:
         kb = _kanban()
         try:
             with kb.connect_closing(board=board_name) as conn:
+                cursor = _cleanup_retry_cursor.get(board_key, 0)
                 pending = kb.list_ended_run_sandboxes(
-                    conn, limit=_CLEANUP_RETRY_BATCH,
+                    conn,
+                    after_event_id=cursor,
+                    limit=_CLEANUP_RETRY_BATCH,
+                )
+                if not pending and cursor:
+                    pending = kb.list_ended_run_sandboxes(
+                        conn,
+                        after_event_id=0,
+                        limit=_CLEANUP_RETRY_BATCH,
+                    )
+                _cleanup_retry_cursor[board_key] = (
+                    pending[-1]["event_id"] if pending else 0
                 )
         except Exception:
             logger.warning(
@@ -1465,6 +1474,32 @@ def retry_ended_sandbox_cleanup(
             _cleanup_run_sandbox(ctx, reason="dispatcher_retry")
     finally:
         _cleanup_retry_lock.release()
+
+
+def retry_ended_sandbox_cleanup(
+    *, board: Any = None, dry_run: bool = False, **_kwargs: Any,
+) -> None:
+    """Queue one bounded rotating cleanup batch and return immediately."""
+    global _cleanup_retry_thread
+    if dry_run or not _cleanup_retry_lock.acquire(blocking=False):
+        return
+    board_name = str(board).strip() if board else None
+    board_key = board_name or "default"
+    try:
+        worker = threading.Thread(
+            target=_cleanup_retry_worker,
+            args=(board_name, board_key),
+            name="raphael-sandbox-cleanup",
+            daemon=True,
+        )
+        _cleanup_retry_thread = worker
+        worker.start()
+    except Exception:
+        _cleanup_retry_lock.release()
+        logger.warning(
+            "raphael sandbox cleanup retry could not start board=%s",
+            board_key,
+        )
 
 
 def _acquire(

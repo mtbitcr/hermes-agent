@@ -3304,6 +3304,13 @@ def _migrate_add_optional_columns(
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_sandbox_lifecycle "
+        "ON task_events(task_id, run_id, id DESC) "
+        "WHERE kind IN ("
+        "'sandbox_reserved', 'sandbox_provisioned', 'sandbox_released'"
+        ")"
+    )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -3558,7 +3565,8 @@ def _reconcile_receipt_owned_tasks(
 #
 # Each entry pairs the canonical CREATE TABLE with the CREATE INDEX
 # statements that DROP TABLE would otherwise take down with it (including
-# ``idx_events_run``, added by the additive pass above). To guard against
+# ``idx_events_run`` and the sandbox partial index, added by the additive
+# pass above). To guard against
 # this list drifting from SCHEMA_SQL, ``test_rebuilt_schema_matches_fresh``
 # asserts a rebuilt legacy DB is byte-identical to a fresh one.
 _REBUILD_SPECS = {
@@ -3570,6 +3578,11 @@ _REBUILD_SPECS = {
         (
             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
+            "CREATE INDEX idx_events_sandbox_lifecycle "
+            "ON task_events(task_id, run_id, id DESC) "
+            "WHERE kind IN ("
+            "'sandbox_reserved', 'sandbox_provisioned', 'sandbox_released'"
+            ")",
         ),
     ),
     "task_comments": (
@@ -12447,7 +12460,7 @@ def release_ended_run_sandbox(
 
 
 def list_ended_run_sandboxes(
-    conn: sqlite3.Connection, *, limit: int = 4,
+    conn: sqlite3.Connection, *, after_event_id: int = 0, limit: int = 4,
 ) -> list[dict[str, Any]]:
     """List a bounded batch of ended runs whose sandbox is still active.
 
@@ -12457,23 +12470,32 @@ def list_ended_run_sandboxes(
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 32:
         raise ValueError("limit must be an integer from 1 to 32")
-    placeholders = ", ".join("?" for _ in RUN_SANDBOX_EVENTS)
+    if (
+        isinstance(after_event_id, bool)
+        or not isinstance(after_event_id, int)
+        or after_event_id < 0
+    ):
+        raise ValueError("after_event_id must be a non-negative integer")
     rows = conn.execute(
         "WITH latest AS ("
         " SELECT task_id, run_id, MAX(id) AS event_id FROM task_events"
-        f" WHERE run_id IS NOT NULL AND kind IN ({placeholders})"
+        " WHERE run_id IS NOT NULL AND kind IN ("
+        "'sandbox_reserved', 'sandbox_provisioned', 'sandbox_released'"
+        ")"
         " GROUP BY task_id, run_id"
         ") "
-        "SELECT e.task_id, e.run_id, r.profile "
+        "SELECT e.id AS event_id, e.task_id, e.run_id, r.profile "
         "FROM latest l JOIN task_events e ON e.id = l.event_id "
         "JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
         "JOIN tasks t ON t.id = e.task_id AND t.task_kind = 'work' "
         "WHERE e.kind = 'sandbox_provisioned' AND r.ended_at IS NOT NULL "
+        "AND e.id > ? "
         "ORDER BY e.id ASC LIMIT ?",
-        (*RUN_SANDBOX_EVENTS, limit),
+        (after_event_id, limit),
     ).fetchall()
     return [
         {
+            "event_id": int(row["event_id"]),
             "task_id": str(row["task_id"]),
             "run_id": int(row["run_id"]),
             "profile": str(row["profile"] or ""),

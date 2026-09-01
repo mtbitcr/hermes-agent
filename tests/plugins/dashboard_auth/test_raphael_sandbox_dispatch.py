@@ -24,6 +24,7 @@ import hashlib
 import logging
 import os
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -256,10 +257,18 @@ class FakeSandbox:
 
 @pytest.fixture(autouse=True)
 def _reset_fake():
+    thread = sd._cleanup_retry_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=10)
+    sd._cleanup_retry_cursor.clear()
     FakeSandbox.created = []
     FakeSandbox.live = {}
     FakeSandbox.connect_calls = []
     FakeSandbox.behavior = {}
+    thread = sd._cleanup_retry_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=10)
+    sd._cleanup_retry_cursor.clear()
     FakeSandbox.counter = 0
     yield
     FakeSandbox.created = []
@@ -383,6 +392,14 @@ def _event_kinds(host):
             (host.task_id, host.run_id),
         ).fetchall()
     return [str(row["kind"]) for row in rows]
+
+
+def _run_cleanup_retry(board="default"):
+    sd.retry_ended_sandbox_cleanup(board=board)
+    thread = sd._cleanup_retry_thread
+    assert thread is not None
+    thread.join(timeout=10)
+    assert not thread.is_alive()
 
 
 # ---------------------------------------------------------------------------
@@ -1973,12 +1990,12 @@ def test_dispatch_tick_retries_ended_run_cleanup_until_release_is_durable(
         raise RuntimeError("temporary control-plane failure")
 
     box.kill = transient_failure
-    sd.retry_ended_sandbox_cleanup(board="default")
+    _run_cleanup_retry()
     assert _reservation(host)["state"] == "active"
     assert box.killed is False
 
     box.kill = original_kill
-    sd.retry_ended_sandbox_cleanup(board="default")
+    _run_cleanup_retry()
     assert box.killed is True
     assert _reservation(host)["state"] == "released"
     assert _event_kinds(host).count("sandbox_released") == 1
@@ -2008,10 +2025,123 @@ def test_dispatch_tick_records_officially_confirmed_absence(
         raise SandboxApiException("gone", status_code=404)
 
     monkeypatch.setattr(FakeSandbox, "connect", classmethod(absent))
-    sd.retry_ended_sandbox_cleanup(board="default")
+    _run_cleanup_retry()
 
     assert _reservation(host)["state"] == "released"
     assert _event_kinds(host).count("sandbox_released") == 1
+
+
+def test_dispatch_tick_returns_before_a_slow_control_plane(
+    host, sdk,
+):
+    _provision()
+    box = FakeSandbox.created[-1]
+    original_kill = box.kill
+    entered = threading.Event()
+    release = threading.Event()
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET profile=?, status='done', "
+                "outcome='completed', ended_at=1 WHERE id=?",
+                (sd.WORKER_PROFILE, host.run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (host.task_id,),
+            )
+
+    def slow_kill():
+        entered.set()
+        assert release.wait(timeout=5)
+        original_kill()
+
+    box.kill = slow_kill
+    started = time.monotonic()
+    sd.retry_ended_sandbox_cleanup(board="default")
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.5
+    assert entered.wait(timeout=2)
+    thread = sd._cleanup_retry_thread
+    assert thread is not None and thread.is_alive()
+    release.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert _reservation(host)["state"] == "released"
+
+
+def test_rotating_cursor_cannot_starve_newer_cleanup_after_four_poisoned_rows(
+    host, sdk,
+):
+    with kb.connect_closing() as conn:
+        for index in range(sd._CLEANUP_RETRY_BATCH):
+            task_id = kb.create_task(
+                conn,
+                title=f"poisoned cleanup {index}",
+                assignee="unadmitted-profile",
+            )
+            with kb.write_txn(conn):
+                cursor = conn.execute(
+                    "INSERT INTO task_runs "
+                    "(task_id, profile, status, started_at) "
+                    "VALUES (?, 'unadmitted-profile', 'running', 0)",
+                    (task_id,),
+                )
+                run_id = int(cursor.lastrowid)
+                conn.execute(
+                    "UPDATE tasks SET status='running', current_run_id=? "
+                    "WHERE id=?",
+                    (run_id, task_id),
+                )
+            kb.advance_run_sandbox(
+                conn,
+                task_id,
+                run_id=run_id,
+                transition="sandbox_reserved",
+                expected_generation=0,
+            )
+            kb.advance_run_sandbox(
+                conn,
+                task_id,
+                run_id=run_id,
+                transition="sandbox_provisioned",
+                expected_generation=1,
+                sandbox_id=f"poison-{index}",
+                receipt={"sandbox_id": f"poison-{index}"},
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_runs SET status='done', "
+                    "outcome='completed', ended_at=1 WHERE id=?",
+                    (run_id,),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status='done', current_run_id=NULL "
+                    "WHERE id=?",
+                    (task_id,),
+                )
+
+    _provision()
+    box = FakeSandbox.created[-1]
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET profile=?, status='done', "
+                "outcome='completed', ended_at=1 WHERE id=?",
+                (sd.WORKER_PROFILE, host.run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (host.task_id,),
+            )
+
+    _run_cleanup_retry()
+    assert box.killed is False
+    assert _reservation(host)["state"] == "active"
+
+    _run_cleanup_retry()
+    assert box.killed is True
+    assert _reservation(host)["state"] == "released"
 
 
 @pytest.mark.parametrize("tool_name", [
