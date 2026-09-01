@@ -73,6 +73,71 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_runtime_admission_block_closes_before_next_allowed_turn(
+        self, monkeypatch
+    ):
+        runtime_inputs = []
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            runtime_inputs.append(user_input)
+            return TurnResult(
+                final_text=f"echo: {user_input}",
+                projected_messages=[
+                    {"role": "assistant", "content": f"echo: {user_input}"},
+                ],
+                turn_id="turn-after-block",
+                thread_id="thread-after-block",
+            )
+
+        admission_results = iter([
+            "This sandbox-bound profile must use the allowed runtime.",
+            None,
+        ])
+        monkeypatch.setattr(
+            "agent.conversation_loop._runtime_turn_block_message",
+            lambda *_args: next(admission_results),
+        )
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-after-block",
+        )
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            blocked = agent.run_conversation("stale blocked request")
+
+        assert runtime_inputs == []
+        assert blocked["failed"] is True
+        assert blocked["turn_exit_reason"] == "runtime_admission_block"
+        assert blocked["error"] == blocked["final_response"]
+        assert [message["role"] for message in blocked["messages"]] == [
+            "user",
+            "assistant",
+        ]
+        assert blocked["messages"][-1]["content"] == blocked["final_response"]
+        assert agent._session_messages == blocked["messages"]
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            allowed = agent.run_conversation(
+                "fresh allowed request",
+                conversation_history=blocked["messages"],
+            )
+
+        assert runtime_inputs == ["fresh allowed request"]
+        assert [
+            message["content"]
+            for message in allowed["messages"]
+            if message["role"] == "user"
+        ] == ["stale blocked request", "fresh allowed request"]
+        assert [message["role"] for message in allowed["messages"]] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
         # No background review fork during tests

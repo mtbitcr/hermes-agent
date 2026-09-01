@@ -1919,16 +1919,21 @@ def run_conversation(
 
     runtime_block = _runtime_turn_block_message(agent, effective_task_id)
     if runtime_block:
-        return {
-            "final_response": runtime_block,
-            "messages": messages,
-            "api_calls": 0,
-            "completed": False,
-            "failed": True,
-            "partial": False,
-            "interrupted": False,
-            "error": runtime_block,
-        }
+        return finalize_turn(
+            agent,
+            final_response=runtime_block,
+            api_call_count=0,
+            interrupted=False,
+            failed=True,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            _should_review_memory=_should_review_memory,
+            _turn_exit_reason="runtime_admission_block",
+        )
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
