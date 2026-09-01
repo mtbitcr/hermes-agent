@@ -12374,6 +12374,65 @@ def advance_run_sandbox(
         return read_run_sandbox(conn, task_id, run_id=run_id)
 
 
+def release_ended_run_sandbox(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    expected_generation: int,
+    reason: str,
+) -> dict:
+    """Record cleanup of an exact sandbox after its task run has ended.
+
+    Normal provisioning transitions are writable only while the run is the
+    task's active claim. Lifecycle cleanup deliberately happens at, or just
+    after, the terminal transition, when ``current_run_id`` has already been
+    cleared. This narrow companion transition accepts only an existing ended
+    run, only its still-active sandbox generation, and carries no sandbox ID or
+    receipt. A later retry is isolated by ``run_id`` and cannot be touched.
+    """
+    if (
+        isinstance(run_id, bool)
+        or not isinstance(run_id, int)
+        or run_id <= 0
+    ):
+        raise ValueError("run_id must be a positive integer")
+    if isinstance(expected_generation, bool) or not isinstance(
+        expected_generation, int
+    ):
+        raise ValueError("expected_generation must be an integer")
+    cleaned_reason = str(reason or "").strip()
+    if not cleaned_reason or len(cleaned_reason) > 100:
+        raise ValueError("reason must be a short non-empty code")
+
+    with write_txn(conn):
+        ended = conn.execute(
+            "SELECT 1 FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            "WHERE r.id = ? AND r.task_id = ? AND r.ended_at IS NOT NULL "
+            "AND t.task_kind = 'work'",
+            (run_id, task_id),
+        ).fetchone()
+        if ended is None:
+            raise RunSandboxConflict("this task run has not ended")
+        current = read_run_sandbox(conn, task_id, run_id=run_id)
+        if current["generation"] != expected_generation:
+            raise RunSandboxConflict(
+                "this run's sandbox reservation advanced concurrently"
+            )
+        if current["state"] != "active":
+            raise RunSandboxConflict(
+                f"cannot release ended run sandbox from state {current['state']!r}"
+            )
+        _append_event(
+            conn,
+            task_id,
+            "sandbox_released",
+            {"generation": expected_generation, "reason": cleaned_reason},
+            run_id=run_id,
+        )
+        return read_run_sandbox(conn, task_id, run_id=run_id)
+
+
 def _path_is_owned(path: str, owned_paths: list[str]) -> bool:
     if "." in owned_paths:
         return True

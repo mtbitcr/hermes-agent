@@ -210,6 +210,11 @@ PROVISION_SCHEMA = {
         "run as root on the machine and can still overwrite it, and the "
         "reviewer accepts your work by reapplying your patch to the revision "
         "named in this receipt, not by reading either tree on the machine. "
+        "An empty ownership_scope permits observation and temporary test "
+        "scratch inside this disposable machine but authorizes no source "
+        "patch import back to the Project. Do not create, list, or kill sandboxes with "
+        "generic management tools: Hermes destroys this exact machine "
+        "automatically when the run ends. "
         "Never ask a person for sign-in material — if this refuses, report "
         "its message verbatim to the operator and stop."
     ),
@@ -500,11 +505,36 @@ def _package_source(source: _Source, staging: Path) -> tuple:
 
 
 def _load_host_config() -> dict:
-    """Read the operator's ``raphael.sandbox`` settings from config.yaml."""
+    """Read machine-wide ``raphael.sandbox`` settings from the shared root.
+
+    Kanban workers run with profile-scoped ``HERMES_HOME`` values, but the
+    Server 2 connection describes this host rather than one model profile.
+    Keep one authority at ``<root>/config.yaml``.  The active-profile lookup
+    remains a compatibility fallback until existing installations migrate.
+    """
     try:
         from hermes_cli.config import cfg_get, load_config
+        from hermes_constants import (
+            get_default_hermes_root,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
 
-        section = cfg_get(load_config(), "raphael", "sandbox", default={})
+        legacy_config = load_config()
+        token = set_hermes_home_override(get_default_hermes_root())
+        try:
+            shared_config = load_config()
+        finally:
+            reset_hermes_home_override(token)
+
+        missing = object()
+        section = cfg_get(
+            shared_config, "raphael", "sandbox", default=missing,
+        )
+        if section is missing:
+            section = cfg_get(
+                legacy_config, "raphael", "sandbox", default={},
+            )
     except Exception:
         section = None
     return dict(section) if isinstance(section, dict) else {}
@@ -1170,6 +1200,161 @@ def _verify_recorded_sandbox(
     return None
 
 
+def _record_cleaned_release(
+    ctx: _WorkerContext, generation: int, reason: str,
+) -> bool:
+    """Settle one killed sandbox in either the active or ended run phase."""
+    kb = _kanban()
+    try:
+        with kb.connect_closing(board=ctx.board) as conn:
+            try:
+                settled = kb.advance_run_sandbox(
+                    conn,
+                    ctx.task_id,
+                    run_id=ctx.run_id,
+                    transition="sandbox_released",
+                    expected_generation=generation,
+                    reason=reason,
+                )
+            except kb.RunSandboxConflict:
+                try:
+                    settled = kb.release_ended_run_sandbox(
+                        conn,
+                        ctx.task_id,
+                        run_id=ctx.run_id,
+                        expected_generation=generation,
+                        reason=reason,
+                    )
+                except kb.RunSandboxConflict:
+                    return kb.read_run_sandbox(
+                        conn, ctx.task_id, run_id=ctx.run_id,
+                    ).get("state") == "released"
+    except Exception:
+        logger.warning(
+            "raphael sandbox cleanup receipt failed for task=%s run=%s",
+            ctx.task_id,
+            ctx.run_id,
+        )
+        return False
+    return settled.get("state") == "released"
+
+
+def _cleanup_run_sandbox(ctx: _WorkerContext, *, reason: str) -> bool:
+    """Kill only this exact run's recorded sandbox and persist the cleanup."""
+    try:
+        record = _read_reservation(ctx)
+    except SandboxDispatchError:
+        return False
+    if record.get("state") != "active":
+        return True
+    sandbox_id = record.get("sandbox_id")
+    generation = record.get("generation")
+    if (
+        not isinstance(sandbox_id, str)
+        or not sandbox_id
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+    ):
+        return False
+
+    sandbox = None
+    try:
+        sdk = _load_sdk()
+        connection = _resolve_connection()
+        sandbox = sdk.sandbox.connect(
+            sandbox_id,
+            connection_config=_connection_config(sdk, connection),
+            connect_timeout=timedelta(seconds=SANDBOX_VERIFY_TIMEOUT_SECONDS),
+        )
+        verdict = _receipt_still_holds(
+            sandbox, ctx, record, minimum_remaining=0,
+        )
+        if verdict == "foreign":
+            _close_quietly(sandbox)
+            sandbox = None
+            _log_event(
+                ctx, "cleanup_refused", level=logging.WARNING,
+                generation=generation, reason="ownership_unverified",
+            )
+            return False
+        sandbox.kill()
+        _close_quietly(sandbox)
+        sandbox = None
+    except Exception as exc:
+        if sandbox is not None:
+            _close_quietly(sandbox)
+        _log_event(
+            ctx, "cleanup_failed", level=logging.WARNING,
+            generation=generation, reason=type(exc).__name__,
+        )
+        return False
+
+    if not _record_cleaned_release(ctx, generation, reason):
+        return False
+    _log_event(ctx, "cleaned", generation=generation, reason=reason)
+    return True
+
+
+def _hook_context(
+    *,
+    task_id: Any,
+    run_id: Any,
+    board: Any,
+    assignee: Any,
+    profile_name: Any,
+) -> Optional[_WorkerContext]:
+    profile = str(assignee or profile_name or "").strip()
+    if (
+        profile not in SANDBOX_PROFILES
+        or not isinstance(task_id, str)
+        or not task_id.strip()
+        or isinstance(run_id, bool)
+        or not isinstance(run_id, int)
+        or run_id <= 0
+    ):
+        return None
+    return _WorkerContext(
+        task_id=task_id.strip(),
+        run_id=run_id,
+        board=str(board).strip() if board else None,
+        workspace_env="",
+        profile=profile,
+    )
+
+
+def cleanup_sandbox_on_session_end(**_kwargs: Any) -> None:
+    """Clean a normally finalizing Kanban worker before it reports terminal."""
+    try:
+        ctx = _worker_context()
+    except SandboxDispatchError:
+        return
+    _cleanup_run_sandbox(ctx, reason="session_end")
+
+
+def _cleanup_sandbox_from_lifecycle(reason: str, **kwargs: Any) -> None:
+    ctx = _hook_context(
+        task_id=kwargs.get("task_id"),
+        run_id=kwargs.get("run_id"),
+        board=kwargs.get("board"),
+        assignee=kwargs.get("assignee"),
+        profile_name=kwargs.get("profile_name"),
+    )
+    if ctx is not None:
+        _cleanup_run_sandbox(ctx, reason=reason)
+
+
+def cleanup_sandbox_on_task_completed(**kwargs: Any) -> None:
+    _cleanup_sandbox_from_lifecycle("task_completed", **kwargs)
+
+
+def cleanup_sandbox_on_worker_exited(**kwargs: Any) -> None:
+    _cleanup_sandbox_from_lifecycle("worker_exited", **kwargs)
+
+
+def cleanup_sandbox_on_stale_claim(**kwargs: Any) -> None:
+    _cleanup_sandbox_from_lifecycle("stale_claim", **kwargs)
+
+
 def _acquire(
     sdk: _Sdk, connection: _Connection, ctx: _WorkerContext
 ) -> tuple[str, Any]:
@@ -1337,6 +1522,9 @@ def _provision(
                 "sandbox_token_is_placeholder": secret is not None,
                 "source_is_tracked_head_only": True,
                 "source_tree_clean": True,
+                "host_patch_import_authorized": bool(source.ownership_scope),
+                "automatic_run_cleanup": True,
+                "manual_sandbox_management_blocked": True,
                 # What the seeding command provably did — not a claim that the
                 # baseline is protected. uid 0 can still rewrite it; the
                 # Reviewer verifies the produced patch against
@@ -1561,10 +1749,13 @@ def maintain_sandbox_lease(tool_name: str = "", args: Optional[dict] = None, **_
         try:
             ctx = _worker_context()
             _resolve_task(ctx)
-            if opensandbox_operation in {"sandbox_create", "sandbox_list"}:
+            if opensandbox_operation in {
+                "sandbox_create", "sandbox_list", "sandbox_kill",
+            }:
                 raise SandboxDispatchError(
-                    "Generic sandbox creation and listing are unavailable to this "
-                    "worker. Use raphael_sandbox_provision for the current run.",
+                    "Generic sandbox creation, listing, and manual killing are "
+                    "unavailable to this worker. Use raphael_sandbox_provision "
+                    "for the current run; cleanup is automatic when the run ends.",
                     code="generic_sandbox_management",
                 )
             record = _read_reservation(ctx)
@@ -1645,6 +1836,10 @@ def register_sandbox_tool(ctx) -> None:
     register_artifact_tool(ctx)
     ctx.register_hook("pre_runtime_turn", enforce_sandbox_runtime)
     ctx.register_hook("pre_tool_call", maintain_sandbox_lease)
+    ctx.register_hook("on_session_end", cleanup_sandbox_on_session_end)
+    ctx.register_hook("kanban_task_completed", cleanup_sandbox_on_task_completed)
+    ctx.register_hook("on_kanban_worker_exited", cleanup_sandbox_on_worker_exited)
+    ctx.register_hook("on_kanban_worker_stale_claim", cleanup_sandbox_on_stale_claim)
     ctx.register_tool(
         name=TOOL_NAME,
         toolset=TOOLSET,

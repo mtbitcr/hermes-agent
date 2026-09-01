@@ -190,6 +190,50 @@ def test_a_second_run_never_inherits_the_first_runs_machine(running_task):
             )
 
 
+def test_ended_run_cleanup_releases_only_its_own_active_sandbox(running_task):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_reserved", expected_generation=0,
+        )
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_provisioned", expected_generation=1,
+            sandbox_id="sbx-001", receipt=RECEIPT,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='done', outcome='completed', ended_at=1 "
+                "WHERE id=?",
+                (run_id,),
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, status, started_at) "
+                "VALUES (?, 'running', 2)",
+                (task_id,),
+            )
+            next_run = int(
+                conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            )
+            conn.execute(
+                "UPDATE tasks SET status='running', current_run_id=? WHERE id=?",
+                (next_run, task_id),
+            )
+
+        released = kb.release_ended_run_sandbox(
+            conn,
+            task_id,
+            run_id=run_id,
+            expected_generation=1,
+            reason="worker_exited",
+        )
+        assert released["state"] == "released"
+        assert kb.read_run_sandbox(
+            conn, task_id, run_id=next_run,
+        )["state"] == "absent"
+
+
 def test_a_run_that_is_no_longer_active_cannot_reserve(running_task):
     task_id, run_id = running_task
     with kb.connect() as conn:

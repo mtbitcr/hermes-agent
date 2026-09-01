@@ -1197,7 +1197,21 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
             "parents": clean_parents,
             **route_pin,
         }
-        if "owned_paths" in raw:
+        if assignee == "raphael-verifier":
+            scope = (
+                _normalize_ownership_scope(
+                    raw.get("owned_paths"), f"tasks[{index}]",
+                )
+                if "owned_paths" in raw
+                else []
+            )
+            if scope != []:
+                raise OwnerWorkspaceError(
+                    "invalid_ownership_scope",
+                    f"tasks[{index}].owned_paths must be [] for raphael-verifier",
+                )
+            entry["owned_paths"] = []
+        elif "owned_paths" in raw:
             # Only carried when the approved proposal states it, so a task
             # committed without the field keeps its historical NULL scope.
             entry["owned_paths"] = _normalize_ownership_scope(
@@ -4041,7 +4055,19 @@ def _normalize_project_task_spec(
         )
     except ValueError as exc:
         raise OwnerWorkspaceError("invalid_argument", str(exc)) from exc
-    if "owned_paths" in raw:
+    if result["assignee"] == "raphael-verifier":
+        scope = (
+            _normalize_ownership_scope(raw["owned_paths"], field)
+            if "owned_paths" in raw
+            else []
+        )
+        if scope != []:
+            raise OwnerWorkspaceError(
+                "invalid_ownership_scope",
+                f"{field}.owned_paths must be [] for raphael-verifier",
+            )
+        result["owned_paths"] = []
+    elif "owned_paths" in raw:
         result["owned_paths"] = _normalize_ownership_scope(raw["owned_paths"], field)
     result.update(
         _resolved_route_pin(

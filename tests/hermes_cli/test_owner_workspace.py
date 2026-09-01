@@ -141,6 +141,11 @@ def _configured_anthropic(profile):
     return model_policy.assignment_for(profile, "anthropic")
 
 
+def _configured_raphael_role(profile):
+    provider = "openai-codex" if profile == "raphael-verifier" else "anthropic"
+    return model_policy.assignment_for(profile, provider)
+
+
 @pytest.fixture(autouse=True)
 def _configured_provider():
     with _temporarily_patch(
@@ -3924,6 +3929,64 @@ def test_a_read_only_scope_needs_no_project_repository(ctx):
         ).owned_paths == []
 
 
+def test_verifier_project_work_defaults_to_explicit_read_only(ctx):
+    _install_profiles("raphael-verifier")
+    setup = _bootstrap_board(ctx)
+    approver = _with_approver(ctx.session)
+    with _temporarily_patch(
+        model_policy, "configured_assignment_for", _configured_raphael_role,
+    ):
+        result = _commit_project_plan(
+            ctx, **_project_plan_args(
+                setup,
+                [{
+                    "action": "add",
+                    "reason": "Run one independent read-only review.",
+                    "title": "Verify the release",
+                    "body": "Inspect and report; change nothing.",
+                    "assignee": "raphael-verifier",
+                    "responsibility": "R12",
+                    "execution_tier": "deep",
+                    "existing_parents": [],
+                    "new_parents": [],
+                }],
+                idempotency_key="verifier-default-readonly",
+            )
+        )
+    approver.join()
+
+    assert result["ok"] is True
+    with kanban_db.connect(board=setup["board"]) as conn:
+        task = kanban_db.get_task(conn, result["created_task_ids"][0])
+        assert task.assignee == "raphael-verifier"
+        assert task.owned_paths == []
+
+
+def test_verifier_project_work_rejects_a_mutating_scope(ctx):
+    _install_profiles("raphael-verifier")
+    setup = _bootstrap_board(ctx)
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "add",
+            "reason": "A reviewer must not own source writes.",
+            "title": "Unsafe verifier work",
+            "body": "This must be refused before approval.",
+            "assignee": "raphael-verifier",
+            "responsibility": "R12",
+            "execution_tier": "deep",
+            "existing_parents": [],
+            "new_parents": [],
+            "owned_paths": ["src"],
+        }],
+        idempotency_key="verifier-mutating-scope-refused",
+    )
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        _commit_project_plan(ctx, **args)
+    assert excinfo.value.code == "invalid_ownership_scope"
+
+
 def test_task_graph_carries_explicit_scopes_into_committed_children(ctx, tmp_path):
     setup = _bootstrap_board(ctx)
     repo = _project_repo(tmp_path, ctx, setup["project_id"])
@@ -3971,6 +4034,41 @@ def test_task_graph_carries_explicit_scopes_into_committed_children(ctx, tmp_pat
         assert child.workspace_kind == "worktree"
         assert child.workspace_path == str(repo / ".worktrees" / child.id)
         assert child.model_policy_lock
+
+
+def test_task_graph_defaults_verifier_children_to_read_only(ctx, tmp_path):
+    _install_profiles("raphael-verifier")
+    setup = _bootstrap_board(ctx)
+    _project_repo(tmp_path, ctx, setup["project_id"])
+    approver = _with_approver(ctx.session)
+    with _temporarily_patch(
+        model_policy, "configured_assignment_for", _configured_raphael_role,
+    ):
+        result = _commit_task_graph(
+            ctx,
+            idempotency_key="graph-verifier-readonly",
+            mode="existing",
+            project_id=setup["project_id"],
+            request_title="Verify the milestone",
+            specification="One independent reviewer reads the result.",
+            current_milestone="Review without source ownership.",
+            owner_visible_result="The reviewer reports a verdict.",
+            root_assignee="default",
+            tasks=[{
+                "title": "Review the exact result",
+                "body": "Inspect, test and report without importing changes.",
+                "assignee": "raphael-verifier",
+                "responsibility": "R12",
+                "execution_tier": "deep",
+                "parents": [],
+            }],
+        )
+    approver.join()
+
+    with kanban_db.connect(board=setup["board"]) as conn:
+        task = kanban_db.get_task(conn, result["task_ids"][0])
+        assert task.assignee == "raphael-verifier"
+        assert task.owned_paths == []
 
 
 def test_task_graph_scope_is_never_inferred_from_the_assignee(ctx, tmp_path):

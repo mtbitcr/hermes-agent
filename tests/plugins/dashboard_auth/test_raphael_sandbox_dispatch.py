@@ -386,6 +386,44 @@ def _event_kinds(host):
 
 
 # ---------------------------------------------------------------------------
+# 0. Machine-wide host configuration
+# ---------------------------------------------------------------------------
+
+
+def _write_sandbox_config(home: Path, image: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    home.joinpath("config.yaml").write_text(
+        "raphael:\n"
+        "  sandbox:\n"
+        f"    image: {image}\n"
+        "    domain: sandbox.internal:8080\n"
+        "    protocol: https\n",
+        encoding="utf-8",
+    )
+
+
+class TestSharedHostConfig:
+    def test_shared_root_wins_for_verifier_profile(self, tmp_path, monkeypatch):
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "raphael-verifier"
+        _write_sandbox_config(root, IMAGE_REF)
+        _write_sandbox_config(profile, "registry.invalid/legacy@sha256:" + "cd" * 32)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setenv("HERMES_PROFILE", "raphael-verifier")
+
+        assert sd._load_host_config()["image"] == IMAGE_REF
+
+    def test_legacy_profile_is_a_migration_fallback(self, tmp_path, monkeypatch):
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "raphael-verifier"
+        _write_sandbox_config(profile, IMAGE_REF)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setenv("HERMES_PROFILE", "raphael-verifier")
+
+        assert sd._load_host_config()["image"] == IMAGE_REF
+
+
+# ---------------------------------------------------------------------------
 # 1. Model-call surface
 # ---------------------------------------------------------------------------
 
@@ -545,6 +583,9 @@ class TestProvision:
             "sandbox_token_is_placeholder": True,
             "source_is_tracked_head_only": True,
             "source_tree_clean": True,
+            "host_patch_import_authorized": True,
+            "automatic_run_cleanup": True,
+            "manual_sandbox_management_blocked": True,
             "baseline_write_bits_removed": True,
             "idempotent_reuse": False,
         }
@@ -1695,6 +1736,10 @@ class TestPluginRegistration:
         assert hooks == [
             ("pre_runtime_turn", sd.enforce_sandbox_runtime),
             ("pre_tool_call", sd.maintain_sandbox_lease),
+            ("on_session_end", sd.cleanup_sandbox_on_session_end),
+            ("kanban_task_completed", sd.cleanup_sandbox_on_task_completed),
+            ("on_kanban_worker_exited", sd.cleanup_sandbox_on_worker_exited),
+            ("on_kanban_worker_stale_claim", sd.cleanup_sandbox_on_stale_claim),
         ]
 
     def test_manifest_declares_a_bounded_plugin_dependency(self):
@@ -1767,7 +1812,10 @@ def test_artifact_round_trip_moves_real_bytes_without_model_text(host, sdk):
 def test_verification_role_gets_same_scoped_sandbox_without_coding_credentials(host, sdk, monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE", "raphael-verifier")
     with kb.connect_closing() as conn:
-        conn.execute("UPDATE tasks SET assignee=? WHERE id=?", ("raphael-verifier", host.task_id))
+        conn.execute(
+            "UPDATE tasks SET assignee=?, owned_paths='[]' WHERE id=?",
+            ("raphael-verifier", host.task_id),
+        )
         conn.commit()
     out = _provision()
     assert "sandbox_id" in out, out
@@ -1775,6 +1823,9 @@ def test_verification_role_gets_same_scoped_sandbox_without_coding_credentials(h
     assert box.reported_metadata["hermes_profile"] == "raphael-verifier"
     assert box.create_kwargs["env"] == {}
     assert box.vault_calls == []
+    assert out["ownership_scope"] == []
+    assert out["policy"]["host_patch_import_authorized"] is False
+    assert out["policy"]["automatic_run_cleanup"] is True
 
 
 def test_active_sandbox_is_renewed_before_the_lease_expires(host, sdk):
@@ -1790,6 +1841,50 @@ def test_active_sandbox_is_renewed_before_the_lease_expires(host, sdk):
     )
     assert result is None, result
     assert box.renewals == [sd.SANDBOX_TIMEOUT_SECONDS]
+
+
+def test_session_end_kills_and_releases_the_active_run_sandbox(host, sdk):
+    _provision()
+    box = FakeSandbox.created[-1]
+    assert _reservation(host)["state"] == "active"
+
+    sd.cleanup_sandbox_on_session_end()
+
+    assert box.killed is True
+    assert _reservation(host)["state"] == "released"
+    assert _event_kinds(host).count("sandbox_released") == 1
+    # Lifecycle hooks are best-effort and can overlap. A second callback is a
+    # no-op, not a second kill or a second durable release.
+    sd.cleanup_sandbox_on_session_end()
+    assert _event_kinds(host).count("sandbox_released") == 1
+
+
+def test_completed_task_hook_cleans_the_exact_ended_run(host, sdk):
+    _provision()
+    box = FakeSandbox.created[-1]
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='done', outcome='completed', ended_at=1 "
+                "WHERE id=?",
+                (host.run_id,),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (host.task_id,),
+            )
+
+    sd.cleanup_sandbox_on_task_completed(
+        task_id=host.task_id,
+        run_id=host.run_id,
+        board="default",
+        assignee=sd.WORKER_PROFILE,
+        profile_name=sd.WORKER_PROFILE,
+    )
+
+    assert box.killed is True
+    assert _reservation(host)["state"] == "released"
+    assert _event_kinds(host).count("sandbox_released") == 1
 
 
 @pytest.mark.parametrize("tool_name", [
@@ -1811,7 +1906,9 @@ def test_generic_opensandbox_requires_this_runs_active_sandbox(host, tool_name):
 
 
 @pytest.mark.parametrize("server_alias", ["opensandbox_agent_factory", "sandbox"])
-@pytest.mark.parametrize("operation", ["sandbox_create", "sandbox_list"])
+@pytest.mark.parametrize(
+    "operation", ["sandbox_create", "sandbox_list", "sandbox_kill"],
+)
 def test_generic_opensandbox_cannot_manage_sandboxes(host, server_alias, operation):
     result = sd.maintain_sandbox_lease(
         tool_name=f"mcp__{server_alias}__{operation}", args={},
