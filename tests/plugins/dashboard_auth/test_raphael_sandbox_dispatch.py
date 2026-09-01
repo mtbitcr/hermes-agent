@@ -1669,6 +1669,7 @@ def _manifest() -> dict:
 class TestPluginRegistration:
     def test_register_wires_the_tool_through_the_existing_plugin_edge(self, host):
         calls = []
+        hooks = []
 
         class Ctx:
             def register_dashboard_auth_provider(self, provider):
@@ -1682,8 +1683,7 @@ class TestPluginRegistration:
                 return None
 
             def register_hook(self, name, callback):
-                assert name == "pre_tool_call"
-                assert callback is sd.maintain_sandbox_lease
+                hooks.append((name, callback))
 
         raphael_workspace.register(Ctx())
         (tool,) = [c for c in calls if c["name"] == sd.TOOL_NAME]
@@ -1692,6 +1692,10 @@ class TestPluginRegistration:
         assert tool["handler"] is sd.handle_provision
         assert tool["check_fn"] is sd.check_provision_available
         assert not tool.get("override")
+        assert hooks == [
+            ("pre_runtime_turn", sd.enforce_sandbox_runtime),
+            ("pre_tool_call", sd.maintain_sandbox_lease),
+        ]
 
     def test_manifest_declares_a_bounded_plugin_dependency(self):
         manifest = _manifest()
@@ -1788,6 +1792,120 @@ def test_active_sandbox_is_renewed_before_the_lease_expires(host, sdk):
     assert box.renewals == [sd.SANDBOX_TIMEOUT_SECONDS]
 
 
+@pytest.mark.parametrize("tool_name", [
+    "mcp__opensandbox_agent_factory__sandbox_command_run",
+    "mcp_opensandbox_agent_factory_sandbox_command_run",
+    "mcp__sandbox__command_run",
+    "mcp__sandbox__sandbox_command_run",
+    "mcp_sandbox_command_run",
+    "mcp__server2__file_read",
+])
+def test_generic_opensandbox_requires_this_runs_active_sandbox(host, tool_name):
+    result = sd.maintain_sandbox_lease(
+        tool_name=tool_name,
+        args={"sandbox_id": "sbx-unrecorded"},
+    )
+
+    assert result and result["action"] == "block"
+    assert FakeSandbox.connect_calls == []
+
+
+@pytest.mark.parametrize("server_alias", ["opensandbox_agent_factory", "sandbox"])
+@pytest.mark.parametrize("operation", ["sandbox_create", "sandbox_list"])
+def test_generic_opensandbox_cannot_manage_sandboxes(host, server_alias, operation):
+    result = sd.maintain_sandbox_lease(
+        tool_name=f"mcp__{server_alias}__{operation}", args={},
+    )
+
+    assert result and result["action"] == "block"
+    assert "raphael_sandbox_provision" in result["message"]
+    assert FakeSandbox.connect_calls == []
+
+
+def test_generic_opensandbox_fails_closed_for_delegated_raphael_worker(host):
+    from agent.delegation_context import delegated_child_context
+
+    with delegated_child_context("sandbox-boundary-negative"):
+        result = sd.maintain_sandbox_lease(
+            tool_name="mcp__opensandbox_agent_factory__sandbox_command_run",
+            args={"sandbox_id": "sbx-unrecorded"},
+        )
+
+    assert result and result["action"] == "block"
+    assert FakeSandbox.connect_calls == []
+
+
+def test_generic_opensandbox_hook_leaves_non_raphael_profiles_unchanged(
+    host, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+
+    result = sd.maintain_sandbox_lease(
+        tool_name="mcp__opensandbox_agent_factory__sandbox_create", args={},
+    )
+
+    assert result is None
+
+
+def test_codex_app_server_runtime_is_blocked_before_tool_dispatch(host):
+    from agent.conversation_loop import _runtime_turn_block_message
+
+    result = sd.enforce_sandbox_runtime(api_mode="codex_app_server")
+    message = _runtime_turn_block_message(
+        SimpleNamespace(
+            api_mode="codex_app_server",
+            model="gpt-5.6-sol",
+            session_id="runtime-boundary",
+            platform="api_server",
+        ),
+        host.task_id,
+    )
+
+    assert result and result["action"] == "block"
+    assert message == result["message"]
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, host.task_id)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+
+
+def test_default_runtime_remains_available_to_sandbox_profiles(host):
+    assert sd.enforce_sandbox_runtime(api_mode="codex_responses") is None
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, host.task_id).status == "running"
+
+
+@pytest.mark.parametrize("bad_args", [
+    {},
+    {"sandbox_id": 7},
+    {"sandbox": {"sandbox_id": "sbx-001"}},
+    {"sandbox_id": "sbx-foreign"},
+])
+@pytest.mark.parametrize("tool_name", [
+    "mcp__opensandbox_agent_factory__sandbox_command_run",
+    "mcp__sandbox__command_run",
+])
+def test_generic_opensandbox_rejects_missing_malformed_and_foreign_ids_before_throttle(
+    host, sdk, bad_args, tool_name,
+):
+    _provision()
+    box = FakeSandbox.created[-1]
+    own = sd.maintain_sandbox_lease(
+        tool_name="mcp__opensandbox_agent_factory__sandbox_command_run",
+        args={"sandbox_id": box.id},
+    )
+    assert own is None
+    FakeSandbox.connect_calls.clear()
+
+    result = sd.maintain_sandbox_lease(
+        tool_name=tool_name,
+        args=bad_args,
+    )
+
+    assert result and result["action"] == "block"
+    assert FakeSandbox.connect_calls == []
+
+
 @pytest.mark.parametrize("bad_input", [
     {"direction": "export", "path": "/etc/passwd", "expected_sha256": "0" * 64},
     {"direction": "export", "path": "/workspace/task/../secret", "expected_sha256": "0" * 64},
@@ -1831,6 +1949,88 @@ def test_artifact_refuses_another_tasks_unrelated_input(host, sdk):
     }))
     assert "error" in result
     assert not any(path.startswith("/workspace/inputs/") for path in FakeSandbox.created[-1].file_data)
+
+
+def test_worker_link_added_after_claim_cannot_authorize_same_project_artifact(
+    host, monkeypatch,
+):
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    _, _, _, current, _ = _replacement_artifact_context(
+        host, monkeypatch, "raphael-builder", "R17",
+    )
+    data = b"unrelated same-project private input"
+    with kb.connect_closing() as conn:
+        unrelated = kb.create_task(
+            conn,
+            title="Unrelated completed work",
+            project_id=current.project_id,
+            project_source_task_id=current.id,
+            initial_status="blocked",
+        )
+        aid = kb.store_attachment_bytes(
+            conn, unrelated, "private.txt", data, uploaded_by="operator",
+        )
+        assert kb.complete_task(
+            conn, unrelated, summary="Done", fire_lifecycle_hook=False,
+        )
+        kb.link_tasks(conn, unrelated, current.id)
+        assert unrelated in kb.parent_ids(conn, current.id)
+
+    result = json.loads(sa.handle_artifact({
+        "direction": "inspect", "attachment_id": aid,
+    }))
+
+    assert "error" in result
+    assert data.decode() not in json.dumps(result)
+
+
+@pytest.mark.parametrize("direction", ["inspect", "copy"])
+def test_preclaim_dependency_snapshot_preserves_authorized_artifact_access(
+    host, monkeypatch, direction,
+):
+    from hermes_cli import projects_db
+    from plugins.dashboard_auth.raphael_workspace import sandbox_artifacts as sa
+
+    with projects_db.connect_closing() as conn:
+        project_id = projects_db.create_project(
+            conn, name="Frozen artifact inputs", primary_path=str(host.repo),
+        )
+    data = b"approved dependency input"
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(
+            conn, title="Completed dependency", project_id=project_id,
+            initial_status="blocked",
+        )
+        aid = kb.store_attachment_bytes(
+            conn, parent, "input.txt", data, uploaded_by="operator",
+        )
+        assert kb.complete_task(
+            conn, parent, summary="Done", fire_lifecycle_hook=False,
+        )
+        child = kb.create_task(
+            conn,
+            title="Consume approved input",
+            assignee=sd.WORKER_PROFILE,
+            project_id=project_id,
+            parents=[parent],
+            owned_paths=[],
+        )
+        current = kb.claim_task(conn, child)
+        assert current is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", current.id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", current.workspace_path)
+    args = {"direction": direction, "attachment_id": aid}
+    if direction == "copy":
+        args["expected_sha256"] = hashlib.sha256(data).hexdigest()
+
+    result = json.loads(sa.handle_artifact(args))
+
+    assert "error" not in result, result
+    assert result["source_task_id"] == parent
+    assert result["sha256"] == hashlib.sha256(data).hexdigest()
 
 
 # ---------------------------------------------------------------------------

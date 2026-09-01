@@ -6463,6 +6463,52 @@ def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return [r["parent_id"] for r in rows]
 
 
+def _artifact_input_snapshot(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Return the full dependency closure frozen into a new worker run."""
+    rows = conn.execute(
+        """
+        WITH RECURSIVE artifact_inputs(id) AS (
+            SELECT parent_id FROM task_links WHERE child_id = ?
+            UNION
+            SELECT links.parent_id
+            FROM task_links links
+            JOIN artifact_inputs inputs ON links.child_id = inputs.id
+        )
+        SELECT id FROM artifact_inputs ORDER BY id
+        """,
+        (task_id,),
+    ).fetchall()
+    return [row["id"] for row in rows]
+
+
+def claimed_artifact_input_ids(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+) -> list[str]:
+    """Read one run's immutable artifact-input authority, failing closed."""
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+        return []
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    try:
+        payload = json.loads(row["payload"]) if row and row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    input_ids = payload.get("artifact_input_task_ids")
+    if not isinstance(input_ids, list) or any(
+        not isinstance(value, str) or not value.strip() for value in input_ids
+    ):
+        return []
+    return sorted(set(input_ids))
+
+
 def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     rows = conn.execute(
         "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
@@ -7626,7 +7672,12 @@ def claim_task(
         )
         _append_event(
             conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
+            {
+                "lock": lock,
+                "expires": expires,
+                "run_id": run_id,
+                "artifact_input_task_ids": _artifact_input_snapshot(conn, task_id),
+            },
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
@@ -7731,8 +7782,13 @@ def claim_review_task(
         )
         _append_event(
             conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+            {
+                "lock": lock,
+                "expires": expires,
+                "run_id": run_id,
+                "source_status": "review",
+                "artifact_input_task_ids": _artifact_input_snapshot(conn, task_id),
+            },
             run_id=run_id,
         )
         return get_task(conn, task_id)

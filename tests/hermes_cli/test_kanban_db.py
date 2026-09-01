@@ -195,6 +195,34 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("review_claim", [False, True])
+def test_claim_freezes_transitive_artifact_inputs(kanban_home, review_claim):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root input")
+        assert kb.complete_task(conn, root, fire_lifecycle_hook=False)
+        parent = kb.create_task(conn, title="parent input", parents=[root])
+        assert kb.complete_task(conn, parent, fire_lifecycle_hook=False)
+        child = kb.create_task(conn, title="artifact consumer", parents=[parent])
+        if review_claim:
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (child,))
+            claimed = kb.claim_review_task(conn, child)
+        else:
+            claimed = kb.claim_task(conn, child)
+        assert claimed is not None
+        assert kb.claimed_artifact_input_ids(
+            conn, child, claimed.current_run_id
+        ) == sorted([root, parent])
+
+        late = kb.create_task(conn, title="late unrelated input")
+        assert kb.complete_task(conn, late, fire_lifecycle_hook=False)
+        kb.link_tasks(conn, late, child)
+
+        assert late in kb.parent_ids(conn, child)
+        assert kb.claimed_artifact_input_ids(
+            conn, child, claimed.current_run_id
+        ) == sorted([root, parent])
+
+
 
 def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
     with kb.connect() as conn:

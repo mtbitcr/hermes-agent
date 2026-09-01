@@ -1462,6 +1462,81 @@ def handle_provision(args: dict, **_kwargs) -> str:
 _lease_checked: dict[tuple, float] = {}
 _lease_lock = threading.Lock()
 
+_OPENSANDBOX_MCP_OPERATIONS = frozenset({
+    "sandbox_create",
+    "sandbox_connect",
+    "sandbox_kill",
+    "sandbox_get_info",
+    "sandbox_list",
+    "sandbox_renew",
+    "sandbox_get_metrics",
+    "sandbox_healthcheck",
+    "sandbox_get_endpoint",
+    "command_run",
+    "sandbox_command_run",
+    "command_interrupt",
+    "file_read",
+    "file_write",
+    "file_delete",
+    "file_search",
+    "file_create_directories",
+    "file_delete_directories",
+    "file_move",
+    "file_replace_contents",
+})
+
+
+def _opensandbox_mcp_operation(tool_name: str) -> Optional[str]:
+    """Resolve an OpenSandbox operation without trusting its server alias."""
+    if not isinstance(tool_name, str):
+        return None
+    normalized = tool_name.strip().lower()
+    if not normalized.startswith("mcp"):
+        return None
+    if normalized.startswith("mcp__") and "__" in normalized[5:]:
+        operation = normalized.rsplit("__", 1)[-1]
+        if operation in _OPENSANDBOX_MCP_OPERATIONS or operation.startswith(
+            ("sandbox_", "command_", "file_")
+        ):
+            return operation
+    for operation in _OPENSANDBOX_MCP_OPERATIONS:
+        if normalized.endswith(f"_{operation}"):
+            return operation
+    if "opensandbox" in normalized:
+        return normalized.rsplit("_", 1)[-1]
+    return None
+
+
+def enforce_sandbox_runtime(api_mode: str = "", **_kwargs):
+    """Block runtimes that bypass this plugin's pre-tool authorization."""
+    if api_mode != "codex_app_server" or _active_profile() not in SANDBOX_PROFILES:
+        return None
+    message = (
+        "This Raphael profile cannot use codex_app_server because that runtime "
+        "bypasses the scoped Server 2 tool authorization. Use the default "
+        "OpenAI runtime for this profile."
+    )
+    try:
+        ctx = _worker_context()
+        _resolve_task(ctx)
+        kb = _kanban()
+        with kb.connect_closing(board=ctx.board) as conn:
+            kb.block_task(
+                conn,
+                ctx.task_id,
+                reason=message,
+                kind="capability",
+                expected_run_id=ctx.run_id,
+            )
+    except SandboxDispatchError:
+        pass
+    except Exception as exc:
+        logger.warning(
+            "sandbox runtime admission could not record blocker (%s)",
+            type(exc).__name__,
+        )
+    return {"action": "block", "message": message}
+
 
 def maintain_sandbox_lease(tool_name: str = "", args: Optional[dict] = None, **_kwargs):
     # Saved native artifacts remain usable after the execution machine expires.
@@ -1472,18 +1547,46 @@ def maintain_sandbox_lease(tool_name: str = "", args: Optional[dict] = None, **_
         and args.get("direction") in {"inspect", "copy"}
     ):
         return None
-    if not (
-        "opensandbox" in tool_name
-        or tool_name in {"kanban_heartbeat", "raphael_sandbox_artifact"}
-    ) or not check_provision_available():
+    opensandbox_operation = _opensandbox_mcp_operation(tool_name)
+    generic_opensandbox = opensandbox_operation is not None
+    if generic_opensandbox and _active_profile() not in SANDBOX_PROFILES:
+        return None
+    if not generic_opensandbox and (
+        tool_name not in {"kanban_heartbeat", "raphael_sandbox_artifact"}
+        or not check_provision_available()
+    ):
         return None
     sandbox = None
     with _lease_lock:
         try:
             ctx = _worker_context()
             _resolve_task(ctx)
+            if opensandbox_operation in {"sandbox_create", "sandbox_list"}:
+                raise SandboxDispatchError(
+                    "Generic sandbox creation and listing are unavailable to this "
+                    "worker. Use raphael_sandbox_provision for the current run.",
+                    code="generic_sandbox_management",
+                )
             record = _read_reservation(ctx)
-            if record.get("state") != "active":
+            if generic_opensandbox:
+                if record.get("state") != "active":
+                    raise SandboxDispatchError(
+                        "This run has no recorded active sandbox. Use "
+                        "raphael_sandbox_provision before sandbox tools.",
+                        code="sandbox_not_active",
+                    )
+                requested_id = args.get("sandbox_id") if isinstance(args, dict) else None
+                if (
+                    not isinstance(requested_id, str)
+                    or not requested_id.strip()
+                    or requested_id != record.get("sandbox_id")
+                ):
+                    raise SandboxDispatchError(
+                        "This sandbox tool call does not target the current run's "
+                        "recorded sandbox.",
+                        code="sandbox_id_mismatch",
+                    )
+            elif record.get("state") != "active":
                 return None
             key = (ctx.board, ctx.task_id, ctx.run_id, record["sandbox_id"])
             now = time.monotonic()
@@ -1540,6 +1643,7 @@ def register_sandbox_tool(ctx) -> None:
     from plugins.dashboard_auth.raphael_workspace.sandbox_artifacts import register_artifact_tool
 
     register_artifact_tool(ctx)
+    ctx.register_hook("pre_runtime_turn", enforce_sandbox_runtime)
     ctx.register_hook("pre_tool_call", maintain_sandbox_lease)
     ctx.register_tool(
         name=TOOL_NAME,
