@@ -600,6 +600,34 @@ def test_completion_derives_exact_clean_in_scope_git_receipt(tmp_path):
         conn.close()
 
 
+def test_completion_rejects_noop_for_mutating_scope_without_closing_task(tmp_path):
+    repo = _repo(tmp_path)
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="must produce an owned change",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="feature/noop-mutator",
+            owned_paths=["src/owned"],
+        )
+        _materialize(conn, task_id)
+
+        with pytest.raises(kb.WorktreeScopeError, match="no committed changes"):
+            kb.complete_task(conn, task_id, summary="Nothing changed")
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "running"
+        assert task.head_commit is None
+        assert kb.list_events(conn, task_id)[-1].kind == (
+            "completion_blocked_file_scope"
+        )
+    finally:
+        conn.close()
+
+
 def test_integrator_must_contain_every_exact_same_project_parent_head(tmp_path):
     repo = _repo(tmp_path)
     conn = kb.connect(tmp_path / "kanban.db")
