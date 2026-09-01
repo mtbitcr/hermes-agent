@@ -7829,6 +7829,15 @@ def _retry_status_for_run(
     return "review" if payload.get("source_status") == "review" else "ready"
 
 
+def run_claimed_from_review(
+    conn: sqlite3.Connection, task_id: str, run_id: int,
+) -> bool:
+    """Return whether this exact run was claimed from the review lane."""
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+        return False
+    return _retry_status_for_run(conn, task_id, run_id) == "review"
+
+
 def goal_run_status(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11883,6 +11892,10 @@ def _materialize_remote_worktree_handoff(
         )
     if expected_run_id is not None and int(expected_run_id) != int(task.current_run_id):
         raise WorktreeScopeError("remote worktree handoff run id is stale")
+    if run_claimed_from_review(conn, task_id, int(task.current_run_id)):
+        raise WorktreeScopeError(
+            "review runs are read-only and cannot materialize patches or parent heads"
+        )
     if task.workspace_kind != "worktree" or not task.workspace_path:
         raise WorktreeScopeError(
             "remote worktree handoff requires an isolated git worktree"
@@ -12431,6 +12444,42 @@ def release_ended_run_sandbox(
             run_id=run_id,
         )
         return read_run_sandbox(conn, task_id, run_id=run_id)
+
+
+def list_ended_run_sandboxes(
+    conn: sqlite3.Connection, *, limit: int = 4,
+) -> list[dict[str, Any]]:
+    """List a bounded batch of ended runs whose sandbox is still active.
+
+    The latest reservation transition is the durable cleanup intent: an ended
+    run whose latest transition is sandbox_provisioned still owns a machine
+    until an exact sandbox_released transition closes it.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 32:
+        raise ValueError("limit must be an integer from 1 to 32")
+    placeholders = ", ".join("?" for _ in RUN_SANDBOX_EVENTS)
+    rows = conn.execute(
+        "WITH latest AS ("
+        " SELECT task_id, run_id, MAX(id) AS event_id FROM task_events"
+        f" WHERE run_id IS NOT NULL AND kind IN ({placeholders})"
+        " GROUP BY task_id, run_id"
+        ") "
+        "SELECT e.task_id, e.run_id, r.profile "
+        "FROM latest l JOIN task_events e ON e.id = l.event_id "
+        "JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
+        "JOIN tasks t ON t.id = e.task_id AND t.task_kind = 'work' "
+        "WHERE e.kind = 'sandbox_provisioned' AND r.ended_at IS NOT NULL "
+        "ORDER BY e.id ASC LIMIT ?",
+        (*RUN_SANDBOX_EVENTS, limit),
+    ).fetchall()
+    return [
+        {
+            "task_id": str(row["task_id"]),
+            "run_id": int(row["run_id"]),
+            "profile": str(row["profile"] or ""),
+        }
+        for row in rows
+    ]
 
 
 def _path_is_owned(path: str, owned_paths: list[str]) -> bool:

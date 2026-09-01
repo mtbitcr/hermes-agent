@@ -410,6 +410,22 @@ def _git(root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _run_requires_read_only_source(ctx: _WorkerContext) -> bool:
+    """Resolve review authority from the exact durable run, not task scope."""
+    if ctx.profile == "raphael-verifier":
+        return True
+    kb = _kanban()
+    try:
+        with kb.connect_closing(board=ctx.board) as conn:
+            return kb.run_claimed_from_review(conn, ctx.task_id, ctx.run_id)
+    except Exception as exc:
+        raise SandboxDispatchError(
+            "this run's review authority could not be read, so no source "
+            "write boundary can be granted.",
+            code="review_authority_unavailable",
+        ) from exc
+
+
 def _resolve_source(task: Any, ctx: _WorkerContext) -> _Source:
     if task.workspace_kind != "worktree" or not task.workspace_path:
         raise SandboxDispatchError(
@@ -438,7 +454,8 @@ def _resolve_source(task: Any, ctx: _WorkerContext) -> _Source:
             "the task's.",
             code="workspace_mismatch",
         )
-    if task.owned_paths is None:
+    read_only = _run_requires_read_only_source(ctx)
+    if task.owned_paths is None and not read_only:
         raise SandboxDispatchError(
             "this task declares no repository ownership scope, so the source "
             "cannot be sent with a provable write boundary. Ask the operator "
@@ -467,7 +484,11 @@ def _resolve_source(task: Any, ctx: _WorkerContext) -> _Source:
             "the task workspace has no resolvable HEAD commit to send.",
             code="source_no_head",
         )
-    return _Source(root=root, commit=commit, ownership_scope=list(task.owned_paths))
+    return _Source(
+        root=root,
+        commit=commit,
+        ownership_scope=[] if read_only else list(task.owned_paths),
+    )
 
 
 def _package_source(source: _Source, staging: Path) -> tuple:
@@ -1110,6 +1131,15 @@ def _close_quietly(sandbox: Any) -> None:
         )
 
 
+def _sandbox_is_confirmed_absent(exc: Exception) -> bool:
+    """Use the official SDK's typed HTTP status as absence authority."""
+    try:
+        from opensandbox.exceptions import SandboxApiException
+    except ImportError:
+        return False
+    return isinstance(exc, SandboxApiException) and exc.status_code == 404
+
+
 def _receipt_still_holds(
     sandbox: Any, ctx: _WorkerContext, record: dict, *,
     minimum_remaining: int = SANDBOX_MIN_REMAINING_SECONDS,
@@ -1119,14 +1149,15 @@ def _receipt_still_holds(
     Returns ``"ok"`` when the machine exists, is running, is healthy, has
     enough lease left to be worth handing back, and matches the receipt
     exactly; ``"retire"`` when it is provably this run's machine but no longer
-    usable; ``"foreign"`` when this process cannot prove the machine belongs to
-    this run at all (so it must never be killed from here).
+    usable; ``"absent"`` when the official API proves it is gone;
+    ``"foreign"`` when this process cannot prove the machine belongs to this
+    run at all (so it must never be killed from here).
     """
     recorded_id = str(record.get("sandbox_id") or "")
     try:
         info = sandbox.get_info()
-    except Exception:
-        return "foreign"
+    except Exception as exc:
+        return "absent" if _sandbox_is_confirmed_absent(exc) else "foreign"
 
     metadata = getattr(info, "metadata", None) or {}
     if (
@@ -1257,39 +1288,74 @@ def _cleanup_run_sandbox(ctx: _WorkerContext, *, reason: str) -> bool:
     ):
         return False
 
-    sandbox = None
     try:
         sdk = _load_sdk()
         connection = _resolve_connection()
-        sandbox = sdk.sandbox.connect(
-            sandbox_id,
-            connection_config=_connection_config(sdk, connection),
-            connect_timeout=timedelta(seconds=SANDBOX_VERIFY_TIMEOUT_SECONDS),
-        )
-        verdict = _receipt_still_holds(
-            sandbox, ctx, record, minimum_remaining=0,
-        )
-        if verdict == "foreign":
-            _close_quietly(sandbox)
-            sandbox = None
-            _log_event(
-                ctx, "cleanup_refused", level=logging.WARNING,
-                generation=generation, reason="ownership_unverified",
-            )
-            return False
-        sandbox.kill()
-        _close_quietly(sandbox)
-        sandbox = None
     except Exception as exc:
-        if sandbox is not None:
-            _close_quietly(sandbox)
         _log_event(
-            ctx, "cleanup_failed", level=logging.WARNING,
+            ctx, "cleanup_pending", level=logging.WARNING,
             generation=generation, reason=type(exc).__name__,
         )
         return False
 
+    sandbox = None
+    try:
+        sandbox = sdk.sandbox.connect(
+            sandbox_id,
+            connection_config=_connection_config(sdk, connection),
+            connect_timeout=timedelta(seconds=SANDBOX_VERIFY_TIMEOUT_SECONDS),
+            skip_health_check=True,
+        )
+    except Exception as exc:
+        if _sandbox_is_confirmed_absent(exc):
+            if _record_cleaned_release(ctx, generation, "already_absent"):
+                _log_event(
+                    ctx, "cleaned", generation=generation,
+                    reason="already_absent",
+                )
+                return True
+        _log_event(
+            ctx, "cleanup_pending", level=logging.WARNING,
+            generation=generation, reason=type(exc).__name__,
+        )
+        return False
+
+    verdict = _receipt_still_holds(
+        sandbox, ctx, record, minimum_remaining=0,
+    )
+    if verdict == "absent":
+        _close_quietly(sandbox)
+        if _record_cleaned_release(ctx, generation, "already_absent"):
+            _log_event(
+                ctx, "cleaned", generation=generation,
+                reason="already_absent",
+            )
+            return True
+        return False
+    if verdict == "foreign":
+        _close_quietly(sandbox)
+        _log_event(
+            ctx, "cleanup_refused", level=logging.WARNING,
+            generation=generation, reason="ownership_unverified",
+        )
+        return False
+    try:
+        sandbox.kill()
+    except Exception as exc:
+        if not _sandbox_is_confirmed_absent(exc):
+            _close_quietly(sandbox)
+            _log_event(
+                ctx, "cleanup_pending", level=logging.WARNING,
+                generation=generation, reason=type(exc).__name__,
+            )
+            return False
+    _close_quietly(sandbox)
+
     if not _record_cleaned_release(ctx, generation, reason):
+        _log_event(
+            ctx, "cleanup_pending", level=logging.WARNING,
+            generation=generation, reason="release_record_unavailable",
+        )
         return False
     _log_event(ctx, "cleaned", generation=generation, reason=reason)
     return True
@@ -1353,6 +1419,52 @@ def cleanup_sandbox_on_worker_exited(**kwargs: Any) -> None:
 
 def cleanup_sandbox_on_stale_claim(**kwargs: Any) -> None:
     _cleanup_sandbox_from_lifecycle("stale_claim", **kwargs)
+
+
+_CLEANUP_RETRY_BATCH = 4
+_cleanup_retry_lock = threading.Lock()
+
+
+def retry_ended_sandbox_cleanup(
+    *, board: Any = None, dry_run: bool = False, **_kwargs: Any,
+) -> None:
+    """Retry a bounded batch of durable ended-run cleanup intents."""
+    if dry_run or not _cleanup_retry_lock.acquire(blocking=False):
+        return
+    board_name = str(board).strip() if board else None
+    try:
+        kb = _kanban()
+        try:
+            with kb.connect_closing(board=board_name) as conn:
+                pending = kb.list_ended_run_sandboxes(
+                    conn, limit=_CLEANUP_RETRY_BATCH,
+                )
+        except Exception:
+            logger.warning(
+                "raphael sandbox cleanup retry could not read board=%s",
+                board_name or "default",
+            )
+            return
+        for item in pending:
+            profile = item.get("profile")
+            if profile not in SANDBOX_PROFILES:
+                logger.warning(
+                    "raphael sandbox cleanup retry has no admitted profile "
+                    "for task=%s run=%s",
+                    item.get("task_id"),
+                    item.get("run_id"),
+                )
+                continue
+            ctx = _WorkerContext(
+                task_id=item["task_id"],
+                run_id=item["run_id"],
+                board=board_name,
+                workspace_env="",
+                profile=profile,
+            )
+            _cleanup_run_sandbox(ctx, reason="dispatcher_retry")
+    finally:
+        _cleanup_retry_lock.release()
 
 
 def _acquire(
@@ -1840,6 +1952,7 @@ def register_sandbox_tool(ctx) -> None:
     ctx.register_hook("kanban_task_completed", cleanup_sandbox_on_task_completed)
     ctx.register_hook("on_kanban_worker_exited", cleanup_sandbox_on_worker_exited)
     ctx.register_hook("on_kanban_worker_stale_claim", cleanup_sandbox_on_stale_claim)
+    ctx.register_hook("on_kanban_dispatch_tick", retry_ended_sandbox_cleanup)
     ctx.register_tool(
         name=TOOL_NAME,
         toolset=TOOLSET,

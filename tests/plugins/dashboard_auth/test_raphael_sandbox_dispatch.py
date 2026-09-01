@@ -1740,6 +1740,7 @@ class TestPluginRegistration:
             ("kanban_task_completed", sd.cleanup_sandbox_on_task_completed),
             ("on_kanban_worker_exited", sd.cleanup_sandbox_on_worker_exited),
             ("on_kanban_worker_stale_claim", sd.cleanup_sandbox_on_stale_claim),
+            ("on_kanban_dispatch_tick", sd.retry_ended_sandbox_cleanup),
         ]
 
     def test_manifest_declares_a_bounded_plugin_dependency(self):
@@ -1828,6 +1829,69 @@ def test_verification_role_gets_same_scoped_sandbox_without_coding_credentials(h
     assert out["policy"]["automatic_run_cleanup"] is True
 
 
+def test_review_run_keeps_implementer_scope_but_gets_no_patch_authority(
+    host, sdk, monkeypatch,
+):
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, host.task_id).owned_paths == ["."]
+        assert kb.request_review(
+            conn,
+            host.task_id,
+            summary="Implementation is ready for independent review.",
+            reviewer="raphael-verifier",
+            expected_run_id=host.run_id,
+        )
+        claimed = kb.claim_review_task(
+            conn, host.task_id, claimer="reviewer:test",
+        )
+        assert claimed is not None
+        review_run_id = claimed.current_run_id
+        assert review_run_id is not None
+        assert kb.get_task(conn, host.task_id).owned_paths == ["."]
+
+    monkeypatch.setenv("HERMES_PROFILE", "raphael-verifier")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review_run_id))
+    out = _provision()
+    assert out["ownership_scope"] == []
+    assert out["policy"]["host_patch_import_authorized"] is False
+
+    with kb.connect_closing() as conn:
+        attachment_id = kb.store_attachment_bytes(
+            conn,
+            host.task_id,
+            "review.patch",
+            b"review must not write the implementation tree",
+            uploaded_by="agent",
+            expected_run_id=review_run_id,
+        )
+        with pytest.raises(
+            kb.WorktreeScopeError,
+            match="review runs are read-only",
+        ):
+            kb.complete_task(
+                conn,
+                host.task_id,
+                summary="Reviewed.",
+                patch_attachment_id=attachment_id,
+                expected_run_id=review_run_id,
+                fire_lifecycle_hook=False,
+            )
+        with pytest.raises(
+            kb.WorktreeScopeError,
+            match="review runs are read-only",
+        ):
+            kb.complete_task(
+                conn,
+                host.task_id,
+                summary="Reviewed.",
+                merge_parent_heads=True,
+                expected_run_id=review_run_id,
+                fire_lifecycle_hook=False,
+            )
+        assert kb.get_task(conn, host.task_id).status == "running"
+        assert kb.get_task(conn, host.task_id).owned_paths == ["."]
+
+
 def test_active_sandbox_is_renewed_before_the_lease_expires(host, sdk):
     _provision()
     box = FakeSandbox.created[-1]
@@ -1883,6 +1947,69 @@ def test_completed_task_hook_cleans_the_exact_ended_run(host, sdk):
     )
 
     assert box.killed is True
+    assert _reservation(host)["state"] == "released"
+    assert _event_kinds(host).count("sandbox_released") == 1
+
+
+def test_dispatch_tick_retries_ended_run_cleanup_until_release_is_durable(
+    host, sdk,
+):
+    _provision()
+    box = FakeSandbox.created[-1]
+    original_kill = box.kill
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET profile=?, status='done', "
+                "outcome='completed', ended_at=1 WHERE id=?",
+                (sd.WORKER_PROFILE, host.run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (host.task_id,),
+            )
+
+    def transient_failure():
+        raise RuntimeError("temporary control-plane failure")
+
+    box.kill = transient_failure
+    sd.retry_ended_sandbox_cleanup(board="default")
+    assert _reservation(host)["state"] == "active"
+    assert box.killed is False
+
+    box.kill = original_kill
+    sd.retry_ended_sandbox_cleanup(board="default")
+    assert box.killed is True
+    assert _reservation(host)["state"] == "released"
+    assert _event_kinds(host).count("sandbox_released") == 1
+
+
+def test_dispatch_tick_records_officially_confirmed_absence(
+    host, sdk, monkeypatch,
+):
+    from opensandbox.exceptions import SandboxApiException
+
+    _provision()
+    box = FakeSandbox.created[-1]
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET profile=?, status='done', "
+                "outcome='completed', ended_at=1 WHERE id=?",
+                (sd.WORKER_PROFILE, host.run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (host.task_id,),
+            )
+    FakeSandbox.live.pop(box.id)
+
+    def absent(_cls, _sandbox_id, **_kwargs):
+        raise SandboxApiException("gone", status_code=404)
+
+    monkeypatch.setattr(FakeSandbox, "connect", classmethod(absent))
+    sd.retry_ended_sandbox_cleanup(board="default")
+
     assert _reservation(host)["state"] == "released"
     assert _event_kinds(host).count("sandbox_released") == 1
 

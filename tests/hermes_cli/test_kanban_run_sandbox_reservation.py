@@ -32,8 +32,8 @@ def running_task():
         task_id = kb.create_task(conn, title="remote build", assignee="worker")
         with kb.write_txn(conn):
             conn.execute(
-                "INSERT INTO task_runs (task_id, status, started_at) "
-                "VALUES (?, 'running', 0)",
+                "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                "VALUES (?, 'worker', 'running', 0)",
                 (task_id,),
             )
             run_id = int(
@@ -232,6 +232,44 @@ def test_ended_run_cleanup_releases_only_its_own_active_sandbox(running_task):
         assert kb.read_run_sandbox(
             conn, task_id, run_id=next_run,
         )["state"] == "absent"
+
+
+def test_ended_active_sandbox_is_a_bounded_durable_cleanup_intent(running_task):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_reserved", expected_generation=0,
+        )
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_provisioned", expected_generation=1,
+            sandbox_id="sbx-001", receipt=RECEIPT,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='done', outcome='completed', ended_at=1 "
+                "WHERE id=?",
+                (run_id,),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (task_id,),
+            )
+
+        assert kb.list_ended_run_sandboxes(conn) == [{
+            "task_id": task_id,
+            "run_id": run_id,
+            "profile": "worker",
+        }]
+        kb.release_ended_run_sandbox(
+            conn,
+            task_id,
+            run_id=run_id,
+            expected_generation=1,
+            reason="dispatcher_retry",
+        )
+        assert kb.list_ended_run_sandboxes(conn) == []
 
 
 def test_a_run_that_is_no_longer_active_cannot_reserve(running_task):
