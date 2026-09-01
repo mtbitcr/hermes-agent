@@ -238,6 +238,31 @@ def test_ended_run_cleanup_releases_only_its_own_active_sandbox(running_task):
         )["state"] == "absent"
 
 
+def test_task_deletion_waits_for_durable_sandbox_release(running_task):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_reserved", expected_generation=0,
+        )
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_provisioned", expected_generation=1,
+            sandbox_id="sbx-001", receipt=RECEIPT,
+        )
+        assert kb.delete_task(conn, task_id) is False
+        assert kb.archive_task(conn, task_id)
+        assert kb.delete_archived_task(conn, task_id) is False
+        kb.release_ended_run_sandbox(
+            conn,
+            task_id,
+            run_id=run_id,
+            expected_generation=1,
+            reason="dispatcher_retry",
+        )
+        assert kb.delete_archived_task(conn, task_id) is True
+
+
 def test_ended_active_sandbox_is_a_bounded_durable_cleanup_intent(running_task):
     task_id, run_id = running_task
     with kb.connect() as conn:
@@ -302,7 +327,10 @@ def test_ended_active_sandbox_is_a_bounded_durable_cleanup_intent(running_task):
         assert kb.claim_ended_run_sandbox_cleanups(conn, now=200) == []
 
 
-def test_migration_backfills_a_pre_intent_table_active_machine(running_task):
+@pytest.mark.parametrize("interrupted", ["missing_table", "empty_table"])
+def test_migration_backfills_a_pre_intent_table_active_machine(
+    running_task, interrupted,
+):
     task_id, run_id = running_task
     with kb.connect() as conn:
         kb.advance_run_sandbox(
@@ -315,15 +343,98 @@ def test_migration_backfills_a_pre_intent_table_active_machine(running_task):
             sandbox_id="sbx-001", receipt=RECEIPT,
         )
         with kb.write_txn(conn):
-            conn.execute("DROP TABLE run_sandbox_cleanup_intents")
-        kb._migrate_add_optional_columns(
-            conn, backfill_sandbox_cleanup=True,
-        )
+            if interrupted == "missing_table":
+                conn.execute("DROP TABLE run_sandbox_cleanup_intents")
+            else:
+                conn.execute("DELETE FROM run_sandbox_cleanup_intents")
+        kb._migrate_add_optional_columns(conn)
         row = conn.execute(
             "SELECT task_id, run_id, profile, generation, sandbox_id "
             "FROM run_sandbox_cleanup_intents",
         ).fetchone()
         assert dict(row) == {
+            "task_id": task_id,
+            "run_id": run_id,
+            "profile": "worker",
+            "generation": 1,
+            "sandbox_id": "sbx-001",
+        }
+
+
+def test_cleanup_reconciliation_runs_after_legacy_id_rebuild(running_task):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_reserved", expected_generation=0,
+        )
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_provisioned", expected_generation=1,
+            sandbox_id="sbx-001", receipt=RECEIPT,
+        )
+        run_columns = [
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(task_runs)")
+        ]
+        event_columns = [
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(task_events)")
+        ]
+        runs = [dict(row) for row in conn.execute("SELECT * FROM task_runs")]
+        events = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_events ORDER BY id",
+        )]
+        for row in runs:
+            row["id"] = str(row["id"])
+        for row in events:
+            if row["kind"] == "sandbox_reserved":
+                row["id"] = "2"
+            elif row["kind"] == "sandbox_provisioned":
+                row["id"] = "10"
+            else:
+                row["id"] = None
+
+        with kb.write_txn(conn):
+            conn.execute("DELETE FROM run_sandbox_cleanup_intents")
+            conn.execute("DROP TABLE task_events")
+            conn.execute("DROP TABLE task_runs")
+            conn.execute(
+                kb._REBUILD_SPECS["task_runs"][0].replace(
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT", "id TEXT",
+                )
+            )
+            conn.execute(
+                kb._REBUILD_SPECS["task_events"][0].replace(
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT", "id TEXT",
+                )
+            )
+            run_names = ", ".join(run_columns)
+            run_slots = ", ".join("?" for _ in run_columns)
+            conn.executemany(
+                f"INSERT INTO task_runs ({run_names}) VALUES ({run_slots})",
+                (tuple(row[name] for name in run_columns) for row in runs),
+            )
+            event_names = ", ".join(event_columns)
+            event_slots = ", ".join("?" for _ in event_columns)
+            conn.executemany(
+                f"INSERT INTO task_events ({event_names}) VALUES ({event_slots})",
+                (tuple(row[name] for name in event_columns) for row in events),
+            )
+
+        kb._migrate_add_optional_columns(conn)
+
+        assert conn.execute(
+            "SELECT type FROM pragma_table_info('task_events') WHERE name='id'",
+        ).fetchone()["type"] == "INTEGER"
+        assert conn.execute(
+            "SELECT type FROM pragma_table_info('task_runs') WHERE name='id'",
+        ).fetchone()["type"] == "INTEGER"
+        intent = conn.execute(
+            "SELECT task_id, run_id, profile, generation, sandbox_id "
+            "FROM run_sandbox_cleanup_intents",
+        ).fetchone()
+        assert dict(intent) == {
             "task_id": task_id,
             "run_id": run_id,
             "profile": "worker",

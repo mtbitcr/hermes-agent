@@ -2906,10 +2906,6 @@ def connect(
                     # process are cheap. The lock prevents same-process dispatcher
                     # threads from racing through the additive ALTER TABLE pass with
                     # stale PRAGMA snapshots during gateway startup.
-                    cleanup_intents_existed = conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' "
-                        "AND name='run_sandbox_cleanup_intents'"
-                    ).fetchone() is not None
                     conn.executescript(SCHEMA_SQL)
                     # Which board this file IS, so the migration can read its
                     # published owner metadata. An explicit ``db_path`` with no
@@ -2919,7 +2915,6 @@ def connect(
                         conn,
                         _normalize_board_slug(board)
                         or (get_current_board() if db_path is None else None),
-                        backfill_sandbox_cleanup=not cleanup_intents_existed,
                     )
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
@@ -2998,8 +2993,6 @@ def init_db(
 def _migrate_add_optional_columns(
     conn: sqlite3.Connection,
     board_slug: Optional[str] = None,
-    *,
-    backfill_sandbox_cleanup: bool = False,
 ) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -3348,28 +3341,6 @@ def _migrate_add_optional_columns(
         "CREATE INDEX IF NOT EXISTS idx_sandbox_cleanup_due "
         "ON run_sandbox_cleanup_intents(next_attempt_at, provision_event_id)"
     )
-    # One-time compatibility backfill for active machines provisioned before
-    # the intent table existed. The partial event index keeps this startup-only
-    # reconciliation away from ordinary board history.
-    if backfill_sandbox_cleanup:
-        conn.execute(
-            "WITH latest AS ("
-            " SELECT task_id, run_id, MAX(id) AS event_id FROM task_events "
-            " WHERE run_id IS NOT NULL AND kind IN ("
-            "'sandbox_reserved', 'sandbox_provisioned', 'sandbox_released'"
-            ") GROUP BY task_id, run_id"
-            ") INSERT OR IGNORE INTO run_sandbox_cleanup_intents ("
-            "task_id, run_id, profile, generation, sandbox_id, provision_event_id"
-            ") SELECT e.task_id, e.run_id, r.profile, "
-            "json_extract(e.payload, '$.generation'), "
-            "json_extract(e.payload, '$.sandbox_id'), e.id "
-            "FROM latest l JOIN task_events e ON e.id = l.event_id "
-            "JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
-            "WHERE e.kind = 'sandbox_provisioned' "
-            "AND json_type(e.payload, '$.generation') = 'integer' "
-            "AND json_type(e.payload, '$.sandbox_id') = 'text'"
-        )
-
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -3497,6 +3468,7 @@ def _migrate_add_optional_columns(
         )
 
     _rebuild_drifted_tables(conn)
+    _reconcile_run_sandbox_cleanup_intents(conn)
     _reconcile_receipt_owned_tasks(conn, board_slug)
 
 
@@ -3751,6 +3723,81 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass
         raise
+
+
+def _reconcile_run_sandbox_cleanup_intents(conn: sqlite3.Connection) -> None:
+    """Rebuild the current cleanup scheduler from canonical post-migration events.
+
+    This runs after drifted event/run tables are rebuilt and on every
+    initialization. It is idempotent, so an interrupted first migration cannot
+    suppress a later backfill.
+    """
+    tables = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if not {
+        "tasks", "task_runs", "task_events", "run_sandbox_cleanup_intents",
+    } <= tables:
+        return
+    task_columns = {
+        str(row["name"]) for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    if "task_kind" not in task_columns:
+        return
+
+    latest = (
+        "SELECT task_id, run_id, MAX(id) AS event_id FROM task_events "
+        "WHERE run_id IS NOT NULL AND kind IN ("
+        "'sandbox_reserved', 'sandbox_provisioned', 'sandbox_released'"
+        ") GROUP BY task_id, run_id"
+    )
+    valid = (
+        "e.kind = 'sandbox_provisioned' "
+        "AND json_type(e.payload, '$.generation') = 'integer' "
+        "AND json_type(e.payload, '$.sandbox_id') = 'text'"
+    )
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            "WITH latest AS (" + latest + ") "
+            "DELETE FROM run_sandbox_cleanup_intents AS i "
+            "WHERE NOT EXISTS ("
+            " SELECT 1 FROM latest l "
+            " JOIN task_events e ON e.id = l.event_id "
+            " WHERE e.task_id = i.task_id AND e.run_id = i.run_id "
+            " AND " + valid +
+            ")"
+        )
+        conn.execute(
+            "WITH latest AS (" + latest + ") "
+            "INSERT INTO run_sandbox_cleanup_intents ("
+            "task_id, run_id, profile, generation, sandbox_id, provision_event_id"
+            ") SELECT e.task_id, e.run_id, r.profile, "
+            "json_extract(e.payload, '$.generation'), "
+            "json_extract(e.payload, '$.sandbox_id'), e.id "
+            "FROM latest l JOIN task_events e ON e.id = l.event_id "
+            "JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
+            "JOIN tasks t ON t.id = e.task_id AND t.task_kind = 'work' "
+            "WHERE " + valid + " "
+            "ON CONFLICT(task_id, run_id) DO UPDATE SET "
+            "profile=excluded.profile, generation=excluded.generation, "
+            "sandbox_id=excluded.sandbox_id, "
+            "provision_event_id=excluded.provision_event_id, "
+            "attempt_count=CASE WHEN "
+            "run_sandbox_cleanup_intents.provision_event_id = "
+            "excluded.provision_event_id THEN "
+            "run_sandbox_cleanup_intents.attempt_count ELSE 0 END, "
+            "next_attempt_at=CASE WHEN "
+            "run_sandbox_cleanup_intents.provision_event_id = "
+            "excluded.provision_event_id THEN "
+            "run_sandbox_cleanup_intents.next_attempt_at ELSE 0 END, "
+            "last_error=CASE WHEN "
+            "run_sandbox_cleanup_intents.provision_event_id = "
+            "excluded.provision_event_id THEN "
+            "run_sandbox_cleanup_intents.last_error ELSE NULL END"
+        )
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
@@ -11483,7 +11530,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
     Safety guard: only archived tasks can be deleted. Active / blocked / done
     tasks must be explicitly archived first so accidental data loss requires a
-    second deliberate action.
+    second deliberate action. A task with a current sandbox cleanup intent is
+    retained until the exact machine is durably released.
     """
     with write_txn(conn):
         row = conn.execute(
@@ -11491,6 +11539,12 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
             (task_id,),
         ).fetchone()
         if not row or row["status"] != "archived":
+            return False
+        if conn.execute(
+            "SELECT 1 FROM run_sandbox_cleanup_intents "
+            "WHERE task_id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone() is not None:
             return False
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
@@ -11511,12 +11565,20 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
     Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
     we explicitly delete from child tables first, then the task row.
-    This keeps the operation atomic (single ``write_txn``).
+    This keeps the operation atomic (single ``write_txn``). A current sandbox
+    cleanup intent is a deletion guard: removing its task/run/event authority
+    before release would make the remote machine unreachable.
 
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
     """
     with write_txn(conn):
+        if conn.execute(
+            "SELECT 1 FROM run_sandbox_cleanup_intents "
+            "WHERE task_id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone() is not None:
+            return False
         cur = conn.execute(
             "DELETE FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
         )
