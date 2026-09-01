@@ -12357,6 +12357,10 @@ def _verify_scoped_worktree_completion(
                     f"completed head does not contain parent head from {row['id']}"
                 )
             parent_heads.append({"task_id": str(row["id"]), "head_commit": parent_head})
+    if owned_paths and not changed_paths:
+        raise WorktreeScopeError(
+            "mutating completion has no committed changes"
+        )
     receipt_changed_paths = changed_paths[:_MAX_RECEIPT_CHANGED_PATHS]
     receipt: dict[str, Any] = {
         "kind": "scoped_worktree_v1",
