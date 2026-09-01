@@ -65,7 +65,12 @@ def _authorized_attachment(conn, task, attachment_id):
         if not task.project_id:
             raise ValueError("this task has no project-bound artifact inputs")
         seen = {(task.id, False), (task.id, True)}
-        pending = [(parent, False) for parent in kb.parent_ids(conn, task.id)]
+        pending = [
+            (parent, False)
+            for parent in kb.claimed_artifact_input_ids(
+                conn, task.id, task.current_run_id
+            )
+        ]
         pending.extend((parent, True) for parent in _predecessor_ids(conn, task.id))
         found = False
         while pending:
@@ -81,7 +86,6 @@ def _authorized_attachment(conn, task, attachment_id):
             ):
                 found = True
                 break
-            pending.extend((parent, False) for parent in kb.parent_ids(conn, tid))
             pending.extend((parent, True) for parent in _predecessor_ids(conn, tid))
         if not found:
             raise ValueError("attachment is not an approved input of this project task")

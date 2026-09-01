@@ -154,6 +154,10 @@ _install_plugin_debug_handler()
 # ---------------------------------------------------------------------------
 
 VALID_HOOKS: Set[str] = {
+    # Blocking runtime admission gate. Plugins use this when a runtime would
+    # bypass a security boundary that only exists in Hermes' own tool loop.
+    # Return {"action": "block", "message": "..."}; any other result passes.
+    "pre_runtime_turn",
     "pre_tool_call",
     "post_tool_call",
     "transform_terminal_output",

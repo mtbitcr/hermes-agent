@@ -744,6 +744,8 @@ def finalize_turn(
             result["failure_reason"] = (
                 "session_persistence_failed:" + (_cause or "unknown")
             )
+    elif failed and str(_turn_exit_reason) == "runtime_admission_block":
+        result["error"] = final_response or "runtime admission blocked"
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

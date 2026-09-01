@@ -1688,6 +1688,31 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _runtime_turn_block_message(agent: Any, effective_task_id: str) -> Optional[str]:
+    """Return the first plugin runtime-admission block, if any."""
+    try:
+        from hermes_cli.lifecycle import invoke_hook
+
+        results = invoke_hook(
+            "pre_runtime_turn",
+            api_mode=getattr(agent, "api_mode", "") or "",
+            model=getattr(agent, "model", "") or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            task_id=effective_task_id or "",
+            platform=getattr(agent, "platform", "") or "",
+        )
+    except Exception:
+        logger.warning("pre_runtime_turn hook failed", exc_info=True)
+        return None
+    for result in results:
+        if not isinstance(result, dict) or result.get("action") != "block":
+            continue
+        message = str(result.get("message") or "").strip()
+        if message:
+            return message
+    return None
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1891,6 +1916,24 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+
+    runtime_block = _runtime_turn_block_message(agent, effective_task_id)
+    if runtime_block:
+        return finalize_turn(
+            agent,
+            final_response=runtime_block,
+            api_call_count=0,
+            interrupted=False,
+            failed=True,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            _should_review_memory=_should_review_memory,
+            _turn_exit_reason="runtime_admission_block",
+        )
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching

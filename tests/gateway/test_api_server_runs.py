@@ -393,12 +393,13 @@ class TestStartRun:
                 )
                 first_data = await first.json()
                 first_run_id = first_data["run_id"]
-                for _ in range(40):
+                for _ in range(200):
                     status_response = await cli.get(f"/v1/runs/{first_run_id}")
                     status = await status_response.json()
                     if status["status"] == "completed":
                         break
                     await asyncio.sleep(0.05)
+                assert status["status"] == "completed", status
                 retry = await cli.post(
                     "/v1/runs",
                     json=body,
@@ -778,10 +779,11 @@ class TestStartRun:
                     headers={"Idempotency-Key": idempotency_key},
                 )
                 first_run_id = (await first.json())["run_id"]
-                for _ in range(40):
+                for _ in range(200):
                     if adapter._run_statuses.get(first_run_id, {}).get("status") == "failed":
                         break
                     await asyncio.sleep(0.05)
+                assert adapter._run_statuses.get(first_run_id, {}).get("status") == "failed"
                 assert adapter._response_store.owner_claim_is_released(
                     "raphael-planner", conversation, response_id, claim_id, first_run_id,
                 ) is True
@@ -791,10 +793,11 @@ class TestStartRun:
                     headers={"Idempotency-Key": idempotency_key},
                 )
                 retry_run_id = (await retry.json())["run_id"]
-                for _ in range(40):
+                for _ in range(200):
                     if adapter._run_statuses.get(retry_run_id, {}).get("status") == "completed":
                         break
                     await asyncio.sleep(0.05)
+                assert adapter._run_statuses.get(retry_run_id, {}).get("status") == "completed"
 
         assert first.status == retry.status == 202
         assert retry_run_id != first_run_id
