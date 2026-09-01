@@ -1949,6 +1949,21 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     created_at   INTEGER NOT NULL
 );
 
+-- Current remote sandbox cleanup authority. One row exists only while an
+-- exact run has a provisioned machine with no durable release event.
+CREATE TABLE IF NOT EXISTS run_sandbox_cleanup_intents (
+    task_id             TEXT NOT NULL,
+    run_id              INTEGER NOT NULL,
+    profile             TEXT,
+    generation          INTEGER NOT NULL,
+    sandbox_id          TEXT NOT NULL,
+    provision_event_id  INTEGER NOT NULL,
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at     INTEGER NOT NULL DEFAULT 0,
+    last_error          TEXT,
+    PRIMARY KEY (task_id, run_id)
+);
+
 -- Subscription from a gateway source (platform + chat + thread) to a
 -- task. The gateway's kanban-notifier watcher tails task_events and
 -- pushes ``completed`` / ``blocked`` / ``spawn_auto_blocked`` events to
@@ -1978,6 +1993,7 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_sandbox_cleanup_due   ON run_sandbox_cleanup_intents(next_attempt_at, provision_event_id);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
 
@@ -2890,6 +2906,10 @@ def connect(
                     # process are cheap. The lock prevents same-process dispatcher
                     # threads from racing through the additive ALTER TABLE pass with
                     # stale PRAGMA snapshots during gateway startup.
+                    cleanup_intents_existed = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='run_sandbox_cleanup_intents'"
+                    ).fetchone() is not None
                     conn.executescript(SCHEMA_SQL)
                     # Which board this file IS, so the migration can read its
                     # published owner metadata. An explicit ``db_path`` with no
@@ -2899,6 +2919,7 @@ def connect(
                         conn,
                         _normalize_board_slug(board)
                         or (get_current_board() if db_path is None else None),
+                        backfill_sandbox_cleanup=not cleanup_intents_existed,
                     )
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
@@ -2975,7 +2996,10 @@ def init_db(
 
 
 def _migrate_add_optional_columns(
-    conn: sqlite3.Connection, board_slug: Optional[str] = None,
+    conn: sqlite3.Connection,
+    board_slug: Optional[str] = None,
+    *,
+    backfill_sandbox_cleanup: bool = False,
 ) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -3311,6 +3335,40 @@ def _migrate_add_optional_columns(
         "'sandbox_reserved', 'sandbox_provisioned', 'sandbox_released'"
         ")"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS run_sandbox_cleanup_intents ("
+        "task_id TEXT NOT NULL, run_id INTEGER NOT NULL, profile TEXT, "
+        "generation INTEGER NOT NULL, sandbox_id TEXT NOT NULL, "
+        "provision_event_id INTEGER NOT NULL, "
+        "attempt_count INTEGER NOT NULL DEFAULT 0, "
+        "next_attempt_at INTEGER NOT NULL DEFAULT 0, last_error TEXT, "
+        "PRIMARY KEY (task_id, run_id))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sandbox_cleanup_due "
+        "ON run_sandbox_cleanup_intents(next_attempt_at, provision_event_id)"
+    )
+    # One-time compatibility backfill for active machines provisioned before
+    # the intent table existed. The partial event index keeps this startup-only
+    # reconciliation away from ordinary board history.
+    if backfill_sandbox_cleanup:
+        conn.execute(
+            "WITH latest AS ("
+            " SELECT task_id, run_id, MAX(id) AS event_id FROM task_events "
+            " WHERE run_id IS NOT NULL AND kind IN ("
+            "'sandbox_reserved', 'sandbox_provisioned', 'sandbox_released'"
+            ") GROUP BY task_id, run_id"
+            ") INSERT OR IGNORE INTO run_sandbox_cleanup_intents ("
+            "task_id, run_id, profile, generation, sandbox_id, provision_event_id"
+            ") SELECT e.task_id, e.run_id, r.profile, "
+            "json_extract(e.payload, '$.generation'), "
+            "json_extract(e.payload, '$.sandbox_id'), e.id "
+            "FROM latest l JOIN task_events e ON e.id = l.event_id "
+            "JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
+            "WHERE e.kind = 'sandbox_provisioned' "
+            "AND json_type(e.payload, '$.generation') = 'integer' "
+            "AND json_type(e.payload, '$.sandbox_id') = 'text'"
+        )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -12397,6 +12455,39 @@ def advance_run_sandbox(
         )
         payload["generation"] = generation
         _append_event(conn, task_id, transition, payload, run_id=run_id)
+        event_id = int(
+            conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        )
+        if transition == "sandbox_provisioned":
+            profile_row = conn.execute(
+                "SELECT profile FROM task_runs WHERE id = ? AND task_id = ?",
+                (run_id, task_id),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO run_sandbox_cleanup_intents ("
+                "task_id, run_id, profile, generation, sandbox_id, "
+                "provision_event_id, attempt_count, next_attempt_at, last_error"
+                ") VALUES (?, ?, ?, ?, ?, ?, 0, 0, NULL) "
+                "ON CONFLICT(task_id, run_id) DO UPDATE SET "
+                "profile=excluded.profile, generation=excluded.generation, "
+                "sandbox_id=excluded.sandbox_id, "
+                "provision_event_id=excluded.provision_event_id, "
+                "attempt_count=0, next_attempt_at=0, last_error=NULL",
+                (
+                    task_id,
+                    run_id,
+                    profile_row["profile"] if profile_row else None,
+                    generation,
+                    sandbox_id,
+                    event_id,
+                ),
+            )
+        elif transition == "sandbox_released":
+            conn.execute(
+                "DELETE FROM run_sandbox_cleanup_intents "
+                "WHERE task_id = ? AND run_id = ?",
+                (task_id, run_id),
+            )
         return read_run_sandbox(conn, task_id, run_id=run_id)
 
 
@@ -12456,52 +12547,99 @@ def release_ended_run_sandbox(
             {"generation": expected_generation, "reason": cleaned_reason},
             run_id=run_id,
         )
+        conn.execute(
+            "DELETE FROM run_sandbox_cleanup_intents "
+            "WHERE task_id = ? AND run_id = ?",
+            (task_id, run_id),
+        )
         return read_run_sandbox(conn, task_id, run_id=run_id)
 
 
-def list_ended_run_sandboxes(
-    conn: sqlite3.Connection, *, after_event_id: int = 0, limit: int = 4,
+def claim_ended_run_sandbox_cleanups(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+    limit: int = 1,
+    lease_seconds: int = 30,
 ) -> list[dict[str, Any]]:
-    """List a bounded batch of ended runs whose sandbox is still active.
-
-    The latest reservation transition is the durable cleanup intent: an ended
-    run whose latest transition is sandbox_provisioned still owns a machine
-    until an exact sandbox_released transition closes it.
-    """
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 32:
-        raise ValueError("limit must be an integer from 1 to 32")
+    """Lease a bounded due batch from the current cleanup-intent table."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 8:
+        raise ValueError("limit must be an integer from 1 to 8")
     if (
-        isinstance(after_event_id, bool)
-        or not isinstance(after_event_id, int)
-        or after_event_id < 0
+        isinstance(lease_seconds, bool)
+        or not isinstance(lease_seconds, int)
+        or not 1 <= lease_seconds <= 300
     ):
-        raise ValueError("after_event_id must be a non-negative integer")
-    rows = conn.execute(
-        "WITH latest AS ("
-        " SELECT task_id, run_id, MAX(id) AS event_id FROM task_events"
-        " WHERE run_id IS NOT NULL AND kind IN ("
-        "'sandbox_reserved', 'sandbox_provisioned', 'sandbox_released'"
-        ")"
-        " GROUP BY task_id, run_id"
-        ") "
-        "SELECT e.id AS event_id, e.task_id, e.run_id, r.profile "
-        "FROM latest l JOIN task_events e ON e.id = l.event_id "
-        "JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
-        "JOIN tasks t ON t.id = e.task_id AND t.task_kind = 'work' "
-        "WHERE e.kind = 'sandbox_provisioned' AND r.ended_at IS NOT NULL "
-        "AND e.id > ? "
-        "ORDER BY e.id ASC LIMIT ?",
-        (after_event_id, limit),
-    ).fetchall()
-    return [
-        {
-            "event_id": int(row["event_id"]),
-            "task_id": str(row["task_id"]),
-            "run_id": int(row["run_id"]),
-            "profile": str(row["profile"] or ""),
-        }
-        for row in rows
-    ]
+        raise ValueError("lease_seconds must be an integer from 1 to 300")
+    current_time = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT i.task_id, i.run_id, i.profile, i.generation, "
+            "i.sandbox_id, i.provision_event_id, i.attempt_count "
+            "FROM run_sandbox_cleanup_intents i "
+            "INDEXED BY idx_sandbox_cleanup_due "
+            "CROSS JOIN task_runs r ON r.id = i.run_id AND r.task_id = i.task_id "
+            "CROSS JOIN tasks t ON t.id = i.task_id AND t.task_kind = 'work' "
+            "WHERE r.ended_at IS NOT NULL AND i.next_attempt_at <= ? "
+            "ORDER BY i.next_attempt_at ASC, i.provision_event_id ASC LIMIT ?",
+            (current_time, limit),
+        ).fetchall()
+        claimed: list[dict[str, Any]] = []
+        for row in rows:
+            attempt_count = int(row["attempt_count"]) + 1
+            conn.execute(
+                "UPDATE run_sandbox_cleanup_intents "
+                "SET attempt_count = ?, next_attempt_at = ?, last_error = NULL "
+                "WHERE task_id = ? AND run_id = ?",
+                (
+                    attempt_count,
+                    current_time + lease_seconds,
+                    row["task_id"],
+                    row["run_id"],
+                ),
+            )
+            claimed.append({
+                "task_id": str(row["task_id"]),
+                "run_id": int(row["run_id"]),
+                "profile": str(row["profile"] or ""),
+                "generation": int(row["generation"]),
+                "sandbox_id": str(row["sandbox_id"]),
+                "provision_event_id": int(row["provision_event_id"]),
+                "attempt_count": attempt_count,
+            })
+        return claimed
+
+
+def defer_run_sandbox_cleanup(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    *,
+    reason: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Persist exponential retry scheduling for one failed cleanup claim."""
+    cleaned_reason = str(reason or "").strip()
+    if not cleaned_reason or len(cleaned_reason) > 100:
+        raise ValueError("reason must be a short non-empty code")
+    current_time = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT attempt_count FROM run_sandbox_cleanup_intents "
+            "WHERE task_id = ? AND run_id = ?",
+            (task_id, run_id),
+        ).fetchone()
+        if row is None:
+            return False
+        attempt_count = max(1, int(row["attempt_count"]))
+        delay = min(3600, 15 * (2 ** min(attempt_count - 1, 8)))
+        cursor = conn.execute(
+            "UPDATE run_sandbox_cleanup_intents "
+            "SET next_attempt_at = ?, last_error = ? "
+            "WHERE task_id = ? AND run_id = ?",
+            (current_time + delay, cleaned_reason, task_id, run_id),
+        )
+        return cursor.rowcount == 1
 
 
 def _path_is_owned(path: str, owned_paths: list[str]) -> bool:

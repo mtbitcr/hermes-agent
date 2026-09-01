@@ -24,7 +24,6 @@ import hashlib
 import logging
 import os
 import subprocess
-import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -257,18 +256,10 @@ class FakeSandbox:
 
 @pytest.fixture(autouse=True)
 def _reset_fake():
-    thread = sd._cleanup_retry_thread
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=10)
-    sd._cleanup_retry_cursor.clear()
     FakeSandbox.created = []
     FakeSandbox.live = {}
     FakeSandbox.connect_calls = []
     FakeSandbox.behavior = {}
-    thread = sd._cleanup_retry_thread
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=10)
-    sd._cleanup_retry_cursor.clear()
     FakeSandbox.counter = 0
     yield
     FakeSandbox.created = []
@@ -337,9 +328,9 @@ def host(tmp_path, monkeypatch):
         _git(repo, "worktree", "add", str(worktree), "-b", f"wt/{task_id}", "HEAD")
         with kb.write_txn(conn):
             conn.execute(
-                "INSERT INTO task_runs (task_id, status, started_at) "
-                "VALUES (?, 'running', 0)",
-                (task_id,),
+                "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                "VALUES (?, ?, 'running', 0)",
+                (task_id, sd.WORKER_PROFILE),
             )
             run_id = int(
                 conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
@@ -396,10 +387,6 @@ def _event_kinds(host):
 
 def _run_cleanup_retry(board="default"):
     sd.retry_ended_sandbox_cleanup(board=board)
-    thread = sd._cleanup_retry_thread
-    assert thread is not None
-    thread.join(timeout=10)
-    assert not thread.is_alive()
 
 
 # ---------------------------------------------------------------------------
@@ -1994,6 +1981,13 @@ def test_dispatch_tick_retries_ended_run_cleanup_until_release_is_durable(
     assert _reservation(host)["state"] == "active"
     assert box.killed is False
 
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE run_sandbox_cleanup_intents "
+                "SET next_attempt_at=0 WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            )
     box.kill = original_kill
     _run_cleanup_retry()
     assert box.killed is True
@@ -2031,14 +2025,11 @@ def test_dispatch_tick_records_officially_confirmed_absence(
     assert _event_kinds(host).count("sandbox_released") == 1
 
 
-def test_dispatch_tick_returns_before_a_slow_control_plane(
+def test_one_shot_dispatch_uses_strict_native_timeouts_and_finishes_cleanup(
     host, sdk,
 ):
     _provision()
     box = FakeSandbox.created[-1]
-    original_kill = box.kill
-    entered = threading.Event()
-    release = threading.Event()
     with kb.connect_closing() as conn:
         with kb.write_txn(conn):
             conn.execute(
@@ -2051,30 +2042,24 @@ def test_dispatch_tick_returns_before_a_slow_control_plane(
                 (host.task_id,),
             )
 
-    def slow_kill():
-        entered.set()
-        assert release.wait(timeout=5)
-        original_kill()
-
-    box.kill = slow_kill
-    started = time.monotonic()
-    sd.retry_ended_sandbox_cleanup(board="default")
-    elapsed = time.monotonic() - started
-    assert elapsed < 0.5
-    assert entered.wait(timeout=2)
-    thread = sd._cleanup_retry_thread
-    assert thread is not None and thread.is_alive()
-    release.set()
-    thread.join(timeout=10)
-    assert not thread.is_alive()
+    _run_cleanup_retry()
     assert _reservation(host)["state"] == "released"
+    assert box.killed is True
+    call = FakeSandbox.connect_calls[-1]
+    assert call["connect_timeout"] == timedelta(
+        seconds=sd.SANDBOX_CLEANUP_CONNECT_TIMEOUT_SECONDS,
+    )
+    assert call["connection_config"].request_timeout == timedelta(
+        seconds=sd.SANDBOX_CLEANUP_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert call["skip_health_check"] is True
 
 
-def test_rotating_cursor_cannot_starve_newer_cleanup_after_four_poisoned_rows(
+def test_durable_retry_schedule_reaches_newer_cleanup_after_four_poisoned_rows(
     host, sdk,
 ):
     with kb.connect_closing() as conn:
-        for index in range(sd._CLEANUP_RETRY_BATCH):
+        for index in range(4):
             task_id = kb.create_task(
                 conn,
                 title=f"poisoned cleanup {index}",
@@ -2135,7 +2120,8 @@ def test_rotating_cursor_cannot_starve_newer_cleanup_after_four_poisoned_rows(
                 (host.task_id,),
             )
 
-    _run_cleanup_retry()
+    for _ in range(4):
+        _run_cleanup_retry()
     assert box.killed is False
     assert _reservation(host)["state"] == "active"
 

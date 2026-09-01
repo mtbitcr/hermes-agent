@@ -5,6 +5,10 @@ exactly one machine: the fold + append share one ``BEGIN IMMEDIATE``
 transaction, so it is a real compare-and-swap, and it lives in the
 append-only event log rather than a side file that a ``task_runs.metadata``
 rewrite could silently drop.
+
+The current provisioned generation is mirrored transactionally into a narrow
+cleanup-intent table. It schedules crash-safe one-shot retries; the event fold
+remains the authority for whether the run actually owns a live machine.
 """
 from __future__ import annotations
 
@@ -257,17 +261,37 @@ def test_ended_active_sandbox_is_a_bounded_durable_cleanup_intent(running_task):
                 (task_id,),
             )
 
-        pending = kb.list_ended_run_sandboxes(conn)
+        pending = kb.claim_ended_run_sandbox_cleanups(
+            conn, now=100, lease_seconds=30,
+        )
         assert len(pending) == 1
-        assert pending[0]["event_id"] > 0
+        assert pending[0]["provision_event_id"] > 0
         assert {
             key: pending[0][key]
-            for key in ("task_id", "run_id", "profile")
+            for key in (
+                "task_id", "run_id", "profile", "generation",
+                "sandbox_id", "attempt_count",
+            )
         } == {
             "task_id": task_id,
             "run_id": run_id,
             "profile": "worker",
+            "generation": 1,
+            "sandbox_id": "sbx-001",
+            "attempt_count": 1,
         }
+        assert kb.claim_ended_run_sandbox_cleanups(conn, now=100) == []
+        assert kb.defer_run_sandbox_cleanup(
+            conn,
+            task_id,
+            run_id,
+            reason="transient",
+            now=100,
+        )
+        assert kb.claim_ended_run_sandbox_cleanups(conn, now=114) == []
+        retried = kb.claim_ended_run_sandbox_cleanups(conn, now=115)
+        assert len(retried) == 1
+        assert retried[0]["attempt_count"] == 2
         kb.release_ended_run_sandbox(
             conn,
             task_id,
@@ -275,37 +299,73 @@ def test_ended_active_sandbox_is_a_bounded_durable_cleanup_intent(running_task):
             expected_generation=1,
             reason="dispatcher_retry",
         )
-        assert kb.list_ended_run_sandboxes(conn) == []
+        assert kb.claim_ended_run_sandbox_cleanups(conn, now=200) == []
 
 
-def test_cleanup_intent_query_uses_only_the_partial_sandbox_index(running_task):
+def test_migration_backfills_a_pre_intent_table_active_machine(running_task):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_reserved", expected_generation=0,
+        )
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_provisioned", expected_generation=1,
+            sandbox_id="sbx-001", receipt=RECEIPT,
+        )
+        with kb.write_txn(conn):
+            conn.execute("DROP TABLE run_sandbox_cleanup_intents")
+        kb._migrate_add_optional_columns(
+            conn, backfill_sandbox_cleanup=True,
+        )
+        row = conn.execute(
+            "SELECT task_id, run_id, profile, generation, sandbox_id "
+            "FROM run_sandbox_cleanup_intents",
+        ).fetchone()
+        assert dict(row) == {
+            "task_id": task_id,
+            "run_id": run_id,
+            "profile": "worker",
+            "generation": 1,
+            "sandbox_id": "sbx-001",
+        }
+
+
+def test_cleanup_intent_query_is_bounded_away_from_all_event_history(running_task):
     task_id, run_id = running_task
     with kb.connect() as conn:
         with kb.write_txn(conn):
             conn.executemany(
                 "INSERT INTO task_events "
                 "(task_id, run_id, kind, payload, created_at) "
-                "VALUES (?, ?, 'ordinary_history', NULL, ?)",
-                ((task_id, run_id, index) for index in range(2_000)),
+                "VALUES (?, ?, 'sandbox_released', ?, ?)",
+                (
+                    (
+                        task_id,
+                        run_id + index + 1,
+                        '{"generation": 1}',
+                        index,
+                    )
+                    for index in range(2_000)
+                ),
             )
         plan = conn.execute(
-            "EXPLAIN QUERY PLAN WITH latest AS ("
-            " SELECT task_id, run_id, MAX(id) AS event_id FROM task_events"
-            " WHERE run_id IS NOT NULL AND kind IN ("
-            "'sandbox_reserved', 'sandbox_provisioned', 'sandbox_released'"
-            ") GROUP BY task_id, run_id"
-            ") SELECT e.id FROM latest l "
-            "JOIN task_events e ON e.id = l.event_id "
-            "JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
-            "WHERE e.kind = 'sandbox_provisioned' AND r.ended_at IS NOT NULL "
-            "AND e.id > ? ORDER BY e.id ASC LIMIT ?",
-            (0, 4),
+            "EXPLAIN QUERY PLAN SELECT i.task_id "
+            "FROM run_sandbox_cleanup_intents i "
+            "INDEXED BY idx_sandbox_cleanup_due "
+            "CROSS JOIN task_runs r ON r.id = i.run_id AND r.task_id = i.task_id "
+            "CROSS JOIN tasks t ON t.id = i.task_id AND t.task_kind = 'work' "
+            "WHERE r.ended_at IS NOT NULL AND i.next_attempt_at <= ? "
+            "ORDER BY i.next_attempt_at ASC, i.provision_event_id ASC LIMIT ?",
+            (100, 1),
         ).fetchall()
         details = [str(row["detail"]) for row in plan]
         assert any(
-            "idx_events_sandbox_lifecycle" in detail
+            "idx_sandbox_cleanup_due" in detail
             for detail in details
         ), details
+        assert all("task_events" not in detail for detail in details), details
 
 
 def test_a_run_that_is_no_longer_active_cannot_reserve(running_task):

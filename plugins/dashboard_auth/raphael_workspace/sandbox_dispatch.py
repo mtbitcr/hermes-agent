@@ -65,6 +65,11 @@ and emits ordinary sanitized log lines — it deliberately keeps no second state
 store, so there is exactly one answer to "is a machine already live for this
 run" and it is the one an operator already reads in the task history.
 
+The same transaction also mirrors only the current provisioned generation
+into ``run_sandbox_cleanup_intents``. That table grants no machine authority:
+it is a bounded durable scheduler for ended-run cleanup, deleted by the exact
+``sandbox_released`` transition. The event fold remains the liveness proof.
+
 Fail-closed everywhere
 ----------------------
 Wrong profile, missing/foreign Kanban run, scratch or ambiguous or unscoped
@@ -129,6 +134,8 @@ SANDBOX_REQUEST_TIMEOUT_SECONDS = 60
 #: How long to wait when re-attaching to a recorded machine to prove it is
 #: still alive. Short: an unreachable machine must be replaced, not waited on.
 SANDBOX_VERIFY_TIMEOUT_SECONDS = 30
+SANDBOX_CLEANUP_REQUEST_TIMEOUT_SECONDS = 3
+SANDBOX_CLEANUP_CONNECT_TIMEOUT_SECONDS = 3
 #: A recorded machine with less than this left on its own server-side lease is
 #: treated as expired and replaced, rather than handed back for a task that
 #: would then lose it mid-build.
@@ -1104,6 +1111,20 @@ def _connection_config(sdk: _Sdk, connection: _Connection):
     )
 
 
+def _cleanup_connection_config(sdk: _Sdk, connection: _Connection):
+    """Official SDK connection with a strict one-shot cleanup timeout."""
+    return sdk.connection_config(
+        api_key=connection.api_key,
+        domain=connection.domain,
+        protocol=connection.protocol,
+        request_timeout=timedelta(
+            seconds=SANDBOX_CLEANUP_REQUEST_TIMEOUT_SECONDS,
+        ),
+        use_server_proxy=True,
+        disable_metrics=True,
+    )
+
+
 def _discard_quietly(sandbox: Any) -> None:
     """Kill the remote machine, then release local resources. Never raises."""
     for step in ("kill", "close"):
@@ -1302,8 +1323,10 @@ def _cleanup_run_sandbox(ctx: _WorkerContext, *, reason: str) -> bool:
     try:
         sandbox = sdk.sandbox.connect(
             sandbox_id,
-            connection_config=_connection_config(sdk, connection),
-            connect_timeout=timedelta(seconds=SANDBOX_VERIFY_TIMEOUT_SECONDS),
+            connection_config=_cleanup_connection_config(sdk, connection),
+            connect_timeout=timedelta(
+                seconds=SANDBOX_CLEANUP_CONNECT_TIMEOUT_SECONDS,
+            ),
             skip_health_check=True,
         )
     except Exception as exc:
@@ -1421,85 +1444,71 @@ def cleanup_sandbox_on_stale_claim(**kwargs: Any) -> None:
     _cleanup_sandbox_from_lifecycle("stale_claim", **kwargs)
 
 
-_CLEANUP_RETRY_BATCH = 4
-_cleanup_retry_lock = threading.Lock()
-_cleanup_retry_cursor: dict[str, int] = {}
-_cleanup_retry_thread: Optional[threading.Thread] = None
+_CLEANUP_RETRY_LEASE_SECONDS = 30
 
 
-def _cleanup_retry_worker(board_name: Optional[str], board_key: str) -> None:
-    """Run one rotating cleanup batch outside the dispatcher thread."""
+def _defer_cleanup_retry(
+    ctx: _WorkerContext, *, reason: str,
+) -> None:
+    kb = _kanban()
     try:
-        kb = _kanban()
-        try:
-            with kb.connect_closing(board=board_name) as conn:
-                cursor = _cleanup_retry_cursor.get(board_key, 0)
-                pending = kb.list_ended_run_sandboxes(
-                    conn,
-                    after_event_id=cursor,
-                    limit=_CLEANUP_RETRY_BATCH,
-                )
-                if not pending and cursor:
-                    pending = kb.list_ended_run_sandboxes(
-                        conn,
-                        after_event_id=0,
-                        limit=_CLEANUP_RETRY_BATCH,
-                    )
-                _cleanup_retry_cursor[board_key] = (
-                    pending[-1]["event_id"] if pending else 0
-                )
-        except Exception:
-            logger.warning(
-                "raphael sandbox cleanup retry could not read board=%s",
-                board_name or "default",
+        with kb.connect_closing(board=ctx.board) as conn:
+            kb.defer_run_sandbox_cleanup(
+                conn,
+                ctx.task_id,
+                ctx.run_id,
+                reason=reason,
             )
-            return
-        for item in pending:
-            profile = item.get("profile")
-            if profile not in SANDBOX_PROFILES:
-                logger.warning(
-                    "raphael sandbox cleanup retry has no admitted profile "
-                    "for task=%s run=%s",
-                    item.get("task_id"),
-                    item.get("run_id"),
-                )
-                continue
-            ctx = _WorkerContext(
-                task_id=item["task_id"],
-                run_id=item["run_id"],
-                board=board_name,
-                workspace_env="",
-                profile=profile,
-            )
-            _cleanup_run_sandbox(ctx, reason="dispatcher_retry")
-    finally:
-        _cleanup_retry_lock.release()
+    except Exception:
+        logger.warning(
+            "raphael sandbox cleanup retry schedule failed for task=%s run=%s",
+            ctx.task_id,
+            ctx.run_id,
+        )
 
 
 def retry_ended_sandbox_cleanup(
     *, board: Any = None, dry_run: bool = False, **_kwargs: Any,
 ) -> None:
-    """Queue one bounded rotating cleanup batch and return immediately."""
-    global _cleanup_retry_thread
-    if dry_run or not _cleanup_retry_lock.acquire(blocking=False):
+    """Complete one durably leased retry for persistent or one-shot dispatch."""
+    if dry_run:
         return
     board_name = str(board).strip() if board else None
-    board_key = board_name or "default"
+    kb = _kanban()
     try:
-        worker = threading.Thread(
-            target=_cleanup_retry_worker,
-            args=(board_name, board_key),
-            name="raphael-sandbox-cleanup",
-            daemon=True,
-        )
-        _cleanup_retry_thread = worker
-        worker.start()
+        with kb.connect_closing(board=board_name) as conn:
+            pending = kb.claim_ended_run_sandbox_cleanups(
+                conn,
+                limit=1,
+                lease_seconds=_CLEANUP_RETRY_LEASE_SECONDS,
+            )
     except Exception:
-        _cleanup_retry_lock.release()
         logger.warning(
-            "raphael sandbox cleanup retry could not start board=%s",
-            board_key,
+            "raphael sandbox cleanup retry could not read board=%s",
+            board_name or "default",
         )
+        return
+    if not pending:
+        return
+    item = pending[0]
+    ctx = _WorkerContext(
+        task_id=item["task_id"],
+        run_id=item["run_id"],
+        board=board_name,
+        workspace_env="",
+        profile=item.get("profile") or "",
+    )
+    if ctx.profile not in SANDBOX_PROFILES:
+        logger.warning(
+            "raphael sandbox cleanup retry has no admitted profile "
+            "for task=%s run=%s",
+            ctx.task_id,
+            ctx.run_id,
+        )
+        _defer_cleanup_retry(ctx, reason="profile_unavailable")
+        return
+    if not _cleanup_run_sandbox(ctx, reason="dispatcher_retry"):
+        _defer_cleanup_retry(ctx, reason="cleanup_retry_failed")
 
 
 def _acquire(
