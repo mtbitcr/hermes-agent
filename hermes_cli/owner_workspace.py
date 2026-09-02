@@ -4233,11 +4233,23 @@ def _normalize_project_task_ref(value: Any, field: str, *, mutating: bool) -> di
 
 def _normalize_project_task_spec(
     value: Any, field: str, *, parent_limit: Optional[int] = None,
+    allow_body_mode: bool = False,
 ) -> dict:
-    required = {
-        "title", "body", "assignee", "execution_tier",
-    } | ({"parents"} if parent_limit is not None else set())
-    allowed = required | {"responsibility", "owned_paths"}
+    body_mode = value.get("body_mode") if allow_body_mode and isinstance(value, dict) else None
+    if body_mode == "preserve":
+        required = {"title", "body_mode", "assignee", "execution_tier", "owned_paths"}
+        allowed = required | {"responsibility"}
+    elif body_mode == "rewrite":
+        required = {
+            "title", "body_mode", "body", "assignee", "execution_tier",
+            "owned_paths",
+        }
+        allowed = required | {"responsibility"}
+    else:
+        required = {
+            "title", "body", "assignee", "execution_tier",
+        } | ({"parents"} if parent_limit is not None else set())
+        allowed = required | {"responsibility", "owned_paths"}
     if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(allowed):
         raise OwnerWorkspaceError(
             "invalid_argument",
@@ -4249,11 +4261,16 @@ def _normalize_project_task_spec(
 
     result = {
         "title": _native_owner_title(raw["title"], f"{field}.title"),
-        "body": redact_sensitive_text(
-            _bounded_text(raw["body"], f"{field}.body", limit=12_000), force=True,
-        ),
         "assignee": _normalize_graph_assignee(raw["assignee"], f"{field}.assignee"),
     }
+    if body_mode == "preserve":
+        result["body_mode"] = "preserve"
+    else:
+        result["body"] = redact_sensitive_text(
+            _bounded_text(raw["body"], f"{field}.body", limit=12_000), force=True,
+        )
+        if body_mode == "rewrite":
+            result["body_mode"] = "rewrite"
     try:
         result["responsibility"] = kanban_db.normalize_responsibility(
             raw.get("responsibility")
@@ -4418,7 +4435,8 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
                     raw["target"], f"{field}.target", mutating=True,
                 ),
                 "replacement": _normalize_project_task_spec(
-                    raw["replacement"], f"{field}.replacement", parent_limit=None,
+                    raw["replacement"], f"{field}.replacement",
+                    parent_limit=None, allow_body_mode=True,
                 ),
             })
             created_count += 1

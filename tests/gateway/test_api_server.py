@@ -40,6 +40,10 @@ from gateway.platforms.api_server import (
     _derive_chat_session_id,
     _hermes_version,
     _make_request_fingerprint,
+    _owner_current_replace_shape,
+    _owner_current_task_shape,
+    _OWNER_PROPOSAL_ADD_KEYS,
+    _OWNER_PROPOSAL_SPLIT_TASK_KEYS,
     _OWNER_INTERRUPTED_TURN_MESSAGE,
     OwnerAuthorityBroken,
     OwnerAuthorityUnavailable,
@@ -86,7 +90,7 @@ def _owner_new_proposal(**overrides):
 
 def _owner_existing_proposal(**overrides):
     proposal = {
-        "schema_version": 4,
+        "schema_version": 5,
         "kind": "project_change_proposal",
         "mode": "existing",
         "request_title": "Add the approved milestone",
@@ -105,12 +109,61 @@ def _owner_existing_proposal(**overrides):
             "assignee": "default",
             "responsibility": "B03",
             "execution_tier": "routine",
+            "owned_paths": [],
             "existing_parent_refs": [],
             "new_parents": [],
         }],
     }
     proposal.update(overrides)
     return proposal
+
+
+def test_schema_v5_created_tasks_require_explicit_array_scope_and_body_mode():
+    add = _owner_existing_proposal()["changes"][0]
+    assert _owner_current_task_shape(add, _OWNER_PROPOSAL_ADD_KEYS)
+    assert not _owner_current_task_shape(
+        {key: value for key, value in add.items() if key != "owned_paths"},
+        _OWNER_PROPOSAL_ADD_KEYS,
+    )
+    assert not _owner_current_task_shape(
+        {**add, "owned_paths": None},
+        _OWNER_PROPOSAL_ADD_KEYS,
+    )
+
+    split_task = {
+        "title": "Prepare the milestone",
+        "body": "Prepare the owner-visible milestone.",
+        "assignee": "default",
+        "responsibility": "B03",
+        "execution_tier": "routine",
+        "owned_paths": [],
+        "parents": [],
+    }
+    assert _owner_current_task_shape(split_task, _OWNER_PROPOSAL_SPLIT_TASK_KEYS)
+
+    common = {
+        "title": "Prepare the milestone",
+        "assignee": "default",
+        "responsibility": "B03",
+        "execution_tier": "routine",
+        "owned_paths": [],
+    }
+    assert _owner_current_replace_shape({**common, "body_mode": "preserve"})
+    assert _owner_current_replace_shape({
+        **common,
+        "body_mode": "rewrite",
+        "body": "Prepare the revised milestone.",
+    })
+    assert not _owner_current_replace_shape({
+        **common,
+        "body": "Legacy replacement body.",
+    })
+    assert not _owner_current_replace_shape({
+        **common,
+        "body_mode": "preserve",
+        "owned_paths": None,
+    })
+    assert not _owner_current_replace_shape({**common, "body_mode": []})
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +362,29 @@ class TestOwnerWorkspaceRunContext:
         finally:
             store.close()
 
-    def test_stored_replace_proposal_derives_exact_native_run_payload(self):
+    @pytest.mark.parametrize(
+        ("replacement", "authorized"),
+        [
+            ({
+                "title": "Complete the bounded recovery",
+                "body_mode": "preserve",
+                "assignee": "raphael-claude-worker",
+                "responsibility": "R07",
+                "execution_tier": "deep",
+                "owned_paths": [],
+            }, True),
+            ({
+                "title": "Complete the bounded recovery",
+                "body": "Legacy replacement body.",
+                "assignee": "raphael-claude-worker",
+                "responsibility": "R07",
+                "execution_tier": "deep",
+            }, False),
+        ],
+    )
+    def test_stored_replace_proposal_validates_exact_native_run_payload(
+        self, replacement, authorized,
+    ):
         conversation = "raphael-owner-" + "4" * 32
         response_id = "resp_native_replace_proposal"
         idempotency_key = "conversation-" + hashlib.sha256(
@@ -343,13 +418,6 @@ class TestOwnerWorkspaceRunContext:
                 secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256,
             ).digest()
         ).decode("ascii").rstrip("=")
-        replacement = {
-            "title": "Complete the bounded recovery",
-            "body": "Preserve the findings and complete the same delivery chain.",
-            "assignee": "raphael-claude-worker",
-            "responsibility": "R07",
-            "execution_tier": "deep",
-        }
         proposal = _owner_existing_proposal(changes=[{
             "action": "replace",
             "reason": "The earlier attempt stopped before producing a result.",
@@ -428,9 +496,18 @@ class TestOwnerWorkspaceRunContext:
                     return_value=snapshot,
                 ),
             ):
-                binding = adapter._validated_owner_proposal_authority(
-                    authority, context, "default",
-                )
+                if authorized:
+                    binding = adapter._validated_owner_proposal_authority(
+                        authority, context, "default",
+                    )
+                else:
+                    with pytest.raises(
+                        ValueError, match="stored proposal change is invalid",
+                    ):
+                        adapter._validated_owner_proposal_authority(
+                            authority, context, "default",
+                        )
+                    return
 
             assert binding["operation"] == "owner_project_plan_commit"
             assert binding["idempotency_key"] == idempotency_key

@@ -1352,10 +1352,10 @@ _OWNER_PROPOSAL_MAX_MUTATIONS = 12
 # committing it would leave the native kernel resolving a route from a class
 # the planner never stated.
 _OWNER_NEW_PROPOSAL_SCHEMA = 3
-_OWNER_EXISTING_PROPOSAL_SCHEMA = 4
+_OWNER_EXISTING_PROPOSAL_SCHEMA = 5
 # Every schema version whose structured assistant replies remain projectable in
 # owner conversation history, including the pre-tier ones.
-_OWNER_HISTORY_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
+_OWNER_HISTORY_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5})
 _OWNER_NEW_PROPOSAL_KEYS = frozenset({
     "schema_version", "kind", "mode", "project_name",
     "project_description", "request_title", "summary", "project_size",
@@ -1367,14 +1367,42 @@ _OWNER_EXISTING_PROPOSAL_KEYS = frozenset({
     "project_size", "specification", "current_milestone",
     "owner_visible_result", "impact", "later_milestones", "changes",
 })
-# Exact shape of one ``add`` change inside an actionable existing-project
-# proposal. ``execution_tier`` is part of the authority: it is what the native
-# kernel resolves the task's immutable route from, so a change object without
-# it does not authorize anything.
-_OWNER_PROPOSAL_ADD_KEYS = frozenset({
-    "action", "reason", "title", "body", "assignee", "responsibility",
-    "execution_tier", "existing_parent_refs", "new_parents",
+# Exact created-task shapes inside an actionable existing-project proposal.
+# Route, scope, and replacement body mode are all approval authority; the
+# gateway must not let the native expand-compatible legacy arm supply them.
+_OWNER_PROPOSAL_TASK_KEYS = frozenset({
+    "title", "body", "assignee", "responsibility", "execution_tier",
+    "owned_paths",
 })
+_OWNER_PROPOSAL_ADD_KEYS = _OWNER_PROPOSAL_TASK_KEYS | frozenset({
+    "action", "reason", "existing_parent_refs", "new_parents",
+})
+_OWNER_PROPOSAL_SPLIT_TASK_KEYS = _OWNER_PROPOSAL_TASK_KEYS | frozenset({"parents"})
+_OWNER_PROPOSAL_PRESERVED_TASK_KEYS = (
+    _OWNER_PROPOSAL_TASK_KEYS - frozenset({"body"})
+) | frozenset({"body_mode"})
+_OWNER_PROPOSAL_REWRITTEN_TASK_KEYS = _OWNER_PROPOSAL_TASK_KEYS | frozenset({
+    "body_mode",
+})
+
+
+def _owner_current_task_shape(value: Any, expected_keys: frozenset[str]) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == expected_keys
+        and isinstance(value.get("owned_paths"), list)
+    )
+
+
+def _owner_current_replace_shape(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    body_mode = value.get("body_mode")
+    if body_mode == "preserve":
+        return _owner_current_task_shape(value, _OWNER_PROPOSAL_PRESERVED_TASK_KEYS)
+    if body_mode == "rewrite":
+        return _owner_current_task_shape(value, _OWNER_PROPOSAL_REWRITTEN_TASK_KEYS)
+    return False
 
 
 class OwnerAuthorityBroken(RuntimeError):
@@ -12910,19 +12938,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     raise ValueError("stored proposal change is invalid")
                 action = raw.get("action")
                 reason = clean(raw.get("reason"))
-                if action == "add" and set(raw) == _OWNER_PROPOSAL_ADD_KEYS:
+                if action == "add" and _owner_current_task_shape(
+                    raw, _OWNER_PROPOSAL_ADD_KEYS,
+                ):
                     changes.append({
                         "action": "add", "reason": reason,
                         "title": clean(raw.get("title")), "body": clean(raw.get("body")),
                         "assignee": clean(raw.get("assignee")),
                         "responsibility": clean(raw.get("responsibility")),
                         "execution_tier": clean(raw.get("execution_tier")),
+                        "owned_paths": clean(raw.get("owned_paths")),
                         "existing_parents": [native(ref) for ref in raw["existing_parent_refs"]],
                         "new_parents": clean(raw.get("new_parents")),
                     })
                 elif action == "replace" and set(raw) == {
                     "action", "reason", "target_ref", "replacement",
-                }:
+                } and _owner_current_replace_shape(raw.get("replacement")):
                     changes.append({
                         "action": "replace", "reason": reason,
                         "target": native(raw.get("target_ref")),
@@ -12930,7 +12961,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                 elif action == "split" and set(raw) == {
                     "action", "reason", "target_ref", "replacements",
-                }:
+                } and isinstance(raw.get("replacements"), list) and all(
+                    _owner_current_task_shape(
+                        replacement, _OWNER_PROPOSAL_SPLIT_TASK_KEYS,
+                    )
+                    for replacement in raw["replacements"]
+                ):
                     changes.append({
                         "action": "split", "reason": reason,
                         "target": native(raw.get("target_ref")),
@@ -12938,7 +12974,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                 elif action == "merge" and set(raw) == {
                     "action", "reason", "target_refs", "replacement",
-                }:
+                } and _owner_current_task_shape(
+                    raw.get("replacement"), _OWNER_PROPOSAL_TASK_KEYS,
+                ):
                     changes.append({
                         "action": "merge", "reason": reason,
                         "targets": [native(ref) for ref in raw["target_refs"]],

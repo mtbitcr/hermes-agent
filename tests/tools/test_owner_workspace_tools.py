@@ -160,7 +160,7 @@ class TestSchemas:
 
         specs = [
             add,
-            replace["properties"]["replacement"],
+            *replace["properties"]["replacement"]["oneOf"],
             split["properties"]["replacements"]["items"],
             merge["properties"]["replacement"],
         ]
@@ -194,18 +194,34 @@ class TestSchemas:
             if change["properties"]["action"] == {"const": "replace"}
         )
 
-        specs = [
+        assert graph_task["properties"]["owned_paths"] is owt._OWNED_PATHS
+        # New-Project task graphs remain legacy-compatible because that flow
+        # has no repository folder yet.
+        assert "owned_paths" not in graph_task["required"]
+
+        replacement = replace["properties"]["replacement"]
+        assert set(replacement) == {"oneOf"}
+        preserve, rewrite, legacy = replacement["oneOf"]
+        assert preserve["properties"]["body_mode"] == {"const": "preserve"}
+        assert "body" not in preserve["properties"]
+        assert rewrite["properties"]["body_mode"] == {"const": "rewrite"}
+        assert "body" in rewrite["required"]
+
+        legacy_specs = [
             graph_task,
             add,
-            replace["properties"]["replacement"],
+            legacy,
             split["properties"]["replacements"]["items"],
             merge["properties"]["replacement"],
         ]
-        for spec in specs:
+        for spec in legacy_specs:
             assert spec["properties"]["owned_paths"] is owt._OWNED_PATHS
-            # Still optional: a proposal committed before the field existed
-            # replays unchanged rather than failing validation.
+            # Expand compatibility: an in-flight pre-v5 proposal still runs.
             assert "owned_paths" not in spec["required"]
+
+        for spec in (preserve, rewrite):
+            assert spec["properties"]["owned_paths"] is owt._OWNED_PATHS
+            assert "owned_paths" in spec["required"]
 
         text = owt._OWNED_PATHS["description"]
         assert "repository-executing or coding task MUST state its scope" in text
@@ -259,7 +275,12 @@ class TestSchemas:
         assert set(replace["required"]) == {
             "action", "reason", "target", "replacement",
         }
-        assert "execution_tier" in replace["properties"]["replacement"]["required"]
+        replacement = replace["properties"]["replacement"]
+        assert set(replacement) == {"oneOf"}
+        assert all(
+            "execution_tier" in variant["required"]
+            for variant in replacement["oneOf"]
+        )
 
     def test_task_comment_requires_task_id_and_body(self):
         entry = registry.get_entry("owner_task_comment")

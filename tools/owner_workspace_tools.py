@@ -436,7 +436,7 @@ _PROJECT_TASK_SPEC = {
     "required": ["title", "body", "assignee", "responsibility", "execution_tier"],
 }
 
-_PROJECT_REPLACEMENT_SPEC = {
+_PROJECT_SPLIT_TASK_SPEC = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
@@ -448,6 +448,48 @@ _PROJECT_REPLACEMENT_SPEC = {
     },
     "required": [
         "title", "body", "assignee", "responsibility", "execution_tier", "parents",
+    ],
+}
+
+_PROJECT_PRESERVED_TASK_SPEC = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": {"type": "string"},
+        "body_mode": {"const": "preserve"},
+        "assignee": {"type": "string"},
+        "responsibility": {
+            "type": "string",
+            "description": "Stable logical responsibility; separate from the runtime profile.",
+        },
+        "execution_tier": _EXECUTION_TIER,
+        "owned_paths": _OWNED_PATHS,
+    },
+    "required": [
+        "title", "body_mode", "assignee", "responsibility",
+        "execution_tier", "owned_paths",
+    ],
+}
+
+_PROJECT_REWRITTEN_TASK_SPEC = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        **_PROJECT_TASK_SPEC["properties"],
+        "body_mode": {"const": "rewrite"},
+    },
+    "required": [
+        "title", "body_mode", "body", "assignee", "responsibility",
+        "execution_tier", "owned_paths",
+    ],
+}
+
+_PROJECT_ONE_TO_ONE_REPLACEMENT_SPEC = {
+    "oneOf": [
+        _PROJECT_PRESERVED_TASK_SPEC,
+        _PROJECT_REWRITTEN_TASK_SPEC,
+        # Expand compatibility for an in-flight pre-v5 Workspace proposal.
+        _PROJECT_TASK_SPEC,
     ],
 }
 
@@ -528,7 +570,7 @@ registry.register(
                                         "type": "array",
                                         "minItems": 2,
                                         "maxItems": 6,
-                                        "items": _PROJECT_REPLACEMENT_SPEC,
+                                        "items": _PROJECT_SPLIT_TASK_SPEC,
                                     },
                                 },
                                 "required": ["action", "reason", "target", "replacements"],
@@ -577,7 +619,7 @@ registry.register(
                                     "action": {"const": "replace"},
                                     "reason": {"type": "string"},
                                     "target": _PROJECT_TASK_REF,
-                                    "replacement": _PROJECT_TASK_SPEC,
+                                    "replacement": _PROJECT_ONE_TO_ONE_REPLACEMENT_SPEC,
                                 },
                                 "required": ["action", "reason", "target", "replacement"],
                             },
