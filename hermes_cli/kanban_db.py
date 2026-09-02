@@ -3740,10 +3740,11 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> set[str]:
     every kanban notification is silently lost (#35096). Each affected table is
     rebuilt with the standard SQLite pattern — CREATE new → INSERT shared
     columns → DROP old → RENAME — recreating its indexes too (DROP TABLE takes
-    them down). The legacy TEXT ids are dropped (they aren't valid integers);
-    AUTOINCREMENT assigns fresh ones and ``last_event_id`` cursors reset to 0,
-    so the first post-migration tick replays a task's event history once —
-    the safe failure mode for a feature that was already fully broken.
+    them down). Legacy IDs are not retained as primary keys; AUTOINCREMENT
+    assigns fresh ones while dependent run/event references are remapped in
+    the same transaction. ``last_event_id`` cursors reset to 0, so the first
+    post-migration tick replays a task's event history once — the safe failure
+    mode for a feature that was already fully broken.
 
     The whole pass runs in one transaction so an interruption can't leave a
     table half-renamed, and under ``connect()``'s init locks so nothing races
@@ -3782,31 +3783,57 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> set[str]:
                 cols_csv = ", ".join(shared)
                 slots = ", ".join("?" for _ in shared)
                 legacy_rows = conn.execute(
-                    f"SELECT id, {cols_csv} FROM {table}_legacy ORDER BY rowid"
+                    f"SELECT rowid AS __legacy_rowid, id, {cols_csv} "
+                    f"FROM {table}_legacy ORDER BY rowid"
                 ).fetchall()
-                mappings: list[tuple[str, str, int]] = []
-                seen_ids: set[str] = set()
+                raw_mappings: list[tuple[str, str, int]] = []
+                seen_ids: set[tuple[str, str]] = set()
                 for legacy in legacy_rows:
-                    old_id = legacy["id"]
                     cursor = conn.execute(
                         f"INSERT INTO {table} ({cols_csv}) VALUES ({slots})",
                         tuple(legacy[column] for column in shared),
                     )
-                    if old_id is None:
-                        continue
-                    old_key = str(old_id)
-                    if old_key in seen_ids:
-                        raise sqlite3.DatabaseError(
-                            f"legacy {table} contains duplicate id {old_key!r}"
-                        )
-                    seen_ids.add(old_key)
-                    mappings.append(
-                        (str(legacy["task_id"]), old_key, int(cursor.lastrowid))
+                    # A legacy table with a nullable, non-PK ``id`` still had
+                    # a real SQLite rowid. Callers using last_insert_rowid()
+                    # could persist that hidden value even when ``id`` was
+                    # NULL, so it is part of the reference namespace.
+                    old_key = str(
+                        legacy["id"]
+                        if legacy["id"] is not None
+                        else legacy["__legacy_rowid"]
                     )
+                    task_id = str(legacy["task_id"])
+                    scoped_old_id = (task_id, old_key)
+                    if scoped_old_id in seen_ids:
+                        raise sqlite3.DatabaseError(
+                            f"legacy {table} contains duplicate id {old_key!r} "
+                            f"for task {task_id!r}"
+                        )
+                    seen_ids.add(scoped_old_id)
+                    new_id = int(cursor.lastrowid)
+                    raw_mappings.append((task_id, old_key, new_id))
+
+                # Use collision-checked sentinels; a legacy TEXT id can contain
+                # any printable value, including a plausible migration prefix.
+                mappings: list[tuple[str, str, int, str]] = []
+                temporary_ids: set[str] = set()
+                for task_id, old_key, new_id in raw_mappings:
+                    while True:
+                        temporary = f"__{table}_{secrets.token_hex(16)}__"
+                        if (
+                            (task_id, temporary) not in seen_ids
+                            and temporary not in temporary_ids
+                        ):
+                            break
+                    temporary_ids.add(temporary)
+                    mappings.append((task_id, old_key, new_id, temporary))
 
                 if table == "task_runs":
-                    for index, (task_id, old_id, new_id) in enumerate(mappings):
-                        temporary = f"__run_rebuild_{index}_{new_id}__"
+                    # Stage every source reference before finalizing any one
+                    # of them. Legacy IDs may overlap the newly assigned IDs
+                    # (for example 1->2 and 2->1); per-mapping finalization
+                    # would let a later stage capture an already-remapped row.
+                    for task_id, old_id, _new_id, temporary in mappings:
                         conn.execute(
                             "UPDATE tasks SET current_run_id=? "
                             "WHERE id=? AND CAST(current_run_id AS TEXT)=?",
@@ -3826,6 +3853,7 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> set[str]:
                                 "WHERE task_id=? AND CAST(run_id AS TEXT)=?",
                                 (temporary, task_id, old_id),
                             )
+                    for task_id, _old_id, new_id, temporary in mappings:
                         conn.execute(
                             "UPDATE tasks SET current_run_id=? "
                             "WHERE id=? AND current_run_id=?",
@@ -3846,8 +3874,7 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> set[str]:
                                 (new_id, task_id, temporary),
                             )
                 else:
-                    for index, (task_id, old_id, new_id) in enumerate(mappings):
-                        temporary = f"__event_rebuild_{index}_{new_id}__"
+                    for task_id, old_id, _new_id, temporary in mappings:
                         conn.execute(
                             "UPDATE run_sandbox_cleanup_intents "
                             "SET provision_event_id=? WHERE task_id=? "
@@ -3860,6 +3887,7 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> set[str]:
                             "AND CAST(created_event_id AS TEXT)=?",
                             (temporary, task_id, old_id),
                         )
+                    for task_id, _old_id, new_id, temporary in mappings:
                         conn.execute(
                             "UPDATE run_sandbox_cleanup_intents "
                             "SET provision_event_id=? WHERE task_id=? "
@@ -12954,31 +12982,168 @@ def release_ended_run_sandbox(
         return read_run_sandbox(conn, task_id, run_id=run_id)
 
 
-def next_run_sandbox_cleanup_queue(
+def claim_next_run_sandbox_cleanup(
     conn: sqlite3.Connection,
     *,
     now: Optional[int] = None,
-) -> Optional[str]:
-    """Return the globally oldest due canonical/orphan cleanup queue."""
+    lease_seconds: int = 30,
+) -> list[dict[str, Any]]:
+    """Atomically lease the globally oldest due sandbox cleanup.
+
+    Queue choice, final-lease terminalization, and the selected row's lease all
+    happen under one ``BEGIN IMMEDIATE``. Two dispatchers therefore cannot
+    choose different per-table heads from the same stale snapshot, and a crash
+    after the final allowed lease cannot make that row starve the other queue.
+    """
+    if (
+        isinstance(lease_seconds, bool)
+        or not isinstance(lease_seconds, int)
+        or not 1 <= lease_seconds <= 300
+    ):
+        raise ValueError("lease_seconds must be an integer from 1 to 300")
     current_time = int(time.time()) if now is None else int(now)
-    row = conn.execute(
-        "SELECT queue FROM ("
-        " SELECT 'canonical' AS queue, i.next_attempt_at AS due_at, "
-        " i.provision_event_id AS authority_id "
-        " FROM run_sandbox_cleanup_intents i "
-        " JOIN task_runs r ON r.id=i.run_id AND r.task_id=i.task_id "
-        " WHERE r.ended_at IS NOT NULL AND i.exhausted_at IS NULL "
-        " AND i.next_attempt_at <= ? "
-        " UNION ALL "
-        " SELECT 'orphan' AS queue, i.next_attempt_at AS due_at, "
-        " i.created_event_id AS authority_id "
-        " FROM run_sandbox_orphan_cleanup_intents i "
-        " JOIN tasks t ON t.id=i.task_id AND t.task_kind='work' "
-        " WHERE i.exhausted_at IS NULL AND i.next_attempt_at <= ?"
-        ") ORDER BY due_at ASC, authority_id ASC, queue ASC LIMIT 1",
-        (current_time, current_time),
-    ).fetchone()
-    return str(row["queue"]) if row is not None else None
+    with write_txn(conn):
+        # Bound poison-row maintenance independently of dispatcher cadence.
+        # Every loop either terminalizes one exact row or returns one lease.
+        for _ in range(16):
+            row = conn.execute(
+                "SELECT queue, task_id, run_id, profile, generation, sandbox_id, "
+                "authority_id, attempt_count, due_at FROM ("
+                " SELECT 'canonical' AS queue, i.task_id, i.run_id, i.profile, "
+                " i.generation, i.sandbox_id, i.provision_event_id AS authority_id, "
+                " i.attempt_count, i.next_attempt_at AS due_at "
+                " FROM run_sandbox_cleanup_intents AS i "
+                " INDEXED BY idx_sandbox_cleanup_due "
+                " JOIN task_runs AS r "
+                " ON r.id=i.run_id AND r.task_id=i.task_id "
+                " JOIN tasks AS t "
+                " ON t.id=i.task_id AND t.task_kind='work' "
+                " WHERE r.ended_at IS NOT NULL AND i.exhausted_at IS NULL "
+                " AND i.next_attempt_at <= ? "
+                " UNION ALL "
+                " SELECT 'orphan' AS queue, i.task_id, i.run_id, i.profile, "
+                " i.generation, i.sandbox_id, i.created_event_id AS authority_id, "
+                " i.attempt_count, i.next_attempt_at AS due_at "
+                " FROM run_sandbox_orphan_cleanup_intents AS i "
+                " INDEXED BY idx_sandbox_orphan_cleanup_due "
+                " JOIN tasks AS t "
+                " ON t.id=i.task_id AND t.task_kind='work' "
+                " WHERE i.exhausted_at IS NULL AND i.next_attempt_at <= ?"
+                ") ORDER BY due_at ASC, authority_id ASC, queue ASC LIMIT 1",
+                (current_time, current_time),
+            ).fetchone()
+            if row is None:
+                return []
+
+            orphan = str(row["queue"]) == "orphan"
+            task_id = str(row["task_id"])
+            run_id = int(row["run_id"])
+            sandbox_id = str(row["sandbox_id"])
+            attempt_count = int(row["attempt_count"])
+            if attempt_count >= RUN_SANDBOX_CLEANUP_MAX_ATTEMPTS:
+                if orphan:
+                    cursor = conn.execute(
+                        "UPDATE run_sandbox_orphan_cleanup_intents "
+                        "SET exhausted_at=?, last_error=? "
+                        "WHERE task_id=? AND run_id=? AND sandbox_id=? "
+                        "AND exhausted_at IS NULL AND attempt_count=? "
+                        "AND next_attempt_at<=?",
+                        (
+                            current_time,
+                            "final_attempt_lease_expired",
+                            task_id,
+                            run_id,
+                            sandbox_id,
+                            attempt_count,
+                            current_time,
+                        ),
+                    )
+                    event_kind = "sandbox_orphan_cleanup_exhausted"
+                    payload = {
+                        "sandbox_id": sandbox_id,
+                        "attempt_count": attempt_count,
+                        "reason": "final_attempt_lease_expired",
+                        "manual_cleanup_required": True,
+                    }
+                else:
+                    cursor = conn.execute(
+                        "UPDATE run_sandbox_cleanup_intents "
+                        "SET exhausted_at=?, last_error=? "
+                        "WHERE task_id=? AND run_id=? AND exhausted_at IS NULL "
+                        "AND attempt_count=? AND next_attempt_at<=?",
+                        (
+                            current_time,
+                            "final_attempt_lease_expired",
+                            task_id,
+                            run_id,
+                            attempt_count,
+                            current_time,
+                        ),
+                    )
+                    event_kind = "sandbox_cleanup_exhausted"
+                    payload = {
+                        "attempt_count": attempt_count,
+                        "reason": "final_attempt_lease_expired",
+                        "manual_cleanup_required": True,
+                    }
+                if cursor.rowcount == 1:
+                    _append_event(
+                        conn,
+                        task_id,
+                        event_kind,
+                        payload,
+                        run_id=run_id,
+                    )
+                continue
+
+            claimed_attempt = attempt_count + 1
+            if orphan:
+                cursor = conn.execute(
+                    "UPDATE run_sandbox_orphan_cleanup_intents "
+                    "SET attempt_count=?, next_attempt_at=?, last_error=NULL "
+                    "WHERE task_id=? AND run_id=? AND sandbox_id=? "
+                    "AND exhausted_at IS NULL AND attempt_count=? "
+                    "AND next_attempt_at=?",
+                    (
+                        claimed_attempt,
+                        current_time + lease_seconds,
+                        task_id,
+                        run_id,
+                        sandbox_id,
+                        attempt_count,
+                        int(row["due_at"]),
+                    ),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE run_sandbox_cleanup_intents "
+                    "SET attempt_count=?, next_attempt_at=?, last_error=NULL "
+                    "WHERE task_id=? AND run_id=? AND exhausted_at IS NULL "
+                    "AND attempt_count=? AND next_attempt_at=?",
+                    (
+                        claimed_attempt,
+                        current_time + lease_seconds,
+                        task_id,
+                        run_id,
+                        attempt_count,
+                        int(row["due_at"]),
+                    ),
+                )
+            if cursor.rowcount != 1:
+                continue
+            item: dict[str, Any] = {
+                "task_id": task_id,
+                "run_id": run_id,
+                "profile": str(row["profile"] or ""),
+                "generation": int(row["generation"]),
+                "sandbox_id": sandbox_id,
+                "attempt_count": claimed_attempt,
+                "orphan": orphan,
+            }
+            authority_key = "created_event_id" if orphan else "provision_event_id"
+            item[authority_key] = int(row["authority_id"])
+            return [item]
+        return []
 
 
 def claim_ended_run_sandbox_cleanups(

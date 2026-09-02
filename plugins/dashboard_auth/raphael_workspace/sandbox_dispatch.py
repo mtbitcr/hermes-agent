@@ -1648,20 +1648,9 @@ def retry_ended_sandbox_cleanup(
     kb = _kanban()
     try:
         with kb.connect_closing(board=board_name) as conn:
-            queue = kb.next_run_sandbox_cleanup_queue(conn)
-            orphan = queue == "orphan"
-            if orphan:
-                pending = kb.claim_run_sandbox_orphan_cleanups(
-                    conn, limit=1, lease_seconds=_CLEANUP_RETRY_LEASE_SECONDS,
-                )
-            elif queue == "canonical":
-                pending = kb.claim_ended_run_sandbox_cleanups(
-                    conn,
-                    limit=1,
-                    lease_seconds=_CLEANUP_RETRY_LEASE_SECONDS,
-                )
-            else:
-                pending = []
+            pending = kb.claim_next_run_sandbox_cleanup(
+                conn, lease_seconds=_CLEANUP_RETRY_LEASE_SECONDS,
+            )
     except Exception:
         logger.warning(
             "raphael sandbox cleanup retry could not read board=%s",
@@ -1671,6 +1660,7 @@ def retry_ended_sandbox_cleanup(
     if not pending:
         return
     item = pending[0]
+    orphan = bool(item["orphan"])
     ctx = _WorkerContext(
         task_id=item["task_id"],
         run_id=item["run_id"],

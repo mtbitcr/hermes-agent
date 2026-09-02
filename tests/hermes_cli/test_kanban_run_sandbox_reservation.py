@@ -404,7 +404,7 @@ def test_ended_active_sandbox_is_a_bounded_durable_cleanup_intent(running_task):
         assert kb.claim_ended_run_sandbox_cleanups(conn, now=200) == []
 
 
-def test_cleanup_scheduler_selects_the_globally_oldest_queue(running_task):
+def test_cleanup_scheduler_atomically_leases_the_globally_oldest_row(running_task):
     task_id, run_id = running_task
     with kb.connect() as conn:
         kb.advance_run_sandbox(
@@ -440,12 +440,75 @@ def test_cleanup_scheduler_selects_the_globally_oldest_queue(running_task):
             conn.execute(
                 "UPDATE run_sandbox_orphan_cleanup_intents SET next_attempt_at=50"
             )
-        assert kb.next_run_sandbox_cleanup_queue(conn, now=100) == "orphan"
+        first = kb.claim_next_run_sandbox_cleanup(conn, now=100, lease_seconds=30)
+        assert len(first) == 1
+        assert first[0]["orphan"] is True
+        assert first[0]["sandbox_id"] == "sbx-orphan"
+        second = kb.claim_next_run_sandbox_cleanup(conn, now=100, lease_seconds=30)
+        assert len(second) == 1
+        assert second[0]["orphan"] is False
+        assert second[0]["sandbox_id"] == "sbx-canonical"
+
+
+def test_cleanup_scheduler_terminalizes_expired_head_then_leases_next(running_task):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_reserved", expected_generation=0,
+        )
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_provisioned", expected_generation=1,
+            sandbox_id="sbx-canonical", receipt=RECEIPT,
+        )
+        assert kb.record_run_sandbox_orphan_cleanup(
+            conn,
+            task_id,
+            run_id=run_id,
+            generation=1,
+            sandbox_id="sbx-expired-orphan",
+            reason="expired_head_fixture",
+        )
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE run_sandbox_orphan_cleanup_intents SET next_attempt_at=150"
+                "UPDATE task_runs SET status='done', outcome='completed', ended_at=1 "
+                "WHERE id=?",
+                (run_id,),
             )
-        assert kb.next_run_sandbox_cleanup_queue(conn, now=100) == "canonical"
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (task_id,),
+            )
+            conn.execute(
+                "UPDATE run_sandbox_cleanup_intents SET next_attempt_at=100"
+            )
+            conn.execute(
+                "UPDATE run_sandbox_orphan_cleanup_intents "
+                "SET attempt_count=?, next_attempt_at=50",
+                (kb.RUN_SANDBOX_CLEANUP_MAX_ATTEMPTS,),
+            )
+
+        claimed = kb.claim_next_run_sandbox_cleanup(conn, now=100)
+        assert len(claimed) == 1
+        assert claimed[0]["orphan"] is False
+        assert claimed[0]["sandbox_id"] == "sbx-canonical"
+        expired = conn.execute(
+            "SELECT exhausted_at, last_error "
+            "FROM run_sandbox_orphan_cleanup_intents "
+            "WHERE task_id=? AND run_id=? AND sandbox_id=?",
+            (task_id, run_id, "sbx-expired-orphan"),
+        ).fetchone()
+        assert dict(expired) == {
+            "exhausted_at": 100,
+            "last_error": "final_attempt_lease_expired",
+        }
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='sandbox_orphan_cleanup_exhausted'",
+            (task_id, run_id),
+        ).fetchall()
+        assert len(events) == 1
 
 
 @pytest.mark.parametrize("interrupted", ["missing_table", "empty_table"])
@@ -651,6 +714,126 @@ def test_cleanup_reconciliation_recovers_a_crash_after_legacy_id_rebuild(
                 (task_id, rebuilt_run),
             ).fetchone()["id"],
         }
+
+
+def test_legacy_id_rebuild_stages_overlaps_and_hidden_rowid_references():
+    kb.init_db()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy remap", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("DROP TABLE task_events")
+            conn.execute("DROP TABLE task_runs")
+            conn.execute(
+                kb._REBUILD_SPECS["task_runs"][0].replace(
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT", "id TEXT",
+                )
+            )
+            conn.execute(
+                kb._REBUILD_SPECS["task_events"][0].replace(
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT", "id TEXT",
+                )
+            )
+            # In insertion order these become hidden rowids 1, 2, 3. The
+            # declared IDs swap 1/2 and leave row 3 NULL, while persisted
+            # references use the hidden rowid for that NULL row.
+            conn.executemany(
+                "INSERT INTO task_runs "
+                "(id, task_id, profile, step_key, status, started_at, ended_at) "
+                "VALUES (?, ?, 'worker', ?, 'done', ?, ?)",
+                (
+                    ("2", task_id, "old-2", 1, 11),
+                    ("1", task_id, "old-1", 2, 12),
+                    (None, task_id, "rowid-3", 3, 13),
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO task_events "
+                "(id, task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?, '{}', ?)",
+                (
+                    ("2", task_id, "2", "legacy-old-2", 1),
+                    ("1", task_id, "1", "legacy-old-1", 2),
+                    (None, task_id, "3", "legacy-rowid-3", 3),
+                ),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='running', current_run_id='2' WHERE id=?",
+                (task_id,),
+            )
+            for old_id, label in (("2", "old-2"), ("1", "old-1"), ("3", "rowid-3")):
+                conn.execute(
+                    "INSERT INTO run_sandbox_cleanup_intents "
+                    "(task_id, run_id, profile, generation, sandbox_id, "
+                    "provision_event_id) VALUES (?, ?, 'worker', 1, ?, ?)",
+                    (task_id, old_id, f"sbx-main-{label}", old_id),
+                )
+                conn.execute(
+                    "INSERT INTO run_sandbox_orphan_cleanup_intents "
+                    "(task_id, run_id, profile, generation, sandbox_id, "
+                    "created_event_id) VALUES (?, ?, 'worker', 1, ?, ?)",
+                    (task_id, old_id, f"sbx-orphan-{label}", old_id),
+                )
+
+        assert kb._rebuild_drifted_tables(conn) == {"task_runs", "task_events"}
+
+        run_ids = {
+            str(row["step_key"]): int(row["id"])
+            for row in conn.execute(
+                "SELECT id, step_key FROM task_runs WHERE task_id=?",
+                (task_id,),
+            )
+        }
+        event_ids = {
+            str(row["kind"]): int(row["id"])
+            for row in conn.execute(
+                "SELECT id, kind FROM task_events WHERE task_id=?",
+                (task_id,),
+            )
+        }
+        assert run_ids == {"old-2": 1, "old-1": 2, "rowid-3": 3}
+        assert event_ids == {
+            "legacy-old-2": 1,
+            "legacy-old-1": 2,
+            "legacy-rowid-3": 3,
+        }
+        assert conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()["current_run_id"] == run_ids["old-2"]
+        assert {
+            str(row["kind"]): int(row["run_id"])
+            for row in conn.execute(
+                "SELECT kind, run_id FROM task_events WHERE task_id=?",
+                (task_id,),
+            )
+        } == {
+            "legacy-old-2": run_ids["old-2"],
+            "legacy-old-1": run_ids["old-1"],
+            "legacy-rowid-3": run_ids["rowid-3"],
+        }
+        for prefix, authority_column in (
+            ("sbx-main-", "provision_event_id"),
+            ("sbx-orphan-", "created_event_id"),
+        ):
+            table = (
+                "run_sandbox_cleanup_intents"
+                if prefix == "sbx-main-"
+                else "run_sandbox_orphan_cleanup_intents"
+            )
+            actual = {
+                str(row["sandbox_id"]): (int(row["run_id"]), int(row["authority_id"]))
+                for row in conn.execute(
+                    f"SELECT sandbox_id, run_id, {authority_column} AS authority_id "
+                    f"FROM {table} WHERE task_id=?",
+                    (task_id,),
+                )
+            }
+            assert actual == {
+                f"{prefix}old-2": (run_ids["old-2"], event_ids["legacy-old-2"]),
+                f"{prefix}old-1": (run_ids["old-1"], event_ids["legacy-old-1"]),
+                f"{prefix}rowid-3": (
+                    run_ids["rowid-3"], event_ids["legacy-rowid-3"],
+                ),
+            }
 
 
 def test_cleanup_intent_query_is_bounded_away_from_all_event_history(running_task):
