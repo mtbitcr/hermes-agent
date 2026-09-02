@@ -7367,6 +7367,88 @@ class TestStoredTranscriptTurnStart:
             [], "Plan the workshop.", result,
         ) == 1
 
+    @pytest.mark.asyncio
+    async def test_a_db_persisted_user_only_turn_stores_owner_and_final_once(
+        self, adapter,
+    ):
+        owner = "Plan the workshop."
+        reply = json.dumps({
+            "schema_version": 1,
+            "kind": "question",
+            "message": "Which audience should Raphael plan for?",
+        })
+        result = {"messages": [
+            {
+                **self._stamped("user", owner, at=100.0),
+                "_db_persisted": True,
+            },
+        ], "final_response": reply, "api_calls": 1}
+
+        conversation = "raphael-owner-" + "7" * 32
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+                return_value=(
+                    result,
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                ),
+            ):
+                response = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": owner,
+                        "conversation": conversation,
+                        "store": True,
+                        "expected_previous_response_id": None,
+                    },
+                    headers={"Idempotency-Key": f"response-{uuid.uuid4().hex}"},
+                )
+            assert response.status == 200
+            response_id = (await response.json())["id"]
+
+        stored = adapter._response_store.get(response_id)
+        assert [
+            (message["role"], message["content"])
+            for message in stored["conversation_history"]
+        ] == [
+            ("user", owner),
+            ("assistant", reply),
+        ]
+        assert adapter._response_store.owner_history_snapshot(
+            conversation,
+        )["data"] == [
+            {"owner": owner, "raphael": reply},
+        ]
+
+    def test_an_unrecognized_nonassistant_tail_is_not_completed(self):
+        result = {"messages": [{"role": "tool", "content": "Tool output."}]}
+
+        stored = APIServerAdapter._build_response_conversation_history(
+            [], "Plan the workshop.", result, "Here is the plan.",
+        )
+
+        assert [(message["role"], message["content"]) for message in stored] == [
+            ("user", "Plan the workshop."),
+            ("tool", "Tool output."),
+        ]
+
+    def test_a_prior_only_transcript_is_not_completed_as_the_current_turn(self):
+        prior = [
+            self._stamped("user", "First request.", at=100.0),
+            self._stamped("assistant", "First reply.", at=101.0),
+        ]
+        result = {"messages": [dict(message) for message in prior]}
+
+        stored = APIServerAdapter._build_response_conversation_history(
+            prior, "Second request.", result, "Second reply.",
+        )
+
+        assert stored == result["messages"]
+
     def test_a_restamped_prior_prefix_is_recognised_not_reappended(self):
         """The agent restamping its copies of prior is bookkeeping, not content."""
         prior = [

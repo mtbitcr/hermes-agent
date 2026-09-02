@@ -11578,7 +11578,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 result,
             )
             if turn_start:
-                return list(agent_messages)
+                completed_messages = list(agent_messages)
+                if (
+                    turn_start == len(completed_messages)
+                    and turn_start == len(conversation_history) + 1
+                ):
+                    completed_messages.append(
+                        {"role": "assistant", "content": final_response}
+                    )
+                return completed_messages
 
             # turn_start == 0: agent_messages does not start with prior.
             # This can happen because compression rewrote the transcript
@@ -11611,8 +11619,8 @@ class APIServerAdapter(BasePlatformAdapter):
         content, and every tool-call field such as ``tool_calls``,
         ``tool_call_id``, ``name``, ``refusal`` or ``reasoning``. Only the
         durable bookkeeping the live transcript stamps onto its own copies is
-        ignored, and ``PERSISTENCE_ONLY_MESSAGE_FIELDS`` is what names it: those
-        fields describe Hermes' record, not what was said.
+        ignored: the shared persistence-only fields plus ``_db_persisted``,
+        which exists only on the live cached copy.
 
         Comparing whole dicts instead meant this turn's own user message never
         equalled the one the request described, because the agent had stamped
@@ -11630,6 +11638,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 key: value
                 for key, value in message.items()
                 if key not in PERSISTENCE_ONLY_MESSAGE_FIELDS
+                and key != "_db_persisted"
             }
 
         return all(
