@@ -1711,6 +1711,98 @@ class TestConcurrency:
             "sandbox_orphan_released",
         ]
 
+    @pytest.mark.parametrize("delete_path", ["hard", "archive_then_purge"])
+    def test_remote_create_inflight_blocks_deletion_until_cleanup(
+        self, host, sdk, delete_path,
+    ):
+        deletion_results = []
+
+        def _attempt_delete_after_allocation(_box):
+            # FakeSandbox invokes this after the remote allocation exists but
+            # before create() returns its handle to the provisioner: the exact
+            # pre-ID persistence window from the regression.
+            with kb.connect_closing() as conn:
+                if delete_path == "hard":
+                    deletion_results.append(kb.delete_task(conn, host.task_id))
+                    if not deletion_results[-1]:
+                        assert kb.archive_task(conn, host.task_id)
+                else:
+                    assert kb.archive_task(conn, host.task_id)
+                    deletion_results.append(
+                        kb.delete_archived_task(conn, host.task_id)
+                    )
+
+        FakeSandbox.behavior = {
+            "after_create": _attempt_delete_after_allocation,
+            "kill_fails": True,
+        }
+        out = _provision()
+        assert "error" in out
+        assert deletion_results == [False]
+        box = FakeSandbox.created[0]
+        assert box.killed is False
+
+        # The task/run survived long enough for the exact returned ID to become
+        # canonical cleanup authority, even though compensating kill failed.
+        with kb.connect_closing() as conn:
+            task = kb.get_task(conn, host.task_id)
+            assert task is not None
+            assert task.status == "archived"
+            intent = conn.execute(
+                "SELECT sandbox_id, generation, attempt_count "
+                "FROM run_sandbox_cleanup_intents "
+                "WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            ).fetchone()
+            assert dict(intent) == {
+                "sandbox_id": box.id,
+                "generation": 1,
+                "attempt_count": 0,
+            }
+            assert kb.delete_archived_task(conn, host.task_id) is False
+
+        # A later dispatcher process can reconnect, clean the exact machine,
+        # record release, and only then permit permanent deletion.
+        FakeSandbox.behavior["kill_fails"] = False
+        sd.retry_ended_sandbox_cleanup(board="default")
+        assert box.killed is True
+        with kb.connect_closing() as conn:
+            assert conn.execute(
+                "SELECT 1 FROM run_sandbox_cleanup_intents "
+                "WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            ).fetchone() is None
+            assert kb.delete_archived_task(conn, host.task_id) is True
+
+    def test_archive_during_create_records_confirmed_cleanup_synchronously(
+        self, host, sdk,
+    ):
+        purge_results = []
+
+        def _archive_after_allocation(_box):
+            with kb.connect_closing() as conn:
+                assert kb.archive_task(conn, host.task_id)
+                purge_results.append(
+                    kb.delete_archived_task(conn, host.task_id)
+                )
+
+        FakeSandbox.behavior = {"after_create": _archive_after_allocation}
+        out = _provision()
+        assert "error" in out
+        assert purge_results == [False]
+        box = FakeSandbox.created[0]
+        assert box.killed is True
+        with kb.connect_closing() as conn:
+            assert kb.read_run_sandbox(
+                conn, host.task_id, run_id=host.run_id,
+            )["state"] == "released"
+            assert conn.execute(
+                "SELECT 1 FROM run_sandbox_cleanup_intents "
+                "WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            ).fetchone() is None
+            assert kb.delete_archived_task(conn, host.task_id) is True
+
     def test_lost_post_create_cas_and_failed_kill_remain_restart_cleanable(
         self, host, sdk
     ):

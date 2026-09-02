@@ -986,19 +986,13 @@ def _advance_reservation(
 
 def _release_reservation(ctx: _WorkerContext, generation: int, reason: str) -> None:
     """Close the generation this call owns so a corrected retry is not wedged."""
-    try:
-        if _advance_reservation(
-            ctx, "sandbox_released", generation, reason=reason
-        ) is None:
-            logger.warning(
-                "raphael sandbox dispatch: reservation generation %s was "
-                "already settled for task=%s run=%s",
-                generation, ctx.task_id, ctx.run_id,
-            )
-    except SandboxDispatchError:
+    if not _record_cleaned_release(ctx, generation, reason):
         logger.warning(
-            "raphael sandbox dispatch: reservation not released for "
-            "task=%s run=%s", ctx.task_id, ctx.run_id,
+            "raphael sandbox dispatch: reservation generation %s could not be "
+            "released for task=%s run=%s",
+            generation,
+            ctx.task_id,
+            ctx.run_id,
         )
 
 

@@ -340,6 +340,129 @@ def test_task_deletion_waits_for_durable_sandbox_release(running_task):
         assert kb.delete_archived_task(conn, task_id) is True
 
 
+def test_inflight_reservation_guards_deletion_and_survives_event_gc(running_task):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_reserved", expected_generation=0,
+        )
+        # No remote ID exists yet, so both cleanup tables are intentionally
+        # empty. The canonical reservation event is the deletion authority.
+        assert conn.execute(
+            "SELECT 1 FROM run_sandbox_cleanup_intents WHERE task_id=?",
+            (task_id,),
+        ).fetchone() is None
+        assert kb.delete_task(conn, task_id) is False
+        assert kb.archive_task(conn, task_id)
+        assert kb.delete_archived_task(conn, task_id) is False
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET created_at=0 "
+                "WHERE task_id=? AND kind NOT LIKE 'sandbox_%'",
+                (task_id,),
+            )
+        assert kb.gc_events(conn, older_than_seconds=0) > 0
+        assert kb.read_run_sandbox(
+            conn, task_id, run_id=run_id,
+        )["state"] == "reserved"
+        assert kb.delete_archived_task(conn, task_id) is False
+
+        released = kb.advance_run_sandbox(
+            conn,
+            task_id,
+            run_id=run_id,
+            transition="sandbox_released",
+            expected_generation=1,
+            reason="no_remote_handle",
+        )
+        assert released["state"] == "released"
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET created_at=0 "
+                "WHERE task_id=? AND kind LIKE 'sandbox_%'",
+                (task_id,),
+            )
+        assert kb.gc_events(conn, older_than_seconds=0) > 0
+        events = conn.execute(
+            "SELECT kind FROM task_events "
+            "WHERE task_id=? AND kind LIKE 'sandbox_%' ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        assert [row["kind"] for row in events] == ["sandbox_released"]
+        assert kb.read_run_sandbox(
+            conn, task_id, run_id=run_id,
+        )["state"] == "released"
+        assert kb.delete_archived_task(conn, task_id) is True
+
+
+def test_expired_ended_reservation_terminalizes_before_deletion(running_task):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_reserved", expected_generation=0,
+        )
+        reserved = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='sandbox_reserved'",
+            (task_id, run_id),
+        ).fetchone()
+        assert json.loads(reserved["payload"])["expires_at"] > 0
+        assert kb.archive_task(conn, task_id)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET created_at=0, payload=? WHERE id=?",
+                (json.dumps({"generation": 1, "expires_at": 0}), reserved["id"]),
+            )
+            assert kb._task_has_run_sandbox_deletion_guard(conn, task_id) is False
+        record = kb.read_run_sandbox(conn, task_id, run_id=run_id)
+        assert record["state"] == "released"
+        terminal = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='sandbox_released' ORDER BY id DESC LIMIT 1",
+            (task_id, run_id),
+        ).fetchone()
+        assert json.loads(terminal["payload"])["reason"] == (
+            "reservation_recovery_expired"
+        )
+        assert kb.delete_archived_task(conn, task_id) is True
+
+
+@pytest.mark.parametrize("malformed_kind", ["sandbox_provisioned", "sandbox_released"])
+def test_malformed_latest_lifecycle_event_remains_deletion_protecting(
+    running_task, malformed_kind,
+):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_reserved", expected_generation=0,
+        )
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, task_id, malformed_kind, {}, run_id=run_id,
+            )
+        assert kb.read_run_sandbox(
+            conn, task_id, run_id=run_id,
+        )["state"] == "reserved"
+        assert kb.delete_task(conn, task_id) is False
+        assert kb.archive_task(conn, task_id)
+        assert kb.delete_archived_task(conn, task_id) is False
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET created_at=0 WHERE task_id=? "
+                "AND run_id=? AND kind='sandbox_reserved'",
+                (task_id, run_id),
+            )
+        assert kb.gc_events(conn, older_than_seconds=0) > 0
+        assert kb.read_run_sandbox(
+            conn, task_id, run_id=run_id,
+        )["state"] == "reserved"
+        assert kb.delete_archived_task(conn, task_id) is False
+
+
 def test_ended_active_sandbox_is_a_bounded_durable_cleanup_intent(running_task):
     task_id, run_id = running_task
     with kb.connect() as conn:

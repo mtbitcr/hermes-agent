@@ -11834,6 +11834,114 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
+def _task_has_run_sandbox_deletion_guard(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Return whether deleting *task_id* could orphan a remote sandbox.
+
+    Cleanup rows protect machines whose exact ID is already known. The latest
+    lifecycle fold also protects the smaller pre-create window and malformed
+    histories where a machine may exist. Both this read and the eventual delete
+    run under the caller's ``BEGIN IMMEDIATE``, so reserve-first blocks deletion
+    and delete-first makes the later reservation fail before any remote
+    allocation starts. An ended reservation with no known ID is terminalized
+    only after its durable recovery deadline outlives every admitted lease.
+    """
+    for table in (
+        "run_sandbox_cleanup_intents",
+        "run_sandbox_orphan_cleanup_intents",
+    ):
+        if conn.execute(
+            f"SELECT 1 FROM {table} WHERE task_id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone() is not None:
+            return True
+    latest_events = conn.execute(
+        "SELECT lifecycle.id, lifecycle.run_id, lifecycle.created_at "
+        "FROM task_events AS lifecycle "
+        "INDEXED BY idx_events_sandbox_lifecycle "
+        "WHERE lifecycle.task_id = ? AND lifecycle.run_id IS NOT NULL "
+        "AND lifecycle.kind IN ("
+        " 'sandbox_reserved', 'sandbox_created', "
+        " 'sandbox_provisioned', 'sandbox_released'"
+        ") "
+        "AND NOT EXISTS ("
+        " SELECT 1 FROM task_events AS later "
+        " INDEXED BY idx_events_sandbox_lifecycle "
+        " WHERE later.task_id = lifecycle.task_id "
+        " AND later.run_id = lifecycle.run_id AND later.id > lifecycle.id "
+        " AND later.kind IN ("
+        "  'sandbox_reserved', 'sandbox_created', "
+        "  'sandbox_provisioned', 'sandbox_released'"
+        " )"
+        ")",
+        (task_id,),
+    ).fetchall()
+    current_time = int(time.time())
+    for latest in latest_events:
+        run_id = int(latest["run_id"])
+        current = read_run_sandbox(conn, task_id, run_id=run_id)
+        if current["state"] == "released":
+            continue
+        reservation = conn.execute(
+            "SELECT payload, created_at FROM task_events "
+            "INDEXED BY idx_events_sandbox_lifecycle "
+            "WHERE task_id=? AND run_id=? AND id<=? AND kind IN ("
+            " 'sandbox_reserved', 'sandbox_created', "
+            " 'sandbox_provisioned', 'sandbox_released'"
+            ") AND kind='sandbox_reserved' ORDER BY id DESC LIMIT 1",
+            (task_id, run_id, int(latest["id"])),
+        ).fetchone()
+        deadline_source = reservation if reservation is not None else latest
+        try:
+            created_at = int(deadline_source["created_at"])
+        except (TypeError, ValueError):
+            return True
+        recovery_deadline = (
+            created_at + RUN_SANDBOX_RESERVATION_RECOVERY_SECONDS
+        )
+        if reservation is not None:
+            try:
+                reservation_payload = (
+                    json.loads(reservation["payload"])
+                    if reservation["payload"]
+                    else {}
+                )
+            except (TypeError, ValueError):
+                reservation_payload = {}
+            declared_expiry = (
+                reservation_payload.get("expires_at")
+                if isinstance(reservation_payload, dict)
+                else None
+            )
+            if isinstance(declared_expiry, int) and not isinstance(
+                declared_expiry, bool
+            ):
+                recovery_deadline = max(recovery_deadline, declared_expiry)
+        if current_time < recovery_deadline:
+            return True
+        run = conn.execute(
+            "SELECT ended_at FROM task_runs WHERE id=? AND task_id=?",
+            (run_id, task_id),
+        ).fetchone()
+        if run is not None and run["ended_at"] is None:
+            return True
+        # No exact ID survived, the run is over, and the durable recovery
+        # horizon exceeds every admitted remote lease. Record the terminal
+        # transition before deletion instead of silently dropping authority.
+        _append_event(
+            conn,
+            task_id,
+            "sandbox_released",
+            {
+                "generation": int(current.get("generation") or 0),
+                "reason": "reservation_recovery_expired",
+            },
+            run_id=run_id,
+        )
+    return False
+
+
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Permanently remove an already-archived task and its related rows.
 
@@ -11849,17 +11957,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
-        if conn.execute(
-            "SELECT 1 FROM run_sandbox_cleanup_intents "
-            "WHERE task_id = ? LIMIT 1",
-            (task_id,),
-        ).fetchone() is not None:
-            return False
-        if conn.execute(
-            "SELECT 1 FROM run_sandbox_orphan_cleanup_intents "
-            "WHERE task_id = ? LIMIT 1",
-            (task_id,),
-        ).fetchone() is not None:
+        if _task_has_run_sandbox_deletion_guard(conn, task_id):
             return False
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
@@ -11888,17 +11986,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
-        if conn.execute(
-            "SELECT 1 FROM run_sandbox_cleanup_intents "
-            "WHERE task_id = ? LIMIT 1",
-            (task_id,),
-        ).fetchone() is not None:
-            return False
-        if conn.execute(
-            "SELECT 1 FROM run_sandbox_orphan_cleanup_intents "
-            "WHERE task_id = ? LIMIT 1",
-            (task_id,),
-        ).fetchone() is not None:
+        if _task_has_run_sandbox_deletion_guard(conn, task_id):
             return False
         cur = conn.execute(
             "DELETE FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
@@ -12675,6 +12763,11 @@ _RUN_SANDBOX_FROM = {
 _RUN_SANDBOX_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_RUN_SANDBOX_RECEIPT_KEYS = 32
 RUN_SANDBOX_CLEANUP_MAX_ATTEMPTS = 8
+#: A reservation with no returned sandbox ID must outlive every admitted
+#: remote lease before deletion can settle it as expired. Raphael's fixed
+#: machine lease is one hour; 24 hours leaves a wide create/control-plane
+#: margin and gives future callers a conservative default they may extend.
+RUN_SANDBOX_RESERVATION_RECOVERY_SECONDS = 24 * 3600
 
 
 class RunSandboxConflict(Exception):
@@ -12790,6 +12883,7 @@ def advance_run_sandbox(
     sandbox_id: Optional[str] = None,
     receipt: Optional[dict] = None,
     reason: Optional[str] = None,
+    reservation_expires_at: Optional[int] = None,
 ) -> dict:
     """Append one sandbox reservation transition, or refuse on drift.
 
@@ -12825,6 +12919,23 @@ def advance_run_sandbox(
             raise ValueError("sandbox_created does not carry a receipt")
     elif sandbox_id is not None or receipt is not None:
         raise ValueError(f"{transition} does not carry a sandbox_id or receipt")
+    if transition == "sandbox_reserved":
+        minimum_expiry = int(time.time()) + RUN_SANDBOX_RESERVATION_RECOVERY_SECONDS
+        if reservation_expires_at is None:
+            reservation_expires_at = minimum_expiry
+        if (
+            isinstance(reservation_expires_at, bool)
+            or not isinstance(reservation_expires_at, int)
+            or reservation_expires_at < minimum_expiry
+        ):
+            raise ValueError(
+                "reservation_expires_at must preserve the recovery horizon"
+            )
+        payload["expires_at"] = reservation_expires_at
+    elif reservation_expires_at is not None:
+        raise ValueError(
+            f"{transition} does not carry a reservation_expires_at"
+        )
     if reason is not None:
         cleaned = str(reason).strip()
         if not cleaned or len(cleaned) > 100:
@@ -12839,24 +12950,31 @@ def advance_run_sandbox(
         ).fetchone()
         if row is None:
             raise RunSandboxConflict(f"unknown task {task_id}")
+        current = read_run_sandbox(conn, task_id, run_id=run_id)
         active_run = (
             row["status"] == "running"
             and int(row["current_run_id"] or 0) == run_id
         )
         if not active_run:
             # A stale worker normally cannot mutate a reservation. The one
-            # narrow exception closes the remote-create/DB-commit gap: if this
-            # exact run ended while create was in flight, its still-reserved
-            # generation may record only the returned remote ID and cleanup
-            # intent. It still cannot provision or reuse the machine.
+            # narrow exceptions close the remote-create/DB-commit gap: an
+            # ended run may record only the returned remote ID and cleanup
+            # intent, or close a still-empty reservation after create never
+            # produced a handle (or that exact unrecorded handle was safely
+            # killed). It still cannot provision or reuse a machine.
             ended = conn.execute(
                 "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
                 "AND ended_at IS NOT NULL",
                 (run_id, task_id),
             ).fetchone()
-            if transition != "sandbox_created" or ended is None:
+            late_create = transition == "sandbox_created" and ended is not None
+            settled_empty_reservation = (
+                transition == "sandbox_released"
+                and ended is not None
+                and current["state"] == "reserved"
+            )
+            if not (late_create or settled_empty_reservation):
                 raise RunSandboxConflict("this run is no longer the task's active run")
-        current = read_run_sandbox(conn, task_id, run_id=run_id)
         if current["generation"] != expected_generation:
             raise RunSandboxConflict(
                 "this run's sandbox reservation advanced concurrently"
@@ -17926,12 +18044,27 @@ def gc_events(
     """Delete task_events rows older than ``older_than_seconds`` for tasks
     in a terminal state (``done`` or ``archived``). Returns the number of
     rows deleted. Running / ready / blocked tasks keep their full event
-    history."""
+    history. The latest sandbox lifecycle event for each run is retained
+    regardless of age: this bounded one-row fold head classifies deletion and
+    cleanup authority, including malformed events that must fail closed.
+    """
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
+            "AND NOT (run_id IS NOT NULL AND kind IN ("
+            " 'sandbox_reserved', 'sandbox_created', "
+            " 'sandbox_provisioned', 'sandbox_released'"
+            ") AND NOT EXISTS ("
+            " SELECT 1 FROM task_events AS later "
+            " WHERE later.task_id = task_events.task_id "
+            " AND later.run_id = task_events.run_id AND later.id > task_events.id "
+            " AND later.kind IN ("
+            "  'sandbox_reserved', 'sandbox_created', "
+            "  'sandbox_provisioned', 'sandbox_released'"
+            " )"
+            "))",
             (cutoff,),
         )
     return int(cur.rowcount or 0)
