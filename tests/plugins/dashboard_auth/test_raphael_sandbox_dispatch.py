@@ -212,10 +212,14 @@ class FakeSandbox:
 
     @classmethod
     def connect(cls, sandbox_id, **kwargs):
+        from opensandbox.exceptions import SandboxApiException
+
         cls.connect_calls.append({"sandbox_id": sandbox_id, **kwargs})
+        if cls.behavior.get("connect_fails"):
+            raise RuntimeError("control plane temporarily unavailable")
         box = cls.live.get(sandbox_id)
         if box is None or box.killed:
-            raise RuntimeError(f"sandbox {sandbox_id} does not exist")
+            raise SandboxApiException("gone", status_code=404)
         box.connect_kwargs = kwargs
         return box
 
@@ -247,6 +251,11 @@ class FakeSandbox:
         return self.healthy
 
     def kill(self):
+        hook = self.behavior.get("before_kill")
+        if hook is not None:
+            hook(self)
+        if self.behavior.get("kill_fails"):
+            raise RuntimeError("kill unavailable")
         self.killed = True
         type(self).live.pop(self.id, None)
 
@@ -328,9 +337,9 @@ def host(tmp_path, monkeypatch):
         _git(repo, "worktree", "add", str(worktree), "-b", f"wt/{task_id}", "HEAD")
         with kb.write_txn(conn):
             conn.execute(
-                "INSERT INTO task_runs (task_id, status, started_at) "
-                "VALUES (?, 'running', 0)",
-                (task_id,),
+                "INSERT INTO task_runs (task_id, profile, status, started_at) "
+                "VALUES (?, ?, 'running', 0)",
+                (task_id, sd.WORKER_PROFILE),
             )
             run_id = int(
                 conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
@@ -383,6 +392,48 @@ def _event_kinds(host):
             (host.task_id, host.run_id),
         ).fetchall()
     return [str(row["kind"]) for row in rows]
+
+
+def _run_cleanup_retry(board="default"):
+    sd.retry_ended_sandbox_cleanup(board=board)
+
+
+# ---------------------------------------------------------------------------
+# 0. Machine-wide host configuration
+# ---------------------------------------------------------------------------
+
+
+def _write_sandbox_config(home: Path, image: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    home.joinpath("config.yaml").write_text(
+        "raphael:\n"
+        "  sandbox:\n"
+        f"    image: {image}\n"
+        "    domain: sandbox.internal:8080\n"
+        "    protocol: https\n",
+        encoding="utf-8",
+    )
+
+
+class TestSharedHostConfig:
+    def test_shared_root_wins_for_verifier_profile(self, tmp_path, monkeypatch):
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "raphael-verifier"
+        _write_sandbox_config(root, IMAGE_REF)
+        _write_sandbox_config(profile, "registry.invalid/legacy@sha256:" + "cd" * 32)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setenv("HERMES_PROFILE", "raphael-verifier")
+
+        assert sd._load_host_config()["image"] == IMAGE_REF
+
+    def test_legacy_profile_is_a_migration_fallback(self, tmp_path, monkeypatch):
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "raphael-verifier"
+        _write_sandbox_config(profile, IMAGE_REF)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setenv("HERMES_PROFILE", "raphael-verifier")
+
+        assert sd._load_host_config()["image"] == IMAGE_REF
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +596,9 @@ class TestProvision:
             "sandbox_token_is_placeholder": True,
             "source_is_tracked_head_only": True,
             "source_tree_clean": True,
+            "host_patch_import_authorized": True,
+            "automatic_run_cleanup": True,
+            "manual_sandbox_management_blocked": True,
             "baseline_write_bits_removed": True,
             "idempotent_reuse": False,
         }
@@ -1292,6 +1346,40 @@ class TestFailureCleanup:
         assert len(FakeSandbox.created) == 2
         assert _reservation(host)["generation"] == 2
 
+    def test_failed_setup_and_kill_retains_id_for_restart_cleanup(self, host, sdk):
+        FakeSandbox.behavior = {"vault_fails": True, "kill_fails": True}
+        out = _provision()
+        assert "error" in out
+        box = FakeSandbox.created[0]
+        assert box.killed is False
+        assert _reservation(host) == {
+            "generation": 1,
+            "state": "created",
+            "sandbox_id": box.id,
+            "receipt": None,
+        }
+        with kb.connect_closing() as conn:
+            intent = conn.execute(
+                "SELECT sandbox_id FROM run_sandbox_cleanup_intents "
+                "WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            ).fetchone()
+            assert intent["sandbox_id"] == box.id
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_runs SET status='done', outcome='failed', ended_at=1 "
+                    "WHERE id=?",
+                    (host.run_id,),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status='blocked', current_run_id=NULL WHERE id=?",
+                    (host.task_id,),
+                )
+        FakeSandbox.behavior["kill_fails"] = False
+        _run_cleanup_retry()
+        assert box.killed is True
+        assert _reservation(host)["state"] == "released"
+
 
 class TestUnexpectedFailureEvent:
     def test_the_unexpected_path_logs_only_the_exception_type(
@@ -1338,7 +1426,9 @@ class TestNativeAuthority:
         assert record["generation"] == 1
         assert record["sandbox_id"] == "sbx-001"
         assert record["receipt"] == out
-        assert _event_kinds(host) == ["sandbox_reserved", "sandbox_provisioned"]
+        assert _event_kinds(host) == [
+            "sandbox_reserved", "sandbox_created", "sandbox_provisioned",
+        ]
 
     def test_no_side_json_ledger_is_written(self, host, sdk):
         _provision()
@@ -1359,7 +1449,9 @@ class TestNativeAuthority:
             "sandbox_id": None,
             "receipt": None,
         }
-        assert _event_kinds(host) == ["sandbox_reserved", "sandbox_released"]
+        assert _event_kinds(host) == [
+            "sandbox_reserved", "sandbox_created", "sandbox_released",
+        ]
 
     def test_the_board_is_the_only_thing_a_new_process_needs(self, host, sdk):
         first = _provision()
@@ -1383,7 +1475,9 @@ class TestIdempotentReuse:
         assert second["source_commit"] == first["source_commit"]
         assert second["policy"]["idempotent_reuse"] is True
         assert first["policy"]["idempotent_reuse"] is False
-        assert _event_kinds(host) == ["sandbox_reserved", "sandbox_provisioned"]
+        assert _event_kinds(host) == [
+            "sandbox_reserved", "sandbox_created", "sandbox_provisioned",
+        ]
 
     def test_reuse_proves_liveness_over_the_trusted_connection(self, host, sdk):
         _provision()
@@ -1436,8 +1530,9 @@ class TestReplacement:
         assert out["sandbox_id"] == "sbx-002"
         assert len(FakeSandbox.created) == 2
         assert _event_kinds(host) == [
-            "sandbox_reserved", "sandbox_provisioned",
-            "sandbox_released", "sandbox_reserved", "sandbox_provisioned",
+            "sandbox_reserved", "sandbox_created", "sandbox_provisioned",
+            "sandbox_released", "sandbox_reserved", "sandbox_created",
+            "sandbox_provisioned",
         ]
         record = _reservation(host)
         assert record["generation"] == 2
@@ -1472,10 +1567,34 @@ class TestReplacement:
         )
         self._assert_replaced(host, _provision())
 
-    def test_a_machine_whose_info_is_unreadable_is_replaced(self, host, sdk):
+    def test_a_machine_whose_info_is_unreadable_retains_cleanup_authority(
+        self, host, sdk,
+    ):
         _provision()
-        self._break(host, info_fails=True)
-        self._assert_replaced(host, _provision())
+        box = self._break(host, info_fails=True)
+        out = _provision()
+        assert "error" in out
+        assert len(FakeSandbox.created) == 1
+        assert box.killed is False
+        assert _reservation(host)["state"] == "active"
+
+    def test_a_transient_connect_failure_retains_cleanup_authority(self, host, sdk):
+        _provision()
+        FakeSandbox.behavior["connect_fails"] = True
+        out = _provision()
+        assert "error" in out
+        assert len(FakeSandbox.created) == 1
+        assert _reservation(host)["state"] == "active"
+
+    def test_a_failed_retirement_kill_retains_cleanup_authority(self, host, sdk):
+        _provision()
+        box = self._break(host, state="TERMINATED")
+        FakeSandbox.behavior["kill_fails"] = True
+        out = _provision()
+        assert "error" in out
+        assert len(FakeSandbox.created) == 1
+        assert box.killed is False
+        assert _reservation(host)["state"] == "active"
 
     def test_a_stopped_machine_is_killed_because_it_is_provably_this_runs(
         self, host, sdk
@@ -1493,7 +1612,9 @@ class TestReplacement:
         out = _provision()
         assert box.killed is False
         assert box.closed is True
-        self._assert_replaced(host, out)
+        assert "error" in out
+        assert len(FakeSandbox.created) == 1
+        assert _reservation(host)["state"] == "active"
 
     def test_a_malformed_recorded_receipt_is_never_reused(self, host, sdk):
         _provision()
@@ -1583,7 +1704,175 @@ class TestConcurrency:
 
         FakeSandbox.behavior = {"after_create": _winner_settles_first}
         _provision()
-        assert _event_kinds(host) == ["sandbox_reserved", "sandbox_provisioned"]
+        assert _event_kinds(host) == [
+            "sandbox_reserved",
+            "sandbox_provisioned",
+            "sandbox_orphan_cleanup_pending",
+            "sandbox_orphan_released",
+        ]
+
+    @pytest.mark.parametrize("delete_path", ["hard", "archive_then_purge"])
+    def test_remote_create_inflight_blocks_deletion_until_cleanup(
+        self, host, sdk, delete_path,
+    ):
+        deletion_results = []
+
+        def _attempt_delete_after_allocation(_box):
+            # FakeSandbox invokes this after the remote allocation exists but
+            # before create() returns its handle to the provisioner: the exact
+            # pre-ID persistence window from the regression.
+            with kb.connect_closing() as conn:
+                if delete_path == "hard":
+                    deletion_results.append(kb.delete_task(conn, host.task_id))
+                    if not deletion_results[-1]:
+                        assert kb.archive_task(conn, host.task_id)
+                else:
+                    assert kb.archive_task(conn, host.task_id)
+                    deletion_results.append(
+                        kb.delete_archived_task(conn, host.task_id)
+                    )
+
+        FakeSandbox.behavior = {
+            "after_create": _attempt_delete_after_allocation,
+            "kill_fails": True,
+        }
+        out = _provision()
+        assert "error" in out
+        assert deletion_results == [False]
+        box = FakeSandbox.created[0]
+        assert box.killed is False
+        assert box.vault_calls == []
+        assert box.uploads == []
+        assert box.commands_log == []
+
+        # The task/run survived long enough for the exact returned ID to become
+        # canonical cleanup authority, even though compensating kill failed.
+        with kb.connect_closing() as conn:
+            task = kb.get_task(conn, host.task_id)
+            assert task is not None
+            assert task.status == "archived"
+            intent = conn.execute(
+                "SELECT sandbox_id, generation, attempt_count "
+                "FROM run_sandbox_cleanup_intents "
+                "WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            ).fetchone()
+            assert dict(intent) == {
+                "sandbox_id": box.id,
+                "generation": 1,
+                "attempt_count": 0,
+            }
+            assert kb.delete_archived_task(conn, host.task_id) is False
+
+        # A later dispatcher process can reconnect, clean the exact machine,
+        # record release, and only then permit permanent deletion.
+        FakeSandbox.behavior["kill_fails"] = False
+        sd.retry_ended_sandbox_cleanup(board="default")
+        assert box.killed is True
+        with kb.connect_closing() as conn:
+            assert conn.execute(
+                "SELECT 1 FROM run_sandbox_cleanup_intents "
+                "WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            ).fetchone() is None
+            assert kb.delete_archived_task(conn, host.task_id) is True
+
+    def test_archive_during_create_records_confirmed_cleanup_synchronously(
+        self, host, sdk,
+    ):
+        purge_results = []
+
+        def _archive_after_allocation(_box):
+            with kb.connect_closing() as conn:
+                assert kb.archive_task(conn, host.task_id)
+                purge_results.append(
+                    kb.delete_archived_task(conn, host.task_id)
+                )
+
+        FakeSandbox.behavior = {"after_create": _archive_after_allocation}
+        out = _provision()
+        assert "error" in out
+        assert purge_results == [False]
+        box = FakeSandbox.created[0]
+        assert box.killed is True
+        assert box.vault_calls == []
+        assert box.uploads == []
+        assert box.commands_log == []
+        with kb.connect_closing() as conn:
+            assert kb.read_run_sandbox(
+                conn, host.task_id, run_id=host.run_id,
+            )["state"] == "released"
+            assert conn.execute(
+                "SELECT 1 FROM run_sandbox_cleanup_intents "
+                "WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            ).fetchone() is None
+            assert kb.delete_archived_task(conn, host.task_id) is True
+
+    def test_lost_post_create_cas_and_failed_kill_remain_restart_cleanable(
+        self, host, sdk
+    ):
+        authority_visible_before_kill = []
+
+        def _winner_settles_first(box):
+            with kb.connect_closing() as conn:
+                kb.advance_run_sandbox(
+                    conn, host.task_id, run_id=host.run_id,
+                    transition="sandbox_provisioned", expected_generation=1,
+                    sandbox_id="sbx-winner",
+                    receipt={
+                        "sandbox_id": "sbx-winner",
+                        "image_digest": IMAGE_DIGEST,
+                    },
+                )
+
+        def _assert_authority_precedes_kill(box):
+            with kb.connect_closing() as conn:
+                row = conn.execute(
+                    "SELECT sandbox_id FROM run_sandbox_orphan_cleanup_intents "
+                    "WHERE task_id=? AND run_id=?",
+                    (host.task_id, host.run_id),
+                ).fetchone()
+            authority_visible_before_kill.append(row["sandbox_id"] == box.id)
+
+        FakeSandbox.behavior = {
+            "after_create": _winner_settles_first,
+            "before_kill": _assert_authority_precedes_kill,
+            "kill_fails": True,
+        }
+        out = _provision()
+        assert "error" in out
+        loser = FakeSandbox.created[0]
+        assert loser.killed is False
+        assert authority_visible_before_kill == [True]
+        with kb.connect_closing() as conn:
+            orphan = conn.execute(
+                "SELECT sandbox_id, generation, attempt_count "
+                "FROM run_sandbox_orphan_cleanup_intents "
+                "WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            ).fetchone()
+            assert dict(orphan) == {
+                "sandbox_id": loser.id,
+                "generation": 1,
+                "attempt_count": 0,
+            }
+            assert kb.delete_task(conn, host.task_id) is False
+
+        # A later dispatcher process can clean the losing allocation without
+        # touching the canonical winner, even while the run is still active.
+        FakeSandbox.behavior["kill_fails"] = False
+        sd.retry_ended_sandbox_cleanup(board="default")
+        assert loser.killed is True
+        with kb.connect_closing() as conn:
+            assert conn.execute(
+                "SELECT 1 FROM run_sandbox_orphan_cleanup_intents "
+                "WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            ).fetchone() is None
+        record = _reservation(host)
+        assert record["state"] == "active"
+        assert record["sandbox_id"] == "sbx-winner"
 
 
 # ---------------------------------------------------------------------------
@@ -1695,6 +1984,11 @@ class TestPluginRegistration:
         assert hooks == [
             ("pre_runtime_turn", sd.enforce_sandbox_runtime),
             ("pre_tool_call", sd.maintain_sandbox_lease),
+            ("on_session_end", sd.cleanup_sandbox_on_session_end),
+            ("kanban_task_completed", sd.cleanup_sandbox_on_task_completed),
+            ("on_kanban_worker_exited", sd.cleanup_sandbox_on_worker_exited),
+            ("on_kanban_worker_stale_claim", sd.cleanup_sandbox_on_stale_claim),
+            ("on_kanban_dispatch_tick", sd.retry_ended_sandbox_cleanup),
         ]
 
     def test_manifest_declares_a_bounded_plugin_dependency(self):
@@ -1767,7 +2061,10 @@ def test_artifact_round_trip_moves_real_bytes_without_model_text(host, sdk):
 def test_verification_role_gets_same_scoped_sandbox_without_coding_credentials(host, sdk, monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE", "raphael-verifier")
     with kb.connect_closing() as conn:
-        conn.execute("UPDATE tasks SET assignee=? WHERE id=?", ("raphael-verifier", host.task_id))
+        conn.execute(
+            "UPDATE tasks SET assignee=?, owned_paths='[]' WHERE id=?",
+            ("raphael-verifier", host.task_id),
+        )
         conn.commit()
     out = _provision()
     assert "sandbox_id" in out, out
@@ -1775,6 +2072,167 @@ def test_verification_role_gets_same_scoped_sandbox_without_coding_credentials(h
     assert box.reported_metadata["hermes_profile"] == "raphael-verifier"
     assert box.create_kwargs["env"] == {}
     assert box.vault_calls == []
+    assert out["ownership_scope"] == []
+    assert out["policy"]["host_patch_import_authorized"] is False
+    assert out["policy"]["automatic_run_cleanup"] is True
+
+
+def test_review_run_keeps_implementer_scope_but_gets_no_patch_authority(
+    host, sdk, monkeypatch,
+):
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, host.task_id).owned_paths == ["."]
+        assert kb.request_review(
+            conn,
+            host.task_id,
+            summary="Implementation is ready for independent review.",
+            reviewer="raphael-verifier",
+            expected_run_id=host.run_id,
+        )
+        claimed = kb.claim_review_task(
+            conn, host.task_id, claimer="reviewer:test",
+        )
+        assert claimed is not None
+        review_run_id = claimed.current_run_id
+        assert review_run_id is not None
+        assert kb.get_task(conn, host.task_id).owned_paths == ["."]
+
+    monkeypatch.setenv("HERMES_PROFILE", "raphael-verifier")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review_run_id))
+    out = _provision()
+    assert out["ownership_scope"] == []
+    assert out["policy"]["host_patch_import_authorized"] is False
+
+    with kb.connect_closing() as conn:
+        attachment_id = kb.store_attachment_bytes(
+            conn,
+            host.task_id,
+            "review.patch",
+            b"review must not write the implementation tree",
+            uploaded_by="agent",
+            expected_run_id=review_run_id,
+        )
+        with pytest.raises(
+            kb.WorktreeScopeError,
+            match="read-only runs",
+        ):
+            kb.complete_task(
+                conn,
+                host.task_id,
+                summary="Reviewed.",
+                patch_attachment_id=attachment_id,
+                expected_run_id=review_run_id,
+                fire_lifecycle_hook=False,
+            )
+        with pytest.raises(
+            kb.WorktreeScopeError,
+            match="read-only runs",
+        ):
+            kb.complete_task(
+                conn,
+                host.task_id,
+                summary="Reviewed.",
+                merge_parent_heads=True,
+                expected_run_id=review_run_id,
+                fire_lifecycle_hook=False,
+            )
+        assert kb.get_task(conn, host.task_id).status == "running"
+        assert kb.get_task(conn, host.task_id).owned_paths == ["."]
+
+
+def test_standalone_verifier_run_cannot_materialize_patch_or_parent_heads(host):
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee='raphael-verifier', owned_paths='[\".\"]', "
+                "integrates_parent_heads=1 WHERE id=?",
+                (host.task_id,),
+            )
+            conn.execute(
+                "UPDATE task_runs SET profile='raphael-verifier' WHERE id=?",
+                (host.run_id,),
+            )
+        attachment_id = kb.store_attachment_bytes(
+            conn,
+            host.task_id,
+            "standalone-verifier.patch",
+            b"untrusted verifier patch",
+            uploaded_by="agent",
+            expected_run_id=host.run_id,
+        )
+        for materialization in (
+            {"patch_attachment_id": attachment_id},
+            {"merge_parent_heads": True},
+        ):
+            with pytest.raises(kb.WorktreeScopeError, match="read-only runs"):
+                kb.complete_task(
+                    conn,
+                    host.task_id,
+                    summary="Reviewed.",
+                    expected_run_id=host.run_id,
+                    fire_lifecycle_hook=False,
+                    **materialization,
+                )
+        assert kb.complete_task(
+            conn,
+            host.task_id,
+            summary="Read-only verdict recorded without host materialization.",
+            expected_run_id=host.run_id,
+            fire_lifecycle_hook=False,
+        )
+
+
+def test_core_create_assign_and_claim_enforce_verifier_read_only_scope(host):
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match="read-only owned_paths"):
+            kb.create_task(
+                conn,
+                title="Unsafe verifier",
+                assignee="raphael-verifier",
+                workspace_kind="worktree",
+                workspace_path=str(host.worktree),
+                owned_paths=["."],
+            )
+        created = kb.create_task(
+            conn,
+            title="Safe verifier",
+            assignee="raphael-verifier",
+            owned_paths=None,
+        )
+        assert kb.get_task(conn, created).owned_paths == []
+
+        reassigned = kb.create_task(
+            conn,
+            title="Reassigned verifier",
+            assignee="raphael-builder",
+            workspace_kind="worktree",
+            workspace_path=str(host.worktree),
+            owned_paths=["."],
+        )
+        assert kb.assign_task(conn, reassigned, "raphael-verifier")
+        task = kb.get_task(conn, reassigned)
+        assert task.owned_paths == []
+        assert task.integrates_parent_heads is False
+
+        drifted = kb.create_task(
+            conn,
+            title="Drifted verifier",
+            assignee="raphael-builder",
+            workspace_kind="worktree",
+            workspace_path=str(host.worktree),
+            owned_paths=["."],
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee='raphael-verifier', "
+                "integrates_parent_heads=1 WHERE id=?",
+                (drifted,),
+            )
+        claimed = kb.claim_task(conn, drifted, claimer="verifier:test")
+        assert claimed is not None
+        claimed = kb.get_task(conn, drifted)
+        assert claimed.owned_paths == []
+        assert claimed.integrates_parent_heads is False
 
 
 def test_active_sandbox_is_renewed_before_the_lease_expires(host, sdk):
@@ -1790,6 +2248,225 @@ def test_active_sandbox_is_renewed_before_the_lease_expires(host, sdk):
     )
     assert result is None, result
     assert box.renewals == [sd.SANDBOX_TIMEOUT_SECONDS]
+
+
+def test_session_end_kills_and_releases_the_active_run_sandbox(host, sdk):
+    _provision()
+    box = FakeSandbox.created[-1]
+    assert _reservation(host)["state"] == "active"
+
+    sd.cleanup_sandbox_on_session_end()
+
+    assert box.killed is True
+    assert _reservation(host)["state"] == "released"
+    assert _event_kinds(host).count("sandbox_released") == 1
+    # Lifecycle hooks are best-effort and can overlap. A second callback is a
+    # no-op, not a second kill or a second durable release.
+    sd.cleanup_sandbox_on_session_end()
+    assert _event_kinds(host).count("sandbox_released") == 1
+
+
+def test_completed_task_hook_cleans_the_exact_ended_run(host, sdk):
+    _provision()
+    box = FakeSandbox.created[-1]
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='done', outcome='completed', ended_at=1 "
+                "WHERE id=?",
+                (host.run_id,),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (host.task_id,),
+            )
+
+    sd.cleanup_sandbox_on_task_completed(
+        task_id=host.task_id,
+        run_id=host.run_id,
+        board="default",
+        assignee=sd.WORKER_PROFILE,
+        profile_name=sd.WORKER_PROFILE,
+    )
+
+    assert box.killed is True
+    assert _reservation(host)["state"] == "released"
+    assert _event_kinds(host).count("sandbox_released") == 1
+
+
+def test_dispatch_tick_retries_ended_run_cleanup_until_release_is_durable(
+    host, sdk,
+):
+    _provision()
+    box = FakeSandbox.created[-1]
+    original_kill = box.kill
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET profile=?, status='done', "
+                "outcome='completed', ended_at=1 WHERE id=?",
+                (sd.WORKER_PROFILE, host.run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (host.task_id,),
+            )
+
+    def transient_failure():
+        raise RuntimeError("temporary control-plane failure")
+
+    box.kill = transient_failure
+    _run_cleanup_retry()
+    assert _reservation(host)["state"] == "active"
+    assert box.killed is False
+
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE run_sandbox_cleanup_intents "
+                "SET next_attempt_at=0 WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            )
+    box.kill = original_kill
+    _run_cleanup_retry()
+    assert box.killed is True
+    assert _reservation(host)["state"] == "released"
+    assert _event_kinds(host).count("sandbox_released") == 1
+
+
+def test_dispatch_tick_records_officially_confirmed_absence(
+    host, sdk, monkeypatch,
+):
+    from opensandbox.exceptions import SandboxApiException
+
+    _provision()
+    box = FakeSandbox.created[-1]
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET profile=?, status='done', "
+                "outcome='completed', ended_at=1 WHERE id=?",
+                (sd.WORKER_PROFILE, host.run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (host.task_id,),
+            )
+    FakeSandbox.live.pop(box.id)
+
+    def absent(_cls, _sandbox_id, **_kwargs):
+        raise SandboxApiException("gone", status_code=404)
+
+    monkeypatch.setattr(FakeSandbox, "connect", classmethod(absent))
+    _run_cleanup_retry()
+
+    assert _reservation(host)["state"] == "released"
+    assert _event_kinds(host).count("sandbox_released") == 1
+
+
+def test_one_shot_dispatch_uses_strict_native_timeouts_and_finishes_cleanup(
+    host, sdk,
+):
+    _provision()
+    box = FakeSandbox.created[-1]
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET profile=?, status='done', "
+                "outcome='completed', ended_at=1 WHERE id=?",
+                (sd.WORKER_PROFILE, host.run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (host.task_id,),
+            )
+
+    _run_cleanup_retry()
+    assert _reservation(host)["state"] == "released"
+    assert box.killed is True
+    call = FakeSandbox.connect_calls[-1]
+    assert call["connect_timeout"] == timedelta(
+        seconds=sd.SANDBOX_CLEANUP_CONNECT_TIMEOUT_SECONDS,
+    )
+    assert call["connection_config"].request_timeout == timedelta(
+        seconds=sd.SANDBOX_CLEANUP_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert call["skip_health_check"] is True
+
+
+def test_durable_retry_schedule_reaches_newer_cleanup_after_four_poisoned_rows(
+    host, sdk,
+):
+    with kb.connect_closing() as conn:
+        for index in range(4):
+            task_id = kb.create_task(
+                conn,
+                title=f"poisoned cleanup {index}",
+                assignee="unadmitted-profile",
+            )
+            with kb.write_txn(conn):
+                cursor = conn.execute(
+                    "INSERT INTO task_runs "
+                    "(task_id, profile, status, started_at) "
+                    "VALUES (?, 'unadmitted-profile', 'running', 0)",
+                    (task_id,),
+                )
+                run_id = int(cursor.lastrowid)
+                conn.execute(
+                    "UPDATE tasks SET status='running', current_run_id=? "
+                    "WHERE id=?",
+                    (run_id, task_id),
+                )
+            kb.advance_run_sandbox(
+                conn,
+                task_id,
+                run_id=run_id,
+                transition="sandbox_reserved",
+                expected_generation=0,
+            )
+            kb.advance_run_sandbox(
+                conn,
+                task_id,
+                run_id=run_id,
+                transition="sandbox_provisioned",
+                expected_generation=1,
+                sandbox_id=f"poison-{index}",
+                receipt={"sandbox_id": f"poison-{index}"},
+            )
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_runs SET status='done', "
+                    "outcome='completed', ended_at=1 WHERE id=?",
+                    (run_id,),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status='done', current_run_id=NULL "
+                    "WHERE id=?",
+                    (task_id,),
+                )
+
+    _provision()
+    box = FakeSandbox.created[-1]
+    with kb.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET profile=?, status='done', "
+                "outcome='completed', ended_at=1 WHERE id=?",
+                (sd.WORKER_PROFILE, host.run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (host.task_id,),
+            )
+
+    for _ in range(4):
+        _run_cleanup_retry()
+    assert box.killed is False
+    assert _reservation(host)["state"] == "active"
+
+    _run_cleanup_retry()
+    assert box.killed is True
+    assert _reservation(host)["state"] == "released"
 
 
 @pytest.mark.parametrize("tool_name", [
@@ -1811,7 +2488,9 @@ def test_generic_opensandbox_requires_this_runs_active_sandbox(host, tool_name):
 
 
 @pytest.mark.parametrize("server_alias", ["opensandbox_agent_factory", "sandbox"])
-@pytest.mark.parametrize("operation", ["sandbox_create", "sandbox_list"])
+@pytest.mark.parametrize(
+    "operation", ["sandbox_create", "sandbox_list", "sandbox_kill", "sandbox_renew"],
+)
 def test_generic_opensandbox_cannot_manage_sandboxes(host, server_alias, operation):
     result = sd.maintain_sandbox_lease(
         tool_name=f"mcp__{server_alias}__{operation}", args={},
@@ -2233,7 +2912,7 @@ def _replacement_artifact_context(host, monkeypatch, profile, responsibility):
         "model_policy_lock": kb.mint_policy_lock(
             profile, route.provider, route.model, route.reasoning_effort, "deep",
         ),
-        "owned_paths": ["."],
+        "owned_paths": [] if profile == "raphael-verifier" else ["."],
     }
     data = json.dumps({"original_input": "preserved exactly"}).encode()
     with kb.connect_closing() as conn:

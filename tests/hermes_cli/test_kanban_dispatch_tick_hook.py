@@ -120,6 +120,7 @@ def test_no_subscriber_short_circuits_tick_hook(kanban_home, monkeypatch):
         return real_invoke(hook_name, **kw)
 
     monkeypatch.setattr(lifecycle, "invoke_hook", _spy)
+    monkeypatch.setattr(kb, "_kanban_observer_consumed", lambda _event: False)
     conn = kb.connect()
     try:
         kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
