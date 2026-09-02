@@ -281,6 +281,40 @@ def test_ended_run_cleanup_releases_only_its_own_active_sandbox(running_task):
         )["state"] == "absent"
 
 
+def test_create_returned_after_run_end_still_records_cleanup_authority(running_task):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_reserved", expected_generation=0,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='done', outcome='completed', ended_at=1 "
+                "WHERE id=?",
+                (run_id,),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (task_id,),
+            )
+        created = kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_created", expected_generation=1,
+            sandbox_id="sbx-late-create",
+        )
+        assert created["state"] == "created"
+        intent = conn.execute(
+            "SELECT sandbox_id, generation FROM run_sandbox_cleanup_intents "
+            "WHERE task_id=? AND run_id=?",
+            (task_id, run_id),
+        ).fetchone()
+        assert dict(intent) == {
+            "sandbox_id": "sbx-late-create",
+            "generation": 1,
+        }
+
+
 def test_task_deletion_waits_for_durable_sandbox_release(running_task):
     task_id, run_id = running_task
     with kb.connect() as conn:
@@ -408,7 +442,9 @@ def test_migration_backfills_a_pre_intent_table_active_machine(
         }
 
 
-def test_cleanup_reconciliation_runs_after_legacy_id_rebuild(running_task):
+def test_cleanup_reconciliation_recovers_a_crash_after_legacy_id_rebuild(
+    running_task, monkeypatch,
+):
     task_id, run_id = running_task
     with kb.connect() as conn:
         kb.advance_run_sandbox(
@@ -469,6 +505,23 @@ def test_cleanup_reconciliation_runs_after_legacy_id_rebuild(running_task):
                 (tuple(row[name] for name in event_columns) for row in events),
             )
 
+        original_reconcile = kb._reconcile_run_sandbox_cleanup_intents
+
+        def crash_before_reconcile(*_args, **_kwargs):
+            raise RuntimeError("crash after rebuild commit")
+
+        monkeypatch.setattr(
+            kb, "_reconcile_run_sandbox_cleanup_intents", crash_before_reconcile,
+        )
+        with pytest.raises(RuntimeError, match="crash after rebuild commit"):
+            kb._migrate_add_optional_columns(conn)
+        assert conn.execute(
+            "SELECT 1 FROM kanban_migration_markers WHERE name=?",
+            (kb._SANDBOX_CLEANUP_BACKFILL_MARKER,),
+        ).fetchone() is None
+        monkeypatch.setattr(
+            kb, "_reconcile_run_sandbox_cleanup_intents", original_reconcile,
+        )
         kb._migrate_add_optional_columns(conn)
 
         assert conn.execute(
@@ -606,6 +659,63 @@ def test_cleanup_retry_exhaustion_leaves_authority_but_exits_due_queue(running_t
             expected_generation=1, reason="manual_cleanup",
         )
         assert released["state"] == "released"
+
+
+def test_final_cleanup_lease_crash_exhausts_before_attempt_nine(running_task):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_reserved", expected_generation=0,
+        )
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_created", expected_generation=1,
+            sandbox_id="sbx-final-lease",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='done', outcome='completed', ended_at=1 "
+                "WHERE id=?",
+                (run_id,),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (task_id,),
+            )
+        for attempt in range(1, kb.RUN_SANDBOX_CLEANUP_MAX_ATTEMPTS):
+            now = attempt * 10_000
+            claimed = kb.claim_ended_run_sandbox_cleanups(conn, now=now)
+            assert claimed[0]["attempt_count"] == attempt
+            assert kb.defer_run_sandbox_cleanup(
+                conn, task_id, run_id, reason="transient", now=now,
+            )
+
+        final_now = kb.RUN_SANDBOX_CLEANUP_MAX_ATTEMPTS * 10_000
+        final = kb.claim_ended_run_sandbox_cleanups(
+            conn, now=final_now, lease_seconds=30,
+        )
+        assert final[0]["attempt_count"] == kb.RUN_SANDBOX_CLEANUP_MAX_ATTEMPTS
+        assert kb.claim_ended_run_sandbox_cleanups(conn, now=final_now + 29) == []
+        assert kb.claim_ended_run_sandbox_cleanups(conn, now=final_now + 30) == []
+        row = conn.execute(
+            "SELECT attempt_count, exhausted_at, last_error "
+            "FROM run_sandbox_cleanup_intents WHERE task_id=? AND run_id=?",
+            (task_id, run_id),
+        ).fetchone()
+        assert dict(row) == {
+            "attempt_count": kb.RUN_SANDBOX_CLEANUP_MAX_ATTEMPTS,
+            "exhausted_at": final_now + 30,
+            "last_error": "final_attempt_lease_expired",
+        }
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='sandbox_cleanup_exhausted' ORDER BY id",
+            (task_id, run_id),
+        ).fetchall()
+        assert len(events) == 1
+        assert json.loads(events[0]["payload"])["attempt_count"] == 8
+        assert kb.delete_task(conn, task_id) is False
 
 
 def test_a_run_that_is_no_longer_active_cannot_reserve(running_task):

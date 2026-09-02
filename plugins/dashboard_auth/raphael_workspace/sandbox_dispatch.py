@@ -71,7 +71,10 @@ into ``run_sandbox_cleanup_intents``. That table grants no machine authority:
 it is a bounded durable scheduler for ended-run cleanup, deleted by the exact
 ``sandbox_released`` transition. Exhausted automatic cleanup remains visible
 and deletion-protecting until an operator resolves it. The event fold remains
-the liveness proof.
+the liveness proof. A physical allocation that loses the post-create CAS is
+not another candidate authority; its ID is retained separately in
+``run_sandbox_orphan_cleanup_intents`` only so bounded cleanup can kill that
+loser without replacing or releasing the canonical winner.
 
 Fail-closed everywhere
 ----------------------
@@ -1308,6 +1311,132 @@ def _record_cleaned_release(
     return settled.get("state") == "released"
 
 
+def _record_orphan_cleanup(
+    ctx: _WorkerContext,
+    generation: int,
+    sandbox_id: str,
+    reason: str,
+) -> bool:
+    """Persist a losing remote allocation without touching the winner."""
+    kb = _kanban()
+    try:
+        with kb.connect_closing(board=ctx.board) as conn:
+            return kb.record_run_sandbox_orphan_cleanup(
+                conn,
+                ctx.task_id,
+                run_id=ctx.run_id,
+                generation=generation,
+                sandbox_id=sandbox_id,
+                reason=reason,
+            ) or conn.execute(
+                "SELECT 1 FROM run_sandbox_orphan_cleanup_intents "
+                "WHERE task_id = ? AND run_id = ? AND sandbox_id = ?",
+                (ctx.task_id, ctx.run_id, sandbox_id),
+            ).fetchone() is not None
+    except Exception:
+        logger.warning(
+            "raphael orphan sandbox cleanup authority could not be recorded "
+            "for task=%s run=%s",
+            ctx.task_id,
+            ctx.run_id,
+        )
+        return False
+
+
+def _record_orphan_release(
+    ctx: _WorkerContext,
+    sandbox_id: str,
+    reason: str,
+) -> bool:
+    kb = _kanban()
+    try:
+        with kb.connect_closing(board=ctx.board) as conn:
+            return kb.release_run_sandbox_orphan_cleanup(
+                conn,
+                ctx.task_id,
+                ctx.run_id,
+                sandbox_id,
+                reason=reason,
+            )
+    except Exception:
+        logger.warning(
+            "raphael orphan sandbox cleanup receipt failed for task=%s run=%s",
+            ctx.task_id,
+            ctx.run_id,
+        )
+        return False
+
+
+def _cleanup_orphan_sandbox(
+    ctx: _WorkerContext,
+    item: dict,
+    *,
+    reason: str,
+) -> bool:
+    """Kill one exact losing allocation without reading the winner's record."""
+    sandbox_id = item.get("sandbox_id")
+    generation = item.get("generation")
+    if (
+        not isinstance(sandbox_id, str)
+        or not sandbox_id
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+    ):
+        return False
+    try:
+        sdk = _load_sdk()
+        connection = _resolve_connection()
+    except Exception:
+        return False
+    sandbox = None
+    try:
+        sandbox = sdk.sandbox.connect(
+            sandbox_id,
+            connection_config=_cleanup_connection_config(sdk, connection),
+            connect_timeout=timedelta(
+                seconds=SANDBOX_CLEANUP_CONNECT_TIMEOUT_SECONDS,
+            ),
+            skip_health_check=True,
+        )
+    except Exception as exc:
+        if _sandbox_is_confirmed_absent(exc):
+            return _record_orphan_release(ctx, sandbox_id, "already_absent")
+        return False
+    verdict = _receipt_still_holds(
+        sandbox,
+        ctx,
+        {
+            "sandbox_id": sandbox_id,
+            "receipt": {
+                "sandbox_id": sandbox_id,
+                "image_digest": connection.image_digest,
+            },
+        },
+        minimum_remaining=0,
+    )
+    if verdict == "absent":
+        _close_quietly(sandbox)
+        return _record_orphan_release(ctx, sandbox_id, "already_absent")
+    if verdict == "foreign":
+        _close_quietly(sandbox)
+        _log_event(
+            ctx,
+            "orphan_cleanup_refused",
+            level=logging.WARNING,
+            generation=generation,
+            reason="ownership_unverified",
+        )
+        return False
+    try:
+        sandbox.kill()
+    except Exception as exc:
+        if not _sandbox_is_confirmed_absent(exc):
+            _close_quietly(sandbox)
+            return False
+    _close_quietly(sandbox)
+    return _record_orphan_release(ctx, sandbox_id, reason)
+
+
 def _cleanup_run_sandbox(ctx: _WorkerContext, *, reason: str) -> bool:
     """Kill only this exact run's recorded sandbox and persist the cleanup."""
     try:
@@ -1484,6 +1613,31 @@ def _defer_cleanup_retry(
         )
 
 
+def _defer_orphan_cleanup_retry(
+    ctx: _WorkerContext,
+    sandbox_id: str,
+    *,
+    reason: str,
+) -> None:
+    kb = _kanban()
+    try:
+        with kb.connect_closing(board=ctx.board) as conn:
+            kb.defer_run_sandbox_orphan_cleanup(
+                conn,
+                ctx.task_id,
+                ctx.run_id,
+                sandbox_id,
+                reason=reason,
+            )
+    except Exception:
+        logger.warning(
+            "raphael orphan sandbox cleanup retry schedule failed "
+            "for task=%s run=%s",
+            ctx.task_id,
+            ctx.run_id,
+        )
+
+
 def retry_ended_sandbox_cleanup(
     *, board: Any = None, dry_run: bool = False, **_kwargs: Any,
 ) -> None:
@@ -1494,11 +1648,17 @@ def retry_ended_sandbox_cleanup(
     kb = _kanban()
     try:
         with kb.connect_closing(board=board_name) as conn:
-            pending = kb.claim_ended_run_sandbox_cleanups(
-                conn,
-                limit=1,
-                lease_seconds=_CLEANUP_RETRY_LEASE_SECONDS,
+            pending = kb.claim_run_sandbox_orphan_cleanups(
+                conn, limit=1, lease_seconds=_CLEANUP_RETRY_LEASE_SECONDS,
             )
+            orphan = bool(pending)
+            if not pending:
+                pending = kb.claim_ended_run_sandbox_cleanups(
+                    conn,
+                    limit=1,
+                    lease_seconds=_CLEANUP_RETRY_LEASE_SECONDS,
+                )
+                orphan = False
     except Exception:
         logger.warning(
             "raphael sandbox cleanup retry could not read board=%s",
@@ -1522,9 +1682,19 @@ def retry_ended_sandbox_cleanup(
             ctx.task_id,
             ctx.run_id,
         )
-        _defer_cleanup_retry(ctx, reason="profile_unavailable")
+        if orphan:
+            _defer_orphan_cleanup_retry(
+                ctx, item["sandbox_id"], reason="profile_unavailable",
+            )
+        else:
+            _defer_cleanup_retry(ctx, reason="profile_unavailable")
         return
-    if not _cleanup_run_sandbox(ctx, reason="dispatcher_retry"):
+    if orphan:
+        if not _cleanup_orphan_sandbox(ctx, item, reason="dispatcher_retry"):
+            _defer_orphan_cleanup_retry(
+                ctx, item["sandbox_id"], reason="cleanup_retry_failed",
+            )
+    elif not _cleanup_run_sandbox(ctx, reason="dispatcher_retry"):
         _defer_cleanup_retry(ctx, reason="cleanup_retry_failed")
 
 
@@ -1810,12 +1980,23 @@ def _provision(
                     reason="provision_cleanup_unconfirmed",
                 )
             else:
+                sandbox_id = str(getattr(sandbox, "id", "") or "")
+                retained = bool(sandbox_id) and _record_orphan_cleanup(
+                    ctx,
+                    generation,
+                    sandbox_id,
+                    "allocation_record_unavailable",
+                )
                 _log_event(
                     ctx,
-                    "cleanup_untracked",
-                    level=logging.ERROR,
+                    "orphan_cleanup_pending" if retained else "cleanup_untracked",
+                    level=logging.WARNING if retained else logging.ERROR,
                     generation=generation,
-                    reason="allocation_record_unavailable",
+                    reason=(
+                        "allocation_record_unavailable"
+                        if retained
+                        else "orphan_authority_unavailable"
+                    ),
                 )
         shutil.rmtree(staging, ignore_errors=True)
 

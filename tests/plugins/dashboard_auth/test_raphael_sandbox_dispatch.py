@@ -1703,6 +1703,58 @@ class TestConcurrency:
         _provision()
         assert _event_kinds(host) == ["sandbox_reserved", "sandbox_provisioned"]
 
+    def test_lost_post_create_cas_and_failed_kill_remain_restart_cleanable(
+        self, host, sdk
+    ):
+        def _winner_settles_first(box):
+            with kb.connect_closing() as conn:
+                kb.advance_run_sandbox(
+                    conn, host.task_id, run_id=host.run_id,
+                    transition="sandbox_provisioned", expected_generation=1,
+                    sandbox_id="sbx-winner",
+                    receipt={
+                        "sandbox_id": "sbx-winner",
+                        "image_digest": IMAGE_DIGEST,
+                    },
+                )
+
+        FakeSandbox.behavior = {
+            "after_create": _winner_settles_first,
+            "kill_fails": True,
+        }
+        out = _provision()
+        assert "error" in out
+        loser = FakeSandbox.created[0]
+        assert loser.killed is False
+        with kb.connect_closing() as conn:
+            orphan = conn.execute(
+                "SELECT sandbox_id, generation, attempt_count "
+                "FROM run_sandbox_orphan_cleanup_intents "
+                "WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            ).fetchone()
+            assert dict(orphan) == {
+                "sandbox_id": loser.id,
+                "generation": 1,
+                "attempt_count": 0,
+            }
+            assert kb.delete_task(conn, host.task_id) is False
+
+        # A later dispatcher process can clean the losing allocation without
+        # touching the canonical winner, even while the run is still active.
+        FakeSandbox.behavior["kill_fails"] = False
+        sd.retry_ended_sandbox_cleanup(board="default")
+        assert loser.killed is True
+        with kb.connect_closing() as conn:
+            assert conn.execute(
+                "SELECT 1 FROM run_sandbox_orphan_cleanup_intents "
+                "WHERE task_id=? AND run_id=?",
+                (host.task_id, host.run_id),
+            ).fetchone() is None
+        record = _reservation(host)
+        assert record["state"] == "active"
+        assert record["sandbox_id"] == "sbx-winner"
+
 
 # ---------------------------------------------------------------------------
 # 12. The real SDK surface this module depends on
