@@ -1834,6 +1834,11 @@ def _provision(
                 code="reservation_lost",
             )
         created_recorded = True
+        # ``sandbox_created`` may be admitted solely to retain cleanup
+        # authority after this run ended during remote create. Re-check the
+        # exact native run before any credential, source, or command side
+        # effect; cleanup below still owns the already-recorded exact ID.
+        _resolve_task(ctx)
         _log_event(
             ctx,
             "created",

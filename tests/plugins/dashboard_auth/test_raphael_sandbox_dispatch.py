@@ -1741,6 +1741,9 @@ class TestConcurrency:
         assert deletion_results == [False]
         box = FakeSandbox.created[0]
         assert box.killed is False
+        assert box.vault_calls == []
+        assert box.uploads == []
+        assert box.commands_log == []
 
         # The task/run survived long enough for the exact returned ID to become
         # canonical cleanup authority, even though compensating kill failed.
@@ -1792,6 +1795,9 @@ class TestConcurrency:
         assert purge_results == [False]
         box = FakeSandbox.created[0]
         assert box.killed is True
+        assert box.vault_calls == []
+        assert box.uploads == []
+        assert box.commands_log == []
         with kb.connect_closing() as conn:
             assert kb.read_run_sandbox(
                 conn, host.task_id, run_id=host.run_id,
