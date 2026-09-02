@@ -251,6 +251,9 @@ class FakeSandbox:
         return self.healthy
 
     def kill(self):
+        hook = self.behavior.get("before_kill")
+        if hook is not None:
+            hook(self)
         if self.behavior.get("kill_fails"):
             raise RuntimeError("kill unavailable")
         self.killed = True
@@ -1701,11 +1704,18 @@ class TestConcurrency:
 
         FakeSandbox.behavior = {"after_create": _winner_settles_first}
         _provision()
-        assert _event_kinds(host) == ["sandbox_reserved", "sandbox_provisioned"]
+        assert _event_kinds(host) == [
+            "sandbox_reserved",
+            "sandbox_provisioned",
+            "sandbox_orphan_cleanup_pending",
+            "sandbox_orphan_released",
+        ]
 
     def test_lost_post_create_cas_and_failed_kill_remain_restart_cleanable(
         self, host, sdk
     ):
+        authority_visible_before_kill = []
+
         def _winner_settles_first(box):
             with kb.connect_closing() as conn:
                 kb.advance_run_sandbox(
@@ -1718,14 +1728,25 @@ class TestConcurrency:
                     },
                 )
 
+        def _assert_authority_precedes_kill(box):
+            with kb.connect_closing() as conn:
+                row = conn.execute(
+                    "SELECT sandbox_id FROM run_sandbox_orphan_cleanup_intents "
+                    "WHERE task_id=? AND run_id=?",
+                    (host.task_id, host.run_id),
+                ).fetchone()
+            authority_visible_before_kill.append(row["sandbox_id"] == box.id)
+
         FakeSandbox.behavior = {
             "after_create": _winner_settles_first,
+            "before_kill": _assert_authority_precedes_kill,
             "kill_fails": True,
         }
         out = _provision()
         assert "error" in out
         loser = FakeSandbox.created[0]
         assert loser.killed is False
+        assert authority_visible_before_kill == [True]
         with kb.connect_closing() as conn:
             orphan = conn.execute(
                 "SELECT sandbox_id, generation, attempt_count "

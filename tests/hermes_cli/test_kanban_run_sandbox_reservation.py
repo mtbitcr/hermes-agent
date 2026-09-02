@@ -404,6 +404,50 @@ def test_ended_active_sandbox_is_a_bounded_durable_cleanup_intent(running_task):
         assert kb.claim_ended_run_sandbox_cleanups(conn, now=200) == []
 
 
+def test_cleanup_scheduler_selects_the_globally_oldest_queue(running_task):
+    task_id, run_id = running_task
+    with kb.connect() as conn:
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_reserved", expected_generation=0,
+        )
+        kb.advance_run_sandbox(
+            conn, task_id, run_id=run_id,
+            transition="sandbox_provisioned", expected_generation=1,
+            sandbox_id="sbx-canonical", receipt=RECEIPT,
+        )
+        assert kb.record_run_sandbox_orphan_cleanup(
+            conn,
+            task_id,
+            run_id=run_id,
+            generation=1,
+            sandbox_id="sbx-orphan",
+            reason="fairness_fixture",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='done', outcome='completed', ended_at=1 "
+                "WHERE id=?",
+                (run_id,),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', current_run_id=NULL WHERE id=?",
+                (task_id,),
+            )
+            conn.execute(
+                "UPDATE run_sandbox_cleanup_intents SET next_attempt_at=100"
+            )
+            conn.execute(
+                "UPDATE run_sandbox_orphan_cleanup_intents SET next_attempt_at=50"
+            )
+        assert kb.next_run_sandbox_cleanup_queue(conn, now=100) == "orphan"
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE run_sandbox_orphan_cleanup_intents SET next_attempt_at=150"
+            )
+        assert kb.next_run_sandbox_cleanup_queue(conn, now=100) == "canonical"
+
+
 @pytest.mark.parametrize("interrupted", ["missing_table", "empty_table"])
 def test_migration_backfills_a_pre_intent_table_active_machine(
     running_task, interrupted,
@@ -456,6 +500,14 @@ def test_cleanup_reconciliation_recovers_a_crash_after_legacy_id_rebuild(
             transition="sandbox_provisioned", expected_generation=1,
             sandbox_id="sbx-001", receipt=RECEIPT,
         )
+        assert kb.record_run_sandbox_orphan_cleanup(
+            conn,
+            task_id,
+            run_id=run_id,
+            generation=1,
+            sandbox_id="sbx-orphan",
+            reason="migration_fixture",
+        )
         run_columns = [
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(task_runs)")
@@ -469,17 +521,38 @@ def test_cleanup_reconciliation_recovers_a_crash_after_legacy_id_rebuild(
             "SELECT * FROM task_events ORDER BY id",
         )]
         for row in runs:
-            row["id"] = str(row["id"])
-        for row in events:
+            row["id"] = "legacy-run-41"
+        for index, row in enumerate(events, start=1):
             if row["kind"] == "sandbox_reserved":
-                row["id"] = "2"
+                row["id"] = "legacy-event-reserved"
             elif row["kind"] == "sandbox_provisioned":
-                row["id"] = "10"
+                row["id"] = "legacy-event-provisioned"
+            elif row["kind"] == "sandbox_orphan_cleanup_pending":
+                row["id"] = "legacy-event-orphan"
             else:
-                row["id"] = None
+                row["id"] = f"legacy-event-{index}"
+            if row["run_id"] is not None:
+                row["run_id"] = "legacy-run-41"
 
         with kb.write_txn(conn):
-            conn.execute("DELETE FROM run_sandbox_cleanup_intents")
+            conn.execute(
+                "UPDATE tasks SET current_run_id='legacy-run-41' WHERE id=?",
+                (task_id,),
+            )
+            conn.execute(
+                "UPDATE run_sandbox_cleanup_intents "
+                "SET run_id='legacy-run-41', "
+                "provision_event_id='legacy-event-provisioned' "
+                "WHERE task_id=?",
+                (task_id,),
+            )
+            conn.execute(
+                "UPDATE run_sandbox_orphan_cleanup_intents "
+                "SET run_id='legacy-run-41', "
+                "created_event_id='legacy-event-orphan' "
+                "WHERE task_id=?",
+                (task_id,),
+            )
             conn.execute("DROP TABLE task_events")
             conn.execute("DROP TABLE task_runs")
             conn.execute(
@@ -530,16 +603,53 @@ def test_cleanup_reconciliation_recovers_a_crash_after_legacy_id_rebuild(
         assert conn.execute(
             "SELECT type FROM pragma_table_info('task_runs') WHERE name='id'",
         ).fetchone()["type"] == "INTEGER"
+        rebuilt_run = int(conn.execute(
+            "SELECT id FROM task_runs WHERE task_id=?",
+            (task_id,),
+        ).fetchone()["id"])
+        assert conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()["current_run_id"] == rebuilt_run
+        assert {
+            int(row["run_id"])
+            for row in conn.execute(
+                "SELECT DISTINCT run_id FROM task_events "
+                "WHERE task_id=? AND run_id IS NOT NULL",
+                (task_id,),
+            )
+        } == {rebuilt_run}
         intent = conn.execute(
-            "SELECT task_id, run_id, profile, generation, sandbox_id "
+            "SELECT task_id, run_id, profile, generation, sandbox_id, "
+            "provision_event_id "
             "FROM run_sandbox_cleanup_intents",
         ).fetchone()
         assert dict(intent) == {
             "task_id": task_id,
-            "run_id": run_id,
+            "run_id": rebuilt_run,
             "profile": "worker",
             "generation": 1,
             "sandbox_id": "sbx-001",
+            "provision_event_id": conn.execute(
+                "SELECT id FROM task_events WHERE task_id=? AND run_id=? "
+                "AND kind='sandbox_provisioned'",
+                (task_id, rebuilt_run),
+            ).fetchone()["id"],
+        }
+        orphan = conn.execute(
+            "SELECT task_id, run_id, generation, sandbox_id, created_event_id "
+            "FROM run_sandbox_orphan_cleanup_intents",
+        ).fetchone()
+        assert dict(orphan) == {
+            "task_id": task_id,
+            "run_id": rebuilt_run,
+            "generation": 1,
+            "sandbox_id": "sbx-orphan",
+            "created_event_id": conn.execute(
+                "SELECT id FROM task_events WHERE task_id=? AND run_id=? "
+                "AND kind='sandbox_orphan_cleanup_pending'",
+                (task_id, rebuilt_run),
+            ).fetchone()["id"],
         }
 
 

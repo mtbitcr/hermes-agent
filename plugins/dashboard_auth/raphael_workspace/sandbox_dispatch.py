@@ -1648,17 +1648,20 @@ def retry_ended_sandbox_cleanup(
     kb = _kanban()
     try:
         with kb.connect_closing(board=board_name) as conn:
-            pending = kb.claim_run_sandbox_orphan_cleanups(
-                conn, limit=1, lease_seconds=_CLEANUP_RETRY_LEASE_SECONDS,
-            )
-            orphan = bool(pending)
-            if not pending:
+            queue = kb.next_run_sandbox_cleanup_queue(conn)
+            orphan = queue == "orphan"
+            if orphan:
+                pending = kb.claim_run_sandbox_orphan_cleanups(
+                    conn, limit=1, lease_seconds=_CLEANUP_RETRY_LEASE_SECONDS,
+                )
+            elif queue == "canonical":
                 pending = kb.claim_ended_run_sandbox_cleanups(
                     conn,
                     limit=1,
                     lease_seconds=_CLEANUP_RETRY_LEASE_SECONDS,
                 )
-                orphan = False
+            else:
+                pending = []
     except Exception:
         logger.warning(
             "raphael sandbox cleanup retry could not read board=%s",
@@ -1784,6 +1787,7 @@ def _provision(
     secure_parent_dir(staging)
     sandbox = None
     created_recorded = False
+    orphan_recorded = False
     provisioned = False
     try:
         secret = (
@@ -1831,6 +1835,15 @@ def _provision(
             sandbox_id=str(sandbox.id),
         )
         if created is None:
+            # Persist the losing physical allocation BEFORE attempting kill.
+            # kill() is a remote call and can hang, crash the process or fail;
+            # the next dispatcher must already know this exact ID.
+            orphan_recorded = _record_orphan_cleanup(
+                ctx,
+                generation,
+                str(sandbox.id),
+                "post_create_reservation_lost",
+            )
             raise SandboxDispatchError(
                 "another attempt advanced this task's build-machine reservation, "
                 "so this newly created machine could not be adopted.",
@@ -1950,10 +1963,33 @@ def _provision(
         # cleanup intent for the dispatcher. Never turn an unconfirmed kill
         # into release authority.
         if not provisioned:
+            if sandbox is not None and not created_recorded and not orphan_recorded:
+                orphan_recorded = _record_orphan_cleanup(
+                    ctx,
+                    generation,
+                    str(getattr(sandbox, "id", "") or ""),
+                    "allocation_record_unavailable",
+                )
             cleaned = sandbox is None
             if sandbox is not None:
                 cleaned = _discard_confirmed(sandbox)
-            if cleaned and created_recorded:
+            if orphan_recorded:
+                sandbox_id = str(getattr(sandbox, "id", "") or "")
+                released = cleaned and _record_orphan_release(
+                    ctx, sandbox_id, "provision_failed",
+                )
+                _log_event(
+                    ctx,
+                    "orphan_cleaned" if released else "orphan_cleanup_pending",
+                    level=logging.INFO if released else logging.WARNING,
+                    generation=generation,
+                    reason=(
+                        "provision_failed"
+                        if released
+                        else "provision_cleanup_unconfirmed"
+                    ),
+                )
+            elif cleaned and created_recorded:
                 _release_reservation(ctx, generation, "provision_failed")
             elif cleaned and sandbox is None:
                 _release_reservation(ctx, generation, "provision_failed")
@@ -1980,23 +2016,12 @@ def _provision(
                     reason="provision_cleanup_unconfirmed",
                 )
             else:
-                sandbox_id = str(getattr(sandbox, "id", "") or "")
-                retained = bool(sandbox_id) and _record_orphan_cleanup(
-                    ctx,
-                    generation,
-                    sandbox_id,
-                    "allocation_record_unavailable",
-                )
                 _log_event(
                     ctx,
-                    "orphan_cleanup_pending" if retained else "cleanup_untracked",
-                    level=logging.WARNING if retained else logging.ERROR,
+                    "cleanup_untracked",
+                    level=logging.ERROR,
                     generation=generation,
-                    reason=(
-                        "allocation_record_unavailable"
-                        if retained
-                        else "orphan_authority_unavailable"
-                    ),
+                    reason="orphan_authority_unavailable",
                 )
         shutil.rmtree(staging, ignore_errors=True)
 
