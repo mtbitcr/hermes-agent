@@ -723,9 +723,160 @@ def test_project_snapshot_is_exact_receipt_backed_and_read_only(ctx):
     assert snapshot["workers"] == []
     assert snapshot["attachments"] == []
     assert snapshot["runs"] == []
+    assert "planning_context" not in snapshot
     assert snapshot["steward"]["schema_version"] == 2
     assert snapshot["steward"]["execution"]["state"] == "working"
     assert snapshot["steward"]["execution"]["paused"] is False
+
+
+def test_project_snapshot_planning_context_prioritizes_live_relations_and_recent_history(
+    ctx,
+):
+    args = _task_graph_args(
+        idempotency_key="graph-planning-context",
+        project_name="Planning Context Project",
+    )
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+
+    with kanban_db.connect(board=result["board"]) as conn:
+        generic_done = [
+            kanban_db.create_task(
+                conn,
+                title=f"Completed work {index}",
+                project_id=result["project_id"],
+            )
+            for index in range(196)
+        ]
+        archived = [
+            kanban_db.create_task(
+                conn,
+                title=f"Archived work {index}",
+                project_id=result["project_id"],
+            )
+            for index in range(2)
+        ]
+        artifact_parent = kanban_db.create_task(
+            conn,
+            title="Produce the retained artifact",
+            project_id=result["project_id"],
+        )
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done' WHERE id IN ("
+                + ",".join("?" for _ in (*generic_done, artifact_parent))
+                + ")",
+                (*generic_done, artifact_parent),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'archived' WHERE id IN (?, ?)",
+                archived,
+            )
+            # The related artifact is deliberately oldest. It must still be
+            # retained ahead of unrelated terminal history, while the recent
+            # terminal window keeps the newest unrelated completion.
+            for index, task_id in enumerate(generic_done):
+                conn.execute(
+                    "UPDATE task_events SET created_at = ? WHERE task_id = ?",
+                    (10_000 + index, task_id),
+                )
+            conn.execute(
+                "UPDATE task_events SET created_at = 1 WHERE task_id = ?",
+                (artifact_parent,),
+            )
+        dependent = kanban_db.create_task(
+            conn,
+            title="Use the retained artifact",
+            project_id=result["project_id"],
+            parents=[artifact_parent],
+        )
+
+    snapshot = ow.read_project_snapshot(
+        ctx,
+        result["project_slug"],
+        planning_context=True,
+    )
+
+    context = snapshot["planning_context"]
+    assert set(context) == {
+        "schema_version",
+        "actionable_count",
+        "omitted_terminal_count",
+        "actionable_truncated",
+        "relations_truncated",
+        "tasks",
+    }
+    assert context["schema_version"] == 1
+    assert context["actionable_count"] == 4
+    assert context["actionable_truncated"] is False
+    assert context["relations_truncated"] is False
+    assert len(context["tasks"]) == ow._OWNER_PROJECT_MAX_TASKS
+    assert context["omitted_terminal_count"] == 3
+    assert (
+        sum(snapshot["board"]["counts"][status] for status in ("done", "archived"))
+        == context["omitted_terminal_count"]
+        + sum(task["status"] in {"done", "archived"} for task in context["tasks"])
+    )
+    by_id = {task["id"]: task for task in context["tasks"]}
+    assert artifact_parent in by_id
+    assert dependent in by_id
+    assert artifact_parent in by_id[dependent]["parent_ids"]
+    assert by_id[dependent]["omitted_parent_count"] == 0
+    assert by_id[dependent]["omitted_child_count"] == 0
+    assert generic_done[0] not in by_id
+    assert generic_done[-1] in by_id
+    assert all(set(task) == {
+        "id", "title", "status", "assignee_name", "responsibility",
+        "updated_at", "event_revision", "parent_ids", "child_ids",
+        "omitted_parent_count", "omitted_child_count",
+    } for task in context["tasks"])
+
+
+@pytest.mark.parametrize("unowned", [False, True])
+def test_project_snapshot_marks_foreign_work_relations_without_disclosing_them(
+    ctx,
+    unowned,
+):
+    args = _task_graph_args(
+        idempotency_key=f"graph-foreign-relation-{unowned}",
+        project_name="Foreign Relation Project",
+    )
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+
+    with kanban_db.connect(board=result["board"]) as conn:
+        foreign_parent = kanban_db.create_task(
+            conn,
+            title="Foreign predecessor",
+            project_id="p_foreign",
+        )
+        dependent = kanban_db.create_task(
+            conn,
+            title="Project-owned dependent",
+            project_id=result["project_id"],
+            parents=[foreign_parent],
+        )
+        if unowned:
+            with kanban_db.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET project_id = NULL WHERE id = ?",
+                    (foreign_parent,),
+                )
+
+    context = ow.read_project_snapshot(
+        ctx,
+        result["project_slug"],
+        planning_context=True,
+    )["planning_context"]
+
+    assert context["relations_truncated"] is True
+    by_id = {task["id"]: task for task in context["tasks"]}
+    assert foreign_parent not in by_id
+    assert by_id[dependent]["parent_ids"] == []
+    assert by_id[dependent]["omitted_parent_count"] == 1
+    assert foreign_parent not in json.dumps(context)
 
 
 def test_owner_title_projection_vectors_are_shared_with_the_owner_workspace():
