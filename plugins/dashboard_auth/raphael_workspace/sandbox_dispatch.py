@@ -14,8 +14,9 @@ This module adds the one missing capability as a single, argument-free worker
 tool: *create one sandbox for my current task and seed it*. Everything the
 generic path let the model choose — source, image, endpoint, resources, egress
 policy, credentials — is resolved here from host-owned state and frozen
-constants. Ordinary command / file / kill work stays on the maintained official
-MCP tools; this tool is only the trusted create-and-seed step.
+constants. Ordinary command, file, info, health, and endpoint work stays on the
+maintained official MCP tools. Generic create/list/renew/kill management is
+blocked: this plugin owns creation, fixed-duration renewal, and cleanup.
 
 The coding profile receives a scoped credential-vault binding. Builder and
 verification profiles receive no coding credentials. Reference-only inspection
@@ -65,10 +66,12 @@ and emits ordinary sanitized log lines — it deliberately keeps no second state
 store, so there is exactly one answer to "is a machine already live for this
 run" and it is the one an operator already reads in the task history.
 
-The same transaction also mirrors only the current provisioned generation
+The same transaction also mirrors the current created or provisioned generation
 into ``run_sandbox_cleanup_intents``. That table grants no machine authority:
 it is a bounded durable scheduler for ended-run cleanup, deleted by the exact
-``sandbox_released`` transition. The event fold remains the liveness proof.
+``sandbox_released`` transition. Exhausted automatic cleanup remains visible
+and deletion-protecting until an operator resolves it. The event fold remains
+the liveness proof.
 
 Fail-closed everywhere
 ----------------------
@@ -76,9 +79,10 @@ Wrong profile, missing/foreign Kanban run, scratch or ambiguous or unscoped
 source, a dirty tree, a mutable image tag, an unconfigured connection, a
 missing host credential, a Claude account token that would expire mid-task and
 cannot be refreshed, or a missing SDK all refuse before anything is created. A
-failure after creation kills the new sandbox, removes host temporary material,
-records a sanitized outcome, and returns one actionable error. Exception bodies
-are never logged or returned — they can carry protected data.
+failure after creation records the remote ID before later setup, then either
+confirms cleanup or retains durable cleanup authority. Host temporary material
+is removed and the caller receives one actionable sanitized error. Exception
+bodies are never logged or returned — they can carry protected data.
 """
 from __future__ import annotations
 
@@ -1125,16 +1129,21 @@ def _cleanup_connection_config(sdk: _Sdk, connection: _Connection):
     )
 
 
-def _discard_quietly(sandbox: Any) -> None:
-    """Kill the remote machine, then release local resources. Never raises."""
-    for step in ("kill", "close"):
-        try:
-            getattr(sandbox, step)()
-        except Exception:
+def _discard_confirmed(sandbox: Any) -> bool:
+    """Kill one held machine and report only confirmed remote absence."""
+    confirmed = False
+    try:
+        sandbox.kill()
+        confirmed = True
+    except Exception as exc:
+        confirmed = _sandbox_is_confirmed_absent(exc)
+        if not confirmed:
             logger.warning(
-                "raphael sandbox dispatch: %s failed while unwinding a failed "
-                "provision", step,
+                "raphael sandbox dispatch: kill failed while unwinding a failed "
+                "provision"
             )
+    _close_quietly(sandbox)
+    return confirmed
 
 
 def _close_quietly(sandbox: Any) -> None:
@@ -1220,8 +1229,8 @@ def _receipt_still_holds(
 
 def _verify_recorded_sandbox(
     sdk: _Sdk, connection: _Connection, ctx: _WorkerContext, record: dict
-) -> Optional[Any]:
-    """Return a live handle for the recorded machine, or ``None`` to replace it.
+) -> tuple[str, Optional[Any]]:
+    """Return an explicit reuse/retirement disposition for one recorded machine.
 
     A receipt in ``task_events`` is durable, but the machine it names is not:
     Server 2 may have expired, evicted, or never finished it. So a reuse is
@@ -1231,25 +1240,33 @@ def _verify_recorded_sandbox(
     """
     sandbox_id = record.get("sandbox_id")
     if not isinstance(sandbox_id, str) or not sandbox_id:
-        return None
+        return "blocked", None
     try:
         sandbox = sdk.sandbox.connect(
             sandbox_id,
             connection_config=_connection_config(sdk, connection),
             connect_timeout=timedelta(seconds=SANDBOX_VERIFY_TIMEOUT_SECONDS),
         )
-    except Exception:
-        # Gone, unreachable, or never healthy — nothing to reuse and nothing
-        # local to release.
-        return None
+    except Exception as exc:
+        return (
+            ("confirmed_absent", None)
+            if _sandbox_is_confirmed_absent(exc)
+            else ("blocked", None)
+        )
     verdict = _receipt_still_holds(sandbox, ctx, record)
     if verdict == "ok":
-        return sandbox
-    if verdict == "retire":
-        _discard_quietly(sandbox)
-    else:
+        return "reuse", sandbox
+    if verdict == "absent":
         _close_quietly(sandbox)
-    return None
+        return "confirmed_absent", None
+    if verdict == "retire":
+        return (
+            ("cleaned", None)
+            if _discard_confirmed(sandbox)
+            else ("blocked", None)
+        )
+    _close_quietly(sandbox)
+    return "blocked", None
 
 
 def _record_cleaned_release(
@@ -1297,7 +1314,7 @@ def _cleanup_run_sandbox(ctx: _WorkerContext, *, reason: str) -> bool:
         record = _read_reservation(ctx)
     except SandboxDispatchError:
         return False
-    if record.get("state") != "active":
+    if record.get("state") not in {"created", "active"}:
         return True
     sandbox_id = record.get("sandbox_id")
     generation = record.get("generation")
@@ -1526,20 +1543,42 @@ def _acquire(
         generation = record["generation"]
         state = record["state"]
         if state == "active":
-            sandbox = _verify_recorded_sandbox(sdk, connection, ctx, record)
-            if sandbox is not None:
+            disposition, sandbox = _verify_recorded_sandbox(
+                sdk, connection, ctx, record,
+            )
+            if disposition == "reuse" and sandbox is not None:
                 # Proof is all this needed the handle for; the machine keeps
                 # running for the worker's own MCP tools.
                 _close_quietly(sandbox)
                 return "reuse", record["receipt"]
-            # Dead, expired, malformed, or not the machine the receipt
-            # describes: close this exact generation before opening the next,
-            # so the replacement is recorded as a replacement.
-            _advance_reservation(
-                ctx, "sandbox_released", generation, reason="unverifiable"
+            if disposition in {"confirmed_absent", "cleaned"}:
+                _advance_reservation(
+                    ctx,
+                    "sandbox_released",
+                    generation,
+                    reason=disposition,
+                )
+                _log_event(
+                    ctx,
+                    "retired",
+                    generation=generation,
+                    reason=disposition,
+                )
+                continue
+            raise SandboxDispatchError(
+                "the recorded build machine could not be proved absent or "
+                "safely retired, so its cleanup authority was retained and no "
+                "replacement was started.",
+                code="retirement_unconfirmed",
             )
-            _log_event(ctx, "retired", generation=generation)
-            continue
+        if state == "created":
+            if _cleanup_run_sandbox(ctx, reason="provision_retry"):
+                continue
+            raise SandboxDispatchError(
+                "a previously created build machine still needs cleanup before "
+                "this run can start another.",
+                code="created_cleanup_pending",
+            )
         if state == "reserved":
             # Another attempt for this same run holds the open generation.
             # Refusing is the whole point of the CAS: the loser must wait
@@ -1570,14 +1609,18 @@ def _provision(
     generation: int,
 ) -> dict:
     """Create, seed, and durably record exactly one machine for *generation*."""
-    secret = _prepare_host_credential() if ctx.profile == WORKER_PROFILE else None
-
     staging = _temp_root() / uuid.uuid4().hex
     staging.mkdir(parents=True, exist_ok=True)
     secure_parent_dir(staging)
     sandbox = None
+    created_recorded = False
     provisioned = False
     try:
+        secret = (
+            _prepare_host_credential()
+            if ctx.profile == WORKER_PROFILE
+            else None
+        )
         archive, source_digest = _package_source(source, staging)
 
         config = _connection_config(sdk, connection)
@@ -1610,6 +1653,26 @@ def _provision(
                 "operator to check the connection and retry.",
                 code="create_failed",
             ) from exc
+
+        created = _advance_reservation(
+            ctx,
+            "sandbox_created",
+            generation,
+            sandbox_id=str(sandbox.id),
+        )
+        if created is None:
+            raise SandboxDispatchError(
+                "another attempt advanced this task's build-machine reservation, "
+                "so this newly created machine could not be adopted.",
+                code="reservation_lost",
+            )
+        created_recorded = True
+        _log_event(
+            ctx,
+            "created",
+            generation=generation,
+            sandbox_id=str(sandbox.id),
+        )
 
         if secret is not None:
             credentials, bindings = _vault_payload(sdk, secret)
@@ -1712,10 +1775,48 @@ def _provision(
         _log_event(ctx, "provisioned", generation=generation, **_event_view(receipt))
         return receipt
     finally:
-        # Any exit before the receipt is durable — refusal, unexpected fault,
-        # or interrupt — must leave no machine behind.
-        if sandbox is not None and not provisioned:
-            _discard_quietly(sandbox)
+        # Any exit before the receipt is durable must either prove the remote
+        # machine absent and close the generation, or retain the created ID and
+        # cleanup intent for the dispatcher. Never turn an unconfirmed kill
+        # into release authority.
+        if not provisioned:
+            cleaned = sandbox is None
+            if sandbox is not None:
+                cleaned = _discard_confirmed(sandbox)
+            if cleaned and created_recorded:
+                _release_reservation(ctx, generation, "provision_failed")
+            elif cleaned and sandbox is None:
+                _release_reservation(ctx, generation, "provision_failed")
+            elif cleaned:
+                # A concurrent winner may have advanced this generation while
+                # this process was inside remote create. Only close a still-
+                # unallocated reservation; never release the winner's active
+                # machine after killing our own unrecorded loser.
+                try:
+                    current = _read_reservation(ctx)
+                except SandboxDispatchError:
+                    current = {}
+                if (
+                    current.get("generation") == generation
+                    and current.get("state") == "reserved"
+                ):
+                    _release_reservation(ctx, generation, "provision_failed")
+            elif created_recorded:
+                _log_event(
+                    ctx,
+                    "cleanup_pending",
+                    level=logging.WARNING,
+                    generation=generation,
+                    reason="provision_cleanup_unconfirmed",
+                )
+            else:
+                _log_event(
+                    ctx,
+                    "cleanup_untracked",
+                    level=logging.ERROR,
+                    generation=generation,
+                    reason="allocation_record_unavailable",
+                )
         shutil.rmtree(staging, ignore_errors=True)
 
 
@@ -1763,9 +1864,13 @@ def handle_provision(args: dict, **_kwargs) -> str:
             _log_event(ctx, "reused", **_event_view(receipt))
             return tool_result(receipt)
 
-        owned_generation = payload
+        generation = payload
+        # From this point _provision owns the reserved generation and either
+        # releases it after confirmed absence or leaves durable cleanup
+        # authority. The outer generic error path must not guess.
+        owned_generation = None
         return tool_result(
-            _provision(sdk, connection, ctx, source, owned_generation)
+            _provision(sdk, connection, ctx, source, generation)
         )
     except SandboxDispatchError as exc:
         if ctx is not None:
@@ -1906,12 +2011,12 @@ def maintain_sandbox_lease(tool_name: str = "", args: Optional[dict] = None, **_
             ctx = _worker_context()
             _resolve_task(ctx)
             if opensandbox_operation in {
-                "sandbox_create", "sandbox_list", "sandbox_kill",
+                "sandbox_create", "sandbox_list", "sandbox_kill", "sandbox_renew",
             }:
                 raise SandboxDispatchError(
-                    "Generic sandbox creation, listing, and manual killing are "
+                    "Generic sandbox creation, listing, renewal, and manual killing are "
                     "unavailable to this worker. Use raphael_sandbox_provision "
-                    "for the current run; cleanup is automatic when the run ends.",
+                    "for the current run; lease renewal and cleanup are automatic.",
                     code="generic_sandbox_management",
                 )
             record = _read_reservation(ctx)

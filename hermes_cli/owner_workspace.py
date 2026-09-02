@@ -4334,6 +4334,12 @@ def _inherit_replaced_ownership_scopes(
         if change["action"] != "replace":
             continue
         replacement = change["replacement"]
+        if replacement.get("assignee") == "raphael-verifier":
+            # Replacement continuity never widens the verifier's read-only
+            # authority, including legacy sources that still spell exclusive
+            # ownership as NULL/["."].
+            replacement["owned_paths"] = []
+            continue
         if "owned_paths" in replacement:
             # An explicitly approved boundary is the owner's decision and is
             # never overridden by what the superseded task happened to hold.
