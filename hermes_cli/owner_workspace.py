@@ -3686,7 +3686,13 @@ _OWNER_PRIVATE_WORK_ITEM_PATTERNS = (
         r"[0-9a-f]{12}\b",
         re.IGNORECASE,
     ),
-    re.compile(r"\b(?:task|run|resp|claim)[_-][0-9a-z]{6,}\b", re.IGNORECASE),
+    # An internal id suffix always carries a digit (`run_1c1d27…`, `resp_9ff9…`);
+    # the digit requirement keeps ordinary hyphenated words such as
+    # "run-through" or "task-force" owner-visible.
+    re.compile(
+        r"\b(?:task|run|resp|claim)[_-](?=[0-9a-z]*\d)[0-9a-z]{6,}\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\braphael-[a-z0-9][a-z0-9_-]{2,}\b", re.IGNORECASE),
     re.compile(r"(?:^|\s)(?:/[A-Za-z0-9._-]+){2,}(?:\s|$)"),
     re.compile(r"\b[A-Za-z]:\\(?:[^\\\s]+\\)+[^\\\s]+"),

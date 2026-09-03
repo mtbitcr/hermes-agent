@@ -28,6 +28,7 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _approval_event_choices,
     _make_request_fingerprint,
+    _owner_mutation_refusal,
     cors_middleware,
     security_headers_middleware,
 )
@@ -2007,3 +2008,26 @@ class TestOrphanedRunRecovery:
             "cancelled"
         )
         assert store.claim_orphaned_owner_jobs("run") == []
+
+
+class TestOwnerMutationRefusal:
+    """An owner mutation that did not commit reports the kernel's own reason."""
+
+    def test_reason_is_taken_from_the_handler_error(self):
+        result = {"final_response": '{"error": "owner_project_plan_commit: changes[2].title contains private operational detail"}'}
+        assert _owner_mutation_refusal(result) == (
+            "owner_project_plan_commit: changes[2].title contains private operational detail"
+        )
+
+    def test_secret_bearing_reasons_are_redacted(self):
+        result = '{"error": "route sk-ABCDEFGHIJKLMNOPQRSTUV refused"}'
+        refusal = _owner_mutation_refusal(result)
+        assert refusal
+        assert "sk-ABCDEFGHIJKLMNOPQRSTUV" not in refusal
+
+    @pytest.mark.parametrize(
+        "result",
+        [None, "", "not json", '{"ok": true}', {"final_response": '{"error": "   "}'}, {"other": 1}],
+    )
+    def test_silent_when_no_reason_is_available(self, result):
+        assert _owner_mutation_refusal(result) == ""
