@@ -139,7 +139,11 @@ class FakeFiles:
             elif resolved in self._box.file_data:
                 entry_type = "file"
             else:
-                continue
+                if self._box.behavior.get("missing_info_returns_empty"):
+                    continue
+                from opensandbox.exceptions import SandboxApiException
+
+                raise SandboxApiException("missing", status_code=404)
             info[requested] = EntryInfo(
                 path=requested, entry_type=entry_type, mode=0o644,
                 owner="root", group="root",
@@ -2723,6 +2727,26 @@ def test_preclaim_dependency_snapshot_preserves_authorized_artifact_access(
 
 
 class TestArtifactRemoteSymlinkContainment:
+    def test_source_staging_accepts_the_sdks_typed_missing_new_leaf(
+        self, host, sdk,
+    ):
+        out = _provision()
+
+        assert "error" not in out, out
+        assert [path for path, _ in FakeSandbox.created[0].uploads] == [
+            sd.SANDBOX_ARCHIVE_PATH,
+        ]
+
+    def test_source_staging_refuses_an_empty_successful_leaf_probe(
+        self, host, sdk,
+    ):
+        FakeSandbox.behavior = {"missing_info_returns_empty": True}
+
+        out = _provision()
+
+        assert "error" in out
+        assert FakeSandbox.created[0].uploads == []
+
     def test_export_refuses_a_leaf_symlink_even_when_the_target_holds_the_expected_bytes(
         self, host, sdk
     ):
