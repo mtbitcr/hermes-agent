@@ -935,6 +935,40 @@ def test_owner_title_hides_private_operational_detail_but_project_name_keeps_own
     assert ow.owner_project_name(value) == value
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Prepare your private run-through and capture your go or no-go decision",
+        "Present the finished materials and run-through results for your decision",
+        "Set up the task-force meeting",
+        "Send the claim-handling checklist",
+    ],
+)
+def test_owner_title_keeps_hyphenated_english_words(value):
+    """The internal-id pattern must not swallow ordinary hyphenated words.
+
+    A planner title such as "run-through" once matched the ``run_<id>`` guard,
+    so an approved Project plan failed at commit with no owner-visible reason.
+    """
+    assert ow.owner_title(value) == value
+    assert ow._native_owner_title(value, "changes[0].title") == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Retry run_1c1d270be8e5440ca3135b74e690cd15 tonight",
+        "Inspect task-9ad0279a before Friday",
+        "Reply to resp_9ff92fc3f60c479295a5926452ae",
+        "Release claim_ab12cd34ef",
+    ],
+)
+def test_owner_title_still_hides_internal_ids(value):
+    assert ow.owner_title(value) == "Untitled work item"
+    with pytest.raises(ow.OwnerWorkspaceError):
+        ow._native_owner_title(value, "changes[0].title")
+
+
 def test_owner_title_masks_url_credentials_at_a_non_navigation_egress():
     """A title is never followed as a link, so URL credentials are masked.
 

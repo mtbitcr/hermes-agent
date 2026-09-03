@@ -5367,6 +5367,25 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return text
 
 
+def _owner_mutation_refusal(result: Any) -> str:
+    """Return the kernel's own refusal text for an owner mutation that did not
+    commit, or ``""``. The handler answers with a ``tool_error`` JSON string; its
+    ``error`` is the exact reason (a title, scope or route the kernel refused),
+    which the owner otherwise never sees."""
+    if isinstance(result, dict):
+        result = result.get("final_response")
+    if not isinstance(result, str):
+        return ""
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return ""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, str) or not error.strip():
+        return ""
+    return _redact_api_error_text(error.strip(), limit=300)
+
+
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     """Redact API-bound error text before it crosses the HTTP boundary."""
     redacted = redact_sensitive_text(str(value), force=True)
@@ -14279,6 +14298,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 elif owner_mutation_authority is not None:
                     error_msg = "The approved Project change was not committed"
+                    refusal = _owner_mutation_refusal(result)
+                    if refusal:
+                        error_msg = f"{error_msg}: {refusal}"
                     _put_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
