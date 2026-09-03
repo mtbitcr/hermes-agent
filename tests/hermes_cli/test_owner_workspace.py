@@ -3814,6 +3814,113 @@ def test_project_plan_replace_of_a_scratch_task_invents_no_boundary(ctx):
         assert replacement.workspace_kind == "scratch"
 
 
+def test_project_plan_preserves_body_with_explicit_scope_after_repo_binding(
+    ctx, tmp_path,
+):
+    """The kernel copies the source body while applying the approved scope."""
+    setup = _bootstrap_board(ctx)
+    source_body = "Keep this exact specification.\n\nSpacing and café stay byte-identical."
+    with kanban_db.connect(board=setup["board"]) as conn:
+        source_id = kanban_db.create_task(
+            conn,
+            title="Blocked read-only canary",
+            body=source_body,
+            assignee="default",
+            parents=[setup["task_id"]],
+            project_id=setup["project_id"],
+        )
+        downstream_id = kanban_db.create_task(
+            conn,
+            title="Read the canary receipt",
+            assignee="default",
+            parents=[source_id],
+            project_id=setup["project_id"],
+        )
+        source = kanban_db.get_task(conn, source_id)
+        assert source.workspace_kind == "scratch"
+        assert source.owned_paths is None
+        source_ref = _project_task_ref(conn, source_id)
+
+    repo = _project_repo(tmp_path, ctx, setup["project_id"])
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "replace",
+            "reason": "Retry the same instructions on the explicit read-only route.",
+            "target": source_ref,
+            "replacement": {
+                "title": "Run the read-only canary again",
+                "body_mode": "preserve",
+                "assignee": "default",
+                "execution_tier": "routine",
+                "responsibility": "R07",
+                "owned_paths": [],
+            },
+        }],
+        idempotency_key="steward-preserve-body-after-repo-binding",
+    )
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    assert result["ok"] is True
+    replacement_id = result["created_task_ids"][0]
+    with kanban_db.connect(board=setup["board"]) as conn:
+        replacement = kanban_db.get_task(conn, replacement_id)
+        assert replacement.body.encode("utf-8") == source_body.encode("utf-8")
+        assert replacement.owned_paths == []
+        assert replacement.workspace_kind == "worktree"
+        assert replacement.workspace_path == str(repo / ".worktrees" / replacement_id)
+        assert replacement.execution_tier == "routine"
+        assert kanban_db.get_task(conn, source_id).status == "archived"
+        assert kanban_db.parent_ids(conn, replacement_id) == [setup["task_id"]]
+        assert replacement_id in kanban_db.parent_ids(conn, downstream_id)
+
+    assert _commit_project_plan(ctx, **args) == result
+
+
+def test_project_plan_rewrite_body_mode_uses_the_approved_body(ctx, tmp_path):
+    setup = _bootstrap_board(ctx)
+    _project_repo(tmp_path, ctx, setup["project_id"])
+    with kanban_db.connect(board=setup["board"]) as conn:
+        source_id = kanban_db.create_task(
+            conn,
+            title="Outdated instructions",
+            body="Old body",
+            assignee="default",
+            project_id=setup["project_id"],
+            owned_paths=[],
+        )
+        source_ref = _project_task_ref(conn, source_id)
+
+    args = _project_plan_args(
+        setup,
+        [{
+            "action": "replace",
+            "reason": "The owner approved rewritten instructions.",
+            "target": source_ref,
+            "replacement": {
+                "title": "Current instructions",
+                "body_mode": "rewrite",
+                "body": "Use this exact new body.",
+                "assignee": "default",
+                "execution_tier": "routine",
+                "responsibility": "R07",
+                "owned_paths": [],
+            },
+        }],
+        idempotency_key="steward-rewrite-body-mode",
+    )
+    approver = _with_approver(ctx.session)
+    result = _commit_project_plan(ctx, **args)
+    approver.join()
+
+    with kanban_db.connect(board=setup["board"]) as conn:
+        replacement = kanban_db.get_task(conn, result["created_task_ids"][0])
+        assert replacement.body == "Use this exact new body."
+        assert replacement.owned_paths == []
+
+
 @pytest.mark.parametrize("action", ["split", "merge"])
 def test_only_a_one_to_one_replace_inherits_a_source_boundary(ctx, tmp_path, action):
     """Split and merge are not one-to-one, so nothing is inherited for them."""

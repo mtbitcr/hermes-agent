@@ -1,8 +1,8 @@
 """Cross-repository owner-proposal schema contract.
 
 The Workspace planner emits ``schema_version`` 3 for a new-project proposal and
-4 for an existing-project change proposal, and every created task now names its
-``execution_tier``. Hermes must recognise exactly those as actionable — an
+5 for an existing-project change proposal, and every created task now names its
+``execution_tier`` and repository scope. Hermes must recognise exactly those as actionable — an
 older stored proposal stays readable in history but can no longer be committed,
 because committing it would leave the kernel resolving a route from a class the
 planner never stated.
@@ -56,7 +56,7 @@ def _workspace_new_proposal(**overrides):
 
 def _workspace_existing_proposal(**overrides):
     proposal = {
-        "schema_version": 4,
+        "schema_version": 5,
         "kind": "project_change_proposal",
         "mode": "existing",
         "request_title": "Add the approved milestone",
@@ -75,6 +75,7 @@ def _workspace_existing_proposal(**overrides):
             "assignee": "default",
             "responsibility": "B03",
             "execution_tier": "deep",
+            "owned_paths": [],
             "existing_parent_refs": [],
             "new_parents": [],
         }],
@@ -91,7 +92,11 @@ def _history(proposal):
 
 
 def test_hermes_and_workspace_agree_on_the_actionable_versions():
-    assert (_OWNER_NEW_PROPOSAL_SCHEMA, _OWNER_EXISTING_PROPOSAL_SCHEMA) == (3, 4)
+    assert _workspace_new_proposal()["schema_version"] == _OWNER_NEW_PROPOSAL_SCHEMA
+    assert (
+        _workspace_existing_proposal()["schema_version"]
+        == _OWNER_EXISTING_PROPOSAL_SCHEMA
+    )
 
 
 @pytest.mark.parametrize(
@@ -109,9 +114,12 @@ def test_current_workspace_proposals_grant_commit_authority(proposal):
         # The pre-tier versions the Workspace used to emit.
         _workspace_new_proposal(schema_version=2),
         _workspace_existing_proposal(schema_version=3),
+        _workspace_existing_proposal(schema_version=4),
         # Version numbers this build does not mint at all.
-        _workspace_new_proposal(schema_version=4),
-        _workspace_existing_proposal(schema_version=5),
+        _workspace_new_proposal(schema_version=_OWNER_NEW_PROPOSAL_SCHEMA + 1),
+        _workspace_existing_proposal(
+            schema_version=_OWNER_EXISTING_PROPOSAL_SCHEMA + 1,
+        ),
         # Right version, wrong kind/mode pairing.
         _workspace_new_proposal(mode="existing"),
         _workspace_existing_proposal(kind="proposal"),
@@ -122,7 +130,7 @@ def test_non_current_proposals_grant_no_authority(proposal):
     assert _owner_history_has_actionable_final_proposal(_history(proposal)) is False
 
 
-def test_existing_project_add_requires_execution_tier_in_the_run_payload():
+def test_existing_project_add_requires_route_and_scope_in_the_run_payload():
     """The nested add validator is part of the authority, not just the header."""
     from gateway.platforms.api_server import _OWNER_PROPOSAL_ADD_KEYS
 
@@ -131,3 +139,4 @@ def test_existing_project_add_requires_execution_tier_in_the_run_payload():
     # Dropping the tier makes the change object unrecognisable, so the commit
     # cannot be authorized from it.
     assert set(add) - {"execution_tier"} != set(_OWNER_PROPOSAL_ADD_KEYS)
+    assert set(add) - {"owned_paths"} != set(_OWNER_PROPOSAL_ADD_KEYS)

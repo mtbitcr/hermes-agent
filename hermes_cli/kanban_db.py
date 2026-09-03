@@ -11599,8 +11599,18 @@ def apply_owner_project_plan(
             if action == "replace":
                 source_id = change["target"]["task_id"]
                 target_status, target_revision = expected_target(change["target"])
+                replacement = change["replacement"]
+                if replacement.get("body_mode") == "preserve":
+                    source = conn.execute(
+                        "SELECT body FROM tasks WHERE id = ?", (source_id,),
+                    ).fetchone()
+                    if source is None:
+                        raise RuntimeError(
+                            "preflighted replacement target disappeared inside transaction"
+                        )
+                    replacement = {**replacement, "body": source["body"]}
                 replacement_id = create_planned_task(
-                    change["replacement"],
+                    replacement,
                     parent_task_ids=parent_ids(conn, source_id),
                     change_index=change_index,
                     replacement_index=0,
