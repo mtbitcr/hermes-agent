@@ -119,9 +119,9 @@ def _verify_remote_containment(sandbox, path: PurePosixPath, root: str, *, must_
     ``must_be_new`` selects which leaf is acceptable: an export read requires
     an ordinary pre-existing file; an import/staging write requires that
     nothing at all exists there yet, so the caller can create it exclusively
-    rather than overwrite whatever the leaf turns out to be. Any missing
-    ancestor, wrong type, absent/unknown metadata, or exception from the
-    metadata call is a refusal — a failure to prove safety is never a pass.
+    rather than overwrite whatever the leaf turns out to be. A typed SDK 404
+    proves that new leaf absent; a missing ancestor, wrong type, absent or
+    unknown required metadata, and every other exception remain refusals.
     """
     root_path = PurePosixPath(root)
     if (
@@ -132,18 +132,24 @@ def _verify_remote_containment(sandbox, path: PurePosixPath, root: str, *, must_
     ancestors = _remote_ancestors(path, root_path)
     leaf = str(path)
     try:
-        info = sandbox.files.get_file_info(ancestors + [leaf])
+        info = sandbox.files.get_file_info(
+            ancestors if must_be_new else ancestors + [leaf]
+        )
     except Exception as exc:
         raise ValueError(message) from exc
     for ancestor in ancestors:
         entry = info.get(ancestor)
         if entry is None or getattr(entry, "entry_type", None) != "directory":
             raise ValueError(message)
-    leaf_entry = info.get(leaf)
     if must_be_new:
-        if leaf_entry is not None:
-            raise ValueError(message)
-    elif leaf_entry is None or getattr(leaf_entry, "entry_type", None) != "file":
+        try:
+            sandbox.files.get_file_info([leaf])
+        except Exception as exc:
+            if not sd._sandbox_is_confirmed_absent(exc):
+                raise ValueError(message) from exc
+            return
+        raise ValueError(message)
+    elif info.get(leaf) is None or getattr(info[leaf], "entry_type", None) != "file":
         raise ValueError(message)
 
 
