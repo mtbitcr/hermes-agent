@@ -479,6 +479,10 @@ class TestGates:
         monkeypatch.setenv("HERMES_PROFILE", "default")
         assert sd.check_provision_available() is False
 
+    def test_check_fn_true_for_the_planner(self, host, monkeypatch):
+        monkeypatch.setenv("HERMES_PROFILE", "raphael-planner")
+        assert sd.check_provision_available() is True
+
     def test_check_fn_false_without_kanban_run(self, host, monkeypatch):
         monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
         assert sd.check_provision_available() is False
@@ -2074,6 +2078,27 @@ def test_verification_role_gets_same_scoped_sandbox_without_coding_credentials(h
     assert "sandbox_id" in out, out
     box = FakeSandbox.created[-1]
     assert box.reported_metadata["hermes_profile"] == "raphael-verifier"
+    assert box.create_kwargs["env"] == {}
+    assert box.vault_calls == []
+    assert out["ownership_scope"] == []
+    assert out["policy"]["host_patch_import_authorized"] is False
+    assert out["policy"]["automatic_run_cleanup"] is True
+
+
+def test_planner_role_gets_read_only_sandbox_from_unscoped_task(host, sdk, monkeypatch):
+    # A planner Task carries no owned_paths (legacy NULL scope) and must still
+    # get the exact source read-only: no coding credential, no patch authority.
+    monkeypatch.setenv("HERMES_PROFILE", "raphael-planner")
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET assignee=?, owned_paths=NULL WHERE id=?",
+            ("raphael-planner", host.task_id),
+        )
+        conn.commit()
+    out = _provision()
+    assert "sandbox_id" in out, out
+    box = FakeSandbox.created[-1]
+    assert box.reported_metadata["hermes_profile"] == "raphael-planner"
     assert box.create_kwargs["env"] == {}
     assert box.vault_calls == []
     assert out["ownership_scope"] == []

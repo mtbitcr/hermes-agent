@@ -117,7 +117,13 @@ logger = logging.getLogger(__name__)
 TOOL_NAME = "raphael_sandbox_provision"
 TOOLSET = "raphael_sandbox"
 WORKER_PROFILE = "raphael-claude-worker"
-SANDBOX_PROFILES = frozenset({WORKER_PROFILE, "raphael-builder", "raphael-verifier"})
+SANDBOX_PROFILES = frozenset({
+    WORKER_PROFILE, "raphael-builder", "raphael-verifier", "raphael-planner",
+})
+#: Profiles whose runs only ever read the exact source: no patch authority,
+#: no coding credential. The planner joins the verifier here so code
+#: evidence for planning work is gathered on Server 2, never on the host.
+READ_ONLY_SOURCE_PROFILES = frozenset({"raphael-verifier", "raphael-planner"})
 
 #: Where the task source is extracted inside the sandbox. Fixed so no caller
 #: — model or operator — picks a path on Server 2.
@@ -426,7 +432,7 @@ def _git(root: Path, *args: str) -> str:
 
 def _run_requires_read_only_source(ctx: _WorkerContext) -> bool:
     """Resolve review authority from the exact durable run, not task scope."""
-    if ctx.profile == "raphael-verifier":
+    if ctx.profile in READ_ONLY_SOURCE_PROFILES:
         return True
     kb = _kanban()
     try:
