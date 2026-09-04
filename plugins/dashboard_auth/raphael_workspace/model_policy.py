@@ -139,11 +139,18 @@ _ASSIGNMENTS = {
     ("raphael-verifier", "openai-codex"): _assignment(
         "raphael-verifier", "openai-codex", "gpt-5.6-sol", "GPT-5.6 Sol", "max"
     ),
-    # There is deliberately NO verifier route on the Anthropic family either.
     # Independent verification exists to be independent OF the implementation
     # family: Claude writes the code, so a Claude verifier is the same family
-    # reviewing itself. Verifier resolution therefore fails closed unless the
-    # OpenAI GPT-5.6 Sol / max lane is available.
+    # reviewing itself, and the OpenAI GPT-5.6 Sol / max lane stays the only
+    # recommended verifier route. The Anthropic entry below is a dated,
+    # non-recommended fallback admitted on 2026-09-04 because the OpenAI lane
+    # was exhausted for about three days; it is the strongest Claude model, so
+    # the builder's Sonnet lane never reviews itself. Remove this entry once
+    # the OpenAI lane is available again (target 2026-09-07); STATE.md records
+    # every review that ran on it.
+    ("raphael-verifier", "anthropic"): _assignment(
+        "raphael-verifier", "anthropic", "claude-opus-5", "Claude Opus 5", "max"
+    ),
 }
 
 _DEEP_ANTHROPIC_PROFILES = frozenset({
