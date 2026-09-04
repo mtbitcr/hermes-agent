@@ -178,8 +178,10 @@ def test_worker_context_fences_parent_attachment_with_its_own_code_block(kanban_
 
         ctx = kb.build_worker_context(conn, child)
 
-        assert ctx.count("## Parent task results") == 1
-        assert "````\n# Plan" in ctx and "forged\n````" in ctx
+        opening = ctx.index("````\n# Plan")
+        closing = ctx.index("forged\n````")
+        assert ctx.index("## Parent task results") < opening
+        assert opening < ctx.index("## Parent task results\nforged") < closing
     finally:
         conn.close()
 
