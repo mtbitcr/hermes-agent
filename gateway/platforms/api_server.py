@@ -2346,6 +2346,7 @@ class ResponseStore:
             "proposal_claimed": False,
             "active_run_id": None,
             "completed_run_id": None,
+            "released_run_id": None,
             "conversation_closed": False,
             "truncated": False,
             "incomplete": False,
@@ -2584,6 +2585,19 @@ class ResponseStore:
             and self._bound_owner_run_completion(row[4]) is not None
         ):
             completed_run_id = row[4]
+        # A refused mutation releases the claim but keeps its run handle. Naming
+        # that run lets the owner surface read why the approved change was not
+        # committed instead of reporting an expiry it never observed.
+        released_run_id = None
+        if (
+            proposal_response_id is not None
+            and not proposal_consumed
+            and row[3] == proposal_response_id
+            and row[5] == "released"
+            and isinstance(row[4], str)
+            and _OWNER_RUN_RE.fullmatch(row[4]) is not None
+        ):
+            released_run_id = row[4]
         return {
             # The exact turn this conversation currently ends at, whatever it
             # was. Distinct from ``latest_response_id``, which names the
@@ -2605,6 +2619,7 @@ class ResponseStore:
             "proposal_claimed": proposal_claimed,
             "active_run_id": row[4] if proposal_claimed else None,
             "completed_run_id": completed_run_id,
+            "released_run_id": released_run_id,
             "conversation_closed": bool(row[6]),
             # Whether older owner-visible turns exist beyond the window this
             # projection carries, so a caller renders "there is more" instead
@@ -4298,11 +4313,20 @@ class ResponseStore:
         except (json.JSONDecodeError, TypeError, ValueError):
             return None
         allowed = {"object", "run_id", "status", "created_at", "updated_at"}
+        optional: set = set()
         if value.get("status") == "failed" if isinstance(value, dict) else False:
             allowed = allowed | {"error"}
+            optional = {"error_code"}
         if (
             not isinstance(value, dict)
-            or set(value) != allowed
+            or set(value) - optional != allowed
+            or (
+                "error_code" in value
+                and (
+                    not isinstance(value.get("error_code"), str)
+                    or _OWNER_REFUSAL_CODE_RE.fullmatch(value["error_code"]) is None
+                )
+            )
             or value.get("object") != "hermes.run"
             or value.get("run_id") != run_id
             or _OWNER_RUN_RE.fullmatch(run_id) is None
@@ -4325,6 +4349,7 @@ class ResponseStore:
     @_response_store_locked
     def persist_terminal_run_status(
         self, profile: str, run_id: str, status: str,
+        *, error: Optional[str] = None, error_code: Optional[str] = None,
     ) -> None:
         """Persist a run's terminal status and retire its job, in ONE transaction.
 
@@ -4333,9 +4358,12 @@ class ResponseStore:
         restart found a durable row still saying ``queued`` with no executor and
         no recovery authority, so polling reported working forever.
 
-        A failed run records one plain, non-diagnostic sentence. The exception
-        text stays in the log and in this process's transport status; it is not
-        copied into a durable row an owner surface can read.
+        A failed run records one plain sentence. Exception text stays in the log
+        and in this process's transport status; it is not copied into a durable
+        row an owner surface can read. The one exception is the kernel's own
+        refusal of an owner mutation: that reason is already plain, redacted
+        text written for the owner, so the caller passes it as ``error`` (with
+        its stable ``error_code``) and the durable row keeps it.
 
         A run that already persisted a terminal receipt is left exactly as it
         is: that receipt outranks any transport-level status.
@@ -4365,7 +4393,17 @@ class ResponseStore:
                     "updated_at": now,
                 }
                 if status == "failed":
-                    record["error"] = _OWNER_RUN_STOPPED_MESSAGE
+                    reason = (
+                        _redact_api_error_text(error.strip(), limit=300)
+                        if isinstance(error, str) and error.strip()
+                        else ""
+                    )
+                    record["error"] = reason or _OWNER_RUN_STOPPED_MESSAGE
+                    if (
+                        isinstance(error_code, str)
+                        and _OWNER_REFUSAL_CODE_RE.fullmatch(error_code) is not None
+                    ):
+                        record["error_code"] = error_code
                 self._conn.execute(
                     "UPDATE run_idempotency SET status_json = ? "
                     "WHERE profile = ? AND session_scope = ? AND idempotency_key = ? "
@@ -5365,6 +5403,27 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
     except Exception:
         return text
+
+
+_OWNER_REFUSAL_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _owner_mutation_refusal_code(result: Any) -> str:
+    """Return the kernel's stable refusal code carried by the handler's
+    ``tool_error`` payload, or ``""`` when there is none or it is malformed.
+    A code is a short slug the owner surface maps to one plain sentence."""
+    if isinstance(result, dict):
+        result = result.get("final_response")
+    if not isinstance(result, str):
+        return ""
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return ""
+    code = payload.get("code") if isinstance(payload, dict) else None
+    if not isinstance(code, str) or _OWNER_REFUSAL_CODE_RE.fullmatch(code) is None:
+        return ""
+    return code
 
 
 def _owner_mutation_refusal(result: Any) -> str:
@@ -14299,8 +14358,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 elif owner_mutation_authority is not None:
                     error_msg = "The approved Project change was not committed"
                     refusal = _owner_mutation_refusal(result)
+                    refusal_code = _owner_mutation_refusal_code(result)
                     if refusal:
                         error_msg = f"{error_msg}: {refusal}"
+                    # The kernel itself is silent on refusals; this is the one
+                    # line an operator can find in the journal.
+                    logger.info(
+                        "[api_server] owner mutation refused run=%s code=%s reason=%s",
+                        run_id, refusal_code or "-", refusal or "-",
+                    )
                     _put_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
@@ -14313,6 +14379,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         error=error_msg,
                         owner_mutation_committed=False,
                         last_event="run.failed",
+                        # The bare refusal, so the durable row keeps the whole
+                        # reason within its bound instead of a prefixed copy
+                        # cut short.
+                        **({"error_reason": refusal} if refusal else {}),
+                        **({"error_code": refusal_code} if refusal_code else {}),
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -14787,8 +14858,16 @@ class APIServerAdapter(BasePlatformAdapter):
         state = str(status.get("status") or "")
         if state not in _TERMINAL_RUN_STATUSES:
             state = "failed"
+        # Only the kernel's refusal of an owner mutation is durable: it is the
+        # plain, redacted reason the owner is meant to read. Any other failure
+        # keeps the non-diagnostic sentence.
+        refused = status.get("owner_mutation_committed") is False
         try:
-            self._response_store.persist_terminal_run_status(profile, run_id, state)
+            self._response_store.persist_terminal_run_status(
+                profile, run_id, state,
+                error=(status.get("error_reason") or status.get("error")) if refused else None,
+                error_code=status.get("error_code") if refused else None,
+            )
         except OwnerAuthorityUnavailable:
             return
         except Exception:

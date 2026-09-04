@@ -678,6 +678,9 @@ def test_committed_project_projection_is_receipt_backed_and_read_only(ctx):
         "description": "A plain-English owner project.",
         "board": result["board"],
         "archived": False,
+        # A board-only Project has no repository folder, so a planner must not
+        # propose file ownership for it.
+        "has_repository": False,
     }]
     assert ow.list_committed_projects(
         ctx, lifecycle_revision=True,

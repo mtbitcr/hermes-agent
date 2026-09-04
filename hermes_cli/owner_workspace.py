@@ -2037,8 +2037,8 @@ def list_committed_projects(
         for project_id in project_ids:
             try:
                 row = conn.execute(
-                    "SELECT id, slug, name, description, board_slug, archived "
-                    "FROM projects WHERE id = ?",
+                    "SELECT id, slug, name, description, board_slug, archived, "
+                    "primary_path FROM projects WHERE id = ?",
                     (project_id,),
                 ).fetchone()
             except sqlite3.Error as exc:
@@ -2064,6 +2064,9 @@ def list_committed_projects(
                 "description": row["description"],
                 "board": row["board_slug"],
                 "archived": bool(row["archived"]),
+                # A Project without a repository folder cannot scope file
+                # ownership; the planner must know that before it proposes.
+                "has_repository": bool(row["primary_path"]),
             }
             if lifecycle_revision:
                 # Opt-in keeps the legacy closed projection stable during a

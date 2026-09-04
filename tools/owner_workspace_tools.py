@@ -25,6 +25,15 @@ from tools.registry import registry, tool_error
 logger = logging.getLogger(__name__)
 
 
+def _refused(operation: str, exc: OwnerWorkspaceError) -> str:
+    """Render a kernel refusal with its stable code.
+
+    The message is the kernel's own plain reason; the code lets the run layer
+    and the owner surface name the rule that refused without parsing text.
+    """
+    return tool_error(f"{operation}: {exc.message}", code=exc.code)
+
+
 def _ok(result: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
@@ -82,7 +91,7 @@ def _handle_bootstrap(args: dict, **kw) -> str:
         )
         return _ok(result)
     except OwnerWorkspaceError as e:
-        return tool_error(f"owner_workspace_bootstrap: {e.message}")
+        return _refused("owner_workspace_bootstrap", e)
     except Exception:
         logger.exception("owner_workspace_bootstrap failed")
         return tool_error("owner_workspace_bootstrap: internal error")
@@ -96,7 +105,7 @@ def _handle_project_steward_snapshot(args: dict, **kw) -> str:
         )
         return _ok(result)
     except OwnerWorkspaceError as e:
-        return tool_error(f"project_steward_snapshot: {e.message}")
+        return _refused("project_steward_snapshot", e)
     except Exception:
         logger.exception("project_steward_snapshot failed")
         return tool_error("project_steward_snapshot: internal error")
@@ -123,7 +132,7 @@ def _handle_task_graph(args: dict, **kw) -> str:
         )
         return _ok(result)
     except OwnerWorkspaceError as e:
-        return tool_error(f"owner_task_graph_commit: {e.message}")
+        return _refused("owner_task_graph_commit", e)
     except ValueError as e:
         return tool_error(f"owner_task_graph_commit: {e}")
     except Exception:
@@ -149,7 +158,7 @@ def _handle_project_plan(args: dict, **kw) -> str:
         )
         return _ok(result)
     except OwnerWorkspaceError as e:
-        return tool_error(f"owner_project_plan_commit: {e.message}")
+        return _refused("owner_project_plan_commit", e)
     except ValueError as e:
         return tool_error(f"owner_project_plan_commit: {e}")
     except Exception:
@@ -169,7 +178,7 @@ def _handle_project_lifecycle(args: dict, **kw) -> str:
         )
         return _ok(result)
     except OwnerWorkspaceError as e:
-        return tool_error(f"owner_project_lifecycle: {e.message}")
+        return _refused("owner_project_lifecycle", e)
     except ValueError as e:
         return tool_error(f"owner_project_lifecycle: {e}")
     except Exception:
@@ -191,7 +200,7 @@ def _handle_task_move(args: dict, **kw) -> str:
         )
         return _ok(result)
     except OwnerWorkspaceError as e:
-        return tool_error(f"owner_task_move: {e.message}")
+        return _refused("owner_task_move", e)
     except ValueError as e:
         return tool_error(f"owner_task_move: {e}")
     except Exception:
@@ -211,7 +220,7 @@ def _handle_task_comment(args: dict, **kw) -> str:
         )
         return _ok(result)
     except OwnerWorkspaceError as e:
-        return tool_error(f"owner_task_comment: {e.message}")
+        return _refused("owner_task_comment", e)
     except ValueError as e:
         return tool_error(f"owner_task_comment: {e}")
     except Exception:
