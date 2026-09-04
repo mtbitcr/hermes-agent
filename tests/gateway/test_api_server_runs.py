@@ -28,7 +28,9 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _approval_event_choices,
     _make_request_fingerprint,
+    _OWNER_RUN_STOPPED_MESSAGE,
     _owner_mutation_refusal,
+    _owner_mutation_refusal_code,
     cors_middleware,
     security_headers_middleware,
 )
@@ -2010,6 +2012,48 @@ class TestOrphanedRunRecovery:
         assert store.claim_orphaned_owner_jobs("run") == []
 
 
+    @pytest.mark.asyncio
+    async def test_a_refused_owner_mutation_persists_its_reason_and_code(self, adapter):
+        """The kernel's refusal is plain, redacted owner text; the durable row
+        keeps it with its code so a restarted service can still say why."""
+        self._queued_owner_run(adapter, dead=False)
+        store = adapter._response_store
+        adapter._run_statuses[self._RUN_ID] = {
+            "object": "hermes.run", "run_id": self._RUN_ID, "status": "failed",
+            "error": "The approved Project change was not committed: "
+                     "owner_project_plan_commit: changes declares repository ownership",
+            "error_reason": "owner_project_plan_commit: changes declares repository ownership",
+            "error_code": "ownership_scope_unavailable",
+            "owner_mutation_committed": False,
+        }
+
+        adapter._finalize_run_recovery_job(self._RUN_ID, "default")
+
+        durable = store.run_idempotency_status("default", self._RUN_ID)
+        assert durable["status"] == "failed"
+        # The bare reason, whole: the transport prefix is not part of the row.
+        assert durable["error"] == (
+            "owner_project_plan_commit: changes declares repository ownership"
+        )
+        assert durable["error_code"] == "ownership_scope_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_any_other_failure_stays_non_diagnostic(self, adapter):
+        """Exception text never becomes a durable owner-readable row."""
+        self._queued_owner_run(adapter, dead=False)
+        store = adapter._response_store
+        adapter._run_statuses[self._RUN_ID] = {
+            "object": "hermes.run", "run_id": self._RUN_ID, "status": "failed",
+            "error": "Traceback: KeyError: 'model'",
+        }
+
+        adapter._finalize_run_recovery_job(self._RUN_ID, "default")
+
+        durable = store.run_idempotency_status("default", self._RUN_ID)
+        assert durable["error"] == _OWNER_RUN_STOPPED_MESSAGE
+        assert "error_code" not in durable
+
+
 class TestOwnerMutationRefusal:
     """An owner mutation that did not commit reports the kernel's own reason."""
 
@@ -2031,3 +2075,21 @@ class TestOwnerMutationRefusal:
     )
     def test_silent_when_no_reason_is_available(self, result):
         assert _owner_mutation_refusal(result) == ""
+
+    def test_the_stable_code_rides_along(self):
+        result = {"final_response": '{"error": "owner_project_plan_commit: refused", "code": "ownership_scope_unavailable"}'}
+        assert _owner_mutation_refusal_code(result) == "ownership_scope_unavailable"
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            None,
+            '{"error": "refused"}',
+            '{"error": "refused", "code": ""}',
+            '{"error": "refused", "code": "Not A Slug"}',
+            '{"error": "refused", "code": 7}',
+            {"final_response": '{"error": "refused", "code": "x" * 65}'},
+        ],
+    )
+    def test_a_missing_or_malformed_code_is_dropped(self, result):
+        assert _owner_mutation_refusal_code(result) == ""

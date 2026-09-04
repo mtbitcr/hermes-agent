@@ -773,6 +773,7 @@ class TestResponseStore:
             "proposal_claimed": False,
             "active_run_id": None,
             "completed_run_id": None,
+            "released_run_id": None,
             "conversation_closed": False,
             "truncated": False,
             "incomplete": False,
@@ -1122,6 +1123,9 @@ class TestResponseStore:
         assert store.claim_owner_proposal("default", conversation, response_id, claim_id) is True
         assert store.attach_owner_run("default", conversation, response_id, claim_id, run_id) is True
         assert store.release_owner_claim("default", conversation, response_id, claim_id, run_id) is True
+        # A released claim keeps naming its run: that is how a refused approval
+        # can still tell the owner why it was not committed.
+        assert store.owner_history_snapshot(conversation)["released_run_id"] == run_id
         assert store.close_owner_conversation("default", conversation, response_id) is True
         assert store.close_owner_conversation("default", conversation, response_id) is True
         assert store.set_conversation(conversation, "resp_after_close") is False
@@ -1129,6 +1133,7 @@ class TestResponseStore:
         assert snapshot["proposal_consumed"] is False
         assert snapshot["conversation_closed"] is True
         assert snapshot["proposal_claimed"] is False
+        assert snapshot["released_run_id"] == run_id
         assert snapshot["conversation_closed"] is True
 
     def test_close_missing_owner_conversation_persists_a_tombstone(self, tmp_path):
@@ -2490,6 +2495,7 @@ class TestResponseStore:
             "proposal_claimed": False,
             "active_run_id": None,
             "completed_run_id": None,
+            "released_run_id": None,
             "conversation_closed": False,
             "truncated": False,
             "incomplete": False,

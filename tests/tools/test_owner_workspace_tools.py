@@ -313,6 +313,33 @@ def trusted_ctx():
     return OwnerContext(actor="trusted-actor", profile="trusted-profile", session="trusted-session")
 
 
+class TestRefusalRendering:
+    def test_a_refusal_carries_its_kernel_code(self, monkeypatch, trusted_ctx):
+        """The run layer and the owner surface name the rule that refused
+        without parsing the message text."""
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+
+        def refuse(ctx, **kwargs):
+            raise OwnerWorkspaceError(
+                "ownership_scope_unavailable",
+                "changes declares repository ownership, but this Project has no "
+                "primary repository folder to scope a worktree in",
+            )
+
+        monkeypatch.setattr(owt._kernel, "commit_project_plan", refuse)
+        payload = json.loads(owt._handle_project_plan({
+            "idempotency_key": "plan-refused",
+            "project_id": "p1",
+            "request_title": "Reassign the edit",
+            "summary": "Reassign one task.",
+            "changes": [],
+        }))
+        assert payload["code"] == "ownership_scope_unavailable"
+        assert payload["error"].startswith(
+            "owner_project_plan_commit: changes declares repository ownership"
+        )
+
+
 class TestTrustedContextResolution:
     def test_bootstrap_uses_resolved_context_not_args(self, monkeypatch, trusted_ctx):
         monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
