@@ -133,6 +133,37 @@ def test_attachments_root_is_per_board(kanban_home, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_worker_context_inlines_parent_text_attachments(kanban_home):
+    # A child on a host without file tools still reads a done parent's
+    # text deliverables inline; binary and oversized files are only listed.
+    conn = kb.connect()
+    try:
+        parent = _make_task(conn, title="write the plan")
+        kb.store_attachment_bytes(
+            conn, parent, "plan.md", b"# Plan\nstep one\n", content_type="text/markdown",
+        )
+        kb.store_attachment_bytes(
+            conn, parent, "manual.pdf", b"%PDF-binary", content_type="application/pdf",
+        )
+        kb.store_attachment_bytes(
+            conn, parent, "big.txt", b"y" * (kb._CTX_MAX_ATTACHMENT_BYTES + 1),
+            content_type="text/plain",
+        )
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        conn.commit()
+        child = kb.create_task(conn, title="use the plan", parents=[parent])
+
+        ctx = kb.build_worker_context(conn, child)
+
+        assert "## Parent task results" in ctx
+        assert "step one" in ctx
+        assert "manual.pdf" in ctx and "%PDF" not in ctx
+        assert "big.txt" in ctx and "y" * 64 not in ctx
+        assert "id=" in ctx
+    finally:
+        conn.close()
+
+
 def test_worker_context_lists_attachments_with_absolute_path(kanban_home):
     conn = kb.connect()
     try:
