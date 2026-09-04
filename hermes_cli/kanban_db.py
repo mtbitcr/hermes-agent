@@ -674,6 +674,8 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+_CTX_MAX_ATTACHMENT_BYTES         = 8 * 1024   # per inlined parent text attachment
+_CTX_MAX_PARENT_ATTACHMENTS_BYTES = 32 * 1024  # total inlined across all parents
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -17180,7 +17182,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
       4. Structured handoff results of every done parent task. Prefers
          ``run.summary`` / ``run.metadata`` when the parent was executed
          via a run; falls back to ``task.result`` for older data. Same
-         per-field cap.
+         per-field cap. Each parent's attachments are listed; text ones
+         (``text/*``, ``application/json``) are inlined up to
+         ``_CTX_MAX_ATTACHMENT_BYTES`` each and
+         ``_CTX_MAX_PARENT_ATTACHMENTS_BYTES`` in total, so a worker
+         without file tools still reads the parent's deliverables.
       5. Cross-task role history for the assignee (most recent 5
          completed runs on other tasks).
       6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
@@ -17316,6 +17322,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
     if parent_ids:
         wrote_header = False
+        attach_budget = _CTX_MAX_PARENT_ATTACHMENTS_BYTES
+        budget_noted = False
         for pid in parent_ids:
             pt = get_task(conn, pid)
             if not pt or pt.status != "done":
@@ -17367,6 +17375,33 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 except Exception:
                     pass
             lines.extend(body_lines)
+            for att in list_attachments(conn, pid):
+                ctype = (att.content_type or "").split(";")[0].strip().lower()
+                inline = (
+                    (ctype.startswith("text/") or ctype == "application/json")
+                    and att.size <= _CTX_MAX_ATTACHMENT_BYTES
+                    and att.size <= attach_budget
+                )
+                text = ""
+                if inline:
+                    try:
+                        text = read_attachment_bytes(att).decode("utf-8", errors="replace")
+                    except (OSError, ValueError):
+                        inline = False
+                lines.append(
+                    f"- attachment `{att.filename}` (id={att.id}, {att.size} bytes, "
+                    f"{ctype or 'unknown type'})"
+                )
+                if inline:
+                    attach_budget -= att.size
+                    lines.extend(["```", text.strip(), "```"])
+                elif (
+                    not budget_noted
+                    and att.size > attach_budget
+                    and att.size <= _CTX_MAX_ATTACHMENT_BYTES
+                ):
+                    budget_noted = True
+                    lines.append("_(inline attachment budget exhausted; the rest is listed by id)_")
             lines.append("")
 
     # Cross-task role history: what else has THIS assignee completed
