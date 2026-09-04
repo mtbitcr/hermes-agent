@@ -676,6 +676,12 @@ _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 _CTX_MAX_ATTACHMENT_BYTES         = 8 * 1024   # per inlined parent text attachment
 _CTX_MAX_PARENT_ATTACHMENTS_BYTES = 32 * 1024  # total inlined across all parents
+# Structured-text types inlined beside ``text/*``; the stored content type is
+# what the upload declared, so a NUL byte in the bytes still wins over it.
+_CTX_INLINE_ATTACHMENT_TYPES = frozenset({
+    "application/json", "application/xml", "application/toml",
+    "application/yaml", "application/x-yaml",
+})
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -17377,29 +17383,29 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.extend(body_lines)
             for att in list_attachments(conn, pid):
                 ctype = (att.content_type or "").split(";")[0].strip().lower()
-                inline = (
-                    (ctype.startswith("text/") or ctype == "application/json")
-                    and att.size <= _CTX_MAX_ATTACHMENT_BYTES
-                    and att.size <= attach_budget
-                )
-                text = ""
-                if inline:
+                is_text = ctype.startswith("text/") or ctype in _CTX_INLINE_ATTACHMENT_TYPES
+                fits_file = att.size <= _CTX_MAX_ATTACHMENT_BYTES
+                text = None
+                if is_text and fits_file and att.size <= attach_budget:
                     try:
-                        text = read_attachment_bytes(att).decode("utf-8", errors="replace")
+                        raw = read_attachment_bytes(att)
                     except (OSError, ValueError):
-                        inline = False
+                        raw = None
+                    if raw is not None and b"\x00" not in raw:
+                        text = raw.decode("utf-8", errors="replace")
                 lines.append(
                     f"- attachment `{att.filename}` (id={att.id}, {att.size} bytes, "
                     f"{ctype or 'unknown type'})"
                 )
-                if inline:
+                if text is not None:
                     attach_budget -= att.size
-                    lines.extend(["```", text.strip(), "```"])
-                elif (
-                    not budget_noted
-                    and att.size > attach_budget
-                    and att.size <= _CTX_MAX_ATTACHMENT_BYTES
-                ):
+                    # The fence must outrun any backtick run inside the file,
+                    # otherwise attachment bytes could close it and pose as
+                    # context structure.
+                    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+                    fence = "`" * max(3, longest + 1)
+                    lines.extend([fence, text.strip(), fence])
+                elif is_text and fits_file and att.size > attach_budget and not budget_noted:
                     budget_noted = True
                     lines.append("_(inline attachment budget exhausted; the rest is listed by id)_")
             lines.append("")
