@@ -2500,7 +2500,7 @@ class ResponseStore:
                 continue
             if (
                 candidate["kind"]
-                not in {"question", "proposal", "project_change_proposal"}
+                not in {"question", "no_change", "proposal", "project_change_proposal"}
                 and not _owner_failure_reply_is_projectable(candidate)
             ):
                 # A real reply of a kind this projection deliberately excludes

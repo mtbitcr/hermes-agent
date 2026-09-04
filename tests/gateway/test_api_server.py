@@ -714,6 +714,34 @@ class TestResponseStore:
             "default", conversation, response_id,
         ) is None
 
+    def test_owner_history_projects_a_no_change_reply(self):
+        """A planner that answers "nothing needs to change" has answered: the
+        turn is owner-visible history, not a dropped reply."""
+        conversation = "raphael-owner-" + "c" * 32
+        store = ResponseStore(max_size=10)
+        store.put("resp_no_change", {
+            "response": {"id": "resp_no_change"},
+            "conversation_history": [
+                {"role": "user", "content": "Hand the edit to a specialist who can open files."},
+                {"role": "assistant", "content": json.dumps({
+                    "schema_version": 1,
+                    "kind": "no_change",
+                    "message": "That task is already assigned to the only specialist who can edit files.",
+                })},
+            ],
+        })
+        assert store.set_conversation(conversation, "resp_no_change") is True
+
+        history = store.owner_history(conversation)
+        assert [item["owner"] for item in history] == [
+            "Hand the edit to a specialist who can open files.",
+        ]
+        assert json.loads(history[0]["raphael"])["kind"] == "no_change"
+        snapshot = store.owner_history_snapshot(conversation)
+        assert snapshot["head_response_id"] == "resp_no_change"
+        assert len(snapshot["data"]) == 1
+        assert snapshot["incomplete"] is False
+
     def test_owner_history_projects_only_final_structured_turns(self):
         secret = "sk-ant-api03-" + "a" * 80
         conversation = "raphael-owner-" + "a" * 32
