@@ -1672,15 +1672,24 @@ def test_run_receipt_is_checked_against_that_task_own_pinned_route(ctx):
     )["state"] == "known"
 
     # Independent verification exists to be independent OF the implementation
-    # family, so there is no admitted Claude verifier route at all: the
-    # role-level check itself refuses it, and the pinned check refuses the run.
+    # family. The only admitted Claude verifier route is the dated Opus 5 / max
+    # fallback (2026-09-04): the role-level check admits it, but this run was
+    # recorded on the OpenAI route, so a pin naming the fallback still cannot
+    # confirm it. The builder's Sonnet lane stays refused at the role level.
+    assert ow.validate_raphael_model_assignment(
+        "raphael-verifier", "anthropic", "claude-opus-5", "max",
+        disable_fallbacks=True,
+    ).model == "claude-opus-5"
+    assert runtime(
+        pin("raphael-verifier", "anthropic", "claude-opus-5", "max")
+    ) == ow._OWNER_UNKNOWN_RUNTIME
     with pytest.raises(ValueError):
         ow.validate_raphael_model_assignment(
-            "raphael-verifier", "anthropic", "claude-opus-5", "max",
+            "raphael-verifier", "anthropic", "claude-sonnet-5", "max",
             disable_fallbacks=True,
         )
     assert runtime(
-        pin("raphael-verifier", "anthropic", "claude-opus-5", "max")
+        pin("raphael-verifier", "anthropic", "claude-sonnet-5", "max")
     ) == ow._OWNER_UNKNOWN_RUNTIME
     # Same model and provider, different approved depth.
     assert runtime(

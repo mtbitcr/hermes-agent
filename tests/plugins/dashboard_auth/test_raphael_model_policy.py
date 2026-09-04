@@ -44,6 +44,7 @@ from plugins.dashboard_auth.raphael_workspace.model_policy import (
         ("raphael-claude-worker", "anthropic", "claude-sonnet-", "max"),
         ("raphael-builder", "anthropic", "claude-sonnet-", "max"),
         ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max"),
+        ("raphael-verifier", "anthropic", "claude-opus-", "max"),
         ("raphael-planner", "openai-codex", "gpt-5.6-sol", "max"),
         ("default", "openai-codex", "gpt-5.6-sol", "max"),
         ("raphael-business", "openai-codex", "gpt-5.6-terra", "max"),
@@ -75,11 +76,12 @@ def test_admitted_assignment_is_role_bound(profile, provider, family, effort):
         ("default", "openai-codex", "gpt-5.6-sol", "xhigh", False),
         ("other-profile", "anthropic", "claude-opus-5", "max", True),
         # High-risk coding may not leave the Claude family, and independent
-        # verification may not return to it.
+        # verification may only fall back to the strongest Claude model, never
+        # to the builder's own Sonnet lane.
         ("raphael-builder", "openai-codex", "gpt-5.6-terra", "max", True),
         ("raphael-builder", "openai-codex", "gpt-5.6-sol", "max", True),
-        ("raphael-verifier", "anthropic", "claude-opus-5", "max", True),
         ("raphael-verifier", "anthropic", "claude-sonnet-5", "max", True),
+        ("raphael-verifier", "anthropic", "claude-opus-5", "high", True),
     ],
 )
 def test_unadmitted_or_fallback_capable_assignment_fails_closed(
@@ -139,17 +141,27 @@ def test_no_builder_lane_leaves_the_claude_family(tier):
 
 
 @pytest.mark.parametrize("tier", ["routine", "deep"])
-def test_independent_review_cannot_route_back_through_the_builder_family(tier):
-    """The verifier exists to be independent of the implementation family."""
-    with pytest.raises(ValueError):
-        assignment_for("raphael-verifier", "anthropic")
-    with pytest.raises(ValueError):
-        task_assignment_for("raphael-verifier", "anthropic", tier)
+def test_independent_review_recommends_openai_and_admits_only_the_opus_fallback(tier):
+    """The verifier stays independent of the builder's lane.
+
+    The OpenAI route remains the recommended one; the dated Anthropic fallback
+    (admitted 2026-09-04) resolves to Claude Opus 5 / max on every tier and is
+    never presented as recommended, and the builder's Sonnet lane is refused.
+    """
+    fallback = assignment_for("raphael-verifier", "anthropic")
+    assert (fallback.model, fallback.reasoning_effort, fallback.recommended) == (
+        "claude-opus-5", "max", False,
+    )
+    assert task_assignment_for("raphael-verifier", "anthropic", tier) == fallback
+    assert model_policy.mint_policy_lock(
+        "raphael-verifier", "anthropic", "claude-opus-5", "max", tier,
+    ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
     with pytest.raises(ValueError):
         model_policy.mint_policy_lock(
-            "raphael-verifier", "anthropic", "claude-opus-5", "max", tier,
+            "raphael-verifier", "anthropic", "claude-sonnet-5", "max", tier,
         )
     verifier = task_assignment_for("raphael-verifier", "openai-codex", tier)
+    assert verifier.recommended is True
     assert (verifier.provider, verifier.model, verifier.reasoning_effort) == (
         "openai-codex", "gpt-5.6-sol", "max",
     )
@@ -183,9 +195,10 @@ def test_removed_lanes_are_not_exposed_as_selectable_options():
 
     verifier = project_options_payload(native, profile="raphael-verifier")
     by_slug = {row["slug"]: row for row in verifier["providers"]}
-    assert by_slug["anthropic"]["assignment"] is None
-    assert by_slug["anthropic"]["task_routes"] is None
-    assert by_slug["anthropic"]["models"] == []
+    assert by_slug["anthropic"]["assignment"]["model"] == "claude-opus-5"
+    assert by_slug["anthropic"]["assignment"]["recommended"] is False
+    assert by_slug["anthropic"]["models"] == ["claude-opus-5"]
+    assert by_slug["openai-codex"]["assignment"]["recommended"] is True
     assert by_slug["openai-codex"]["models"] == ["gpt-5.6-sol"]
 
 
