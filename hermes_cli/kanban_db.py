@@ -702,12 +702,13 @@ def _inferred_content_type(filename: str, declared: Optional[str]) -> Optional[s
     ``application/octet-stream``; then the filename decides, and a guessed
     encoding makes the row the wrapper type so it never enters the text path.
     """
-    if declared and declared != "application/octet-stream":
+    generic = (declared or "").split(";", 1)[0].strip().lower()
+    if generic and generic != "application/octet-stream":
         return declared
     guessed, encoding = mimetypes.guess_type(filename)
     if encoding:
         return _ENCODING_CONTENT_TYPES.get(encoding, "application/octet-stream")
-    return guessed or declared
+    return guessed or (generic or None)
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -2981,11 +2982,14 @@ def connect(
                     # garbage-collected after 30 days. Added here, after the
                     # schema, because the legacy pass above may run on
                     # databases that have no task_attachments table yet.
-                    if _add_column_if_missing(
-                        conn, "task_attachments", "source_attachment_id",
-                        "source_attachment_id INTEGER",
-                    ):
-                        _backfill_attachment_sources(conn)
+                    # One transaction: an interrupted upgrade rolls the column
+                    # back too, so the next startup retries the back-fill.
+                    with write_txn(conn):
+                        if _add_column_if_missing(
+                            conn, "task_attachments", "source_attachment_id",
+                            "source_attachment_id INTEGER",
+                        ):
+                            _backfill_attachment_sources(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -7386,22 +7390,22 @@ def _add_attachment_row(
 
 def _backfill_attachment_sources(conn: sqlite3.Connection) -> int:
     """Fill ``source_attachment_id`` for copies stored before the column
-    existed, from their retained ``attached`` events. Returns rows updated."""
-    with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE task_attachments SET source_attachment_id = ("
-            " SELECT json_extract(e.payload, '$.source_attachment_id') FROM task_events e"
-            " WHERE e.task_id = task_attachments.task_id AND e.kind = 'attached'"
-            " AND json_extract(e.payload, '$.attachment_id') = task_attachments.id"
-            " AND json_extract(e.payload, '$.source_attachment_id') IS NOT NULL"
-            " ORDER BY e.id DESC LIMIT 1)"
-            " WHERE source_attachment_id IS NULL AND EXISTS ("
-            " SELECT 1 FROM task_events e"
-            " WHERE e.task_id = task_attachments.task_id AND e.kind = 'attached'"
-            " AND json_extract(e.payload, '$.attachment_id') = task_attachments.id"
-            " AND json_extract(e.payload, '$.source_attachment_id') IS NOT NULL)"
-        )
-        return cur.rowcount
+    existed, from their retained ``attached`` events. Runs inside the
+    caller's transaction. Returns rows updated."""
+    cur = conn.execute(
+        "UPDATE task_attachments SET source_attachment_id = ("
+        " SELECT json_extract(e.payload, '$.source_attachment_id') FROM task_events e"
+        " WHERE e.task_id = task_attachments.task_id AND e.kind = 'attached'"
+        " AND json_extract(e.payload, '$.attachment_id') = task_attachments.id"
+        " AND json_extract(e.payload, '$.source_attachment_id') IS NOT NULL"
+        " ORDER BY e.id DESC LIMIT 1)"
+        " WHERE source_attachment_id IS NULL AND EXISTS ("
+        " SELECT 1 FROM task_events e"
+        " WHERE e.task_id = task_attachments.task_id AND e.kind = 'attached'"
+        " AND json_extract(e.payload, '$.attachment_id') = task_attachments.id"
+        " AND json_extract(e.payload, '$.source_attachment_id') IS NOT NULL)"
+    )
+    return cur.rowcount
 
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
