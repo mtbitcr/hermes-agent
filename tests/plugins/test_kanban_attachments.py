@@ -610,12 +610,19 @@ def test_upgrade_adds_the_source_column_and_back_fills_copies_once(client, monke
 
 
 def test_compressed_names_are_listed_but_never_inlined(kanban_home):
+    # Delivered through the worker's real completion path, like plan.md above.
     conn = kb.connect()
     try:
         parent = _make_task(conn, title="write the notes")
-        kb.store_attachment_bytes(conn, parent, "notes.md.gz", b"plain looking bytes without a nul")
-        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
-        conn.commit()
+        claimed = kb.claim_task(conn, parent)
+        staged = kb.task_attachments_dir(parent)
+        staged.mkdir(parents=True, exist_ok=True)
+        path = staged / "notes.md.gz"
+        path.write_bytes(b"plain looking bytes without a nul")
+        assert kb.complete_task(
+            conn, parent, result="done", metadata={"_staged_artifacts": [str(path)]},
+            expected_run_id=claimed.current_run_id,
+        )
         child = kb.create_task(conn, title="read the notes", parents=[parent])
 
         ctx = kb.build_worker_context(conn, child)
