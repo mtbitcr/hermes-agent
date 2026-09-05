@@ -529,6 +529,95 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def _govern_current_board(kb):
+    """Publish an owner project id on the board so tool-created tasks are governed."""
+    kb.write_board_metadata(kb.get_current_board(), project_id="p_governed_test")
+
+
+def _stub_admitted_route(monkeypatch):
+    from plugins.dashboard_auth.raphael_workspace import model_policy as mp
+    from hermes_cli import owner_workspace as ow
+
+    def fake_resolve(profile, tier):
+        return mp.task_assignment_for(profile, "anthropic", tier)
+
+    monkeypatch.setattr(ow, "resolve_task_assignment", fake_resolve)
+
+
+def test_create_on_governed_board_pins_the_admitted_route(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _govern_current_board(kb)
+    _stub_admitted_route(monkeypatch)
+    out = kt._handle_create({
+        "title": "governed child",
+        "assignee": "raphael-builder",
+        "execution_tier": "deep",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["execution_tier"] == "deep"
+    assert d["route_pinned"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.execution_tier == "deep"
+        assert child.provider_override == "anthropic"
+        assert child.model_override == "claude-opus-5"
+        assert child.reasoning_effort == "max"
+        assert kb.policy_lock_error(
+            child.model_policy_lock, "raphael-builder", "anthropic", "claude-opus-5", "max", "deep",
+        ) is None
+    finally:
+        conn.close()
+
+
+def test_create_on_governed_board_refuses_model_override(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _govern_current_board(kb)
+    _stub_admitted_route(monkeypatch)
+    conn = kb.connect()
+    try:
+        before = len(kb.list_tasks(conn))
+    finally:
+        conn.close()
+    out = kt._handle_create({
+        "title": "hand-routed child",
+        "assignee": "raphael-verifier",
+        "model": "gpt-5.6-sol",
+        "provider": "openai-codex",
+    })
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "owner-governed" in d["error"]
+    conn = kb.connect()
+    try:
+        assert len(kb.list_tasks(conn)) == before
+    finally:
+        conn.close()
+
+
+def test_create_on_governed_board_inherits_creator_deep_tier(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _govern_current_board(kb)
+    _stub_admitted_route(monkeypatch)
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET execution_tier='deep' WHERE id=?", (worker_env,))
+        conn.commit()
+    finally:
+        conn.close()
+    out = kt._handle_create({"title": "inherits tier", "assignee": "raphael-builder"})
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["execution_tier"] == "deep"
+
+
 def test_create_explicit_worktree_inherits_current_project(worker_env, tmp_path):
     """Scoped parallel children stay linked to the parent's Project."""
     from hermes_cli import kanban_db as kb
@@ -1901,3 +1990,90 @@ def test_recommend_kind_enum_tracks_the_db_and_adds_exactly_one_tool():
     )
     # One new tool on the existing toolset — no new registry, route, or surface.
     assert "kanban_recommend" in TOOLSETS["kanban"]["tools"]
+
+
+def test_create_on_plain_board_keeps_the_hand_set_route(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    d = json.loads(kt._handle_create({
+        "title": "hand-routed child",
+        "assignee": "raphael-verifier",
+        "model": "gpt-5.6-sol",
+        "provider": "openai-codex",
+    }))
+    assert d["ok"] is True, d
+    assert d["route_pinned"] is False
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert (child.model_override, child.provider_override) == ("gpt-5.6-sol", "openai-codex")
+        assert not child.model_policy_lock
+    finally:
+        conn.close()
+
+
+def test_create_on_governed_board_refuses_provider_only(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _govern_current_board(kb)
+    _stub_admitted_route(monkeypatch)
+    d = json.loads(kt._handle_create({
+        "title": "provider only", "assignee": "raphael-verifier", "provider": "openai-codex",
+    }))
+    assert d.get("ok") is not True
+    assert "owner-governed" in d["error"]
+
+
+def test_create_governance_follows_the_pinned_database_not_the_board_argument(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _govern_current_board(kb)
+    _stub_admitted_route(monkeypatch)
+    kb.write_board_metadata("plain", name="Plain")
+    kb.connect(board="plain").close()
+    default_db = kb.kanban_db_path(board="default")
+    plain_db = kb.kanban_db_path(board="plain")
+
+    def count(board):
+        conn = kb.connect(board=board)
+        try:
+            return len(kb.list_tasks(conn))
+        finally:
+            conn.close()
+
+    before = {b: count(b) for b in ("default", "plain")}
+    hand_set = {"assignee": "raphael-verifier", "model": "gpt-5.6-sol", "provider": "openai-codex"}
+    # A worker pinned to the governed database asks for a plain board.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(default_db))
+    d = json.loads(kt._handle_create({"title": "escape attempt", "board": "plain", **hand_set}))
+    assert d.get("ok") is not True
+    assert "does not match" in d["error"]
+    # A worker pinned to a plain database names the governed board.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(plain_db))
+    d = json.loads(kt._handle_create({"title": "wrong claim", "board": "default", **hand_set}))
+    assert d.get("ok") is not True
+    assert "does not match" in d["error"]
+    monkeypatch.delenv("HERMES_KANBAN_DB")
+    assert {b: count(b) for b in ("default", "plain")} == before
+
+
+def test_create_refuses_a_board_claim_on_an_unmappable_pinned_database(worker_env, monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    foreign = tmp_path / "legacy" / "custom.db"
+    kb.init_db(foreign)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(foreign))
+    d = json.loads(kt._handle_create({
+        "title": "claims a board", "assignee": "raphael-verifier", "board": "default",
+    }))
+    assert d.get("ok") is not True
+    assert "does not match" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.list_tasks(conn) == []
+    finally:
+        conn.close()
