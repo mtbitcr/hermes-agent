@@ -2058,3 +2058,22 @@ def test_create_governance_follows_the_pinned_database_not_the_board_argument(wo
     assert "does not match" in d["error"]
     monkeypatch.delenv("HERMES_KANBAN_DB")
     assert {b: count(b) for b in ("default", "plain")} == before
+
+
+def test_create_refuses_a_board_claim_on_an_unmappable_pinned_database(worker_env, monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    foreign = tmp_path / "legacy" / "custom.db"
+    kb.init_db(foreign)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(foreign))
+    d = json.loads(kt._handle_create({
+        "title": "claims a board", "assignee": "raphael-verifier", "board": "default",
+    }))
+    assert d.get("ok") is not True
+    assert "does not match" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.list_tasks(conn) == []
+    finally:
+        conn.close()
