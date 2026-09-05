@@ -141,18 +141,18 @@ def test_no_builder_lane_leaves_the_claude_family(tier):
 
 
 @pytest.mark.parametrize("tier", ["routine", "deep"])
-def test_independent_review_recommends_openai_and_admits_only_the_opus_fallback(tier):
+def test_independent_review_recommends_openai_and_admits_only_the_claude_security_lane(tier):
     """The verifier stays independent of the builder's lane.
 
-    The OpenAI route remains the recommended one; the dated Anthropic fallback
-    (admitted 2026-09-04) resolves to Claude Opus 5 / max on every tier and is
-    never presented as recommended, and the builder's Sonnet lane is refused.
+    The OpenAI route remains the recommended one; the named Claude Security
+    lane resolves to Claude Opus 5 / max on every tier and is never presented
+    as recommended, and the builder's Sonnet lane is refused.
     """
-    fallback = assignment_for("raphael-verifier", "anthropic")
-    assert (fallback.model, fallback.reasoning_effort, fallback.recommended) == (
+    claude_lane = assignment_for("raphael-verifier", "anthropic")
+    assert (claude_lane.model, claude_lane.reasoning_effort, claude_lane.recommended) == (
         "claude-opus-5", "max", False,
     )
-    assert task_assignment_for("raphael-verifier", "anthropic", tier) == fallback
+    assert task_assignment_for("raphael-verifier", "anthropic", tier) == claude_lane
     assert model_policy.mint_policy_lock(
         "raphael-verifier", "anthropic", "claude-opus-5", "max", tier,
     ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")

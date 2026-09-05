@@ -1672,10 +1672,10 @@ def test_run_receipt_is_checked_against_that_task_own_pinned_route(ctx):
     )["state"] == "known"
 
     # Independent verification exists to be independent OF the implementation
-    # family. The only admitted Claude verifier route is the dated Opus 5 / max
-    # fallback (2026-09-04): the role-level check admits it, but this run was
-    # recorded on the OpenAI route, so a pin naming the fallback still cannot
-    # confirm it. The builder's Sonnet lane stays refused at the role level.
+    # family. The only admitted Claude verifier route is the named Claude
+    # Security lane (Opus 5 / max): the role-level check admits it, but this
+    # run was recorded on the OpenAI route, so a pin naming that lane still
+    # cannot confirm it. The builder's Sonnet lane stays refused at the role level.
     assert ow.validate_raphael_model_assignment(
         "raphael-verifier", "anthropic", "claude-opus-5", "max",
         disable_fallbacks=True,
