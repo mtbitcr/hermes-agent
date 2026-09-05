@@ -15381,7 +15381,9 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection, task_id: str, pid: int, *, max_turns: Optional[int] = None,
+) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
@@ -15399,7 +15401,10 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
                 (int(pid), run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        payload: dict[str, Any] = {"pid": int(pid)}
+        if max_turns:
+            payload["max_turns"] = int(max_turns)
+        _append_event(conn, task_id, "spawned", payload, run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -16371,7 +16376,7 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(conn, claimed.id, int(pid), max_turns=_worker_max_turns(claimed))
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -16533,7 +16538,7 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(conn, claimed.id, int(pid), max_turns=_worker_max_turns(claimed))
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
@@ -16843,6 +16848,17 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+#: Iteration budget handed to deep-tier workers. Profiles default to 64-128
+#: turns, which a deep run over a large source tree exhausts before it can
+#: finish; the value rides in the spawned event so the receipt shows it.
+_DEEP_TIER_MAX_TURNS = 160
+
+
+def _worker_max_turns(task: Task) -> Optional[int]:
+    """Return the dispatcher's iteration budget for ``task`` (deep tier only)."""
+    return _DEEP_TIER_MAX_TURNS if getattr(task, "execution_tier", None) == "deep" else None
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -17051,6 +17067,10 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
+    budget = _worker_max_turns(task)
+    if budget:
+        # ``--max-turns`` is a chat-subparser flag, so it must follow ``chat``.
+        cmd.extend(["--max-turns", str(budget)])
     if task.goal_mode:
         # Goal-mode workers must take the fully-quiet single-query path:
         # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
