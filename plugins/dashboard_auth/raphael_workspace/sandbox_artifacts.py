@@ -262,7 +262,7 @@ def handle_artifact(args: dict, **_kwargs) -> str:
                 sd._resolve_task(ctx)
                 attachment_id = kb.store_attachment_bytes(
                     conn, task.id, path.name, data,
-                    content_type="application/octet-stream",
+                    content_type=None,
                     uploaded_by="agent", board=ctx.board, expected_run_id=ctx.run_id,
                 )
                 stored = kb.get_attachment(conn, attachment_id)

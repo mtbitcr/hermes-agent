@@ -440,3 +440,195 @@ def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
         conn.close()
 
 
+
+
+# ---------------------------------------------------------------------------
+# Content-type inference, inline caps and copy provenance
+# ---------------------------------------------------------------------------
+
+
+def test_store_attachment_bytes_infers_content_type_from_the_filename(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+        inferred = {
+            name: kb.get_attachment(conn, kb.store_attachment_bytes(conn, task_id, name, b"x")).content_type
+            for name in ("plan.md", "change.patch", "blob.zzz")
+        }
+        explicit = kb.get_attachment(conn, kb.store_attachment_bytes(
+            conn, task_id, "notes.md", b"x", content_type="text/plain",
+        ))
+        assert inferred == {"plan.md": "text/markdown", "change.patch": "text/x-diff", "blob.zzz": None}
+        assert explicit.content_type == "text/plain"
+    finally:
+        conn.close()
+
+
+def test_worker_context_inlines_a_sixteen_kilobyte_parent_markdown(kanban_home):
+    # A 16 KB design document is an ordinary deliverable; it inlines whole.
+    conn = kb.connect()
+    try:
+        parent = _make_task(conn, title="write the design")
+        body = b"design:" + b"d" * (16 * 1024 - 11) + b"end."
+        kb.store_attachment_bytes(conn, parent, "design.md", body, content_type="text/markdown")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        conn.commit()
+        child = kb.create_task(conn, title="review the design", parents=[parent])
+
+        ctx = kb.build_worker_context(conn, child)
+
+        assert "design:" in ctx and "end." in ctx
+        assert "inline attachment budget exhausted" not in ctx
+    finally:
+        conn.close()
+
+
+def test_list_exposes_the_source_of_a_copied_attachment(client):
+    parent = _create_task_via_api(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{parent}/attachments",
+        files={"file": ("result.md", b"# result", "text/markdown")},
+    )
+    original = r.json()["attachment"]["id"]
+    conn = kb.connect()
+    try:
+        child = _make_task(conn, title="use the result")
+        claimed = kb.claim_task(conn, child)
+        copy = kb.store_attachment_bytes(
+            conn, child, "result.md", b"# result", content_type="text/markdown",
+            uploaded_by="agent", expected_run_id=claimed.current_run_id,
+            source_attachment_id=original,
+        )
+    finally:
+        conn.close()
+
+    def listed(task_id):
+        return {a["id"]: a for a in client.get(
+            f"/api/plugins/kanban/tasks/{task_id}/attachments"
+        ).json()["attachments"]}
+
+    assert listed(parent)[original]["source_attachment_id"] is None
+    assert listed(child)[copy]["source_attachment_id"] == original
+
+    # Provenance outlives the run's events: retention deletes those after
+    # 30 days for finished tasks, the attachment row stays.
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET status='done' WHERE id IN (?, ?)", (parent, child))
+        conn.commit()
+        kb.gc_events(conn, older_than_seconds=-5)
+    finally:
+        conn.close()
+    assert listed(child)[copy]["source_attachment_id"] == original
+
+
+def test_every_attachment_writer_infers_the_type_and_keeps_compressed_names_binary(kanban_home, tmp_path):
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+
+        def add(name, declared=None):
+            f = tmp_path / name
+            f.write_bytes(b"x")
+            return kb.get_attachment(conn, kb.add_attachment(
+                conn, task_id, filename=name, stored_path=str(f), content_type=declared, size=1,
+            )).content_type
+
+        assert add("plan.md") == "text/markdown"
+        assert add("notes.md", "application/octet-stream") == "text/markdown"
+        assert add("plan.md.gz") == "application/gzip"
+        assert add("spec.md", "Application/Octet-Stream; charset=binary") == "text/markdown"
+        assert add("spec2.md", " application/octet-stream ") == "text/markdown"
+        assert add("data.bin", "application/octet-stream") == "application/octet-stream"
+        assert add("readme.md", "text/plain") == "text/plain"
+    finally:
+        conn.close()
+
+
+def test_completion_artifact_inlines_into_the_child_context(kanban_home):
+    # The worker's own completion path, not a direct row write.
+    conn = kb.connect()
+    try:
+        parent = _make_task(conn, title="write the plan")
+        claimed = kb.claim_task(conn, parent)
+        staged = kb.task_attachments_dir(parent)
+        staged.mkdir(parents=True, exist_ok=True)
+        path = staged / "plan.md"
+        path.write_bytes(b"# Plan\nstep one\n")
+        assert kb.complete_task(
+            conn, parent, result="done", metadata={"_staged_artifacts": [str(path)]},
+            expected_run_id=claimed.current_run_id,
+        )
+        child = kb.create_task(conn, title="use the plan", parents=[parent])
+
+        ctx = kb.build_worker_context(conn, child)
+
+        assert "step one" in ctx
+    finally:
+        conn.close()
+
+
+def test_upgrade_adds_the_source_column_and_back_fills_copies_once(client, monkeypatch):
+    parent = _create_task_via_api(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{parent}/attachments",
+        files={"file": ("result.md", b"# result", "text/markdown")},
+    )
+    original = r.json()["attachment"]["id"]
+    conn = kb.connect()
+    try:
+        child = _make_task(conn, title="use the result")
+        claimed = kb.claim_task(conn, child)
+        copy = kb.store_attachment_bytes(
+            conn, child, "result.md", b"# result", content_type="text/markdown",
+            uploaded_by="agent", expected_run_id=claimed.current_run_id,
+            source_attachment_id=original,
+        )
+        # Turn the database into one written before the column existed.
+        conn.execute("ALTER TABLE task_attachments DROP COLUMN source_attachment_id")
+    finally:
+        conn.close()
+    calls = []
+    real = kb._backfill_attachment_sources
+    monkeypatch.setattr(kb, "_backfill_attachment_sources", lambda c: calls.append(1) or real(c))
+
+    kb._INITIALIZED_PATHS.clear()
+    conn = kb.connect()  # the real startup migration
+    try:
+        assert kb.get_attachment(conn, copy).source_attachment_id == original
+        assert kb.get_attachment(conn, original).source_attachment_id is None
+    finally:
+        conn.close()
+    listed = {a["id"]: a for a in client.get(
+        f"/api/plugins/kanban/tasks/{child}/attachments"
+    ).json()["attachments"]}
+    assert listed[copy]["source_attachment_id"] == original
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.connect().close()  # a later startup finds the column and never back-fills again
+    assert calls == [1]
+
+
+def test_compressed_names_are_listed_but_never_inlined(kanban_home):
+    # Delivered through the worker's real completion path, like plan.md above.
+    conn = kb.connect()
+    try:
+        parent = _make_task(conn, title="write the notes")
+        claimed = kb.claim_task(conn, parent)
+        staged = kb.task_attachments_dir(parent)
+        staged.mkdir(parents=True, exist_ok=True)
+        path = staged / "notes.md.gz"
+        path.write_bytes(b"plain looking bytes without a nul")
+        assert kb.complete_task(
+            conn, parent, result="done", metadata={"_staged_artifacts": [str(path)]},
+            expected_run_id=claimed.current_run_id,
+        )
+        child = kb.create_task(conn, title="read the notes", parents=[parent])
+
+        ctx = kb.build_worker_context(conn, child)
+
+        assert "notes.md.gz" in ctx
+        assert "plain looking bytes" not in ctx
+        assert "inline attachment budget exhausted" not in ctx
+    finally:
+        conn.close()

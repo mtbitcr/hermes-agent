@@ -83,6 +83,7 @@ import subprocess
 import sys
 import threading
 import logging
+import mimetypes
 import time
 import unicodedata
 from contextvars import ContextVar, Token
@@ -674,14 +675,40 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
-_CTX_MAX_ATTACHMENT_BYTES         = 8 * 1024   # per inlined parent text attachment
-_CTX_MAX_PARENT_ATTACHMENTS_BYTES = 32 * 1024  # total inlined across all parents
+_CTX_MAX_ATTACHMENT_BYTES         = 32 * 1024  # per inlined parent text attachment
+_CTX_MAX_PARENT_ATTACHMENTS_BYTES = 128 * 1024 # total inlined across all parents
 # Structured-text types inlined beside ``text/*``; the stored content type is
 # what the upload declared, so a NUL byte in the bytes still wins over it.
 _CTX_INLINE_ATTACHMENT_TYPES = frozenset({
     "application/json", "application/xml", "application/toml",
     "application/yaml", "application/x-yaml",
 })
+# Types inferred from the filename when an upload declares none; Python 3.11
+# knows neither markdown nor patches.
+mimetypes.add_type("text/markdown", ".md")
+mimetypes.add_type("text/x-diff", ".patch")
+mimetypes.add_type("text/x-diff", ".diff")
+# A compressed name (``plan.md.gz``) holds bytes of the wrapper, not text.
+_ENCODING_CONTENT_TYPES = {
+    "gzip": "application/gzip", "bzip2": "application/x-bzip2",
+    "xz": "application/x-xz", "compress": "application/x-compress",
+}
+
+
+def _inferred_content_type(filename: str, declared: Optional[str]) -> Optional[str]:
+    """The content type for a new attachment row.
+
+    A declared type wins unless it is absent or the uninformative
+    ``application/octet-stream``; then the filename decides, and a guessed
+    encoding makes the row the wrapper type so it never enters the text path.
+    """
+    generic = (declared or "").split(";", 1)[0].strip().lower()
+    if generic and generic != "application/octet-stream":
+        return declared
+    guessed, encoding = mimetypes.guess_type(filename)
+    if encoding:
+        return _ENCODING_CONTENT_TYPES.get(encoding, "application/octet-stream")
+    return guessed or (generic or None)
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -1716,6 +1743,7 @@ class Attachment:
     size: int
     uploaded_by: Optional[str]
     created_at: int
+    source_attachment_id: Optional[int] = None
 
 
 @dataclass
@@ -1954,7 +1982,8 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     content_type TEXT,
     size         INTEGER NOT NULL DEFAULT 0,
     uploaded_by  TEXT,
-    created_at   INTEGER NOT NULL
+    created_at   INTEGER NOT NULL,
+    source_attachment_id INTEGER
 );
 
 -- Current remote sandbox cleanup authority. One row exists while an exact run
@@ -2948,6 +2977,19 @@ def connect(
                         _normalize_board_slug(board)
                         or (get_current_board() if db_path is None else None),
                     )
+                    # A worker copy of a native attachment keeps its source for
+                    # as long as the row lives; ``attached`` events are
+                    # garbage-collected after 30 days. Added here, after the
+                    # schema, because the legacy pass above may run on
+                    # databases that have no task_attachments table yet.
+                    # One transaction: an interrupted upgrade rolls the column
+                    # back too, so the next startup retries the back-fill.
+                    with write_txn(conn):
+                        if _add_column_if_missing(
+                            conn, "task_attachments", "source_attachment_id",
+                            "source_attachment_id INTEGER",
+                        ):
+                            _backfill_attachment_sources(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -7314,10 +7356,11 @@ def _add_attachment_row(
         "SELECT 1 FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
     ).fetchone():
         raise ValueError(f"unknown task {task_id}")
+    content_type = _inferred_content_type(requested_filename or filename, content_type)
     cur = conn.execute(
         "INSERT INTO task_attachments "
-        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at, "
+        "source_attachment_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             filename.strip(),
@@ -7326,6 +7369,7 @@ def _add_attachment_row(
             int(size),
             uploaded_by,
             now,
+            source_attachment.id if source_attachment is not None else None,
         ),
     )
     attachment_id = int(cur.lastrowid or 0)
@@ -7342,6 +7386,26 @@ def _add_attachment_row(
         )
     _append_event(conn, task_id, "attached", receipt, run_id=run_id)
     return attachment_id
+
+
+def _backfill_attachment_sources(conn: sqlite3.Connection) -> int:
+    """Fill ``source_attachment_id`` for copies stored before the column
+    existed, from their retained ``attached`` events. Runs inside the
+    caller's transaction. Returns rows updated."""
+    cur = conn.execute(
+        "UPDATE task_attachments SET source_attachment_id = ("
+        " SELECT json_extract(e.payload, '$.source_attachment_id') FROM task_events e"
+        " WHERE e.task_id = task_attachments.task_id AND e.kind = 'attached'"
+        " AND json_extract(e.payload, '$.attachment_id') = task_attachments.id"
+        " AND json_extract(e.payload, '$.source_attachment_id') IS NOT NULL"
+        " ORDER BY e.id DESC LIMIT 1)"
+        " WHERE source_attachment_id IS NULL AND EXISTS ("
+        " SELECT 1 FROM task_events e"
+        " WHERE e.task_id = task_attachments.task_id AND e.kind = 'attached'"
+        " AND json_extract(e.payload, '$.attachment_id') = task_attachments.id"
+        " AND json_extract(e.payload, '$.source_attachment_id') IS NOT NULL)"
+    )
+    return cur.rowcount
 
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
@@ -7361,6 +7425,7 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
             size=r["size"] or 0,
             uploaded_by=r["uploaded_by"],
             created_at=r["created_at"],
+            source_attachment_id=r["source_attachment_id"],
         )
         for r in rows
     ]
@@ -7383,6 +7448,7 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
         size=r["size"] or 0,
         uploaded_by=r["uploaded_by"],
         created_at=r["created_at"],
+        source_attachment_id=r["source_attachment_id"],
     )
 
 
@@ -9263,8 +9329,8 @@ def _insert_completion_attachment(
     conn.execute(
         "INSERT INTO task_attachments "
         "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, NULL, ?, 'kanban_complete', ?)",
-        (task_id, filename, stored_path, size, created_at),
+        "VALUES (?, ?, ?, ?, ?, 'kanban_complete', ?)",
+        (task_id, filename, stored_path, _inferred_content_type(filename, None), size, created_at),
     )
     _append_event(
         conn,

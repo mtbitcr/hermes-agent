@@ -334,6 +334,7 @@ def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
         "uploaded_by": a.uploaded_by,
         "stored_path": a.stored_path,
         "created_at": a.created_at,
+        "source_attachment_id": a.source_attachment_id,
     }
 
 
@@ -3842,6 +3843,7 @@ def _workspace_task_attachments_response(task_id: str) -> Optional[dict]:
                     "media_type": _workspace_validate_media_type(a.content_type),
                     "size": a.size,
                     "created_at": _workspace_iso_timestamp(a.created_at),
+                    "source_attachment_id": a.source_attachment_id,
                 }
                 for a in atts
             ]
