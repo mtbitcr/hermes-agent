@@ -231,7 +231,11 @@ def test_default_spawn_deep_tier_forwards_max_turns_after_chat(monkeypatch, tmp_
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    kb._default_spawn(_pinned_task(kb), str(workspace))
+    # An unlocked deep task: the lock-only ``--no-fallbacks`` bootstrap flag is
+    # not part of build_top_level_parser(), and the budget does not need it.
+    task = _make_task(kb, assignee="elias")
+    task.execution_tier = "deep"
+    kb._default_spawn(task, str(workspace))
 
     cmd = captured["cmd"]
     assert cmd.index("--max-turns") > cmd.index("chat")
