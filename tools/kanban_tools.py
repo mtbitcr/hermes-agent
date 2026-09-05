@@ -398,6 +398,24 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
+def _board_of_connection(kb, conn) -> Optional[str]:
+    """Slug of the board whose database ``conn`` opened, or ``None`` for a
+    file outside the boards tree (a legacy ``HERMES_KANBAN_DB`` path).
+
+    ``HERMES_KANBAN_DB`` wins over a ``board`` argument in ``kb.connect``, so
+    the connection, not the argument, is the one authority on which board a
+    task lands on. Owner-governed boards are always created inside the boards
+    tree, so a foreign file is never governed.
+    """
+    db_file = os.path.realpath(conn.execute("PRAGMA database_list").fetchone()[2])
+    if db_file == os.path.realpath(kb.kanban_home() / "kanban.db"):
+        return kb.DEFAULT_BOARD
+    parent = os.path.dirname(db_file)
+    if os.path.basename(db_file) == "kanban.db" and os.path.dirname(parent) == os.path.realpath(kb.boards_root()):
+        return os.path.basename(parent)
+    return None
+
+
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 
 
@@ -1721,8 +1739,6 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(integration_bool_error)
     model_override = args.get("model")
     provider_override = args.get("provider")
-    if provider_override and not model_override:
-        return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -1749,9 +1765,14 @@ def _handle_create(args: dict, **kw) -> str:
                 "model_override": model_override,
                 "provider_override": provider_override,
             }
-            governed_board = kb._board_owner_project_id(
-                kb._normalize_board_slug(board) or kb.get_current_board()
-            )
+            effective_board = _board_of_connection(kb, conn)
+            requested_board = kb._normalize_board_slug(board)
+            if requested_board and effective_board and requested_board != effective_board:
+                return tool_error(
+                    f"kanban_create: board '{requested_board}' does not match the board "
+                    f"database this worker is pinned to ('{effective_board}')"
+                )
+            governed_board = kb._board_owner_project_id(effective_board)
             if governed_board is not None:
                 if model_override or provider_override:
                     return tool_error(
@@ -1772,6 +1793,8 @@ def _handle_create(args: dict, **kw) -> str:
                     route_fields = _resolved_route_pin(str(assignee), tier, "execution_tier")
                 except OwnerWorkspaceError as exc:
                     return tool_error(f"kanban_create: {exc.message}")
+            elif provider_override and not model_override:
+                return tool_error("'provider' requires 'model' to be set as well")
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
