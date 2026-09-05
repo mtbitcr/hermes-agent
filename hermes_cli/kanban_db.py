@@ -2956,6 +2956,15 @@ def connect(
                         _normalize_board_slug(board)
                         or (get_current_board() if db_path is None else None),
                     )
+                    # A worker copy of a native attachment keeps its source for
+                    # as long as the row lives; ``attached`` events are
+                    # garbage-collected after 30 days. Added here, after the
+                    # schema, because the legacy pass above may run on
+                    # databases that have no task_attachments table yet.
+                    _add_column_if_missing(
+                        conn, "task_attachments", "source_attachment_id",
+                        "source_attachment_id INTEGER",
+                    )
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -3076,12 +3085,6 @@ def _migrate_add_optional_columns(
     # initial snapshot did not. Re-snapshot here so the legacy-column migration
     # below is truly idempotent and never re-adds columns that already exist.
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
-
-    # A worker copy of a native attachment keeps its source for as long as the
-    # row lives; ``attached`` events are garbage-collected after 30 days.
-    _add_column_if_missing(
-        conn, "task_attachments", "source_attachment_id", "source_attachment_id INTEGER",
-    )
 
     # Legacy column migration: ``spawn_failures`` → ``consecutive_failures``
     # and ``last_spawn_error`` → ``last_failure_error``.
