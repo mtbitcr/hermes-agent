@@ -2508,6 +2508,11 @@ def _owner_project_attachment_projection(row: sqlite3.Row) -> dict:
         "media_type": media_type,
         "size": int(row["size"] or 0),
         "created_at": _owner_timestamp(row["created_at"]),
+        # The native original this row was copied from, so the owner surface
+        # can show one document instead of one per sandbox that pulled it.
+        "source_attachment_id": (
+            str(row["source_attachment_id"]) if row["source_attachment_id"] else None
+        ),
     }
 
 
@@ -3068,7 +3073,7 @@ def read_project_snapshot(
         )[:_OWNER_PROJECT_MAX_WORKERS + 1]
 
         attachment_rows = conn.execute(
-            "SELECT a.id, a.filename, a.content_type, a.size, a.created_at "
+            "SELECT a.id, a.filename, a.content_type, a.size, a.created_at, a.source_attachment_id "
             "FROM task_attachments a JOIN tasks t ON t.id = a.task_id "
             "WHERE t.project_id = ? AND t.task_kind = 'work' "
             "ORDER BY a.created_at ASC, a.id ASC LIMIT ?",

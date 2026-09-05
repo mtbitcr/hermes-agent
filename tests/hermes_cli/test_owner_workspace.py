@@ -687,6 +687,40 @@ def test_committed_project_projection_is_receipt_backed_and_read_only(ctx):
     )[0]["lifecycle_revision"] == 0
 
 
+def test_project_snapshot_names_the_source_of_a_copied_attachment(ctx):
+    # A worker's copy of a deliverable is the same document; the snapshot
+    # says which native original it came from so the owner sees it once.
+    args = _task_graph_args(
+        idempotency_key="graph-snapshot-copy",
+        project_name="Copy Project",
+    )
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+    board = result["board"]
+    with kanban_db.connect(board=board) as conn:
+        original = kanban_db.store_attachment_bytes(
+            conn, result["task_ids"][0], "plan.md", b"# plan", board=board,
+        )
+        copy_dir = kanban_db.task_attachments_dir(result["task_ids"][1], board=board)
+        copy_dir.mkdir(parents=True, exist_ok=True)
+        copy_path = copy_dir / "plan.md"
+        copy_path.write_bytes(b"# plan")
+        with kanban_db.write_txn(conn):
+            copy = kanban_db._add_attachment_row(
+                conn, result["task_ids"][1], filename="plan.md",
+                stored_path=str(copy_path), size=6,
+                source_attachment=kanban_db.get_attachment(conn, original),
+            )
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+
+    by_id = {item["id"]: item for item in snapshot["attachments"]}
+    assert by_id[str(original)]["source_attachment_id"] is None
+    assert by_id[str(copy)]["source_attachment_id"] == str(original)
+    assert by_id[str(copy)]["media_type"] == "text/markdown"
+
+
 def test_project_snapshot_is_exact_receipt_backed_and_read_only(ctx):
     args = _task_graph_args(
         idempotency_key="graph-snapshot",
@@ -1946,6 +1980,7 @@ def test_project_attachment_is_exact_receipt_bound_and_bounded(ctx):
         "media_type": "application/octet-stream",
         "size": 16,
         "created_at": attachment["created_at"],
+        "source_attachment_id": None,
         "body": b"safe owner bytes",
     }
 
