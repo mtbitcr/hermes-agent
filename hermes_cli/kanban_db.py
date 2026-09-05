@@ -688,6 +688,26 @@ _CTX_INLINE_ATTACHMENT_TYPES = frozenset({
 mimetypes.add_type("text/markdown", ".md")
 mimetypes.add_type("text/x-diff", ".patch")
 mimetypes.add_type("text/x-diff", ".diff")
+# A compressed name (``plan.md.gz``) holds bytes of the wrapper, not text.
+_ENCODING_CONTENT_TYPES = {
+    "gzip": "application/gzip", "bzip2": "application/x-bzip2",
+    "xz": "application/x-xz", "compress": "application/x-compress",
+}
+
+
+def _inferred_content_type(filename: str, declared: Optional[str]) -> Optional[str]:
+    """The content type for a new attachment row.
+
+    A declared type wins unless it is absent or the uninformative
+    ``application/octet-stream``; then the filename decides, and a guessed
+    encoding makes the row the wrapper type so it never enters the text path.
+    """
+    if declared and declared != "application/octet-stream":
+        return declared
+    guessed, encoding = mimetypes.guess_type(filename)
+    if encoding:
+        return _ENCODING_CONTENT_TYPES.get(encoding, "application/octet-stream")
+    return guessed or declared
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -2961,10 +2981,11 @@ def connect(
                     # garbage-collected after 30 days. Added here, after the
                     # schema, because the legacy pass above may run on
                     # databases that have no task_attachments table yet.
-                    _add_column_if_missing(
+                    if _add_column_if_missing(
                         conn, "task_attachments", "source_attachment_id",
                         "source_attachment_id INTEGER",
-                    )
+                    ):
+                        _backfill_attachment_sources(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -7220,7 +7241,6 @@ def store_attachment_bytes(
     ):
         raise ValueError("expected_run_id must be an integer")
     safe_name = _safe_attachment_name(filename)
-    content_type = content_type or mimetypes.guess_type(safe_name)[0]
     if source_attachment_id is not None and (
         isinstance(source_attachment_id, bool)
         or not isinstance(source_attachment_id, int)
@@ -7332,6 +7352,7 @@ def _add_attachment_row(
         "SELECT 1 FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
     ).fetchone():
         raise ValueError(f"unknown task {task_id}")
+    content_type = _inferred_content_type(requested_filename or filename, content_type)
     cur = conn.execute(
         "INSERT INTO task_attachments "
         "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at, "
@@ -7361,6 +7382,26 @@ def _add_attachment_row(
         )
     _append_event(conn, task_id, "attached", receipt, run_id=run_id)
     return attachment_id
+
+
+def _backfill_attachment_sources(conn: sqlite3.Connection) -> int:
+    """Fill ``source_attachment_id`` for copies stored before the column
+    existed, from their retained ``attached`` events. Returns rows updated."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_attachments SET source_attachment_id = ("
+            " SELECT json_extract(e.payload, '$.source_attachment_id') FROM task_events e"
+            " WHERE e.task_id = task_attachments.task_id AND e.kind = 'attached'"
+            " AND json_extract(e.payload, '$.attachment_id') = task_attachments.id"
+            " AND json_extract(e.payload, '$.source_attachment_id') IS NOT NULL"
+            " ORDER BY e.id DESC LIMIT 1)"
+            " WHERE source_attachment_id IS NULL AND EXISTS ("
+            " SELECT 1 FROM task_events e"
+            " WHERE e.task_id = task_attachments.task_id AND e.kind = 'attached'"
+            " AND json_extract(e.payload, '$.attachment_id') = task_attachments.id"
+            " AND json_extract(e.payload, '$.source_attachment_id') IS NOT NULL)"
+        )
+        return cur.rowcount
 
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
@@ -9284,8 +9325,8 @@ def _insert_completion_attachment(
     conn.execute(
         "INSERT INTO task_attachments "
         "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, NULL, ?, 'kanban_complete', ?)",
-        (task_id, filename, stored_path, size, created_at),
+        "VALUES (?, ?, ?, ?, ?, 'kanban_complete', ?)",
+        (task_id, filename, stored_path, _inferred_content_type(filename, None), size, created_at),
     )
     _append_event(
         conn,
