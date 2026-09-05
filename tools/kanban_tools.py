@@ -1733,16 +1733,45 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            _self_tid = os.environ.get("HERMES_KANBAN_TASK")
+            _self_task = kb.get_task(conn, _self_tid) if _self_tid else None
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
             if _inherit_project and project_id is None:
-                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
-                if _self_tid:
-                    _self_task = kb.get_task(conn, _self_tid)
-                    if _self_task is not None and _self_task.project_id:
-                        project_id = _self_task.project_id
-                        project_source_task_id = _self_task.id
+                if _self_task is not None and _self_task.project_id:
+                    project_id = _self_task.project_id
+                    project_source_task_id = _self_task.id
+            # On an owner-governed board the route is never hand-set: the
+            # Raphael model policy pins provider, model and effort from the
+            # task class, exactly as the owner-approved creation path does.
+            route_fields: dict = {
+                "model_override": model_override,
+                "provider_override": provider_override,
+            }
+            governed_board = kb._board_owner_project_id(
+                kb._normalize_board_slug(board) or kb.get_current_board()
+            )
+            if governed_board is not None:
+                if model_override or provider_override:
+                    return tool_error(
+                        "kanban_create: 'model' and 'provider' are not accepted on an "
+                        "owner-governed board; the route is pinned by the Raphael model "
+                        "policy from execution_tier"
+                    )
+                tier = (
+                    args.get("execution_tier")
+                    or (_self_task.execution_tier if _self_task is not None else None)
+                    or "routine"
+                )
+                from hermes_cli.owner_workspace import (
+                    OwnerWorkspaceError,
+                    _resolved_route_pin,
+                )
+                try:
+                    route_fields = _resolved_route_pin(str(assignee), tier, "execution_tier")
+                except OwnerWorkspaceError as exc:
+                    return tool_error(f"kanban_create: {exc.message}")
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1764,8 +1793,6 @@ def _handle_create(args: dict, **kw) -> str:
                     if max_runtime_seconds is not None else None
                 ),
                 skills=skills,
-                model_override=model_override,
-                provider_override=provider_override,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -1773,12 +1800,15 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                **route_fields,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                execution_tier=new_task.execution_tier if new_task else None,
+                route_pinned=bool(new_task.model_policy_lock) if new_task else False,
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
@@ -2765,13 +2795,24 @@ KANBAN_CREATE_SCHEMA = {
                     "true. Defaults to the goal-engine default (20)."
                 ),
             },
+            "execution_tier": {
+                "type": "string",
+                "enum": ["routine", "deep"],
+                "description": (
+                    "Task class. On an owner-governed board Hermes pins "
+                    "provider, model and effort from it through the Raphael "
+                    "model policy; defaults to the creator's own tier, else "
+                    "routine."
+                ),
+            },
             "model": {
                 "type": "string",
                 "description": (
                     "Pin the dispatched worker to this model instead of "
                     "the assignee profile's configured model. Use the "
                     "exact model name the target provider expects. Omit "
-                    "to use the profile default."
+                    "to use the profile default. Refused on owner-governed "
+                    "boards."
                 ),
             },
             "provider": {
@@ -2782,7 +2823,8 @@ KANBAN_CREATE_SCHEMA = {
                     "is not from the assignee profile's configured "
                     "provider — a model name alone is resolved against "
                     "the profile's provider and will fail if it belongs "
-                    "to a different one. Requires 'model'."
+                    "to a different one. Requires 'model'. Refused on "
+                    "owner-governed boards."
                 ),
             },
             "board": _board_schema_prop(),
