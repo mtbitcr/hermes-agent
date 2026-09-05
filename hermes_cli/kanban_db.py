@@ -83,6 +83,7 @@ import subprocess
 import sys
 import threading
 import logging
+import mimetypes
 import time
 import unicodedata
 from contextvars import ContextVar, Token
@@ -674,14 +675,19 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
-_CTX_MAX_ATTACHMENT_BYTES         = 8 * 1024   # per inlined parent text attachment
-_CTX_MAX_PARENT_ATTACHMENTS_BYTES = 32 * 1024  # total inlined across all parents
+_CTX_MAX_ATTACHMENT_BYTES         = 32 * 1024  # per inlined parent text attachment
+_CTX_MAX_PARENT_ATTACHMENTS_BYTES = 128 * 1024 # total inlined across all parents
 # Structured-text types inlined beside ``text/*``; the stored content type is
 # what the upload declared, so a NUL byte in the bytes still wins over it.
 _CTX_INLINE_ATTACHMENT_TYPES = frozenset({
     "application/json", "application/xml", "application/toml",
     "application/yaml", "application/x-yaml",
 })
+# Types inferred from the filename when an upload declares none; Python 3.11
+# knows neither markdown nor patches.
+mimetypes.add_type("text/markdown", ".md")
+mimetypes.add_type("text/x-diff", ".patch")
+mimetypes.add_type("text/x-diff", ".diff")
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -7203,6 +7209,7 @@ def store_attachment_bytes(
     ):
         raise ValueError("expected_run_id must be an integer")
     safe_name = _safe_attachment_name(filename)
+    content_type = content_type or mimetypes.guess_type(safe_name)[0]
     if source_attachment_id is not None and (
         isinstance(source_attachment_id, bool)
         or not isinstance(source_attachment_id, int)
