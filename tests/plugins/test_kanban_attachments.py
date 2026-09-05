@@ -510,6 +510,17 @@ def test_list_exposes_the_source_of_a_copied_attachment(client):
     assert listed(parent)[original]["source_attachment_id"] is None
     assert listed(child)[copy]["source_attachment_id"] == original
 
+    # A database upgraded from before the column existed gets its copies
+    # back-filled from the retained ``attached`` events.
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE task_attachments SET source_attachment_id = NULL")
+        conn.commit()
+        assert kb._backfill_attachment_sources(conn) == 1
+    finally:
+        conn.close()
+    assert listed(child)[copy]["source_attachment_id"] == original
+
     # Provenance outlives the run's events: retention deletes those after
     # 30 days for finished tasks, the attachment row stays.
     conn = kb.connect()
@@ -520,3 +531,47 @@ def test_list_exposes_the_source_of_a_copied_attachment(client):
     finally:
         conn.close()
     assert listed(child)[copy]["source_attachment_id"] == original
+
+
+def test_every_attachment_writer_infers_the_type_and_keeps_compressed_names_binary(kanban_home, tmp_path):
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+
+        def add(name, declared=None):
+            f = tmp_path / name
+            f.write_bytes(b"x")
+            return kb.get_attachment(conn, kb.add_attachment(
+                conn, task_id, filename=name, stored_path=str(f), content_type=declared, size=1,
+            )).content_type
+
+        assert add("plan.md") == "text/markdown"
+        assert add("notes.md", "application/octet-stream") == "text/markdown"
+        assert add("plan.md.gz") == "application/gzip"
+        assert add("data.bin", "application/octet-stream") == "application/octet-stream"
+        assert add("readme.md", "text/plain") == "text/plain"
+    finally:
+        conn.close()
+
+
+def test_completion_artifact_inlines_into_the_child_context(kanban_home):
+    # The worker's own completion path, not a direct row write.
+    conn = kb.connect()
+    try:
+        parent = _make_task(conn, title="write the plan")
+        claimed = kb.claim_task(conn, parent)
+        staged = kb.task_attachments_dir(parent)
+        staged.mkdir(parents=True, exist_ok=True)
+        path = staged / "plan.md"
+        path.write_bytes(b"# Plan\nstep one\n")
+        assert kb.complete_task(
+            conn, parent, result="done", metadata={"_staged_artifacts": [str(path)]},
+            expected_run_id=claimed.current_run_id,
+        )
+        child = kb.create_task(conn, title="use the plan", parents=[parent])
+
+        ctx = kb.build_worker_context(conn, child)
+
+        assert "step one" in ctx
+    finally:
+        conn.close()
