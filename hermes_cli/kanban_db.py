@@ -1421,6 +1421,1422 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Board Removal Fence Primitives (§3 of board-removal-safety-design)
+# ---------------------------------------------------------------------------
+#
+# This section implements the two-gate fence from the Board Removal Safety
+# Design, Revision 5. The architecture:
+#
+#   Gate A (the register, outside every board's storage):
+#     - Per-board-name register with lifecycle, epoch, epoch_before, gate_move
+#     - Ever-existed marker for resurrection guard
+#     - Lives in kanban_home(), NOT inside any board's directory
+#
+#   Gate B (the in-board gate, inside each board's store):
+#     - Gate values: open, closing, frozen
+#     - Epoch mirror co-located with the gate
+#     - The fence-closing point is the commit of gate from open→closing
+#
+# The epoch mirror exists so operations can validate without an extra round
+# trip to the register — the mirror is read inside the board's own transaction.
+
+from enum import Enum
+
+
+class BoardLifecycle(str, Enum):
+    """Register entry lifecycle states (§3.2 Gate A admission table)."""
+    LIVE = "live"
+    REMOVING = "removing"
+    ARCHIVED = "archived"
+    HARD_REMOVED = "hard-removed"
+
+
+class GateMove(str, Enum):
+    """Whether the board-store commit for the current phase is recorded (§1.1)."""
+    PENDING = "pending"
+    SETTLED = "settled"
+
+
+class InBoardGate(str, Enum):
+    """In-board gate values (§3.1 Gate B)."""
+    OPEN = "open"
+    CLOSING = "closing"
+    FROZEN = "frozen"
+
+
+class FenceRefusalRule(str, Enum):
+    """Machine-readable rule identifiers for fence refusals (§3.4)."""
+    GA_1 = "GA-1"  # removing admits opening (not a refusal, but for completeness)
+    GA_2 = "GA-2"  # removing refuses creation
+    GA_4 = "GA-4"  # open never creates — incomplete or absent board
+    GA_4a = "GA-4a"  # incomplete board (schema not present)
+    GA_5_FAIL = "GA-5-fail"  # backfill conditions not met
+    GA_6a = "GA-6a"  # indeterminate: no entry, no marker, but receipt/audit exists
+    GA_6b = "GA-6b"  # archive lookup failed
+    EM_4c = "EM-4c"  # unexpected epoch pair — refuses
+    CLOSED = "closed"  # fence is explicitly closed
+    INDETERMINATE = "indeterminate"  # cannot determine fence state
+    TIMEOUT = "timeout"  # consultation exceeded bound
+
+
+class FenceOutcome(str, Enum):
+    """Outcome of a fence consultation — distinguishes closed from indeterminate (§3.4)."""
+    ADMITTED = "admitted"
+    REFUSED_CLOSED = "refused-closed"
+    REFUSED_INDETERMINATE = "refused-indeterminate"
+    REFUSED_TIMEOUT = "refused-timeout"
+
+
+@dataclass
+class FenceRefusal:
+    """Structured refusal from a fence check (§3.4).
+
+    Refusals are machine-readable so callers can branch on reason without
+    parsing strings. The rule field names the design-document rule that
+    produced the refusal.
+    """
+    outcome: FenceOutcome
+    rule: FenceRefusalRule
+    board: str
+    message: str
+    register_epoch: Optional[int] = None
+    mirror_epoch: Optional[int] = None
+
+
+@dataclass
+class RegisterEntry:
+    """A single board's entry in the board register (§1.1, §3.2).
+
+    The register lives OUTSIDE every board's storage area, alongside board
+    state keyed by board name. The epoch is authoritative; the entry also
+    carries epoch_before (the epoch before the in-flight removal's increment)
+    and gate_move (whether the board-store commit is recorded complete).
+
+    The epoch_lineage field (§EP-3b3) is the append-only list of epochs this
+    board has held — used for transcript attribution validation.
+    """
+    board_name: str
+    lifecycle: BoardLifecycle
+    epoch: int
+    epoch_before: Optional[int] = None
+    gate_move: GateMove = GateMove.SETTLED
+    ever_existed_marker: bool = False
+    removal_mode: Optional[str] = None
+    scope_declaration_version: Optional[str] = None
+    epoch_lineage: Optional[list[int]] = None
+    created_at: Optional[int] = None
+    updated_at: Optional[int] = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "RegisterEntry":
+        epoch_lineage = None
+        if row["epoch_lineage"]:
+            try:
+                parsed = json.loads(row["epoch_lineage"])
+                if isinstance(parsed, list):
+                    epoch_lineage = [int(e) for e in parsed]
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
+        return cls(
+            board_name=row["board_name"],
+            lifecycle=BoardLifecycle(row["lifecycle"]),
+            epoch=int(row["epoch"]),
+            epoch_before=int(row["epoch_before"]) if row["epoch_before"] is not None else None,
+            gate_move=GateMove(row["gate_move"]) if row["gate_move"] else GateMove.SETTLED,
+            ever_existed_marker=bool(row["ever_existed_marker"]),
+            removal_mode=row["removal_mode"],
+            scope_declaration_version=row["scope_declaration_version"],
+            epoch_lineage=epoch_lineage,
+            created_at=int(row["created_at"]) if row["created_at"] else None,
+            updated_at=int(row["updated_at"]) if row["updated_at"] else None,
+        )
+
+
+@dataclass
+class InBoardFenceState:
+    """The fence state read from inside a board's store (§3.1, §3.9).
+
+    Contains the in-board gate value and the epoch mirror. Both are read
+    together in one atomic read so they cannot be observed partially updated.
+    """
+    gate: InBoardGate
+    epoch_mirror: int
+
+
+# Default consultation bound for reading both gates (§3.8)
+DEFAULT_FENCE_CONSULTATION_TIMEOUT_SECONDS = 5.0
+
+
+def _fence_consultation_timeout_seconds() -> float:
+    """Return the configured fence consultation bound (§3.8).
+
+    Reads from config.yaml kanban.fence_consultation_timeout_seconds,
+    falling back to the 5-second default from the design document.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = (load_config_readonly() or {}).get("kanban", {})
+        raw = cfg.get("fence_consultation_timeout_seconds")
+        if raw is not None:
+            return max(0.1, float(raw))
+    except Exception:
+        pass
+    return DEFAULT_FENCE_CONSULTATION_TIMEOUT_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Board Register Database (§3.6 — lives outside every board's storage)
+# ---------------------------------------------------------------------------
+
+REGISTER_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS board_register (
+    board_name              TEXT PRIMARY KEY,
+    lifecycle               TEXT NOT NULL DEFAULT 'live',
+    epoch                   INTEGER NOT NULL DEFAULT 1,
+    epoch_before            INTEGER,
+    gate_move               TEXT NOT NULL DEFAULT 'settled',
+    ever_existed_marker     INTEGER NOT NULL DEFAULT 0,
+    removal_mode            TEXT,
+    scope_declaration_version TEXT,
+    epoch_lineage           TEXT,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL
+);
+
+-- Receipt/audit archive lookup seam (§GA-6a/GA-6b). The actual archive
+-- is out of scope for this task; this table provides the injectable
+-- predicate interface with a safe default (no records → backfill admitted).
+CREATE TABLE IF NOT EXISTS board_removal_archive (
+    board_name              TEXT NOT NULL,
+    record_type             TEXT NOT NULL,
+    record_id               TEXT NOT NULL,
+    created_at              INTEGER NOT NULL,
+    PRIMARY KEY (board_name, record_type, record_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_register_lifecycle ON board_register(lifecycle);
+CREATE INDEX IF NOT EXISTS idx_archive_board ON board_removal_archive(board_name);
+"""
+
+
+def register_db_path() -> Path:
+    """Return the path to the board register database (§3.6).
+
+    The register lives OUTSIDE every board's storage area, in kanban_home(),
+    so board removal cannot relocate or delete it while operating on a board.
+    """
+    return kanban_home() / "kanban" / "board_register.db"
+
+
+def _register_connect() -> sqlite3.Connection:
+    """Open the board register database with appropriate settings."""
+    path = register_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    busy_timeout_ms = _resolve_busy_timeout_ms()
+    conn = sqlite3.connect(
+        str(path),
+        isolation_level=None,
+        timeout=busy_timeout_ms / 1000.0,
+    )
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+_REGISTER_INITIALIZED: bool = False
+_REGISTER_INIT_LOCK = threading.Lock()
+
+
+def _ensure_register_initialized(conn: sqlite3.Connection) -> None:
+    """Ensure the register schema exists (idempotent)."""
+    global _REGISTER_INITIALIZED
+    if _REGISTER_INITIALIZED:
+        return
+    with _REGISTER_INIT_LOCK:
+        if _REGISTER_INITIALIZED:
+            return
+        conn.executescript(REGISTER_SCHEMA_SQL)
+        _REGISTER_INITIALIZED = True
+
+
+@contextlib.contextmanager
+def register_connect() -> sqlite3.Connection:
+    """Open the board register database, ensuring schema exists.
+
+    Use as a context manager: the connection is closed on exit.
+    """
+    conn = _register_connect()
+    try:
+        _ensure_register_initialized(conn)
+        yield conn
+    finally:
+        conn.close()
+
+
+def get_register_entry(
+    board_name: str,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[RegisterEntry]:
+    """Read a board's register entry, or None if absent (§3.2).
+
+    This is a read-only lookup. For the full admission check including
+    the ever-existed marker and archive lookup, use check_gate_a_admission.
+    """
+    normed = _normalize_board_slug(board_name)
+    if not normed:
+        return None
+
+    def _read(c: sqlite3.Connection) -> Optional[RegisterEntry]:
+        _ensure_register_initialized(c)
+        row = c.execute(
+            "SELECT * FROM board_register WHERE board_name = ?",
+            (normed,),
+        ).fetchone()
+        if row is None:
+            return None
+        return RegisterEntry.from_row(row)
+
+    if conn is not None:
+        return _read(conn)
+    with register_connect() as c:
+        return _read(c)
+
+
+def _write_register_entry(
+    conn: sqlite3.Connection,
+    entry: RegisterEntry,
+) -> None:
+    """Write or update a register entry (internal helper).
+
+    Callers must hold an appropriate transaction. This sets the ever_existed
+    marker on any write, as required by §1.3.
+    """
+    now = int(time.time())
+    lineage_json = json.dumps(entry.epoch_lineage) if entry.epoch_lineage else None
+    conn.execute(
+        """
+        INSERT INTO board_register (
+            board_name, lifecycle, epoch, epoch_before, gate_move,
+            ever_existed_marker, removal_mode, scope_declaration_version,
+            epoch_lineage, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+        ON CONFLICT(board_name) DO UPDATE SET
+            lifecycle = excluded.lifecycle,
+            epoch = excluded.epoch,
+            epoch_before = excluded.epoch_before,
+            gate_move = excluded.gate_move,
+            ever_existed_marker = 1,
+            removal_mode = excluded.removal_mode,
+            scope_declaration_version = excluded.scope_declaration_version,
+            epoch_lineage = excluded.epoch_lineage,
+            updated_at = excluded.updated_at
+        """,
+        (
+            entry.board_name,
+            entry.lifecycle.value,
+            entry.epoch,
+            entry.epoch_before,
+            entry.gate_move.value,
+            entry.removal_mode,
+            entry.scope_declaration_version,
+            lineage_json,
+            entry.created_at or now,
+            now,
+        ),
+    )
+
+
+def has_removal_archive_record(
+    board_name: str,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[bool]:
+    """Check if any receipt or audit record exists for a board name (§GA-6a).
+
+    Returns True if records exist, False if none exist, or None if the
+    lookup failed (caller should treat as indeterminate per §GA-6b).
+
+    This is the injectable predicate seam — the actual archive implementation
+    is out of scope for this task.
+    """
+    normed = _normalize_board_slug(board_name)
+    if not normed:
+        return None
+
+    def _check(c: sqlite3.Connection) -> Optional[bool]:
+        try:
+            _ensure_register_initialized(c)
+            row = c.execute(
+                "SELECT 1 FROM board_removal_archive WHERE board_name = ? LIMIT 1",
+                (normed,),
+            ).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return None
+
+    if conn is not None:
+        return _check(conn)
+    with register_connect() as c:
+        return _check(c)
+
+
+# ---------------------------------------------------------------------------
+# In-Board Fence State (§3.1 Gate B, §3.9 Epoch Mirror)
+# ---------------------------------------------------------------------------
+#
+# The in-board gate and epoch mirror live inside each board's kanban.db.
+# They are stored in a dedicated table so they can be read atomically.
+
+IN_BOARD_FENCE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS board_fence_state (
+    id                      INTEGER PRIMARY KEY CHECK (id = 1),
+    gate                    TEXT NOT NULL DEFAULT 'open',
+    epoch_mirror            INTEGER NOT NULL DEFAULT 1,
+    updated_at              INTEGER NOT NULL
+);
+"""
+
+
+def _ensure_in_board_fence_schema(conn: sqlite3.Connection) -> None:
+    """Ensure the in-board fence state table exists."""
+    conn.execute(IN_BOARD_FENCE_SCHEMA_SQL)
+    row = conn.execute(
+        "SELECT 1 FROM board_fence_state WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        now = int(time.time())
+        conn.execute(
+            "INSERT OR IGNORE INTO board_fence_state (id, gate, epoch_mirror, updated_at) "
+            "VALUES (1, 'open', 1, ?)",
+            (now,),
+        )
+
+
+def get_in_board_fence_state(
+    conn: sqlite3.Connection,
+) -> Optional[InBoardFenceState]:
+    """Read the in-board gate and epoch mirror atomically (§3.1, §3.9).
+
+    Returns None if the fence state cannot be read (fail-closed, §3.4).
+    """
+    try:
+        row = conn.execute(
+            "SELECT gate, epoch_mirror FROM board_fence_state WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return InBoardFenceState(
+            gate=InBoardGate(row["gate"]),
+            epoch_mirror=int(row["epoch_mirror"]),
+        )
+    except (sqlite3.Error, ValueError, TypeError):
+        return None
+
+
+def commit_gate_state(
+    conn: sqlite3.Connection,
+    new_gate: InBoardGate,
+    epoch_to_write: int,
+) -> bool:
+    """Atomically commit a new gate value with the epoch mirror (§3.3, EM-2).
+
+    The gate and epoch mirror are written in the SAME commit — this is
+    the fence-closing point when transitioning open→closing. Returns True
+    if the commit succeeded, False otherwise.
+
+    MUST be called inside a write_txn for atomicity.
+    """
+    try:
+        now = int(time.time())
+        conn.execute(
+            "UPDATE board_fence_state SET gate = ?, epoch_mirror = ?, updated_at = ? "
+            "WHERE id = 1",
+            (new_gate.value, epoch_to_write, now),
+        )
+        return True
+    except sqlite3.Error:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Epoch Pair Validation (§3.9 EM-4)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EpochPairResult:
+    """Result of validating an epoch pair against the register (§3.9 EM-4)."""
+    valid: bool
+    rule: Optional[FenceRefusalRule] = None
+    message: str = ""
+
+
+def validate_epoch_pair(
+    register_epoch: int,
+    mirror_epoch: int,
+    entry: Optional[RegisterEntry],
+) -> EpochPairResult:
+    """Validate a (register epoch, mirror epoch) pair per EM-4 (§3.9).
+
+    EM-4a — equal is normal: proceed
+    EM-4b — one expected lag: mirror == epoch_before, lifecycle == removing,
+            gate_move == pending → proceed (refuses nothing)
+    EM-4c — every other pair: refuse as indeterminate
+
+    The entry parameter provides epoch_before, lifecycle, and gate_move.
+    """
+    # EM-4a: equal is normal, matched FIRST
+    if mirror_epoch == register_epoch:
+        return EpochPairResult(valid=True, message="EM-4a: epochs equal")
+
+    # Without an entry, any difference is indeterminate
+    if entry is None:
+        return EpochPairResult(
+            valid=False,
+            rule=FenceRefusalRule.EM_4c,
+            message="EM-4c: no register entry to evaluate epoch pair",
+        )
+
+    # EM-4b: one expected lag during intent→fence window
+    if (
+        entry.epoch_before is not None
+        and mirror_epoch == entry.epoch_before
+        and entry.lifecycle == BoardLifecycle.REMOVING
+        and entry.gate_move == GateMove.PENDING
+    ):
+        return EpochPairResult(
+            valid=True,
+            message="EM-4b: expected lag during intent→fence window, refuses nothing",
+        )
+
+    # EM-4c: every other pair is indeterminate
+    reasons = []
+    if mirror_epoch > register_epoch:
+        reasons.append("mirror ahead of register")
+    elif entry.epoch_before is not None and mirror_epoch != entry.epoch_before:
+        reasons.append(f"mirror ({mirror_epoch}) matches neither epoch ({register_epoch}) nor epoch_before ({entry.epoch_before})")
+    elif entry.lifecycle != BoardLifecycle.REMOVING:
+        reasons.append(f"lag on entry that is not removing (lifecycle={entry.lifecycle.value})")
+    elif entry.gate_move == GateMove.SETTLED:
+        reasons.append("lag with gate_move=settled")
+    else:
+        reasons.append(f"unexpected epoch pair: register={register_epoch}, mirror={mirror_epoch}")
+
+    return EpochPairResult(
+        valid=False,
+        rule=FenceRefusalRule.EM_4c,
+        message=f"EM-4c: {'; '.join(reasons)}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate A Admission Rule (§3.2)
+# ---------------------------------------------------------------------------
+
+class GateAAction(str, Enum):
+    """Actions gated by Gate A (§3.2)."""
+    OPEN = "open"
+    CREATE = "create"
+    SERVE = "serve"
+    BEGIN_REMOVAL = "begin_removal"
+
+
+@dataclass
+class GateAResult:
+    """Result of a Gate A admission check (§3.2)."""
+    admitted: bool
+    outcome: FenceOutcome = FenceOutcome.ADMITTED
+    rule: Optional[FenceRefusalRule] = None
+    message: str = ""
+    entry: Optional[RegisterEntry] = None
+
+
+def check_gate_a_admission(
+    board_name: str,
+    action: GateAAction,
+    *,
+    storage_exists: Optional[bool] = None,
+    storage_complete: Optional[bool] = None,
+    is_backfill: bool = False,
+    conn: Optional[sqlite3.Connection] = None,
+) -> GateAResult:
+    """Check Gate A admission for a board and action (§3.2).
+
+    Implements the full admission table from the design document.
+    The storage_exists and storage_complete parameters allow the caller
+    to provide pre-checked storage state to avoid redundant I/O.
+
+    Args:
+        board_name: The board slug to check.
+        action: The action being attempted (open, create, serve, begin_removal).
+        storage_exists: Whether the board's storage exists (kanban.db present).
+        storage_complete: Whether the storage has a complete schema (GA-4a).
+        is_backfill: Whether this is a GA-5 backfill operation.
+        conn: Optional pre-opened register connection.
+
+    Returns:
+        GateAResult with admitted=True if the action is permitted.
+    """
+    normed = _normalize_board_slug(board_name)
+    if not normed:
+        return GateAResult(
+            admitted=False,
+            outcome=FenceOutcome.REFUSED_INDETERMINATE,
+            rule=FenceRefusalRule.INDETERMINATE,
+            message="invalid board name",
+        )
+
+    # Determine storage state if not provided
+    if storage_exists is None:
+        db_path = kanban_db_path(board=normed)
+        storage_exists = db_path.exists() and db_path.stat().st_size > 0
+
+    def _check(c: sqlite3.Connection) -> GateAResult:
+        _ensure_register_initialized(c)
+        entry = get_register_entry(normed, conn=c)
+
+        # Entry exists — check lifecycle
+        if entry is not None:
+            lifecycle = entry.lifecycle
+
+            if lifecycle == BoardLifecycle.LIVE:
+                # live: admit all actions
+                return GateAResult(admitted=True, entry=entry, message="lifecycle=live admits all")
+
+            if lifecycle == BoardLifecycle.REMOVING:
+                # removing: admit open and serve, refuse create and begin_removal
+                if action == GateAAction.CREATE:
+                    return GateAResult(
+                        admitted=False,
+                        outcome=FenceOutcome.REFUSED_CLOSED,
+                        rule=FenceRefusalRule.GA_2,
+                        entry=entry,
+                        message="GA-2: removing refuses creation",
+                    )
+                if action == GateAAction.BEGIN_REMOVAL:
+                    return GateAResult(
+                        admitted=False,
+                        outcome=FenceOutcome.REFUSED_CLOSED,
+                        rule=FenceRefusalRule.GA_2,
+                        entry=entry,
+                        message="removing refuses new removal (join-or-refuse is out of scope)",
+                    )
+                # GA-1: removing admits opening
+                return GateAResult(admitted=True, entry=entry, message="GA-1: removing admits open/serve")
+
+            if lifecycle in (BoardLifecycle.ARCHIVED, BoardLifecycle.HARD_REMOVED):
+                return GateAResult(
+                    admitted=False,
+                    outcome=FenceOutcome.REFUSED_CLOSED,
+                    rule=FenceRefusalRule.CLOSED,
+                    entry=entry,
+                    message=f"lifecycle={lifecycle.value} refuses all actions",
+                )
+
+        # Entry absent — check based on storage existence and markers
+        if entry is None:
+            # Check ever-existed marker (stored as a separate field on the entry, but
+            # we need to check if we've ever seen this board)
+            marker_row = c.execute(
+                "SELECT ever_existed_marker FROM board_register WHERE board_name = ?",
+                (normed,),
+            ).fetchone()
+            marker_set = marker_row is not None and marker_row["ever_existed_marker"]
+
+            # Check for receipt/audit records (GA-6a)
+            archive_exists = has_removal_archive_record(normed, conn=c)
+
+            if storage_exists:
+                if not marker_set and archive_exists is False:
+                    # absent, storage exists, marker never set, no receipt/audit
+                    if is_backfill:
+                        # GA-5: backfill admitted if all conditions met
+                        if storage_complete is False:
+                            return GateAResult(
+                                admitted=False,
+                                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                                rule=FenceRefusalRule.GA_5_FAIL,
+                                message="GA-5: backfill refuses incomplete board (GA-4a)",
+                            )
+                        return GateAResult(
+                            admitted=True,
+                            message="GA-5: backfill admitted",
+                        )
+                    # Not backfill — refuse, but backfill is the only admitted path
+                    return GateAResult(
+                        admitted=False,
+                        outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                        rule=FenceRefusalRule.GA_4,
+                        message="absent entry, storage exists: refuse (backfill only)",
+                    )
+
+                if marker_set:
+                    # absent, storage exists, marker set — indeterminate
+                    return GateAResult(
+                        admitted=False,
+                        outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                        rule=FenceRefusalRule.INDETERMINATE,
+                        message="absent entry with marker set: indeterminate, operator-repair only",
+                    )
+
+                if archive_exists is True:
+                    # GA-6a: no entry, no marker, but receipt/audit exists
+                    return GateAResult(
+                        admitted=False,
+                        outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                        rule=FenceRefusalRule.GA_6a,
+                        message="GA-6a: absent entry, archive record exists: indeterminate",
+                    )
+
+                if archive_exists is None:
+                    # Archive lookup failed — fail closed (GA-6b)
+                    return GateAResult(
+                        admitted=False,
+                        outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                        rule=FenceRefusalRule.GA_6b,
+                        message="GA-6b: archive lookup failed, refusing as indeterminate",
+                    )
+
+            else:
+                # No storage exists
+                if archive_exists is True:
+                    # No entry, no storage, but archive record exists
+                    return GateAResult(
+                        admitted=False,
+                        outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                        rule=FenceRefusalRule.GA_6a,
+                        message="GA-6a: no entry, no storage, but archive exists: indeterminate",
+                    )
+
+                # absent, no storage, no receipt/audit — only deliberate creation admitted
+                if action == GateAAction.CREATE:
+                    return GateAResult(admitted=True, message="deliberate creation admitted")
+
+                return GateAResult(
+                    admitted=False,
+                    outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                    rule=FenceRefusalRule.GA_4,
+                    message="absent entry, no storage: refuse all except deliberate creation",
+                )
+
+        # Should not reach here
+        return GateAResult(
+            admitted=False,
+            outcome=FenceOutcome.REFUSED_INDETERMINATE,
+            rule=FenceRefusalRule.INDETERMINATE,
+            message="unexpected state in Gate A check",
+        )
+
+    if conn is not None:
+        return _check(conn)
+    with register_connect() as c:
+        return _check(c)
+
+
+# ---------------------------------------------------------------------------
+# GA-4: Opening Never Creates (§3.2)
+# ---------------------------------------------------------------------------
+#
+# GA-4 requires that opening and creating are two DISTINCT primitives.
+# Opening never creates a directory, store, or schema — it finds an
+# existing, complete store or reports absence and refuses.
+
+
+def open_board_store(
+    board: Optional[str] = None,
+    *,
+    validate_epoch: bool = True,
+) -> Optional[sqlite3.Connection]:
+    """Open an existing board's store (GA-4: never creates).
+
+    This is the GA-4 compliant open primitive. It:
+    - Never creates a containing directory
+    - Never creates a store
+    - Never initializes a schema
+    - Reports absence and refuses for incomplete boards (GA-4a)
+
+    Returns a connection if the board exists and is complete, or None
+    if it should be refused. The existing connect() function is preserved
+    for backward compatibility — this is the explicit open primitive.
+
+    Args:
+        board: The board slug to open.
+        validate_epoch: If True, validate the epoch pair against the register.
+
+    Returns:
+        sqlite3.Connection if admitted, None if refused.
+    """
+    slug = _normalize_board_slug(board) or get_current_board()
+    db_path = kanban_db_path(board=slug)
+
+    # GA-4: check storage exists without creating anything
+    if not db_path.exists():
+        _log.debug("open_board_store: %s does not exist, refusing", db_path)
+        return None
+
+    try:
+        if db_path.stat().st_size == 0:
+            _log.debug("open_board_store: %s is zero-length, refusing as incomplete", db_path)
+            return None
+    except OSError:
+        return None
+
+    # Check Gate A admission for opening
+    result = check_gate_a_admission(
+        slug,
+        GateAAction.OPEN,
+        storage_exists=True,
+        storage_complete=None,  # Will check below
+    )
+    if not result.admitted:
+        _log.debug("open_board_store: Gate A refused: %s", result.message)
+        return None
+
+    # Open without creating (GA-4)
+    try:
+        conn = _sqlite_connect(db_path)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as e:
+        _log.debug("open_board_store: sqlite open failed: %s", e)
+        return None
+
+    # GA-4a: check schema is complete
+    try:
+        if not _schema_is_present(conn):
+            conn.close()
+            _log.debug("open_board_store: schema incomplete, refusing (GA-4a)")
+            return None
+    except sqlite3.Error:
+        conn.close()
+        return None
+
+    # Epoch validation (EM-3, EM-4) if requested
+    if validate_epoch:
+        try:
+            fence_state = get_in_board_fence_state(conn)
+            if fence_state is None:
+                # Cannot read fence state — fail closed (§3.4)
+                conn.close()
+                _log.debug("open_board_store: cannot read fence state, refusing")
+                return None
+
+            entry = result.entry or get_register_entry(slug)
+            if entry is not None:
+                pair_result = validate_epoch_pair(entry.epoch, fence_state.epoch_mirror, entry)
+                if not pair_result.valid:
+                    conn.close()
+                    _log.debug("open_board_store: epoch pair invalid: %s", pair_result.message)
+                    return None
+        except Exception as e:
+            conn.close()
+            _log.debug("open_board_store: epoch validation failed: %s", e)
+            return None
+
+    return conn
+
+
+def create_board_store(
+    board: str,
+    *,
+    register_conn: Optional[sqlite3.Connection] = None,
+) -> Optional[sqlite3.Connection]:
+    """Create a new board's store (GA-4b: distinct create primitive).
+
+    This is the deliberate creation primitive, separate from open.
+    It checks Gate A for CREATE action, then creates the store and
+    registers the board.
+
+    Returns a connection to the new board, or None if creation refused.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return None
+
+    db_path = kanban_db_path(board=slug)
+
+    # Check if already exists
+    storage_exists = db_path.exists() and db_path.stat().st_size > 0
+
+    # Check Gate A admission for creation
+    result = check_gate_a_admission(
+        slug,
+        GateAAction.CREATE,
+        storage_exists=storage_exists,
+        conn=register_conn,
+    )
+    if not result.admitted:
+        _log.debug("create_board_store: Gate A refused creation: %s", result.message)
+        return None
+
+    # Create the store
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = connect(db_path=db_path, board=slug)
+
+    # Ensure in-board fence state exists
+    with write_txn(conn):
+        _ensure_in_board_fence_schema(conn)
+
+    # Create register entry with initial epoch
+    with register_connect() as reg_conn:
+        now = int(time.time())
+        entry = RegisterEntry(
+            board_name=slug,
+            lifecycle=BoardLifecycle.LIVE,
+            epoch=1,
+            epoch_lineage=[1],
+            created_at=now,
+            updated_at=now,
+        )
+        reg_conn.execute("BEGIN IMMEDIATE")
+        try:
+            _write_register_entry(reg_conn, entry)
+            reg_conn.execute("COMMIT")
+        except Exception:
+            reg_conn.execute("ROLLBACK")
+            raise
+
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# GA-5: One-Time Backfill (§3.2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BackfillResult:
+    """Result of a backfill operation (GA-5)."""
+    success: bool
+    message: str
+    entry: Optional[RegisterEntry] = None
+
+
+def backfill_register_entry(
+    board_name: str,
+) -> BackfillResult:
+    """Perform a one-time backfill of a register entry (GA-5).
+
+    Backfill is admitted only when ALL FIVE conditions hold:
+    1. It is a named operation an ordinary path cannot invoke
+    2. It is recorded as a backfill with its time and subject
+    3. The ever-existed marker for that name is unset
+    4. The board's storage is complete (GA-4a)
+    5. The removal archive holds no receipt or audit record (GA-6a)
+
+    Backfill writes the entry as 'live', sets the ever-existed marker,
+    and writes the in-board epoch mirror in the same act.
+    """
+    slug = _normalize_board_slug(board_name)
+    if not slug:
+        return BackfillResult(False, "invalid board name")
+
+    db_path = kanban_db_path(board=slug)
+
+    # Check storage exists
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        return BackfillResult(False, "GA-5: storage does not exist or is empty")
+
+    # Check storage is complete (GA-4a)
+    try:
+        test_conn = _sqlite_connect(db_path)
+        test_conn.row_factory = sqlite3.Row
+        try:
+            if not _schema_is_present(test_conn):
+                return BackfillResult(False, "GA-5: storage incomplete (GA-4a)")
+        finally:
+            test_conn.close()
+    except sqlite3.Error:
+        return BackfillResult(False, "GA-5: cannot open storage to verify completeness")
+
+    with register_connect() as reg_conn:
+        # Check admission
+        result = check_gate_a_admission(
+            slug,
+            GateAAction.OPEN,
+            storage_exists=True,
+            storage_complete=True,
+            is_backfill=True,
+            conn=reg_conn,
+        )
+        if not result.admitted:
+            return BackfillResult(False, f"GA-5: {result.message}")
+
+        # Check ever-existed marker is unset
+        row = reg_conn.execute(
+            "SELECT ever_existed_marker FROM board_register WHERE board_name = ?",
+            (slug,),
+        ).fetchone()
+        if row is not None and row["ever_existed_marker"]:
+            return BackfillResult(
+                False,
+                "GA-5: ever-existed marker is set, backfill not permitted",
+            )
+
+        # Check no archive records exist (GA-6a)
+        archive_exists = has_removal_archive_record(slug, conn=reg_conn)
+        if archive_exists is True:
+            return BackfillResult(
+                False,
+                "GA-6a: archive record exists, backfill not permitted",
+            )
+        if archive_exists is None:
+            return BackfillResult(
+                False,
+                "GA-6b: archive lookup failed, refusing backfill",
+            )
+
+        # All conditions met — perform backfill
+        now = int(time.time())
+        entry = RegisterEntry(
+            board_name=slug,
+            lifecycle=BoardLifecycle.LIVE,
+            epoch=1,
+            epoch_lineage=[1],
+            created_at=now,
+            updated_at=now,
+        )
+
+        reg_conn.execute("BEGIN IMMEDIATE")
+        try:
+            _write_register_entry(reg_conn, entry)
+
+            # Record the backfill in the archive
+            reg_conn.execute(
+                """
+                INSERT INTO board_removal_archive (board_name, record_type, record_id, created_at)
+                VALUES (?, 'backfill', ?, ?)
+                """,
+                (slug, f"backfill-{now}", now),
+            )
+
+            reg_conn.execute("COMMIT")
+        except Exception as e:
+            reg_conn.execute("ROLLBACK")
+            return BackfillResult(False, f"GA-5: backfill failed: {e}")
+
+    # Write the epoch mirror in the board's store
+    try:
+        board_conn = _sqlite_connect(db_path)
+        board_conn.row_factory = sqlite3.Row
+        try:
+            board_conn.execute("BEGIN IMMEDIATE")
+            _ensure_in_board_fence_schema(board_conn)
+            board_conn.execute(
+                "UPDATE board_fence_state SET epoch_mirror = ?, updated_at = ? WHERE id = 1",
+                (1, now),
+            )
+            board_conn.execute("COMMIT")
+        finally:
+            board_conn.close()
+    except sqlite3.Error as e:
+        return BackfillResult(
+            False,
+            f"GA-5: backfill registered but epoch mirror write failed: {e}",
+        )
+
+    return BackfillResult(
+        True,
+        "GA-5: backfill complete",
+        entry=entry,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fence-Closing Point (§3.3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FenceCloseResult:
+    """Result of committing the fence-closing point."""
+    success: bool
+    message: str
+    new_epoch: Optional[int] = None
+
+
+def commit_fence_closing_point(
+    board: str,
+    *,
+    new_epoch: int,
+) -> FenceCloseResult:
+    """Commit the fence-closing point: gate open→closing with epoch mirror (§3.3).
+
+    This is the single atomic commit that closes the fence. The in-board gate
+    moves from 'open' to 'closing' with the epoch mirror written in the same
+    commit (EM-2).
+
+    This function is called by the removal sequence at Phase 2 (Fenced).
+    It should be called AFTER the register intent commit (Phase 1).
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return FenceCloseResult(False, "invalid board name")
+
+    db_path = kanban_db_path(board=slug)
+    if not db_path.exists():
+        return FenceCloseResult(False, "board storage does not exist")
+
+    try:
+        conn = _sqlite_connect(db_path)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as e:
+        return FenceCloseResult(False, f"cannot open board store: {e}")
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _ensure_in_board_fence_schema(conn)
+
+            # Read current state
+            row = conn.execute(
+                "SELECT gate, epoch_mirror FROM board_fence_state WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return FenceCloseResult(False, "fence state row missing")
+
+            current_gate = InBoardGate(row["gate"])
+
+            # The fence-closing point: open → closing
+            if current_gate == InBoardGate.OPEN:
+                now = int(time.time())
+                conn.execute(
+                    "UPDATE board_fence_state SET gate = ?, epoch_mirror = ?, updated_at = ? "
+                    "WHERE id = 1 AND gate = ?",
+                    (InBoardGate.CLOSING.value, new_epoch, now, InBoardGate.OPEN.value),
+                )
+                if conn.execute("SELECT changes()").fetchone()[0] == 0:
+                    # CAS failed — gate changed concurrently
+                    conn.execute("ROLLBACK")
+                    return FenceCloseResult(False, "fence-closing CAS failed")
+            elif current_gate == InBoardGate.CLOSING:
+                # Idempotent: already closing, just update epoch mirror
+                now = int(time.time())
+                conn.execute(
+                    "UPDATE board_fence_state SET epoch_mirror = ?, updated_at = ? WHERE id = 1",
+                    (new_epoch, now),
+                )
+            else:
+                # Gate is frozen — cannot close further
+                conn.execute("ROLLBACK")
+                return FenceCloseResult(False, f"gate is {current_gate.value}, cannot close")
+
+            conn.execute("COMMIT")
+            return FenceCloseResult(True, "fence-closing point committed", new_epoch=new_epoch)
+        except Exception as e:
+            conn.execute("ROLLBACK")
+            return FenceCloseResult(False, f"fence-closing commit failed: {e}")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Fail-Closed Behavior (§3.4)
+# ---------------------------------------------------------------------------
+
+
+def check_fence_for_operation(
+    board: str,
+    operation: str = "operation",
+    *,
+    timeout_seconds: Optional[float] = None,
+) -> tuple[bool, Optional[FenceRefusal]]:
+    """Check the fence before an operation, failing closed on any uncertainty (§3.4).
+
+    Returns (admitted, refusal) where admitted is True if the operation may
+    proceed, and refusal contains the structured reason if not.
+
+    The check reads both gates (register and in-board) within the configured
+    bound and validates the epoch pair. Any failure to read, malformed state,
+    or epoch mismatch results in a refusal.
+    """
+    slug = _normalize_board_slug(board) or get_current_board()
+    timeout = timeout_seconds or _fence_consultation_timeout_seconds()
+    start = time.monotonic()
+
+    # Read register entry
+    try:
+        entry = get_register_entry(slug)
+    except Exception as e:
+        return False, FenceRefusal(
+            outcome=FenceOutcome.REFUSED_INDETERMINATE,
+            rule=FenceRefusalRule.INDETERMINATE,
+            board=slug,
+            message=f"cannot read register entry: {e}",
+        )
+
+    if time.monotonic() - start > timeout:
+        return False, FenceRefusal(
+            outcome=FenceOutcome.REFUSED_TIMEOUT,
+            rule=FenceRefusalRule.TIMEOUT,
+            board=slug,
+            message=f"register read exceeded {timeout}s bound",
+        )
+
+    # Check lifecycle
+    if entry is not None:
+        if entry.lifecycle in (BoardLifecycle.ARCHIVED, BoardLifecycle.HARD_REMOVED):
+            return False, FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.CLOSED,
+                board=slug,
+                message=f"board is {entry.lifecycle.value}",
+                register_epoch=entry.epoch,
+            )
+
+    # Read in-board fence state
+    db_path = kanban_db_path(board=slug)
+    if not db_path.exists():
+        if entry is None:
+            # No entry and no storage — fail closed
+            return False, FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=FenceRefusalRule.INDETERMINATE,
+                board=slug,
+                message="no register entry and no storage",
+            )
+        # Entry exists but storage is gone — indeterminate
+        return False, FenceRefusal(
+            outcome=FenceOutcome.REFUSED_INDETERMINATE,
+            rule=FenceRefusalRule.INDETERMINATE,
+            board=slug,
+            message="register entry exists but storage absent",
+            register_epoch=entry.epoch,
+        )
+
+    try:
+        conn = _sqlite_connect(db_path)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as e:
+        return False, FenceRefusal(
+            outcome=FenceOutcome.REFUSED_INDETERMINATE,
+            rule=FenceRefusalRule.INDETERMINATE,
+            board=slug,
+            message=f"cannot open board store: {e}",
+            register_epoch=entry.epoch if entry else None,
+        )
+
+    try:
+        fence_state = get_in_board_fence_state(conn)
+    except Exception as e:
+        conn.close()
+        return False, FenceRefusal(
+            outcome=FenceOutcome.REFUSED_INDETERMINATE,
+            rule=FenceRefusalRule.INDETERMINATE,
+            board=slug,
+            message=f"cannot read in-board fence state: {e}",
+            register_epoch=entry.epoch if entry else None,
+        )
+    finally:
+        if fence_state is None:
+            conn.close()
+
+    if fence_state is None:
+        return False, FenceRefusal(
+            outcome=FenceOutcome.REFUSED_INDETERMINATE,
+            rule=FenceRefusalRule.INDETERMINATE,
+            board=slug,
+            message="in-board fence state missing or malformed",
+            register_epoch=entry.epoch if entry else None,
+        )
+
+    if time.monotonic() - start > timeout:
+        conn.close()
+        return False, FenceRefusal(
+            outcome=FenceOutcome.REFUSED_TIMEOUT,
+            rule=FenceRefusalRule.TIMEOUT,
+            board=slug,
+            message=f"gate reads exceeded {timeout}s bound",
+            register_epoch=entry.epoch if entry else None,
+            mirror_epoch=fence_state.epoch_mirror,
+        )
+
+    conn.close()
+
+    # Check in-board gate
+    if fence_state.gate in (InBoardGate.CLOSING, InBoardGate.FROZEN):
+        return False, FenceRefusal(
+            outcome=FenceOutcome.REFUSED_CLOSED,
+            rule=FenceRefusalRule.CLOSED,
+            board=slug,
+            message=f"in-board gate is {fence_state.gate.value}",
+            register_epoch=entry.epoch if entry else None,
+            mirror_epoch=fence_state.epoch_mirror,
+        )
+
+    # Validate epoch pair (EM-4)
+    if entry is not None:
+        pair_result = validate_epoch_pair(entry.epoch, fence_state.epoch_mirror, entry)
+        if not pair_result.valid:
+            return False, FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=pair_result.rule or FenceRefusalRule.EM_4c,
+                board=slug,
+                message=pair_result.message,
+                register_epoch=entry.epoch,
+                mirror_epoch=fence_state.epoch_mirror,
+            )
+
+    # All checks passed
+    return True, None
+
+
+# ---------------------------------------------------------------------------
+# Board Handle with Epoch Validation (EM-3)
+# ---------------------------------------------------------------------------
+
+
+class BoardHandle:
+    """A handle to a board that validates epoch on each operation (EM-3).
+
+    The handle records the epoch mirror value when opened (EM-3a) and
+    validates it against the current mirror before each operation (EM-3b).
+    A mismatch is evaluated against EM-4's pair rule, not as raw inequality.
+    """
+
+    def __init__(
+        self,
+        board: str,
+        conn: sqlite3.Connection,
+        recorded_epoch: int,
+    ):
+        self._board = board
+        self._conn = conn
+        self._recorded_epoch = recorded_epoch
+        self._closed = False
+
+    @property
+    def board(self) -> str:
+        return self._board
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        return self._conn
+
+    @property
+    def recorded_epoch(self) -> int:
+        """The epoch this handle recorded when opened (EM-3a: from mirror, not register)."""
+        return self._recorded_epoch
+
+    def validate_for_operation(self) -> tuple[bool, Optional[FenceRefusal]]:
+        """Validate the handle's epoch before an operation (EM-3, EM-4).
+
+        Returns (valid, refusal). A handle whose recorded epoch differs from
+        the current mirror is NOT discarded on that fact alone (EM-3b) — the
+        pair is evaluated against EM-4.
+        """
+        if self._closed:
+            return False, FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=FenceRefusalRule.INDETERMINATE,
+                board=self._board,
+                message="handle is closed",
+            )
+
+        try:
+            fence_state = get_in_board_fence_state(self._conn)
+        except Exception as e:
+            return False, FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=FenceRefusalRule.INDETERMINATE,
+                board=self._board,
+                message=f"cannot read fence state: {e}",
+            )
+
+        if fence_state is None:
+            return False, FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=FenceRefusalRule.INDETERMINATE,
+                board=self._board,
+                message="fence state missing",
+            )
+
+        # EM-3a: recorded epoch is from the mirror, validated against current mirror
+        # EM-3b: evaluate the pair with EM-4, not raw inequality
+        entry = get_register_entry(self._board)
+        pair_result = validate_epoch_pair(
+            entry.epoch if entry else fence_state.epoch_mirror,
+            fence_state.epoch_mirror,
+            entry,
+        )
+
+        # Check if our recorded epoch vs current mirror is valid
+        if self._recorded_epoch != fence_state.epoch_mirror:
+            # Difference — evaluate with EM-4 against the register
+            if entry is not None:
+                handle_pair = validate_epoch_pair(entry.epoch, self._recorded_epoch, entry)
+                if not handle_pair.valid:
+                    return False, FenceRefusal(
+                        outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                        rule=handle_pair.rule or FenceRefusalRule.EM_4c,
+                        board=self._board,
+                        message=f"handle epoch invalid: {handle_pair.message}",
+                        register_epoch=entry.epoch,
+                        mirror_epoch=fence_state.epoch_mirror,
+                    )
+
+        # Check in-board gate
+        if fence_state.gate in (InBoardGate.CLOSING, InBoardGate.FROZEN):
+            return False, FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.CLOSED,
+                board=self._board,
+                message=f"gate is {fence_state.gate.value}",
+                mirror_epoch=fence_state.epoch_mirror,
+            )
+
+        return True, None
+
+    def close(self) -> None:
+        """Close the handle."""
+        if not self._closed:
+            self._closed = True
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> "BoardHandle":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+
+def open_board_handle(
+    board: Optional[str] = None,
+) -> Optional[BoardHandle]:
+    """Open a board handle that validates epoch on operations (EM-3).
+
+    The handle records the epoch mirror value (not the register value)
+    when opened, per EM-3a. Returns None if the board cannot be opened.
+    """
+    slug = _normalize_board_slug(board) or get_current_board()
+    db_path = kanban_db_path(board=slug)
+
+    if not db_path.exists():
+        return None
+
+    try:
+        conn = _sqlite_connect(db_path)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return None
+
+    # EM-3a: record the MIRROR value, not the register value
+    fence_state = get_in_board_fence_state(conn)
+    if fence_state is None:
+        conn.close()
+        return None
+
+    recorded_epoch = fence_state.epoch_mirror
+    return BoardHandle(slug, conn, recorded_epoch)
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
