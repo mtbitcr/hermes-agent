@@ -1767,10 +1767,10 @@ def _handle_create(args: dict, **kw) -> str:
             }
             effective_board = _board_of_connection(kb, conn)
             requested_board = kb._normalize_board_slug(board)
-            if requested_board and effective_board and requested_board != effective_board:
+            if requested_board and requested_board != effective_board:
                 return tool_error(
                     f"kanban_create: board '{requested_board}' does not match the board "
-                    f"database this worker is pinned to ('{effective_board}')"
+                    f"database this worker is pinned to ('{effective_board or 'a file outside the boards tree'}')"
                 )
             governed_board = kb._board_owner_project_id(effective_board)
             if governed_board is not None:
