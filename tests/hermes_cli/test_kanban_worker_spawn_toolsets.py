@@ -210,6 +210,73 @@ def test_default_spawn_disables_fallbacks_for_a_policy_locked_task(monkeypatch, 
     assert get_fallback_chain(drifted) == []
 
 
+def test_default_spawn_deep_tier_forwards_max_turns_after_chat(monkeypatch, tmp_path):
+    """A deep task gets the dispatcher's iteration budget as a ``chat`` flag.
+
+    ``--max-turns`` belongs to the chat subparser, so it must follow ``chat``;
+    the real parser proves the value reaches ``args.max_turns``.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli._parser import build_top_level_parser
+
+    workspace = _spawn_profile_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4247
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    kb._default_spawn(_pinned_task(kb), str(workspace))
+
+    cmd = captured["cmd"]
+    assert cmd.index("--max-turns") > cmd.index("chat")
+    assert cmd[cmd.index("--max-turns") + 1] == str(kb._DEEP_TIER_MAX_TURNS)
+    parser, _subparsers, _chat_parser = build_top_level_parser()
+    args = parser.parse_args(cmd[3:])
+    assert args.max_turns == kb._DEEP_TIER_MAX_TURNS
+
+
+def test_default_spawn_routine_task_keeps_profile_max_turns(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    workspace = _spawn_profile_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4248
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    task = _make_task(kb, assignee="elias")
+    task.execution_tier = "routine"
+    kb._default_spawn(task, str(workspace))
+
+    assert "--max-turns" not in captured["cmd"]
+
+
+def test_set_worker_pid_records_max_turns_in_spawned_event(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="budgeted")
+        kb._set_worker_pid(conn, tid, 4249, max_turns=160)
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "spawned"]
+        assert events and events[-1].payload == {"pid": 4249, "max_turns": 160}
+    finally:
+        conn.close()
+
+
 def test_default_spawn_does_not_disable_fallbacks_for_ordinary_tasks(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
     from hermes_cli.fallback_config import FALLBACKS_DISABLED_ENV
