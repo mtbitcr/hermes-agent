@@ -293,7 +293,7 @@ def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_su
     )
     assert attachments.status_code == 200
     item = attachments.json()["attachments"][0]
-    assert set(item) == {"id", "filename", "media_type", "size", "created_at"}
+    assert set(item) == {"id", "filename", "media_type", "size", "created_at", "source_attachment_id"}
     assert item["id"] == s["attachment_id"]
     assert item["created_at"].endswith("Z")
 
