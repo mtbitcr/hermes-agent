@@ -509,3 +509,14 @@ def test_list_exposes_the_source_of_a_copied_attachment(client):
 
     assert listed(parent)[original]["source_attachment_id"] is None
     assert listed(child)[copy]["source_attachment_id"] == original
+
+    # Provenance outlives the run's events: retention deletes those after
+    # 30 days for finished tasks, the attachment row stays.
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET status='done' WHERE id IN (?, ?)", (parent, child))
+        conn.commit()
+        kb.gc_events(conn, older_than_seconds=-5)
+    finally:
+        conn.close()
+    assert listed(child)[copy]["source_attachment_id"] == original
