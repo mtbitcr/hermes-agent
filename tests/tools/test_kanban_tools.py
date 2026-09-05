@@ -529,6 +529,95 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def _govern_current_board(kb):
+    """Publish an owner project id on the board so tool-created tasks are governed."""
+    kb.write_board_metadata(kb.get_current_board(), project_id="p_governed_test")
+
+
+def _stub_admitted_route(monkeypatch):
+    from plugins.dashboard_auth.raphael_workspace import model_policy as mp
+    from hermes_cli import owner_workspace as ow
+
+    def fake_resolve(profile, tier):
+        return mp.task_assignment_for(profile, "anthropic", tier)
+
+    monkeypatch.setattr(ow, "resolve_task_assignment", fake_resolve)
+
+
+def test_create_on_governed_board_pins_the_admitted_route(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _govern_current_board(kb)
+    _stub_admitted_route(monkeypatch)
+    out = kt._handle_create({
+        "title": "governed child",
+        "assignee": "raphael-builder",
+        "execution_tier": "deep",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["execution_tier"] == "deep"
+    assert d["route_pinned"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.execution_tier == "deep"
+        assert child.provider_override == "anthropic"
+        assert child.model_override == "claude-opus-5"
+        assert child.reasoning_effort == "max"
+        assert kb.policy_lock_error(
+            child.model_policy_lock, "raphael-builder", "anthropic", "claude-opus-5", "max", "deep",
+        ) is None
+    finally:
+        conn.close()
+
+
+def test_create_on_governed_board_refuses_model_override(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _govern_current_board(kb)
+    _stub_admitted_route(monkeypatch)
+    conn = kb.connect()
+    try:
+        before = len(kb.list_tasks(conn))
+    finally:
+        conn.close()
+    out = kt._handle_create({
+        "title": "hand-routed child",
+        "assignee": "raphael-verifier",
+        "model": "gpt-5.6-sol",
+        "provider": "openai-codex",
+    })
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "owner-governed" in d["error"]
+    conn = kb.connect()
+    try:
+        assert len(kb.list_tasks(conn)) == before
+    finally:
+        conn.close()
+
+
+def test_create_on_governed_board_inherits_creator_deep_tier(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _govern_current_board(kb)
+    _stub_admitted_route(monkeypatch)
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET execution_tier='deep' WHERE id=?", (worker_env,))
+        conn.commit()
+    finally:
+        conn.close()
+    out = kt._handle_create({"title": "inherits tier", "assignee": "raphael-builder"})
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["execution_tier"] == "deep"
+
+
 def test_create_explicit_worktree_inherits_current_project(worker_env, tmp_path):
     """Scoped parallel children stay linked to the parent's Project."""
     from hermes_cli import kanban_db as kb
