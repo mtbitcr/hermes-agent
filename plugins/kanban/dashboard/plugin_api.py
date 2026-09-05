@@ -322,21 +322,7 @@ def _comment_dict(c: kanban_db.Comment) -> dict[str, Any]:
     }
 
 
-def _attachment_sources(conn, task_id: str) -> dict[int, int]:
-    """Map copied attachment ids to their native source, from ``attached`` events."""
-    rows = conn.execute(
-        "SELECT json_extract(payload, '$.attachment_id') AS id, "
-        "json_extract(payload, '$.source_attachment_id') AS source "
-        "FROM task_events WHERE task_id = ? AND kind = 'attached' "
-        "AND json_extract(payload, '$.source_attachment_id') IS NOT NULL",
-        (task_id,),
-    )
-    return {int(r["id"]): int(r["source"]) for r in rows}
-
-
-def _attachment_dict(
-    a: kanban_db.Attachment, source_attachment_id: Optional[int] = None,
-) -> dict[str, Any]:
+def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
     """Serialise an Attachment for the drawer. ``stored_path`` is the
     absolute on-disk path workers read; the UI uses ``id`` for download."""
     return {
@@ -348,7 +334,7 @@ def _attachment_dict(
         "uploaded_by": a.uploaded_by,
         "stored_path": a.stored_path,
         "created_at": a.created_at,
-        "source_attachment_id": source_attachment_id,
+        "source_attachment_id": a.source_attachment_id,
     }
 
 
@@ -881,11 +867,9 @@ def list_task_attachments(task_id: str, request: Request, board: Optional[str] =
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        sources = _attachment_sources(conn, task_id)
         return {
             "attachments": [
-                _attachment_dict(a, sources.get(a.id))
-                for a in kanban_db.list_attachments(conn, task_id)
+                _attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)
             ]
         }
     finally:
@@ -3851,7 +3835,6 @@ def _workspace_task_attachments_response(task_id: str) -> Optional[dict]:
         if not _workspace_work_task_exists(conn, task_id):
             return None
         atts = kanban_db.list_attachments(conn, task_id)
-        sources = _attachment_sources(conn, task_id)
         return {
             "attachments": [
                 {
@@ -3860,7 +3843,7 @@ def _workspace_task_attachments_response(task_id: str) -> Optional[dict]:
                     "media_type": _workspace_validate_media_type(a.content_type),
                     "size": a.size,
                     "created_at": _workspace_iso_timestamp(a.created_at),
-                    "source_attachment_id": sources.get(a.id),
+                    "source_attachment_id": a.source_attachment_id,
                 }
                 for a in atts
             ]

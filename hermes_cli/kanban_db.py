@@ -1722,6 +1722,7 @@ class Attachment:
     size: int
     uploaded_by: Optional[str]
     created_at: int
+    source_attachment_id: Optional[int] = None
 
 
 @dataclass
@@ -1960,7 +1961,8 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     content_type TEXT,
     size         INTEGER NOT NULL DEFAULT 0,
     uploaded_by  TEXT,
-    created_at   INTEGER NOT NULL
+    created_at   INTEGER NOT NULL,
+    source_attachment_id INTEGER
 );
 
 -- Current remote sandbox cleanup authority. One row exists while an exact run
@@ -3074,6 +3076,12 @@ def _migrate_add_optional_columns(
     # initial snapshot did not. Re-snapshot here so the legacy-column migration
     # below is truly idempotent and never re-adds columns that already exist.
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+
+    # A worker copy of a native attachment keeps its source for as long as the
+    # row lives; ``attached`` events are garbage-collected after 30 days.
+    _add_column_if_missing(
+        conn, "task_attachments", "source_attachment_id", "source_attachment_id INTEGER",
+    )
 
     # Legacy column migration: ``spawn_failures`` → ``consecutive_failures``
     # and ``last_spawn_error`` → ``last_failure_error``.
@@ -7323,8 +7331,8 @@ def _add_attachment_row(
         raise ValueError(f"unknown task {task_id}")
     cur = conn.execute(
         "INSERT INTO task_attachments "
-        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at, "
+        "source_attachment_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             task_id,
             filename.strip(),
@@ -7333,6 +7341,7 @@ def _add_attachment_row(
             int(size),
             uploaded_by,
             now,
+            source_attachment.id if source_attachment is not None else None,
         ),
     )
     attachment_id = int(cur.lastrowid or 0)
@@ -7368,6 +7377,7 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
             size=r["size"] or 0,
             uploaded_by=r["uploaded_by"],
             created_at=r["created_at"],
+            source_attachment_id=r["source_attachment_id"],
         )
         for r in rows
     ]
@@ -7390,6 +7400,7 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
         size=r["size"] or 0,
         uploaded_by=r["uploaded_by"],
         created_at=r["created_at"],
+        source_attachment_id=r["source_attachment_id"],
     )
 
 
