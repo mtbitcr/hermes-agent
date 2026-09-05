@@ -142,12 +142,12 @@ _ASSIGNMENTS = {
     # Independent verification exists to be independent OF the implementation
     # family: Claude writes the code, so a Claude verifier is the same family
     # reviewing itself, and the OpenAI GPT-5.6 Sol / max lane stays the only
-    # recommended verifier route. The Anthropic entry below is a dated,
-    # non-recommended fallback admitted on 2026-09-04 because the OpenAI lane
-    # was exhausted for about three days; it is the strongest Claude model, so
-    # the builder's Sonnet lane never reviews itself. Remove this entry once
-    # the OpenAI lane is available again (target 2026-09-07); STATE.md records
-    # every review that ran on it.
+    # recommended verifier route. The Anthropic entry below is the named,
+    # non-recommended "Claude Security" lane: security analysis runs on two
+    # explicitly identified lanes (Codex Security on the recommended route,
+    # Claude Security on this one), so a finding is never verified only by
+    # the family that wrote the code. It is the strongest Claude model, so the
+    # builder's Sonnet lane never reviews itself. Admitted, never recommended.
     ("raphael-verifier", "anthropic"): _assignment(
         "raphael-verifier", "anthropic", "claude-opus-5", "Claude Opus 5", "max"
     ),
