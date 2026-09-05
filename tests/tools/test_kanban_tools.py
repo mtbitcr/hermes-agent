@@ -1990,3 +1990,71 @@ def test_recommend_kind_enum_tracks_the_db_and_adds_exactly_one_tool():
     )
     # One new tool on the existing toolset — no new registry, route, or surface.
     assert "kanban_recommend" in TOOLSETS["kanban"]["tools"]
+
+
+def test_create_on_plain_board_keeps_the_hand_set_route(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    d = json.loads(kt._handle_create({
+        "title": "hand-routed child",
+        "assignee": "raphael-verifier",
+        "model": "gpt-5.6-sol",
+        "provider": "openai-codex",
+    }))
+    assert d["ok"] is True, d
+    assert d["route_pinned"] is False
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert (child.model_override, child.provider_override) == ("gpt-5.6-sol", "openai-codex")
+        assert not child.model_policy_lock
+    finally:
+        conn.close()
+
+
+def test_create_on_governed_board_refuses_provider_only(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _govern_current_board(kb)
+    _stub_admitted_route(monkeypatch)
+    d = json.loads(kt._handle_create({
+        "title": "provider only", "assignee": "raphael-verifier", "provider": "openai-codex",
+    }))
+    assert d.get("ok") is not True
+    assert "owner-governed" in d["error"]
+
+
+def test_create_governance_follows_the_pinned_database_not_the_board_argument(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _govern_current_board(kb)
+    _stub_admitted_route(monkeypatch)
+    kb.write_board_metadata("plain", name="Plain")
+    kb.connect(board="plain").close()
+    default_db = kb.kanban_db_path(board="default")
+    plain_db = kb.kanban_db_path(board="plain")
+
+    def count(board):
+        conn = kb.connect(board=board)
+        try:
+            return len(kb.list_tasks(conn))
+        finally:
+            conn.close()
+
+    before = {b: count(b) for b in ("default", "plain")}
+    hand_set = {"assignee": "raphael-verifier", "model": "gpt-5.6-sol", "provider": "openai-codex"}
+    # A worker pinned to the governed database asks for a plain board.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(default_db))
+    d = json.loads(kt._handle_create({"title": "escape attempt", "board": "plain", **hand_set}))
+    assert d.get("ok") is not True
+    assert "does not match" in d["error"]
+    # A worker pinned to a plain database names the governed board.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(plain_db))
+    d = json.loads(kt._handle_create({"title": "wrong claim", "board": "default", **hand_set}))
+    assert d.get("ok") is not True
+    assert "does not match" in d["error"]
+    monkeypatch.delenv("HERMES_KANBAN_DB")
+    assert {b: count(b) for b in ("default", "plain")} == before
