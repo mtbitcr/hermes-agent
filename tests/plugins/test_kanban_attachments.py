@@ -440,3 +440,72 @@ def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
         conn.close()
 
 
+
+
+# ---------------------------------------------------------------------------
+# Content-type inference, inline caps and copy provenance
+# ---------------------------------------------------------------------------
+
+
+def test_store_attachment_bytes_infers_content_type_from_the_filename(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+        inferred = {
+            name: kb.get_attachment(conn, kb.store_attachment_bytes(conn, task_id, name, b"x")).content_type
+            for name in ("plan.md", "change.patch", "blob.zzz")
+        }
+        explicit = kb.get_attachment(conn, kb.store_attachment_bytes(
+            conn, task_id, "notes.md", b"x", content_type="text/plain",
+        ))
+        assert inferred == {"plan.md": "text/markdown", "change.patch": "text/x-diff", "blob.zzz": None}
+        assert explicit.content_type == "text/plain"
+    finally:
+        conn.close()
+
+
+def test_worker_context_inlines_a_sixteen_kilobyte_parent_markdown(kanban_home):
+    # A 16 KB design document is an ordinary deliverable; it inlines whole.
+    conn = kb.connect()
+    try:
+        parent = _make_task(conn, title="write the design")
+        body = b"design:" + b"d" * (16 * 1024 - 11) + b"end."
+        kb.store_attachment_bytes(conn, parent, "design.md", body, content_type="text/markdown")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        conn.commit()
+        child = kb.create_task(conn, title="review the design", parents=[parent])
+
+        ctx = kb.build_worker_context(conn, child)
+
+        assert "design:" in ctx and "end." in ctx
+        assert "inline attachment budget exhausted" not in ctx
+    finally:
+        conn.close()
+
+
+def test_list_exposes_the_source_of_a_copied_attachment(client):
+    parent = _create_task_via_api(client)
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{parent}/attachments",
+        files={"file": ("result.md", b"# result", "text/markdown")},
+    )
+    original = r.json()["attachment"]["id"]
+    conn = kb.connect()
+    try:
+        child = _make_task(conn, title="use the result")
+        claimed = kb.claim_task(conn, child)
+        copy = kb.store_attachment_bytes(
+            conn, child, "result.md", b"# result", content_type="text/markdown",
+            uploaded_by="agent", expected_run_id=claimed.current_run_id,
+            source_attachment_id=original,
+        )
+    finally:
+        conn.close()
+
+    def listed(task_id):
+        return {a["id"]: a for a in client.get(
+            f"/api/plugins/kanban/tasks/{task_id}/attachments"
+        ).json()["attachments"]}
+
+    assert listed(parent)[original]["source_attachment_id"] is None
+    assert listed(child)[copy]["source_attachment_id"] == original

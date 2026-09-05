@@ -2058,6 +2058,7 @@ def test_artifact_round_trip_moves_real_bytes_without_model_text(host, sdk):
     with kb.connect_closing() as conn:
         stored = kb.get_attachment(conn, exported["attachment_id"])
         assert Path(stored.stored_path).read_bytes() == data
+        assert stored.content_type == "text/x-diff"
     imported = json.loads(sa.handle_artifact({
         "direction": "import", "attachment_id": exported["attachment_id"],
         "expected_sha256": digest,
