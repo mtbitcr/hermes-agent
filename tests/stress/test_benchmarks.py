@@ -53,6 +53,23 @@ def seed_tasks(conn, kb, n, assignee="bench-worker", with_parents=False):
     return ids
 
 
+def _reset_store_caches(kb) -> None:
+    """Forget every per-path store cache after HERMES_HOME is recreated.
+
+    Each benchmark rebuilds its home from scratch, which also removes the
+    board register and the removal archive. Those two stores cache "schema
+    already created" by path exactly the way board stores do, so clearing
+    only ``_INITIALIZED_PATHS`` left the register believed-initialised and
+    every subsequent Gate A read failed with ``no such table:
+    board_register``. Same reset the hermes_cli conftest performs when it
+    moves HERMES_HOME.
+    """
+    kb._INITIALIZED_PATHS.clear()
+    kb._REGISTER_INITIALIZED = False
+    kb._REGISTER_INITIALIZED_PATHS.clear()
+    kb._ARCHIVE_INITIALIZED_PATHS.clear()
+
+
 def main():
     home = tempfile.mkdtemp(prefix="hermes_bench_")
     os.environ["HERMES_HOME"] = home
@@ -71,7 +88,7 @@ def main():
         import shutil
         shutil.rmtree(home, ignore_errors=True)
         os.makedirs(home)
-        kb._INITIALIZED_PATHS.clear()
+        _reset_store_caches(kb)
         kb.init_db()
         conn = kb.connect()
         seed_tasks(conn, kb, n, assignee=None)  # no assignee → won't spawn
@@ -90,7 +107,7 @@ def main():
         print(f"\n== recompute_ready @ {n} tasks (5 parents each) ==")
         shutil.rmtree(home, ignore_errors=True)
         os.makedirs(home)
-        kb._INITIALIZED_PATHS.clear()
+        _reset_store_caches(kb)
         kb.init_db()
         conn = kb.connect()
         ids = seed_tasks(conn, kb, n, assignee=None, with_parents=True)
@@ -112,7 +129,7 @@ def main():
         print(f"\n== build_worker_context with {parent_count} parents ==")
         shutil.rmtree(home, ignore_errors=True)
         os.makedirs(home)
-        kb._INITIALIZED_PATHS.clear()
+        _reset_store_caches(kb)
         kb.init_db()
         conn = kb.connect()
         # Create parents, complete them with summaries+metadata
@@ -145,7 +162,7 @@ def main():
         print(f"\n== list_tasks @ {n} ==")
         shutil.rmtree(home, ignore_errors=True)
         os.makedirs(home)
-        kb._INITIALIZED_PATHS.clear()
+        _reset_store_caches(kb)
         kb.init_db()
         conn = kb.connect()
         seed_tasks(conn, kb, n)
@@ -164,7 +181,7 @@ def main():
         print(f"\n== board_stats @ {n} ==")
         shutil.rmtree(home, ignore_errors=True)
         os.makedirs(home)
-        kb._INITIALIZED_PATHS.clear()
+        _reset_store_caches(kb)
         kb.init_db()
         conn = kb.connect()
         seed_tasks(conn, kb, n)
@@ -183,7 +200,7 @@ def main():
         print(f"\n== list_runs for task with {n} attempts ==")
         shutil.rmtree(home, ignore_errors=True)
         os.makedirs(home)
-        kb._INITIALIZED_PATHS.clear()
+        _reset_store_caches(kb)
         kb.init_db()
         conn = kb.connect()
         tid = kb.create_task(conn, title="x", assignee="w")
@@ -212,7 +229,7 @@ def main():
 
     # Save for future diffing.
     out_path = "/tmp/kanban_bench_results.json"
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {out_path}")
 

@@ -2814,14 +2814,137 @@ def rename_board(slug: str, payload: RenameBoardBody):
     return {"board": meta}
 
 
+class BoardRemovalConfirmBody(BaseModel):
+    """A statement-bound confirmation of a permanent board removal.
+
+    Both fields come from the disclosure the route hands back on a first,
+    unconfirmed request: ``confirm`` is the exact line that was shown and
+    ``statement_digest`` is the statement it was shown for. Returning
+    them is what proves the caller displayed THIS statement — a bare
+    "yes" flag cannot, which is why there is not one.
+    """
+    confirm: Optional[str] = Field(
+        default=None,
+        description="The exact statement-bound confirmation line that was shown",
+    )
+    statement_digest: Optional[str] = Field(
+        default=None,
+        description="Digest of the permanence statement the caller displayed",
+    )
+
+
 @router.delete("/boards/{slug}")
-def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete instead of archive")):
-    """Archive (default) or hard-delete a board."""
+def delete_board(
+    slug: str,
+    delete: bool = Query(False, description="Hard-delete instead of archive"),
+    payload: Optional[BoardRemovalConfirmBody] = None,
+):
+    """Archive (default) or hard-delete a board.
+
+    Both removals go through the ONE common driver
+    (``kanban_db.remove_board_fenced``) the CLI uses, including the
+    resume of a removal an earlier request left mid-flight.
+
+    Hard delete is a two-step flow, because a permanent removal requires
+    the operator to have been SHOWN the permanence statement:
+
+    1. A request with no confirmation gets **409** carrying the
+       disclosure — the statement text, its digest, the exact line to
+       return, and this board's FROZEN PROSPECTIVE INVENTORY as
+       structured data: the repository, references and commits that will
+       survive, the transcript identities and their location, and the
+       registrations that will be removed, each by exact identity. The
+       digest binds that exact snapshot, so a confirmation cannot be
+       carried over to a board whose prospective inventory differs.
+       Nothing is removed and nothing is recorded; the caller now has
+       what it needs to display.
+    2. A request that returns that exact line (and the digest it was
+       shown for) is validated by ``kanban_db.confirm_permanent_removal``
+       — the only thing that mints a confirmation — and the validated
+       confirmation is passed into the common driver. An unbound or
+       mismatched payload is refused with the board fully intact.
+
+    Archive (reversible removal) needs no confirmation.
+    """
     try:
-        res = kanban_db.remove_board(slug, archive=not delete)
+        normed = kanban_db._normalize_board_slug(slug)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return {"result": res, "current": kanban_db.get_current_board()}
+    if not normed:
+        raise HTTPException(status_code=400, detail="board slug is required")
+
+    mode = kanban_db.RemovalMode.PERMANENT if delete else kanban_db.RemovalMode.REVERSIBLE
+
+    permanent_confirmation = None
+    if mode == kanban_db.RemovalMode.PERMANENT:
+        disclosure = kanban_db.permanent_removal_disclosure(normed)
+        offered = None if payload is None else payload.confirm
+        shown = None if payload is None else payload.statement_digest
+        if offered is None and shown is None:
+            # Step 1: hand back what has to be displayed. A dead 400 here
+            # is what made the permanent driver unreachable from this
+            # route at all.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "confirmation-required",
+                    "message": (
+                        "a permanent (hard) removal requires the operator to "
+                        "be shown this permanence statement and to return the "
+                        "exact line below in a 'confirm' field"
+                    ),
+                    "disclosure": disclosure.as_payload(),
+                },
+            )
+        checked = kanban_db.confirm_permanent_removal(
+            normed,
+            response=offered,
+            shown_digest=shown,
+            confirmed_by="dashboard-operator",
+            disclosure=disclosure,
+        )
+        if not checked.confirmed:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": checked.refusal.value,
+                    "message": checked.message,
+                    "board_intact": True,
+                    "disclosure": disclosure.as_payload(),
+                },
+            )
+        permanent_confirmation = checked.confirmation
+
+    result = kanban_db.remove_board_fenced(
+        normed,
+        mode=mode,
+        permanent_confirmation=permanent_confirmation,
+    )
+
+    if not result.success:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": result.refusal_reason or "removal-refused",
+                "message": f"removal refused: {result.message}",
+                "phase": result.phase,
+                "removal_id": result.removal_id,
+                "steps": result.steps,
+            },
+        )
+
+    return {
+        "result": {
+            "slug": result.slug,
+            "action": result.action,
+            "removal_id": result.removal_id,
+            "mode": result.mode,
+            "phase": result.phase,
+            "resumed": result.resumed,
+            "steps": result.steps,
+        },
+        "current": kanban_db.get_current_board(),
+    }
 
 
 @router.post("/boards/{slug}/switch")

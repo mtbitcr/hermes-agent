@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -87,11 +88,12 @@ import mimetypes
 import time
 import unicodedata
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import (
+    InitLockUnavailable,
     add_column_if_missing as _add_column_if_missing,
     cross_process_init_lock as _shared_cross_process_init_lock,
 )
@@ -1418,6 +1420,12013 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         import shutil
         shutil.rmtree(d)
         return {"slug": normed, "action": "deleted", "new_path": ""}
+
+
+@dataclass
+class FencedRemovalResult:
+    """Result of :func:`remove_board_fenced`.
+
+    ``steps`` is the ordered account of what the resumable loop decided
+    and did on this invocation — one entry per recovery point it passed
+    through — so a surface can report "it resumed at P9a and finished"
+    rather than just an outcome.
+    """
+    success: bool
+    message: str
+    slug: str = ""
+    mode: str = ""
+    removal_id: Optional[str] = None
+    phase: Optional[str] = None
+    action: str = ""
+    refusal_reason: Optional[str] = None
+    resumed: bool = False
+    steps: list = field(default_factory=list)
+    # Only the legacy (pre-fence) path sets this: where the archived
+    # directory went, which is the one thing that path can still tell an
+    # operator that the fenced path records durably instead.
+    new_path: str = ""
+
+
+def _drive_and_journal_init_lock(
+    slug: str, resumed: bool = False
+) -> FencedRemovalResult:
+    """Drive the removal loop; the init-lock is retained by design.
+
+    cross_process_init_lock creates ``<path>.init.lock`` as a stable
+    sibling of the register lock path.  The apply phase destroys it by
+    exact identity (journalled), but every subsequent register-lock
+    acquisition — swept, done, and even the journal write itself —
+    re-materialises it.  No post-receipt removal is possible without
+    re-creating the file, so the init-lock is explicitly RETAINED:
+    the receipt's ``init-lock-retained`` check states this, and the
+    ledger carries its disposition as retained-by-design.
+    """
+    return drive_removal(slug, resumed=resumed)
+
+
+def remove_board_fenced(
+    slug: str,
+    *,
+    mode: "RemovalMode | str" = "reversible",
+    permanent_confirmation: Optional["PermanentRemovalConfirmation"] = None,
+) -> FencedRemovalResult:
+    """Remove a board through the full eight-phase fenced removal sequence.
+
+    **The one common driver.** The CLI and the dashboard both come here;
+    neither implements a removal of its own, and neither mints its own
+    permanent confirmation — a surface displays
+    :attr:`PermanentRemovalDisclosure.statement_text`, obtains an answer,
+    and gets a confirmation from :func:`confirm_permanent_removal`, which
+    is the only thing that mints one. That is why there is exactly one
+    place where "may this board be permanently destroyed" is decided.
+
+    Rules:
+    - **The register and the removal record are consulted BEFORE any
+      filesystem existence check.** A board mid-removal whose storage is
+      already destroyed is a board being removed, not a board that does
+      not exist: reporting "does not exist" for it is what stranded a
+      permanent removal at ``applied`` with no way to finish. The
+      filesystem only decides for a board the register has never heard
+      of.
+    - A removal already in flight is RESUMED rather than restarted, from
+      whatever phase durable state records — including from inside the
+      permanent apply.
+    - A removal the fence or a phase REFUSES surfaces that refusal to the
+      caller (non-zero exit / HTTP error). It NEVER silently falls back
+      to the old unguarded path.
+    - Success is reported only after Done AND, for permanent mode, after
+      the §12 receipt is durably recorded.
+    - ``default`` still cannot be removed.
+    """
+    _assert_not_delegated_child_mutation()
+    normed = _normalize_board_slug(slug)
+    if not normed:
+        return FencedRemovalResult(False, "board slug is required")
+    if normed == DEFAULT_BOARD:
+        return FencedRemovalResult(
+            False, "the 'default' board cannot be removed", slug=normed,
+        )
+
+    mode = RemovalMode(mode)
+
+    # ── Durable authority first, filesystem last ─────────────────────────
+    # Both of these live OUTSIDE every board's storage area, so they are
+    # readable exactly when the board's own store is not.
+    entry = get_register_entry(normed)
+    record = get_removal_phase_record(normed)
+
+    in_flight = record is not None and record.phase != RemovalPhase.DONE
+    finished = (
+        record is not None
+        and record.phase == RemovalPhase.DONE
+        and entry is not None
+        and entry.lifecycle in (
+            BoardLifecycle.ARCHIVED, BoardLifecycle.HARD_REMOVED,
+        )
+    )
+
+    if finished and record.mode == mode:
+        # A completed removal of the mode the caller asked for. Driving it
+        # is a no-op UNLESS something terminal is still owed — a receipt a
+        # crash between Done and the archive write left unrecorded — in
+        # which case this is the roll-forward that finishes it.
+        return _drive_and_journal_init_lock(normed, resumed=True)
+
+    if in_flight or finished:
+        # Joining is what decides whether THIS request may drive THIS
+        # removal: the same mode joins and returns the in-flight
+        # removal_id, a different mode (or a terminal entry) is refused
+        # with a durably recorded outcome. A join needs no fresh
+        # confirmation — the operator's confirmation for this removal is
+        # already durable.
+        joined = record_removal_intent(
+            normed, mode=mode, permanent_confirmation=permanent_confirmation,
+        )
+        if not joined.success:
+            return FencedRemovalResult(
+                False, joined.message, slug=normed, mode=mode.value,
+                removal_id=record.removal_id,
+                phase=record.phase.value,
+                refusal_reason=joined.outcome.value,
+            )
+        return _drive_and_journal_init_lock(normed, resumed=True)
+
+    if entry is None:
+        # A board the register has never heard of: it predates the fence,
+        # so the filesystem IS the only authority for it and only now
+        # does its absence mean anything.
+        if not board_dir(normed).exists():
+            return FencedRemovalResult(
+                False, f"board {normed!r} does not exist", slug=normed,
+                refusal_reason="no-such-board",
+            )
+        _log.warning(
+            "remove_board_fenced: board %s has no register entry; using "
+            "legacy removal (run `hermes kanban boards backfill-fence %s` "
+            "to arm the fence first)",
+            normed, normed,
+        )
+        try:
+            result = remove_board(normed, archive=(mode == RemovalMode.REVERSIBLE))
+        except ValueError as exc:
+            return FencedRemovalResult(
+                False, str(exc), slug=normed, mode=mode.value,
+                refusal_reason="legacy-removal-refused",
+            )
+        return FencedRemovalResult(
+            True,
+            f"board {normed!r} removed via legacy path (no fence)",
+            slug=normed,
+            mode=mode.value,
+            action=result.get("action", "removed"),
+            new_path=result.get("new_path", ""),
+        )
+
+    # A fenced board, no removal in flight. Permanent mode needs an
+    # operator confirmation bound to the statement in force — and one this
+    # module minted, not one a surface asserted.
+    if mode == RemovalMode.PERMANENT:
+        if not isinstance(permanent_confirmation, PermanentRemovalConfirmation):
+            return FencedRemovalResult(
+                False,
+                "permanent removal requires an operator confirmation minted "
+                "by confirm_permanent_removal() from the exact permanence "
+                "statement the operator was shown; the calling surface may "
+                "not supply one of its own",
+                slug=normed, mode=mode.value,
+                refusal_reason="no-confirmation",
+            )
+        expected = permanence_statement(normed).digest()
+        if (
+            not permanent_confirmation.confirmed
+            or permanent_confirmation.statement_digest != expected
+        ):
+            return FencedRemovalResult(
+                False,
+                "the offered confirmation is not bound to the permanence "
+                "statement in force for this board: refusing to treat it as "
+                "a confirmation of this removal",
+                slug=normed, mode=mode.value,
+                refusal_reason="unbound-confirmation",
+            )
+
+    intent = record_removal_intent(
+        normed, mode=mode, permanent_confirmation=permanent_confirmation,
+    )
+    if not intent.success:
+        return FencedRemovalResult(
+            False,
+            f"Intent refused: {intent.message}",
+            slug=normed,
+            mode=mode.value,
+            refusal_reason=intent.outcome.value,
+        )
+    return _drive_and_journal_init_lock(normed)
+
+
+# ---------------------------------------------------------------------------
+# The one resumable loop (§9.3): decide from durable state, act, repeat
+# ---------------------------------------------------------------------------
+
+# Every phase boundary plus the intra-apply points and the terminal
+# receipt, with margin for an idempotent revalidation at each. A loop that
+# has not converged in this many steps is not making progress, and saying
+# so beats spinning.
+_REMOVAL_DRIVE_MAX_STEPS = 32
+
+
+def _drive_mode_content(slug: str, record: "RemovalPhaseRecord"):
+    """Perform §6.6's mode-specific content through that mode's own driver."""
+    if record.mode == RemovalMode.PERMANENT:
+        return apply_permanent_mode_content(slug, removal_id=record.removal_id)
+    return apply_reversible_mode_content(slug, removal_id=record.removal_id)
+
+
+def _drive_into_done(slug: str, record: "RemovalPhaseRecord"):
+    """Done, through the terminal transition's own prepare-then-apply protocol.
+
+    ``archived`` / ``hard-removed`` is a durable claim about the world.
+    For permanent mode the §12 receipt is part of that claim and lives in
+    a different database file, so :func:`complete_removal` commits the
+    EXACT receipt content first and only then records the terminal state.
+
+    There is deliberately no preflight probe here any more. A rollback
+    probe that merely proves the archive is writable is a check in one
+    transaction about a write in another: it passing did not mean the
+    insert would succeed, and the removal proceeded to record a terminal
+    lifecycle on the strength of it. The content the probe stood in for is
+    now what actually gets committed, before anything terminal happens.
+    """
+    return complete_removal(
+        slug,
+        removal_id=record.removal_id,
+        outcome="completed" if record.mode == RemovalMode.PERMANENT else "archived",
+    )
+
+
+# What each §9.3 roll-forward action is performed BY. One table, so the
+# loop has no per-phase branching of its own to get out of step with
+# :func:`resume_removal`'s decision.
+_REMOVAL_DRIVE_ACTIONS: dict = {}
+
+
+def _removal_drive_actions() -> dict:
+    """The action → driver table, built once, lazily (enums load later)."""
+    if not _REMOVAL_DRIVE_ACTIONS:
+        _REMOVAL_DRIVE_ACTIONS.update({
+            RemovalRecoveryAction.CLOSE_FENCE_AND_SETTLE: (
+                lambda slug, rec: advance_removal_to_fenced(
+                    slug, removal_id=rec.removal_id
+                )
+            ),
+            RemovalRecoveryAction.ROLL_FORWARD_INTO_QUIESCENCE: (
+                lambda slug, rec: advance_removal_to_quiesced(
+                    slug, removal_id=rec.removal_id
+                )
+            ),
+            RemovalRecoveryAction.ROLL_FORWARD_CARRY_AND_RELEASE: (
+                lambda slug, rec: advance_removal_to_carried(
+                    slug, removal_id=rec.removal_id
+                )
+            ),
+            RemovalRecoveryAction.ROLL_FORWARD_RETRY_RELEASE: (
+                lambda slug, rec: advance_removal_to_released(
+                    slug, removal_id=rec.removal_id
+                )
+            ),
+            RemovalRecoveryAction.ROLL_FORWARD_INTO_APPLIED: (
+                lambda slug, rec: advance_removal_to_applied(
+                    slug, removal_id=rec.removal_id
+                )
+            ),
+            RemovalRecoveryAction.ROLL_FORWARD_APPLY_CONTENT: _drive_mode_content,
+            RemovalRecoveryAction.ROLL_FORWARD_DEREGISTER: _drive_mode_content,
+            RemovalRecoveryAction.ROLL_FORWARD_RETENTION_RECORDS: (
+                _drive_mode_content
+            ),
+            RemovalRecoveryAction.ROLL_FORWARD_INTO_SWEEP: (
+                lambda slug, rec: advance_removal_to_swept(
+                    slug, removal_id=rec.removal_id
+                )
+            ),
+            RemovalRecoveryAction.ROLL_FORWARD_INTO_DONE: _drive_into_done,
+            RemovalRecoveryAction.ROLL_FORWARD_TERMINAL_RECEIPT: (
+                lambda slug, rec: write_terminal_removal_receipt(
+                    slug, removal_id=rec.removal_id
+                )
+            ),
+        })
+    return _REMOVAL_DRIVE_ACTIONS
+
+
+def drive_removal(
+    board: str, *, resumed: bool = False, max_steps: int = _REMOVAL_DRIVE_MAX_STEPS
+) -> FencedRemovalResult:
+    """Drive a recorded removal to Done, resuming from wherever it is.
+
+    The ONE loop, and the production caller of :func:`resume_removal`.
+    Each iteration asks durable state where the removal is and what §9.3
+    prescribes, performs exactly that, and asks again — so a fresh
+    removal and a restart after a crash at ANY point follow the identical
+    path, and the phase the loop starts from is never something the
+    caller passed in.
+
+    Nothing here decides anything: the decision is
+    :func:`resume_removal`'s and the work is each phase's own named
+    driver. Every driver is idempotent by exact recorded identity, so
+    re-driving a step that had already committed is a recorded no-op.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return FencedRemovalResult(False, "board slug is required")
+    steps: list = []
+    mode = ""
+    removal_id = None
+    for _ in range(max_steps):
+        decision = resume_removal(slug)
+        record = decision.record
+        if record is None:
+            return FencedRemovalResult(
+                False,
+                f"no removal is recorded for {slug!r}: {decision.message}",
+                slug=slug, mode=mode, removal_id=removal_id,
+                refusal_reason=decision.point.value, resumed=resumed, steps=steps,
+            )
+        mode = record.mode.value
+        removal_id = record.removal_id
+        steps.append({
+            "point": decision.point.value,
+            "action": decision.action.value,
+            "phase": record.phase.value,
+            "message": decision.message,
+        })
+        if decision.action is RemovalRecoveryAction.NO_ACTION_COMPLETE:
+            action = (
+                "deleted" if record.mode == RemovalMode.PERMANENT else "archived"
+            )
+            return FencedRemovalResult(
+                True,
+                f"board {slug!r} {action} via fenced removal",
+                slug=slug, mode=mode, removal_id=removal_id,
+                phase=record.phase.value, action=action,
+                resumed=resumed, steps=steps,
+            )
+        driver = _removal_drive_actions().get(decision.action)
+        if driver is None:
+            return FencedRemovalResult(
+                False,
+                f"no roll-forward is defined for {decision.action.value!r} at "
+                f"{decision.point.value}: {decision.message}",
+                slug=slug, mode=mode, removal_id=removal_id,
+                phase=record.phase.value,
+                refusal_reason=decision.action.value,
+                resumed=resumed, steps=steps,
+            )
+        result = driver(slug, record)
+        steps[-1]["result"] = result.message
+        if not result.success:
+            outcome = getattr(result, "outcome", None)
+            return FencedRemovalResult(
+                False,
+                f"{record.phase.value} -> {decision.action.value} refused: "
+                f"{result.message}",
+                slug=slug, mode=mode, removal_id=removal_id,
+                phase=record.phase.value,
+                refusal_reason=(
+                    outcome.value if isinstance(outcome, Enum)
+                    else decision.action.value
+                ),
+                resumed=resumed, steps=steps,
+            )
+    return FencedRemovalResult(
+        False,
+        f"the removal of {slug!r} did not reach Done in {max_steps} "
+        "roll-forward steps: it is not making progress",
+        slug=slug, mode=mode, removal_id=removal_id,
+        refusal_reason="no-progress", resumed=resumed, steps=steps,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Board Removal Fence Primitives (§3 of board-removal-safety-design)
+# ---------------------------------------------------------------------------
+#
+# This section implements the two-gate fence from the Board Removal Safety
+# Design, Revision 5. The architecture:
+#
+#   Gate A (the register, outside every board's storage):
+#     - Per-board-name register with lifecycle, epoch, epoch_before, gate_move
+#     - Ever-existed marker for resurrection guard
+#     - Lives in kanban_home(), NOT inside any board's directory
+#
+#   Gate B (the in-board gate, inside each board's store):
+#     - Gate values: open, closing, frozen
+#     - Epoch mirror co-located with the gate
+#     - The fence-closing point is the commit of gate from open→closing
+#
+# The epoch mirror exists so operations can validate without an extra round
+# trip to the register — the mirror is read inside the board's own transaction.
+
+from enum import Enum
+
+
+class BoardLifecycle(str, Enum):
+    """Register entry lifecycle states (§3.2 Gate A admission table)."""
+    LIVE = "live"
+    REMOVING = "removing"
+    ARCHIVED = "archived"
+    HARD_REMOVED = "hard-removed"
+
+
+class GateMove(str, Enum):
+    """Whether the board-store commit for the current phase is recorded (§1.1)."""
+    PENDING = "pending"
+    SETTLED = "settled"
+
+
+class InBoardGate(str, Enum):
+    """In-board gate values (§3.1 Gate B)."""
+    OPEN = "open"
+    CLOSING = "closing"
+    FROZEN = "frozen"
+
+
+class RemovalMode(str, Enum):
+    """The two board-removal modes (design revision 5, §6).
+
+    The vocabulary both later, mode-specific phases (Applied — §7.2/§7.3)
+    will specialise. Nothing mode-specific is implemented against this
+    enum yet; it exists so the recorded ``removal_mode`` column has a
+    fixed, checkable set of values.
+    """
+    PERMANENT = "permanent"
+    REVERSIBLE = "reversible"
+
+
+class RemovalPhase(str, Enum):
+    """The eight removal phases shared by both modes (design revision 5, §6).
+
+    Ordering is DATA, not definition order — see :data:`REMOVAL_PHASE_ORDER`
+    and :func:`removal_phase_ordinal`. There is no member for the
+    pre-durable **Requested** state: Requested is the absence of a phase
+    record (§6, phase table), and nothing may be reported as started
+    before Intent commits.
+    """
+    INTENT = "intent"
+    FENCED = "fenced"
+    QUIESCED = "quiesced"
+    CARRIED = "carried"
+    RELEASED = "released"
+    APPLIED = "applied"
+    SWEPT = "swept"
+    DONE = "done"
+
+
+# The removal phases, in order. This tuple — not enum member definition
+# order — is the authority for "forward" (§6: "phases only move forward").
+REMOVAL_PHASE_ORDER: "tuple[RemovalPhase, ...]" = (
+    RemovalPhase.INTENT,
+    RemovalPhase.FENCED,
+    RemovalPhase.QUIESCED,
+    RemovalPhase.CARRIED,
+    RemovalPhase.RELEASED,
+    RemovalPhase.APPLIED,
+    RemovalPhase.SWEPT,
+    RemovalPhase.DONE,
+)
+
+_REMOVAL_PHASE_ORDINALS: "dict[RemovalPhase, int]" = {
+    phase: index + 1 for index, phase in enumerate(REMOVAL_PHASE_ORDER)
+}
+
+
+def removal_phase_ordinal(phase: "RemovalPhase | str") -> int:
+    """The 1-based ordinal of *phase* in :data:`REMOVAL_PHASE_ORDER`."""
+    return _REMOVAL_PHASE_ORDINALS[RemovalPhase(phase)]
+
+
+def next_removal_phase(phase: "RemovalPhase | str") -> "Optional[RemovalPhase]":
+    """The successor of *phase*, or ``None`` when *phase* is Done."""
+    ordinal = removal_phase_ordinal(phase)
+    if ordinal >= len(REMOVAL_PHASE_ORDER):
+        return None
+    return REMOVAL_PHASE_ORDER[ordinal]
+
+
+class FenceRefusalRule(str, Enum):
+    """Machine-readable rule identifiers for fence refusals (§3.4)."""
+    GA_1 = "GA-1"  # removing admits opening (not a refusal, but for completeness)
+    GA_2 = "GA-2"  # removing refuses creation
+    GA_4 = "GA-4"  # open never creates — incomplete or absent board
+    GA_4a = "GA-4a"  # incomplete board (schema not present)
+    GA_5_FAIL = "GA-5-fail"  # backfill conditions not met
+    GA_5_REQUIRED = "GA-5-required"  # board predates the fence: backfill it first
+    GA_6a = "GA-6a"  # indeterminate: no entry, no marker, but receipt/audit exists
+    GA_6b = "GA-6b"  # archive lookup failed
+    EM_4c = "EM-4c"  # unexpected epoch pair — refuses
+    CLOSED = "closed"  # fence is explicitly closed
+    INDETERMINATE = "indeterminate"  # cannot determine fence state
+    TIMEOUT = "timeout"  # consultation exceeded bound
+
+
+class FenceOutcome(str, Enum):
+    """Outcome of a fence consultation — distinguishes closed from indeterminate (§3.4)."""
+    ADMITTED = "admitted"
+    REFUSED_CLOSED = "refused-closed"
+    REFUSED_INDETERMINATE = "refused-indeterminate"
+    REFUSED_TIMEOUT = "refused-timeout"
+
+
+@dataclass
+class FenceRefusal:
+    """Structured refusal from a fence check (§3.4).
+
+    Refusals are machine-readable so callers can branch on reason without
+    parsing strings. The rule field names the design-document rule that
+    produced the refusal.
+    """
+    outcome: FenceOutcome
+    rule: FenceRefusalRule
+    board: str
+    message: str
+    register_epoch: Optional[int] = None
+    mirror_epoch: Optional[int] = None
+
+
+@dataclass
+class RegisterEntry:
+    """A single board's entry in the board register (§1.1, §3.2).
+
+    The register lives OUTSIDE every board's storage area, alongside board
+    state keyed by board name. The epoch is authoritative; the entry also
+    carries epoch_before (the epoch before the in-flight removal's increment)
+    and gate_move (whether the board-store commit is recorded complete).
+
+    The epoch_lineage field (§EP-3b3) is the append-only list of epochs this
+    board has held — used for transcript attribution validation.
+    """
+    board_name: str
+    lifecycle: BoardLifecycle
+    epoch: int
+    epoch_before: Optional[int] = None
+    gate_move: GateMove = GateMove.SETTLED
+    ever_existed_marker: bool = False
+    removal_mode: Optional[str] = None
+    scope_declaration_version: Optional[str] = None
+    epoch_lineage: Optional[list[int]] = None
+    created_at: Optional[int] = None
+    updated_at: Optional[int] = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "RegisterEntry":
+        epoch_lineage = None
+        if row["epoch_lineage"]:
+            try:
+                parsed = json.loads(row["epoch_lineage"])
+                if isinstance(parsed, list):
+                    epoch_lineage = [int(e) for e in parsed]
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
+        return cls(
+            board_name=row["board_name"],
+            lifecycle=BoardLifecycle(row["lifecycle"]),
+            epoch=int(row["epoch"]),
+            epoch_before=int(row["epoch_before"]) if row["epoch_before"] is not None else None,
+            gate_move=GateMove(row["gate_move"]) if row["gate_move"] else GateMove.SETTLED,
+            ever_existed_marker=bool(row["ever_existed_marker"]),
+            removal_mode=row["removal_mode"],
+            scope_declaration_version=row["scope_declaration_version"],
+            epoch_lineage=epoch_lineage,
+            created_at=int(row["created_at"]) if row["created_at"] else None,
+            updated_at=int(row["updated_at"]) if row["updated_at"] else None,
+        )
+
+
+@dataclass
+class InBoardFenceState:
+    """The fence state read from inside a board's store (§3.1, §3.9).
+
+    Contains the in-board gate value and the epoch mirror. Both are read
+    together in one atomic read so they cannot be observed partially updated.
+
+    ``updated_at`` is the durable instant of the row's last write. For a
+    gate sitting at ``closing`` that instant IS the fence-closing point
+    (QB-2): the close writes it in the same commit and the idempotent
+    repeat writes nothing, so it survives a restart unchanged and a
+    recovery never has to guess the closing instant from its own clock.
+    """
+    gate: InBoardGate
+    epoch_mirror: int
+    updated_at: Optional[int] = None
+
+
+# Consultation bound for reading both gates (§3.8).
+#
+# The bound is a HARD ceiling, not a suggestion: ``MAX_...`` is the only
+# value a consultation may ever wait for. Configuration is allowed to
+# *narrow* the bound (tests want a tight one) but can never widen it — a
+# fence whose bound can be raised to an hour is not a fence, it is a hint.
+DEFAULT_FENCE_CONSULTATION_TIMEOUT_SECONDS = 5.0
+MAX_FENCE_CONSULTATION_TIMEOUT_SECONDS = 5.0
+MIN_FENCE_CONSULTATION_TIMEOUT_SECONDS = 0.001
+
+
+def clamp_fence_consultation_timeout(value: float) -> float:
+    """Clamp *value* into the non-widenable consultation band (§3.8).
+
+    Anything at or above the ceiling collapses to the ceiling; anything
+    at or below the floor collapses to the floor. Non-numeric input
+    falls back to the default.
+    """
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_FENCE_CONSULTATION_TIMEOUT_SECONDS
+    if seconds != seconds:  # NaN
+        return DEFAULT_FENCE_CONSULTATION_TIMEOUT_SECONDS
+    return max(
+        MIN_FENCE_CONSULTATION_TIMEOUT_SECONDS,
+        min(MAX_FENCE_CONSULTATION_TIMEOUT_SECONDS, seconds),
+    )
+
+
+def _fence_consultation_timeout_seconds() -> float:
+    """Return the effective fence consultation bound (§3.8).
+
+    Reads ``kanban.fence_consultation_timeout_seconds`` from config, but
+    the result is always clamped to
+    ``[MIN..MAX]_FENCE_CONSULTATION_TIMEOUT_SECONDS``. A config value of
+    3600 yields 5.0, not 3600.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = (load_config_readonly() or {}).get("kanban", {})
+        raw = cfg.get("fence_consultation_timeout_seconds")
+        if raw is not None:
+            return clamp_fence_consultation_timeout(raw)
+    except Exception:
+        pass
+    return DEFAULT_FENCE_CONSULTATION_TIMEOUT_SECONDS
+
+
+# The deadline in force for the consultation running on THIS thread, as a
+# ``time.monotonic()`` value. Register and board opens consult it so their
+# SQLite ``busy_timeout`` is sized from the REMAINING budget rather than
+# from the (two-minute) kanban default — enforcing the bound *during* the
+# blocking read instead of comparing elapsed time after it returns.
+_FENCE_DEADLINE = threading.local()
+
+
+@contextlib.contextmanager
+def _fence_deadline_scope(deadline: float):
+    """Publish *deadline* to every register/board read on this thread."""
+    previous = getattr(_FENCE_DEADLINE, "value", None)
+    previous_conns = getattr(_FENCE_DEADLINE, "conns", None)
+    _FENCE_DEADLINE.value = deadline
+    _FENCE_DEADLINE.conns = []
+    try:
+        yield
+    finally:
+        _FENCE_DEADLINE.value = previous
+        _FENCE_DEADLINE.conns = previous_conns
+
+
+def _register_deadline_connection(conn: sqlite3.Connection) -> None:
+    """Remember a connection whose lock wait this budget has narrowed.
+
+    A ``busy_timeout`` is a snapshot: set once at 5 s, it still says 5 s
+    when only 200 ms of the budget is left. Recording the connection lets
+    :func:`_renarrow_store_waits` re-size it whenever the clock resumes.
+    """
+    conns = getattr(_FENCE_DEADLINE, "conns", None)
+    if conns is None:
+        return
+    if not any(existing is conn for existing in conns):
+        conns.append(conn)
+
+
+def _resume_store_reads(conn: sqlite3.Connection) -> None:
+    """Re-size *conn*'s lock wait to what the mutation budget has LEFT.
+
+    Called at the entry of every MIXED helper, and before any read that
+    resumes after an off-store section or after a store wait somebody
+    swallowed. A ``busy_timeout`` set while the budget was full is a
+    licence to wait another whole ceiling on a budget that has nothing
+    left — which is how one 5 s ceiling turned into three.
+    """
+    _register_deadline_connection(conn)
+    _renarrow_store_waits()
+
+
+def _renarrow_store_waits() -> None:
+    """Re-size every registered lock wait to what is LEFT of the budget."""
+    if getattr(_FENCE_DEADLINE, "value", None) is None:
+        return
+    conns = getattr(_FENCE_DEADLINE, "conns", None)
+    if not conns:
+        return
+    timeout_ms = _fence_bounded_busy_timeout_ms()
+    for conn in list(conns):
+        try:
+            conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
+        except Exception:
+            pass
+
+
+@contextlib.contextmanager
+def _after_durable_commit(what: str):
+    """Best-effort bookkeeping that may NOT contradict what is on disk.
+
+    Once a mutator's transaction has committed, its effect is a fact. The
+    housekeeping that follows it — ready recomputation, workspace cleanup,
+    the read that feeds a lifecycle hook — is best effort. A refusal of
+    any kind (closed, indeterminate, timeout) may not contradict what is
+    already on disk: the caller has been told the mutation succeeded, and
+    handing back a fence refusal would be a contradiction. Any refusal is
+    logged at warning level and the tail is abandoned; the durable result
+    is returned to the caller. Non-fence, non-deadline exceptions still
+    propagate unchanged.
+    """
+    try:
+        yield
+    except BoardFenceClosedError as exc:
+        _log.warning(
+            "%s: the fence refused access during post-commit bookkeeping "
+            "(%s, %s); the mutation itself is already durable.",
+            what, exc.refusal.outcome.value, exc.refusal.message,
+        )
+    except sqlite3.Error as exc:
+        if not _is_deadline_error(exc):
+            raise
+        _log.warning(
+            "%s: the board store stayed locked during post-commit "
+            "bookkeeping (%s); the mutation itself is already durable.",
+            what, exc,
+        )
+
+
+def _fence_remaining_seconds() -> Optional[float]:
+    """Seconds left in the active consultation, or None when unbounded."""
+    deadline = getattr(_FENCE_DEADLINE, "value", None)
+    if deadline is None:
+        return None
+    now = time.monotonic()
+    return max(0.0, deadline - now)
+
+
+def _install_deadline_interrupt(conn: sqlite3.Connection, deadline: Optional[float]) -> None:
+    """Abort long-running statements on *conn* once *deadline* passes.
+
+    ``busy_timeout`` only bounds lock waiting; a genuinely slow scan is
+    bounded by this progress handler, which returns non-zero (and so
+    raises ``OperationalError: interrupted``) past the deadline.
+    """
+    if deadline is None:
+        return
+
+    def _abort_past_deadline() -> int:
+        return 1 if time.monotonic() >= deadline else 0
+
+    try:
+        conn.set_progress_handler(_abort_past_deadline, 2000)
+    except Exception:  # pragma: no cover - very old sqlite builds
+        pass
+
+
+_TIMEOUT_ERROR_MARKERS = ("locked", "busy", "interrupted")
+
+
+def _is_deadline_error(exc: BaseException) -> bool:
+    """True when *exc* is a lock wait / interrupt rather than a real fault."""
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _TIMEOUT_ERROR_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# Board Register Database (§3.6 — lives outside every board's storage)
+# ---------------------------------------------------------------------------
+
+REGISTER_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS board_register (
+    board_name              TEXT PRIMARY KEY,
+    lifecycle               TEXT NOT NULL DEFAULT 'live',
+    epoch                   INTEGER NOT NULL DEFAULT 1,
+    epoch_before            INTEGER,
+    gate_move               TEXT NOT NULL DEFAULT 'settled',
+    ever_existed_marker     INTEGER NOT NULL DEFAULT 0,
+    removal_mode            TEXT,
+    scope_declaration_version TEXT,
+    epoch_lineage           TEXT,
+    -- The durable outcome of a REFUSED removal request (§6.1). A refusal
+    -- that writes nothing is indistinguishable from a request nobody made,
+    -- so every terminal / mode-conflict / unconfirmed refusal records its
+    -- outcome here, in the same single Intent transaction. It never moves
+    -- the lifecycle or creates a phase record: a refused request has not
+    -- begun a removal and must never look as though it had.
+    removal_refusal         TEXT,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL
+);
+
+-- Receipt/audit archive lookup seam (§GA-6a/GA-6b). The actual archive
+-- is out of scope for this task; this table provides the injectable
+-- predicate interface with a safe default (no records → backfill admitted).
+CREATE TABLE IF NOT EXISTS board_removal_archive (
+    board_name              TEXT NOT NULL,
+    record_type             TEXT NOT NULL,
+    record_id               TEXT NOT NULL,
+    created_at              INTEGER NOT NULL,
+    PRIMARY KEY (board_name, record_type, record_id)
+);
+
+-- The durable phase record for the removal sequence (design revision 5,
+-- §6). Lives in the register store — OUTSIDE every board's storage — so
+-- the last reached phase survives the board's own content being
+-- destroyed. ``phase`` is the LAST REACHED phase (a ``RemovalPhase``
+-- value); there is no row at all for the pre-durable Requested state.
+-- ``mode`` is fixed at Intent and never changes for this ``removal_id``.
+-- ``quiescence_deadline`` is computed once, at the fence (QB-2), and
+-- never recomputed.
+-- Every column below ``deadline_basis`` is a DURABLE COMPLETION FACT: the
+-- thing a phase's meaning consists of, recorded in the same transaction
+-- that records the phase, and re-read by that phase's precondition so a
+-- phase can never be recorded before its meaning is true (§6, IN-4).
+CREATE TABLE IF NOT EXISTS board_removal_phase (
+    board_name              TEXT PRIMARY KEY,
+    removal_id              TEXT NOT NULL,
+    mode                    TEXT NOT NULL,
+    phase                   TEXT NOT NULL,
+    epoch                   INTEGER NOT NULL,
+    quiescence_deadline     INTEGER,
+    deadline_basis          TEXT,
+    outcome                 TEXT,
+    gate_closed_at          INTEGER,
+    quiesce_completed_at    INTEGER,
+    carry_completed_at      INTEGER,
+    release_completed_at    INTEGER,
+    sweep_completed_at      INTEGER,
+    carried_payload         TEXT,
+    release_state           TEXT,
+    sweep_state             TEXT,
+    permanent_confirmed_at  INTEGER,
+    permanent_confirmation  TEXT,
+    scope_declaration_version TEXT,
+    refusal_outcome         TEXT,
+    applied_mode_content    TEXT,
+    apply_journal           TEXT,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_register_lifecycle ON board_register(lifecycle);
+CREATE INDEX IF NOT EXISTS idx_archive_board ON board_removal_archive(board_name);
+CREATE INDEX IF NOT EXISTS idx_removal_phase_phase ON board_removal_phase(phase);
+"""
+
+
+def register_db_path() -> Path:
+    """Return the path to the board register database (§3.6).
+
+    The register lives OUTSIDE every board's storage area, in kanban_home(),
+    so board removal cannot relocate or delete it while operating on a board.
+    """
+    return kanban_home() / "kanban" / "board_register.db"
+
+
+def _fence_bounded_busy_timeout_ms() -> int:
+    """Busy timeout for a fence read: the REMAINING consultation budget.
+
+    Outside a consultation this is the ordinary kanban busy timeout. Inside
+    one, the connection may not wait longer than the consultation has left,
+    which is what makes the bound real rather than retrospective (§3.8).
+    """
+    remaining = _fence_remaining_seconds()
+    if remaining is None:
+        return _resolve_busy_timeout_ms()
+    return max(0, int(remaining * 1000))
+
+
+def _apply_fence_store_pragmas(
+    conn: sqlite3.Connection, pragmas: "tuple[str, ...]"
+) -> None:
+    """Apply a fence store's pragmas WITHOUT spending more than the budget.
+
+    Each pragma is preceded by a fresh ``busy_timeout`` sized from what is
+    LEFT of the mutation deadline, so a store held under an exclusive lock
+    cannot charge the full ceiling once per pragma — which is how a "5s"
+    bound measured 10s in practice. A pragma that cannot be applied under
+    a held lock is not fatal here: it is the CALLER'S read that the
+    deadline exists to bound, and that read refuses on its own terms.
+
+    ``journal_mode=WAL`` in particular is an optimisation, not a
+    requirement: on filesystems (and in test doubles) where it cannot be
+    enabled the register must still open, because failing to read Gate A
+    would turn every board write into a refusal for missing authority.
+    """
+    for pragma in pragmas:
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute(f"PRAGMA busy_timeout={_fence_bounded_busy_timeout_ms()}")
+            conn.execute(f"PRAGMA {pragma}")
+    with contextlib.suppress(sqlite3.Error):
+        conn.execute(f"PRAGMA busy_timeout={_fence_bounded_busy_timeout_ms()}")
+
+
+def _register_connect() -> sqlite3.Connection:
+    """Open the board register database with appropriate settings."""
+    path = register_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    busy_timeout_ms = _fence_bounded_busy_timeout_ms()
+    conn = sqlite3.connect(
+        str(path),
+        isolation_level=None,
+        timeout=busy_timeout_ms / 1000.0,
+    )
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    conn.row_factory = sqlite3.Row
+    _apply_fence_store_pragmas(conn, ("journal_mode=WAL", "synchronous=FULL", "foreign_keys=ON"))
+    _install_deadline_interrupt(conn, getattr(_FENCE_DEADLINE, "value", None))
+    return conn
+
+
+_REGISTER_INITIALIZED: bool = False
+_REGISTER_INITIALIZED_PATHS: set = set()
+_REGISTER_INIT_LOCK = threading.Lock()
+
+# Columns added to an ALREADY-EXISTING register store on next open. Keyed
+# by (table, column) so the list is the single place a new durable fact is
+# declared; ``CREATE TABLE IF NOT EXISTS`` covers only fresh stores.
+_REGISTER_ADDITIVE_COLUMNS: "tuple[tuple[str, str, str], ...]" = (
+    ("board_register", "removal_refusal", "removal_refusal TEXT"),
+    ("board_removal_phase", "gate_closed_at", "gate_closed_at INTEGER"),
+    ("board_removal_phase", "quiesce_completed_at", "quiesce_completed_at INTEGER"),
+    ("board_removal_phase", "carry_completed_at", "carry_completed_at INTEGER"),
+    ("board_removal_phase", "release_completed_at", "release_completed_at INTEGER"),
+    ("board_removal_phase", "sweep_completed_at", "sweep_completed_at INTEGER"),
+    ("board_removal_phase", "carried_payload", "carried_payload TEXT"),
+    ("board_removal_phase", "release_state", "release_state TEXT"),
+    ("board_removal_phase", "sweep_state", "sweep_state TEXT"),
+    ("board_removal_phase", "permanent_confirmed_at", "permanent_confirmed_at INTEGER"),
+    ("board_removal_phase", "permanent_confirmation", "permanent_confirmation TEXT"),
+    (
+        "board_removal_phase",
+        "scope_declaration_version",
+        "scope_declaration_version TEXT",
+    ),
+    ("board_removal_phase", "refusal_outcome", "refusal_outcome TEXT"),
+    ("board_removal_phase", "applied_mode_content", "applied_mode_content TEXT"),
+    ("board_removal_phase", "apply_journal", "apply_journal TEXT"),
+)
+
+
+def _ensure_register_initialized(conn: sqlite3.Connection) -> None:
+    """Ensure the register schema exists (idempotent).
+
+    Keyed by register-database path as well as by the legacy module flag:
+    a process that moves ``HERMES_HOME`` (every test does) otherwise saw
+    the flag already set and handed back a register with no tables.
+    """
+    global _REGISTER_INITIALIZED
+    key = str(register_db_path())
+    if _REGISTER_INITIALIZED and key in _REGISTER_INITIALIZED_PATHS:
+        return
+    with _REGISTER_INIT_LOCK:
+        if _REGISTER_INITIALIZED and key in _REGISTER_INITIALIZED_PATHS:
+            return
+        conn.executescript(REGISTER_SCHEMA_SQL)
+        # Additive: a register written before the durable completion facts
+        # existed already HAS both tables, so ``CREATE TABLE IF NOT EXISTS``
+        # alone would leave it without the columns each phase's meaning is
+        # recorded in. Same pattern as the archive's compensation column.
+        for table, column, ddl in _REGISTER_ADDITIVE_COLUMNS:
+            _add_column_if_missing(conn, table, column, ddl)
+        _REGISTER_INITIALIZED_PATHS.add(key)
+        _REGISTER_INITIALIZED = True
+
+
+@contextlib.contextmanager
+def register_connect() -> sqlite3.Connection:
+    """Open the board register database, ensuring schema exists.
+
+    Use as a context manager: the connection is closed on exit.
+    """
+    conn = _register_connect()
+    try:
+        _ensure_register_initialized(conn)
+        yield conn
+    finally:
+        conn.close()
+
+
+REGISTER_LOCK_TIMEOUT_SECONDS = 5.0
+
+# Board slugs whose register lock THIS thread holds re-entrantly. Populated
+# only by a holder that passed ``reentrant=True`` — see
+# :func:`board_register_lock` for why re-entrancy is per holder rather than
+# a property of the lock.
+_REGISTER_LOCK_REENTRANT = threading.local()
+
+
+def _reentrant_register_locks() -> set:
+    held = getattr(_REGISTER_LOCK_REENTRANT, "slugs", None)
+    if held is None:
+        held = set()
+        _REGISTER_LOCK_REENTRANT.slugs = held
+    return held
+
+
+def register_lock_path(board_name: str) -> Path:
+    """The per-board mutual-exclusion file for register transitions (§3.6).
+
+    Lives beside the register — NOT inside the board — so it is still
+    there while the board's own directory is being removed.
+    """
+    slug = _normalize_board_slug(board_name) or DEFAULT_BOARD
+    return kanban_home() / "kanban" / "register-locks" / f"{slug}.register"
+
+
+@contextlib.contextmanager
+def board_register_lock(
+    board_name: str,
+    *,
+    timeout_seconds: Optional[float] = None,
+    reentrant: bool = False,
+):
+    """Hold the per-board register-transition lock, or fail closed.
+
+    Every transition of a board's Gate A authority — creation, backfill,
+    removal intent, and the fence-closing point's revalidation — runs
+    under THIS lock for THAT board. Sharing one lock is what makes
+    "read the authority, then act on it" a single indivisible step: the
+    closing primitive can no longer read ``removing/epoch=2``, have the
+    register move to ``live/epoch=3`` behind its back, and commit a
+    Gate B mirror for an epoch that is no longer authoritative.
+
+    The acquire is bounded by the caller's remaining fence budget (or
+    :data:`REGISTER_LOCK_TIMEOUT_SECONDS`) and raises
+    :class:`InitLockUnavailable` at the deadline rather than proceeding
+    unserialized.
+
+    ``reentrant=True`` is the discipline a holder declares when the
+    sequence it is protecting itself performs register transitions — the
+    board publication holds this lock across the create admission AND the
+    ``live/epoch=1`` write, and ``transition_register_entry`` takes the
+    same lock. The flock underneath is per open-file-description, so a
+    second acquire on the SAME thread would otherwise wait for a lock
+    that thread already owns and fail closed at the deadline. Re-entrancy
+    is opt-in per holder, never global: a plain (non-re-entrant) holder
+    keeps today's semantics, where a nested acquire is a bug and refuses.
+    """
+    from hermes_cli.sqlite_util import cross_process_init_lock
+
+    slug = _normalize_board_slug(board_name) or DEFAULT_BOARD
+    held = _reentrant_register_locks()
+    if slug in held:
+        # This thread already owns the lock for *slug*, taken by a holder
+        # that declared it would transition the register from inside.
+        yield slug
+        return
+
+    if timeout_seconds is None:
+        remaining = _fence_remaining_seconds()
+        timeout_seconds = (
+            REGISTER_LOCK_TIMEOUT_SECONDS if remaining is None else remaining
+        )
+    path = register_lock_path(board_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with cross_process_init_lock(
+        path,
+        timeout_seconds=max(0.0, float(timeout_seconds)),
+        required=True,
+    ):
+        if reentrant:
+            held.add(slug)
+        try:
+            yield slug
+        finally:
+            if reentrant:
+                held.discard(slug)
+
+
+def _transition_register_entry_locked(entry: "RegisterEntry") -> None:
+    """Commit a Gate A transition with this board's register lock HELD.
+
+    Split out of :func:`transition_register_entry` so a sequence that
+    already owns the lock (the board publication) drives the same single
+    write path instead of a private one.
+    """
+    with register_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _write_register_entry(conn, entry)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+def transition_register_entry(entry: "RegisterEntry") -> None:
+    """Commit a Gate A transition for one board under its register lock.
+
+    The single write path for board authority. Callers that bypass it
+    (a test poking the table, a crashed half-write) are exactly what the
+    closing primitive's revalidation CAS exists to catch.
+    """
+    with board_register_lock(entry.board_name):
+        _transition_register_entry_locked(entry)
+
+
+def get_register_entry(
+    board_name: str,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[RegisterEntry]:
+    """Read a board's register entry, or None if absent (§3.2).
+
+    This is a read-only lookup of the register row alone.
+    """
+    normed = _normalize_board_slug(board_name)
+    if not normed:
+        return None
+
+    def _read(c: sqlite3.Connection) -> Optional[RegisterEntry]:
+        _ensure_register_initialized(c)
+        row = c.execute(
+            "SELECT * FROM board_register WHERE board_name = ?",
+            (normed,),
+        ).fetchone()
+        if row is None:
+            return None
+        return RegisterEntry.from_row(row)
+
+    if conn is not None:
+        return _read(conn)
+    with register_connect() as c:
+        return _read(c)
+
+
+def _write_register_entry(
+    conn: sqlite3.Connection,
+    entry: RegisterEntry,
+) -> None:
+    """Write or update a register entry (internal helper).
+
+    Callers must hold an appropriate transaction. This sets the ever_existed
+    marker on any write, as required by §1.3.
+    """
+    now = int(time.time())
+    lineage_json = json.dumps(entry.epoch_lineage) if entry.epoch_lineage else None
+    conn.execute(
+        """
+        INSERT INTO board_register (
+            board_name, lifecycle, epoch, epoch_before, gate_move,
+            ever_existed_marker, removal_mode, scope_declaration_version,
+            epoch_lineage, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+        ON CONFLICT(board_name) DO UPDATE SET
+            lifecycle = excluded.lifecycle,
+            epoch = excluded.epoch,
+            epoch_before = excluded.epoch_before,
+            gate_move = excluded.gate_move,
+            ever_existed_marker = 1,
+            removal_mode = excluded.removal_mode,
+            scope_declaration_version = excluded.scope_declaration_version,
+            epoch_lineage = excluded.epoch_lineage,
+            updated_at = excluded.updated_at
+        """,
+        (
+            entry.board_name,
+            entry.lifecycle.value,
+            entry.epoch,
+            entry.epoch_before,
+            entry.gate_move.value,
+            entry.removal_mode,
+            entry.scope_declaration_version,
+            lineage_json,
+            entry.created_at or now,
+            now,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Removal archive + ever-existed marker (§1.3, §GA-6 — separate loss domain)
+# ---------------------------------------------------------------------------
+#
+# These two facts must survive the loss of a board_register ROW, and ideally
+# the loss of the whole register FILE:
+#
+#   * the ever-existed marker, whose entire job is to be readable when the
+#     entry it guards is gone. Storing it as a column on ``board_register``
+#     made the state it exists to represent — "entry absent, marker set" —
+#     literally unrepresentable, because deleting the row deleted the marker.
+#   * the removal archive (receipts/audits), which a resurrection guard
+#     consults precisely when the register has nothing to say.
+#
+# So they live in their OWN database file next to the register, never in it.
+# Reads still consult the legacy in-register table as an additional source:
+# a record found there still counts, which only ever produces more refusals.
+
+# The two states of the §12 receipt under the durable prepare-then-apply
+# protocol (see :func:`prepare_permanent_removal_receipt`).
+#
+#   prepared — the EXACT, byte-final receipt content is committed in the
+#              archive, and the terminal register transition has not been
+#              recorded yet (or its completion was interrupted). Nothing
+#              about the content can still fail.
+#   applied  — the terminal register transition is recorded and this
+#              receipt accounts for it.
+RECEIPT_STATUS_PREPARED = "prepared"
+RECEIPT_STATUS_APPLIED = "applied"
+
+ARCHIVE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS board_name_marker (
+    board_name              TEXT PRIMARY KEY,
+    ever_existed            INTEGER NOT NULL DEFAULT 1,
+    created_at              INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS board_removal_archive (
+    board_name              TEXT NOT NULL,
+    record_type             TEXT NOT NULL,
+    record_id               TEXT NOT NULL,
+    created_at              INTEGER NOT NULL,
+    PRIMARY KEY (board_name, record_type, record_id)
+);
+
+-- Prepared-transaction journal for the cross-store backfill protocol
+-- (§GA-5). An unfinished intent is either re-driven or rolled back on the
+-- next attempt; it is never left to rot.
+-- ``phase`` records how far the protocol got (prepared → mirrored →
+-- registered); ``gate_b_preexisting`` records whether the board already
+-- carried a Gate B before this attempt touched it, which is what lets a
+-- failure COMPENSATE the mirror phase instead of leaving a gate table
+-- with no matching register entry.
+CREATE TABLE IF NOT EXISTS board_backfill_intent (
+    board_name              TEXT PRIMARY KEY,
+    intent_id               TEXT NOT NULL,
+    epoch                   INTEGER NOT NULL,
+    phase                   TEXT NOT NULL,
+    gate_b_preexisting      INTEGER NOT NULL DEFAULT 0,
+    created_at              INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_removal_archive_board
+    ON board_removal_archive(board_name);
+
+-- §12 permanent-removal receipts, stored with full structured content
+-- rather than just an identifier. Each receipt is the full durable record
+-- of what was destroyed, what was kept, and the verification method that
+-- produced it. A receipt whose evidence digests no longer match current
+-- state is stale, not invalid — the archive is append-only.
+-- ``status`` carries the two-step prepare/apply protocol the terminal
+-- transition runs under: the exact, byte-final receipt is committed here
+-- as ``prepared`` BEFORE the register reaches its terminal lifecycle, and
+-- flipped to ``applied`` after. The register and this archive are separate
+-- database files — separate loss-and-rebuild domains — and SQLite gives no
+-- atomic multi-database commit in WAL mode, so a durable prepare-then-apply
+-- is what stands in for the one atomic commit that is not available.
+-- ``receipt_digest`` is the digest of the exact stored bytes, so a
+-- roll-forward never has to regenerate the content to know it is the same.
+CREATE TABLE IF NOT EXISTS board_removal_receipt (
+    board_name              TEXT NOT NULL,
+    removal_id              TEXT NOT NULL,
+    mode                    TEXT NOT NULL,
+    terminal_lifecycle      TEXT NOT NULL,
+    scope_declaration       TEXT,
+    receipt_payload         TEXT NOT NULL,
+    created_at              INTEGER NOT NULL,
+    status                  TEXT NOT NULL DEFAULT 'applied',
+    receipt_digest          TEXT,
+    prepared_at             INTEGER,
+    applied_at              INTEGER,
+    PRIMARY KEY (board_name, removal_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_removal_receipt_board
+    ON board_removal_receipt(board_name);
+"""
+
+_ARCHIVE_INITIALIZED_PATHS: set = set()
+_ARCHIVE_INIT_LOCK = threading.Lock()
+
+
+def archive_db_path() -> Path:
+    """Path to the removal-archive / ever-existed-marker database.
+
+    A file of its own — a DIFFERENT loss and rebuild domain from
+    ``board_register.db``, so losing the register does not silently lose
+    the record that a board name has existed.
+    """
+    return kanban_home() / "kanban" / "board_removal_archive.db"
+
+
+def _archive_connect() -> sqlite3.Connection:
+    path = archive_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    busy_timeout_ms = _fence_bounded_busy_timeout_ms()
+    conn = sqlite3.connect(
+        str(path),
+        isolation_level=None,
+        timeout=busy_timeout_ms / 1000.0,
+    )
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    conn.row_factory = sqlite3.Row
+    _apply_fence_store_pragmas(conn, ("journal_mode=WAL", "synchronous=FULL"))
+    _install_deadline_interrupt(conn, getattr(_FENCE_DEADLINE, "value", None))
+    return conn
+
+
+def _ensure_archive_initialized(conn: sqlite3.Connection) -> None:
+    key = str(archive_db_path())
+    if key in _ARCHIVE_INITIALIZED_PATHS:
+        return
+    with _ARCHIVE_INIT_LOCK:
+        if key in _ARCHIVE_INITIALIZED_PATHS:
+            return
+        conn.executescript(ARCHIVE_SCHEMA_SQL)
+        # Additive: an archive written by the first fence release has an
+        # intent table without the compensation column.
+        _add_column_if_missing(
+            conn,
+            "board_backfill_intent",
+            "gate_b_preexisting",
+            "gate_b_preexisting INTEGER NOT NULL DEFAULT 0",
+        )
+        # Additive: an archive written before the prepare/apply receipt
+        # protocol has receipt rows with no status. Those rows were written
+        # AFTER the terminal transition, so the only honest reading of them
+        # is 'applied' — which is what the column default says.
+        for column, ddl in (
+            ("status", f"status TEXT NOT NULL DEFAULT '{RECEIPT_STATUS_APPLIED}'"),
+            ("receipt_digest", "receipt_digest TEXT"),
+            ("prepared_at", "prepared_at INTEGER"),
+            ("applied_at", "applied_at INTEGER"),
+        ):
+            _add_column_if_missing(conn, "board_removal_receipt", column, ddl)
+        _ARCHIVE_INITIALIZED_PATHS.add(key)
+
+
+@contextlib.contextmanager
+def archive_connect() -> sqlite3.Connection:
+    """Open the removal-archive database, ensuring its schema exists."""
+    conn = _archive_connect()
+    try:
+        _ensure_archive_initialized(conn)
+        yield conn
+    finally:
+        conn.close()
+
+
+def set_ever_existed_marker(board_name: str) -> bool:
+    """Durably record that *board_name* has existed (§1.3). One-way.
+
+    The marker row is never deleted by entry removal — that is the whole
+    point of it. Returns True when the marker is durable afterwards.
+    """
+    normed = _normalize_board_slug(board_name)
+    if not normed:
+        return False
+    try:
+        with archive_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO board_name_marker (board_name, ever_existed, created_at) "
+                    "VALUES (?, 1, ?) ON CONFLICT(board_name) DO UPDATE SET ever_existed = 1",
+                    (normed, int(time.time())),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return True
+    except sqlite3.Error as exc:
+        _log.debug("set_ever_existed_marker(%s) failed: %s", normed, exc)
+        return False
+
+
+def ever_existed_marker_set(
+    board_name: str,
+    *,
+    register_conn: Optional[sqlite3.Connection] = None,
+) -> Optional[bool]:
+    """Has *board_name* ever existed? None when the lookup itself failed.
+
+    Reads the independent marker store first, then the legacy
+    ``board_register.ever_existed_marker`` column. Either saying yes is
+    yes; a failure to read either is ``None`` (indeterminate → refuse).
+    """
+    normed = _normalize_board_slug(board_name)
+    if not normed:
+        return None
+
+    try:
+        with archive_connect() as conn:
+            row = conn.execute(
+                "SELECT ever_existed FROM board_name_marker WHERE board_name = ?",
+                (normed,),
+            ).fetchone()
+        if row is not None and row["ever_existed"]:
+            return True
+    except sqlite3.Error as exc:
+        _log.debug("ever_existed_marker_set(%s): marker store unreadable: %s", normed, exc)
+        return None
+
+    def _legacy(c: sqlite3.Connection) -> Optional[bool]:
+        try:
+            _ensure_register_initialized(c)
+            row = c.execute(
+                "SELECT ever_existed_marker FROM board_register WHERE board_name = ?",
+                (normed,),
+            ).fetchone()
+            return bool(row is not None and row["ever_existed_marker"])
+        except sqlite3.Error:
+            return None
+
+    try:
+        if register_conn is not None:
+            return _legacy(register_conn)
+        with register_connect() as c:
+            return _legacy(c)
+    except sqlite3.Error:
+        return None
+
+
+def record_removal_archive_entry(
+    board_name: str,
+    record_type: str,
+    record_id: str,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """Append a receipt/audit record to the independent removal archive."""
+    normed = _normalize_board_slug(board_name)
+    if not normed:
+        return False
+    now = int(time.time())
+    sql = (
+        "INSERT OR IGNORE INTO board_removal_archive "
+        "(board_name, record_type, record_id, created_at) VALUES (?, ?, ?, ?)"
+    )
+    params = (normed, record_type, record_id, now)
+    try:
+        if conn is not None:
+            conn.execute(sql, params)
+            return True
+        with archive_connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                c.execute(sql, params)
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        return True
+    except sqlite3.Error as exc:
+        _log.debug("record_removal_archive_entry(%s) failed: %s", normed, exc)
+        return False
+
+
+def has_removal_archive_record(
+    board_name: str,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[bool]:
+    """Check if any receipt or audit record exists for a board name (§GA-6a).
+
+    Returns True if records exist, False if none exist, or None if the
+    lookup failed (caller must treat None as indeterminate per §GA-6b —
+    never as "no records").
+
+    Consults the independent archive database AND the legacy in-register
+    table. A failure of either lookup is a failure of the predicate.
+    """
+    normed = _normalize_board_slug(board_name)
+    if not normed:
+        return None
+
+    try:
+        with archive_connect() as c:
+            row = c.execute(
+                "SELECT 1 FROM board_removal_archive WHERE board_name = ? LIMIT 1",
+                (normed,),
+            ).fetchone()
+        if row is not None:
+            return True
+    except sqlite3.Error:
+        return None
+
+    def _check(c: sqlite3.Connection) -> Optional[bool]:
+        try:
+            _ensure_register_initialized(c)
+            row = c.execute(
+                "SELECT 1 FROM board_removal_archive WHERE board_name = ? LIMIT 1",
+                (normed,),
+            ).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return None
+
+    try:
+        if conn is not None:
+            return _check(conn)
+        with register_connect() as c:
+            return _check(c)
+    except sqlite3.Error:
+        return None
+
+
+def _receipt_payload_json(receipt_payload: dict) -> "tuple[str, str]":
+    """The exact bytes a receipt is stored as, and their digest.
+
+    One canonical encoding, used by the prepare, by the immutability check
+    and by every digest comparison — so "byte-identical" means the same
+    thing everywhere and a roll-forward never has to guess.
+    """
+    payload_json = json.dumps(receipt_payload, ensure_ascii=False, sort_keys=True)
+    return payload_json, hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class PreparedRemovalReceipt:
+    """A §12 receipt whose exact content is already durable in the archive.
+
+    ``status`` is :data:`RECEIPT_STATUS_PREPARED` while the terminal
+    register transition has not been recorded, and
+    :data:`RECEIPT_STATUS_APPLIED` once it has. ``payload`` is the DECODED
+    content and ``payload_json`` the exact stored bytes, so a roll-forward
+    applies what was committed rather than regenerating it.
+    """
+    board_name: str
+    removal_id: str
+    status: str
+    digest: str
+    payload: dict
+    payload_json: str
+    terminal_lifecycle: str
+    scope_declaration: Optional[str]
+    prepared_at: Optional[int]
+    applied_at: Optional[int]
+
+    @property
+    def committed(self) -> bool:
+        return self.status == RECEIPT_STATUS_APPLIED
+
+
+def _read_receipt_row(
+    conn: sqlite3.Connection, normed: str, removal_id: str
+) -> "Optional[PreparedRemovalReceipt]":
+    row = conn.execute(
+        "SELECT removal_id, terminal_lifecycle, scope_declaration, "
+        "receipt_payload, status, receipt_digest, prepared_at, applied_at "
+        "FROM board_removal_receipt WHERE board_name = ? AND removal_id = ?",
+        (normed, removal_id),
+    ).fetchone()
+    if row is None:
+        return None
+    stored = row["receipt_payload"] or ""
+    digest = _row_value(row, "receipt_digest") or hashlib.sha256(
+        stored.encode("utf-8")
+    ).hexdigest()
+    return PreparedRemovalReceipt(
+        board_name=normed,
+        removal_id=removal_id,
+        status=_row_value(row, "status") or RECEIPT_STATUS_APPLIED,
+        digest=digest,
+        payload=_decode_json_object(stored) or {},
+        payload_json=stored,
+        terminal_lifecycle=row["terminal_lifecycle"],
+        scope_declaration=_row_value(row, "scope_declaration"),
+        prepared_at=_row_int(row, "prepared_at"),
+        applied_at=_row_int(row, "applied_at"),
+    )
+
+
+def get_prepared_removal_receipt(
+    board_name: str, removal_id: str
+) -> "Optional[PreparedRemovalReceipt]":
+    """The durable receipt row for this removal, whatever its status.
+
+    ``None`` means nothing is committed for this ``(board, removal_id)`` —
+    including when the archive itself could not be read, which callers must
+    treat as "not committed" and therefore as a refusal to reach the
+    terminal state, never as "already done".
+    """
+    normed = _normalize_board_slug(board_name)
+    if not normed:
+        return None
+    try:
+        with archive_connect() as conn:
+            return _read_receipt_row(conn, normed, removal_id)
+    except (sqlite3.Error, OSError) as exc:
+        _log.debug(
+            "get_prepared_removal_receipt(%s, %s) failed: %s",
+            normed, removal_id, exc,
+        )
+        return None
+
+
+def prepare_permanent_removal_receipt(
+    board_name: str,
+    removal_id: str,
+    *,
+    terminal_lifecycle: str,
+    scope_declaration: str,
+    receipt_payload: dict,
+) -> "tuple[Optional[PreparedRemovalReceipt], str]":
+    """Commit the EXACT §12 receipt content, BEFORE the terminal transition.
+
+    Step 1 of the durable prepare-then-apply protocol the terminal
+    transition runs under. The register and the removal archive are two
+    separate SQLite files — deliberately separate loss-and-rebuild domains
+    — and SQLite offers no atomic multi-database commit in WAL mode, so a
+    single transaction spanning both is not available and pretending
+    otherwise with ATTACH would claim an atomicity this does not have.
+
+    What IS available is making the part that can fail for content reasons
+    durable FIRST: the whole, byte-final receipt is written here, with its
+    digest, in state :data:`RECEIPT_STATUS_PREPARED`. Afterwards the only
+    remaining work is a register state flip and a status flip, neither of
+    which can fail because of anything about the receipt's content. A
+    roll-forward in either direction therefore never has to regenerate it.
+
+    IMMUTABLE, exactly as :func:`record_permanent_removal_receipt` is: a
+    prepare whose content is byte-identical to what is already stored is an
+    idempotent success (whatever the stored status), and one whose content
+    DIFFERS is refused rather than overwriting the archive.
+
+    Returns ``(receipt, reason)``; ``receipt`` is None when nothing durable
+    was committed and ``reason`` says why.
+    """
+    normed = _normalize_board_slug(board_name)
+    if not normed:
+        return None, "invalid board name"
+    payload_json, digest = _receipt_payload_json(receipt_payload)
+    now = int(time.time())
+    try:
+        with archive_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = _read_receipt_row(conn, normed, removal_id)
+                if existing is not None:
+                    conn.execute("ROLLBACK")
+                    if existing.digest == digest:
+                        return existing, (
+                            "the identical receipt content is already durable "
+                            f"({existing.status})"
+                        )
+                    _log.warning(
+                        "prepare_permanent_removal_receipt(%s, %s): refusing to "
+                        "replace the recorded receipt (stored digest %s) with a "
+                        "DIFFERENT one (%s) — the removal archive is immutable",
+                        normed, removal_id, existing.digest[:16], digest[:16],
+                    )
+                    return None, (
+                        "a DIFFERENT receipt is already recorded for this "
+                        "removal and the removal archive is immutable"
+                    )
+                conn.execute(
+                    "INSERT INTO board_removal_receipt "
+                    "(board_name, removal_id, mode, terminal_lifecycle, "
+                    "scope_declaration, receipt_payload, created_at, status, "
+                    "receipt_digest, prepared_at, applied_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                    (
+                        normed, removal_id, "permanent", terminal_lifecycle,
+                        scope_declaration, payload_json, now,
+                        RECEIPT_STATUS_PREPARED, digest, now,
+                    ),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            prepared = _read_receipt_row(conn, normed, removal_id)
+        if prepared is None or prepared.digest != digest:
+            return None, (
+                "the receipt content is not readable back from the archive "
+                "after the prepare, so it is not durable"
+            )
+        return prepared, "the exact receipt content is durably prepared"
+    except (sqlite3.Error, OSError) as exc:
+        _log.debug(
+            "prepare_permanent_removal_receipt(%s, %s) failed: %s",
+            normed, removal_id, exc,
+        )
+        return None, f"the removal archive cannot be written: {exc}"
+
+
+def apply_prepared_removal_receipt(
+    board_name: str, removal_id: str, *, expect_digest: Optional[str] = None
+) -> "tuple[bool, str]":
+    """Step 3: mark an already-durable prepared receipt as applied.
+
+    A pure state flip over content that is already committed — it cannot
+    fail for any reason to do with the receipt itself, which is precisely
+    why the terminal register transition is allowed to happen between the
+    prepare and this call. Idempotent: applying an applied receipt is a
+    success.
+    """
+    normed = _normalize_board_slug(board_name)
+    if not normed:
+        return False, "invalid board name"
+    now = int(time.time())
+    try:
+        with archive_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = _read_receipt_row(conn, normed, removal_id)
+                if existing is None:
+                    conn.execute("ROLLBACK")
+                    return False, (
+                        "no receipt content is prepared for this removal: "
+                        "there is nothing to apply"
+                    )
+                if expect_digest is not None and existing.digest != expect_digest:
+                    conn.execute("ROLLBACK")
+                    return False, (
+                        "the prepared receipt is not the one this transition "
+                        "committed: refusing to apply it"
+                    )
+                if existing.status == RECEIPT_STATUS_APPLIED:
+                    conn.execute("ROLLBACK")
+                    return True, "the receipt is already applied (idempotent)"
+                conn.execute(
+                    "UPDATE board_removal_receipt SET status = ?, applied_at = ? "
+                    "WHERE board_name = ? AND removal_id = ?",
+                    (RECEIPT_STATUS_APPLIED, now, normed, removal_id),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return True, "the prepared receipt is applied"
+    except (sqlite3.Error, OSError) as exc:
+        _log.debug(
+            "apply_prepared_removal_receipt(%s, %s) failed: %s",
+            normed, removal_id, exc,
+        )
+        return False, f"the removal archive cannot be written: {exc}"
+
+
+def record_permanent_removal_receipt(
+    board_name: str,
+    removal_id: str,
+    *,
+    terminal_lifecycle: str,
+    scope_declaration: str,
+    receipt_payload: dict,
+) -> bool:
+    """Durably record the §12 permanent-removal receipt, prepared and applied.
+
+    The receipt is the full structured record of what was destroyed, what
+    was retained, and the verification method that produced it. It is
+    required at the end of a SUCCESSFUL permanent removal (§12).
+
+    Required content (§12.1-§12.6):
+    - Subject identity (board name, epoch, mode, terminal lifecycle)
+    - Verification-method version and scope declaration in force
+    - Scan domain place by place
+    - What was destroyed (by category, with counts and destruction records)
+    - Retained version-control history (repositories, references, commits)
+    - Retained conversation transcripts (session identities, locations)
+    - Registration cleanup records
+    - Honesty clauses (exclusions, force-ended reservations, operator items)
+    - The scoped permanence claim
+
+    The receipt is IMMUTABLE, not merely "append-only" by intent: a
+    second write for the same ``(board_name, removal_id)`` is accepted
+    only when it is byte-identical to the one already stored (so a
+    roll-forward after a crash between Done and the receipt is
+    idempotent), and REFUSED when it differs. A receipt whose evidence
+    digests no longer match current state is stale, not invalid — the
+    archive is never rewritten over.
+
+    This is :func:`prepare_permanent_removal_receipt` followed by
+    :func:`apply_prepared_removal_receipt` — the whole protocol in one
+    call, for the caller that has nothing to do between the two.
+    """
+    prepared, _reason = prepare_permanent_removal_receipt(
+        board_name, removal_id,
+        terminal_lifecycle=terminal_lifecycle,
+        scope_declaration=scope_declaration,
+        receipt_payload=receipt_payload,
+    )
+    if prepared is None:
+        return False
+    applied, _applied_reason = apply_prepared_removal_receipt(
+        board_name, removal_id, expect_digest=prepared.digest,
+    )
+    return bool(applied)
+
+
+def get_permanent_removal_receipt(
+    board_name: str,
+    removal_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Retrieve a §12 permanent-removal receipt's CONTENT from the archive.
+
+    If ``removal_id`` is None, returns the most recent receipt for the board.
+    Returns None if no receipt exists or the lookup failed.
+
+    Returns the content whatever its protocol status, because a
+    :data:`RECEIPT_STATUS_PREPARED` receipt's content is exactly as durable
+    and exactly as immutable as an applied one's — that is the whole point
+    of preparing it. A caller deciding whether the TERMINAL CLAIM is
+    accounted for must ask :func:`permanent_removal_receipt_committed`
+    instead, which is status-aware.
+    """
+    normed = _normalize_board_slug(board_name)
+    if not normed:
+        return None
+    try:
+        with archive_connect() as conn:
+            if removal_id is not None:
+                row = conn.execute(
+                    "SELECT receipt_payload FROM board_removal_receipt "
+                    "WHERE board_name = ? AND removal_id = ?",
+                    (normed, removal_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT receipt_payload FROM board_removal_receipt "
+                    "WHERE board_name = ? ORDER BY created_at DESC LIMIT 1",
+                    (normed,),
+                ).fetchone()
+            if row is None:
+                return None
+            return _decode_json_object(row["receipt_payload"])
+    except sqlite3.Error as exc:
+        _log.debug(
+            "get_permanent_removal_receipt(%s) failed: %s", normed, exc,
+        )
+        return None
+
+
+def permanent_removal_receipt_committed(board_name: str, removal_id: str) -> bool:
+    """Is this removal's terminal §12 claim fully accounted for?
+
+    True only when the receipt row exists AND is
+    :data:`RECEIPT_STATUS_APPLIED`. A prepared-but-not-applied receipt is
+    NOT a committed terminal claim — it is the durable half of an
+    interrupted terminal transition, and the answer here is what sends the
+    roll-forward to finish it. An archive that cannot be read answers
+    False, because "not established" and "established" are not the same
+    fact and only one of them may be reported as done.
+    """
+    prepared = get_prepared_removal_receipt(board_name, removal_id)
+    return prepared is not None and prepared.committed
+
+
+# ---------------------------------------------------------------------------
+# In-Board Fence State (§3.1 Gate B, §3.9 Epoch Mirror)
+# ---------------------------------------------------------------------------
+#
+# The in-board gate and epoch mirror live inside each board's kanban.db.
+# They are stored in a dedicated table so they can be read atomically.
+
+IN_BOARD_FENCE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS board_fence_state (
+    id                      INTEGER PRIMARY KEY CHECK (id = 1),
+    gate                    TEXT NOT NULL DEFAULT 'open',
+    epoch_mirror            INTEGER NOT NULL DEFAULT 1,
+    updated_at              INTEGER NOT NULL
+);
+"""
+
+
+def _sqlite_connect_no_create(
+    path: Path,
+    *,
+    timeout_seconds: Optional[float] = None,
+) -> sqlite3.Connection:
+    """Open an EXISTING kanban SQLite file; never create one (GA-4, §3.2).
+
+    ``sqlite3.connect(str(path))`` creates a fresh zero-byte database when
+    the file is missing, so an ordinary open that merely *checked*
+    ``path.exists()`` first still recreated a deleted board in the window
+    between the check and the connect. The ``mode=rw`` URI form raises
+    ``OperationalError`` instead — there is no window, because the
+    no-creation guarantee is enforced by SQLite itself rather than by our
+    preceding stat.
+
+    ``timeout_seconds`` overrides the busy timeout, which is how a bounded
+    fence consultation stops a locked board from blocking past its deadline.
+    """
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    if timeout_seconds is None:
+        busy_timeout_ms = _fence_bounded_busy_timeout_ms()
+    else:
+        busy_timeout_ms = max(0, int(timeout_seconds * 1000))
+    uri = f"{path.resolve().as_uri()}?mode=rw"
+    conn = connect_tracked(
+        uri,
+        tracking_path=path,
+        connect_fn=sqlite3.connect,
+        uri=True,
+        isolation_level=None,
+        timeout=busy_timeout_ms / 1000.0,
+    )
+    try:
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+class FenceReadStatus(str, Enum):
+    """How a bounded fence read finished (§3.4, §3.8)."""
+    OK = "ok"
+    MISSING = "missing"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+
+
+def read_in_board_fence_state_bounded(
+    conn: sqlite3.Connection,
+) -> tuple[Optional[InBoardFenceState], "FenceReadStatus"]:
+    """Read Gate B, distinguishing a lock timeout from a real fault.
+
+    ``get_in_board_fence_state`` collapses every failure into ``None``,
+    which is why a board held under an exclusive lock was reported as
+    "indeterminate" rather than "timed out". This variant keeps the two
+    apart so the caller can return the distinct timeout outcome.
+    """
+    try:
+        row = conn.execute(
+            "SELECT gate, epoch_mirror FROM board_fence_state WHERE id = 1"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        if _is_deadline_error(exc):
+            return None, FenceReadStatus.TIMEOUT
+        return None, FenceReadStatus.ERROR
+    if row is None:
+        return None, FenceReadStatus.MISSING
+    try:
+        return InBoardFenceState(
+            gate=InBoardGate(row["gate"]),
+            epoch_mirror=int(row["epoch_mirror"]),
+        ), FenceReadStatus.OK
+    except (ValueError, TypeError):
+        return None, FenceReadStatus.ERROR
+
+
+def _ensure_in_board_fence_schema(conn: sqlite3.Connection) -> None:
+    """Ensure the in-board fence state table exists."""
+    conn.execute(IN_BOARD_FENCE_SCHEMA_SQL)
+    row = conn.execute(
+        "SELECT 1 FROM board_fence_state WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        now = int(time.time())
+        conn.execute(
+            "INSERT OR IGNORE INTO board_fence_state (id, gate, epoch_mirror, updated_at) "
+            "VALUES (1, 'open', 1, ?)",
+            (now,),
+        )
+
+
+def get_in_board_fence_state(
+    conn: sqlite3.Connection,
+) -> Optional[InBoardFenceState]:
+    """Read the in-board gate and epoch mirror atomically (§3.1, §3.9).
+
+    Returns None if the fence state cannot be read (fail-closed, §3.4).
+    """
+    try:
+        row = conn.execute(
+            "SELECT gate, epoch_mirror, updated_at FROM board_fence_state "
+            "WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return InBoardFenceState(
+            gate=InBoardGate(row["gate"]),
+            epoch_mirror=int(row["epoch_mirror"]),
+            updated_at=(
+                int(row["updated_at"]) if row["updated_at"] is not None else None
+            ),
+        )
+    except (sqlite3.Error, ValueError, TypeError):
+        return None
+
+
+def commit_gate_state(
+    conn: sqlite3.Connection,
+    new_gate: InBoardGate,
+    epoch_to_write: int,
+) -> bool:
+    """Atomically commit a new gate value with the epoch mirror (§3.3, EM-2).
+
+    The gate and epoch mirror are written in the SAME commit — this is
+    the fence-closing point when transitioning open→closing. Returns True
+    if the commit succeeded, False otherwise.
+
+    MUST be called inside a write_txn for atomicity.
+    """
+    try:
+        now = int(time.time())
+        conn.execute(
+            "UPDATE board_fence_state SET gate = ?, epoch_mirror = ?, updated_at = ? "
+            "WHERE id = 1",
+            (new_gate.value, epoch_to_write, now),
+        )
+        return True
+    except sqlite3.Error:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Epoch Pair Validation (§3.9 EM-4)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EpochPairResult:
+    """Result of validating an epoch pair against the register (§3.9 EM-4)."""
+    valid: bool
+    rule: Optional[FenceRefusalRule] = None
+    message: str = ""
+
+
+def validate_epoch_pair(
+    register_epoch: int,
+    mirror_epoch: int,
+    entry: Optional[RegisterEntry],
+) -> EpochPairResult:
+    """Validate a (register epoch, mirror epoch) pair per EM-4 (§3.9).
+
+    EM-4a — equal is normal: proceed
+    EM-4b — one expected lag: mirror == epoch_before, lifecycle == removing,
+            gate_move == pending → proceed (refuses nothing)
+    EM-4c — every other pair: refuse as indeterminate
+
+    The entry parameter provides epoch_before, lifecycle, and gate_move.
+    """
+    # EM-4a: equal is normal, matched FIRST
+    if mirror_epoch == register_epoch:
+        return EpochPairResult(valid=True, message="EM-4a: epochs equal")
+
+    # Without an entry, any difference is indeterminate
+    if entry is None:
+        return EpochPairResult(
+            valid=False,
+            rule=FenceRefusalRule.EM_4c,
+            message="EM-4c: no register entry to evaluate epoch pair",
+        )
+
+    # EM-4b: one expected lag during intent→fence window
+    if (
+        entry.epoch_before is not None
+        and mirror_epoch == entry.epoch_before
+        and entry.lifecycle == BoardLifecycle.REMOVING
+        and entry.gate_move == GateMove.PENDING
+    ):
+        return EpochPairResult(
+            valid=True,
+            message="EM-4b: expected lag during intent→fence window, refuses nothing",
+        )
+
+    # EM-4c: every other pair is indeterminate
+    reasons = []
+    if mirror_epoch > register_epoch:
+        reasons.append("mirror ahead of register")
+    elif entry.epoch_before is not None and mirror_epoch != entry.epoch_before:
+        reasons.append(f"mirror ({mirror_epoch}) matches neither epoch ({register_epoch}) nor epoch_before ({entry.epoch_before})")
+    elif entry.lifecycle != BoardLifecycle.REMOVING:
+        reasons.append(f"lag on entry that is not removing (lifecycle={entry.lifecycle.value})")
+    elif entry.gate_move == GateMove.SETTLED:
+        reasons.append("lag with gate_move=settled")
+    else:
+        reasons.append(f"unexpected epoch pair: register={register_epoch}, mirror={mirror_epoch}")
+
+    return EpochPairResult(
+        valid=False,
+        rule=FenceRefusalRule.EM_4c,
+        message=f"EM-4c: {'; '.join(reasons)}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# GA-5: One-Time Backfill (§3.2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BackfillResult:
+    """Result of a backfill operation (GA-5)."""
+    success: bool
+    message: str
+    entry: Optional[RegisterEntry] = None
+
+
+BACKFILL_EPOCH = 1
+
+
+def _abandon_backfill_intent(slug: str) -> None:
+    """Roll a prepared-but-unfinished backfill intent back to nothing."""
+    try:
+        with archive_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "DELETE FROM board_backfill_intent WHERE board_name = ?", (slug,)
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+    except sqlite3.Error as exc:  # pragma: no cover - archive already failing
+        _log.debug("cannot abandon backfill intent for %s: %s", slug, exc)
+
+
+def _finalize_backfill_intent(slug: str, intent_id: str, now: int) -> bool:
+    """Commit the archive side of a backfill: marker + receipt, intent gone."""
+    try:
+        with archive_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO board_name_marker (board_name, ever_existed, created_at) "
+                    "VALUES (?, 1, ?) ON CONFLICT(board_name) DO UPDATE SET ever_existed = 1",
+                    (slug, now),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO board_removal_archive "
+                    "(board_name, record_type, record_id, created_at) "
+                    "VALUES (?, 'backfill', ?, ?)",
+                    (slug, intent_id, now),
+                )
+                conn.execute(
+                    "DELETE FROM board_backfill_intent WHERE board_name = ?", (slug,)
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return True
+    except sqlite3.Error as exc:
+        _log.debug("cannot finalize backfill intent for %s: %s", slug, exc)
+        return False
+
+
+# Intent phases, in protocol order. ``MIRRORING`` is written BEFORE the
+# board commit, not after it: a phase recorded only once the commit has
+# returned is a phase that is missing for the entire duration of the very
+# window it exists to describe, which is how a crash between the two left
+# a durable Gate B labelled ``prepared`` and therefore treated as clean.
+BACKFILL_PHASE_PREPARED = "prepared"
+BACKFILL_PHASE_MIRRORING = "mirroring"
+BACKFILL_PHASE_MIRRORED = "mirrored"
+BACKFILL_PHASE_REGISTERED = "registered"
+
+# Phases after which a Gate B MAY exist in the board store.
+BACKFILL_PHASES_MAY_HAVE_GATE_B = frozenset(
+    {
+        BACKFILL_PHASE_MIRRORING,
+        BACKFILL_PHASE_MIRRORED,
+        BACKFILL_PHASE_REGISTERED,
+    }
+)
+
+
+def _set_backfill_intent_phase(
+    slug: str, intent_id: str, expected_phase: str, phase: str
+) -> bool:
+    """Compare-and-set ONE phase transition of ONE attempt's journal.
+
+    The blind ``UPDATE ... WHERE board_name = ?`` this replaces reported
+    success for a statement that changed NOTHING — the intent had been
+    discharged under the attempt by a concurrent recovery, or the row
+    belonged to a different attempt entirely. That is precisely the state
+    in which the journal no longer describes what this attempt is doing,
+    so it is a failure, not a success: the transition is matched on the
+    intent id AND the phase it is moving FROM, and exactly one affected
+    row is the only accepted outcome.
+    """
+    try:
+        with archive_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "UPDATE board_backfill_intent SET phase = ? "
+                    "WHERE board_name = ? AND intent_id = ? AND phase = ?",
+                    (phase, slug, intent_id, expected_phase),
+                )
+                changed = cur.rowcount
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+    except sqlite3.Error as exc:
+        _log.debug("cannot record backfill phase for %s: %s", slug, exc)
+        return False
+    if changed != 1:
+        _log.warning(
+            "backfill intent for %s: %s -> %s changed %d rows (intent %s); "
+            "the journal no longer describes this attempt",
+            slug, expected_phase, phase, changed, intent_id,
+        )
+        return False
+    return True
+
+
+def _read_backfill_intent(slug: str) -> Optional[sqlite3.Row]:
+    try:
+        with archive_connect() as conn:
+            return conn.execute(
+                "SELECT intent_id, epoch, phase, gate_b_preexisting, created_at "
+                "FROM board_backfill_intent WHERE board_name = ?",
+                (slug,),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+
+
+def _board_gate_b_present(slug: str) -> Optional[bool]:
+    """Does the board's ACTUAL store carry a Gate B right now?
+
+    ``None`` when the store cannot be inspected — indeterminate, so the
+    caller must retain its intent rather than assume the board is clean.
+    Recovery asks this instead of trusting the intent's phase label: a
+    process killed *inside* the phase write lands between two labels, and
+    the durable Gate B it may already have committed is not something a
+    label can be relied on to describe.
+    """
+    try:
+        db_path = kanban_db_path(board=slug)
+    except Exception:  # pragma: no cover - slug already normalised
+        return None
+    if not db_path.exists():
+        return False
+    try:
+        conn = _sqlite_connect_no_create(db_path)
+    except sqlite3.Error as exc:
+        _log.debug("cannot inspect Gate B for %s: %s", slug, exc)
+        return None
+    try:
+        return (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='board_fence_state' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+    except sqlite3.Error as exc:
+        _log.debug("cannot inspect Gate B for %s: %s", slug, exc)
+        return None
+    finally:
+        conn.close()
+
+
+def _close_orphan_gate_b(slug: str) -> bool:
+    """Shut a Gate B that has no register authority, without dropping it.
+
+    The compensation of last resort for a gate this attempt did NOT
+    install: the board carried one before the backfill touched it, so
+    removing the table would take the board further from where it
+    started, but leaving it OPEN with nothing to vouch for it is the
+    forbidden half-armed shape. Freezing it makes every mutation refuse
+    (fail-closed) while preserving the row for an operator.
+    """
+    try:
+        db_path = kanban_db_path(board=slug)
+    except Exception:  # pragma: no cover - slug already normalised
+        return False
+    if not db_path.exists():
+        return True
+    try:
+        conn = _sqlite_connect_no_create(db_path)
+    except sqlite3.Error as exc:
+        _log.debug("cannot close orphan Gate B for %s: %s", slug, exc)
+        return False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE board_fence_state SET gate = ?, updated_at = ? "
+                "WHERE id = 1 AND gate = ?",
+                (InBoardGate.FROZEN.value, int(time.time()), InBoardGate.OPEN.value),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as exc:
+        _log.debug("cannot close orphan Gate B for %s: %s", slug, exc)
+        return False
+    finally:
+        conn.close()
+    return True
+
+
+def _compensate_backfill_mirror(slug: str) -> bool:
+    """Undo the mirror phase — remove the Gate B THIS attempt installed.
+
+    A backfill that armed Gate B and then failed to write the register
+    entry would otherwise leave a gate table with no matching authority:
+    a board that was merely un-backfilled before is now un-backfillable
+    (its marker/entry checks still pass, but every write refuses for a
+    missing authority). Compensating restores the board to exactly the
+    state the attempt found it in, so a retry can succeed.
+
+    Returns True when the board is back to having no Gate B.
+    """
+    db_path = kanban_db_path(board=slug)
+    if not db_path.exists():
+        return True
+    try:
+        conn = _sqlite_connect_no_create(db_path)
+    except sqlite3.Error as exc:
+        _log.debug("cannot compensate Gate B for %s: %s", slug, exc)
+        return False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DROP TABLE IF EXISTS board_fence_state")
+            conn.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as exc:
+        _log.debug("cannot compensate Gate B for %s: %s", slug, exc)
+        return False
+    finally:
+        conn.close()
+    return True
+
+
+def _restore_prior_gate_b(
+    slug: str, prior_gate: Optional[str], prior_mirror: Optional[int]
+) -> bool:
+    """Put back the Gate B row this attempt found, byte for byte.
+
+    Phase 2b OVERWRITES the mirror of a gate the board already carried.
+    Compensating that by DROPPING the table would take the board further
+    from where it started than the attempt did, so the undo is the value
+    the attempt read before it wrote: the gate and epoch mirror recorded
+    at the same moment ``gate_b_preexisting`` was.
+
+    Returns False when there is nothing recorded to restore TO — the
+    caller must then retain its intent rather than pretend the board is
+    back where it was.
+    """
+    if prior_gate is None or prior_mirror is None:
+        return False
+    try:
+        db_path = kanban_db_path(board=slug)
+    except Exception:  # pragma: no cover - slug already normalised
+        return False
+    if not db_path.exists():
+        return True
+    try:
+        conn = _sqlite_connect_no_create(db_path)
+    except sqlite3.Error as exc:
+        _log.debug("cannot restore the prior Gate B for %s: %s", slug, exc)
+        return False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE board_fence_state SET gate = ?, epoch_mirror = ?, "
+                "updated_at = ? WHERE id = 1",
+                (str(prior_gate), int(prior_mirror), int(time.time())),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as exc:
+        _log.debug("cannot restore the prior Gate B for %s: %s", slug, exc)
+        return False
+    finally:
+        conn.close()
+    return True
+
+
+def _unwind_backfill(
+    slug: str,
+    gate_b_preexisting: bool,
+    reason: str,
+    *,
+    prior_gate: Optional[str] = None,
+    prior_mirror: Optional[int] = None,
+) -> BackfillResult:
+    """Roll a failed attempt all the way back, or keep the intent alive.
+
+    Nothing durable may be left half-armed: either the board's Gate B is
+    put back where the attempt found it AND the intent is discharged, or
+    the intent SURVIVES so the next attempt (or
+    :func:`recover_backfill_intent`) finishes the unwind.
+
+    ``gate_b_preexisting`` used to be treated as "not ours, walk away" —
+    but by the time an unwind runs, phase 2b has already overwritten that
+    gate's mirror with the backfill epoch. Discharging the intent there
+    left ``open/1`` with no register authority and nothing left on disk
+    that described it. So a pre-existing gate is RESTORED to the value
+    recorded before the overwrite and then FROZEN (an open gate with no
+    authority is the shape that must fail closed); if neither can be
+    proven the intent is retained instead.
+    """
+    if gate_b_preexisting:
+        if not _restore_prior_gate_b(slug, prior_gate, prior_mirror):
+            return BackfillResult(
+                False,
+                f"{reason}; the board's prior Gate B could not be restored — "
+                "intent retained for recovery",
+            )
+        if not _close_orphan_gate_b(slug):
+            return BackfillResult(
+                False,
+                f"{reason}; the board's orphan Gate B could not be frozen — "
+                "intent retained for recovery",
+            )
+        _abandon_backfill_intent(slug)
+        return BackfillResult(
+            False,
+            f"{reason}; backfill abandoned (prior Gate B restored, orphan frozen)",
+        )
+    if _compensate_backfill_mirror(slug):
+        _abandon_backfill_intent(slug)
+        return BackfillResult(
+            False, f"{reason}; backfill compensated (Gate B removed)"
+        )
+    return BackfillResult(
+        False,
+        f"{reason}; Gate B could not be compensated — intent retained for recovery",
+    )
+
+
+def _delete_register_entry(slug: str) -> bool:
+    """Undo a register entry written by a backfill that then failed."""
+    try:
+        with register_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM board_register WHERE board_name = ?", (slug,))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def recover_backfill_intent(board_name: str) -> Optional[str]:
+    """Re-drive or roll back an unfinished backfill intent (GA-5).
+
+    Called before any new backfill attempt on the same name. An intent
+    whose register entry landed is FINISHED (its archive side is
+    completed); an intent with no register entry is UNWOUND — and
+    unwinding COMPENSATES the mirror phase, dropping the Gate B the
+    interrupted attempt installed, so the board is never left carrying a
+    gate table with no matching register entry. If the compensation
+    itself fails the intent is deliberately RETAINED, so the next attempt
+    tries again rather than forgetting there is work to undo.
+
+    **The board store is inspected, not inferred.** Recovery used to
+    compensate only an intent already LABELLED ``mirrored``/``registered``
+    and to treat a ``prepared`` one as never having touched the board — so
+    a process killed at the board-commit → phase-record boundary had its
+    intent deleted and its durable Gate B left behind with no authority:
+    the forbidden half-armed board. A crash inside a phase write lands
+    between two labels by construction, so the label cannot be the
+    authority on what is durable. This asks the store.
+
+    **Serialized against the live attempt.** Recovery and an ACTIVE
+    backfill for the same name take the SAME per-board register lock the
+    rest of Gate A transitions take. Without it, recovery could observe
+    the correctly persisted ``mirroring`` phase BEFORE the board commit,
+    see no Gate B yet, delete the LIVE intent and report ``abandoned`` —
+    and the attempt would then commit its Gate B behind a journal that no
+    longer existed. When the lock cannot be taken, the board is being
+    backfilled right now: its own protocol will finish or unwind that
+    intent, so recovery reports ``retained`` and touches nothing.
+
+    Returns a description of the recovery performed, or None when there
+    was no unfinished intent.
+    """
+    slug = _normalize_board_slug(board_name)
+    if not slug:
+        return None
+    try:
+        with board_register_lock(slug, reentrant=True):
+            return _recover_backfill_intent_locked(slug)
+    except InitLockUnavailable as exc:
+        _log.debug(
+            "backfill recovery for %s deferred: the board's register lock is "
+            "held by an active attempt (%s)", slug, exc,
+        )
+        return "retained"
+
+
+def _recover_backfill_intent_locked(slug: str) -> Optional[str]:
+    """The body of :func:`recover_backfill_intent`, register lock HELD."""
+    row = _read_backfill_intent(slug)
+    if row is None:
+        return None
+
+    entry = None
+    try:
+        entry = get_register_entry(slug)
+    except sqlite3.Error:
+        return None
+
+    if entry is not None:
+        if _finalize_backfill_intent(slug, row["intent_id"], int(row["created_at"])):
+            return "finished"
+        return None
+
+    # No authority. Whatever the label says, look at the board itself.
+    gate_b_preexisting = bool(row["gate_b_preexisting"])
+    gate_b_present = _board_gate_b_present(slug)
+    if gate_b_present is None:
+        # Cannot tell whether there is a Gate B to compensate: keep the
+        # intent so the next attempt tries again.
+        return "retained"
+
+    if gate_b_present and not gate_b_preexisting:
+        # This attempt installed it; take it back out.
+        if not _compensate_backfill_mirror(slug):
+            return "retained"
+        _abandon_backfill_intent(slug)
+        return "compensated"
+
+    if gate_b_present and gate_b_preexisting:
+        # Not ours to remove — but an OPEN gate with no authority is the
+        # half-armed shape, so close it rather than walking away from it.
+        if not _close_orphan_gate_b(slug):
+            return "retained"
+        _abandon_backfill_intent(slug)
+        return "closed"
+
+    _abandon_backfill_intent(slug)
+    return "abandoned"
+
+
+def backfill_register_entry(
+    board_name: str,
+) -> BackfillResult:
+    """Perform a one-time backfill of a register entry (GA-5).
+
+    Backfill is admitted only when ALL FIVE conditions hold:
+    1. It is a named operation an ordinary path cannot invoke
+    2. It is recorded as a backfill with its time and subject
+    3. The ever-existed marker for that name is unset
+    4. The board's storage is complete (GA-4a)
+    5. The removal archive holds no receipt or audit record (GA-6a)
+
+    Durability is a PREPARED cross-store protocol, not "commit A then try
+    B". The three durable facts — the register entry, the archive receipt
+    (with the ever-existed marker) and the in-board epoch mirror — either
+    all land or none do:
+
+        prepare   → an intent row in the archive store (recoverable, and
+                    not yet a fact anyone reads as "this board is live")
+        mirroring → the intent is advanced BEFORE the board commit, so
+                    the window in which a Gate B may exist is described
+                    by the journal for its whole duration
+        mirror    → the in-board epoch mirror; failing here abandons the
+                    intent and leaves NOTHING durable
+        entry     → the register entry; failing here abandons the intent
+        finalize  → marker + receipt written, intent deleted
+
+    Every phase write's result is acted on: a phase that cannot be
+    recorded either unwinds the attempt or retains the intent, never
+    "carry on and hope". A crash between phases is repaired by
+    :func:`recover_backfill_intent` on the next attempt: entry present →
+    finish, entry absent → inspect the board store and compensate.
+
+    The whole protocol runs under the board's EXISTING per-board register
+    lock — the same one every other Gate A transition takes — so a
+    concurrent :func:`recover_backfill_intent` cannot discharge this
+    attempt's intent from underneath it while the board commit is still
+    in flight. The lock is taken re-entrantly because phase 3 performs a
+    register transition from inside.
+    """
+    slug = _normalize_board_slug(board_name)
+    if not slug:
+        return BackfillResult(False, "invalid board name")
+    try:
+        with board_register_lock(slug, reentrant=True):
+            return _backfill_register_entry_locked(slug)
+    except InitLockUnavailable as exc:
+        return BackfillResult(
+            False,
+            f"GA-5: cannot serialize the backfill against recovery for "
+            f"{slug!r}: {exc}",
+        )
+
+
+def _backfill_register_entry_locked(slug: str) -> BackfillResult:
+    """The GA-5 protocol, with this board's register lock already HELD."""
+    # Bring any earlier interrupted attempt to rest before judging this one.
+    recover_backfill_intent(slug)
+
+    db_path = kanban_db_path(board=slug)
+
+    # Check storage exists
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        return BackfillResult(False, "GA-5: storage does not exist or is empty")
+
+    # Check storage is complete (GA-4a)
+    try:
+        test_conn = _sqlite_connect_no_create(db_path)
+        try:
+            if not _schema_is_present(test_conn):
+                return BackfillResult(False, "GA-5: storage incomplete (GA-4a)")
+        finally:
+            test_conn.close()
+    except sqlite3.Error:
+        return BackfillResult(False, "GA-5: cannot open storage to verify completeness")
+
+    with register_connect() as reg_conn:
+        # Check admission directly against the register + marker + archive:
+        # an existing LIVE/REMOVING entry admits (the board is already
+        # fenced or mid-removal); ARCHIVED/HARD_REMOVED refuses outright;
+        # an absent entry falls through to the marker/archive resurrection
+        # checks below.
+        _ensure_register_initialized(reg_conn)
+        entry = get_register_entry(slug, conn=reg_conn)
+        if entry is not None:
+            if entry.lifecycle in (BoardLifecycle.ARCHIVED, BoardLifecycle.HARD_REMOVED):
+                return BackfillResult(
+                    False,
+                    f"GA-5: lifecycle={entry.lifecycle.value} refuses all actions",
+                )
+        else:
+            marker_set = ever_existed_marker_set(slug, register_conn=reg_conn)
+            if marker_set is None:
+                return BackfillResult(
+                    False,
+                    "GA-5: ever-existed marker unreadable: refusing as indeterminate",
+                )
+            archive_exists = has_removal_archive_record(slug, conn=reg_conn)
+            if archive_exists is None:
+                return BackfillResult(
+                    False,
+                    "GA-5: GA-6b: archive lookup failed, refusing as indeterminate",
+                )
+            if marker_set:
+                return BackfillResult(
+                    False,
+                    "GA-5: absent entry with ever-existed marker set: "
+                    "indeterminate, operator-repair only",
+                )
+            if archive_exists is True:
+                return BackfillResult(
+                    False,
+                    "GA-5: GA-6a: absent entry, archive record exists: indeterminate",
+                )
+
+        # Check ever-existed marker is unset, in the store that outlives
+        # the entry row as well as in the legacy column.
+        marker = ever_existed_marker_set(slug, register_conn=reg_conn)
+        if marker is None:
+            return BackfillResult(
+                False,
+                "GA-5: ever-existed marker unreadable, refusing backfill",
+            )
+        if marker:
+            return BackfillResult(
+                False,
+                "GA-5: ever-existed marker is set, backfill not permitted",
+            )
+
+        # Check no archive records exist (GA-6a)
+        archive_exists = has_removal_archive_record(slug, conn=reg_conn)
+        if archive_exists is True:
+            return BackfillResult(
+                False,
+                "GA-6a: archive record exists, backfill not permitted",
+            )
+        if archive_exists is None:
+            return BackfillResult(
+                False,
+                "GA-6b: archive lookup failed, refusing backfill",
+            )
+
+    now = int(time.time())
+    intent_id = f"backfill-{now}-{secrets.token_hex(4)}"
+    entry = RegisterEntry(
+        board_name=slug,
+        lifecycle=BoardLifecycle.LIVE,
+        epoch=BACKFILL_EPOCH,
+        epoch_lineage=[BACKFILL_EPOCH],
+        created_at=now,
+        updated_at=now,
+    )
+
+    # Did this board already carry a Gate B before we touched it? Recorded
+    # in the intent so a failure knows whether the mirror phase is ours to
+    # compensate or somebody else's state to put back — and, in the same
+    # read, WHAT to put it back to. Phase 2b overwrites that row, so the
+    # value it held beforehand is the only thing an unwind can restore.
+    prior_gate: Optional[str] = None
+    prior_mirror: Optional[int] = None
+    try:
+        probe_conn = _sqlite_connect_no_create(db_path)
+        try:
+            gate_b_preexisting = (
+                probe_conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='board_fence_state' LIMIT 1"
+                ).fetchone()
+                is not None
+            )
+            if gate_b_preexisting:
+                prior = probe_conn.execute(
+                    "SELECT gate, epoch_mirror FROM board_fence_state "
+                    "WHERE id = 1"
+                ).fetchone()
+                if prior is not None:
+                    prior_gate = str(prior["gate"])
+                    prior_mirror = int(prior["epoch_mirror"])
+        finally:
+            probe_conn.close()
+    except sqlite3.Error as e:
+        return BackfillResult(False, f"GA-5: cannot inspect board Gate B: {e}")
+
+    # Phase 1 — PREPARE. Nothing anybody reads as authority yet.
+    try:
+        with archive_connect() as arch_conn:
+            arch_conn.execute("BEGIN IMMEDIATE")
+            try:
+                arch_conn.execute(
+                    "INSERT INTO board_backfill_intent "
+                    "(board_name, intent_id, epoch, phase, gate_b_preexisting, "
+                    "created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        slug,
+                        intent_id,
+                        BACKFILL_EPOCH,
+                        BACKFILL_PHASE_PREPARED,
+                        1 if gate_b_preexisting else 0,
+                        now,
+                    ),
+                )
+                arch_conn.execute("COMMIT")
+            except Exception:
+                arch_conn.execute("ROLLBACK")
+                raise
+    except sqlite3.Error as e:
+        return BackfillResult(False, f"GA-5: cannot prepare backfill intent: {e}")
+
+    # Phase 2a — declare the intent to touch Gate B BEFORE touching it.
+    # A phase recorded only after the board commit returns is missing for
+    # the whole duration of the window it describes: a process killed in
+    # between left a durable Gate B behind an intent still labelled
+    # ``prepared``, which recovery then deleted as if the board had never
+    # been touched. Recording ``mirroring`` first costs one archive write
+    # and makes the crash window self-describing. Nothing durable exists
+    # on the board yet, so a failure here simply unwinds.
+    if not _set_backfill_intent_phase(
+        slug, intent_id, BACKFILL_PHASE_PREPARED, BACKFILL_PHASE_MIRRORING
+    ):
+        return _unwind_backfill(
+            slug,
+            gate_b_preexisting,
+            "GA-5: cannot record the mirroring phase; refusing to touch Gate B "
+            "with no durable record that it may exist",
+            prior_gate=prior_gate,
+            prior_mirror=prior_mirror,
+        )
+
+    # Phase 2b — the in-board epoch mirror. This is the phase most likely
+    # to fail (another host may hold the board), so it runs BEFORE any
+    # durable register fact exists.
+    try:
+        board_conn = _sqlite_connect_no_create(db_path)
+        try:
+            board_conn.execute("BEGIN IMMEDIATE")
+            try:
+                _ensure_in_board_fence_schema(board_conn)
+                board_conn.execute(
+                    "UPDATE board_fence_state SET epoch_mirror = ?, updated_at = ? "
+                    "WHERE id = 1",
+                    (BACKFILL_EPOCH, now),
+                )
+                board_conn.execute("COMMIT")
+            except Exception:
+                board_conn.execute("ROLLBACK")
+                raise
+        finally:
+            board_conn.close()
+    except sqlite3.Error as e:
+        return _unwind_backfill(
+            slug, gate_b_preexisting, f"GA-5: epoch mirror write failed: {e}",
+            prior_gate=prior_gate, prior_mirror=prior_mirror,
+        )
+
+    # The mirror is durable now — record that. A phase write is never a
+    # fire-and-forget: if it fails, the attempt UNWINDS rather than
+    # carrying on with a journal that no longer describes the board.
+    if not _set_backfill_intent_phase(
+        slug, intent_id, BACKFILL_PHASE_MIRRORING, BACKFILL_PHASE_MIRRORED
+    ):
+        return _unwind_backfill(
+            slug, gate_b_preexisting, "GA-5: cannot record the mirrored phase",
+            prior_gate=prior_gate, prior_mirror=prior_mirror,
+        )
+
+    # Phase 3 — the register entry, under the per-board register lock every
+    # other Gate A transition takes.
+    try:
+        transition_register_entry(entry)
+    except (sqlite3.Error, InitLockUnavailable) as e:
+        return _unwind_backfill(
+            slug, gate_b_preexisting, f"GA-5: register write failed: {e}",
+            prior_gate=prior_gate, prior_mirror=prior_mirror,
+        )
+    except Exception as e:
+        return _unwind_backfill(
+            slug, gate_b_preexisting, f"GA-5: register write failed: {e}",
+            prior_gate=prior_gate, prior_mirror=prior_mirror,
+        )
+
+    if not _set_backfill_intent_phase(
+        slug, intent_id, BACKFILL_PHASE_MIRRORED, BACKFILL_PHASE_REGISTERED
+    ):
+        # The authority is durable but the journal cannot be advanced, so
+        # the archive side (marker + receipt) cannot be trusted to land
+        # either. RETAIN the intent: recovery sees the entry present and
+        # finishes the attempt instead of forgetting it.
+        return BackfillResult(
+            False,
+            "GA-5: cannot record the registered phase; intent retained for "
+            "recovery",
+        )
+
+    # Phase 4 — FINALIZE: marker + receipt land, intent is discharged.
+    if not _finalize_backfill_intent(slug, intent_id, now):
+        # The register entry is durable but the archive side is not. Undo
+        # the entry AND the mirror so the attempt as a whole leaves
+        # nothing; if that undo also fails, the intent row survives and the
+        # next attempt (or recover_backfill_intent) finishes the job.
+        if _delete_register_entry(slug):
+            return _unwind_backfill(
+                slug, gate_b_preexisting, "GA-5: archive finalize failed",
+                prior_gate=prior_gate, prior_mirror=prior_mirror,
+            )
+        return BackfillResult(
+            False,
+            "GA-5: archive finalize failed; intent retained for recovery",
+        )
+
+    return BackfillResult(
+        True,
+        "GA-5: backfill complete",
+        entry=entry,
+    )
+
+
+def backfill_all_boards() -> "list[tuple[str, BackfillResult]]":
+    """Run the GA-5 backfill for every board on disk, in listing order.
+
+    The release-time operator action: a board already carrying a register
+    entry is reported as already-fenced rather than touched.
+    """
+    results: list[tuple[str, BackfillResult]] = []
+    for meta in list_boards(include_archived=False):
+        slug = meta.get("slug")
+        if not slug:
+            continue
+        entry = None
+        try:
+            entry = get_register_entry(slug)
+        except sqlite3.Error:
+            pass
+        if entry is not None:
+            results.append(
+                (slug, BackfillResult(True, "already fenced", entry=entry))
+            )
+            continue
+        results.append((slug, backfill_register_entry(slug)))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Fence-Closing Point (§3.3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FenceCloseResult:
+    """Result of committing the fence-closing point.
+
+    ``transitioned`` distinguishes the caller that actually performed the
+    open→closing commit from the callers that found the fence already
+    closed at the authoritative epoch and wrote nothing. Both are
+    ``success=True`` (closing is idempotent), but exactly one racer can
+    ever have ``transitioned=True``.
+    """
+    success: bool
+    message: str
+    new_epoch: Optional[int] = None
+    transitioned: bool = False
+
+
+def expected_mirror_before_close(entry: RegisterEntry) -> int:
+    """The mirror value a still-open board must be holding (§3.9 EM-4).
+
+    During the intent→fence window the register has already advanced to
+    the new epoch while the mirror still holds ``epoch_before`` — that
+    lag is EM-4b and is expected. Outside the window the two agree.
+    """
+    if (
+        entry.lifecycle == BoardLifecycle.REMOVING
+        and entry.gate_move == GateMove.PENDING
+        and entry.epoch_before is not None
+    ):
+        return int(entry.epoch_before)
+    return int(entry.epoch)
+
+
+def _register_row_identity(row) -> tuple:
+    """The Gate A facts a fence close is authorised against."""
+    return (
+        str(row["lifecycle"]),
+        int(row["epoch"]),
+        -1 if row["epoch_before"] is None else int(row["epoch_before"]),
+        str(row["gate_move"] or GateMove.SETTLED.value),
+    )
+
+
+def _entry_identity(entry: RegisterEntry) -> tuple:
+    return (
+        entry.lifecycle.value,
+        int(entry.epoch),
+        -1 if entry.epoch_before is None else int(entry.epoch_before),
+        entry.gate_move.value,
+    )
+
+
+def commit_fence_closing_point(
+    board: str,
+    *,
+    new_epoch: Optional[int] = None,
+) -> FenceCloseResult:
+    """Commit the fence-closing point: gate open→closing with epoch mirror (§3.3).
+
+    This is the single atomic commit that closes the fence. The in-board gate
+    moves from 'open' to 'closing' with the epoch mirror written in the same
+    commit (EM-2).
+
+    The epoch written is DERIVED from the register, never taken from the
+    caller. ``new_epoch`` is accepted only as an assertion of what the
+    caller believes the authority to be: if it disagrees with the register
+    the call is refused rather than obeyed.
+
+    **The authority is revalidated, not merely read.** The whole primitive
+    runs under :func:`board_register_lock` — the SAME per-board lock every
+    Gate A transition takes — and, inside a register write transaction held
+    open across the Gate B commit, it compare-and-sets the register row
+    against the identity it read. Reading ``removing/epoch=2``, having the
+    register move to ``live/epoch=3`` in the window, and then committing
+    ``gate=closing, mirror=2`` anyway is exactly the failure this closes:
+    the CAS matches no row and BOTH stores roll back.
+
+    The open→closing move is itself a compare-and-set against the EXPECTED
+    mirror value, so a mirror that has drifted refuses instead of being
+    overwritten. When the gate is already closing the call is idempotent
+    only if the stored mirror already equals the authoritative epoch — and
+    in that case it performs NO write at all.
+
+    This function is called by the removal sequence at Phase 2 (Fenced).
+    It should be called AFTER the register intent commit (Phase 1).
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return FenceCloseResult(False, "invalid board name")
+
+    try:
+        lock_scope = board_register_lock(slug)
+    except Exception as e:  # pragma: no cover - lock path construction
+        return FenceCloseResult(False, f"cannot take the register lock: {e}")
+
+    try:
+        with lock_scope:
+            return _commit_fence_closing_point_locked(slug, new_epoch=new_epoch)
+    except InitLockUnavailable as e:
+        return FenceCloseResult(
+            False, f"register lock for {slug!r} is busy, refusing to close: {e}"
+        )
+
+
+def _commit_fence_closing_point_locked(
+    slug: str,
+    *,
+    new_epoch: Optional[int] = None,
+) -> FenceCloseResult:
+    """The fence-closing point, with the per-board register lock held."""
+    # Derive the authority. No entry, no close.
+    try:
+        entry = get_register_entry(slug)
+    except sqlite3.Error as e:
+        return FenceCloseResult(False, f"cannot read register authority: {e}")
+    if entry is None:
+        return FenceCloseResult(
+            False, "no register entry: refusing to close a fence with no authority"
+        )
+    if entry.lifecycle == BoardLifecycle.HARD_REMOVED:
+        return FenceCloseResult(
+            False, f"register lifecycle is {entry.lifecycle.value}: nothing to close"
+        )
+
+    authoritative_epoch = int(entry.epoch)
+    if new_epoch is not None and int(new_epoch) != authoritative_epoch:
+        return FenceCloseResult(
+            False,
+            f"caller epoch {int(new_epoch)} disagrees with register authority "
+            f"{authoritative_epoch}: refusing",
+        )
+    expected_mirror = expected_mirror_before_close(entry)
+
+    db_path = kanban_db_path(board=slug)
+    if not db_path.exists():
+        return FenceCloseResult(False, "board storage does not exist")
+
+    try:
+        reg_ctx = register_connect()
+        reg_conn = reg_ctx.__enter__()
+    except sqlite3.Error as e:
+        return FenceCloseResult(False, f"cannot open register: {e}")
+
+    try:
+        try:
+            reg_conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as e:
+            return FenceCloseResult(False, f"cannot begin register transaction: {e}")
+
+        # ---- REVALIDATE + CAS the authority, before Gate B is touched ----
+        try:
+            row = reg_conn.execute(
+                "SELECT lifecycle, epoch, epoch_before, gate_move "
+                "FROM board_register WHERE board_name = ?",
+                (slug,),
+            ).fetchone()
+        except sqlite3.Error as e:
+            reg_conn.execute("ROLLBACK")
+            return FenceCloseResult(False, f"cannot revalidate register authority: {e}")
+        if row is None:
+            reg_conn.execute("ROLLBACK")
+            return FenceCloseResult(
+                False,
+                "register entry disappeared while closing: refusing to close a "
+                "fence with no authority",
+            )
+        current_identity = _register_row_identity(row)
+        read_identity = _entry_identity(entry)
+        if current_identity != read_identity:
+            reg_conn.execute("ROLLBACK")
+            return FenceCloseResult(
+                False,
+                "register authority changed while closing "
+                f"(read {read_identity}, now {current_identity}): refusing to "
+                "commit a stale epoch",
+            )
+
+        now = int(time.time())
+        cas = reg_conn.execute(
+            "UPDATE board_register SET updated_at = ? "
+            "WHERE board_name = ? AND lifecycle = ? AND epoch = ? "
+            "AND IFNULL(epoch_before, -1) = ? AND gate_move = ?",
+            (
+                now,
+                slug,
+                read_identity[0],
+                read_identity[1],
+                read_identity[2],
+                read_identity[3],
+            ),
+        )
+        if cas.rowcount != 1:
+            reg_conn.execute("ROLLBACK")
+            return FenceCloseResult(
+                False,
+                "register authority CAS failed: refusing to commit a stale epoch",
+            )
+
+        # ---- Gate B, under the still-open register transaction ----------
+        try:
+            conn = _sqlite_connect_no_create(db_path)
+        except sqlite3.Error as e:
+            reg_conn.execute("ROLLBACK")
+            return FenceCloseResult(False, f"cannot open board store: {e}")
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _ensure_in_board_fence_schema(conn)
+
+                row = conn.execute(
+                    "SELECT gate, epoch_mirror FROM board_fence_state WHERE id = 1"
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    reg_conn.execute("ROLLBACK")
+                    return FenceCloseResult(False, "fence state row missing")
+
+                current_gate = InBoardGate(row["gate"])
+                current_mirror = int(row["epoch_mirror"])
+
+                if current_gate == InBoardGate.OPEN:
+                    conn.execute(
+                        "UPDATE board_fence_state SET gate = ?, epoch_mirror = ?, "
+                        "updated_at = ? WHERE id = 1 AND gate = ? AND epoch_mirror = ?",
+                        (
+                            InBoardGate.CLOSING.value,
+                            authoritative_epoch,
+                            now,
+                            InBoardGate.OPEN.value,
+                            expected_mirror,
+                        ),
+                    )
+                    if conn.execute("SELECT changes()").fetchone()[0] == 0:
+                        conn.execute("ROLLBACK")
+                        reg_conn.execute("ROLLBACK")
+                        return FenceCloseResult(
+                            False,
+                            f"fence-closing CAS failed: expected gate=open and "
+                            f"mirror={expected_mirror}, found gate={current_gate.value} "
+                            f"and mirror={current_mirror}",
+                        )
+                    conn.execute("COMMIT")
+                    reg_conn.execute("COMMIT")
+                    return FenceCloseResult(
+                        True,
+                        "fence-closing point committed",
+                        new_epoch=authoritative_epoch,
+                        transitioned=True,
+                    )
+
+                if current_gate == InBoardGate.CLOSING:
+                    # Idempotent ONLY when the stored mirror already equals the
+                    # authority — and then without writing anything.
+                    conn.execute("ROLLBACK")
+                    reg_conn.execute("ROLLBACK")
+                    if current_mirror == authoritative_epoch:
+                        return FenceCloseResult(
+                            True,
+                            "fence already closed at the authoritative epoch (no write)",
+                            new_epoch=authoritative_epoch,
+                            transitioned=False,
+                        )
+                    return FenceCloseResult(
+                        False,
+                        f"gate is closing but mirror {current_mirror} does not match "
+                        f"authority {authoritative_epoch}: refusing to rewrite it",
+                    )
+
+                # Gate is frozen — cannot close further
+                conn.execute("ROLLBACK")
+                reg_conn.execute("ROLLBACK")
+                return FenceCloseResult(False, f"gate is {current_gate.value}, cannot close")
+            except Exception as e:
+                for c in (conn, reg_conn):
+                    try:
+                        c.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                return FenceCloseResult(False, f"fence-closing commit failed: {e}")
+        finally:
+            conn.close()
+    finally:
+        try:
+            reg_conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        reg_ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Board Removal Phases (design revision 5, §6 — the eight phases shared by
+# both removal modes, built on top of the two-gate fence above)
+# ---------------------------------------------------------------------------
+#
+# The durable phase record (``board_removal_phase``) lives in the register
+# store, next to Gate A, so it survives the loss of the board's own
+# storage — the same reasoning that puts the ever-existed marker and the
+# removal archive outside every board (§1.3). It follows the GA-5 backfill
+# journal's shape: one row per board, a ``removal_id`` identifying ONE
+# removal run, and a compare-and-set primitive
+# (:func:`_advance_removal_phase`) that is the ONLY way the ``phase``
+# column ever changes.
+#
+# **A phase is never recorded before its meaning is true.** Each phase's
+# advance (a) performs that phase's work, (b) records the durable fact that
+# the work completed, and (c) advances — with (b) and (c) in ONE
+# transaction (IN-4). The phase's entry in
+# :data:`_REMOVAL_PHASE_PRECONDITIONS` then re-reads that durable fact,
+# inside the same transaction, and refuses the transition when it is not
+# true. The public entry point is therefore *guarded*: no caller can record
+# a phase whose meaning has not happened, and no read that FAILED is ever
+# treated as a satisfied predicate.
+#
+# Applied's mode-specific CONTENT is no longer all outstanding: §7.2's
+# permanent content — destroying the board's storage and deregistering its
+# registrations — now ships as :func:`apply_permanent_mode_content`, which
+# records itself through the checked seam below. §7.3's reversible content
+# (completing and verifying the retained copy, then removing the live one)
+# is still later work. Everything §6 makes common to both modes is built
+# here.
+
+
+class DurableReadStatus(str, Enum):
+    """Three-valued result of reading durable state a predicate needs.
+
+    A predicate may only be satisfied by a POSITIVELY READ answer. A store
+    that is missing, unreadable, or whose query failed is
+    :attr:`INDETERMINATE` — never a zero, never an empty list, never an
+    absence. That distinction is the whole of the fail-closed rule: an
+    error mapped to a safe-looking zero is how a removal commits over live
+    work.
+    """
+    OK = "ok"
+    INDETERMINATE = "indeterminate"
+
+
+# The durable place a multi-step task removal would record its window
+# (TQ-1/TQ-2). This codebase's ``delete_task`` is a single atomic
+# transition, so no such protocol exists yet and the table is absent from
+# every board store — but the count is READ from the store rather than
+# assumed, so an unreadable store is indeterminate (and refuses) instead
+# of silently reading as "zero task removals in window".
+TASK_REMOVAL_WINDOW_TABLE = "task_removal_window"
+
+
+@dataclass
+class QuiescencePredicateReading:
+    """TQ-2's predicate as it was actually read from durable state (§6.3).
+
+    ``held_rows`` are the reservations Held at the moment of the read;
+    ``task_removals_in_window`` is read from
+    :data:`TASK_REMOVAL_WINDOW_TABLE`. Both are ``None``/empty unless
+    ``status`` is OK — an indeterminate reading exposes no counts at all,
+    so a caller cannot accidentally treat one as zero.
+    """
+    status: DurableReadStatus
+    reason: str
+    held_rows: "tuple" = ()
+    task_removals_in_window: Optional[int] = None
+
+    @property
+    def held(self) -> Optional[int]:
+        if self.status is not DurableReadStatus.OK:
+            return None
+        return len(self.held_rows)
+
+    def satisfied(self) -> bool:
+        """True only on a positively read zero/zero (TQ-2)."""
+        return (
+            self.status is DurableReadStatus.OK
+            and self.held == 0
+            and self.task_removals_in_window == 0
+        )
+
+
+@dataclass
+class GateInstantReading:
+    """The in-board gate as durable state, with its own write instant.
+
+    ``updated_at`` for a gate at ``closing`` is the fence-closing point
+    (QB-2). Reading it — rather than the reader's clock — is what makes
+    the one-time deadline survive a delayed restart unchanged.
+    """
+    status: DurableReadStatus
+    reason: str
+    gate: Optional[InBoardGate] = None
+    epoch_mirror: Optional[int] = None
+    updated_at: Optional[int] = None
+
+
+@dataclass
+class RemovalPhaseRecord:
+    """A board's durable removal-phase record (§6), mirroring RegisterEntry.
+
+    ``phase`` is the LAST REACHED phase. ``mode`` is fixed at Intent and
+    never changes for this ``removal_id`` (§6.1). ``quiescence_deadline``
+    is computed once, at the fence (QB-2), and never recomputed.
+
+    The remaining columns are the DURABLE COMPLETION FACTS each phase's
+    meaning consists of: the fence-closing instant, the per-phase
+    completion instants, the §6.4 carry payload, the §6.5 per-environment
+    release states, the §6.7 per-record-class sweep results, the §6.1
+    permanent confirmation and scope-declaration version, the durable
+    outcome of a refusal that did not move the phase, and the §6.6
+    mode-specific application marker (see
+    :func:`applied_mode_content_marker`) that says whether §7.2/§7.3's
+    mode-specific content has actually been performed.
+    """
+    board_name: str
+    removal_id: str
+    mode: RemovalMode
+    phase: RemovalPhase
+    epoch: int
+    quiescence_deadline: Optional[int] = None
+    deadline_basis: Optional[str] = None
+    outcome: Optional[str] = None
+    gate_closed_at: Optional[int] = None
+    quiesce_completed_at: Optional[int] = None
+    carry_completed_at: Optional[int] = None
+    release_completed_at: Optional[int] = None
+    sweep_completed_at: Optional[int] = None
+    carried_payload: Optional[str] = None
+    release_state: Optional[str] = None
+    sweep_state: Optional[str] = None
+    permanent_confirmed_at: Optional[int] = None
+    permanent_confirmation: Optional[str] = None
+    scope_declaration_version: Optional[str] = None
+    refusal_outcome: Optional[str] = None
+    applied_mode_content: Optional[str] = None
+    apply_journal: Optional[str] = None
+    created_at: Optional[int] = None
+    updated_at: Optional[int] = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "RemovalPhaseRecord":
+        return cls(
+            board_name=row["board_name"],
+            removal_id=row["removal_id"],
+            mode=RemovalMode(row["mode"]),
+            phase=RemovalPhase(row["phase"]),
+            epoch=int(row["epoch"]),
+            quiescence_deadline=_row_int(row, "quiescence_deadline"),
+            deadline_basis=_row_value(row, "deadline_basis"),
+            outcome=_row_value(row, "outcome"),
+            gate_closed_at=_row_int(row, "gate_closed_at"),
+            quiesce_completed_at=_row_int(row, "quiesce_completed_at"),
+            carry_completed_at=_row_int(row, "carry_completed_at"),
+            release_completed_at=_row_int(row, "release_completed_at"),
+            sweep_completed_at=_row_int(row, "sweep_completed_at"),
+            carried_payload=_row_value(row, "carried_payload"),
+            release_state=_row_value(row, "release_state"),
+            sweep_state=_row_value(row, "sweep_state"),
+            permanent_confirmed_at=_row_int(row, "permanent_confirmed_at"),
+            permanent_confirmation=_row_value(row, "permanent_confirmation"),
+            scope_declaration_version=_row_value(row, "scope_declaration_version"),
+            refusal_outcome=_row_value(row, "refusal_outcome"),
+            applied_mode_content=_row_value(row, "applied_mode_content"),
+            apply_journal=_row_value(row, "apply_journal"),
+            created_at=int(row["created_at"]) if row["created_at"] else None,
+            updated_at=int(row["updated_at"]) if row["updated_at"] else None,
+        )
+
+    def carried(self) -> Optional[dict]:
+        """The §6.4 carry payload, decoded, or None when absent/unreadable."""
+        return _decode_json_object(self.carried_payload)
+
+    def releases(self) -> Optional[dict]:
+        """The §6.5 per-environment release states, decoded."""
+        return _decode_json_object(self.release_state)
+
+    def sweep(self) -> Optional[dict]:
+        """The §6.7 per-record-class sweep results, decoded."""
+        return _decode_json_object(self.sweep_state)
+
+    def mode_content(self) -> Optional[dict]:
+        """The §6.6 mode-specific application marker, decoded.
+
+        ``None`` when nothing is recorded or the recorded value cannot be
+        decoded. Callers deciding anything must go through
+        :func:`applied_mode_content_marker`, which turns both of those
+        into an explicit OUTSTANDING verdict rather than into silence.
+        """
+        return _decode_json_object(self.applied_mode_content)
+
+    def journal(self) -> dict:
+        """The §7.2/§7.3 apply journal, decoded, read FAIL-CLOSED.
+
+        Every item the mode-specific application destroyed, deregistered
+        or refused is appended here as it happens (:func:`journal_apply_item`),
+        so a restart can tell what has already been done from durable
+        state alone rather than from a re-scan of a world that is
+        mid-destruction. Always a dict with an ``items`` list: an absent
+        or undecodable journal reads as "nothing is recorded as done",
+        never as "everything was done".
+        """
+        decoded = _decode_json_object(self.apply_journal)
+        items = decoded.get("items") if isinstance(decoded, dict) else None
+        return {
+            "version": 1,
+            "removal_id": self.removal_id,
+            "items": items if isinstance(items, list) else [],
+        }
+
+
+def _row_value(row: sqlite3.Row, key: str, default=None):
+    """A column that may be absent from an older row shape."""
+    try:
+        keys = row.keys()
+    except (AttributeError, sqlite3.Error):
+        return default
+    if key not in keys:
+        return default
+    value = row[key]
+    return default if value is None else value
+
+
+def _row_int(row: sqlite3.Row, key: str) -> Optional[int]:
+    value = _row_value(row, key)
+    return None if value is None else int(value)
+
+
+def _decode_json_object(raw: Optional[str]) -> Optional[dict]:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def get_removal_phase_record(board: str) -> Optional[RemovalPhaseRecord]:
+    """Read a board's durable removal-phase record, or None if absent.
+
+    None means no removal was ever recorded (crash point P1, §9.3): the
+    correct action is to do nothing, because the removal had not begun.
+    This is the read a restart uses to determine the last reached phase.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return None
+    with register_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM board_removal_phase WHERE board_name = ?",
+            (slug,),
+        ).fetchone()
+    if row is None:
+        return None
+    return RemovalPhaseRecord.from_row(row)
+
+
+_REMOVAL_PHASE_RECORD_COLUMNS: "tuple[str, ...]" = (
+    "removal_id",
+    "mode",
+    "phase",
+    "epoch",
+    "quiescence_deadline",
+    "deadline_basis",
+    "outcome",
+    "gate_closed_at",
+    "quiesce_completed_at",
+    "carry_completed_at",
+    "release_completed_at",
+    "sweep_completed_at",
+    "carried_payload",
+    "release_state",
+    "sweep_state",
+    "permanent_confirmed_at",
+    "permanent_confirmation",
+    "scope_declaration_version",
+    "refusal_outcome",
+    "applied_mode_content",
+    "apply_journal",
+)
+
+
+def _write_removal_phase_record(
+    conn: sqlite3.Connection,
+    record: RemovalPhaseRecord,
+) -> None:
+    """Insert or overwrite a phase record (internal helper, Phase 1 only).
+
+    Callers must hold an open transaction and the board's register lock.
+    An UPSERT rather than a plain INSERT: a board that was previously
+    removed reversibly and then abandoned back to ``live`` (§9.2) keeps
+    its old phase row (abandonment is later work, not built here), so a
+    fresh Intent for that board name must overwrite it with a new
+    ``removal_id`` rather than conflict on the primary key — and must
+    clear every completion fact the PREVIOUS run recorded, or the new
+    run's preconditions would read the old run's work as its own.
+    """
+    now = int(time.time())
+    columns = ("board_name",) + _REMOVAL_PHASE_RECORD_COLUMNS + (
+        "created_at", "updated_at",
+    )
+    placeholders = ", ".join("?" for _ in columns)
+    updates = ", ".join(
+        f"{col} = excluded.{col}" for col in _REMOVAL_PHASE_RECORD_COLUMNS
+    )
+    values = [record.board_name]
+    for col in _REMOVAL_PHASE_RECORD_COLUMNS:
+        value = getattr(record, col)
+        if isinstance(value, Enum):
+            value = value.value
+        values.append(value)
+    values.extend([record.created_at or now, now])
+    conn.execute(
+        f"INSERT INTO board_removal_phase ({', '.join(columns)}) "
+        f"VALUES ({placeholders}) "
+        f"ON CONFLICT(board_name) DO UPDATE SET {updates}, "
+        "updated_at = excluded.updated_at",
+        values,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Durable readings the phase predicates are evaluated against
+# ---------------------------------------------------------------------------
+
+def _board_store_absence_is_expected(
+    slug: str,
+    record: Optional[RemovalPhaseRecord],
+    *,
+    register_conn: Optional[sqlite3.Connection] = None,
+) -> "tuple[bool, str]":
+    """Is this board's store ABSENT because it was legitimately destroyed?
+
+    A hard-removed board has no store and that is the recorded end state —
+    reading zero reservations from it is a positively known zero, not a
+    failed read. Any other missing store is indeterminate: it may have
+    been moved, renamed, or made unreadable while work was still live.
+    """
+    try:
+        entry = get_register_entry(slug, conn=register_conn)
+    except sqlite3.Error as exc:
+        return False, f"cannot read the register to account for the absence: {exc}"
+    if entry is not None and entry.lifecycle == BoardLifecycle.HARD_REMOVED:
+        return True, "board store absent: the register records it hard-removed"
+    if (
+        record is not None
+        and record.mode == RemovalMode.PERMANENT
+        and removal_phase_ordinal(record.phase) >= removal_phase_ordinal(
+            RemovalPhase.APPLIED
+        )
+    ):
+        return (
+            True,
+            "board store absent: this permanent removal has passed Applied, "
+            "which is where the content is destroyed",
+        )
+    return False, "board store absent with nothing durable accounting for it"
+
+
+def _read_quiescence_predicate(
+    slug: str,
+    *,
+    record: Optional[RemovalPhaseRecord] = None,
+    register_conn: Optional[sqlite3.Connection] = None,
+) -> QuiescencePredicateReading:
+    """Read TQ-2's predicate from durable state, fail-closed (§6.3).
+
+    Reservations Held are ``running`` tasks holding a claim lock; the
+    fence's own write-path predicate refuses every new claim once Gate B
+    leaves ``open`` (QB-1), so a row found here was necessarily granted
+    before the close. Task removals in their window are read from
+    :data:`TASK_REMOVAL_WINDOW_TABLE` — the durable place a multi-step
+    task removal would record one.
+
+    Every failure — a missing store whose absence nothing accounts for, a
+    store that cannot be opened, a query that raised — returns
+    :attr:`DurableReadStatus.INDETERMINATE` with the reason. It NEVER
+    returns zero for an error.
+    """
+    db_path = kanban_db_path(board=slug)
+    if not db_path.exists():
+        expected, why = _board_store_absence_is_expected(
+            slug, record, register_conn=register_conn
+        )
+        if expected:
+            return QuiescencePredicateReading(
+                DurableReadStatus.OK, why, (), 0,
+            )
+        return QuiescencePredicateReading(
+            DurableReadStatus.INDETERMINATE, f"{why}: {db_path}",
+        )
+    try:
+        conn = _sqlite_connect_no_create(db_path)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return QuiescencePredicateReading(
+            DurableReadStatus.INDETERMINATE,
+            f"cannot open the board store to read the predicate: {exc}",
+        )
+    try:
+        try:
+            held_rows = conn.execute(
+                "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+                "WHERE status = 'running' AND claim_lock IS NOT NULL"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            return QuiescencePredicateReading(
+                DurableReadStatus.INDETERMINATE,
+                f"cannot read reservations from the board store: {exc}",
+            )
+        try:
+            present = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? "
+                "LIMIT 1",
+                (TASK_REMOVAL_WINDOW_TABLE,),
+            ).fetchone()
+            if present is None:
+                task_removals = 0
+                removals_reason = (
+                    f"no {TASK_REMOVAL_WINDOW_TABLE} table in this store: this "
+                    "board records no multi-step task removal, read as a "
+                    "positive zero"
+                )
+            else:
+                task_removals = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM {TASK_REMOVAL_WINDOW_TABLE} "
+                        "WHERE ended_at IS NULL"
+                    ).fetchone()[0]
+                )
+                removals_reason = (
+                    f"{task_removals} task removal(s) recorded in window"
+                )
+        except sqlite3.Error as exc:
+            return QuiescencePredicateReading(
+                DurableReadStatus.INDETERMINATE,
+                f"cannot read task removals in window: {exc}",
+            )
+    finally:
+        conn.close()
+    return QuiescencePredicateReading(
+        DurableReadStatus.OK,
+        f"{len(held_rows)} reservation(s) held; {removals_reason}",
+        tuple(held_rows),
+        task_removals,
+    )
+
+
+def _read_gate_instant(slug: str) -> GateInstantReading:
+    """Read the in-board gate, its mirror, and its durable write instant.
+
+    Fail-closed in the same shape as :func:`_read_quiescence_predicate`: a
+    store that is missing, unopenable, or whose fence row cannot be read
+    is INDETERMINATE, and an indeterminate gate never satisfies a
+    precondition.
+    """
+    db_path = kanban_db_path(board=slug)
+    if not db_path.exists():
+        return GateInstantReading(
+            DurableReadStatus.INDETERMINATE,
+            f"board store {db_path} is missing: the in-board gate cannot be read",
+        )
+    try:
+        conn = _sqlite_connect_no_create(db_path)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return GateInstantReading(
+            DurableReadStatus.INDETERMINATE,
+            f"cannot open the board store to read the in-board gate: {exc}",
+        )
+    try:
+        state = get_in_board_fence_state(conn)
+    finally:
+        conn.close()
+    if state is None:
+        return GateInstantReading(
+            DurableReadStatus.INDETERMINATE,
+            "the in-board gate row is absent or unreadable",
+        )
+    return GateInstantReading(
+        DurableReadStatus.OK,
+        f"gate={state.gate.value}, mirror={state.epoch_mirror}",
+        gate=state.gate,
+        epoch_mirror=state.epoch_mirror,
+        updated_at=state.updated_at,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Intent (§6.1)
+# ---------------------------------------------------------------------------
+
+# The scope declaration this build of the removal sequence runs under. An
+# entry that already records a version keeps it; the removal SNAPSHOTS the
+# version in force at its Intent onto the phase record — never the entry's
+# possibly older value — so a restart recovers which rules the run began
+# under, and a permanent-mode confirmation is bound to that same snapshot.
+SCOPE_DECLARATION_VERSION = "board-removal-safety-design-r5"
+
+# §12.5's OUT categories, as this codebase actually implements them: the
+# things a PERMANENT removal RETAINS rather than destroys. The operator is
+# shown this list, with what is retained under each, before confirming —
+# §6.1 requires the permanence statement to name them.
+REMOVAL_OUT_CATEGORIES: "tuple[tuple[str, str], ...]" = (
+    (
+        "removal-archive",
+        "receipts and audit records for this board, in the removal archive "
+        "outside every board's storage",
+    ),
+    (
+        "ever-existed-marker",
+        "the board-name marker that refuses a later resurrection of this name",
+    ),
+    (
+        "register-entry",
+        "this board's own register entry, retained as hard-removed rather "
+        "than deleted, so the name stays accounted for",
+    ),
+    (
+        "operator-items",
+        "any release obligation whose external side could not be proven "
+        "released; it persists until resolved, including after the board is "
+        "gone",
+    ),
+    # The categories §12.5 numbers, retained by DECISION rather than by any
+    # mechanism this project builds. An operator who is not shown them is
+    # shown a permanence statement that understates what survives.
+    (
+        "C6 conversation-transcripts",
+        "the conversation transcripts of this board's work: kept and "
+        "disclosed rather than deleted — they hold full work content and "
+        "live in a store shared with non-board work, so destruction is not "
+        "authorised (deferred, on the safe default), and their existence "
+        "and location are disclosed on the receipt",
+    ),
+    (
+        "C7 version-control-references",
+        "the version-control references and the commits created for this "
+        "board's work inside a shared repository: kept permanently by owner "
+        "decision — version-control history for a board's work is never "
+        "deleted by board removal — with every retained reference and every "
+        "commit explicitly named and listed on the receipt",
+    ),
+    (
+        "C11 removal-outcome-record",
+        "this removal's own outcome record and audit trail: permitted to "
+        "survive precisely because they carry no work content",
+    ),
+    (
+        "C12 system-backups",
+        "system-level backups and snapshots taken before this removal: "
+        "outside every mechanism this project designs, and declared with "
+        "that reason on the receipt",
+    ),
+)
+
+PERMANENCE_LIVE_WORK_NOTICE = (
+    "This removal is PERMANENT and cannot be undone. Work from any "
+    "reservation still live at the quiescence deadline will be destroyed "
+    "(QB-3, permanent column)."
+)
+
+# The shape of the frozen, board-specific inventory a permanence statement
+# is built from. Versioned because it is inside the digest a confirmation
+# binds to: a change in what the operator is shown is a change in what
+# they confirmed.
+PROSPECTIVE_INVENTORY_VERSION = "prospective-removal-inventory-v1"
+
+
+def permanent_removal_prospective_inventory(board: str) -> dict:
+    """The EXACT things this specific board's permanent removal will touch.
+
+    Derived from the same durable rows, through the same ledger builder
+    (:func:`_carried_outside_resource_ledger`) and the same commit
+    derivation that the §12 receipt uses — so what an operator is shown
+    BEFORE confirming and what the receipt states AFTERWARDS are two
+    readings of one derivation, not two independent guesses.
+
+    Three sections, each named for what actually happens to it:
+
+    * ``survives`` — the repositories, the references and the commits.
+      Version-control history is never deleted by a board removal (C7),
+      so this is what the operator keeps. Every reference carries its own
+      :func:`commit_list_completeness` marking, because the commit list is
+      derived from recorded run receipts and no creation-time provenance
+      ledger exists to prove it complete.
+    * ``transcripts`` — the conversation transcripts of this board's work
+      and where they live (C6): kept and disclosed, not destroyed.
+    * ``removed`` — this board's own storage, and the work-area
+      REGISTRATIONS that will be deregistered, by exact identity.
+
+    A board store that cannot be read produces an inventory that SAYS SO,
+    with :data:`RECEIPT_VERDICT_UNVERIFIED` in place of each section. A
+    statement that silently named nothing would read to an operator as
+    "there is nothing there".
+    """
+    slug = _normalize_board_slug(board) or str(board)
+    db_path = kanban_db_path(board=slug)
+    ledger: list = []
+    unreadable: Optional[str] = None
+    try:
+        conn = _sqlite_connect_no_create(db_path)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        unreadable = f"this board's store at {db_path} could not be opened: {exc}"
+    else:
+        try:
+            ledger = _carried_outside_resource_ledger(slug, conn)
+        except sqlite3.Error as exc:
+            unreadable = f"this board's store at {db_path} could not be read: {exc}"
+        finally:
+            conn.close()
+
+    def _member(name: str) -> dict:
+        return next((e for e in ledger if e.get("member") == name), {})
+
+    vc_entry = _member("version-control-references")
+    c13_entry = _member("work-area-registration")
+    c6_entry = _member("conversation-transcripts")
+
+    repositories: list = []
+    references: list = []
+    for ref in vc_entry.get("references") or []:
+        container = ref.get("container")
+        if container and container not in repositories:
+            repositories.append(container)
+        references.append({
+            "task": ref.get("task"),
+            "repository": container or RECEIPT_VERDICT_UNVERIFIED,
+            "reference": ref.get("reference") or RECEIPT_VERDICT_UNVERIFIED,
+            "base_commit": ref.get("base_commit") or RECEIPT_VERDICT_UNVERIFIED,
+            "head_commit": ref.get("head_commit") or RECEIPT_VERDICT_UNVERIFIED,
+            "commits": list(ref.get("board_created_commits") or []),
+            "absorbed_heads": [
+                head.get("head_commit")
+                for head in ref.get("absorbed_heads") or []
+                if head.get("head_commit")
+            ],
+            "commit_list_source": COMMIT_LIST_SOURCE,
+            "commit_list_completeness": commit_list_completeness(ref),
+        })
+
+    return {
+        "version": PROSPECTIVE_INVENTORY_VERSION,
+        "board": slug,
+        "readable": unreadable is None,
+        "unreadable_reason": unreadable,
+        "survives": {
+            "repositories": repositories,
+            "references": references,
+            "commit_list_source": COMMIT_LIST_SOURCE,
+            "commit_list_source_statement": COMMIT_LIST_SOURCE_STATEMENT,
+        },
+        "transcripts": {
+            "store": c6_entry.get("identity") or RECEIPT_VERDICT_UNVERIFIED,
+            "sessions": [
+                {"task": s.get("task"), "session_id": s.get("session_id")}
+                for s in c6_entry.get("originating_sessions") or []
+            ],
+        },
+        "removed": {
+            "board_directory": str(board_dir(slug)),
+            "board_store": str(db_path),
+            "work_area_registrations": [
+                {
+                    "task": reg.get("task"),
+                    "work_area": reg.get("work_area"),
+                    "registration": reg.get("registration"),
+                    "repository": reg.get("container"),
+                    "reference": reg.get("reference"),
+                }
+                for reg in c13_entry.get("registrations") or []
+            ],
+            "unresolved_work_areas": [
+                {
+                    "task": item.get("task"),
+                    "work_area": item.get("work_area"),
+                    "reason": item.get("reason"),
+                }
+                for item in c13_entry.get("unresolved") or []
+                if isinstance(item, dict)
+            ],
+        },
+    }
+
+
+def _render_prospective_inventory(inventory: dict) -> list:
+    """The frozen inventory as the lines an operator actually reads."""
+    lines: list = []
+    if not inventory.get("readable", False):
+        lines.append(
+            "This board's own state could NOT be read, so what will survive "
+            "and what will be deregistered is "
+            f"{RECEIPT_VERDICT_UNVERIFIED}: {inventory.get('unreadable_reason')}"
+        )
+
+    survives = inventory.get("survives") or {}
+    references = survives.get("references") or []
+    lines.append("What SURVIVES this removal, for this board specifically:")
+    repositories = survives.get("repositories") or []
+    if repositories:
+        for repository in repositories:
+            lines.append(f"  - repository kept: {repository}")
+    else:
+        lines.append(
+            "  - repositories: none is recorded for this board's work"
+        )
+    if references:
+        for ref in references:
+            lines.append(
+                f"  - reference kept: {ref['reference']} in {ref['repository']} "
+                f"(task {ref['task']})"
+            )
+            lines.append(
+                f"      base commit (not created by this board): "
+                f"{ref['base_commit']}"
+            )
+            lines.append(f"      head commit: {ref['head_commit']}")
+            commits = ref.get("commits") or []
+            if commits:
+                for commit in commits:
+                    lines.append(f"      commit kept: {commit}")
+            else:
+                lines.append("      commits kept: none is derivable")
+            for absorbed in ref.get("absorbed_heads") or []:
+                lines.append(
+                    f"      head absorbed from another subject's work "
+                    f"(not this board's): {absorbed}"
+                )
+            completeness = ref.get("commit_list_completeness") or {}
+            lines.append(
+                f"      commit-list source: {ref.get('commit_list_source')}; "
+                f"completeness: {completeness.get('verdict')}"
+            )
+            for reason in completeness.get("reasons") or []:
+                lines.append(f"        because: {reason}")
+    else:
+        lines.append(
+            "  - references: none is recorded for this board's work"
+        )
+    lines.append(f"  {survives.get('commit_list_source_statement', '')}")
+
+    transcripts = inventory.get("transcripts") or {}
+    lines.append("Conversation transcripts KEPT, and where they are:")
+    lines.append(f"  - transcript store: {transcripts.get('store')}")
+    sessions = transcripts.get("sessions") or []
+    if sessions:
+        for session in sessions:
+            lines.append(
+                f"  - transcript identity kept: session "
+                f"{session.get('session_id')} (task {session.get('task')})"
+            )
+    else:
+        lines.append("  - transcript identities: none is recorded")
+
+    removed = inventory.get("removed") or {}
+    lines.append("What is DESTROYED or DEREGISTERED, by exact identity:")
+    lines.append(f"  - board storage destroyed: {removed.get('board_directory')}")
+    lines.append(f"  - board store destroyed: {removed.get('board_store')}")
+    registrations = removed.get("work_area_registrations") or []
+    if registrations:
+        for reg in registrations:
+            lines.append(
+                f"  - work area destroyed: {reg.get('work_area')} "
+                f"(task {reg.get('task')})"
+            )
+            lines.append(
+                f"      its registration deregistered: {reg.get('registration')}"
+            )
+            lines.append(
+                f"      its reference {reg.get('reference')} in "
+                f"{reg.get('repository')} is KEPT"
+            )
+    else:
+        lines.append("  - work-area registrations: none is recorded")
+    for item in removed.get("unresolved_work_areas") or []:
+        lines.append(
+            f"  - work area recorded but NOT locatable: {item.get('work_area')} "
+            f"({item.get('reason')})"
+        )
+    return lines
+
+
+@dataclass
+class PermanenceStatement:
+    """The statement §6.1 requires an operator to be shown, permanent mode.
+
+    Names the scope declaration it was built under, the live-work
+    consequence, the OUT categories that are retained rather than
+    destroyed — and THIS BOARD'S OWN FROZEN PROSPECTIVE INVENTORY: the
+    repository, references and commits that will survive, the transcript
+    identities and where they live, and the registrations that will be
+    removed, each by exact identity.
+
+    ``prospective`` is captured ONCE, by :func:`permanence_statement`, and
+    the digest binds that exact snapshot — both through the rendered lines
+    and through an explicit digest of the canonical snapshot itself, so
+    nothing in it can drift out of the binding. A confirmation therefore
+    can never be carried over from a different statement: a different
+    board, a different declaration, a statement that named fewer
+    categories, or a board whose prospective inventory has since changed.
+    """
+    board_name: str
+    live_work_notice: str
+    out_categories: "tuple[tuple[str, str], ...]"
+    scope_declaration_version: str
+    prospective: dict = field(default_factory=dict)
+
+    def inventory_digest(self) -> str:
+        """A digest over the EXACT frozen snapshot, not over its prose."""
+        return hashlib.sha256(
+            json.dumps(
+                self.prospective, sort_keys=True, ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def text(self) -> str:
+        lines = [
+            f"Permanent removal of board {self.board_name!r}.",
+            f"Scope declaration in force: {self.scope_declaration_version}.",
+            self.live_work_notice,
+        ]
+        lines.extend(_render_prospective_inventory(self.prospective))
+        lines.append("Retained rather than destroyed (OUT categories):")
+        for name, retained in self.out_categories:
+            lines.append(f"  - {name}: {retained}")
+        # The rendered lines above are what a person reads; this line is
+        # what makes the digest bind the snapshot EXACTLY, including any
+        # part of it the rendering summarises.
+        lines.append(
+            f"Frozen prospective inventory ({PROSPECTIVE_INVENTORY_VERSION}) "
+            f"digest: {self.inventory_digest()}."
+        )
+        return "\n".join(lines)
+
+    def digest(self) -> str:
+        return hashlib.sha256(self.text().encode("utf-8")).hexdigest()
+
+
+def permanence_statement(
+    board: str,
+    *,
+    scope_declaration_version: Optional[str] = None,
+    prospective: Optional[dict] = None,
+) -> PermanenceStatement:
+    """Build the permanence statement for *board* (§6.1, §12.3-§12.5).
+
+    Bound to the scope declaration IN FORCE, unless the caller pins the
+    snapshot its Intent took — which is what :func:`record_removal_intent`
+    does, so the statement a confirmation is checked against is the
+    statement that removal's own declaration produces.
+
+    The prospective inventory is FROZEN here: derived once from durable
+    state (or passed in already frozen by a caller that captured it), and
+    then bound by the digest. A board whose durable state has changed
+    since produces a different statement and therefore a different
+    required answer, so a confirmation cannot be carried across the
+    change.
+    """
+    slug = _normalize_board_slug(board) or str(board)
+    return PermanenceStatement(
+        board_name=slug,
+        live_work_notice=PERMANENCE_LIVE_WORK_NOTICE,
+        out_categories=REMOVAL_OUT_CATEGORIES,
+        scope_declaration_version=(
+            scope_declaration_version or SCOPE_DECLARATION_VERSION
+        ),
+        prospective=(
+            permanent_removal_prospective_inventory(slug)
+            if prospective is None else prospective
+        ),
+    )
+
+
+@dataclass
+class PermanentRemovalConfirmation:
+    """An operator's confirmation that the permanence statement was shown.
+
+    ``statement_digest`` pins WHICH statement was shown; a confirmation
+    whose digest does not match the statement in force is not a
+    confirmation of this removal and is refused.
+    """
+    confirmed: bool
+    statement_digest: str
+    confirmed_by: Optional[str] = None
+    confirmed_at: Optional[int] = None
+
+
+# The words an operator must echo, verbatim, to confirm a permanent
+# removal. The board name and the statement digest are appended, so the
+# answer for one board — or for one scope declaration — is not the answer
+# for another, and no fixed string an automation could hard-code is ever
+# sufficient (§6.1).
+PERMANENT_CONFIRMATION_TOKEN_WORDS = "permanently remove"
+
+# How much of the statement digest the required answer carries. Long
+# enough that it cannot be guessed and short enough that an operator can
+# retype the line they were shown.
+PERMANENT_CONFIRMATION_DIGEST_CHARS = 16
+
+
+@dataclass(frozen=True)
+class PermanentRemovalDisclosure:
+    """The statement an operator must be SHOWN, plus the answer bound to it.
+
+    A calling surface never decides what a confirmation is: it displays
+    :attr:`statement_text`, obtains an answer, and hands the answer back
+    to :func:`confirm_permanent_removal`, which is the only thing that
+    mints a :class:`PermanentRemovalConfirmation`. ``required_response``
+    is derived from the statement's own digest, so an answer echoed back
+    proves WHICH statement the operator was looking at.
+    """
+    statement: PermanenceStatement
+    required_response: str
+    prompt: str
+
+    @property
+    def board_name(self) -> str:
+        return self.statement.board_name
+
+    @property
+    def statement_text(self) -> str:
+        return self.statement.text()
+
+    @property
+    def statement_digest(self) -> str:
+        return self.statement.digest()
+
+    @property
+    def prospective_inventory(self) -> dict:
+        """The frozen, board-specific inventory the digest binds."""
+        return self.statement.prospective
+
+    def matches(self, response: Any) -> bool:
+        """Is *response* the exact answer this disclosure requires?"""
+        if not isinstance(response, str):
+            return False
+        return response.strip() == self.required_response
+
+    def as_payload(self) -> dict:
+        """The disclosure a non-terminal surface renders and echoes back."""
+        return {
+            "board": self.board_name,
+            "statement": self.statement_text,
+            "statement_digest": self.statement_digest,
+            "required_response": self.required_response,
+            "prompt": self.prompt,
+            "scope_declaration_version": (
+                self.statement.scope_declaration_version
+            ),
+            "out_categories": [
+                {"category": name, "retained": retained}
+                for name, retained in self.statement.out_categories
+            ],
+            # The same frozen snapshot the statement text renders and the
+            # digest binds, handed to a non-terminal surface as STRUCTURED
+            # data so it can display it as more than a wall of prose.
+            "prospective_inventory": self.prospective_inventory,
+            "prospective_inventory_digest": (
+                self.statement.inventory_digest()
+            ),
+        }
+
+
+def permanent_removal_disclosure(
+    board: str, *, scope_declaration_version: Optional[str] = None
+) -> PermanentRemovalDisclosure:
+    """Build what §6.1 requires an operator to be shown, and its answer.
+
+    Pure: it reads no operator input and mints no confirmation, so a
+    surface can obtain the disclosure to DISPLAY it without any risk of
+    having thereby confirmed anything.
+    """
+    statement = permanence_statement(
+        board, scope_declaration_version=scope_declaration_version
+    )
+    digest = statement.digest()
+    required = (
+        f"{PERMANENT_CONFIRMATION_TOKEN_WORDS} {statement.board_name} "
+        f"{digest[:PERMANENT_CONFIRMATION_DIGEST_CHARS]}"
+    )
+    prompt = (
+        "This is permanent. To confirm, reply with exactly this line:\n"
+        f"    {required}\n"
+        "Anything else — including an empty answer or no answer at all — "
+        "refuses the removal and leaves the board fully intact."
+    )
+    return PermanentRemovalDisclosure(statement, required, prompt)
+
+
+class PermanentConfirmationRefusal(str, Enum):
+    """Why an offered answer is not a confirmation of THIS statement."""
+    NO_RESPONSE = "no-response"
+    UNBOUND_RESPONSE = "unbound-response"
+    MISMATCHED_RESPONSE = "mismatched-response"
+    MISMATCHED_STATEMENT = "mismatched-statement"
+
+
+@dataclass
+class PermanentConfirmationResult:
+    """The outcome of checking an operator's answer against the statement."""
+    disclosure: PermanentRemovalDisclosure
+    confirmation: Optional[PermanentRemovalConfirmation] = None
+    refusal: Optional[PermanentConfirmationRefusal] = None
+    message: str = ""
+
+    @property
+    def confirmed(self) -> bool:
+        return self.confirmation is not None
+
+
+def confirm_permanent_removal(
+    board: str,
+    *,
+    response: Any,
+    confirmed_by: Optional[str] = None,
+    shown_digest: Optional[str] = None,
+    disclosure: Optional[PermanentRemovalDisclosure] = None,
+) -> PermanentConfirmationResult:
+    """Check an operator's answer and mint a confirmation ONLY if it binds.
+
+    This is the one and only place a :class:`PermanentRemovalConfirmation`
+    comes from. A calling surface displays
+    :attr:`PermanentRemovalDisclosure.statement_text`, obtains an answer,
+    and passes it here; it cannot mint a confirmation of its own, so
+    "the operator was shown the statement" is never something a surface
+    merely asserts.
+
+    ``response`` must equal the disclosure's ``required_response``, which
+    is derived from the statement's digest. ``shown_digest``, when the
+    surface has one (a dashboard echoing back what it rendered), must
+    equal the statement in force too: an answer bound to a statement this
+    board no longer has is not a confirmation of this removal. A missing
+    or non-matching answer returns no confirmation and the caller must
+    refuse — nothing here changes any durable state either way.
+    """
+    active = disclosure or permanent_removal_disclosure(board)
+    if response is None or (isinstance(response, str) and not response.strip()):
+        return PermanentConfirmationResult(
+            active, refusal=PermanentConfirmationRefusal.NO_RESPONSE,
+            message=(
+                "no answer was given to the permanence statement: a "
+                "permanent removal is refused and the board is untouched"
+            ),
+        )
+    if not isinstance(response, str):
+        return PermanentConfirmationResult(
+            active, refusal=PermanentConfirmationRefusal.UNBOUND_RESPONSE,
+            message=(
+                "the offered confirmation is not the statement-bound line "
+                f"an operator is shown (got {type(response).__name__})"
+            ),
+        )
+    if shown_digest is not None and str(shown_digest).strip() != active.statement_digest:
+        return PermanentConfirmationResult(
+            active, refusal=PermanentConfirmationRefusal.MISMATCHED_STATEMENT,
+            message=(
+                "the answer is bound to a different permanence statement "
+                "than the one in force for this board: refusing to read it "
+                "as a confirmation of this removal"
+            ),
+        )
+    if not active.matches(response):
+        return PermanentConfirmationResult(
+            active, refusal=PermanentConfirmationRefusal.MISMATCHED_RESPONSE,
+            message=(
+                "the answer is not the exact statement-bound line that was "
+                "required: a permanent removal is refused and the board is "
+                "untouched"
+            ),
+        )
+    return PermanentConfirmationResult(
+        active,
+        confirmation=PermanentRemovalConfirmation(
+            confirmed=True,
+            statement_digest=active.statement_digest,
+            confirmed_by=confirmed_by,
+            confirmed_at=int(time.time()),
+        ),
+        message="the operator echoed the statement-bound confirmation line",
+    )
+
+
+class RemovalIntentOutcome(str, Enum):
+    """Outcomes of the single Phase-1 conditional transition (§6.1)."""
+    STARTED = "started"
+    JOINED = "joined"
+    REFUSED_TERMINAL = "refused-terminal"
+    REFUSED_MODE_CONFLICT = "refused-mode-conflict"
+    REFUSED_UNCONFIRMED = "refused-unconfirmed"
+    REFUSED_INDETERMINATE = "refused-indeterminate"
+
+
+# The refusals §6.1 requires to be recorded durably. An indeterminate
+# refusal is NOT here: it is refused precisely because the entry could not
+# be read, so there is no durable place of this board's to record it on.
+_RECORDED_INTENT_REFUSALS = frozenset({
+    RemovalIntentOutcome.REFUSED_TERMINAL,
+    RemovalIntentOutcome.REFUSED_MODE_CONFLICT,
+    RemovalIntentOutcome.REFUSED_UNCONFIRMED,
+})
+
+
+@dataclass
+class RemovalIntentResult:
+    """Result of :func:`record_removal_intent` (§6.1)."""
+    success: bool
+    outcome: RemovalIntentOutcome
+    message: str
+    removal_id: Optional[str] = None
+    mode: Optional[RemovalMode] = None
+    entry: Optional[RegisterEntry] = None
+    record: Optional[RemovalPhaseRecord] = None
+    refusal_recorded: bool = False
+
+
+def record_removal_intent(
+    board: str,
+    *,
+    mode: "RemovalMode | str",
+    removal_id: Optional[str] = None,
+    permanent_confirmation: Optional[PermanentRemovalConfirmation] = None,
+) -> RemovalIntentResult:
+    """Phase 1 — Intent (§6.1): the one transition that begins a removal.
+
+    Performs, under :func:`board_register_lock`, ONE conditional Gate A
+    transition of the register entry from ``live`` to ``removing``,
+    setting lifecycle, mode, the increased epoch, ``epoch_before`` (the
+    epoch it increased from) and ``gate_move`` = ``pending`` — all in that
+    one transition (EM-4b). The phase record is written in the SAME
+    register transaction, at phase Intent, carrying the mode, the epoch, a
+    SNAPSHOT of the scope declaration in force at this Intent — never a
+    stale value the entry happened to carry — and (permanent mode) the
+    operator's confirmation, bound to the statement that snapshot
+    produces.
+
+    **Permanent mode requires confirmation.** §6.1 requires the operator
+    to be shown the permanence statement — that work from any live
+    reservation will be destroyed, and the named list of OUT categories
+    retained rather than destroyed with what is retained under each — and
+    to confirm it. A permanent request without a confirmation matching
+    the statement in force is REFUSED. Reversible mode needs none.
+
+    A removal BEGINS at the commit of this transition and not before;
+    nothing earlier may be reported as started, accepted, or begun.
+
+    Mode precedence (a safety rule, not a preference): the same mode
+    joins an in-flight removal, returning its existing ``removal_id`` and
+    writing nothing. A reversible request joining a permanent removal is
+    refused. A permanent request joining a reversible removal is refused
+    too, with a recorded outcome telling the operator to re-issue once it
+    completes — timing must never upgrade a removal from recoverable to
+    unrecoverable. The recorded mode never changes.
+
+    **Every terminal and mode-conflict refusal is recorded durably**, on
+    the register entry's own refusal field, inside this one transaction.
+    It never moves the lifecycle and never creates a phase record: a
+    refused request has not begun a removal and must not look as if it
+    had.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RemovalIntentResult(
+            False, RemovalIntentOutcome.REFUSED_INDETERMINATE, "invalid board name"
+        )
+    mode = RemovalMode(mode)
+    with board_register_lock(slug):
+        return _record_removal_intent_locked(
+            slug,
+            mode=mode,
+            removal_id=removal_id,
+            permanent_confirmation=permanent_confirmation,
+        )
+
+
+def _intent_refusal_text(outcome: RemovalIntentOutcome, message: str, now: int) -> str:
+    return json.dumps(
+        {"outcome": outcome.value, "message": message, "recorded_at": now},
+        ensure_ascii=False,
+    )
+
+
+def _refuse_intent(
+    slug: str,
+    outcome: RemovalIntentOutcome,
+    message: str,
+    *,
+    entry: Optional[RegisterEntry] = None,
+    record: Optional[RemovalPhaseRecord] = None,
+) -> RemovalIntentResult:
+    """Record a refusal's outcome durably and return it (§6.1).
+
+    One transaction, one write: the register entry's own refusal field.
+    Nothing else moves — not the lifecycle, not the epoch, not the phase
+    record — so a recorded refusal can never make a removal that never
+    began look started.
+    """
+    recorded = False
+    if outcome in _RECORDED_INTENT_REFUSALS:
+        now = int(time.time())
+        payload = _intent_refusal_text(outcome, message, now)
+        try:
+            with register_connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    cur = conn.execute(
+                        "UPDATE board_register SET removal_refusal = ?, "
+                        "updated_at = ? WHERE board_name = ?",
+                        (payload, now, slug),
+                    )
+                    recorded = cur.rowcount == 1
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+        except sqlite3.Error as exc:
+            _log.warning(
+                "kanban removal: could not record the %s refusal for %s: %s",
+                outcome.value, slug, exc,
+            )
+            recorded = False
+    return RemovalIntentResult(
+        False, outcome, message, entry=entry, record=record,
+        refusal_recorded=recorded,
+    )
+
+
+def get_recorded_removal_refusal(board: str) -> Optional[dict]:
+    """The durable outcome of this board's last refused removal request."""
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return None
+    with register_connect() as conn:
+        try:
+            row = conn.execute(
+                "SELECT removal_refusal FROM board_register WHERE board_name = ?",
+                (slug,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+    if row is None:
+        return None
+    return _decode_json_object(row["removal_refusal"])
+
+
+def _record_removal_intent_locked(
+    slug: str,
+    *,
+    mode: RemovalMode,
+    removal_id: Optional[str],
+    permanent_confirmation: Optional[PermanentRemovalConfirmation],
+) -> RemovalIntentResult:
+    try:
+        entry = get_register_entry(slug)
+    except sqlite3.Error as e:
+        return RemovalIntentResult(
+            False, RemovalIntentOutcome.REFUSED_INDETERMINATE,
+            f"cannot read register authority: {e}",
+        )
+
+    if entry is None:
+        # Absent or unreadable entry: refused as indeterminate (§6.1).
+        return RemovalIntentResult(
+            False, RemovalIntentOutcome.REFUSED_INDETERMINATE,
+            f"no register entry for {slug!r}: cannot determine removability",
+        )
+
+    if entry.lifecycle in (BoardLifecycle.ARCHIVED, BoardLifecycle.HARD_REMOVED):
+        return _refuse_intent(
+            slug, RemovalIntentOutcome.REFUSED_TERMINAL,
+            f"board is already {entry.lifecycle.value}", entry=entry,
+        )
+
+    if entry.lifecycle == BoardLifecycle.REMOVING:
+        existing_mode = RemovalMode(entry.removal_mode) if entry.removal_mode else None
+        existing_record = get_removal_phase_record(slug)
+        if existing_mode is None:
+            return RemovalIntentResult(
+                False, RemovalIntentOutcome.REFUSED_INDETERMINATE,
+                "board is removing but its recorded mode is unreadable",
+                entry=entry,
+            )
+        if existing_mode == mode:
+            # Same mode joins: returns the existing removal_id, writes
+            # nothing (§6.1 mode precedence).
+            return RemovalIntentResult(
+                True, RemovalIntentOutcome.JOINED,
+                f"joins the in-flight {mode.value} removal",
+                removal_id=existing_record.removal_id if existing_record else None,
+                mode=mode, entry=entry, record=existing_record,
+            )
+        if mode == RemovalMode.REVERSIBLE:
+            # A reversible request joining a permanent removal is refused.
+            return _refuse_intent(
+                slug, RemovalIntentOutcome.REFUSED_MODE_CONFLICT,
+                "a reversible removal cannot join an in-flight permanent "
+                "removal: timing never upgrades a removal from recoverable "
+                "to unrecoverable",
+                entry=entry, record=existing_record,
+            )
+        # A permanent request joining a reversible removal is refused too.
+        return _refuse_intent(
+            slug, RemovalIntentOutcome.REFUSED_MODE_CONFLICT,
+            "a permanent removal cannot join an in-flight reversible "
+            "removal: re-issue once the reversible removal completes",
+            entry=entry, record=existing_record,
+        )
+
+    # §6.1: the declaration IN FORCE at this Intent, snapshotted. The value
+    # the entry happens to be carrying is NEVER adopted as the declaration
+    # this removal runs under — it can predate the build that is running,
+    # and every later phase reads this field as the authority for what the
+    # run may do. The entry keeps its own value; the snapshot is the
+    # removal's, and it is what a permanent-mode confirmation is bound to.
+    scope_version = SCOPE_DECLARATION_VERSION
+
+    confirmation_text: Optional[str] = None
+    confirmed_at: Optional[int] = None
+    if mode == RemovalMode.PERMANENT:
+        statement = permanence_statement(
+            slug, scope_declaration_version=scope_version
+        )
+        if permanent_confirmation is None or not permanent_confirmation.confirmed:
+            return _refuse_intent(
+                slug, RemovalIntentOutcome.REFUSED_UNCONFIRMED,
+                "a permanent removal requires the operator to be shown the "
+                "permanence statement — including the OUT categories retained "
+                "rather than destroyed — and to confirm it",
+                entry=entry,
+            )
+        if permanent_confirmation.statement_digest != statement.digest():
+            return _refuse_intent(
+                slug, RemovalIntentOutcome.REFUSED_UNCONFIRMED,
+                "the confirmation does not match the permanence statement in "
+                "force for this board: refusing to treat it as a confirmation "
+                "of this removal",
+                entry=entry,
+            )
+        confirmed_at = permanent_confirmation.confirmed_at or int(time.time())
+        confirmation_text = json.dumps(
+            {
+                "statement": statement.text(),
+                "statement_digest": statement.digest(),
+                "scope_declaration_version": statement.scope_declaration_version,
+                "out_categories": [
+                    {"category": name, "retained": retained}
+                    for name, retained in statement.out_categories
+                ],
+                "confirmed_by": permanent_confirmation.confirmed_by,
+                "confirmed_at": confirmed_at,
+            },
+            ensure_ascii=False,
+        )
+
+    # entry.lifecycle == LIVE: the one conditional transition wins.
+    new_removal_id = removal_id or secrets.token_hex(16)
+    now = int(time.time())
+    new_epoch = int(entry.epoch) + 1
+    updated_entry = RegisterEntry(
+        board_name=slug,
+        lifecycle=BoardLifecycle.REMOVING,
+        epoch=new_epoch,
+        epoch_before=int(entry.epoch),
+        gate_move=GateMove.PENDING,
+        removal_mode=mode.value,
+        # The entry keeps whatever version it already recorded; only the
+        # phase record carries this removal's own snapshot.
+        scope_declaration_version=(
+            entry.scope_declaration_version or scope_version
+        ),
+        epoch_lineage=(entry.epoch_lineage or []) + [new_epoch],
+        created_at=entry.created_at,
+        updated_at=now,
+    )
+    record = RemovalPhaseRecord(
+        board_name=slug,
+        removal_id=new_removal_id,
+        mode=mode,
+        phase=RemovalPhase.INTENT,
+        epoch=new_epoch,
+        permanent_confirmed_at=confirmed_at,
+        permanent_confirmation=confirmation_text,
+        scope_declaration_version=scope_version,
+        created_at=now,
+        updated_at=now,
+    )
+    with register_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _write_register_entry(conn, updated_entry)
+            _write_removal_phase_record(conn, record)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return RemovalIntentResult(
+        True, RemovalIntentOutcome.STARTED,
+        "removal intent committed: entry moved live -> removing",
+        removal_id=new_removal_id, mode=mode, entry=updated_entry, record=record,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The compare-and-set phase primitive every later transition goes through
+# ---------------------------------------------------------------------------
+
+class RemovalAdvanceOutcome(str, Enum):
+    """Outcomes of a removal-phase transition (§6, §9.3 roll-forward)."""
+    ADVANCED = "advanced"
+    IDEMPOTENT_NOOP = "idempotent-noop"
+    # A repeat that found the phase already recorded but its own durable
+    # fact missing, and wrote that fact back rather than reporting a no-op
+    # success over the silence. The phase itself did not move.
+    REPAIRED_PHASE_FACT = "repaired-phase-fact"
+    REFUSED_INVALID_BOARD = "refused-invalid-board"
+    REFUSED_NO_RECORD = "refused-no-record"
+    REFUSED_ID_MISMATCH = "refused-id-mismatch"
+    REFUSED_MODE_MISMATCH = "refused-mode-mismatch"
+    REFUSED_BACKWARDS = "refused-backwards"
+    REFUSED_SKIP = "refused-skip"
+    REFUSED_STALE = "refused-stale"
+    REFUSED_LOST_RACE = "refused-lost-race"
+    REFUSED_PRECONDITION = "refused-precondition"
+    REFUSED_INDETERMINATE = "refused-indeterminate"
+    REFUSED_WORK_INCOMPLETE = "refused-work-incomplete"
+    REFUSED_REENTER_QUIESCENCE = "refused-reenter-quiescence"
+    REFUSED_MODE_CONTENT_OUTSTANDING = "refused-mode-content-outstanding"
+
+
+@dataclass
+class RemovalPhaseAdvanceResult:
+    """Result of a compare-and-set phase transition (§6).
+
+    ``transitioned`` is True only when a row actually changed — an
+    idempotent no-op is a success that transitioned nothing, and every
+    refusal transitioned nothing.
+    """
+    success: bool
+    outcome: RemovalAdvanceOutcome
+    message: str
+    record: Optional[RemovalPhaseRecord] = None
+    transitioned: bool = False
+
+
+_REMOVAL_PHASE_WRITABLE_FIELDS = frozenset({
+    "quiescence_deadline",
+    "deadline_basis",
+    "outcome",
+    "gate_closed_at",
+    "quiesce_completed_at",
+    "carry_completed_at",
+    "release_completed_at",
+    "sweep_completed_at",
+    "carried_payload",
+    "release_state",
+    "sweep_state",
+    "refusal_outcome",
+    "applied_mode_content",
+    "apply_journal",
+})
+
+# Every column that records WHAT A PHASE'S OWN WORK ESTABLISHED, mapped to
+# the phase that owns it and the named function that derives and writes it.
+#
+# These are the columns each phase's precondition reads back as the durable
+# proof that the phase's meaning is true. A caller that could pass one
+# would be handing the removal its own conclusion: the predicate would
+# degrade from "the work happened" to "the caller's value has the right
+# shape". So they are SEALED — no public caller may pass any of them (see
+# :func:`advance_removal_phase`) — and the only way one is ever written is
+# the private ``_phase_owned`` channel of :func:`_advance_removal_phase`,
+# which the public signature cannot reach and which
+# :func:`advance_removal_phase` neither sets nor forwards.
+_PHASE_OWNED_FIELD_WRITERS: "dict[str, tuple[str, str]]" = {
+    "quiesce_completed_at": ("quiesced", "advance_removal_to_quiesced"),
+    "carried_payload": ("carried", "advance_removal_to_carried"),
+    "carry_completed_at": ("carried", "advance_removal_to_carried"),
+    "release_state": ("released", "advance_removal_to_released"),
+    "release_completed_at": ("released", "advance_removal_to_released"),
+    # The §6.6 mode-specific application marker: the record of whether
+    # §7.2/§7.3's destruction/retention really happened. Its OUTSTANDING
+    # value is written by Applied's own driver; its APPLIED value only by
+    # record_applied_mode_content(), which verifies the claim against
+    # durable state.
+    "applied_mode_content": (
+        "applied",
+        "advance_removal_to_applied (outstanding) / "
+        "record_applied_mode_content (applied, after verification)",
+    ),
+    # The §7.2/§7.3 apply journal: what the mode-specific application
+    # really destroyed, deregistered or refused, appended as it happens.
+    # Only the mode-content drivers append to it, and only through
+    # journal_apply_item(), which flushes each item before the next
+    # destruction begins.
+    "apply_journal": (
+        "applied",
+        "apply_permanent_mode_content / apply_reversible_mode_content "
+        "(through journal_apply_item)",
+    ),
+    "sweep_state": ("swept", "advance_removal_to_swept"),
+    "sweep_completed_at": ("swept", "advance_removal_to_swept"),
+    # §6.2/QB-2: the quiescence deadline, its derivation basis, and the
+    # gate-closing instant are the facts Fenced's own driver derives from
+    # the durable gate and the durable reservation read.  A caller-supplied
+    # value would let a forged PAST deadline trigger force-end-held on the
+    # next phase, or a forged FUTURE deadline stall the removal
+    # indefinitely — so all three are sealed to the driver.
+    "quiescence_deadline": ("fenced", "advance_removal_to_fenced"),
+    "deadline_basis": ("fenced", "advance_removal_to_fenced"),
+    "gate_closed_at": ("fenced", "advance_removal_to_fenced"),
+}
+
+_REMOVAL_PHASE_SEALED_FIELDS = frozenset(_PHASE_OWNED_FIELD_WRITERS)
+
+
+# ---------------------------------------------------------------------------
+# The precondition registry: what each phase's NAME means, as a predicate
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RemovalPreconditionContext:
+    """Everything a precondition may read, evaluated inside the transition."""
+    slug: str
+    record: RemovalPhaseRecord
+    from_phase: RemovalPhase
+    to_phase: RemovalPhase
+    fields: dict
+    now: int
+    # The register connection whose transaction would record the phase.
+    # Reading the authority through IT — rather than through a second
+    # connection — keeps the predicate and the write on one snapshot.
+    conn: Optional[sqlite3.Connection] = None
+    # The phase-owned facts THIS transition's own driver derived, arriving
+    # through the private channel. Never anything a caller passed.
+    phase_owned: dict = field(default_factory=dict)
+
+    def durable(self, column: str):
+        """The value this transition will leave in *column*.
+
+        Either already recorded, or being recorded by THIS transition —
+        both are durable at the instant the phase is recorded, because
+        they are one commit (IN-4).
+
+        For a SEALED column the only two admissible sources are the
+        committed record and the value this transition's own DRIVER
+        derived (``phase_owned``). A value that arrived in ``fields`` is
+        never consulted: ``fields`` is what a caller passed, and a fact
+        supplied by the caller is not evidence that work happened.
+        """
+        if column in _REMOVAL_PHASE_SEALED_FIELDS:
+            if column in self.phase_owned:
+                return self.phase_owned[column]
+            return getattr(self.record, column, None)
+        if column in self.fields:
+            return self.fields[column]
+        return getattr(self.record, column, None)
+
+
+@dataclass
+class RemovalPreconditionVerdict:
+    """Whether a phase's meaning is durably true, and why not when it is not."""
+    satisfied: bool
+    message: str
+    outcome: RemovalAdvanceOutcome = RemovalAdvanceOutcome.REFUSED_PRECONDITION
+
+
+@dataclass(frozen=True)
+class RemovalPhasePrecondition:
+    """One entry of the registry: a phase's meaning, as a checkable rule."""
+    rule: str
+    summary: str
+    check: Any
+    driver: Optional[str] = None
+
+
+def _satisfied(message: str) -> RemovalPreconditionVerdict:
+    return RemovalPreconditionVerdict(True, message)
+
+
+def _unsatisfied(
+    message: str,
+    outcome: RemovalAdvanceOutcome = RemovalAdvanceOutcome.REFUSED_PRECONDITION,
+) -> RemovalPreconditionVerdict:
+    return RemovalPreconditionVerdict(False, message, outcome)
+
+
+def _precondition_intent(ctx: RemovalPreconditionContext) -> RemovalPreconditionVerdict:
+    """§6.1: Intent is not a compare-and-set target at all.
+
+    Intent is written by :func:`record_removal_intent`, in the same
+    transaction as the register entry's live→removing move. Nothing may
+    record it from the phase primitive.
+    """
+    return _unsatisfied(
+        "Intent is recorded only by record_removal_intent, in the same "
+        "transaction as the register entry's live -> removing transition"
+    )
+
+
+def _precondition_fenced(ctx: RemovalPreconditionContext) -> RemovalPreconditionVerdict:
+    """§6.2/EM-2/QB-2: the fence is really closed, at the right epoch, with
+    the one-time deadline derived from durable state and recorded.
+
+    All facts are read from durable state, and a read that FAILED is not
+    a pass: an unreadable gate or an unreadable reservation set refuses.
+    The three phase-owned columns (quiescence_deadline, deadline_basis,
+    gate_closed_at) are sealed to the driver, so ``ctx.durable(...)``
+    consults only the committed record and the driver's own derivation.
+    The gate_closed_at value must equal the gate row's own closing
+    instant, and the deadline AND its basis must both be consistent with
+    what the derivation would compute from that instant — a
+    caller-supplied value can satisfy none of the three checks.
+    """
+    reading = _read_gate_instant(ctx.slug)
+    if reading.status is not DurableReadStatus.OK:
+        return _unsatisfied(
+            f"the in-board gate could not be read, so the fence cannot be "
+            f"shown closed: {reading.reason}",
+            RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+    if reading.gate is InBoardGate.OPEN:
+        return _unsatisfied(
+            "the in-board gate is still 'open': the fence-closing point has "
+            "not committed, so nothing may be recorded as fenced"
+        )
+    try:
+        entry = get_register_entry(ctx.slug, conn=ctx.conn)
+    except sqlite3.Error as exc:
+        return _unsatisfied(
+            f"the register authority could not be read to check the epoch "
+            f"mirror: {exc}",
+            RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+    if entry is None:
+        return _unsatisfied(
+            "no register entry: the epoch mirror cannot be shown to match "
+            "the authority",
+            RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+    if reading.epoch_mirror != int(entry.epoch):
+        return _unsatisfied(
+            f"the epoch mirror is {reading.epoch_mirror} but the "
+            f"authoritative epoch is {entry.epoch}: the mirror lags, so the "
+            "fence that is closed is not this removal's fence (EM-2)"
+        )
+    if ctx.durable("quiescence_deadline") is None:
+        return _unsatisfied(
+            "no quiescence deadline is recorded and none is being recorded "
+            "by this transition (QB-2)"
+        )
+    # §6.2/QB-2: the durable gate_closed_at must equal the gate row's own
+    # closing instant — a value that did not come from the gate is not
+    # evidence that the gate closed at the claimed time.
+    durable_gate_closed_at = ctx.durable("gate_closed_at")
+    if durable_gate_closed_at is None or reading.updated_at is None:
+        return _unsatisfied(
+            "gate_closed_at is not durably recorded or the gate's own "
+            "closing instant is unreadable (QB-2)",
+            RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+    if int(durable_gate_closed_at) != int(reading.updated_at):
+        return _unsatisfied(
+            f"the durable gate_closed_at ({durable_gate_closed_at}) does not "
+            f"equal the gate row's own closing instant ({reading.updated_at}): "
+            "the value was not derived from the gate (QB-2)"
+        )
+    # §6.2/QB-2: recompute the deadline from the same durable inputs the
+    # driver uses (gate instant + reservation read) and verify the durable
+    # deadline matches. An unreadable reservation set is INDETERMINATE.
+    expected_deadline, expected_basis = _compute_quiescence_deadline(
+        ctx.slug, gate_closed_at=int(durable_gate_closed_at), record=ctx.record
+    )
+    if expected_deadline is None:
+        return _unsatisfied(
+            f"the reservation set could not be read to verify the "
+            f"quiescence deadline: {expected_basis}",
+            RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+    if int(ctx.durable("quiescence_deadline")) != int(expected_deadline):
+        return _unsatisfied(
+            f"the durable quiescence_deadline "
+            f"({ctx.durable('quiescence_deadline')}) does not match the "
+            f"derivation from the gate instant ({expected_deadline}): the "
+            "deadline was not derived from the durable gate and reservation "
+            "state (QB-2)"
+        )
+    # The basis is the third phase-owned fact, and it is bound to the same
+    # derivation: a record carrying the exact valid deadline and the exact
+    # valid gate instant beside a basis that is not the derived one (or no
+    # basis at all) is not evidence of a derived deadline. The reservation
+    # read SUCCEEDED here, so this is an ordinary refusal, not indeterminate.
+    if ctx.durable("deadline_basis") != expected_basis:
+        return _unsatisfied(
+            f"the durable deadline_basis "
+            f"({ctx.durable('deadline_basis')!r}) does not match the basis "
+            f"the derivation from the gate instant yields "
+            f"({expected_basis!r}): the deadline's basis was not derived "
+            "from the durable gate and reservation state (QB-2)"
+        )
+    return _satisfied(
+        f"gate={reading.gate.value} at epoch {reading.epoch_mirror} with the "
+        f"quiescence deadline derived and recorded (gate_closed_at="
+        f"{durable_gate_closed_at}, deadline={ctx.durable('quiescence_deadline')})"
+    )
+
+
+def _precondition_quiesced(
+    ctx: RemovalPreconditionContext,
+) -> RemovalPreconditionVerdict:
+    """§6.3/TQ-2: zero reservations Held and zero task removals in window,
+    positively read, plus the durable fact that quiescence completed."""
+    reading = _read_quiescence_predicate(
+        ctx.slug, record=ctx.record, register_conn=ctx.conn
+    )
+    if reading.status is not DurableReadStatus.OK:
+        return _unsatisfied(
+            f"TQ-2 cannot be evaluated from durable state: {reading.reason}",
+            RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+    if not reading.satisfied():
+        return _unsatisfied(
+            f"TQ-2: {reading.held} reservation(s) held, "
+            f"{reading.task_removals_in_window} task removal(s) in window",
+            RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE,
+        )
+    if ctx.durable("quiesce_completed_at") is None:
+        return _unsatisfied(
+            "quiescence has not been recorded complete by this transition "
+            "(§6.3)"
+        )
+    return _satisfied("zero held, zero task removals in window, positively read")
+
+
+def _carried_payload_defect(payload: Optional[dict]) -> Optional[str]:
+    """Why *payload* is not a §6.4 carry, or ``None`` when it is one.
+
+    One function, used both by Carried's precondition (before the phase is
+    recorded) and by its driver's revalidation of a record that already
+    sits at Carried — so "what a carry IS" is defined once.
+    """
+    if payload is None:
+        return (
+            "no §6.4 carry payload is durably recorded, or the recorded one "
+            "cannot be decoded: release obligations, the outside-resource "
+            "ledger and the pre-application inventory must be migrated "
+            "before anything is destroyed"
+        )
+    for member in ("release_obligations", "outside_resource_ledger"):
+        if member not in payload:
+            return f"the recorded carry payload names no {member}"
+    ledger = payload.get("outside_resource_ledger")
+    if not isinstance(ledger, list):
+        return "the recorded outside-resource ledger is not a list of members"
+    present = {
+        entry.get("member") for entry in ledger if isinstance(entry, dict)
+    }
+    missing = sorted(_REQUIRED_CARRIED_LEDGER_MEMBERS - present)
+    if missing:
+        return (
+            f"the recorded outside-resource ledger is missing required "
+            f"member(s) {missing}: every ledgered category §12.5 names must "
+            "be carried with its disposition and reason, or the removal is "
+            "acting without knowing what it holds"
+        )
+    return None
+
+
+def _precondition_carried(
+    ctx: RemovalPreconditionContext,
+) -> RemovalPreconditionVerdict:
+    """§6.4: the carry payload is durably present before anything is destroyed."""
+    payload = _decode_json_object(ctx.durable("carried_payload"))
+    defect = _carried_payload_defect(payload)
+    if defect is not None:
+        return _unsatisfied(defect)
+    if ctx.durable("carry_completed_at") is None:
+        return _unsatisfied("the carry has not been recorded complete (§6.4)")
+    return _satisfied(
+        f"{len(payload.get('release_obligations') or [])} release "
+        f"obligation(s) and all {len(_REQUIRED_CARRIED_LEDGER_MEMBERS)} "
+        "required ledger members are carried"
+    )
+
+
+def _precondition_released(
+    ctx: RemovalPreconditionContext,
+) -> RemovalPreconditionVerdict:
+    """§6.5: every carried environment has a recorded terminal release state."""
+    if _decode_json_object(ctx.record.carried_payload) is None:
+        return _unsatisfied(
+            "nothing was carried: an environment cannot be released by an "
+            "identity that was never recorded (§6.4, IN-2)"
+        )
+    state = _decode_json_object(ctx.durable("release_state"))
+    if state is None:
+        return _unsatisfied("no §6.5 release state is durably recorded")
+    environments = state.get("environments")
+    if not isinstance(environments, list):
+        return _unsatisfied("the recorded release state names no environments")
+    unresolved = [
+        env for env in environments
+        if env.get("state") not in _TERMINAL_ENVIRONMENT_RELEASE_STATES
+    ]
+    if unresolved:
+        return _unsatisfied(
+            f"{len(unresolved)} environment(s) are neither released nor "
+            "recorded as an operator item (AB-2)",
+            RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE,
+        )
+    if ctx.durable("release_completed_at") is None:
+        return _unsatisfied("the release has not been recorded complete (§6.5)")
+    return _satisfied(f"{len(environments)} environment(s) resolved")
+
+
+def _precondition_applied(
+    ctx: RemovalPreconditionContext,
+) -> RemovalPreconditionVerdict:
+    """§6.6/TQ-2: acting over live work is impossible, in BOTH modes.
+
+    The predicate is read HERE, authoritatively, inside the transition —
+    never supplied by the caller.
+    """
+    if ctx.record.release_completed_at is None:
+        return _unsatisfied(
+            "the release phase has not been recorded complete: authority is "
+            "never destroyed before the resource it governs is released (§6.4)"
+        )
+    reading = _read_quiescence_predicate(
+        ctx.slug, record=ctx.record, register_conn=ctx.conn
+    )
+    if reading.status is not DurableReadStatus.OK:
+        return _unsatisfied(
+            f"TQ-2 cannot be evaluated from durable state: {reading.reason}",
+            RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+    if not reading.satisfied():
+        return _unsatisfied(
+            f"TQ-2: {reading.held} reservation(s) held, "
+            f"{reading.task_removals_in_window} task removal(s) in window — "
+            "the removal re-enters quiescence rather than applying",
+            RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE,
+        )
+    return _satisfied("zero held, zero task removals in window, positively read")
+
+
+def _sweep_state_defect(
+    slug: str, state: Optional[dict]
+) -> "Optional[tuple[str, RemovalAdvanceOutcome]]":
+    """Why *state* does not establish §6.7, or ``None`` when it does.
+
+    One function, used both by Swept's precondition (before the phase is
+    recorded) and by its driver's revalidation of a record already sitting
+    at Swept — so "what a sweep IS" is defined once. Returns the reason
+    and the refusal outcome that fits it.
+    """
+    if state is None:
+        return (
+            "no §6.7 sweep state is durably recorded, or the recorded one "
+            "cannot be decoded",
+            RemovalAdvanceOutcome.REFUSED_PRECONDITION,
+        )
+    classes = state.get("classes")
+    if not isinstance(classes, dict):
+        return (
+            "the recorded sweep state names no record classes",
+            RemovalAdvanceOutcome.REFUSED_PRECONDITION,
+        )
+    missing = sorted(
+        key for key, _ in SWEEP_RECORD_CLASSES
+        if not isinstance(classes.get(key), dict) or not classes[key].get("result")
+    )
+    if missing:
+        return (
+            f"record class(es) with no recorded result: {missing} — a class "
+            "this codebase has no store for is recorded as not-present with "
+            "that reason, never silently skipped (IN-3)",
+            RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE,
+        )
+    indeterminate = sorted(
+        key for key, entry in classes.items()
+        if entry.get("result") == SWEEP_RESULT_INDETERMINATE
+    )
+    if indeterminate:
+        return (
+            f"record class(es) whose records could not be READ: "
+            f"{indeterminate} — a failed read is not a proof of absence",
+            RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+    failed = sorted(
+        key for key, entry in classes.items()
+        if entry.get("result") == SWEEP_RESULT_ERROR
+    )
+    if failed:
+        return (
+            f"record class(es) whose sweep failed: {failed}",
+            RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE,
+        )
+    countless = sorted(
+        key for key, entry in classes.items()
+        if entry.get("result") == SWEEP_RESULT_NOT_PRESENT
+        and "count" in entry and entry.get("count") is None
+    )
+    if countless:
+        # A count that could not be read is a failed read (IN-3): the
+        # absence is not established, so the outcome is INDETERMINATE,
+        # not work-incomplete.  This path is now unreachable by
+        # construction for a failed read (the sweep site yields
+        # INDETERMINATE, not not-present-with-no-count), but remains as
+        # a fail-closed backstop.
+        return (
+            f"record class(es) recorded not-present with no count read: "
+            f"{countless} — a count that could not be read is an "
+            "indeterminate answer, never an absence",
+            RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+    contradiction = _sweep_pointer_contradiction(slug, classes.get("current-pointer"))
+    if contradiction is not None:
+        return contradiction, RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE
+    return None
+
+
+def _sweep_pointer_contradiction(slug: str, entry) -> Optional[str]:
+    """Does durable state still agree with the recorded pointer verdict?
+
+    The current-board pointer is the one swept class whose work is
+    directly checkable after the fact: a recorded ``removed`` /
+    ``not-present`` verdict means the shared pointer does not name this
+    board. If it names this board again, the recorded result is
+    contradicted and no success may be reported over it.
+    """
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("result") not in (SWEEP_RESULT_REMOVED, SWEEP_RESULT_NOT_PRESENT):
+        return None
+    path = current_board_path()
+    try:
+        recorded = path.read_text(encoding="utf-8").strip() if path.exists() else ""
+    except OSError as exc:
+        return (
+            f"the current-board pointer recorded as {entry.get('result')} "
+            f"cannot be read back, so the recorded result is unverifiable: {exc}"
+        )
+    if not recorded:
+        return None
+    try:
+        names_this_board = _normalize_board_slug(recorded) == slug
+    except ValueError:
+        names_this_board = False
+    if names_this_board:
+        return (
+            f"the sweep recorded the current-board pointer as "
+            f"{entry.get('result')}, but the pointer at {path} names "
+            f"{recorded!r} again: durable state contradicts the recorded result"
+        )
+    return None
+
+
+def _precondition_swept(ctx: RemovalPreconditionContext) -> RemovalPreconditionVerdict:
+    """§6.7: every named record class has a POSITIVELY READ result."""
+    state = _decode_json_object(ctx.durable("sweep_state"))
+    defect = _sweep_state_defect(ctx.slug, state)
+    if defect is not None:
+        return _unsatisfied(*defect)
+    if ctx.durable("sweep_completed_at") is None:
+        return _unsatisfied("the sweep has not been recorded complete (§6.7)")
+    return _satisfied(f"{len(state['classes'])} record class(es) swept")
+
+
+def _precondition_done(ctx: RemovalPreconditionContext) -> RemovalPreconditionVerdict:
+    """§6.8: the sweep is durably complete, §6.6's mode-specific application
+    has been performed, and the register entry moves in the SAME
+    transaction — which only :func:`complete_removal` does.
+
+    Done is the only point at which success is reported, and the register
+    entry it moves to ``archived``/``hard-removed`` is a DURABLE CLAIM
+    ABOUT THE WORLD: a restart reading ``hard-removed`` believes the
+    board's content is gone. So Done's meaning includes the one piece of
+    §6 whose content is deferred to §7.2/§7.3 — deferring the WORK is
+    authorised, but reporting success while it is outstanding is not.
+    """
+    if ctx.record.sweep_completed_at is None:
+        return _unsatisfied(
+            "the sweep has not been recorded complete: Done may not be "
+            "recorded before Swept's meaning is true (§6.7, §6.8)"
+        )
+    marker = applied_mode_content_marker(ctx.record)
+    if marker.get("state") != APPLIED_MODE_CONTENT_APPLIED:
+        return _unsatisfied(
+            f"§6.6's mode-specific application is {marker.get('state')}: "
+            f"{marker.get('rule')} ({marker.get('requirement')}) has not been "
+            f"performed for this {marker.get('mode')} removal, so "
+            f"{_terminal_lifecycle_for(ctx.record.mode).value} would be a false "
+            "terminal fact — the outstanding item is recorded and surfaced, and "
+            "record_applied_mode_content() with durable evidence is the only "
+            "thing that clears it",
+            RemovalAdvanceOutcome.REFUSED_MODE_CONTENT_OUTSTANDING,
+        )
+    return _satisfied(
+        "the sweep is durably complete and §6.6's mode-specific application "
+        "is durably recorded as performed"
+    )
+
+
+# Keyed by TARGET phase, one entry per phase in :data:`REMOVAL_PHASE_ORDER`.
+# A new phase cannot be added without a decision about what its name means,
+# because the completeness check below refuses to import without one.
+_REMOVAL_PHASE_PRECONDITIONS: "dict[RemovalPhase, RemovalPhasePrecondition]" = {
+    RemovalPhase.INTENT: RemovalPhasePrecondition(
+        rule="§6.1",
+        summary="the register entry moves live -> removing in the same transaction",
+        check=_precondition_intent,
+        driver="record_removal_intent",
+    ),
+    RemovalPhase.FENCED: RemovalPhasePrecondition(
+        rule="§6.2/EM-2/QB-2",
+        summary="the gate is closing or frozen, the mirror equals the "
+                "authoritative epoch, and the one-time deadline is recorded",
+        check=_precondition_fenced,
+        driver="advance_removal_to_fenced",
+    ),
+    RemovalPhase.QUIESCED: RemovalPhasePrecondition(
+        rule="§6.3/TQ-2",
+        summary="zero reservations Held and zero task removals in window, "
+                "positively read, with quiescence recorded complete",
+        check=_precondition_quiesced,
+        driver="advance_removal_to_quiesced",
+    ),
+    RemovalPhase.CARRIED: RemovalPhasePrecondition(
+        rule="§6.4",
+        summary="the release obligations, ledger and pre-application "
+                "inventory are durably carried",
+        check=_precondition_carried,
+        driver="advance_removal_to_carried",
+    ),
+    RemovalPhase.RELEASED: RemovalPhasePrecondition(
+        rule="§6.5/AB-1/AB-2",
+        summary="every carried environment is released by its exact identity "
+                "or recorded as an operator item",
+        check=_precondition_released,
+        driver="advance_removal_to_released",
+    ),
+    RemovalPhase.APPLIED: RemovalPhasePrecondition(
+        rule="§6.6/TQ-2",
+        summary="zero reservations Held and zero task removals in window, "
+                "read authoritatively inside the transition",
+        check=_precondition_applied,
+        driver="advance_removal_to_applied",
+    ),
+    RemovalPhase.SWEPT: RemovalPhasePrecondition(
+        rule="§6.7/IN-3/IN-5",
+        summary="every named record class has a recorded result",
+        check=_precondition_swept,
+        driver="advance_removal_to_swept",
+    ),
+    RemovalPhase.DONE: RemovalPhasePrecondition(
+        rule="§6.8",
+        summary="the sweep is durably complete, §6.6's mode-specific "
+                "application is durably recorded as performed, and the "
+                "register entry moves in the same transaction",
+        check=_precondition_done,
+        driver="complete_removal",
+    ),
+}
+
+# Phases whose name may ONLY be recorded by their own named driver.
+#
+# Intent and Done are here because their meaning includes a write the
+# phase primitive cannot make (the register entry's own lifecycle
+# transition). Fenced, Quiesced, Carried, Released, Applied and Swept
+# are here because their meaning is WORK (or, for Fenced, a deadline
+# the next phase acts on), and the durable proof of that work is a
+# sealed, phase-owned column (:data:`_PHASE_OWNED_FIELD_WRITERS`) that
+# only their driver can derive and write. A generic transition into one
+# of them could only ever record the name without the work, so the
+# generic public entry point refuses it and names the driver instead.
+#
+# Fenced's three phase-owned facts (quiescence_deadline, deadline_basis,
+# gate_closed_at) are consumed as the deadline the next phase (Quiesced)
+# acts on: a caller-supplied PAST deadline would trigger force-end-held
+# on live work; a caller-supplied FUTURE deadline would stall the
+# removal indefinitely. Sealing them to the driver and closing the
+# phase to the public entry point prevents both.
+_REMOVAL_PHASES_CLOSED_TO_PUBLIC_CAS = frozenset({
+    RemovalPhase.INTENT,
+    RemovalPhase.FENCED,
+    RemovalPhase.QUIESCED,
+    RemovalPhase.CARRIED,
+    RemovalPhase.RELEASED,
+    RemovalPhase.APPLIED,
+    RemovalPhase.SWEPT,
+    RemovalPhase.DONE,
+})
+
+_missing_preconditions = [
+    phase.value for phase in REMOVAL_PHASE_ORDER
+    if phase not in _REMOVAL_PHASE_PRECONDITIONS
+]
+if _missing_preconditions:  # pragma: no cover - import-time completeness check
+    raise RuntimeError(
+        "every removal phase needs a decision about its precondition; "
+        f"missing: {_missing_preconditions}"
+    )
+del _missing_preconditions
+
+
+def removal_phase_precondition(
+    phase: "RemovalPhase | str",
+) -> RemovalPhasePrecondition:
+    """The registered meaning of *phase*, as a checkable precondition."""
+    return _REMOVAL_PHASE_PRECONDITIONS[RemovalPhase(phase)]
+
+
+def advance_removal_phase(
+    board: str,
+    *,
+    removal_id: str,
+    from_phase: "RemovalPhase | str",
+    to_phase: "RemovalPhase | str",
+    observed_phase: "RemovalPhase | str | None" = None,
+    **fields: Any,
+) -> RemovalPhaseAdvanceResult:
+    """The GUARDED entry point for a phase transition (§6).
+
+    Everything :func:`_advance_removal_phase` guards. The target phase's
+    PRECONDITION — its entry in :data:`_REMOVAL_PHASE_PRECONDITIONS` — is
+    NOT supplied here and cannot be: it is derived from ``to_phase`` and
+    evaluated inside the same transaction that writes the ``phase``
+    column, by :func:`_advance_removal_phase_in_txn`. A precondition that
+    is not durably true refuses, naming the rule that failed; a read that
+    FAILED is not a pass.
+
+    **Every phase is closed to this entry point**
+    (:data:`_REMOVAL_PHASES_CLOSED_TO_PUBLIC_CAS`): each is recordable
+    only by its own named driver, and this function refuses while naming
+    that driver. Intent and Done move the register entry in the same
+    transaction, which the phase primitive cannot; Fenced, Quiesced,
+    Carried, Released, Applied and Swept each own sealed, phase-owned
+    columns (:data:`_PHASE_OWNED_FIELD_WRITERS`) their driver alone
+    derives — a caller-supplied value is not durable evidence.
+
+    ``observed_phase`` is what the caller durably observed BEFORE doing
+    this transition's work. Declaring it turns "the record already sits at
+    the target" from an idempotent repeat into a REFUSAL: a caller that
+    saw ``from_phase``, did the work, and then found the phase already
+    moved lost a genuine contended transition and must be told so, not
+    handed a success it did not perform.
+
+    :data:`_REMOVAL_PHASE_SEALED_FIELDS` may not be passed here at all,
+    and nothing here sets or forwards the private ``_phase_owned``
+    channel: a field whose whole point is that it records what was
+    VERIFIED to have happened cannot be accepted as an assertion from the
+    caller.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_INVALID_BOARD, "invalid board name"
+        )
+    sealed = sorted(set(fields) & _REMOVAL_PHASE_SEALED_FIELDS)
+    if sealed:
+        raise ValueError(
+            f"advance_removal_phase: {sealed} may not be written by a caller. "
+            + "; ".join(
+                f"{name} is the durable proof {_PHASE_OWNED_FIELD_WRITERS[name][0]} "
+                f"means what it says, derived and written by "
+                f"{_PHASE_OWNED_FIELD_WRITERS[name][1]}"
+                for name in sealed
+            )
+            + " — a fact supplied by the caller is never durable evidence that "
+            "the work happened"
+        )
+    to_phase = RemovalPhase(to_phase)
+    precondition = removal_phase_precondition(to_phase)
+    if to_phase in _REMOVAL_PHASES_CLOSED_TO_PUBLIC_CAS:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_PRECONDITION,
+            f"{precondition.rule}: {to_phase.value} is recorded only by "
+            f"{precondition.driver} ({precondition.summary})",
+        )
+    return _advance_removal_phase(
+        slug,
+        removal_id=removal_id,
+        from_phase=from_phase,
+        to_phase=to_phase,
+        observed_phase=observed_phase,
+        **fields,
+    )
+
+
+def _advance_removal_phase(
+    board: str,
+    *,
+    removal_id: str,
+    from_phase: "RemovalPhase | str",
+    to_phase: "RemovalPhase | str",
+    observed_phase: "RemovalPhase | str | None" = None,
+    _phase_owned: Optional[dict] = None,
+    **fields: Any,
+) -> RemovalPhaseAdvanceResult:
+    """The single compare-and-set primitive every phase transition uses (§6).
+
+    Runs under :func:`board_register_lock` — the same per-board lock Gate
+    A uses. Matches on ``board_name`` AND ``removal_id`` AND the current
+    phase equalling ``from_phase``; commits only if exactly one row
+    changed. Rules, in the order they are checked:
+
+    * an exact match on the target phase already (``to_phase`` == the
+      recorded phase) is an IDEMPOTENT no-op success — roll-forward
+      recovery re-runs steps, and repeating one must be a no-op — UNLESS
+      the caller declared it observed ``from_phase``, in which case it is
+      a contended transition this caller LOST and is refused;
+    * a ``to_phase`` whose ordinal is lower than the recorded phase is
+      refused: phases only move forward;
+    * a recorded phase that is neither ``from_phase`` nor ``to_phase`` is
+      a stale transition and is refused;
+    * a ``to_phase`` that is not the immediate successor of the recorded
+      phase is refused: no skipping;
+    * a mode passed in ``fields`` that disagrees with the recorded mode
+      is refused: the recorded mode never changes;
+    * the TARGET PHASE'S registered precondition, derived from
+      ``to_phase`` by :func:`_advance_removal_phase_in_txn` itself and
+      evaluated inside the transaction that would write the column: a
+      meaning that is not durably true refuses.
+
+    This is the PRIVATE primitive, and it is guarded exactly as strongly
+    as the public one: there is no parameter through which any caller —
+    driver, recovery or test — can supply, override or omit the
+    precondition.
+
+    ``_phase_owned`` is the ONE channel through which a sealed,
+    phase-owned fact (:data:`_PHASE_OWNED_FIELD_WRITERS`) is ever written.
+    It is module-private, it is not reachable from
+    :func:`advance_removal_phase`'s signature, and that function neither
+    sets it nor forwards anything from ``**fields`` into it — so the only
+    values that reach it are the ones a named driver derived itself. A
+    sealed field passed in ``**fields`` is refused here too, whoever the
+    caller is.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_INVALID_BOARD, "invalid board name"
+        )
+    from_phase = RemovalPhase(from_phase)
+    to_phase = RemovalPhase(to_phase)
+    observed = None if observed_phase is None else RemovalPhase(observed_phase)
+    mode_check = fields.pop("mode", None)
+    unknown = set(fields) - _REMOVAL_PHASE_WRITABLE_FIELDS
+    if unknown:
+        raise ValueError(
+            f"advance_removal_phase: unsupported fields {sorted(unknown)}"
+        )
+    sealed = sorted(set(fields) & _REMOVAL_PHASE_SEALED_FIELDS)
+    if sealed:
+        raise ValueError(
+            f"_advance_removal_phase: {sealed} are phase-owned facts and may "
+            "only be written through the _phase_owned channel by the driver "
+            "that derived them"
+        )
+    phase_owned = dict(_phase_owned or {})
+    unsealed = sorted(set(phase_owned) - _REMOVAL_PHASE_SEALED_FIELDS)
+    if unsealed:
+        raise ValueError(
+            f"_advance_removal_phase: {unsealed} are not phase-owned facts; "
+            "pass them as ordinary fields"
+        )
+    with board_register_lock(slug):
+        with register_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = _advance_removal_phase_in_txn(
+                    conn,
+                    slug,
+                    removal_id=removal_id,
+                    from_phase=from_phase,
+                    to_phase=to_phase,
+                    mode_check=mode_check,
+                    fields=fields,
+                    observed_phase=observed,
+                    phase_owned=phase_owned,
+                )
+                if result.success and result.transitioned:
+                    conn.execute("COMMIT")
+                else:
+                    conn.execute("ROLLBACK")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+    return result
+
+
+def _advance_removal_phase_in_txn(
+    conn: sqlite3.Connection,
+    slug: str,
+    *,
+    removal_id: str,
+    from_phase: RemovalPhase,
+    to_phase: RemovalPhase,
+    mode_check: Optional[str],
+    fields: dict,
+    observed_phase: Optional[RemovalPhase] = None,
+    phase_owned: Optional[dict] = None,
+    at: Optional[int] = None,
+) -> RemovalPhaseAdvanceResult:
+    """The compare-and-set itself, inside a transaction the CALLER owns.
+
+    Split out so Phase 8 can move the phase through this same primitive
+    while its register-entry transition shares one transaction (§6.8):
+    the primitive really is the only writer of ``phase``, and the
+    single-transaction property across both tables is kept. Never commits
+    and never rolls back — that is the caller's, so the two writes are
+    one unit.
+
+    **The target phase's precondition is derived HERE, from ``to_phase``,
+    and always evaluated.** It is not a parameter: a precondition a caller
+    could omit is not a guard, and the same transaction that writes the
+    ``phase`` column is the only place where "the phase's meaning is
+    durably true" can be checked and recorded as one unit (IN-4). The
+    registry (:data:`_REMOVAL_PHASE_PRECONDITIONS`) is the single source
+    of what a phase name means.
+
+    ``phase_owned`` carries the sealed facts the calling DRIVER derived
+    for this phase. They are written in this same statement as the phase
+    column, and the precondition reads them — and only them — as the
+    "being recorded by this transition" half of ``ctx.durable()``.
+
+    ``at`` pins the instant recorded in ``updated_at``. Only Phase 8 passes
+    one, so the terminal instant the register records is the very instant
+    the already-durable §12 receipt names — an instant read back from the
+    receipt cannot be re-chosen here without the two disagreeing.
+    """
+    precondition = removal_phase_precondition(to_phase)
+    phase_owned = dict(phase_owned or {})
+    unsealed = sorted(set(phase_owned) - _REMOVAL_PHASE_SEALED_FIELDS)
+    if unsealed:  # pragma: no cover - programming error, guarded above too
+        raise ValueError(
+            f"_advance_removal_phase_in_txn: {unsealed} are not phase-owned facts"
+        )
+    sealed_in_fields = sorted(set(fields) & _REMOVAL_PHASE_SEALED_FIELDS)
+    if sealed_in_fields:  # pragma: no cover - guarded in every caller above
+        raise ValueError(
+            f"_advance_removal_phase_in_txn: {sealed_in_fields} are phase-owned "
+            "facts and only reach the record through the phase_owned channel"
+        )
+    writes = dict(fields)
+    writes.update(phase_owned)
+    row = conn.execute(
+        "SELECT * FROM board_removal_phase WHERE board_name = ?",
+        (slug,),
+    ).fetchone()
+    if row is None:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_NO_RECORD,
+            f"no removal phase record for {slug!r}",
+        )
+    record = RemovalPhaseRecord.from_row(row)
+
+    if record.removal_id != removal_id:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_ID_MISMATCH,
+            f"removal_id {removal_id!r} does not match the recorded "
+            f"removal {record.removal_id!r}",
+            record=record,
+        )
+
+    if mode_check is not None and RemovalMode(mode_check) != record.mode:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_MODE_MISMATCH,
+            f"recorded mode is {record.mode.value} and never changes",
+            record=record,
+        )
+
+    if record.phase == to_phase:
+        if observed_phase is not None and observed_phase == from_phase != to_phase:
+            # This caller observed from_phase, performed the transition's
+            # work, and arrived to find the phase already moved: it LOST a
+            # genuine contended transition. A loser is refused, never
+            # handed a success it did not perform.
+            return RemovalPhaseAdvanceResult(
+                False, RemovalAdvanceOutcome.REFUSED_LOST_RACE,
+                f"lost the contended {from_phase.value} -> {to_phase.value} "
+                "transition to a concurrent caller",
+                record=record,
+            )
+        # Re-applying a transition that already happened: an idempotent
+        # no-op success, not a failure (§9, roll-forward).
+        return RemovalPhaseAdvanceResult(
+            True, RemovalAdvanceOutcome.IDEMPOTENT_NOOP,
+            f"already at {to_phase.value} (idempotent no-op)",
+            record=record,
+        )
+
+    current_ord = removal_phase_ordinal(record.phase)
+    to_ord = removal_phase_ordinal(to_phase)
+
+    if to_ord < current_ord:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_BACKWARDS,
+            f"phases only move forward: recorded phase is "
+            f"{record.phase.value}, refusing to move to {to_phase.value}",
+            record=record,
+        )
+
+    if record.phase != from_phase:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_STALE,
+            f"recorded phase is {record.phase.value}, not the "
+            f"expected {from_phase.value}: refusing a stale transition",
+            record=record,
+        )
+
+    if to_ord != current_ord + 1:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_SKIP,
+            f"{to_phase.value} is not the immediate successor of "
+            f"{record.phase.value}: refusing to skip",
+            record=record,
+        )
+
+    verdict = precondition.check(
+        RemovalPreconditionContext(
+            slug=slug,
+            record=record,
+            from_phase=from_phase,
+            to_phase=to_phase,
+            fields=dict(fields),
+            now=int(time.time()),
+            conn=conn,
+            phase_owned=dict(phase_owned),
+        )
+    )
+    if not verdict.satisfied:
+        return RemovalPhaseAdvanceResult(
+            False, verdict.outcome,
+            f"{precondition.rule}: refusing to record "
+            f"{to_phase.value} — {verdict.message}",
+            record=record,
+        )
+
+    now = int(time.time()) if at is None else int(at)
+    set_clauses = ["phase = ?", "updated_at = ?"]
+    params: list = [to_phase.value, now]
+    for key, value in writes.items():
+        set_clauses.append(f"{key} = ?")
+        params.append(value)
+    params.extend([slug, removal_id, from_phase.value])
+    cur = conn.execute(
+        f"UPDATE board_removal_phase SET {', '.join(set_clauses)} "
+        "WHERE board_name = ? AND removal_id = ? AND phase = ?",
+        params,
+    )
+    if cur.rowcount != 1:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_STALE,
+            "lost the compare-and-set to a concurrent transition",
+            record=record,
+        )
+
+    updated = replace(record, phase=to_phase, updated_at=now, **writes)
+    return RemovalPhaseAdvanceResult(
+        True, RemovalAdvanceOutcome.ADVANCED,
+        f"advanced {from_phase.value} -> {to_phase.value}",
+        record=updated,
+        transitioned=True,
+    )
+
+
+def _record_phase_fields(
+    slug: str, *, removal_id: str, expect_phase: RemovalPhase, **fields: Any
+) -> bool:
+    """Write non-``phase`` columns on the record, leaving the phase alone.
+
+    Used for durable facts that must survive a transition that did NOT
+    advance: the release attempt budget, the sweep's partial results, and
+    the distinct reason a predicate refused. ``phase`` is never in the SET
+    clause — the compare-and-set primitive stays the only writer of it.
+    """
+    unknown = set(fields) - _REMOVAL_PHASE_WRITABLE_FIELDS
+    if unknown:
+        raise ValueError(f"_record_phase_fields: unsupported fields {sorted(unknown)}")
+    if not fields:
+        return False
+    now = int(time.time())
+    set_clauses = [f"{key} = ?" for key in fields]
+    params: list = list(fields.values())
+    set_clauses.append("updated_at = ?")
+    params.append(now)
+    params.extend([slug, removal_id, expect_phase.value])
+    with board_register_lock(slug, reentrant=True):
+        with register_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    f"UPDATE board_removal_phase SET {', '.join(set_clauses)} "
+                    "WHERE board_name = ? AND removal_id = ? AND phase = ?",
+                    params,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+    return cur.rowcount == 1
+
+
+def _record_phase_refusal(
+    slug: str, record: RemovalPhaseRecord, outcome: str, message: str
+) -> None:
+    """Durably record why a phase did not advance, without moving it."""
+    payload = json.dumps(
+        {
+            "outcome": outcome,
+            "message": message,
+            "phase": record.phase.value,
+            "recorded_at": int(time.time()),
+        },
+        ensure_ascii=False,
+    )
+    try:
+        _record_phase_fields(
+            slug,
+            removal_id=record.removal_id,
+            expect_phase=record.phase,
+            refusal_outcome=payload,
+        )
+    except sqlite3.Error as exc:  # pragma: no cover - register write failure
+        _log.warning(
+            "kanban removal: could not record the %s refusal for %s: %s",
+            outcome, slug, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Fenced (§6.2): wires in the EXISTING fence-closing point
+# ---------------------------------------------------------------------------
+
+# QB-2: the voluntary-completion grace added to the latest recorded held
+# expiry (or the fence-closing instant, whichever is later) to produce the
+# quiescence deadline. Named module constant, never a literal.
+QUIESCENCE_GRACE_SECONDS = 15 * 60
+
+
+@dataclass
+class FencedAdvanceResult:
+    """Result of :func:`advance_removal_to_fenced` (§6.2)."""
+    success: bool
+    message: str
+    transitioned: bool = False
+    record: Optional[RemovalPhaseRecord] = None
+    fence_result: Optional[FenceCloseResult] = None
+    outcome: Optional[RemovalAdvanceOutcome] = None
+
+
+def _compute_quiescence_deadline(
+    slug: str, *, gate_closed_at: int, record: Optional[RemovalPhaseRecord] = None
+) -> "tuple[Optional[int], str]":
+    """QB-2: compute the quiescence deadline, once, at the fence.
+
+    ``deadline = max(latest recorded expiry among reservations Held at the
+    fence-closing point, the fence-closing instant) + grace``. Never
+    earlier than the fence-closing instant plus the grace, even when a
+    held reservation's expiry had already passed (QB-1d-i's
+    carried-to-the-deadline holder still gets the whole
+    voluntary-completion window).
+
+    ``gate_closed_at`` is the DURABLE fence-closing instant — the in-board
+    gate row's own ``updated_at`` — never the caller's clock. A recovery
+    that runs hours after the gate committed therefore computes the same
+    value the original run would have, instead of extending a bound §6.3
+    says is computed once.
+
+    Returns ``(None, reason)`` when the reservations cannot be read: a
+    deadline may not be computed from a failed read.
+    """
+    reading = _read_quiescence_predicate(slug, record=record)
+    if reading.status is not DurableReadStatus.OK:
+        return None, reading.reason
+    expiries = [
+        int(row["claim_expires"])
+        for row in reading.held_rows
+        if row["claim_expires"] is not None
+    ]
+    latest_expiry = max(expiries) if expiries else None
+    if latest_expiry is None:
+        return (
+            gate_closed_at + QUIESCENCE_GRACE_SECONDS,
+            "no-reservations-held-at-fence-close",
+        )
+    if latest_expiry > gate_closed_at:
+        return (
+            latest_expiry + QUIESCENCE_GRACE_SECONDS,
+            "latest-held-reservation-expiry",
+        )
+    return (
+        gate_closed_at + QUIESCENCE_GRACE_SECONDS,
+        "fence-closing-instant-expiry-already-passed",
+    )
+
+
+def advance_removal_to_fenced(
+    board: str, *, removal_id: str
+) -> FencedAdvanceResult:
+    """Phase 2 — Fenced (§6.2): drives and records the fence-closing point.
+
+    Calls the EXISTING :func:`commit_fence_closing_point` — it does not
+    write Gate B itself, does not re-implement the mirror write, and does
+    not copy that function's body. Only if the close succeeds does it
+    record ``gate_move`` = ``settled`` on the register entry. **The order
+    is specified and obeyed**: board-store commit first, register record
+    second. A stop between the two is crash point P2a and refuses
+    nothing, because register and mirror are then equal and EM-4a admits
+    equality on its own.
+
+    This is the only path that legitimately reaches Fenced: it drives the
+    fence-closing point first and only then satisfies Fenced's
+    precondition (gate closed, mirror equal to the authority, deadline
+    recorded by this same transition).
+
+    Computes the quiescence deadline (QB-2) once, FROM THE DURABLE
+    FENCE-CLOSING INSTANT, and records it in the same write as the phase
+    advance to Fenced. Never recomputes it: a repeat of this call, and a
+    recovery arriving hours after the gate committed, both derive the
+    same value from the same durable instant.
+
+    Refuses if the phase record is missing, if ``removal_id`` does not
+    match, or if the fence close fails — and in that last case does NOT
+    advance the phase.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return FencedAdvanceResult(False, "invalid board name")
+
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return FencedAdvanceResult(
+            False, f"no removal phase record for {slug!r}: intent must be "
+            "recorded first"
+        )
+    if record.removal_id != removal_id:
+        return FencedAdvanceResult(
+            False, f"removal_id {removal_id!r} does not match the recorded "
+            f"removal {record.removal_id!r}", record=record,
+        )
+
+    fence_result = commit_fence_closing_point(slug)
+    if not fence_result.success:
+        return FencedAdvanceResult(
+            False, f"fence close refused: {fence_result.message}",
+            record=record, fence_result=fence_result,
+        )
+
+    with board_register_lock(slug, reentrant=True):
+        return _advance_removal_to_fenced_locked(
+            slug, removal_id=removal_id, fence_result=fence_result,
+            observed_phase=record.phase,
+        )
+
+
+def _advance_removal_to_fenced_locked(
+    slug: str,
+    *,
+    removal_id: str,
+    fence_result: FenceCloseResult,
+    observed_phase: Optional[RemovalPhase] = None,
+) -> FencedAdvanceResult:
+    entry = get_register_entry(slug)
+    if entry is None:
+        return FencedAdvanceResult(
+            False, "register entry missing after the fence closed",
+            fence_result=fence_result,
+        )
+
+    # Board-store commit already happened (above). Register record second,
+    # per §6.2's mandated order. Re-recording settled is a no-op (P2a).
+    if entry.gate_move != GateMove.SETTLED:
+        entry = replace(entry, gate_move=GateMove.SETTLED, updated_at=int(time.time()))
+        _transition_register_entry_locked(entry)
+
+    record = get_removal_phase_record(slug)
+    if record is None or record.removal_id != removal_id:
+        return FencedAdvanceResult(
+            False, "phase record missing or removal_id mismatch after the "
+            "fence closed", fence_result=fence_result,
+        )
+
+    # The fence-closing instant is DURABLE STATE, read back from the gate
+    # row that carries it — not this process's clock. A restart between
+    # the gate commit and this record therefore computes the deadline from
+    # the instant the gate actually closed (QB-2, compute-once).
+    gate = _read_gate_instant(slug)
+    if gate.status is not DurableReadStatus.OK:
+        return FencedAdvanceResult(
+            False,
+            f"cannot read the in-board gate after closing it: {gate.reason}",
+            record=record, fence_result=fence_result,
+            outcome=RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+    if gate.gate is InBoardGate.OPEN:
+        return FencedAdvanceResult(
+            False,
+            "the in-board gate is still open after the fence-closing point: "
+            "refusing to record fenced",
+            record=record, fence_result=fence_result,
+            outcome=RemovalAdvanceOutcome.REFUSED_PRECONDITION,
+        )
+    gate_closed_at = record.gate_closed_at
+    if gate_closed_at is None:
+        gate_closed_at = gate.updated_at
+    if gate_closed_at is None:
+        return FencedAdvanceResult(
+            False,
+            "the in-board gate records no closing instant: refusing to "
+            "compute a one-time deadline from this process's clock (QB-2)",
+            record=record, fence_result=fence_result,
+            outcome=RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+
+    deadline = record.quiescence_deadline
+    basis = record.deadline_basis
+    if deadline is None:
+        deadline, basis = _compute_quiescence_deadline(
+            slug, gate_closed_at=int(gate_closed_at), record=record
+        )
+        if deadline is None:
+            return FencedAdvanceResult(
+                False,
+                f"cannot compute the quiescence deadline: {basis}",
+                record=record, fence_result=fence_result,
+                outcome=RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+            )
+
+    advance = _advance_removal_phase(
+        slug,
+        removal_id=removal_id,
+        from_phase=RemovalPhase.INTENT,
+        to_phase=RemovalPhase.FENCED,
+        observed_phase=(
+            observed_phase if observed_phase == RemovalPhase.INTENT else None
+        ),
+        _phase_owned={
+            "quiescence_deadline": deadline,
+            "deadline_basis": basis,
+            "gate_closed_at": int(gate_closed_at),
+        },
+    )
+    return FencedAdvanceResult(
+        advance.success,
+        advance.message,
+        transitioned=advance.transitioned,
+        record=advance.record,
+        fence_result=fence_result,
+        outcome=advance.outcome,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Quiesced (§6.3), and the shared deadline decision point (QB-3)
+# ---------------------------------------------------------------------------
+
+class QuiescenceDeadlineAction(str, Enum):
+    """QB-3's shared decision point: what the deadline implies (§6.3).
+
+    Deciding is shared between both modes; ACTING on ``FORCE_END_HELD``
+    (permanent) or ``ABANDON`` (reversible) is mode-specific later work
+    (§7.2, §9.2) — this enum and :func:`quiescence_deadline_action` only
+    return the decision.
+    """
+    ADVANCE = "advance"
+    WAIT = "wait"
+    FORCE_END_HELD = "force-end-held"
+    ABANDON = "abandon"
+
+
+def quiescence_deadline_action(
+    record: RemovalPhaseRecord, *, held: int, now: Optional[int] = None
+) -> QuiescenceDeadlineAction:
+    """QB-3: what a still-outstanding reservation implies, at the deadline.
+
+    ``held <= 0`` always advances, regardless of the deadline. Otherwise:
+    before the recorded deadline the removal WAITs — QB-1d-i means a
+    passed *expiry* is not, by itself, authority to end anything, so a
+    Held reservation whose holder is alive or indeterminate stays Held
+    until the deadline. At or after the deadline: force-ending is
+    permitted in permanent mode only (disclosed on the receipt);
+    reversible mode abandons instead, destroying nothing.
+    """
+    if held <= 0:
+        return QuiescenceDeadlineAction.ADVANCE
+    now = now if now is not None else int(time.time())
+    deadline = record.quiescence_deadline
+    if deadline is None or now < deadline:
+        return QuiescenceDeadlineAction.WAIT
+    return (
+        QuiescenceDeadlineAction.FORCE_END_HELD
+        if record.mode == RemovalMode.PERMANENT
+        else QuiescenceDeadlineAction.ABANDON
+    )
+
+
+# ---------------------------------------------------------------------------
+# QB-1c / QB-1d — the removal is the SINGLE resolver of every reservation
+# on a board being removed
+# ---------------------------------------------------------------------------
+
+class HolderPresence(str, Enum):
+    """What a liveness probe PROVED about a reservation's holder (AB-1).
+
+    ``INDETERMINATE`` is not a shade of absent: it is treated exactly like
+    ``LIVE``, and the reservation stays Held until the deadline (QB-1d-i).
+    """
+    LIVE = "live"
+    PROVABLY_ABSENT = "provably-absent"
+    INDETERMINATE = "indeterminate"
+
+
+@dataclass
+class HolderProbe:
+    """The verdict on one Held reservation's holder, with its reason."""
+    task_id: str
+    presence: HolderPresence
+    reason: str
+    worker_pid: Optional[int] = None
+    claim_lock: Optional[str] = None
+
+
+@dataclass
+class AbsentHolderResolution:
+    """Result of :func:`resolve_absent_holder_reservations` (QB-1d)."""
+    success: bool
+    message: str
+    probes: "tuple[HolderProbe, ...]" = ()
+    ended: "tuple[str, ...]" = ()
+
+
+def _probe_holder_presence(row, *, host_prefix: str, pid_probe) -> HolderProbe:
+    """Is this reservation's holder PROVABLY absent? (QB-1d, AB-1 shape.)
+
+    A positive standard, in three parts, every one of which must hold:
+    the claim records a ``worker_pid``; the recorded holder is on THIS
+    host (a PID recorded on another host is a PID this system cannot
+    interrogate); and a liveness probe that SUCCEEDED says the process is
+    gone. Anything else — no PID, a foreign host, a probe that raised —
+    is indeterminate, and an indeterminate holder is treated as live.
+    Fail-closed, in the direction that protects work.
+    """
+    task_id = row["id"]
+    claim_lock = row["claim_lock"]
+    pid = row["worker_pid"]
+    if not pid:
+        return HolderProbe(
+            task_id, HolderPresence.INDETERMINATE,
+            "the claim records no worker pid: absence cannot be proven",
+            claim_lock=claim_lock,
+        )
+    lock = claim_lock or ""
+    if not lock.startswith(host_prefix):
+        return HolderProbe(
+            task_id, HolderPresence.INDETERMINATE,
+            f"the holder is recorded on another host ({lock!r}), which this "
+            "system cannot interrogate: its recorded expiry is what resolves it",
+            worker_pid=int(pid), claim_lock=claim_lock,
+        )
+    try:
+        alive = pid_probe(int(pid))
+    except Exception as exc:
+        return HolderProbe(
+            task_id, HolderPresence.INDETERMINATE,
+            f"the liveness probe for pid {int(pid)} failed ({exc}): a query "
+            "that did not succeed proves nothing",
+            worker_pid=int(pid), claim_lock=claim_lock,
+        )
+    if alive:
+        return HolderProbe(
+            task_id, HolderPresence.LIVE,
+            f"pid {int(pid)} is alive on this host",
+            worker_pid=int(pid), claim_lock=claim_lock,
+        )
+    return HolderProbe(
+        task_id, HolderPresence.PROVABLY_ABSENT,
+        f"pid {int(pid)} is recorded on this host and a successful probe "
+        "found it absent",
+        worker_pid=int(pid), claim_lock=claim_lock,
+    )
+
+
+def resolve_absent_holder_reservations(
+    board: str,
+    *,
+    removal_id: str,
+    pid_probe: Optional[Any] = None,
+) -> AbsentHolderResolution:
+    """QB-1d: END every reservation whose holder is PROVABLY absent.
+
+    Standing every claim-ending path down at the fence (QB-1c) leaves the
+    board removal as the single resolver of every reservation on the
+    board. This is that resolver: in BOTH modes, at ANY point during
+    quiescence, a reservation whose holder is provably absent is
+    transitioned to Ended through a single-owner conditional transition
+    (the same ``claim_lock``/``worker_pid`` compare-and-set every derived
+    resource uses), so exactly one side can win and no claim is ended
+    twice.
+
+    **A passed expiry is not, by itself, authority to end anything**
+    (QB-1d-i): there is no expiry arm here. A holder that is alive, or
+    that cannot be SHOWN absent, stays Held and is resolved only at the
+    deadline by QB-3.
+
+    Requires the fence to be closed: with the gate still open the
+    ordinary claim-ending paths are still in charge, and the removal is
+    not yet the single resolver.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return AbsentHolderResolution(False, "invalid board name")
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return AbsentHolderResolution(False, f"no removal phase record for {slug!r}")
+    if record.removal_id != removal_id:
+        return AbsentHolderResolution(
+            False,
+            f"removal_id {removal_id!r} does not match the recorded removal "
+            f"{record.removal_id!r}",
+        )
+    gate = _read_gate_instant(slug)
+    if gate.status is not DurableReadStatus.OK:
+        return AbsentHolderResolution(
+            False, f"cannot read the in-board gate: {gate.reason}"
+        )
+    if gate.gate is InBoardGate.OPEN:
+        return AbsentHolderResolution(
+            False,
+            "the in-board gate is still open: the removal is not yet the "
+            "single resolver of this board's reservations (QB-1c)",
+        )
+
+    reading = _read_quiescence_predicate(slug, record=record)
+    if reading.status is not DurableReadStatus.OK:
+        return AbsentHolderResolution(
+            False, f"cannot read this board's reservations: {reading.reason}"
+        )
+    if not reading.held_rows:
+        return AbsentHolderResolution(True, "no reservation is held")
+
+    probe = pid_probe if pid_probe is not None else _pid_alive
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    probes = tuple(
+        _probe_holder_presence(row, host_prefix=host_prefix, pid_probe=probe)
+        for row in reading.held_rows
+    )
+    absent = [p for p in probes if p.presence is HolderPresence.PROVABLY_ABSENT]
+    if not absent:
+        return AbsentHolderResolution(
+            True, "no holder could be PROVEN absent: every reservation stays "
+            "Held until the deadline (QB-1d-i)",
+            probes=probes,
+        )
+
+    ended: list[str] = []
+    now = int(time.time())
+    # The removal is the machinery here, not a client of it: the gate it
+    # closed itself is what stands every OTHER claim-ending path down.
+    with _fence_protocol_scope():
+        conn = connect(board=slug)
+        try:
+            for verdict in absent:
+                with write_txn(conn):
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL, "
+                        "last_heartbeat_at = NULL "
+                        "WHERE id = ? AND status = 'running' "
+                        "  AND claim_lock IS ? AND worker_pid IS ?",
+                        (verdict.task_id, verdict.claim_lock, verdict.worker_pid),
+                    )
+                    if cur.rowcount != 1:
+                        # Lost the single-owner transition: the loser does
+                        # not act, and no reservation is ended twice.
+                        continue
+                    payload = {
+                        "reason": "removal-resolved-absent-holder",
+                        "rule": "QB-1d",
+                        "removal_id": removal_id,
+                        "claim_lock": verdict.claim_lock,
+                        "worker_pid": verdict.worker_pid,
+                        "detail": verdict.reason,
+                        "now": now,
+                    }
+                    run_id = _end_run(
+                        conn, verdict.task_id,
+                        outcome="reclaimed", status="reclaimed",
+                        error="holder provably absent during board removal",
+                        metadata=payload,
+                    )
+                    _append_event(
+                        conn, verdict.task_id, "removal_ended_claim", payload,
+                        run_id=run_id,
+                    )
+                    ended.append(verdict.task_id)
+        finally:
+            conn.close()
+    return AbsentHolderResolution(
+        True,
+        f"ended {len(ended)} reservation(s) whose holder is provably absent",
+        probes=probes,
+        ended=tuple(ended),
+    )
+
+
+@dataclass
+class QuiescedAdvanceResult:
+    """Result of :func:`advance_removal_to_quiesced` (§6.3)."""
+    success: bool
+    message: str
+    transitioned: bool = False
+    record: Optional[RemovalPhaseRecord] = None
+    action: Optional[QuiescenceDeadlineAction] = None
+    held: Optional[int] = 0
+    outcome: Optional[RemovalAdvanceOutcome] = None
+    resolution: Optional[AbsentHolderResolution] = None
+
+
+def _revalidate_recorded_quiescence(
+    slug: str, record: RemovalPhaseRecord
+) -> QuiescedAdvanceResult:
+    """Re-verify a record that is ALREADY at Quiesced (§6.3).
+
+    An idempotent no-op is a success, and a success is a claim: it says
+    quiescence happened and still holds. So the claim is re-checked
+    against durable state — the phase's own completion fact, and TQ-2
+    itself — and a claim durable state does not support is refused, with
+    the reason recorded. A driver must never return ``idempotent-noop``
+    over state it did not establish.
+    """
+    if record.quiesce_completed_at is None:
+        message = (
+            "the record sits at quiesced but carries no durable completion "
+            "fact (§6.3): refusing to report a no-op success over a phase "
+            "whose meaning is not recorded"
+        )
+        _record_phase_refusal(
+            slug, record,
+            RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE.value, message,
+        )
+        return QuiescedAdvanceResult(
+            False, message, record=record, held=None,
+            outcome=RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE,
+        )
+    reading = _read_quiescence_predicate(slug, record=record)
+    if reading.status is not DurableReadStatus.OK:
+        message = (
+            "the record sits at quiesced but TQ-2 can no longer be read, so "
+            f"the no-op success it would report is not supported: {reading.reason}"
+        )
+        _record_phase_refusal(
+            slug, record,
+            RemovalAdvanceOutcome.REFUSED_INDETERMINATE.value, message,
+        )
+        return QuiescedAdvanceResult(
+            False, message, record=record, held=None,
+            outcome=RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+    if not reading.satisfied():
+        message = (
+            f"the record sits at quiesced but TQ-2 no longer holds: "
+            f"{reading.held} reservation(s) held, "
+            f"{reading.task_removals_in_window} task removal(s) in window — "
+            "the removal re-enters quiescence rather than reporting success"
+        )
+        _record_phase_refusal(
+            slug, record,
+            RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE.value, message,
+        )
+        return QuiescedAdvanceResult(
+            False, message, record=record, held=reading.held,
+            action=quiescence_deadline_action(record, held=reading.held or 0),
+            outcome=RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE,
+        )
+    return QuiescedAdvanceResult(
+        True, "already at quiesced (idempotent no-op), re-verified against "
+        "durable state", record=record, action=QuiescenceDeadlineAction.ADVANCE,
+        held=0, outcome=RemovalAdvanceOutcome.IDEMPOTENT_NOOP,
+    )
+
+
+def advance_removal_to_quiesced(
+    board: str,
+    *,
+    removal_id: str,
+    now: Optional[int] = None,
+    pid_probe: Optional[Any] = None,
+    observed_phase: "RemovalPhase | str | None" = None,
+) -> QuiescedAdvanceResult:
+    """Phase 3 — Quiesced (§6.3): advances only when quiescence is satisfied.
+
+    Does the phase's work before recording it:
+
+    1. **Resolves what it alone can resolve** — every reservation whose
+       holder is provably absent is Ended by the removal itself
+       (:func:`resolve_absent_holder_reservations`, QB-1d), in both modes.
+       A holder that is alive or indeterminate is left Held (QB-1d-i).
+    2. **Reads TQ-2's predicate authoritatively** from durable state —
+       zero reservations Held and zero task removals in their window, in
+       BOTH modes. An indeterminate read is NOT a zero: it refuses.
+    3. Records ``quiesce_completed_at`` — a sealed, phase-owned fact — in
+       the SAME transaction as the advance, through the driver-private
+       channel, and the advance's precondition re-reads the predicate
+       inside that transaction.
+
+    If the predicate fails and the recorded deadline has not arrived,
+    refuses with a distinct still-quiescing reason and leaves the phase
+    where it is. At or after the deadline, reports the shared decision
+    (:func:`quiescence_deadline_action`) without acting on it — force-
+    ending and abandonment are mode-specific later work (§7.2, §9.2).
+
+    A record already AT Quiesced is not taken at its word: the durable
+    completion fact and TQ-2 itself are re-read, and a no-op success is
+    returned only when both still hold. Reporting "already quiesced" over
+    a record whose completion fact is gone, or over a store that can no
+    longer be read, would be reporting a phase whose meaning is not true.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return QuiescedAdvanceResult(False, "invalid board name")
+
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return QuiescedAdvanceResult(False, f"no removal phase record for {slug!r}")
+    if record.removal_id != removal_id:
+        return QuiescedAdvanceResult(
+            False, f"removal_id {removal_id!r} does not match the recorded "
+            f"removal {record.removal_id!r}", record=record,
+        )
+    if record.phase == RemovalPhase.QUIESCED and observed_phase is None:
+        return _revalidate_recorded_quiescence(slug, record)
+
+    resolution = resolve_absent_holder_reservations(
+        slug, removal_id=removal_id, pid_probe=pid_probe
+    )
+
+    reading = _read_quiescence_predicate(slug, record=record)
+    if reading.status is not DurableReadStatus.OK:
+        message = (
+            "TQ-2 may only commit on a positively read zero; this read is "
+            f"indeterminate: {reading.reason}"
+        )
+        _record_phase_refusal(
+            slug, record, RemovalAdvanceOutcome.REFUSED_INDETERMINATE.value, message
+        )
+        return QuiescedAdvanceResult(
+            False, message, record=record, held=None,
+            outcome=RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+            resolution=resolution,
+        )
+
+    if reading.satisfied():
+        advance = _advance_removal_phase(
+            slug, removal_id=removal_id,
+            from_phase=RemovalPhase.FENCED, to_phase=RemovalPhase.QUIESCED,
+            observed_phase=(
+                observed_phase
+                if observed_phase is not None
+                else RemovalPhase.FENCED
+            ),
+            _phase_owned={"quiesce_completed_at": int(time.time())},
+        )
+        return QuiescedAdvanceResult(
+            advance.success, advance.message,
+            transitioned=advance.transitioned,
+            record=advance.record, action=QuiescenceDeadlineAction.ADVANCE, held=0,
+            outcome=advance.outcome, resolution=resolution,
+        )
+
+    held = reading.held
+    action = quiescence_deadline_action(record, held=held, now=now)
+    if held == 0:
+        # Nothing is Held, so QB-3's table — which is about reservations —
+        # has nothing to decide. What is outstanding is a task removal in
+        # its window, and TQ-1 completes a begun task removal by
+        # roll-forward rather than refusing or abandoning it. Driving that
+        # roll-forward is later work; until then the removal waits.
+        action = QuiescenceDeadlineAction.WAIT
+    if action == QuiescenceDeadlineAction.WAIT:
+        message = (
+            f"still quiescing: {held} reservation(s) held, "
+            f"{reading.task_removals_in_window} task removal(s) in window, "
+            "deadline not yet reached"
+        )
+        _record_phase_refusal(
+            slug, record,
+            RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE.value, message,
+        )
+        return QuiescedAdvanceResult(
+            False, message, record=record, action=action, held=held,
+            outcome=RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE,
+            resolution=resolution,
+        )
+    message = (
+        f"quiescence deadline reached: {action.value} is required "
+        "(mode-specific, later work)"
+    )
+    _record_phase_refusal(
+        slug, record, RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE.value, message
+    )
+    return QuiescedAdvanceResult(
+        False, message, record=record, action=action, held=held,
+        outcome=RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE,
+        resolution=resolution,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Carried (§6.4): ONE atomic write, before anything is destroyed
+# ---------------------------------------------------------------------------
+
+CARRIED_PAYLOAD_VERSION = 1
+
+
+def conversation_transcript_store_path() -> Path:
+    """The shared store this codebase keeps conversation transcripts in.
+
+    §12.5's C6 lives here: the session store ``hermes_state`` opens by
+    default, which is OUTSIDE every board's storage area and is shared
+    with non-board work. Resolved from the same Hermes home that store
+    resolves from, without importing the session layer — deriving a
+    carry must not depend on loading it.
+    """
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "state.db"
+
+
+@dataclass(frozen=True)
+class LedgeredOutsideResource:
+    """One member §6.4's outside-resource ledger must name (§12.5).
+
+    ``member`` is the ledger's own id for it, ``category`` the §12.5
+    scope-table category it comes from (``None`` for the members the
+    scope table does not number), ``disposition`` is ``in`` (this removal
+    may act on it) or ``out`` (retained rather than destroyed), and
+    ``identity`` derives THIS board's exact identity for it. ``detail``,
+    when set, contributes the exact recorded identity of each thing the
+    member names — a category is never ledgered as a bare label.
+    """
+    member: str
+    disposition: str
+    reason: str
+    # (slug) -> str: this board's exact identity for the member.
+    identity: Any
+    # The §12.5 scope-table category id, when the scope table numbers it.
+    category: Optional[str] = None
+    # (slug, work) -> dict: extra keys naming what the member holds, where
+    # ``work`` is this board's durable record of the work areas it created
+    # elsewhere (:func:`_board_work_scope`), read once per carry.
+    detail: Any = None
+    # SD-D1: the category is DECLARED and disclosed; this removal performs
+    # no action on it at all.
+    declaration_only: bool = False
+
+
+# The scope table §6.4's ledger is derived from, and the single source of
+# truth for what a carry must name: every member, every disposition, every
+# reason, in ledger order. Carried's precondition requires exactly the
+# members named here, so a payload that leaves one out cannot become a
+# recorded phase — a removal that does not know what it holds outside the
+# board's own storage cannot be trusted to act on it — and because the
+# payload builder is driven from the same tuple, the ledger a carry writes
+# and the ledger a carry is required to have can never drift.
+CARRIED_LEDGER_SCOPE: "tuple[LedgeredOutsideResource, ...]" = (
+    LedgeredOutsideResource(
+        member="board-directory",
+        disposition="in",
+        reason="this board's own storage area",
+        identity=lambda slug: str(board_dir(slug)),
+    ),
+    LedgeredOutsideResource(
+        member="workspaces-root",
+        disposition="in",
+        reason="per-task scratch work areas anchored to this board",
+        identity=lambda slug: str(workspaces_root(slug)),
+    ),
+    LedgeredOutsideResource(
+        member="register-lock",
+        disposition="in",
+        reason="the per-board register-transition lock, held outside "
+               "the board on its behalf",
+        identity=lambda slug: str(register_lock_path(slug)),
+    ),
+    LedgeredOutsideResource(
+        member="register-lock-init",
+        disposition="out",
+        reason="retained by design: the materialised cross-process "
+               "init-lock file for the per-board register lock; "
+               "cross_process_init_lock creates <path>.init.lock as a "
+               "stable sibling of the lock path, and every register-lock "
+               "acquisition (swept, done, journal writes) re-materialises "
+               "it after destruction — removal cannot be made final without "
+               "re-creating the file, so it is retained and disclosed",
+        identity=lambda slug: str(
+            register_lock_path(slug).with_name(
+                register_lock_path(slug).name + ".init.lock"
+            )
+        ),
+    ),
+    LedgeredOutsideResource(
+        member="current-pointer",
+        disposition="in",
+        reason="the shared current/active pointer; only this board's "
+               "own value may be removed from it (IN-5)",
+        identity=lambda slug: str(current_board_path()),
+    ),
+    LedgeredOutsideResource(
+        member="register-entry",
+        # Follows §12.5's OUT list itself rather than restating it.
+        disposition=(
+            "out"
+            if "register-entry" in {name for name, _ in REMOVAL_OUT_CATEGORIES}
+            else "in"
+        ),
+        reason="retained as the durable account of the name",
+        identity=lambda slug: f"board_register:{slug}",
+    ),
+    LedgeredOutsideResource(
+        member="ever-existed-marker",
+        disposition="out",
+        reason="retained: the resurrection guard outlives the board",
+        identity=lambda slug: f"board_name_marker:{slug}",
+    ),
+    LedgeredOutsideResource(
+        member="removal-archive",
+        disposition="out",
+        reason="retained: receipts and audit records are a separate "
+               "loss domain (§1.3)",
+        identity=lambda slug: f"board_removal_archive:{slug}",
+    ),
+    # C6 — the conversation transcripts of this board's work, ledgered at
+    # session start. Kept and disclosed, never destroyed.
+    LedgeredOutsideResource(
+        member="conversation-transcripts",
+        category="C6",
+        disposition="out",
+        reason="kept and disclosed, not destroyed (Decision 4, deferred): "
+               "the transcripts of this board's work hold full work content "
+               "and live outside every board's scope, in a store shared with "
+               "non-board work, so destruction is NOT authorised — the safe "
+               "default is kept rather than deleted, with the store's "
+               "existence and location disclosed on the receipt "
+               "(declaration-only, SD-D1)",
+        identity=lambda slug: str(conversation_transcript_store_path()),
+        detail=lambda slug, work: {
+            "attributed_by": str(workspaces_root(slug)),
+            "originating_sessions": work["sessions"],
+            "count": len(work["sessions"]),
+            "read_from": work["source"],
+        },
+        declaration_only=True,
+    ),
+    # C7 — the version-control references and the commits created for this
+    # board's work inside a shared repository, ledgered at creation. Kept
+    # permanently, by owner decision, and each one explicitly named.
+    LedgeredOutsideResource(
+        member="version-control-references",
+        category="C7",
+        disposition="out",
+        reason="kept permanently, by owner decision (Decisions 1 and 2), and "
+               "settled rather than pending: version-control history for a "
+               "board's work is never deleted by board removal, so every "
+               "retained reference and every commit created for that work is "
+               "explicitly named here and listed on every permanent-removal "
+               "receipt; not declaration-only (SD-D2) — its precondition is "
+               "C13, the registration entry that IS deregistered",
+        identity=lambda slug: f"version-control-references-of-board:{slug}",
+        detail=lambda slug, work: {
+            "references": work["references"],
+            "count": len(work["references"]),
+            "read_from": work["source"],
+        },
+    ),
+    # C13 — the shared container's own registration entry for this board's
+    # ledgered work area, ledgered at creation. Deregistered by exact
+    # recorded identity; the reference and its commits are kept (C7).
+    LedgeredOutsideResource(
+        member="work-area-registration",
+        category="C13",
+        disposition="in",
+        reason="deregistered (Decision 3): the shared container's own "
+               "bookkeeping entry for this board's work area — created by "
+               "the board, naming the project, the task and the task's "
+               "title — is destroyed by EXACT recorded identity, while the "
+               "reference and its commits are kept (C7); the shared "
+               "container itself is never deleted, moved or rewritten, and "
+               "no other board's registration is ever touched (IN-5)",
+        identity=lambda slug: f"work-area-registrations-of-board:{slug}",
+        detail=lambda slug, work: {
+            "registrations": work["registrations"],
+            "count": len(work["registrations"]),
+            "unresolved": work["unresolved"],
+            "read_from": work["source"],
+        },
+    ),
+)
+
+# Every member §6.4's outside-resource ledger must name, every time —
+# derived from the scope table above, which is the only place the answer
+# is written down.
+_REQUIRED_CARRIED_LEDGER_MEMBERS = frozenset(
+    scope.member for scope in CARRIED_LEDGER_SCOPE
+)
+
+
+def _carried_release_obligations(conn: sqlite3.Connection) -> list:
+    """Every outstanding obligation to release an external environment.
+
+    Read from the durable records the board owns — the sandbox cleanup
+    intents, whose rows exist exactly while an exact run has a machine
+    with no durable release event — with the EXACT recorded identity
+    (``sandbox_id``) and everything needed to act on it. Never a pattern,
+    never a name shape (IN-2).
+    """
+    obligations: list = []
+    for table, key_columns in (
+        ("run_sandbox_cleanup_intents", ("task_id", "run_id")),
+        ("run_sandbox_orphan_cleanup_intents", ("task_id", "run_id", "sandbox_id")),
+    ):
+        present = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            (table,),
+        ).fetchone()
+        if present is None:
+            continue
+        for row in conn.execute(
+            f"SELECT task_id, run_id, profile, generation, sandbox_id, "
+            f"attempt_count, exhausted_at FROM {table}"
+        ):
+            obligations.append({
+                "kind": "run-sandbox",
+                "source": table,
+                "identity": {
+                    "sandbox_id": row["sandbox_id"],
+                    "task_id": row["task_id"],
+                    "run_id": int(row["run_id"]),
+                    "generation": int(row["generation"]),
+                },
+                "key_columns": list(key_columns),
+                "profile": row["profile"],
+                "attempt_count": int(row["attempt_count"] or 0),
+                "exhausted_at": (
+                    int(row["exhausted_at"]) if row["exhausted_at"] is not None else None
+                ),
+            })
+    return obligations
+
+
+#: The columns of a task row §6.4 needs to name a work area created
+#: elsewhere with its exact recorded identity. A store that does not have
+#: one of them is recorded as unable to supply it, never read as an absence.
+_WORK_SCOPE_COLUMNS = (
+    "id", "title", "project_id", "workspace_kind", "workspace_path",
+    "branch_name", "base_commit", "head_commit", "session_id",
+)
+
+
+def _worktree_container(workspace_path: Optional[str]) -> Optional[str]:
+    """The shared repository a linked work area was created inside.
+
+    A project-linked worktree work area is ``<repo>/.worktrees/<task-id>``
+    (see :func:`create_task`), so the shared container is that path's
+    grandparent — and only when the path really has that shape. Anything
+    else returns ``None`` rather than guessing at a container this board
+    may not have created.
+    """
+    if not workspace_path:
+        return None
+    path = Path(str(workspace_path))
+    if path.parent.name != ".worktrees":
+        return None
+    return str(path.parent.parent)
+
+
+# The ONE rule that decides whether a commit belongs on a board's created
+# list. It is stated here, recorded on every receipt, and applied by
+# :func:`_board_created_commits` — the single implementation — so the rule
+# and the list can never diverge.
+#
+# Authoring identity is not part of it. A commit made under a CI identity,
+# a co-author, or any other foreign identity is this board's commit if this
+# board's own durable receipts name it as a head an advance of this board's
+# work produced; a commit is NOT this board's merely because this board's
+# identity authored it. That is what makes the rule consistent: it is
+# applied identically regardless of who authored or committed.
+BOARD_CREATED_COMMIT_RULE = (
+    "a commit identity is on this board's created list if and only if this "
+    "board's own durable receipts name it as the head an advance of this "
+    "board's work produced. Applied regardless of the authoring or "
+    "committing identity — a foreign-identity head this board's receipts "
+    "name IS included, and no commit is included merely because of who "
+    "authored it. The base commit is excluded: it existed before this "
+    "board's work and this board did not create it. A head absorbed from "
+    "another subject's work is excluded from the list and disclosed "
+    "separately under 'absorbed_heads', because another advance produced it."
+)
+
+# The per-run receipt key `complete_task` persists into ``task_runs.metadata``.
+_RUN_EXECUTION_RECEIPT_KEY = "execution_receipt"
+
+# WHERE the commit list comes from, named on every receipt and in every
+# prospective statement. There is exactly one derivation and it is this
+# one: the run receipts each advance persisted at completion time.
+#
+# There is deliberately NO creation-time commit provenance ledger in this
+# milestone (owner decision, deferred). That absence is the reason
+# completeness cannot be claimed, so the source and the honest completeness
+# marking are written down together, here, and referenced everywhere else.
+COMMIT_LIST_SOURCE = "recorded-run-receipts"
+COMMIT_LIST_SOURCE_STATEMENT = (
+    "this commit list is derived from the RECORDED RUN RECEIPTS — the "
+    f"task_runs.metadata.{_RUN_EXECUTION_RECEIPT_KEY} rows each advance "
+    "persisted when it completed — and from the per-task git receipt "
+    "columns. It is NOT derived from a creation-time commit provenance "
+    "ledger: this milestone builds no such ledger."
+)
+COMMIT_LIST_COMPLETENESS_UNVERIFIED = (
+    "no creation-time commit provenance ledger exists, so a recorded run "
+    "receipt names the HEAD its advance produced but not every commit that "
+    "advance created. Where one advance produced SEVERAL commits, only its "
+    "head is on this list. Completeness is therefore UNVERIFIED — it is not "
+    "claimed as a complete enumeration, and the absence of an entry is not "
+    "evidence that no commit exists."
+)
+COMMIT_LIST_COMPLETENESS_NO_RECEIPT = (
+    "this reference records a real head commit but no run receipt names an "
+    "advance that produced it, so nothing durable establishes which commits "
+    "belong to it"
+)
+
+
+def commit_list_completeness(ref: dict) -> dict:
+    """The honest completeness marking for ONE reference's commit list.
+
+    Always :data:`RECEIPT_VERDICT_UNVERIFIED` while the creation-time
+    provenance ledger is absent — which it is, by owner decision, for this
+    milestone. The verdict is stated rather than omitted, and the reasons
+    name the specific things about THIS reference that cannot be
+    established, so a reader is never left to infer completeness from
+    silence or from a bare PASS that only meant "nothing was found".
+    """
+    advances = ref.get("advances") or []
+    head = ref.get("head_commit")
+    reasons = [COMMIT_LIST_COMPLETENESS_UNVERIFIED]
+    if head and not advances:
+        reasons.append(COMMIT_LIST_COMPLETENESS_NO_RECEIPT)
+    return {
+        "verdict": RECEIPT_VERDICT_UNVERIFIED,
+        "source": COMMIT_LIST_SOURCE,
+        "creation_time_provenance_ledger": "absent",
+        "reasons": reasons,
+        "advance_count": len(advances),
+        "head_recorded": bool(head),
+    }
+
+
+def _task_advance_ledger(
+    conn: sqlite3.Connection, task_id: Any
+) -> "tuple[list, str]":
+    """The per-advance git receipts this board durably recorded for a task.
+
+    One entry per run that recorded an execution receipt — the creation-time
+    record of that advance: the base it started from, the exact head it
+    produced, the reference it produced it on, and the heads it ABSORBED
+    from another subject's work. Read from the board's own ``task_runs``
+    rows, which is where completion persists them; a store with no such
+    table, or a run with no receipt, contributes nothing and is NAMED as
+    such rather than read as "there were no advances".
+    """
+    present = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND "
+        "name = 'task_runs' LIMIT 1"
+    ).fetchone()
+    if present is None:
+        return [], (
+            "this board's store has no task_runs table, so no per-advance "
+            "receipt can be derived from it"
+        )
+    advances: list = []
+    rows = conn.execute(
+        "SELECT id, started_at, ended_at, outcome, metadata FROM task_runs "
+        "WHERE task_id = ? ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    without_receipt = 0
+    for row in rows:
+        meta = _decode_json_object(row["metadata"])
+        receipt = (meta or {}).get(_RUN_EXECUTION_RECEIPT_KEY)
+        if not isinstance(receipt, dict):
+            without_receipt += 1
+            continue
+        absorbed = [
+            {
+                "task": str(head.get("task_id")),
+                "head_commit": head.get("head_commit"),
+            }
+            for head in (receipt.get("parent_heads") or [])
+            if isinstance(head, dict) and head.get("head_commit")
+        ]
+        advances.append({
+            "run": int(row["id"]),
+            "started_at": _row_int(row, "started_at"),
+            "ended_at": _row_int(row, "ended_at"),
+            "outcome": _row_value(row, "outcome"),
+            "kind": receipt.get("kind"),
+            "reference": receipt.get("branch"),
+            "base_commit": receipt.get("base_commit"),
+            "head_commit": receipt.get("head_commit"),
+            "absorbed_heads": absorbed,
+        })
+    source = f"task_runs.metadata.{_RUN_EXECUTION_RECEIPT_KEY}"
+    if without_receipt:
+        source = (
+            f"{source} ({without_receipt} of {len(rows)} run(s) recorded no "
+            "execution receipt, so those advances contribute no commit)"
+        )
+    return advances, source
+
+
+def _board_created_commits(
+    *, base_commit: Any, head_commit: Any, advances: list
+) -> "tuple[list, list, list]":
+    """Apply :data:`BOARD_CREATED_COMMIT_RULE`. The only implementation.
+
+    Returns ``(created, absorbed, provenance)``: the exact ordered list of
+    commit identities this board created, the heads absorbed from another
+    subject's work (disclosed, never claimed), and one provenance entry per
+    created commit naming the durable receipt it came from.
+    """
+    base = str(base_commit).strip() if base_commit else None
+    absorbed: list = []
+    absorbed_ids: set = set()
+    for advance in advances:
+        for head in advance.get("absorbed_heads") or []:
+            identity = str(head.get("head_commit") or "").strip()
+            if not identity or identity in absorbed_ids:
+                continue
+            absorbed_ids.add(identity)
+            absorbed.append({
+                "head_commit": identity,
+                "absorbed_from_task": head.get("task"),
+                "absorbed_by_advance": advance.get("run"),
+                "disclosure": (
+                    "another advance produced this head; it is disclosed as "
+                    "absorbed and is NOT on this board's created list"
+                ),
+            })
+
+    created: list = []
+    provenance: list = []
+
+    def _consider(identity: Any, source: str, detail: dict) -> None:
+        text = str(identity).strip() if identity else ""
+        if not text or text in created:
+            return
+        if base is not None and text == base:
+            return
+        if text in absorbed_ids:
+            return
+        created.append(text)
+        provenance.append({
+            "commit": text,
+            "source": source,
+            "rule": "board-created-head-named-by-a-durable-receipt",
+            **detail,
+        })
+
+    for advance in advances:
+        _consider(
+            advance.get("head_commit"), "advance-head-receipt",
+            {
+                "run": advance.get("run"),
+                "reference": advance.get("reference"),
+                "recorded_at": advance.get("ended_at"),
+            },
+        )
+    _consider(
+        head_commit, "task-head-receipt",
+        {"run": None, "reference": None, "recorded_at": None},
+    )
+    return created, absorbed, provenance
+
+
+def _board_work_scope(conn: sqlite3.Connection) -> dict:
+    """This board's durable record of the work areas it created elsewhere.
+
+    Read from the board's own task rows — the only durable place it
+    records them — with the EXACT recorded identity of each: the project
+    it was created under, the task and the task's title, the work area's
+    path, the shared container it lives in, the version-control reference
+    created for it and the commits recorded against it (IN-2, never a
+    pattern and never a name shape).
+
+    A column this store does not have is NAMED as unavailable in
+    ``source`` rather than read as an absence, so the ledger says what it
+    could not read.
+    """
+    empty = {
+        "sessions": [], "references": [], "registrations": [], "unresolved": [],
+    }
+    present = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks' "
+        "LIMIT 1"
+    ).fetchone()
+    if present is None:
+        return dict(
+            empty,
+            source="this board's store has no tasks table, so it records no "
+                   "work area created elsewhere",
+        )
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    available = [name for name in _WORK_SCOPE_COLUMNS if name in columns]
+    unavailable = [name for name in _WORK_SCOPE_COLUMNS if name not in columns]
+    source = "tasks"
+    if unavailable:
+        source = f"tasks (columns not in this store: {', '.join(unavailable)})"
+    if "id" not in available:
+        return dict(empty, source=source)
+    rows = conn.execute(
+        f"SELECT {', '.join(available)} FROM tasks ORDER BY id"
+    ).fetchall()
+    sessions: list = []
+    references: list = []
+    registrations: list = []
+    unresolved: list = []
+    for row in rows:
+        task = {name: row[name] for name in available}
+        task_id = task.get("id")
+        title = task.get("title")
+        project = task.get("project_id")
+        session_id = task.get("session_id")
+        if session_id:
+            sessions.append({
+                "task": task_id, "title": title, "session_id": session_id,
+            })
+        reference = task.get("branch_name")
+        container = _worktree_container(task.get("workspace_path"))
+        base_commit = task.get("base_commit")
+        head_commit = task.get("head_commit")
+        advances, advance_source = _task_advance_ledger(conn, task_id)
+        created, absorbed, provenance = _board_created_commits(
+            base_commit=base_commit, head_commit=head_commit, advances=advances,
+        )
+        if reference or created or absorbed or base_commit or head_commit:
+            references.append({
+                "task": task_id,
+                "title": title,
+                "project": project,
+                "reference": reference,
+                "container": container,
+                # §12.3 wants these NAMED, not inferred from a pair: the
+                # base is what the work started from and this board did
+                # not create it; the head is where it ended.
+                "base_commit": base_commit,
+                "head_commit": head_commit,
+                # The exact created list, the base excluded by the one
+                # rule — never "[base, head]", which claims the base.
+                "commits": created,
+                "board_created_commits": created,
+                "absorbed_heads": absorbed,
+                "advances": advances,
+                "commit_provenance": provenance,
+                "commit_rule": BOARD_CREATED_COMMIT_RULE,
+                "advances_read_from": advance_source,
+            })
+        work_area = task.get("workspace_path")
+        if task.get("workspace_kind") != "worktree":
+            continue
+        if container and work_area:
+            registrations.append({
+                "task": task_id,
+                "title": title,
+                "project": project,
+                "work_area": work_area,
+                "container": container,
+                "registration": str(
+                    Path(container) / ".git" / "worktrees" / Path(work_area).name
+                ),
+                "reference": reference,
+            })
+        else:
+            # IN-3: a work area this board recorded creating, whose shared
+            # container the record does not establish, has no exact
+            # identity to deregister — so it is surfaced as unresolved
+            # rather than dropped, which would make the removal look as if
+            # it held nothing there.
+            unresolved.append({
+                "task": task_id,
+                "title": title,
+                "project": project,
+                "work_area": work_area,
+                "reason": "the shared container of this recorded work area "
+                          "cannot be derived from durable state, so its "
+                          "registration entry has no exact identity to "
+                          "deregister by",
+            })
+    return {
+        "source": source,
+        "sessions": sessions,
+        "references": references,
+        "registrations": registrations,
+        "unresolved": unresolved,
+    }
+
+
+def _carried_outside_resource_ledger(slug: str, conn: sqlite3.Connection) -> list:
+    """The outside-resource ledger: what this board owns OUTSIDE its store.
+
+    Derived member by member from :data:`CARRIED_LEDGER_SCOPE`, the one
+    place the scope table is written down, so the ledger a carry writes is
+    the ledger Carried's precondition requires. Each member carries an
+    exact identity and its disposition — ``in`` (this removal may act on
+    it) or ``out`` (retained rather than destroyed, §12.5) — plus, for a
+    category that names individual things, the exact recorded identity of
+    each of them. Recorded before anything is destroyed, so authority is
+    never destroyed before the resource it governs is released.
+    """
+    work = _board_work_scope(conn)
+    ledger = []
+    for scope in CARRIED_LEDGER_SCOPE:
+        entry = {
+            "member": scope.member,
+            "identity": scope.identity(slug),
+            "disposition": scope.disposition,
+            "reason": scope.reason,
+        }
+        if scope.category:
+            entry["category"] = scope.category
+        if scope.declaration_only:
+            entry["declaration_only"] = True
+        if scope.detail is not None:
+            entry.update(scope.detail(slug, work))
+        ledger.append(entry)
+    return ledger
+
+
+def _pre_application_inventory(conn: sqlite3.Connection) -> dict:
+    """§5.4: the task identities on the board and a fingerprint over each.
+
+    Written BEFORE the content is touched, and derived from the durable
+    task rows themselves rather than from any manifest.
+    """
+    tasks = []
+    for row in conn.execute("SELECT * FROM tasks ORDER BY id"):
+        keys = sorted(row.keys())
+        canonical = json.dumps(
+            {key: _fingerprintable(row[key]) for key in keys},
+            sort_keys=True, ensure_ascii=False,
+        )
+        tasks.append({
+            "id": row["id"],
+            "fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        })
+    return {"tasks": tasks, "count": len(tasks)}
+
+
+def _fingerprintable(value):
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return hashlib.sha256(bytes(value)).hexdigest()
+    if isinstance(value, (int, float, str)) or value is None:
+        return value
+    return str(value)
+
+
+def build_removal_carry_payload(
+    slug: str, record: RemovalPhaseRecord
+) -> "tuple[Optional[dict], str]":
+    """Derive the §6.4 carry payload from durable board state.
+
+    Returns ``(None, reason)`` when the board's durable state cannot be
+    read: a carry that cannot be derived is not a carry, and nothing may
+    be recorded as Carried on the strength of a failed read.
+    """
+    db_path = kanban_db_path(board=slug)
+    if not db_path.exists():
+        return None, f"board store {db_path} is missing: nothing can be carried from it"
+    try:
+        conn = _sqlite_connect_no_create(db_path)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return None, f"cannot open the board store to derive the carry: {exc}"
+    try:
+        obligations = _carried_release_obligations(conn)
+        # The ledger is derived while the store is open: the categories it
+        # names individually (C6, C7, C13) come from this board's own
+        # durable rows, and a read that failed is never an absence.
+        ledger = _carried_outside_resource_ledger(slug, conn)
+        inventory = (
+            _pre_application_inventory(conn)
+            if record.mode == RemovalMode.PERMANENT else None
+        )
+    except sqlite3.Error as exc:
+        return None, f"cannot read the board store to derive the carry: {exc}"
+    finally:
+        conn.close()
+    payload = {
+        "version": CARRIED_PAYLOAD_VERSION,
+        "board": slug,
+        "removal_id": record.removal_id,
+        "mode": record.mode.value,
+        "release_obligations": obligations,
+        "outside_resource_ledger": ledger,
+        "pre_application_inventory": inventory,
+        "captured_at": int(time.time()),
+    }
+    return payload, f"{len(obligations)} release obligation(s) carried"
+
+
+def advance_removal_to_carried(
+    board: str,
+    *,
+    removal_id: str,
+    observed_phase: "RemovalPhase | str | None" = None,
+) -> RemovalPhaseAdvanceResult:
+    """Phase 4 — Carried (§6.4): migrate, in ONE atomic write.
+
+    Before anything belonging to the board is destroyed or moved, every
+    outstanding obligation to release an external environment (with its
+    EXACT recorded identity), the outside-resource ledger, and — for
+    permanent mode — the pre-application inventory are migrated into the
+    register entry's durable phase record. Payload and phase are written
+    in the SAME transaction (IN-4), and Carried's precondition re-reads
+    the payload, so the phase can never be recorded without it.
+
+    Authority is never destroyed before the resource it governs is
+    released: this is the phase that guarantees it.
+
+    A record already AT Carried is re-verified rather than believed: the
+    recorded payload must still decode, still name every required member,
+    and still carry its completion instant. An idempotent no-op is a
+    success, and a success here claims the migration happened.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_INVALID_BOARD, "invalid board name"
+        )
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_NO_RECORD,
+            f"no removal phase record for {slug!r}",
+        )
+    if record.removal_id != removal_id:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_ID_MISMATCH,
+            f"removal_id {removal_id!r} does not match the recorded "
+            f"removal {record.removal_id!r}", record=record,
+        )
+    if record.phase == RemovalPhase.CARRIED and observed_phase is None:
+        return _revalidate_recorded_carry(slug, record)
+    payload, reason = build_removal_carry_payload(slug, record)
+    if payload is None:
+        _record_phase_refusal(
+            slug, record, RemovalAdvanceOutcome.REFUSED_INDETERMINATE.value, reason
+        )
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+            f"§6.4: refusing to record carried — {reason}", record=record,
+        )
+    return _advance_removal_phase(
+        slug, removal_id=removal_id,
+        from_phase=RemovalPhase.QUIESCED, to_phase=RemovalPhase.CARRIED,
+        observed_phase=(
+            observed_phase if observed_phase is not None else RemovalPhase.QUIESCED
+        ),
+        _phase_owned={
+            "carried_payload": json.dumps(payload, ensure_ascii=False),
+            "carry_completed_at": int(time.time()),
+        },
+    )
+
+
+def _revalidate_recorded_carry(
+    slug: str, record: RemovalPhaseRecord
+) -> RemovalPhaseAdvanceResult:
+    """Re-verify a record that is ALREADY at Carried (§6.4).
+
+    The payload is the whole meaning of the phase: every later phase acts
+    on the identities it names, and Applied refuses without the §5.4
+    inventory inside it. So a repeat re-reads it and refuses when it is
+    absent, undecodable or incomplete, recording why — rather than
+    reporting a no-op success over a migration nothing records.
+    """
+    defect = _carried_payload_defect(record.carried())
+    if defect is None and record.carry_completed_at is None:
+        defect = "no §6.4 carry completion instant is recorded"
+    if defect is not None:
+        message = (
+            f"§6.4: the record sits at carried but its durable payload does "
+            f"not support that: {defect}"
+        )
+        _record_phase_refusal(
+            slug, record,
+            RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE.value, message,
+        )
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE, message,
+            record=record,
+        )
+    return RemovalPhaseAdvanceResult(
+        True, RemovalAdvanceOutcome.IDEMPOTENT_NOOP,
+        "already at carried (idempotent no-op), payload re-verified",
+        record=record,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Released (§6.5): exact identity, and the qualified
+# already-absent rule
+# ---------------------------------------------------------------------------
+
+# §6.5's attempt budget. Named constants, never bare literals: up to 8
+# attempts per environment, waits doubling from 30 seconds to a 1-hour cap,
+# total elapsed cap 24 hours.
+RELEASE_MAX_ATTEMPTS = 8
+RELEASE_FIRST_WAIT_SECONDS = 30
+RELEASE_MAX_WAIT_SECONDS = 60 * 60
+RELEASE_TOTAL_ELAPSED_CAP_SECONDS = 24 * 60 * 60
+
+
+def release_attempt_wait_seconds(attempt: int) -> int:
+    """The wait before attempt *attempt* + 1, doubling from 30s to a 1h cap.
+
+    The wait is COMPUTED and recorded as a durable ``next_attempt_at``, not
+    slept through: a removal that blocked a process for up to 24 hours
+    would be a worse fault than the one the budget exists to bound.
+    """
+    steps = max(0, int(attempt) - 1)
+    if steps >= 32:  # pragma: no cover - the cap is reached long before this
+        return RELEASE_MAX_WAIT_SECONDS
+    return min(RELEASE_MAX_WAIT_SECONDS, RELEASE_FIRST_WAIT_SECONDS * (2 ** steps))
+
+
+class EnvironmentReleaseState(str, Enum):
+    """The durable release-state of one external environment (§6.3, §6.5).
+
+    Acting on a resource requires winning the conditional transition from
+    ``owed`` to ``releasing``; exactly one side wins, and no resource is
+    released twice.
+    """
+    OWED = "owed"
+    RELEASING = "releasing"
+    RELEASED = "released"
+    OPERATOR_ITEM = "operator-item"
+
+
+_TERMINAL_ENVIRONMENT_RELEASE_STATES = frozenset({
+    EnvironmentReleaseState.RELEASED.value,
+    EnvironmentReleaseState.OPERATOR_ITEM.value,
+})
+
+
+@dataclass
+class EnvironmentReleaseAttempt:
+    """What ONE attempt against the external side actually established.
+
+    ``absent`` alone is not "released": AB-1 counts an absent answer only
+    when the query SUCCEEDED and the listing is proven correctly scoped.
+    ``scope_proven`` is that proof, and it is the releaser's job to
+    establish it — never the remover's job to assume it.
+    """
+    released: bool = False
+    absent: bool = False
+    scope_proven: bool = False
+    detail: Optional[str] = None
+    error: Optional[str] = None
+
+
+def _default_environment_releaser(environment: dict) -> EnvironmentReleaseAttempt:
+    """The default external-side releaser: honest about what it can prove.
+
+    This module has no interface to the external side that allocated a
+    sandbox, so it cannot release one and cannot prove one absent from a
+    correctly scoped listing. It therefore returns INDETERMINATE — never
+    "already absent", which is exactly the unproven absence AB-2 exists
+    to refuse. The obligation is retried within budget and becomes a
+    recorded operator item on exhaustion.
+    """
+    return EnvironmentReleaseAttempt(
+        error="no external-side release interface is reachable from the "
+              "removal sequence: the answer is indeterminate, never "
+              "'already absent' (AB-2)",
+    )
+
+
+def _initial_release_state(payload: dict, *, now: int) -> dict:
+    environments = []
+    for obligation in payload.get("release_obligations") or []:
+        environments.append({
+            "identity": obligation.get("identity"),
+            "kind": obligation.get("kind"),
+            "source": obligation.get("source"),
+            "state": EnvironmentReleaseState.OWED.value,
+            "attempts": 0,
+            "first_attempt_at": None,
+            "next_attempt_at": now,
+            "intent_recorded_at": None,
+            "last_error": None,
+            "detail": None,
+        })
+    return {"environments": environments, "started_at": now}
+
+
+def _release_attempt_is_due(env: dict, *, now: int) -> bool:
+    """Is this environment's next budgeted attempt due at *now*?"""
+    if env.get("state") in _TERMINAL_ENVIRONMENT_RELEASE_STATES:
+        return False
+    due_at = env.get("next_attempt_at")
+    return due_at is None or now >= int(due_at)
+
+
+def _release_intent_record(env: dict, *, now: int) -> dict:
+    """The env as it must be DURABLE BEFORE the external side is touched.
+
+    The ``owed -> releasing`` transition, the instant the intent was
+    recorded, and the attempt that is about to be made — including the
+    backoff that attempt has already consumed. Recording the wait here,
+    rather than after the answer comes back, is what makes the intent a
+    single-owner claim: another caller reading this state is not due and
+    does not act, so no environment is released twice. A crash between
+    this commit and the answer therefore leaves a durable record that an
+    attempt WAS made, and the retry waits out the recorded backoff.
+    """
+    intent = dict(env)
+    intent["state"] = EnvironmentReleaseState.RELEASING.value
+    if intent.get("intent_recorded_at") is None:
+        intent["intent_recorded_at"] = now
+    if intent.get("first_attempt_at") is None:
+        intent["first_attempt_at"] = now
+    intent["attempts"] = int(intent.get("attempts") or 0) + 1
+    intent["next_attempt_at"] = now + release_attempt_wait_seconds(
+        int(intent["attempts"])
+    )
+    return intent
+
+
+def _apply_environment_release_attempt(env: dict, *, now: int, releaser) -> None:
+    """Attempt ONE exact recorded identity and record the answer (§6.5).
+
+    Called only with an env whose ``releasing`` intent is already DURABLE
+    (:func:`_release_intent_record`). Attempts the release BY that exact
+    recorded identity — never by pattern, prefix, name shape or
+    resemblance (IN-2) — and records the result. An indeterminate answer
+    is retried within budget and becomes a recorded operator item on
+    exhaustion; the removal continues and the item persists (IN-3).
+    """
+    if env["state"] != EnvironmentReleaseState.RELEASING.value:
+        # Never contact the external side without a durable releasing
+        # intent behind it.
+        return
+    try:
+        attempt = releaser(dict(env))
+    except Exception as exc:  # a releaser that raised proved nothing
+        attempt = EnvironmentReleaseAttempt(error=f"the release attempt raised: {exc}")
+    if attempt.released:
+        env["state"] = EnvironmentReleaseState.RELEASED.value
+        env["detail"] = attempt.detail or "released by exact recorded identity"
+        env["next_attempt_at"] = None
+        return
+    if attempt.absent and attempt.scope_proven:
+        env["state"] = EnvironmentReleaseState.RELEASED.value
+        env["detail"] = attempt.detail or (
+            "absent from a listing whose scope is proven correct (AB-1)"
+        )
+        env["next_attempt_at"] = None
+        return
+    if attempt.absent:
+        env["last_error"] = attempt.detail or (
+            "absent, but from a listing whose scope is not proven: "
+            "indeterminate, not released (AB-2)"
+        )
+    else:
+        env["last_error"] = attempt.error or "indeterminate"
+    elapsed = now - int(env["first_attempt_at"])
+    wait = release_attempt_wait_seconds(int(env["attempts"]))
+    exhausted = (
+        int(env["attempts"]) >= RELEASE_MAX_ATTEMPTS
+        or elapsed + wait > RELEASE_TOTAL_ELAPSED_CAP_SECONDS
+    )
+    if exhausted:
+        env["state"] = EnvironmentReleaseState.OPERATOR_ITEM.value
+        env["next_attempt_at"] = None
+        env["detail"] = (
+            f"budget exhausted after {env['attempts']} attempt(s) over "
+            f"{elapsed}s: recorded as an operator item naming the exact "
+            f"identity {env['identity']!r} and the failure — the removal "
+            f"continues and the item persists until resolved"
+        )
+        return
+    env["next_attempt_at"] = now + wait
+
+
+def removal_operator_items(record: RemovalPhaseRecord) -> list:
+    """Every recorded operator item this removal left behind (§6.5, §6.6, IN-3).
+
+    Two kinds, in one list, in the same shape: an environment §6.5 could
+    not prove released, and — once Applied is recorded — §6.6's
+    mode-specific application while it is still outstanding. A declared
+    exception must be surfaced, not merely recorded, and this is the list
+    the read-only surface reports.
+    """
+    state = record.releases() or {}
+    items = [
+        env for env in (state.get("environments") or [])
+        if env.get("state") == EnvironmentReleaseState.OPERATOR_ITEM.value
+    ]
+    marker = applied_mode_content_marker(record)
+    if marker.get("state") == APPLIED_MODE_CONTENT_OUTSTANDING:
+        item = marker.get("operator_item")
+        if isinstance(item, dict):
+            items.append(item)
+    return items
+
+
+def advance_removal_to_released(
+    board: str,
+    *,
+    removal_id: str,
+    now: Optional[int] = None,
+    releaser: Optional[Any] = None,
+    observed_phase: "RemovalPhase | str | None" = None,
+) -> RemovalPhaseAdvanceResult:
+    """Phase 5 — Released (§6.5): release each carried environment by its
+    EXACT recorded identity.
+
+    For each environment carried at §6.4: record the intent to release
+    this exact identity, attempt the release by that exact recorded
+    identity — never by pattern, prefix, name shape or resemblance
+    (IN-2) — and record the result. An absent answer counts as released
+    only when the query SUCCEEDED and the listing is proven correctly
+    scoped (AB-1); any other absent answer is indeterminate, retried
+    within the §6.5 budget, and becomes a recorded operator item on
+    exhaustion — the removal continues and the item persists (AB-2,
+    IN-3).
+
+    The attempt budget is recorded durably, not slept through: an
+    environment whose next attempt is not yet due leaves the phase where
+    it is, and the driver re-drives when it comes due.
+
+    **The per-environment order is specified and obeyed**: the recorded
+    state moves ``owed -> releasing`` by a conditional compare-and-set on
+    its own durable value FIRST, and only then is the external side
+    contacted, by exact recorded identity, and the answer recorded. Exactly
+    one side wins that transition; a loser does not act, so nothing is
+    released twice, and a crash mid-release leaves a durable record that
+    an attempt was made.
+
+    A record already AT Released is re-verified rather than believed: every
+    identity §6.4 carried must still be accounted for by a terminal
+    recorded state.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_INVALID_BOARD, "invalid board name"
+        )
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_NO_RECORD,
+            f"no removal phase record for {slug!r}",
+        )
+    if record.removal_id != removal_id:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_ID_MISMATCH,
+            f"removal_id {removal_id!r} does not match the recorded "
+            f"removal {record.removal_id!r}", record=record,
+        )
+    if record.phase == RemovalPhase.RELEASED and observed_phase is None:
+        return _revalidate_recorded_release(slug, record)
+    payload = record.carried()
+    if payload is None:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE,
+            "§6.5: nothing was carried, so no exact identity is recorded to "
+            "release by (IN-2)", record=record,
+        )
+    at = now if now is not None else int(time.time())
+    release_fn = releaser if releaser is not None else _default_environment_releaser
+
+    # The identities and their states must be DURABLE before anything
+    # external is touched: the conditional transition below is a
+    # compare-and-set on this recorded value.
+    if record.release_state is None:
+        initial = json.dumps(
+            _initial_release_state(payload, now=at), ensure_ascii=False
+        )
+        _cas_release_state(
+            slug, removal_id=removal_id, expect_phase=record.phase,
+            witness=None, encoded=initial,
+        )
+    raw, state = _read_release_state(slug, removal_id=removal_id)
+    if state is None:
+        message = (
+            "§6.5: the recorded release state could not be read back, so no "
+            "environment may be acted on"
+        )
+        _record_phase_refusal(
+            slug, record, RemovalAdvanceOutcome.REFUSED_INDETERMINATE.value, message
+        )
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_INDETERMINATE, message,
+            record=record,
+        )
+
+    for index in range(len(state.get("environments") or [])):
+        raw, state = _read_release_state(slug, removal_id=removal_id)
+        if state is None:
+            break
+        env = (state.get("environments") or [])[index]
+        if not _release_attempt_is_due(env, now=at):
+            continue
+        # (1) the releasing intent, durable, by conditional compare-and-set.
+        intent_state = dict(state)
+        environments = list(state["environments"])
+        environments[index] = _release_intent_record(env, now=at)
+        intent_state["environments"] = environments
+        if not _cas_release_state(
+            slug, removal_id=removal_id, expect_phase=record.phase,
+            witness=raw, encoded=json.dumps(intent_state, ensure_ascii=False),
+        ):
+            # Lost the conditional transition: the loser does not act, and
+            # no environment is released twice.
+            continue
+        # (2) only now, the external side, by exact recorded identity.
+        attempted = dict(environments[index])
+        _apply_environment_release_attempt(attempted, now=at, releaser=release_fn)
+        # (3) the answer, recorded.
+        witness = json.dumps(intent_state, ensure_ascii=False)
+        answered = dict(intent_state)
+        answered_envs = list(environments)
+        answered_envs[index] = attempted
+        answered["environments"] = answered_envs
+        _cas_release_state(
+            slug, removal_id=removal_id, expect_phase=record.phase,
+            witness=witness, encoded=json.dumps(answered, ensure_ascii=False),
+        )
+
+    raw, state = _read_release_state(slug, removal_id=removal_id)
+    if state is None:  # pragma: no cover - the read above already succeeded
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+            "§6.5: the recorded release state could not be read back",
+            record=record,
+        )
+    unresolved = [
+        env for env in (state.get("environments") or [])
+        if env.get("state") not in _TERMINAL_ENVIRONMENT_RELEASE_STATES
+    ]
+    if unresolved:
+        # The attempts are already durable — each was committed before its
+        # external call — so there is nothing to save here: a budget that
+        # resets on every call is not a budget.
+        due = min(int(env["next_attempt_at"] or at) for env in unresolved)
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE,
+            f"§6.5: {len(unresolved)} environment(s) still owed a proven "
+            f"answer; next attempt due at {due}", record=record,
+        )
+    return _advance_removal_phase(
+        slug, removal_id=removal_id,
+        from_phase=RemovalPhase.CARRIED, to_phase=RemovalPhase.RELEASED,
+        observed_phase=(
+            observed_phase if observed_phase is not None else RemovalPhase.CARRIED
+        ),
+        _phase_owned={"release_state": raw, "release_completed_at": at},
+    )
+
+
+def _read_release_state(
+    slug: str, *, removal_id: str
+) -> "tuple[Optional[str], Optional[dict]]":
+    """The recorded §6.5 release state, raw and decoded.
+
+    The raw text is the WITNESS a conditional write is guarded on, so the
+    two are always read together and from the same row.
+    """
+    with register_connect() as conn:
+        try:
+            row = conn.execute(
+                "SELECT release_state FROM board_removal_phase "
+                "WHERE board_name = ? AND removal_id = ?",
+                (slug, removal_id),
+            ).fetchone()
+        except sqlite3.Error:
+            return None, None
+    if row is None:
+        return None, None
+    raw = row["release_state"]
+    decoded = _decode_json_object(raw)
+    if not isinstance((decoded or {}).get("environments"), list):
+        return raw, None
+    return raw, decoded
+
+
+def _cas_release_state(
+    slug: str,
+    *,
+    removal_id: str,
+    expect_phase: RemovalPhase,
+    witness: Optional[str],
+    encoded: str,
+) -> bool:
+    """Conditionally write the §6.5 release state, guarded on its prior value.
+
+    ``release_state IS ?`` is null-safe equality, so the first write (from
+    no recorded state at all) is guarded too. Exactly one of two callers
+    holding the same witness can win, which is what makes the
+    ``owed -> releasing`` transition single-owner. The phase is part of the
+    predicate, so a write can never land on a record that has moved on.
+    """
+    now = int(time.time())
+    with board_register_lock(slug, reentrant=True):
+        with register_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "UPDATE board_removal_phase SET release_state = ?, "
+                    "updated_at = ? WHERE board_name = ? AND removal_id = ? "
+                    "AND phase = ? AND release_state IS ?",
+                    (encoded, now, slug, removal_id, expect_phase.value, witness),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+    return cur.rowcount == 1
+
+
+def _revalidate_recorded_release(
+    slug: str, record: RemovalPhaseRecord
+) -> RemovalPhaseAdvanceResult:
+    """Re-verify a record that is ALREADY at Released (§6.5).
+
+    A no-op success here claims every carried identity reached a terminal
+    recorded state — released, or an operator item that persists. The
+    claim is re-checked against the durable record, including that every
+    identity §6.4 carried is still accounted for: an emptied or reverted
+    release state is refused, not rubber-stamped.
+    """
+    reason: Optional[str] = None
+    state = record.releases()
+    carried = record.carried()
+    if state is None or not isinstance(state.get("environments"), list):
+        reason = "no §6.5 release state is recorded, or it cannot be decoded"
+    elif record.release_completed_at is None:
+        reason = "no §6.5 release completion instant is recorded"
+    else:
+        environments = state["environments"]
+        unresolved = [
+            env for env in environments
+            if env.get("state") not in _TERMINAL_ENVIRONMENT_RELEASE_STATES
+        ]
+        if unresolved:
+            reason = (
+                f"{len(unresolved)} environment(s) are neither released nor "
+                "recorded as an operator item (AB-2)"
+            )
+        else:
+            accounted = [
+                json.dumps(env.get("identity"), sort_keys=True)
+                for env in environments
+            ]
+            missing = [
+                obligation.get("identity")
+                for obligation in (carried or {}).get("release_obligations") or []
+                if json.dumps(obligation.get("identity"), sort_keys=True)
+                not in accounted
+            ]
+            if missing:
+                reason = (
+                    f"{len(missing)} carried identity/identities have no "
+                    f"recorded release state at all: {missing} — an identity "
+                    "that is not accounted for was not released (IN-2)"
+                )
+    if reason is not None:
+        message = (
+            f"§6.5: the record sits at released but durable state does not "
+            f"support that: {reason}"
+        )
+        _record_phase_refusal(
+            slug, record,
+            RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE.value, message,
+        )
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE, message,
+            record=record,
+        )
+    return RemovalPhaseAdvanceResult(
+        True, RemovalAdvanceOutcome.IDEMPOTENT_NOOP,
+        "already at released (idempotent no-op), every carried identity "
+        "re-verified", record=record,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Applied (§6.6, mode-specific content deferred to §7.2/§7.3)
+# ---------------------------------------------------------------------------
+
+def advance_removal_to_applied(
+    board: str,
+    *,
+    removal_id: str,
+    observed_phase: "RemovalPhase | str | None" = None,
+) -> RemovalPhaseAdvanceResult:
+    """Phase 6 — Applied (§6.6): TQ-2 as a predicate on the transition itself.
+
+    In BOTH modes, the transition into Applied cannot commit while a
+    reservation is Held or a task removal is in its window: acting over
+    live work is impossible, not merely safe because of phase ordering.
+    The predicate is read AUTHORITATIVELY, from durable state, inside the
+    guarded transition — it is not, and cannot be, supplied by the
+    caller. An indeterminate read refuses; it is never a zero.
+
+    If the predicate fails the removal does not move backwards — it
+    refuses the advance with a distinct re-enter-quiescence reason and
+    leaves the record at its current phase, bounded by QB-2 and
+    terminated by QB-3.
+
+    The mode-specific CONTENT of Applied — destroying storage and
+    deregistering registrations (§7.2), or completing and verifying the
+    retained copy and removing the live one (§7.3) — is later work, and
+    this transition RECORDS THAT IT IS OUTSTANDING: the marker and the
+    operator item naming the mode and the missing step are written in the
+    SAME transaction as the advance (IN-4), and Done refuses while the
+    marker says outstanding. Deferring the work is authorised; reporting
+    success or recording a terminal lifecycle while it is outstanding is
+    not. This is a declared exception under IN-3, so it is recorded AND
+    surfaced (``hermes kanban boards removal-phase``), never silent.
+
+    A record already AT Applied is re-verified rather than believed:
+    Release must still be recorded complete, and the §6.6 marker must
+    still be there. A marker that has gone missing is RE-RECORDED as
+    outstanding — rolling the phase's real obligation forward — because
+    the absence of a record of deferred work is not evidence that it
+    happened.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_INVALID_BOARD, "invalid board name"
+        )
+    record = get_removal_phase_record(slug)
+    if record is not None and record.phase == RemovalPhase.APPLIED and (
+        observed_phase is None
+    ):
+        return _revalidate_recorded_application(slug, record, removal_id=removal_id)
+    phase_owned: dict = {}
+    if record is not None:
+        # Written with the advance, not after it: a crash between the two
+        # would otherwise leave Applied recorded with nothing saying the
+        # mode-specific content is still owed, and Done would believe it.
+        phase_owned["applied_mode_content"] = json.dumps(
+            _outstanding_applied_mode_content(slug, record, now=int(time.time())),
+            ensure_ascii=False,
+        )
+    # The private primitive, which derives and enforces Applied's
+    # REGISTERED precondition itself — the identical guard the public
+    # entry point goes through — because the marker is a sealed,
+    # phase-owned fact no public caller may pass, this driver included.
+    result = _advance_removal_phase(
+        slug, removal_id=removal_id,
+        from_phase=RemovalPhase.RELEASED, to_phase=RemovalPhase.APPLIED,
+        observed_phase=(
+            observed_phase if observed_phase is not None else RemovalPhase.RELEASED
+        ),
+        _phase_owned=phase_owned,
+    )
+    if (
+        record is not None
+        and not result.success
+        and result.outcome in (
+            RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE,
+            RemovalAdvanceOutcome.REFUSED_INDETERMINATE,
+        )
+    ):
+        _record_phase_refusal(slug, record, result.outcome.value, result.message)
+    return result
+
+
+def _revalidate_recorded_application(
+    slug: str, record: RemovalPhaseRecord, *, removal_id: str
+) -> RemovalPhaseAdvanceResult:
+    """Re-verify a record that is ALREADY at Applied (§6.6).
+
+    Two durable facts, re-read: that Release completed (authority is never
+    destroyed before the resource it governs is released), and that the
+    §6.6 mode-specific marker is there. The marker is the one fact this
+    phase OWES rather than proves, so a repeat that finds it missing
+    re-records the OUTSTANDING marker instead of reporting a no-op success
+    over the silence.
+
+    TQ-2 is re-read only while the mode-specific content is still
+    outstanding. Once it is recorded as performed — which
+    :func:`record_applied_mode_content` only does after verifying the
+    board's content really is gone — the store's absence is accounted for
+    by that verified evidence, and re-reading it would be re-checking a
+    store this removal legitimately destroyed.
+    """
+    if record.release_completed_at is None:
+        message = (
+            "§6.6: the record sits at applied but no §6.5 release completion "
+            "is recorded: authority is never destroyed before the resource it "
+            "governs is released, so this is refused rather than reported as "
+            "an idempotent success"
+        )
+        _record_phase_refusal(
+            slug, record,
+            RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE.value, message,
+        )
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE, message,
+            record=record,
+        )
+    marker = applied_mode_content_marker(record)
+    if marker.get("state") != APPLIED_MODE_CONTENT_APPLIED:
+        reading = _read_quiescence_predicate(slug, record=record)
+        if reading.status is not DurableReadStatus.OK:
+            message = (
+                "§6.6: the record sits at applied but TQ-2 can no longer be "
+                f"read, so no success may be reported over it: {reading.reason}"
+            )
+            _record_phase_refusal(
+                slug, record,
+                RemovalAdvanceOutcome.REFUSED_INDETERMINATE.value, message,
+            )
+            return RemovalPhaseAdvanceResult(
+                False, RemovalAdvanceOutcome.REFUSED_INDETERMINATE, message,
+                record=record,
+            )
+        if not reading.satisfied():
+            message = (
+                "§6.6: the record sits at applied but TQ-2 no longer holds: "
+                f"{reading.held} reservation(s) held, "
+                f"{reading.task_removals_in_window} task removal(s) in window"
+            )
+            _record_phase_refusal(
+                slug, record,
+                RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE.value, message,
+            )
+            return RemovalPhaseAdvanceResult(
+                False, RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE, message,
+                record=record,
+            )
+    if not (record.applied_mode_content or "").strip():
+        # The phase's own obligation, rolled forward: re-record what is
+        # still owed, guarded on (removal_id, phase) so it cannot move
+        # anything.
+        rebuilt = json.dumps(
+            _outstanding_applied_mode_content(slug, record, now=int(time.time())),
+            ensure_ascii=False,
+        )
+        written = _record_phase_fields(
+            slug, removal_id=removal_id, expect_phase=RemovalPhase.APPLIED,
+            applied_mode_content=rebuilt,
+        )
+        if not written:
+            return RemovalPhaseAdvanceResult(
+                False, RemovalAdvanceOutcome.REFUSED_STALE,
+                "the phase moved while §6.6's outstanding marker was being "
+                "re-recorded: nothing written", record=record,
+            )
+        return RemovalPhaseAdvanceResult(
+            True, RemovalAdvanceOutcome.REPAIRED_PHASE_FACT,
+            "already at applied: §6.6's mode-specific application was owed "
+            "with nothing recording it, so the outstanding marker was "
+            "re-recorded", record=replace(record, applied_mode_content=rebuilt),
+        )
+    return RemovalPhaseAdvanceResult(
+        True, RemovalAdvanceOutcome.IDEMPOTENT_NOOP,
+        "already at applied (idempotent no-op), re-verified against durable "
+        "state", record=record,
+    )
+
+
+# ---------------------------------------------------------------------------
+# §6.6's mode-specific content: the OUTSTANDING marker and its one seam
+# ---------------------------------------------------------------------------
+#
+# §6 is the part of a removal common to both modes, and it is built. The
+# mode-specific CONTENT of Applied is not: destroying the board's storage
+# and deregistering its registrations (§7.2, permanent), or completing and
+# verifying the retained copy and removing the live one (§7.3,
+# reversible). Deferring that work is authorised.
+#
+# What is NOT authorised is reporting success while it is outstanding.
+# ``hard-removed`` and ``archived`` are durable claims about the world: a
+# restart reading ``hard-removed`` believes the board's content is gone.
+# §6.8 makes Done "the only point at which success is reported", and a
+# phase may never advance until its meaning is durably true — so Applied
+# records that its mode-specific content is OUTSTANDING (a declared
+# exception under IN-3: recorded AND surfaced), and Done refuses while it
+# is.
+#
+# The single way to clear it is :func:`record_applied_mode_content`, the
+# narrow seam §7.2/§7.3 will call. It does not accept a caller's word for
+# it: it VERIFIES the claim against durable state — the store really gone
+# (permanent), the retained copy really present and readable and the live
+# one really gone (reversible) — and records what it verified. Nothing in
+# this task calls it in anger; the phases beyond §6 are what will.
+
+APPLIED_MODE_CONTENT_OUTSTANDING = "outstanding"
+APPLIED_MODE_CONTENT_APPLIED = "applied"
+
+# The kind recorded on the operator item, so the surfaced item is
+# distinguishable from a §6.5 environment obligation at a glance.
+APPLIED_MODE_CONTENT_ITEM_KIND = "applied-mode-content"
+
+# What each mode's deferred content IS, keyed by the recorded mode. The
+# rule and the requirement are recorded on the marker and named in every
+# refusal, so an operator reading durable state learns which step is
+# missing rather than that "something" is.
+APPLIED_MODE_CONTENT_RULES: "dict[RemovalMode, tuple[str, str]]" = {
+    RemovalMode.PERMANENT: (
+        "§7.2",
+        "destroy the board's durable storage and deregister its "
+        "registrations, so nothing of the board's content remains",
+    ),
+    RemovalMode.REVERSIBLE: (
+        "§7.3",
+        "complete and verify the retained copy, then remove the live one, "
+        "so the board's content is recoverable and no longer live",
+    ),
+}
+
+
+def _terminal_lifecycle_for(mode: RemovalMode) -> BoardLifecycle:
+    """The lifecycle Done would record for *mode* (§6.8)."""
+    return (
+        BoardLifecycle.HARD_REMOVED if mode == RemovalMode.PERMANENT
+        else BoardLifecycle.ARCHIVED
+    )
+
+
+def _outstanding_applied_mode_content(
+    slug: str, record: RemovalPhaseRecord, *, now: int
+) -> dict:
+    """The marker Applied records: this mode's content has NOT been applied.
+
+    Carries a recorded operator item in the same shape §6.5 uses, so the
+    one surface that already reports operator items
+    (:func:`removal_operator_items`) reports this too.
+    """
+    rule, requirement = APPLIED_MODE_CONTENT_RULES[record.mode]
+    return {
+        "state": APPLIED_MODE_CONTENT_OUTSTANDING,
+        "mode": record.mode.value,
+        "rule": rule,
+        "requirement": requirement,
+        "recorded_at": now,
+        "seam": "record_applied_mode_content",
+        "operator_item": {
+            "identity": {
+                "board": slug,
+                "removal_id": record.removal_id,
+                "mode": record.mode.value,
+                "step": rule,
+            },
+            "kind": APPLIED_MODE_CONTENT_ITEM_KIND,
+            "source": "§6.6",
+            "state": EnvironmentReleaseState.OPERATOR_ITEM.value,
+            "detail": (
+                f"{record.mode.value} removal: {rule}'s mode-specific "
+                f"application ({requirement}) has NOT been performed. Done is "
+                f"refused and the register entry stays 'removing' — "
+                f"{_terminal_lifecycle_for(record.mode).value} would be a false "
+                "terminal fact — until record_applied_mode_content() records "
+                "durable evidence that the work really happened."
+            ),
+        },
+        "evidence": None,
+        "applied_at": None,
+    }
+
+
+def applied_mode_content_marker(record: RemovalPhaseRecord) -> dict:
+    """The §6.6 mode-specific application marker, read FAIL-CLOSED.
+
+    Always a dict with a ``state``. A record at or past Applied whose
+    marker is absent, unreadable, or does not say ``applied`` reads as
+    OUTSTANDING: a missing record of the work is not evidence that the
+    work happened. A record before Applied reads as ``not-applicable``,
+    because the transition that owes the content has not been made.
+    """
+    if removal_phase_ordinal(record.phase) < removal_phase_ordinal(
+        RemovalPhase.APPLIED
+    ):
+        rule, requirement = APPLIED_MODE_CONTENT_RULES[record.mode]
+        return {
+            "state": "not-applicable",
+            "mode": record.mode.value,
+            "rule": rule,
+            "requirement": requirement,
+            "reason": (
+                f"the record is at {record.phase.value}: Applied, the phase "
+                "that owes the mode-specific content, has not been reached"
+            ),
+        }
+    marker = record.mode_content()
+    if not isinstance(marker, dict) or not marker.get("state"):
+        # Fail closed, including for a record advanced into Applied by a
+        # route that recorded no marker at all.
+        rebuilt = _outstanding_applied_mode_content(
+            record.board_name, record, now=record.updated_at or 0
+        )
+        rebuilt["reason"] = (
+            "no readable §6.6 mode-specific application marker is recorded: "
+            "read as outstanding, because the absence of a record of the work "
+            "is not evidence that it happened"
+        )
+        return rebuilt
+    if marker.get("state") == APPLIED_MODE_CONTENT_APPLIED and not marker.get(
+        "evidence"
+    ):
+        # An "applied" marker with no recorded evidence is exactly the
+        # caller-trusted flag this seam exists to refuse.
+        rebuilt = _outstanding_applied_mode_content(
+            record.board_name, record, now=record.updated_at or 0
+        )
+        rebuilt["reason"] = (
+            "the recorded marker says applied but carries no verified "
+            "evidence: read as outstanding"
+        )
+        return rebuilt
+    return marker
+
+
+def applied_mode_content_is_outstanding(record: RemovalPhaseRecord) -> bool:
+    """True when this removal still owes §6.6's mode-specific application."""
+    return applied_mode_content_marker(record).get("state") == (
+        APPLIED_MODE_CONTENT_OUTSTANDING
+    )
+
+
+@dataclass(frozen=True)
+class AppliedModeContentEvidence:
+    """What a §7.2/§7.3 caller offers, in terms that can be CHECKED (§6.6).
+
+    Deliberately not a boolean, and deliberately not enough on its own:
+    :func:`record_applied_mode_content` verifies the mode's requirement
+    against durable state and refuses when the world does not agree.
+    ``performed_by`` and ``detail`` are attribution — recorded, never
+    trusted as proof. ``retained_path`` is the one thing the caller
+    genuinely knows that this module cannot derive: where §7.3 put the
+    retained copy.
+    """
+    performed_by: str
+    retained_path: Optional[str] = None
+    detail: Optional[str] = None
+
+    def recorded(self) -> dict:
+        return {
+            "performed_by": self.performed_by,
+            "retained_path": self.retained_path,
+            "detail": self.detail,
+        }
+
+
+@dataclass
+class AppliedModeContentVerification:
+    """Whether durable state agrees that the mode-specific work happened."""
+    status: DurableReadStatus
+    verified: bool
+    reason: str
+    checks: list = field(default_factory=list)
+
+
+def _durable_path_presence(path: Path) -> "tuple[DurableReadStatus, Optional[bool], str]":
+    """Is *path* there? A stat that FAILED is never "gone" (AB-1/AB-2)."""
+    try:
+        present = Path(path).exists()
+    except OSError as exc:
+        return (
+            DurableReadStatus.INDETERMINATE, None,
+            f"cannot determine whether {path} exists: {exc}",
+        )
+    return (
+        DurableReadStatus.OK, present,
+        f"{path} is {'present' if present else 'absent'}",
+    )
+
+
+def _mode_content_check(name: str, required: str, observed: str) -> dict:
+    return {"check": name, "required": required, "observed": observed}
+
+
+def _verify_permanent_mode_content(
+    slug: str, record: RemovalPhaseRecord
+) -> AppliedModeContentVerification:
+    """§7.2: the board's content is really gone, read from the filesystem."""
+    checks: list = []
+    for name, path in (
+        ("board-store-absent", kanban_db_path(board=slug)),
+        ("board-directory-absent", board_dir(slug)),
+    ):
+        status, present, detail = _durable_path_presence(path)
+        if status is not DurableReadStatus.OK:
+            return AppliedModeContentVerification(
+                status, False, detail, checks,
+            )
+        checks.append(_mode_content_check(name, f"{path} no longer exists", detail))
+        if present:
+            return AppliedModeContentVerification(
+                DurableReadStatus.OK, False,
+                f"§7.2 is not done: {detail}, so the board's content still "
+                "exists and nothing may be recorded as hard-removed",
+                checks,
+            )
+    payload = record.carried() or {}
+    inventory = payload.get("pre_application_inventory")
+    if not isinstance(inventory, dict) or not isinstance(
+        inventory.get("tasks"), list
+    ):
+        return AppliedModeContentVerification(
+            DurableReadStatus.OK, False,
+            "§7.2 cannot be recorded applied without the §5.4 "
+            "pre-application inventory in the carry payload: what was "
+            "destroyed would have no durable record",
+            checks,
+        )
+    checks.append(_mode_content_check(
+        "pre-application-inventory-carried",
+        "the §5.4 inventory of what the board held is durably carried",
+        f"{len(inventory['tasks'])} task identity/identities recorded before "
+        "the content was destroyed",
+    ))
+    return AppliedModeContentVerification(
+        DurableReadStatus.OK, True,
+        "the board's store and directory are absent and the §5.4 "
+        "pre-application inventory of what they held is carried",
+        checks,
+    )
+
+
+def _retained_store_path(retained: Path) -> Path:
+    """The board store inside a retained copy (a directory or the file)."""
+    try:
+        if retained.is_dir():
+            return retained / "kanban.db"
+    except OSError:
+        pass
+    return retained
+
+
+def _verify_reversible_mode_content(
+    slug: str, record: RemovalPhaseRecord, evidence: "AppliedModeContentEvidence"
+) -> AppliedModeContentVerification:
+    """§7.3: the retained copy is really there and readable, the live one gone."""
+    checks: list = []
+    if not (evidence.retained_path or "").strip():
+        return AppliedModeContentVerification(
+            DurableReadStatus.OK, False,
+            "§7.3 names no retained copy: a reversible removal that cannot "
+            "point at the copy it retained has not completed one",
+            checks,
+        )
+    retained = Path(evidence.retained_path).expanduser()
+    live_dir = board_dir(slug)
+    if retained == live_dir or live_dir in retained.parents:
+        return AppliedModeContentVerification(
+            DurableReadStatus.OK, False,
+            f"the named retained copy {retained} is inside the live board "
+            f"directory {live_dir}: a copy retained inside what was removed "
+            "is not a retained copy",
+            checks,
+        )
+    status, present, detail = _durable_path_presence(retained)
+    if status is not DurableReadStatus.OK:
+        return AppliedModeContentVerification(status, False, detail, checks)
+    if not present:
+        return AppliedModeContentVerification(
+            DurableReadStatus.OK, False,
+            f"§7.3 is not done: the named retained copy is absent ({detail})",
+            checks,
+        )
+    checks.append(_mode_content_check(
+        "retained-copy-present", f"{retained} exists", detail,
+    ))
+    store = _retained_store_path(retained)
+    try:
+        conn = _sqlite_connect_no_create(store)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return AppliedModeContentVerification(
+            DurableReadStatus.OK, False,
+            f"the retained copy's store {store} cannot be opened, so the "
+            f"copy is not verified: {exc}",
+            checks,
+        )
+    try:
+        inventory = _pre_application_inventory(conn)
+    except sqlite3.Error as exc:
+        return AppliedModeContentVerification(
+            DurableReadStatus.OK, False,
+            f"the retained copy's store {store} cannot be read, so the copy "
+            f"is not verified: {exc}",
+            checks,
+        )
+    finally:
+        conn.close()
+    verified = _mode_content_check(
+        "retained-copy-verified",
+        f"{store} opens and its task rows are readable",
+        f"{inventory['count']} task identity/identities read from the "
+        "retained copy, each with a fingerprint",
+    )
+    # The inventory itself, inside its own check entry: every member of
+    # ``checks`` keeps one shape, so a reader can iterate them.
+    verified["retained_inventory"] = inventory
+    checks.append(verified)
+    status, present, detail = _durable_path_presence(kanban_db_path(board=slug))
+    if status is not DurableReadStatus.OK:
+        return AppliedModeContentVerification(status, False, detail, checks)
+    if present:
+        return AppliedModeContentVerification(
+            DurableReadStatus.OK, False,
+            f"§7.3 is not done: the live board store is still there "
+            f"({detail}), so the board's content has not stopped being live",
+            checks,
+        )
+    checks.append(_mode_content_check(
+        "live-store-absent", "the live board store no longer exists", detail,
+    ))
+    return AppliedModeContentVerification(
+        DurableReadStatus.OK, True,
+        f"the retained copy at {retained} is present and readable "
+        f"({inventory['count']} task identity/identities) and the live store "
+        "is absent",
+        checks,
+    )
+
+
+def _verify_applied_mode_content(
+    slug: str, record: RemovalPhaseRecord, evidence: "AppliedModeContentEvidence"
+) -> AppliedModeContentVerification:
+    """Does durable state agree that this mode's §6.6 content happened?"""
+    if record.mode == RemovalMode.PERMANENT:
+        return _verify_permanent_mode_content(slug, record)
+    return _verify_reversible_mode_content(slug, record, evidence)
+
+
+class AppliedModeContentOutcome(str, Enum):
+    """Outcomes of :func:`record_applied_mode_content`."""
+    RECORDED = "recorded"
+    IDEMPOTENT_NOOP = "idempotent-noop"
+    REFUSED_INVALID_BOARD = "refused-invalid-board"
+    REFUSED_NO_RECORD = "refused-no-record"
+    REFUSED_ID_MISMATCH = "refused-id-mismatch"
+    REFUSED_PHASE = "refused-phase"
+    REFUSED_UNVERIFIED = "refused-unverified"
+    REFUSED_INDETERMINATE = "refused-indeterminate"
+
+
+@dataclass
+class AppliedModeContentResult:
+    """Result of recording that §6.6's mode-specific content happened."""
+    success: bool
+    outcome: AppliedModeContentOutcome
+    message: str
+    record: Optional[RemovalPhaseRecord] = None
+    verification: Optional[AppliedModeContentVerification] = None
+
+
+def record_applied_mode_content(
+    board: str,
+    *,
+    removal_id: str,
+    evidence: "AppliedModeContentEvidence",
+) -> AppliedModeContentResult:
+    """Record that §6.6's MODE-SPECIFIC application really happened.
+
+    The one and only thing that clears the outstanding marker Applied
+    records, and therefore the one and only way a removal can reach Done.
+    **§7.2 / §7.3 are the intended callers**: the work whose content
+    those sections define — destroying the board's storage and
+    deregistering its registrations (permanent), or completing and
+    verifying the retained copy and removing the live one (reversible) —
+    calls this once it has actually done it. Nothing in §6 calls it in
+    anger, because §6 does not perform that work.
+
+    ``evidence`` is not a caller-trusted flag. It carries attribution and
+    the one fact this module cannot derive (where §7.3 put the retained
+    copy), and the requirement itself is VERIFIED here against durable
+    state: for permanent, that the board's store and directory are really
+    gone and the §5.4 pre-application inventory of what they held is
+    carried; for reversible, that the named retained copy is present and
+    its store readable and the live store really gone. A verification that
+    disagrees refuses. A verification that could not be READ is
+    indeterminate and also refuses — an unreadable answer is never "the
+    work happened".
+
+    Refusals leave the marker exactly as it was, so a refused claim can
+    never move a removal closer to reporting success.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return AppliedModeContentResult(
+            False, AppliedModeContentOutcome.REFUSED_INVALID_BOARD,
+            "invalid board name",
+        )
+    if not isinstance(evidence, AppliedModeContentEvidence):
+        raise TypeError(
+            "record_applied_mode_content: evidence must be an "
+            "AppliedModeContentEvidence describing what was done, not "
+            f"{type(evidence).__name__} — a bare flag from the caller is the "
+            "self-asserted predicate this seam exists to refuse"
+        )
+    if not (evidence.performed_by or "").strip():
+        return AppliedModeContentResult(
+            False, AppliedModeContentOutcome.REFUSED_UNVERIFIED,
+            "evidence names nobody as having performed the work: attribution "
+            "is part of the record (IN-3)",
+        )
+    # Re-entrant: verification and the write are one indivisible step
+    # under the board's register lock, and the write itself takes the
+    # same lock.
+    with board_register_lock(slug, reentrant=True):
+        record = get_removal_phase_record(slug)
+        if record is None:
+            return AppliedModeContentResult(
+                False, AppliedModeContentOutcome.REFUSED_NO_RECORD,
+                f"no removal phase record for {slug!r}",
+            )
+        if record.removal_id != removal_id:
+            return AppliedModeContentResult(
+                False, AppliedModeContentOutcome.REFUSED_ID_MISMATCH,
+                f"removal_id {removal_id!r} does not match the recorded "
+                f"removal {record.removal_id!r}", record=record,
+            )
+        marker = applied_mode_content_marker(record)
+        if marker.get("state") == APPLIED_MODE_CONTENT_APPLIED:
+            return AppliedModeContentResult(
+                True, AppliedModeContentOutcome.IDEMPOTENT_NOOP,
+                "§6.6's mode-specific application is already recorded as "
+                "performed (idempotent no-op)", record=record,
+            )
+        if removal_phase_ordinal(record.phase) < removal_phase_ordinal(
+            RemovalPhase.APPLIED
+        ):
+            return AppliedModeContentResult(
+                False, AppliedModeContentOutcome.REFUSED_PHASE,
+                f"the record is at {record.phase.value}: the mode-specific "
+                "application belongs to Applied and cannot be recorded before "
+                "the transition that owes it", record=record,
+            )
+        verification = _verify_applied_mode_content(slug, record, evidence)
+        if verification.status is not DurableReadStatus.OK:
+            return AppliedModeContentResult(
+                False, AppliedModeContentOutcome.REFUSED_INDETERMINATE,
+                f"durable state could not be read to verify the claim, so it "
+                f"is not recorded: {verification.reason}",
+                record=record, verification=verification,
+            )
+        if not verification.verified:
+            return AppliedModeContentResult(
+                False, AppliedModeContentOutcome.REFUSED_UNVERIFIED,
+                f"durable state does not agree that the work happened: "
+                f"{verification.reason}",
+                record=record, verification=verification,
+            )
+        now = int(time.time())
+        rule, requirement = APPLIED_MODE_CONTENT_RULES[record.mode]
+        applied_marker = {
+            "state": APPLIED_MODE_CONTENT_APPLIED,
+            "mode": record.mode.value,
+            "rule": rule,
+            "requirement": requirement,
+            "recorded_at": marker.get("recorded_at"),
+            "seam": "record_applied_mode_content",
+            "operator_item": None,
+            "applied_at": now,
+            "evidence": {
+                "claimed": evidence.recorded(),
+                "verified": verification.reason,
+                "checks": verification.checks,
+                "verified_at": now,
+            },
+        }
+        written = _record_phase_fields(
+            slug, removal_id=removal_id, expect_phase=record.phase,
+            applied_mode_content=json.dumps(applied_marker, ensure_ascii=False),
+        )
+    if not written:
+        return AppliedModeContentResult(
+            False, AppliedModeContentOutcome.REFUSED_PHASE,
+            "the phase moved while the claim was being verified: nothing "
+            "recorded", record=record, verification=verification,
+        )
+    return AppliedModeContentResult(
+        True, AppliedModeContentOutcome.RECORDED,
+        f"{rule}'s mode-specific application recorded as performed: "
+        f"{verification.reason}",
+        record=replace(
+            record,
+            applied_mode_content=json.dumps(applied_marker, ensure_ascii=False),
+        ),
+        verification=verification,
+    )
+
+
+# ---------------------------------------------------------------------------
+# §7.2 Permanent mode driver — the content Applied owes for permanent mode
+# ---------------------------------------------------------------------------
+#
+# This driver performs the work §7.2 specifies, in order:
+# 1. Capture pre-application inventory if not already captured
+# 2. Destroy the board's own storage area (C1)
+# 3. Destroy every ledgered IN resource by exact recorded identity
+# 4. Deregister every ledgered C13 registration entry by exact identity
+# 5. Write retention records for OUT resources (C6, C7)
+# 6. Record any failures that block Done
+# 7. Reduce the surviving fields (SV-1)
+#
+# At the end, calls record_applied_mode_content with verified evidence,
+# then builds and records the §12 receipt.
+
+
+@dataclass
+class PermanentModeContentResult:
+    """Result of :func:`apply_permanent_mode_content` (§7.2)."""
+    success: bool
+    message: str
+    destroyed: list = field(default_factory=list)
+    deregistered: list = field(default_factory=list)
+    retained: list = field(default_factory=list)
+    failures: list = field(default_factory=list)
+    leftovers: "Optional[ScopedLeftoverReport]" = None
+    record: Optional[RemovalPhaseRecord] = None
+
+
+def _destroy_board_storage(slug: str) -> "tuple[bool, str, dict]":
+    """C1: Destroy the board's own storage area and everything in it.
+
+    Returns (success, reason, detail). Destroying what is already gone is
+    a no-op that reports success — this is what makes P9 roll-forward safe.
+    """
+    db_path = kanban_db_path(board=slug)
+    board_directory = board_dir(slug)
+    detail = {"store": str(db_path), "directory": str(board_directory)}
+
+    # Remove the database file first
+    if db_path.exists():
+        try:
+            db_path.unlink()
+            detail["store_destroyed"] = True
+        except OSError as exc:
+            return False, f"cannot destroy board store {db_path}: {exc}", detail
+    else:
+        detail["store_destroyed"] = "already-absent"
+
+    # Remove the board directory
+    if board_directory.exists():
+        try:
+            shutil.rmtree(board_directory)
+            detail["directory_destroyed"] = True
+        except OSError as exc:
+            return (
+                False,
+                f"cannot destroy board directory {board_directory}: {exc}",
+                detail,
+            )
+    else:
+        detail["directory_destroyed"] = "already-absent"
+
+    return True, "board storage area destroyed", detail
+
+
+def _destroy_in_resource(resource: dict) -> "tuple[bool, str, dict]":
+    """Destroy an IN-disposition resource by its exact recorded identity.
+
+    Returns (success, reason, detail). Destroying what is already destroyed
+    is a no-op that reports success — idempotence for P9 roll-forward.
+    """
+    identity = resource.get("identity", "")
+    member = resource.get("member", "unknown")
+    detail = {"member": member, "identity": identity}
+
+    if not identity:
+        return (
+            False,
+            f"resource {member!r} has no recorded identity to destroy by (IN-2)",
+            detail,
+        )
+
+    path = Path(identity)
+
+    # Handle different resource types
+    if member in ("board-storage", "board-directory", "workspaces-root"):
+        # Directory-based resources
+        if path.exists():
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                detail["destroyed"] = True
+            except OSError as exc:
+                return False, f"cannot destroy {identity}: {exc}", detail
+        else:
+            detail["destroyed"] = "already-absent"
+
+    elif member in ("register-lock", "register-lock-init"):
+        # Lock file (or the materialised init-lock sibling)
+        if path.exists():
+            try:
+                path.unlink()
+                detail["destroyed"] = True
+            except OSError as exc:
+                return False, f"cannot destroy register lock {identity}: {exc}", detail
+        else:
+            detail["destroyed"] = "already-absent"
+
+    elif member == "current-pointer":
+        # Special handling for current-board pointer (IN-5 compliant)
+        # Only remove this board's own value, never touch the file if it
+        # names another board
+        try:
+            if path.exists():
+                recorded = path.read_text(encoding="utf-8").strip()
+                # We don't remove this here — it's handled in sweep
+                detail["destroyed"] = "handled-in-sweep"
+            else:
+                detail["destroyed"] = "already-absent"
+        except OSError as exc:
+            return False, f"cannot read current pointer: {exc}", detail
+
+    else:
+        # IN-3: an IN member this driver has no destruction defined for is
+        # a BLOCKING failure, never a success. Reporting "skipped" as
+        # success is how an undestroyed resource reaches a receipt that
+        # claims everything IN was destroyed.
+        detail["destroyed"] = False
+        return (
+            False,
+            f"no destruction is defined for IN member {member!r}: an IN "
+            "resource this driver does not know how to destroy blocks Done "
+            "rather than being reported as done",
+            detail,
+        )
+
+    return True, f"{member} destroyed by exact recorded identity", detail
+
+
+# ---------------------------------------------------------------------------
+# C13 work areas: owned members, verified before anything is destroyed
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class WorkAreaOwnership:
+    """Whether a ledgered work area is provably THIS board's to destroy.
+
+    ``owned`` is tri-state on purpose: ``True`` (the recorded identity and
+    the container's own registration metadata agree that this board
+    created it), ``False`` (they positively disagree), or ``None`` — the
+    ownership question could not be READ, which is never a licence to
+    delete. Only ``True`` authorises destruction (IN-2, IN-5).
+    """
+    owned: Optional[bool]
+    reason: str
+    evidence: dict = field(default_factory=dict)
+
+
+def _registration_gitdir_target(registration_dir: Path) -> "tuple[Optional[str], str]":
+    """The work area a container's registration entry points at.
+
+    A linked git work area's registration is a directory inside
+    ``<container>/.git/worktrees/`` whose ``gitdir`` file holds the
+    ABSOLUTE path of the work area's own ``.git`` file. That is the
+    container's own bookkeeping, written by the tool that created the
+    work area — so it is the authority on which directory the
+    registration belongs to, and reading it is how ownership is proven
+    rather than inferred from a name.
+    """
+    gitdir = registration_dir / "gitdir"
+    try:
+        raw = gitdir.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return None, f"cannot read {gitdir}: {exc}"
+    if not raw:
+        return None, f"{gitdir} is empty"
+    return raw, f"{gitdir} names {raw}"
+
+
+def verify_work_area_ownership(registration: dict) -> WorkAreaOwnership:
+    """Is this ledgered C13 work area provably owned by this board?
+
+    Every fact comes from the EXACT recorded identity in the carry ledger
+    plus the shared container's own registration metadata. Nothing is
+    decided by a pattern, a prefix or a resemblance, and a fact that
+    could not be read yields ``owned=None`` so the caller refuses instead
+    of deleting.
+    """
+    reg_path = registration.get("registration")
+    work_area = registration.get("work_area")
+    container = registration.get("container")
+    evidence = {
+        "registration": reg_path,
+        "work_area": work_area,
+        "container": container,
+        "task": registration.get("task"),
+    }
+    if not (reg_path and work_area and container):
+        return WorkAreaOwnership(
+            False,
+            "the ledgered registration does not name a registration entry, a "
+            "work area and a container, so there is no exact identity to "
+            "establish ownership from (IN-2)",
+            evidence,
+        )
+    work_area_path = Path(work_area)
+    container_path = Path(container)
+    expected_registration = (
+        container_path / ".git" / "worktrees" / work_area_path.name
+    )
+    evidence["expected_registration"] = str(expected_registration)
+    if Path(reg_path) != expected_registration:
+        return WorkAreaOwnership(
+            False,
+            f"the recorded registration {reg_path} is not this container's "
+            f"own registration entry for the recorded work area "
+            f"({expected_registration})",
+            evidence,
+        )
+    if work_area_path.parent != container_path / ".worktrees":
+        return WorkAreaOwnership(
+            False,
+            f"the recorded work area {work_area} is not inside the recorded "
+            f"container's work-area root ({container_path / '.worktrees'})",
+            evidence,
+        )
+
+    registration_present = expected_registration.exists()
+    try:
+        work_area_present = work_area_path.exists()
+    except OSError as exc:
+        return WorkAreaOwnership(
+            None, f"cannot determine whether {work_area} exists: {exc}", evidence,
+        )
+    evidence["registration_present"] = registration_present
+    evidence["work_area_present"] = work_area_present
+
+    if not registration_present:
+        if not work_area_present:
+            # Both already gone: a completed roll-forward, not a mystery.
+            return WorkAreaOwnership(
+                True,
+                "the registration entry and the work area are both already "
+                "absent: this item is already destroyed (idempotent)",
+                evidence,
+            )
+        return WorkAreaOwnership(
+            None,
+            f"the container's registration entry {reg_path} is gone but the "
+            f"work area {work_area} is still there, so nothing durable "
+            "establishes that this board owns that directory: it is left "
+            "intact and recorded as a blocking failure",
+            evidence,
+        )
+
+    target, detail = _registration_gitdir_target(expected_registration)
+    evidence["gitdir"] = detail
+    if target is None:
+        return WorkAreaOwnership(
+            None,
+            f"the container's registration metadata could not be read, so "
+            f"ownership of {work_area} is not established: {detail}",
+            evidence,
+        )
+    expected_target = work_area_path / ".git"
+    if Path(target) != expected_target:
+        return WorkAreaOwnership(
+            False,
+            f"the container's registration entry points at {target}, not at "
+            f"the recorded work area's own git file ({expected_target}): this "
+            "board does not own that directory (IN-5)",
+            evidence,
+        )
+    return WorkAreaOwnership(
+        True,
+        f"the container's own registration entry for {work_area_path.name} "
+        f"points at {expected_target}, so this board created it and owns it",
+        evidence,
+    )
+
+
+def _destroy_work_area_content(
+    registration: dict, ownership: WorkAreaOwnership
+) -> "tuple[bool, str, dict]":
+    """Destroy a VERIFIED-owned work area's content, before deregistration.
+
+    Order matters and is the whole point: the container's registration
+    metadata is the only durable thing that establishes ownership, so it
+    is the LAST thing to go. Destroying the content first means a crash
+    between the two leaves an owned, still-identifiable work area a
+    restart can finish — never an orphaned directory nothing claims.
+    """
+    work_area = registration.get("work_area")
+    detail = {
+        "work_area": work_area,
+        "container": registration.get("container"),
+        "ownership": ownership.reason,
+    }
+    if ownership.owned is not True:  # pragma: no cover - caller checks first
+        return False, "work-area ownership is not established", detail
+    path = Path(str(work_area))
+    try:
+        present = path.exists()
+    except OSError as exc:
+        return False, f"cannot determine whether {work_area} exists: {exc}", detail
+    if not present:
+        detail["destroyed"] = "already-absent"
+        return True, f"work area {work_area} is already absent", detail
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError as exc:
+        return False, f"cannot destroy work area {work_area}: {exc}", detail
+    detail["destroyed"] = True
+    return True, f"work area {work_area} destroyed by exact recorded identity", detail
+
+
+def journal_apply_item(
+    slug: str, *, removal_id: str, phase: RemovalPhase, item: dict
+) -> bool:
+    """Append ONE item to the durable §7.2/§7.3 apply journal, immediately.
+
+    Called after each destruction, deregistration or refusal and before
+    the next one begins, so the journal is a record of what really
+    happened rather than a summary written once at the end — which a
+    crash mid-apply would lose entirely.
+
+    Returns whether the item is DURABLE. ``False`` is a blocking fact, not
+    a diagnostic: the caller must stop the sequence rather than proceed to
+    the next destructive or deregistration step (see
+    :class:`ApplyJournalUnwritable`). A discarded ``False`` here is what
+    let an apply destroy a work area, lose the record of having done so,
+    and finish reporting a clean pass over an empty journal.
+    """
+    record = get_removal_phase_record(slug)
+    if record is None or record.removal_id != removal_id:
+        return False
+    journal = record.journal()
+    entry = dict(item)
+    entry.setdefault("recorded_at", int(time.time()))
+    entry["sequence"] = len(journal["items"]) + 1
+    journal["items"].append(entry)
+    try:
+        return _record_phase_fields(
+            slug, removal_id=removal_id, expect_phase=phase,
+            apply_journal=json.dumps(journal, ensure_ascii=False),
+        )
+    except sqlite3.Error as exc:  # pragma: no cover - register write failure
+        _log.warning(
+            "kanban removal: could not journal the apply item for %s/%s: %s",
+            slug, removal_id, exc,
+        )
+        return False
+
+
+def journalled_apply_identities(record: RemovalPhaseRecord, *, action: str) -> set:
+    """The exact identities the journal records *action* as done for."""
+    return {
+        str(item.get("identity"))
+        for item in record.journal()["items"]
+        if item.get("action") == action and item.get("ok") and item.get("identity")
+    }
+
+
+APPLY_JOURNAL_STORAGE_DESTROYED = "board-storage-destroyed"
+APPLY_JOURNAL_RESOURCE_DESTROYED = "in-resource-destroyed"
+APPLY_JOURNAL_WORK_AREA_DESTROYED = "work-area-destroyed"
+APPLY_JOURNAL_DEREGISTERED = "registration-deregistered"
+APPLY_JOURNAL_RETENTION_RECORDED = "retention-recorded"
+APPLY_JOURNAL_RETAINED_COPY = "retained-copy-completed"
+APPLY_JOURNAL_FAILURE = "blocked"
+
+# The journal actions a SUCCESSFUL apply step is recorded under. Completion
+# and per-item idempotence are both defined over exactly these, so a new
+# step cannot be added to the apply without also being accounted for.
+APPLY_JOURNAL_SUCCESS_ACTIONS: "tuple[str, ...]" = (
+    APPLY_JOURNAL_STORAGE_DESTROYED,
+    APPLY_JOURNAL_RESOURCE_DESTROYED,
+    APPLY_JOURNAL_WORK_AREA_DESTROYED,
+    APPLY_JOURNAL_DEREGISTERED,
+    APPLY_JOURNAL_RETENTION_RECORDED,
+)
+
+
+class ApplyJournalUnwritable(RuntimeError):
+    """A durable apply-journal write did not commit.
+
+    Raised the instant :func:`journal_apply_item` reports a failure, which
+    STOPS the apply sequence where it stands. A journal entry that did not
+    commit means durable state no longer records what has been done to the
+    world, and the next destructive or deregistration step would be taken
+    with no way for a restart to know the previous one happened. The one
+    correct response is to stop and block, never to log and step over.
+    """
+
+    def __init__(self, action: str, identity: Optional[str], reason: str):
+        self.action = action
+        self.identity = identity
+        self.step_reason = reason
+        super().__init__(
+            f"the durable apply journal did not record {action!r} for "
+            f"{identity!r} ({reason}): the apply is BLOCKED here rather than "
+            "continuing to the next destructive or deregistration step"
+        )
+
+
+def carried_apply_expectations(slug: str, payload: dict) -> list:
+    """Every ``(action, identity)`` the carried ledger says must be journalled.
+
+    Derived from the §6.4 carry payload — the ledger recorded BEFORE
+    anything was destroyed — so "what should have been acted on" comes
+    from durable state captured up front, not from a re-scan of a world
+    that is mid-destruction. The pairs are exactly the ones
+    :func:`journalled_apply_identities` reports, so the two can be
+    compared directly.
+    """
+    expected: list = [(APPLY_JOURNAL_STORAGE_DESTROYED, str(board_dir(slug)))]
+    for resource in (payload or {}).get("outside_resource_ledger") or []:
+        member = resource.get("member")
+        category = resource.get("category")
+        identity = resource.get("identity")
+        if resource.get("disposition") == "out":
+            if identity:
+                expected.append(
+                    (APPLY_JOURNAL_RETENTION_RECORDED, str(identity))
+                )
+            continue
+        if member in ("board-storage", "board-directory", "current-pointer"):
+            # board storage is its own step; the shared current pointer is
+            # the sweep's, so neither is owed a step-3 journal entry here.
+            continue
+        if category == "C13" or member == "work-area-registration":
+            for registration in resource.get("registrations") or []:
+                if registration.get("work_area"):
+                    expected.append((
+                        APPLY_JOURNAL_WORK_AREA_DESTROYED,
+                        str(registration["work_area"]),
+                    ))
+                if registration.get("registration"):
+                    expected.append((
+                        APPLY_JOURNAL_DEREGISTERED,
+                        str(registration["registration"]),
+                    ))
+            continue
+        if identity:
+            expected.append((APPLY_JOURNAL_RESOURCE_DESTROYED, str(identity)))
+    return expected
+
+
+def missing_apply_journal_entries(
+    slug: str, record: RemovalPhaseRecord
+) -> list:
+    """Carried members with no durable journal entry recording them done.
+
+    Read from the DURABLE record, so it answers "what does the journal on
+    disk say", not "what did this process believe it wrote". A non-empty
+    result BLOCKS: an apply that cannot show a durable entry for every
+    member the carry says it was to act on has not been shown to have
+    acted on them.
+    """
+    payload = record.carried() or {}
+    journalled = {
+        action: journalled_apply_identities(record, action=action)
+        for action in APPLY_JOURNAL_SUCCESS_ACTIONS
+    }
+    return [
+        {"action": action, "identity": identity}
+        for action, identity in carried_apply_expectations(slug, payload)
+        if identity not in journalled.get(action, frozenset())
+    ]
+
+
+def _deregister_work_area(registration: dict) -> "tuple[bool, str, dict]":
+    """Deregister a C13 work-area registration by exact recorded identity (RC-4).
+
+    A registration is the shared container's bookkeeping entry for a work area.
+    Deregistering removes ONLY that entry — the reference and its commits are
+    kept (C7), and no other board's registration is touched (IN-5).
+
+    Returns (success, reason, detail). Deregistering what is already gone is
+    a no-op reporting the same result (RC-5) — idempotence for P9a roll-forward.
+    """
+    reg_path = registration.get("registration")
+    work_area = registration.get("work_area")
+    container = registration.get("container")
+    reference = registration.get("reference")
+    detail = {
+        "registration": reg_path,
+        "work_area": work_area,
+        "container": container,
+        "reference": reference,
+    }
+
+    if not reg_path:
+        return (
+            False,
+            "registration has no exact identity to deregister by (IN-2)",
+            detail,
+        )
+
+    path = Path(reg_path)
+
+    if not path.exists():
+        # Already deregistered — idempotent success (RC-5)
+        detail["deregistered"] = "already-absent"
+        return True, "registration already absent (idempotent no-op)", detail
+
+    try:
+        # Remove only the registration entry — a directory inside .git/worktrees/
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        detail["deregistered"] = True
+    except OSError as exc:
+        return False, f"cannot deregister {reg_path}: {exc}", detail
+
+    return True, "registration deregistered by exact recorded identity", detail
+
+
+# ---------------------------------------------------------------------------
+# The untracked-leftovers check, scoped to THIS board's own roots (§14.2)
+# ---------------------------------------------------------------------------
+
+# How many child entries a flagged root contributes as evidence. A cap, not
+# a scan budget: the roots themselves are exact, so this only bounds how
+# much of a leftover's content the receipt quotes.
+_LEFTOVER_EVIDENCE_ENTRIES = 16
+
+
+@dataclass
+class ScopedLeftoverReport:
+    """What is left inside THIS board's own roots after the content applied.
+
+    ``roots`` is the whole scan domain and it is derived member by member
+    from the carry ledger's EXACT recorded identities — this board's own
+    storage area, its own work-area root, and each work area and
+    registration entry it recorded creating. Nothing else is looked at:
+    no glob, no prefix, no resemblance, and never a walk of a shared
+    parent. So another board's directory, another board's registration
+    and an unrelated file in a shared parent are all outside the domain
+    by construction, not by a filter that could be wrong.
+    """
+    board: str
+    roots: list = field(default_factory=list)
+    leftovers: list = field(default_factory=list)
+    unreadable: list = field(default_factory=list)
+
+    @property
+    def clean(self) -> bool:
+        """True only when every root was READ and every root was empty."""
+        return not self.leftovers and not self.unreadable
+
+
+def _leftover_root_entries(path: Path) -> "tuple[Optional[list], str]":
+    """The child entries of a flagged root, or ``None`` when unreadable."""
+    try:
+        if not path.is_dir():
+            return [], f"{path} exists and is not a directory"
+        names = sorted(entry.name for entry in path.iterdir())
+    except OSError as exc:
+        return None, f"cannot list {path}: {exc}"
+    return names[:_LEFTOVER_EVIDENCE_ENTRIES], f"{path} exists"
+
+
+def scoped_leftover_roots(slug: str, payload: Optional[dict]) -> list:
+    """This board's own roots, derived from its carry ledger (IN-2).
+
+    The one place the leftovers domain is written down, so the check and
+    the receipt's account of the check can never disagree about what was
+    looked at.
+    """
+    ledger = (payload or {}).get("outside_resource_ledger") or []
+    roots: list = []
+    seen: set = set()
+
+    def _add(root: Any, member: str, source: str) -> None:
+        text = str(root or "").strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        roots.append({"root": text, "member": member, "source": source})
+
+    for entry in ledger:
+        if not isinstance(entry, dict):
+            continue
+        member = entry.get("member")
+        if member in ("board-directory", "workspaces-root"):
+            _add(entry.get("identity"), member, "carried outside-resource ledger")
+        if member == "work-area-registration":
+            for registration in entry.get("registrations") or []:
+                if not isinstance(registration, dict):
+                    continue
+                _add(
+                    registration.get("work_area"), "work-area",
+                    "carried C13 registration",
+                )
+                _add(
+                    registration.get("registration"), "work-area-registration",
+                    "carried C13 registration",
+                )
+    if not roots:
+        # The ledger is required by Carried's precondition, so an empty
+        # domain means the caller handed us no carry at all. Fall back to
+        # this board's two own storage roots, still by exact identity.
+        _add(str(board_dir(slug)), "board-directory", "board_dir(slug)")
+        _add(str(workspaces_root(slug)), "workspaces-root", "workspaces_root(slug)")
+    return roots
+
+
+def check_scoped_leftovers(
+    board: str, record: Optional[RemovalPhaseRecord] = None
+) -> ScopedLeftoverReport:
+    """Is anything left inside this board's OWN roots? (§14.2)
+
+    The production leftovers check. Every root comes from
+    :func:`scoped_leftover_roots`; each is stat-ed by that exact path and
+    nothing else is enumerated. A root that still exists is FLAGGED with
+    its exact path (and, as evidence, up to
+    :data:`_LEFTOVER_EVIDENCE_ENTRIES` of its child names). A root that
+    could not be READ is recorded as unreadable rather than as clean — a
+    failed read is never a proof of absence — and either one makes the
+    report not clean.
+
+    Read-only: nothing here removes, moves or rewrites anything, so a
+    root belonging to some other board could not be touched even if it
+    somehow entered the domain.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return ScopedLeftoverReport(board=str(board))
+    if record is None:
+        record = get_removal_phase_record(slug)
+    payload = record.carried() if record is not None else None
+    report = ScopedLeftoverReport(
+        board=slug, roots=scoped_leftover_roots(slug, payload)
+    )
+    for root in report.roots:
+        path = Path(root["root"])
+        try:
+            present = path.exists()
+        except OSError as exc:
+            report.unreadable.append({
+                **root,
+                "reason": f"cannot determine whether {path} exists: {exc}",
+            })
+            continue
+        if not present:
+            continue
+        entries, reason = _leftover_root_entries(path)
+        if entries is None:
+            report.unreadable.append({**root, "reason": reason})
+            continue
+        report.leftovers.append({
+            **root,
+            "reason": (
+                f"{reason}: this board's own root still holds content after "
+                "the mode-specific application"
+            ),
+            "entries": entries,
+        })
+    return report
+
+
+def _build_retention_record(
+    slug: str, category: str, resource: dict
+) -> dict:
+    """Build a retention record for an OUT-disposition resource (C6, C7).
+
+    The retention record names the exact members and the declaration clause
+    that retained them.
+    """
+    return {
+        "board": slug,
+        "category": category,
+        "member": resource.get("member"),
+        "identity": resource.get("identity"),
+        "disposition": "out",
+        "reason": resource.get("reason", "retained by declaration"),
+        "clause": f"C{category[-1]} — {resource.get('reason', 'retained')}",
+        "detail": resource.get("detail") or resource,
+    }
+
+
+# §12.7 verdicts. An explicit value for every check, including for a fact
+# durable state genuinely cannot establish — never a guess, and never
+# silence.
+RECEIPT_VERDICT_PASS = "PASS"
+RECEIPT_VERDICT_FAIL = "FAIL"
+# The check is defined and was evaluated, but durable state cannot prove
+# the fact either way. Distinct from INDETERMINATE, which is a read that
+# FAILED.
+RECEIPT_VERDICT_UNVERIFIED = "UNVERIFIED"
+RECEIPT_VERDICT_INDETERMINATE = "INDETERMINATE"
+
+RECEIPT_VERDICTS = (
+    RECEIPT_VERDICT_PASS,
+    RECEIPT_VERDICT_FAIL,
+    RECEIPT_VERDICT_UNVERIFIED,
+    RECEIPT_VERDICT_INDETERMINATE,
+)
+
+
+def _receipt_check(
+    name: str, required: str, *, verdict: str, observed: str, evidence: Any = None
+) -> dict:
+    """One §12.7 check: what was required, what was observed, the verdict."""
+    return {
+        "check": name,
+        "required": required,
+        "observed": observed,
+        "verdict": verdict,
+        "evidence": evidence,
+    }
+
+
+def _receipt_path_absence_check(name: str, required: str, path: Path) -> dict:
+    """A §12.7 check over a path, with a failed stat kept INDETERMINATE."""
+    status, present, detail = _durable_path_presence(path)
+    if status is not DurableReadStatus.OK:
+        return _receipt_check(
+            name, required, verdict=RECEIPT_VERDICT_INDETERMINATE,
+            observed=detail, evidence={"path": str(path)},
+        )
+    return _receipt_check(
+        name, required,
+        verdict=RECEIPT_VERDICT_FAIL if present else RECEIPT_VERDICT_PASS,
+        observed=detail, evidence={"path": str(path)},
+    )
+
+
+def _build_receipt_verification(
+    slug: str,
+    record: RemovalPhaseRecord,
+    entry: Optional[RegisterEntry],
+    destroyed: list,
+    deregistered: list,
+    failures: list,
+    leftovers: "Optional[ScopedLeftoverReport]",
+) -> dict:
+    """§12.7: the checks that were performed, each with a verdict and evidence.
+
+    Every field is present for every removal. Where durable state cannot
+    prove a fact, the verdict is the explicit
+    :data:`RECEIPT_VERDICT_UNVERIFIED` (or
+    :data:`RECEIPT_VERDICT_INDETERMINATE` for a read that failed) with the
+    reason — never a guess, and never an omitted key that a reader would
+    have to interpret.
+    """
+    checks: list = [
+        _receipt_path_absence_check(
+            "board-store-absent",
+            "the board's own SQLite store no longer exists",
+            kanban_db_path(board=slug),
+        ),
+        _receipt_path_absence_check(
+            "board-directory-absent",
+            "the board's own storage directory no longer exists",
+            board_dir(slug),
+        ),
+    ]
+
+    journal = record.journal()
+    work_areas = journalled_apply_identities(
+        record, action=APPLY_JOURNAL_WORK_AREA_DESTROYED
+    )
+    deregistrations = journalled_apply_identities(
+        record, action=APPLY_JOURNAL_DEREGISTERED
+    )
+    checks.append(_receipt_check(
+        "work-area-content-destroyed",
+        "every ledgered C13 work area this board owns had its CONTENT "
+        "destroyed, journalled as it happened, before its registration went",
+        verdict=(
+            RECEIPT_VERDICT_PASS if work_areas or not deregistrations
+            else RECEIPT_VERDICT_FAIL
+        ),
+        observed=(
+            f"{len(work_areas)} work area(s) journalled destroyed, "
+            f"{len(deregistrations)} registration(s) journalled deregistered"
+        ),
+        evidence=sorted(work_areas),
+    ))
+    checks.append(_receipt_check(
+        "destruction-journalled-durably",
+        "every destruction, deregistration and refusal is durably journalled "
+        "on the removal record as it happened",
+        verdict=(
+            RECEIPT_VERDICT_PASS if journal["items"]
+            else RECEIPT_VERDICT_UNVERIFIED
+        ),
+        observed=(
+            f"{len(journal['items'])} journal item(s) recorded"
+            if journal["items"] else
+            "no journal item is recorded, so what was destroyed when cannot "
+            "be established from durable state"
+        ),
+        evidence=journal["items"],
+    ))
+
+    if leftovers is None:
+        checks.append(_receipt_check(
+            "scoped-leftovers-clean",
+            "nothing is left inside this board's OWN roots",
+            verdict=RECEIPT_VERDICT_UNVERIFIED,
+            observed="the leftovers check was not run for this removal",
+        ))
+    else:
+        if leftovers.unreadable:
+            verdict = RECEIPT_VERDICT_INDETERMINATE
+        elif leftovers.leftovers:
+            verdict = RECEIPT_VERDICT_FAIL
+        else:
+            verdict = RECEIPT_VERDICT_PASS
+        checks.append(_receipt_check(
+            "scoped-leftovers-clean",
+            "nothing is left inside this board's OWN roots, each root taken "
+            "from the carry ledger's exact recorded identity",
+            verdict=verdict,
+            observed=(
+                f"{len(leftovers.roots)} root(s) checked, "
+                f"{len(leftovers.leftovers)} flagged, "
+                f"{len(leftovers.unreadable)} unreadable"
+            ),
+            evidence={
+                "roots": leftovers.roots,
+                "leftovers": leftovers.leftovers,
+                "unreadable": leftovers.unreadable,
+            },
+        ))
+
+    payload = record.carried() or {}
+    inventory = payload.get("pre_application_inventory")
+    has_inventory = isinstance(inventory, dict) and isinstance(
+        inventory.get("tasks"), list
+    )
+    checks.append(_receipt_check(
+        "pre-application-inventory-carried",
+        "the §5.4 inventory of what the board held was captured BEFORE the "
+        "content was destroyed",
+        verdict=RECEIPT_VERDICT_PASS if has_inventory else RECEIPT_VERDICT_FAIL,
+        observed=(
+            f"{len(inventory['tasks'])} task identity/identities recorded"
+            if has_inventory else
+            "no §5.4 pre-application inventory is durably carried"
+        ),
+        evidence=inventory if has_inventory else None,
+    ))
+
+    marker = applied_mode_content_marker(record)
+    checks.append(_receipt_check(
+        "mode-content-recorded-applied",
+        "§6.6's mode-specific application is durably recorded as PERFORMED, "
+        "verified against durable state by record_applied_mode_content",
+        verdict=(
+            RECEIPT_VERDICT_PASS
+            if marker.get("state") == APPLIED_MODE_CONTENT_APPLIED
+            else RECEIPT_VERDICT_FAIL
+        ),
+        observed=f"the §6.6 marker reads {marker.get('state')!r}",
+        evidence=(marker.get("evidence") or {}).get("checks"),
+    ))
+
+    checks.append(_receipt_check(
+        "phase-done",
+        "the removal record is at the terminal phase 'done'",
+        verdict=(
+            RECEIPT_VERDICT_PASS if record.phase is RemovalPhase.DONE
+            else RECEIPT_VERDICT_FAIL
+        ),
+        observed=f"the recorded phase is {record.phase.value!r}",
+        evidence={"outcome": record.outcome, "updated_at": record.updated_at},
+    ))
+
+    terminal = _terminal_lifecycle_for(record.mode)
+    if entry is None:
+        checks.append(_receipt_check(
+            "terminal-lifecycle-recorded",
+            f"the register entry records the terminal lifecycle {terminal.value!r}",
+            verdict=RECEIPT_VERDICT_INDETERMINATE,
+            observed="the register entry could not be read at receipt time",
+        ))
+    else:
+        checks.append(_receipt_check(
+            "terminal-lifecycle-recorded",
+            f"the register entry records the terminal lifecycle {terminal.value!r}",
+            verdict=(
+                RECEIPT_VERDICT_PASS if entry.lifecycle is terminal
+                else RECEIPT_VERDICT_FAIL
+            ),
+            observed=f"the register records {entry.lifecycle.value!r}",
+            evidence={"epoch": entry.epoch, "gate_move": entry.gate_move.value},
+        ))
+
+    open_items = removal_operator_items(record)
+    checks.append(_receipt_check(
+        "no-open-operator-items",
+        "no operator item is left outstanding by this removal",
+        verdict=(
+            RECEIPT_VERDICT_PASS if not open_items else RECEIPT_VERDICT_FAIL
+        ),
+        observed=f"{len(open_items)} open operator item(s)",
+        evidence=open_items,
+    ))
+
+    checks.append(_receipt_check(
+        "no-blocking-failures",
+        "no IN resource was left undestroyed and no registration undeleted",
+        verdict=RECEIPT_VERDICT_PASS if not failures else RECEIPT_VERDICT_FAIL,
+        observed=f"{len(failures)} blocking failure(s)",
+        evidence=failures,
+    ))
+
+    # The init-lock is retained by design: every register-lock
+    # acquisition (swept, done, journal writes) re-materialises it after
+    # destruction, so removal cannot be made final without re-creating
+    # the file.  The receipt states this explicitly rather than silently
+    # leaving or silently attempting a post-receipt unlink.
+    _init_lock_path = register_lock_path(slug).with_name(
+        register_lock_path(slug).name + ".init.lock"
+    )
+    _init_lock_identity = str(_init_lock_path)
+    _init_lock_retained = any(
+        item.get("identity") == _init_lock_identity
+        and item.get("action") == APPLY_JOURNAL_RETENTION_RECORDED
+        and item.get("ok")
+        for item in journal["items"]
+    )
+    # The presence of the retained file is read ONCE, and the expected
+    # materialised identity — a regular file — is derived from that same
+    # reading. Both gate the verdict and both are carried as evidence: a
+    # PASS that claimed retention while its own reading said the file was
+    # absent would be a receipt contradicting itself.
+    try:
+        _init_lock_stat = _init_lock_path.stat()
+    except OSError:
+        _init_lock_stat = None
+    _init_lock_present = _init_lock_stat is not None
+    _init_lock_is_file = bool(
+        _init_lock_stat is not None
+        and (_init_lock_stat.st_mode & 0o170000) == 0o100000
+    )
+    _init_lock_verdict = (
+        RECEIPT_VERDICT_PASS
+        if _init_lock_retained and _init_lock_present and _init_lock_is_file
+        else RECEIPT_VERDICT_UNVERIFIED
+    )
+    checks.append(_receipt_check(
+        "init-lock-retained",
+        "the register-lock init-lock is retained by design: every "
+        "register-lock acquisition re-materialises it, so removal "
+        "cannot be made final without re-creating the file",
+        verdict=_init_lock_verdict,
+        observed=(
+            f"retention journalled: {_init_lock_retained}; "
+            f"file present at receipt time: {_init_lock_present}; "
+            f"present as a regular file: {_init_lock_is_file}"
+            + (
+                " (expected — retained by design)"
+                if _init_lock_verdict == RECEIPT_VERDICT_PASS
+                else " — the retention this check asserts cannot be shown "
+                     "true from that reading"
+            )
+        ),
+        evidence={
+            "identity": _init_lock_identity,
+            "retention_journalled": _init_lock_retained,
+            "file_present": _init_lock_present,
+            "file_is_regular_file": _init_lock_is_file,
+            "disposition": "retained-by-design",
+            "reason": (
+                "the register lock discipline re-materialises the file "
+                "on every acquisition; removal is self-defeating"
+            ),
+        },
+    ))
+
+    ledger = payload.get("outside_resource_ledger") or []
+    vc_entry = next(
+        (e for e in ledger if e.get("member") == "version-control-references"),
+        {},
+    )
+    references = vc_entry.get("references") or []
+    # A reference whose head this board's receipts never recorded cannot
+    # have its commits established from durable state. Saying so is the
+    # point: the alternative is a PASS that means "we found nothing".
+    unnamed = [
+        {
+            "task": ref.get("task"),
+            "reference": ref.get("reference"),
+            "reason": (
+                "no head commit is recorded for this reference, so the exact "
+                "list of commits it holds cannot be derived from durable state"
+                if not ref.get("head_commit") else
+                "a head is recorded but no commit is attributable to this "
+                "board under the created-commit rule"
+            ),
+        }
+        for ref in references
+        if not ref.get("head_commit")
+        or not (ref.get("board_created_commits") or [])
+    ]
+    checks.append(_receipt_check(
+        "version-control-retained-and-named",
+        "every retained reference and every commit this board created is "
+        "named explicitly, under one identity-blind rule",
+        verdict=(
+            RECEIPT_VERDICT_PASS if not unnamed else RECEIPT_VERDICT_UNVERIFIED
+        ),
+        observed=(
+            f"{len(references)} reference(s) named; "
+            f"{len(unnamed)} cannot have their created commits established "
+            "from durable state"
+        ),
+        evidence={"rule": BOARD_CREATED_COMMIT_RULE, "unnamed": unnamed},
+    ))
+
+    # The commit list's SOURCE is a named fact on the receipt, and its
+    # COMPLETENESS is not something this build can verify: the creation-time
+    # commit provenance ledger that would establish it is deferred and
+    # absent. Marked UNVERIFIED here rather than claimed, dropped, or
+    # allowed to read as a pass.
+    checks.append(_receipt_check(
+        "commit-list-completeness",
+        "the commit list's source is named, and its completeness is only "
+        "claimed where durable state can establish it",
+        verdict=RECEIPT_VERDICT_UNVERIFIED,
+        observed=(
+            f"the commit list for {len(references)} reference(s) is derived "
+            f"from {COMMIT_LIST_SOURCE}; {COMMIT_LIST_COMPLETENESS_UNVERIFIED}"
+        ),
+        evidence={
+            "commit_list_source": COMMIT_LIST_SOURCE,
+            "commit_list_source_statement": COMMIT_LIST_SOURCE_STATEMENT,
+            "creation_time_provenance_ledger": "absent",
+            "per_reference": [
+                {
+                    "task": ref.get("task"),
+                    "reference": ref.get("reference"),
+                    "completeness": commit_list_completeness(ref),
+                }
+                for ref in references
+            ],
+        },
+    ))
+
+    transcript_entry = next(
+        (e for e in ledger if e.get("member") == "conversation-transcripts"),
+        {},
+    )
+    transcript_identity = transcript_entry.get("identity")
+    transcript_sessions = transcript_entry.get("originating_sessions") or []
+    _transcript_present = None
+    if not transcript_identity:
+        _transcript_verdict = RECEIPT_VERDICT_UNVERIFIED
+        _transcript_observed = (
+            "the transcript store's location is not in the carry ledger"
+        )
+    else:
+        _transcript_path = Path(transcript_identity)
+        _transcript_present = _transcript_path.exists()
+        if _transcript_present:
+            _transcript_verdict = RECEIPT_VERDICT_PASS
+            _transcript_observed = (
+                f"store retained at {transcript_identity} (verified present)"
+            )
+        else:
+            if not transcript_sessions:
+                _transcript_verdict = RECEIPT_VERDICT_PASS
+                _transcript_observed = (
+                    f"store absent at {transcript_identity} with "
+                    "0 session(s) attributed: no store was materialised "
+                    "and no session is attributed"
+                )
+            else:
+                # UNVERIFIED, not FAIL: the store is absent but sessions
+                # are attributed — the retention promise ("kept, not
+                # deleted") cannot be verified from durable state.  FAIL
+                # would assert the removal itself broke the promise;
+                # UNVERIFIED states that the fact cannot be established
+                # either way, which is honest when the store is written
+                # by a layer that may never have run.
+                _transcript_verdict = RECEIPT_VERDICT_UNVERIFIED
+                _transcript_observed = (
+                    f"store absent at {transcript_identity} with "
+                    f"{len(transcript_sessions)} session(s) attributed: "
+                    "the retention promise cannot be verified — the store "
+                    "does not exist while sessions are attributed to it"
+                )
+    checks.append(_receipt_check(
+        "transcripts-retained-and-disclosed",
+        "the conversation-transcript store is kept, not deleted, with its "
+        "existence and location disclosed",
+        verdict=_transcript_verdict,
+        observed=_transcript_observed,
+        evidence={
+            "sessions": transcript_sessions,
+            "store_present": _transcript_present,
+        },
+    ))
+
+    verdicts = {name: 0 for name in RECEIPT_VERDICTS}
+    for check in checks:
+        verdicts[check["verdict"]] = verdicts.get(check["verdict"], 0) + 1
+    return {
+        "clause": "§12.7",
+        "method": "board-removal-safety-design-r5",
+        "verdict_values": list(RECEIPT_VERDICTS),
+        "checks": checks,
+        "verdicts": verdicts,
+        "overall": (
+            RECEIPT_VERDICT_PASS
+            if verdicts[RECEIPT_VERDICT_FAIL] == 0
+            and verdicts[RECEIPT_VERDICT_INDETERMINATE] == 0
+            else RECEIPT_VERDICT_FAIL
+        ),
+        "honesty": (
+            "a fact durable state cannot prove carries the explicit verdict "
+            f"{RECEIPT_VERDICT_UNVERIFIED!r}, and a read that FAILED carries "
+            f"{RECEIPT_VERDICT_INDETERMINATE!r}: neither is ever reported as a "
+            "pass and neither is ever omitted"
+        ),
+    }
+
+
+def _build_permanent_receipt(
+    slug: str,
+    record: RemovalPhaseRecord,
+    entry: Optional[RegisterEntry],
+    destroyed: list,
+    deregistered: list,
+    retained: list,
+    failures: list,
+    leftovers: "Optional[ScopedLeftoverReport]" = None,
+) -> dict:
+    """Build the §12 permanent-removal receipt from FINAL durable state.
+
+    The receipt contains all required content from §12.1-§12.7:
+    - Subject identity and provenance (§12.1)
+    - What was destroyed (§12.2)
+    - Retained version-control history (§12.3)
+    - Retained conversation transcripts (§12.4)
+    - Registration cleanup (§12.5)
+    - Honesty clauses (§12.6)
+    - The checks that were performed, with verdicts and evidence (§12.7)
+
+    ``record`` and ``entry`` must be the state read AFTER Done committed:
+    the terminal lifecycle, the completion instant, the cleared §6.6
+    marker and the empty operator-item list are all facts about the
+    finished removal, and a receipt built from the state that existed
+    before them would state the opposite of what is true. That is why
+    this takes them as arguments instead of reading whatever the caller
+    happened to be holding.
+    """
+    payload = record.carried() or {}
+    journal = record.journal()
+
+    # §12.1 Subject and provenance
+    receipt = {
+        "version": "permanent-removal-receipt-v2",
+        "subject": {
+            "board_name": slug,
+            "epoch": record.epoch,
+            "mode": record.mode.value,
+            "removal_id": record.removal_id,
+            "phase": record.phase.value,
+            "outcome": record.outcome,
+            # Read from the durable record of the Done transition, not
+            # from the clock of whoever is building the receipt.
+            "terminal_lifecycle": (
+                entry.lifecycle.value if entry is not None else None
+            ),
+            "completion_time": record.updated_at,
+        },
+        "provenance": {
+            "verification_method_version": "board-removal-safety-design-r5",
+            "scope_declaration_identity": SCOPE_DECLARATION_VERSION,
+            "scope_declaration_version": record.scope_declaration_version,
+            "scan_domain": _build_scan_domain(slug, payload),
+            "apply_journal": journal["items"],
+        },
+
+        # §12.2 Destroyed
+        "destroyed": {
+            "categories": _categorize_destroyed(destroyed, failures),
+            "records": destroyed,
+            "failures": failures,
+        },
+
+        # §12.3 Retained version-control history
+        "version_control": _build_version_control_receipt(payload),
+
+        # §12.4 Retained conversation transcripts
+        "transcripts": _build_transcript_receipt(payload),
+
+        # §12.5 Registration cleanup
+        "registrations": {
+            "deregistered": deregistered,
+            "statement": (
+                "deregistration removed ONLY the shared container's own "
+                "bookkeeping entry for this board's work area; the reference "
+                "and its commits were kept; no other board's registration and "
+                "no part of the shared container itself was touched"
+            ),
+        },
+
+        # §12.6 Honesty clauses
+        "honesty": {
+            "retained_records": retained,
+            "declared_exclusions": [],
+            "force_ended_reservations": [],
+            "open_operator_items": removal_operator_items(record),
+            "permanence_claim": (
+                f"Board {slug!r} was permanently removed. Its own storage area "
+                "and IN-disposition resources were destroyed as recorded above. "
+                "Version-control history (C7) and conversation transcripts (C6) "
+                "were retained as declared, and are listed with their exact "
+                "identities above. This receipt does NOT claim 'permanent and "
+                "unrecoverable' without qualification — it states exactly what "
+                "was destroyed and what was kept."
+            ),
+        },
+
+        # §12.7 The checks performed, with verdicts and evidence
+        "verification": _build_receipt_verification(
+            slug, record, entry, destroyed, deregistered, failures, leftovers,
+        ),
+    }
+
+    return receipt
+
+
+def _build_scan_domain(slug: str, payload: dict) -> list:
+    """Build the scan domain place by place (§12.1)."""
+    domain = []
+    domain.append({
+        "place": "board-storage",
+        "location": str(board_dir(slug)),
+        "kind": "board's own storage location",
+    })
+    domain.append({
+        "place": "board-store",
+        "location": str(kanban_db_path(board=slug)),
+        "kind": "board's SQLite store",
+    })
+    ledger = payload.get("outside_resource_ledger") or []
+    for entry in ledger:
+        if entry.get("identity"):
+            domain.append({
+                "place": entry.get("member"),
+                "location": entry.get("identity"),
+                "kind": entry.get("reason", "ledgered resource"),
+            })
+    return domain
+
+
+def _categorize_destroyed(destroyed: list, failures: list) -> dict:
+    """Categorize destroyed items by category with counts."""
+    by_category: dict = {}
+    for item in destroyed:
+        cat = item.get("member", "unknown")
+        if cat not in by_category:
+            by_category[cat] = {"count": 0, "items": []}
+        by_category[cat]["count"] += 1
+        by_category[cat]["items"].append(item)
+    for item in failures:
+        cat = item.get("member", "unknown")
+        if cat not in by_category:
+            by_category[cat] = {"count": 0, "items": [], "failures": []}
+        if "failures" not in by_category[cat]:
+            by_category[cat]["failures"] = []
+        by_category[cat]["failures"].append(item)
+    return by_category
+
+
+def _build_version_control_receipt(payload: dict) -> dict:
+    """Build the §12.3 version-control retention section.
+
+    Names every repository, every reference, and every commit created for
+    this board's work. Honest about what can and cannot be derived from
+    durable state.
+    """
+    ledger = payload.get("outside_resource_ledger") or []
+    vc_entry = next(
+        (e for e in ledger if e.get("member") == "version-control-references"),
+        {},
+    )
+    references = vc_entry.get("references") or []
+
+    return {
+        "retained_statement": (
+            "version-control history for this board's work is never deleted by "
+            "board removal; every retained reference and every commit created "
+            "for that work is explicitly named here and remains readable"
+        ),
+        "clause": "C7",
+        "commit_rule": BOARD_CREATED_COMMIT_RULE,
+        "references": [_build_reference_receipt(ref) for ref in references],
+        "count": len(references),
+        "source": vc_entry.get("read_from", "outside_resource_ledger"),
+        "commit_list_source": COMMIT_LIST_SOURCE,
+        "commit_list_source_statement": COMMIT_LIST_SOURCE_STATEMENT,
+        "commit_list_completeness": {
+            "verdict": RECEIPT_VERDICT_UNVERIFIED,
+            "creation_time_provenance_ledger": "absent",
+            "reason": COMMIT_LIST_COMPLETENESS_UNVERIFIED,
+        },
+    }
+
+
+def _build_reference_receipt(ref: dict) -> dict:
+    """One §12.3 reference: repository, reference, base, head, commits.
+
+    Each field is emitted EXPLICITLY, with
+    :data:`RECEIPT_VERDICT_UNVERIFIED` in place of any value durable
+    state cannot supply — a receipt that silently omitted a field would
+    read as "there was nothing there".
+    """
+    created = ref.get("board_created_commits")
+    if created is None:
+        created = ref.get("commits") or []
+    base = ref.get("base_commit")
+    absorbed = ref.get("absorbed_heads") or []
+    advances = ref.get("advances") or []
+    return {
+        "repository": ref.get("container") or RECEIPT_VERDICT_UNVERIFIED,
+        "reference": ref.get("reference") or RECEIPT_VERDICT_UNVERIFIED,
+        # Kept under its §12.3 name as well, so a reader looking for
+        # either spelling finds the same value rather than nothing.
+        "reference_name": ref.get("reference") or RECEIPT_VERDICT_UNVERIFIED,
+        "task": ref.get("task"),
+        "title": ref.get("title"),
+        "project": ref.get("project"),
+        "base_commit": base or RECEIPT_VERDICT_UNVERIFIED,
+        "head_commit": ref.get("head_commit") or RECEIPT_VERDICT_UNVERIFIED,
+        # The exact list of commits THIS BOARD created. The base is not on
+        # it: this board did not create the commit its work started from.
+        "board_created_commits": list(created),
+        "commit_count": len(created),
+        "base_commit_excluded": True,
+        "commit_rule": ref.get("commit_rule") or BOARD_CREATED_COMMIT_RULE,
+        "commit_provenance": ref.get("commit_provenance") or [],
+        # A head absorbed from another subject's work: disclosed by fact,
+        # count and exact identity, and NOT claimed as this board's.
+        "absorbed_heads": absorbed,
+        "absorbed_head_count": len(absorbed),
+        "advances": advances,
+        "advance_count": len(advances),
+        "derivation": (
+            ref.get("advances_read_from")
+            or "this board's durable task rows' recorded git receipts"
+        ),
+        # WHERE this list came from, as a named field, so a reader never
+        # has to assume it came from a creation-time provenance ledger.
+        "commit_list_source": {
+            "source": COMMIT_LIST_SOURCE,
+            "statement": COMMIT_LIST_SOURCE_STATEMENT,
+            "read_from": (
+                ref.get("advances_read_from")
+                or "this board's durable task rows' recorded git receipts"
+            ),
+            "creation_time_provenance_ledger": "absent",
+        },
+        # …and how complete that makes it. Never a verified claim while the
+        # ledger is absent, and never silence.
+        "commit_list_completeness": commit_list_completeness(ref),
+    }
+
+
+def _build_transcript_receipt(payload: dict) -> dict:
+    """Build the §12.4 conversation transcript retention section."""
+    ledger = payload.get("outside_resource_ledger") or []
+    transcript_entry = next(
+        (e for e in ledger if e.get("member") == "conversation-transcripts"),
+        {},
+    )
+    sessions = transcript_entry.get("originating_sessions") or []
+    store_identity = transcript_entry.get("identity")
+    store_present = Path(store_identity).exists() if store_identity else None
+
+    if store_present:
+        retention_verified = True
+    elif store_present is None:
+        retention_verified = None
+    elif not sessions:
+        retention_verified = True
+    else:
+        retention_verified = False
+
+    return {
+        "retained_statement": (
+            "conversation transcripts hold full work content and are kept, not "
+            "deleted, with existence and location disclosed on the receipt; "
+            "this is the safe default while the decision remains deferred"
+        ),
+        "clause": "C6",
+        "store": store_identity,
+        "store_present": store_present,
+        "retention_verified": retention_verified,
+        "sessions": [
+            {
+                "session_id": s.get("session_id"),
+                "task": s.get("task"),
+                "title": s.get("title"),
+            }
+            for s in sessions
+        ],
+        "count": len(sessions),
+        "source": transcript_entry.get("read_from", "outside_resource_ledger"),
+    }
+
+
+def apply_permanent_mode_content(
+    board: str,
+    *,
+    removal_id: str,
+) -> PermanentModeContentResult:
+    """§7.2: Perform permanent mode's Applied content and record it.
+
+    This is the named driver for permanent mode, performing the work §7.2
+    specifies in order:
+
+    1. Capture pre-application inventory if not already captured
+    2. Destroy the board's own storage area (C1)
+    3. Destroy every ledgered IN resource by exact recorded identity
+    4. Deregister every ledgered C13 registration entry by exact identity
+    5. Write retention records for OUT resources (C6, C7)
+    6. Any IN resource that cannot be destroyed and any registration that
+       cannot be deregistered is recorded as an EXPLICIT failure and
+       surfaced — it BLOCKS Done, never skipped silently
+    7. Reduce surviving fields (SV-1)
+
+    Work areas (C13) are OWNED MEMBERS, not bookkeeping: each one's
+    ownership is verified against the shared container's own registration
+    metadata (:func:`verify_work_area_ownership`) BEFORE anything is
+    touched, its CONTENT is destroyed FIRST and its registration entry
+    LAST — so a crash between the two can never orphan content whose
+    owner is no longer identifiable — and every item is journalled
+    durably as it happens (:func:`journal_apply_item`). A work area whose
+    ownership is not positively established is left completely intact and
+    recorded as a blocking failure; a registration this board recorded
+    creating whose container the record cannot establish (``unresolved``)
+    is a blocking failure too.
+
+    THE JOURNAL IS NOT ADVISORY. Three properties hold it to that:
+
+    * a journal write that does not commit STOPS the sequence where it
+      stands (:class:`ApplyJournalUnwritable`) — including in the window
+      between a work area's content going and its registration going,
+      which is precisely where a lost entry would orphan the content;
+    * before leaving Applied, the journal must ACCOUNT FOR every member
+      the carried ledger says was to be acted on
+      (:func:`missing_apply_journal_entries`); a short journal blocks,
+      because the §12 receipt is built from it;
+    * every step is idempotent BY EXACT IDENTITY against the durable
+      journal (:func:`journalled_apply_identities`), so a re-drive after a
+      crash appends no second entry for a resource already recorded done.
+      One resource, one durable destruction record, one count.
+
+    At the end, records the applied content through the official seam
+    (record_applied_mode_content), so "applied" is never a caller-trusted
+    flag. The §12 receipt is NOT written here: a receipt is a terminal
+    claim, and terminal claims belong after Done (see
+    :func:`write_terminal_removal_receipt`).
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return PermanentModeContentResult(
+            False, "invalid board name",
+        )
+
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return PermanentModeContentResult(
+            False, f"no removal phase record for {slug!r}",
+        )
+    if record.removal_id != removal_id:
+        return PermanentModeContentResult(
+            False,
+            f"removal_id {removal_id!r} does not match the recorded "
+            f"removal {record.removal_id!r}",
+            record=record,
+        )
+    if record.mode != RemovalMode.PERMANENT:
+        return PermanentModeContentResult(
+            False,
+            f"apply_permanent_mode_content is for permanent mode; this "
+            f"removal is {record.mode.value}",
+            record=record,
+        )
+    if record.phase != RemovalPhase.APPLIED:
+        return PermanentModeContentResult(
+            False,
+            f"the removal is at {record.phase.value}, not Applied: the "
+            "mode-specific content belongs to Applied",
+            record=record,
+        )
+
+    payload = record.carried()
+    if payload is None:
+        return PermanentModeContentResult(
+            False,
+            "§7.2: nothing was carried, so there is no ledger to act on",
+            record=record,
+        )
+
+    destroyed: list = []
+    deregistered: list = []
+    retained: list = []
+    failures: list = []
+    ledger = payload.get("outside_resource_ledger") or []
+
+    # What the DURABLE journal already records as done, by exact identity.
+    # Consulted before every step, so a re-drive after a crash appends no
+    # second entry for a resource already recorded done: one resource, one
+    # durable destruction record, one count.
+    journalled: dict = {
+        action: set(journalled_apply_identities(record, action=action))
+        for action in APPLY_JOURNAL_SUCCESS_ACTIONS
+    }
+    blocked_journalled: set = {
+        (item.get("step"), item.get("identity"), item.get("reason"))
+        for item in record.journal()["items"] if not item.get("ok")
+    }
+
+    def _journal(action: str, identity: Any, ok: bool, reason: str, extra: dict) -> None:
+        """Append ONE durable journal item, or BLOCK the whole sequence.
+
+        Idempotent by exact identity: an identity this journal already
+        records this action as done for is not appended a second time. And
+        a write that does not commit raises, which stops the apply before
+        the next destructive or deregistration step — including in the
+        window between a work area's content going and its registration
+        going, where a lost entry would leave content nothing claims.
+        """
+        key = None if identity is None else str(identity)
+        if ok:
+            if key is not None and key in journalled.get(action, frozenset()):
+                return
+        elif (action, key, reason) in blocked_journalled:
+            return
+        if not journal_apply_item(
+            slug, removal_id=removal_id, phase=RemovalPhase.APPLIED,
+            item={
+                "action": action if ok else APPLY_JOURNAL_FAILURE,
+                "step": action,
+                "identity": key,
+                "ok": bool(ok),
+                "reason": reason,
+                "detail": extra,
+            },
+        ):
+            raise ApplyJournalUnwritable(action, key, reason)
+        if ok:
+            if key is not None:
+                journalled.setdefault(action, set()).add(key)
+        else:
+            blocked_journalled.add((action, key, reason))
+
+    def _destroyed(member, category, identity, action, reason, detail) -> None:
+        destroyed.append({
+            "member": member,
+            "category": category,
+            "identity": identity,
+            "destroyed": True,
+            "reason": reason,
+            "detail": detail,
+        })
+        _journal(action, identity, True, reason, detail)
+
+    def _blocked(member, category, identity, action, reason, detail, **extra) -> None:
+        failures.append({
+            "member": member,
+            "category": category,
+            "identity": identity,
+            "destroyed": False,
+            "reason": reason,
+            "detail": detail,
+            **extra,
+        })
+        _journal(action, identity, False, reason, detail)
+
+    c13_entry = next(
+        (e for e in ledger if e.get("member") == "work-area-registration"),
+        {},
+    )
+    leftovers = None
+    try:
+        # Step 2: Destroy the board's own storage area (C1)
+        ok, reason, detail = _destroy_board_storage(slug)
+        (
+            _destroyed if ok else _blocked
+        )(
+            "board-storage", "C1", str(board_dir(slug)),
+            APPLY_JOURNAL_STORAGE_DESTROYED, reason, detail,
+        )
+
+        # Step 3: Destroy every ledgered IN resource by exact identity
+        for resource in ledger:
+            disposition = resource.get("disposition")
+            member = resource.get("member")
+            category = resource.get("category")
+
+            if disposition != "in":
+                continue
+            if member in ("board-storage", "board-directory", "current-pointer"):
+                # board storage is step 2's; the shared current pointer is the
+                # sweep's, because only this board's own value may leave it.
+                continue
+            # Skip registrations — they're handled in step 4
+            if category == "C13" or member == "work-area-registration":
+                continue
+
+            ok, reason, detail = _destroy_in_resource(resource)
+            (
+                _destroyed if ok else _blocked
+            )(
+                member, category or "IN", resource.get("identity"),
+                APPLY_JOURNAL_RESOURCE_DESTROYED, reason, detail,
+            )
+
+        # Step 4: each C13 work area is an OWNED MEMBER — verify ownership,
+        # destroy the CONTENT first, and deregister LAST, journalling each
+        # item as it happens so a crash can never orphan content.
+        for registration in c13_entry.get("registrations") or []:
+            ownership = verify_work_area_ownership(registration)
+            if ownership.owned is not True:
+                _blocked(
+                    "work-area", "C13", registration.get("work_area"),
+                    APPLY_JOURNAL_WORK_AREA_DESTROYED,
+                    f"work-area ownership is not established, so nothing was "
+                    f"touched: {ownership.reason}",
+                    ownership.evidence,
+                    ownership=(
+                        "indeterminate" if ownership.owned is None else "denied"
+                    ),
+                )
+                continue
+            ok, reason, detail = _destroy_work_area_content(registration, ownership)
+            if not ok:
+                _blocked(
+                    "work-area", "C13", registration.get("work_area"),
+                    APPLY_JOURNAL_WORK_AREA_DESTROYED, reason, detail,
+                )
+                continue
+            # This journals the destruction and RAISES if it does not
+            # commit — which is the blocking check that has to sit between
+            # the destruction and the deregistration, because the
+            # registration is the only durable thing that identifies the
+            # content's owner and it is deliberately the last to go.
+            _destroyed(
+                "work-area", "C13", registration.get("work_area"),
+                APPLY_JOURNAL_WORK_AREA_DESTROYED, reason, detail,
+            )
+            # Only now, with the content gone and that fact durably
+            # journalled, does the metadata that identified its owner go.
+            ok, reason, detail = _deregister_work_area(registration)
+            if not ok:
+                _blocked(
+                    "work-area-registration", "C13",
+                    registration.get("registration"),
+                    APPLY_JOURNAL_DEREGISTERED, reason, detail,
+                )
+                continue
+            deregistered.append({
+                "member": "work-area-registration",
+                "category": "C13",
+                "identity": registration.get("registration"),
+                "deregistered": True,
+                "reason": reason,
+                "detail": detail,
+                "reference_kept": registration.get("reference"),
+                "work_area_destroyed": registration.get("work_area"),
+                "ownership": ownership.reason,
+            })
+            _journal(
+                APPLY_JOURNAL_DEREGISTERED, registration.get("registration"),
+                True, reason, detail,
+            )
+
+        # Step 4b (IN-3): a work area this board recorded creating whose shared
+        # container durable state cannot establish has no exact identity to act
+        # on. It is a recorded BLOCKING failure — reaching Done over it would
+        # claim content was destroyed that was never even located.
+        for unresolved in c13_entry.get("unresolved") or []:
+            if not isinstance(unresolved, dict):
+                continue
+            _blocked(
+                "work-area", "C13", unresolved.get("work_area"),
+                APPLY_JOURNAL_WORK_AREA_DESTROYED,
+                f"unresolved C13 registration: {unresolved.get('reason')}",
+                dict(unresolved),
+                ownership="unresolved",
+            )
+
+        # Step 5: Write retention records for OUT resources (C6, C7)
+        for resource in ledger:
+            disposition = resource.get("disposition")
+            category = resource.get("category")
+            if disposition != "out":
+                continue
+            retention = _build_retention_record(slug, category or "OUT", resource)
+            retained.append(retention)
+            _journal(
+                APPLY_JOURNAL_RETENTION_RECORDED, resource.get("identity"), True,
+                retention["reason"], {"category": retention["category"]},
+            )
+
+        # Step 6: the untracked-leftovers check, scoped to this board's own
+        # roots. Anything still inside them is a blocking failure: a receipt
+        # that claimed the content was destroyed while it is readable would be
+        # untrue.
+        leftovers = check_scoped_leftovers(slug, record)
+        for leftover in leftovers.leftovers:
+            _blocked(
+                leftover.get("member"), "C1", leftover.get("root"),
+                APPLY_JOURNAL_WORK_AREA_DESTROYED, leftover.get("reason"),
+                {
+                    "entries": leftover.get("entries"),
+                    "source": leftover.get("source"),
+                },
+                leftover=True,
+            )
+        for unreadable in leftovers.unreadable:
+            _blocked(
+                unreadable.get("member"), "C1", unreadable.get("root"),
+                APPLY_JOURNAL_WORK_AREA_DESTROYED, unreadable.get("reason"),
+                {"source": unreadable.get("source")},
+                leftover="indeterminate",
+            )
+    except ApplyJournalUnwritable as unwritable:
+        # A journal write that did not commit stops the sequence HERE. The
+        # steps already performed stand and are reported; the ones after
+        # this point are not attempted, because durable state no longer
+        # records what has been done to the world.
+        message = (
+            f"§7.2: {unwritable} — this BLOCKS Done. What was already done "
+            "is durable in the journal up to this point and a re-drive "
+            "resumes from it."
+        )
+        failures.append({
+            "member": "apply-journal",
+            "category": "C1",
+            "identity": unwritable.identity,
+            "destroyed": False,
+            "reason": str(unwritable),
+            "detail": {
+                "action": unwritable.action,
+                "step_reason": unwritable.step_reason,
+            },
+        })
+        return PermanentModeContentResult(
+            False, message,
+            destroyed=destroyed,
+            deregistered=deregistered,
+            retained=retained,
+            failures=failures,
+            leftovers=leftovers,
+            record=get_removal_phase_record(slug) or record,
+        )
+
+    # Step 7: Check for blocking failures
+    if failures:
+        return PermanentModeContentResult(
+            False,
+            f"§7.2: {len(failures)} resource(s) could not be destroyed or "
+            "deregistered — this BLOCKS Done and must be resolved",
+            destroyed=destroyed,
+            deregistered=deregistered,
+            retained=retained,
+            failures=failures,
+            leftovers=leftovers,
+            record=get_removal_phase_record(slug) or record,
+        )
+
+    # Step 7b: before leaving Applied, the journal must ACCOUNT FOR every
+    # member the carried ledger says was to be acted on. An empty or short
+    # journal over real destruction is exactly the shape a fail-open write
+    # leaves behind, and it must block rather than pass — the receipt that
+    # follows is built from this journal.
+    durable = get_removal_phase_record(slug) or record
+    missing = missing_apply_journal_entries(slug, durable)
+    if missing:
+        message = (
+            f"§7.2: the durable apply journal accounts for none or only some "
+            f"of what the carry ledger says was acted on — {len(missing)} "
+            "carried member(s) have no durable journal entry. This BLOCKS "
+            "Done: a receipt built from this journal would understate what "
+            "was destroyed."
+        )
+        failures = [
+            {
+                "member": "apply-journal",
+                "category": "C1",
+                "identity": entry["identity"],
+                "destroyed": False,
+                "reason": (
+                    f"no durable journal entry records {entry['action']!r} "
+                    "for this carried member"
+                ),
+                "detail": entry,
+            }
+            for entry in missing
+        ]
+        return PermanentModeContentResult(
+            False, message,
+            destroyed=destroyed,
+            deregistered=deregistered,
+            retained=retained,
+            failures=failures,
+            leftovers=leftovers,
+            record=durable,
+        )
+
+    # Now record through the official seam
+    apply_result = record_applied_mode_content(
+        slug,
+        removal_id=removal_id,
+        evidence=AppliedModeContentEvidence(
+            performed_by="apply_permanent_mode_content (§7.2 driver)",
+            retained_path=None,
+            detail=f"destroyed {len(destroyed)} resource(s), "
+                   f"deregistered {len(deregistered)} registration(s), "
+                   f"retained {len(retained)} OUT resource(s)",
+        ),
+    )
+
+    if not apply_result.success:
+        return PermanentModeContentResult(
+            False,
+            f"§7.2: the work completed but record_applied_mode_content "
+            f"refused: {apply_result.message}",
+            destroyed=destroyed,
+            deregistered=deregistered,
+            retained=retained,
+            failures=failures,
+            leftovers=leftovers,
+            record=apply_result.record,
+        )
+
+    return PermanentModeContentResult(
+        True,
+        f"§7.2 permanent mode content applied: {len(destroyed)} destroyed, "
+        f"{len(deregistered)} deregistered, {len(retained)} retained",
+        destroyed=destroyed,
+        deregistered=deregistered,
+        retained=retained,
+        failures=failures,
+        leftovers=leftovers,
+        record=apply_result.record,
+    )
+
+
+# ---------------------------------------------------------------------------
+# §7.3 Reversible mode driver — the content Applied owes for reversible mode
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ReversibleModeContentResult:
+    """Result of :func:`apply_reversible_mode_content` (§7.3)."""
+    success: bool
+    message: str
+    retained_path: Optional[str] = None
+    failures: list = field(default_factory=list)
+    record: Optional[RemovalPhaseRecord] = None
+
+
+def reversible_retained_path(slug: str, removal_id: str) -> Path:
+    """Where §7.3 retains this removal's copy — an exact, derived identity.
+
+    Outside every board's storage area (so it is not inside what is being
+    removed) and named by the removal, so a re-drive after a crash finds
+    the SAME copy rather than making a second one.
+    """
+    return kanban_home() / "retained" / f"{slug}-{removal_id}"
+
+
+def apply_reversible_mode_content(
+    board: str,
+    *,
+    removal_id: str,
+) -> ReversibleModeContentResult:
+    """§7.3: complete and verify the retained copy, then remove the live one.
+
+    The reversible peer of :func:`apply_permanent_mode_content`, and the
+    reason the common driver has no mode-specific branch of its own to
+    get wrong. Journalled item by item, idempotent under re-drive (the
+    retained copy has one derived identity, so a restart completes the
+    same copy instead of making a second), and recorded through the same
+    seam — which verifies the retained copy is really readable and the
+    live store really gone before anything is marked applied.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return ReversibleModeContentResult(False, "invalid board name")
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return ReversibleModeContentResult(
+            False, f"no removal phase record for {slug!r}",
+        )
+    if record.removal_id != removal_id:
+        return ReversibleModeContentResult(
+            False,
+            f"removal_id {removal_id!r} does not match the recorded "
+            f"removal {record.removal_id!r}", record=record,
+        )
+    if record.mode != RemovalMode.REVERSIBLE:
+        return ReversibleModeContentResult(
+            False,
+            "apply_reversible_mode_content is for reversible mode; this "
+            f"removal is {record.mode.value}", record=record,
+        )
+    if record.phase != RemovalPhase.APPLIED:
+        return ReversibleModeContentResult(
+            False,
+            f"the removal is at {record.phase.value}, not Applied: the "
+            "mode-specific content belongs to Applied", record=record,
+        )
+
+    retained = reversible_retained_path(slug, removal_id)
+    live = board_dir(slug)
+    failures: list = []
+    try:
+        retained.parent.mkdir(parents=True, exist_ok=True)
+        if live.exists() and not retained.exists():
+            shutil.copytree(live, retained)
+        journal_apply_item(
+            slug, removal_id=removal_id, phase=RemovalPhase.APPLIED,
+            item={
+                "action": APPLY_JOURNAL_RETAINED_COPY,
+                "step": APPLY_JOURNAL_RETAINED_COPY,
+                "identity": str(retained),
+                "ok": True,
+                "reason": "the retained copy is complete outside the board",
+                "detail": {"source": str(live)},
+            },
+        )
+        if live.exists():
+            shutil.rmtree(live)
+        db_path = kanban_db_path(board=slug)
+        if db_path.exists():
+            # The default board's store lives outside board_dir.
+            db_path.unlink()
+        journal_apply_item(
+            slug, removal_id=removal_id, phase=RemovalPhase.APPLIED,
+            item={
+                "action": APPLY_JOURNAL_STORAGE_DESTROYED,
+                "step": APPLY_JOURNAL_STORAGE_DESTROYED,
+                "identity": str(live),
+                "ok": True,
+                "reason": "the live copy was removed after the retained copy "
+                          "was complete",
+                "detail": {"retained": str(retained)},
+            },
+        )
+    except OSError as exc:
+        failures.append({
+            "member": "board-storage",
+            "category": "C1",
+            "identity": str(live),
+            "reason": f"§7.3 could not complete the retained copy: {exc}",
+        })
+        journal_apply_item(
+            slug, removal_id=removal_id, phase=RemovalPhase.APPLIED,
+            item={
+                "action": APPLY_JOURNAL_FAILURE,
+                "step": APPLY_JOURNAL_RETAINED_COPY,
+                "identity": str(retained),
+                "ok": False,
+                "reason": str(exc),
+                "detail": {"source": str(live)},
+            },
+        )
+        return ReversibleModeContentResult(
+            False, failures[0]["reason"], retained_path=str(retained),
+            failures=failures, record=get_removal_phase_record(slug) or record,
+        )
+
+    apply_result = record_applied_mode_content(
+        slug,
+        removal_id=removal_id,
+        evidence=AppliedModeContentEvidence(
+            performed_by="apply_reversible_mode_content (§7.3 driver)",
+            retained_path=str(retained),
+            detail="the board was archived to the retained copy and the live "
+                   "copy removed",
+        ),
+    )
+    if not apply_result.success:
+        return ReversibleModeContentResult(
+            False,
+            f"§7.3: the work completed but record_applied_mode_content "
+            f"refused: {apply_result.message}",
+            retained_path=str(retained), record=apply_result.record,
+        )
+    return ReversibleModeContentResult(
+        True, f"§7.3 reversible mode content applied: retained at {retained}",
+        retained_path=str(retained), record=apply_result.record,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 — Swept (§6.7): every record elsewhere, found by exact key
+# ---------------------------------------------------------------------------
+
+# The record classes §6.7 names, in the order it names them. Every one gets
+# a recorded result; a class this codebase genuinely has no store for is
+# recorded as ``not-present`` WITH the reason, never silently skipped
+# (IN-3).
+SWEEP_RECORD_CLASSES: "tuple[tuple[str, str], ...]" = (
+    ("current-pointer", "the current/active/selected board pointer"),
+    ("subscriptions", "subscriptions and notification registrations"),
+    ("pending-notifications", "pending or undelivered notifications"),
+    ("scheduled-actions", "queued or scheduled future actions"),
+    ("cached-views", "cached views and index entries"),
+    ("listings-and-counts", "listings and counts naming this board"),
+    (
+        "external-locks-and-leases",
+        "any lock or lease held outside the board on its behalf",
+    ),
+)
+
+SWEEP_RESULT_REMOVED = "removed"
+SWEEP_RESULT_NOT_PRESENT = "not-present"
+SWEEP_RESULT_RETAINED = "retained-in-use"
+SWEEP_RESULT_DEFERRED = "deferred"
+SWEEP_RESULT_ERROR = "error"
+# A class whose records could not be READ: an unreadable or corrupt store, a
+# locked database, a query that raised. Distinct from ``not-present``, which
+# is a POSITIVE fact about where a class's records live. A failed read is
+# never a proof of absence, so this result refuses the phase (IN-3).
+SWEEP_RESULT_INDETERMINATE = "indeterminate"
+
+# Results that do not establish anything about a record class. Either one
+# refuses Swept; neither may ever be read as "there was nothing there".
+_SWEEP_UNRESOLVED_RESULTS = frozenset({
+    SWEEP_RESULT_ERROR, SWEEP_RESULT_INDETERMINATE,
+})
+
+
+def _sweep_current_pointer(slug: str, *, reversible: bool) -> dict:
+    """The current/active/selected pointer, found by exact key.
+
+    IN-5: the pointer is a shared container. Only this board's OWN
+    recorded value is removed from it; the file is never rewritten as a
+    whole with something else, and a value naming another board is never
+    touched.
+
+    A failed READ yields INDETERMINATE — a read that failed is never a
+    proof of absence, and the sweep cannot decide what to do. A failed
+    CLEAR (the write, after a successful read) yields ERROR — that is a
+    failed ACTION, not a failed read, and the two are kept distinct.
+    """
+    path = current_board_path()
+    try:
+        recorded = path.read_text(encoding="utf-8").strip() if path.exists() else ""
+    except OSError as exc:
+        # A failed READ: not a proof of absence, so INDETERMINATE.
+        return {
+            "result": SWEEP_RESULT_INDETERMINATE,
+            "key": str(path),
+            "reason": f"cannot read the current-board pointer: {exc}",
+        }
+    if not recorded:
+        return {
+            "result": SWEEP_RESULT_NOT_PRESENT,
+            "key": str(path),
+            "reason": "no current-board pointer is recorded",
+        }
+    if _normalize_board_slug(recorded) != slug:
+        return {
+            "result": SWEEP_RESULT_NOT_PRESENT,
+            "key": str(path),
+            "reason": f"the pointer names {recorded!r}, not this board: a "
+                      "member this board did not create is never touched (IN-5)",
+        }
+    entry = {"result": SWEEP_RESULT_REMOVED, "key": str(path)}
+    if reversible:
+        # Copied into the retained set BEFORE removal from the live side.
+        entry["retained"] = {"current_board": recorded}
+    try:
+        clear_current_board()
+    except OSError as exc:
+        return {
+            "result": SWEEP_RESULT_ERROR,
+            "key": str(path),
+            "reason": f"cannot clear the current-board pointer: {exc}",
+        }
+    entry["reason"] = "the pointer named this board and was cleared by exact key"
+    return entry
+
+
+def _sweep_in_board_table(slug: str, table: str, description: str) -> dict:
+    """A record class this codebase keeps INSIDE the board's own store.
+
+    Recorded as not-present-elsewhere WITH the reason and the count found,
+    rather than silently skipped: §6.7 sweeps records ELSEWHERE, and a
+    record that lives in the board's own store leaves with it.
+
+    **A read that failed is never a proof of absence (IN-3).**  An
+    unreadable store, a file that is not a database, a locked database,
+    or a query that raised yields INDETERMINATE with a reason naming what
+    could not be read and why.  A store file that does NOT EXIST is a
+    positive fact about the filesystem and stays ``not-present`` with its
+    real (zero) count.  A successful open-and-query likewise stays
+    ``not-present`` with its real integer count.  The two legitimate cases
+    are modelled separately from the failure case — both record exactly
+    what was read, and neither may be reached by a failed read.
+    """
+    db_path = kanban_db_path(board=slug)
+    if not db_path.exists():
+        # A file that does not exist is a positive fact, not a failed read.
+        return {
+            "result": SWEEP_RESULT_NOT_PRESENT,
+            "key": f"{db_path}:{table}",
+            "count": 0,
+            "reason": f"{description} live in this board's OWN store ({table}), "
+                      "not elsewhere: the store file does not exist",
+        }
+    # The store file exists — try to open and query it.
+    try:
+        conn = _sqlite_connect_no_create(db_path)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        # Failed to OPEN: INDETERMINATE, not a proof of absence.
+        return {
+            "result": SWEEP_RESULT_INDETERMINATE,
+            "key": f"{db_path}:{table}",
+            "count": None,
+            "reason": f"{description}: the board store could not be opened "
+                      f"to count them: {exc}",
+        }
+    try:
+        present = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND "
+            "name = ? LIMIT 1",
+            (table,),
+        ).fetchone()
+        if present is not None:
+            count = int(
+                conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            )
+        else:
+            # Table does not exist — count is zero, a positive fact.
+            count = 0
+    except sqlite3.Error as exc:
+        # Failed to QUERY: INDETERMINATE, not a proof of absence.
+        conn.close()
+        return {
+            "result": SWEEP_RESULT_INDETERMINATE,
+            "key": f"{db_path}:{table}",
+            "count": None,
+            "reason": f"{description}: the count could not be read: {exc}",
+        }
+    conn.close()
+    # Successfully read — record exactly what was found.
+    return {
+        "result": SWEEP_RESULT_NOT_PRESENT,
+        "key": f"{db_path}:{table}",
+        "count": count,
+        "reason": f"{description} live in this board's OWN store ({table}), "
+                  "not elsewhere: they leave with the board",
+    }
+
+
+def _sweep_record_class(key: str, slug: str, *, reversible: bool, record) -> dict:
+    if key == "current-pointer":
+        return _sweep_current_pointer(slug, reversible=reversible)
+    if key == "subscriptions":
+        return _sweep_in_board_table(
+            slug, "kanban_notify_subs",
+            "subscriptions and notification registrations",
+        )
+    if key == "pending-notifications":
+        entry = _sweep_in_board_table(
+            slug, "task_events", "pending or undelivered notifications",
+        )
+        entry["reason"] = (
+            "undelivered notifications are derived from this board's own "
+            "task_events by each subscription's last_event_id cursor, both of "
+            "which live in the board's store: there is no queue elsewhere"
+        )
+        return entry
+    if key == "scheduled-actions":
+        carried = (record.carried() or {}).get("release_obligations") or []
+        return {
+            "result": SWEEP_RESULT_NOT_PRESENT,
+            "key": f"{kanban_db_path(board=slug)}:run_sandbox_cleanup_intents",
+            "count": len(carried),
+            "reason": "queued future actions for this board are the sandbox "
+                      "cleanup intents in its own store, already carried as "
+                      "release obligations at §6.4; the scheduler's own store "
+                      "records no board reference",
+        }
+    if key == "cached-views":
+        db_path = str(kanban_db_path(board=slug).resolve())
+        _INITIALIZED_PATHS.discard(db_path)
+        return {
+            "result": SWEEP_RESULT_REMOVED,
+            "key": db_path,
+            "reason": "the per-process store-initialisation cache entry for "
+                      "this board was dropped by exact key; this codebase "
+                      "persists no cached view or index entry naming a board",
+        }
+    if key == "listings-and-counts":
+        return {
+            "result": SWEEP_RESULT_DEFERRED,
+            "key": f"board_register:{slug}",
+            "reason": "the only stored listing entry naming this board is its "
+                      "OWN register entry, which §6.8 transitions in one "
+                      "conditional transition; board listings are computed by "
+                      "scanning, so no count is stored (IN-5)",
+        }
+    if key == "external-locks-and-leases":
+        return {
+            "result": SWEEP_RESULT_RETAINED,
+            "key": str(register_lock_path(slug)),
+            "reason": "the per-board register lock is held outside the board "
+                      "on its behalf and is HELD BY THIS REMOVAL right now: "
+                      "removing it under its holder would destroy the mutual "
+                      "exclusion the removal depends on",
+        }
+    return {  # pragma: no cover - unreachable while the table above is total
+        "result": SWEEP_RESULT_ERROR,
+        "key": key,
+        "reason": "no sweep is defined for this record class",
+    }
+
+
+def build_removal_sweep_state(
+    slug: str, record: RemovalPhaseRecord, *, now: int
+) -> dict:
+    """Sweep every record class §6.7 names and record each one's result."""
+    reversible = record.mode == RemovalMode.REVERSIBLE
+    classes: dict = {}
+    retained: dict = {}
+    for key, description in SWEEP_RECORD_CLASSES:
+        entry = _sweep_record_class(
+            key, slug, reversible=reversible, record=record
+        )
+        entry["description"] = description
+        if "retained" in entry:
+            retained[key] = entry["retained"]
+        classes[key] = entry
+    return {
+        "version": 1,
+        "board": slug,
+        "mode": record.mode.value,
+        "classes": classes,
+        "retained": retained,
+        "swept_at": now,
+    }
+
+
+def advance_removal_to_swept(
+    board: str,
+    *,
+    removal_id: str,
+    observed_phase: "RemovalPhase | str | None" = None,
+) -> RemovalPhaseAdvanceResult:
+    """Phase 7 — Swept (§6.7): update or remove every record elsewhere.
+
+    Every record elsewhere naming this board or its tasks, each found by
+    EXACT KEY, over the classes §6.7 names:
+    :data:`SWEEP_RECORD_CLASSES`. Each class gets a recorded result; a
+    class this codebase genuinely has no store for is recorded as
+    ``not-present`` with that reason rather than silently skipped (IN-3).
+
+    Under reversible mode a record is copied into the retained set BEFORE
+    it is removed from the live side. IN-5 is respected throughout:
+    shared containers may have their own ledgered members removed but are
+    never deleted or rewritten as a whole, and no member this board did
+    not create is ever touched.
+
+    **A read that failed is never a proof of absence.** A class whose
+    store cannot be opened, whose file is not a database, whose database
+    is locked, or whose query raised is recorded as INDETERMINATE with its
+    reason — never as ``not-present`` — and the phase does not advance.
+    The one legitimate not-present-with-a-count case (a class this
+    codebase keeps only inside the board's own store, positively read) is
+    modelled separately and stays distinct.
+
+    A record already AT Swept is re-verified rather than believed: the
+    recorded per-class results must still be there, still complete, and
+    still consistent with durable state where the work is checkable.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_INVALID_BOARD, "invalid board name"
+        )
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_NO_RECORD,
+            f"no removal phase record for {slug!r}",
+        )
+    if record.removal_id != removal_id:
+        return RemovalPhaseAdvanceResult(
+            False, RemovalAdvanceOutcome.REFUSED_ID_MISMATCH,
+            f"removal_id {removal_id!r} does not match the recorded "
+            f"removal {record.removal_id!r}", record=record,
+        )
+    if record.phase == RemovalPhase.SWEPT and observed_phase is None:
+        return _revalidate_recorded_sweep(slug, record)
+    now = int(time.time())
+    state = build_removal_sweep_state(slug, record, now=now)
+    encoded = json.dumps(state, ensure_ascii=False)
+    failed = sorted(
+        key for key, entry in state["classes"].items()
+        if entry["result"] == SWEEP_RESULT_ERROR
+    )
+    indeterminate = sorted(
+        key for key, entry in state["classes"].items()
+        if entry["result"] == SWEEP_RESULT_INDETERMINATE
+    )
+    if failed or indeterminate:
+        # The partial results are durable even though the phase does not
+        # move, and so is the reason: an indeterminate sweep is a recorded
+        # refusal, not a silent retry.
+        _record_phase_fields(
+            slug, removal_id=removal_id, expect_phase=record.phase,
+            sweep_state=encoded,
+        )
+        if indeterminate:
+            reasons = "; ".join(
+                f"{key}: {state['classes'][key].get('reason')}"
+                for key in indeterminate
+            )
+            message = (
+                f"§6.7: record class(es) {indeterminate} could not be READ, so "
+                f"their absence is not established — {reasons}"
+            )
+            outcome = RemovalAdvanceOutcome.REFUSED_INDETERMINATE
+        else:
+            message = f"§6.7: record class(es) {failed} could not be swept"
+            outcome = RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE
+        _record_phase_refusal(slug, record, outcome.value, message)
+        return RemovalPhaseAdvanceResult(False, outcome, message, record=record)
+    return _advance_removal_phase(
+        slug, removal_id=removal_id,
+        from_phase=RemovalPhase.APPLIED, to_phase=RemovalPhase.SWEPT,
+        observed_phase=(
+            observed_phase if observed_phase is not None else RemovalPhase.APPLIED
+        ),
+        _phase_owned={"sweep_state": encoded, "sweep_completed_at": now},
+    )
+
+
+def _revalidate_recorded_sweep(
+    slug: str, record: RemovalPhaseRecord
+) -> RemovalPhaseAdvanceResult:
+    """Re-verify a record that is ALREADY at Swept (§6.7).
+
+    An idempotent no-op here claims every record class elsewhere was
+    resolved. The recorded per-class results are re-read against the same
+    rules that let them be recorded in the first place, plus — where the
+    work is checkable after the fact — durable state itself.
+    """
+    reason: Optional[str] = None
+    outcome = RemovalAdvanceOutcome.REFUSED_WORK_INCOMPLETE
+    if not (record.sweep_state or "").strip():
+        reason = "no §6.7 sweep state is recorded at all"
+    elif record.sweep_completed_at is None:
+        reason = "no §6.7 sweep completion instant is recorded"
+    else:
+        defect = _sweep_state_defect(slug, _decode_json_object(record.sweep_state))
+        if defect is not None:
+            reason, outcome = defect
+    if reason is not None:
+        message = (
+            f"§6.7: the record sits at swept but durable state does not "
+            f"support that: {reason}"
+        )
+        _record_phase_refusal(slug, record, outcome.value, message)
+        return RemovalPhaseAdvanceResult(False, outcome, message, record=record)
+    return RemovalPhaseAdvanceResult(
+        True, RemovalAdvanceOutcome.IDEMPOTENT_NOOP,
+        "already at swept (idempotent no-op), every record class re-verified",
+        record=record,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — Done (§6.8): the only point at which success may be reported
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RemovalCompletionResult:
+    """Result of :func:`complete_removal` (§6.8)."""
+    success: bool
+    message: str
+    transitioned: bool = False
+    record: Optional[RemovalPhaseRecord] = None
+    outcome: Optional[RemovalAdvanceOutcome] = None
+    receipt: "Optional[PreparedRemovalReceipt]" = None
+    # The refusal key :func:`complete_removal` must record durably, OUTSIDE
+    # the register lock the refusal happened under. Recording it inside
+    # would re-enter a non-re-entrant lock this thread already holds.
+    refusal_key: Optional[str] = None
+
+
+# Why a terminal lifecycle was refused because its §12 receipt could not be
+# made durable first. Recorded on the phase record, so the reason survives
+# the transaction that refused.
+REMOVAL_REFUSAL_RECEIPT_UNWRITABLE = "refused-receipt-unwritable"
+
+
+def _projected_terminal_state(
+    record: RemovalPhaseRecord,
+    entry: RegisterEntry,
+    *,
+    outcome: str,
+    completed_at: int,
+) -> "tuple[RemovalPhaseRecord, RegisterEntry]":
+    """The record and entry EXACTLY as the terminal transition will leave them.
+
+    The §12 receipt is a claim about the finished removal, so it has to
+    read the finished facts. The prepare/apply protocol writes it BEFORE
+    those facts are durable, which means they are projected here rather
+    than read — from the very values the transition is about to commit,
+    with the completion instant pinned so the register records the same
+    number the receipt names. Nothing is guessed: every projected field is
+    an argument of the transition that follows.
+    """
+    projected_record = replace(
+        record,
+        phase=RemovalPhase.DONE,
+        outcome=outcome,
+        updated_at=completed_at,
+    )
+    projected_entry = replace(
+        entry,
+        lifecycle=_terminal_lifecycle_for(record.mode),
+        gate_move=GateMove.SETTLED,
+        updated_at=completed_at,
+    )
+    return projected_record, projected_entry
+
+
+def _prepare_terminal_receipt_for(
+    slug: str,
+    record: RemovalPhaseRecord,
+    entry: RegisterEntry,
+    *,
+    outcome: str,
+    completed_at: int,
+) -> "tuple[Optional[PreparedRemovalReceipt], str]":
+    """Make the exact terminal receipt durable before the terminal transition.
+
+    Reuses an ALREADY prepared receipt verbatim when one exists — a
+    roll-forward must apply what was committed, never a freshly built
+    payload that might differ — and otherwise builds the receipt from the
+    projected terminal state and prepares it.
+    """
+    existing = get_prepared_removal_receipt(slug, record.removal_id)
+    if existing is not None and existing.payload:
+        return existing, (
+            "the exact receipt content was already prepared by an earlier "
+            f"attempt ({existing.status}) and is reused verbatim"
+        )
+    projected_record, projected_entry = _projected_terminal_state(
+        record, entry, outcome=outcome, completed_at=completed_at,
+    )
+    payload = build_terminal_removal_receipt_payload(
+        slug, projected_record, projected_entry
+    )
+    return prepare_permanent_removal_receipt(
+        slug, record.removal_id,
+        terminal_lifecycle=_terminal_lifecycle_for(record.mode).value,
+        scope_declaration=(
+            record.scope_declaration_version or SCOPE_DECLARATION_VERSION
+        ),
+        receipt_payload=payload,
+    )
+
+
+def complete_removal(
+    board: str, *, removal_id: str, outcome: str
+) -> RemovalCompletionResult:
+    """Phase 8 — Done (§6.8): the terminal register transition.
+
+    One conditional transition of the register entry to ``archived``
+    (reversible) or ``hard-removed`` (permanent), chosen from the
+    RECORDED mode, with the phase moved THROUGH THE NAMED COMPARE-AND-SET
+    PRIMITIVE in the SAME register-store transaction — one transaction
+    spanning both tables, so there is no instant at which one is written
+    and the other is not, and the primitive really is the only writer of
+    ``phase``. This is the ONLY point at which success may be reported.
+
+    Done's precondition, evaluated inside that same transaction, is that
+    the sweep is durably complete (§6.7) AND that §6.6's mode-specific
+    application is durably recorded as performed. While that is
+    outstanding this function reports NO success and moves NEITHER
+    table: ``archived``/``hard-removed`` is a durable claim about the
+    world, and recording one over work that has not happened is a false
+    terminal fact. The refusal is durably recorded on the phase record,
+    naming what is missing.
+
+    **For PERMANENT mode the §12 receipt is part of that same terminal
+    claim, and it lives in a DIFFERENT database file** — the removal
+    archive is a separate loss-and-rebuild domain from the register, and
+    SQLite gives no atomic multi-database commit in WAL mode, so one
+    co-located transaction across both is not available. Instead this runs
+    the durable prepare-then-apply protocol:
+
+    1. the EXACT, byte-final receipt is committed to the archive as
+       :data:`RECEIPT_STATUS_PREPARED`, with its digest — not a probe of
+       whether the archive is writable, which proves nothing about the
+       write that comes later;
+    2. only then does the terminal register transition run;
+    3. the prepared receipt is flipped to
+       :data:`RECEIPT_STATUS_APPLIED` — a state change over content that
+       is already durable, so it cannot fail for content reasons.
+
+    If step 1 does not commit, NO terminal state is recorded at all and the
+    board stays resumable at Swept. If the process stops between any two
+    steps, :func:`resume_removal` finishes the protocol from durable state
+    in whichever direction it was interrupted, and never regenerates the
+    receipt: the exact bytes were committed in step 1.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RemovalCompletionResult(False, "invalid board name")
+    with board_register_lock(slug):
+        result = _complete_removal_locked(
+            slug, removal_id=removal_id, outcome=outcome
+        )
+    # Outside the lock the refusal took, and in its own transaction: the
+    # transaction that refused rolled BOTH tables back, so the reason has
+    # to be recorded separately or it would be rolled back with it. The
+    # write is guarded on (removal_id, phase), so it cannot move anything.
+    if not result.success and result.record is not None:
+        if result.refusal_key is not None:
+            _record_phase_refusal(
+                slug, result.record, result.refusal_key, result.message
+            )
+        elif (
+            result.outcome
+            is RemovalAdvanceOutcome.REFUSED_MODE_CONTENT_OUTSTANDING
+        ):
+            _record_phase_refusal(
+                slug, result.record, result.outcome.value, result.message
+            )
+    return result
+
+
+def _complete_removal_locked(
+    slug: str, *, removal_id: str, outcome: str
+) -> RemovalCompletionResult:
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return RemovalCompletionResult(False, f"no removal phase record for {slug!r}")
+    if record.removal_id != removal_id:
+        return RemovalCompletionResult(
+            False, f"removal_id {removal_id!r} does not match the recorded "
+            f"removal {record.removal_id!r}", record=record,
+        )
+    if record.phase == RemovalPhase.DONE:
+        return RemovalCompletionResult(
+            True, "already done (idempotent no-op)", transitioned=False, record=record,
+            outcome=RemovalAdvanceOutcome.IDEMPOTENT_NOOP,
+        )
+    if record.phase != RemovalPhase.SWEPT:
+        return RemovalCompletionResult(
+            False, f"cannot complete from phase {record.phase.value}: "
+            "Swept must be reached first", record=record,
+            outcome=RemovalAdvanceOutcome.REFUSED_STALE,
+        )
+
+    entry = get_register_entry(slug)
+    if entry is None:
+        return RemovalCompletionResult(False, "register entry missing", record=record)
+
+    target_lifecycle = _terminal_lifecycle_for(record.mode)
+
+    now = int(time.time())
+
+    # Step 1 of the prepare-then-apply protocol. Skipped only when the
+    # transition is going to be refused anyway for a reason this function
+    # can establish without touching the archive — preparing a receipt for
+    # a transition that cannot happen would leave content in the archive
+    # for a removal that is still resumable.
+    prepared: "Optional[PreparedRemovalReceipt]" = None
+    if record.mode == RemovalMode.PERMANENT and not (
+        applied_mode_content_is_outstanding(record)
+    ):
+        prepared, reason = _prepare_terminal_receipt_for(
+            slug, record, entry, outcome=outcome, completed_at=now,
+        )
+        if prepared is None:
+            message = (
+                "§12: refusing to record a terminal lifecycle because the "
+                f"removal receipt could not be made durable first: {reason}"
+            )
+            return RemovalCompletionResult(
+                False, message, record=record,
+                outcome=RemovalAdvanceOutcome.REFUSED_PRECONDITION,
+                refusal_key=REMOVAL_REFUSAL_RECEIPT_UNWRITABLE,
+            )
+        # The receipt names the instant the register is about to record.
+        # Reading it back (rather than reusing ``now``) is what keeps a
+        # reused, earlier-prepared receipt and the register agreeing.
+        pinned = (prepared.payload.get("subject") or {}).get("completion_time")
+        if isinstance(pinned, int):
+            now = pinned
+
+    with register_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            lifecycle_cur = conn.execute(
+                "UPDATE board_register SET lifecycle = ?, gate_move = ?, "
+                "updated_at = ? WHERE board_name = ? AND lifecycle = ?",
+                (
+                    target_lifecycle.value, GateMove.SETTLED.value, now,
+                    slug, entry.lifecycle.value,
+                ),
+            )
+            if lifecycle_cur.rowcount != 1:
+                conn.execute("ROLLBACK")
+                return RemovalCompletionResult(
+                    False, "register lifecycle compare-and-set failed: "
+                    "authority changed", record=record,
+                    outcome=RemovalAdvanceOutcome.REFUSED_STALE,
+                )
+            # The phase moves through the SAME primitive every other phase
+            # goes through, inside this transaction — never an inline
+            # UPDATE of its own.
+            advance = _advance_removal_phase_in_txn(
+                conn, slug,
+                removal_id=removal_id,
+                from_phase=RemovalPhase.SWEPT,
+                to_phase=RemovalPhase.DONE,
+                mode_check=None,
+                fields={"outcome": outcome},
+                at=now,
+            )
+            if not (advance.success and advance.transitioned):
+                conn.execute("ROLLBACK")
+                return RemovalCompletionResult(
+                    False, f"phase compare-and-set refused: {advance.message}",
+                    record=advance.record or record, outcome=advance.outcome,
+                )
+            # The invariant, checked in the transaction that would record
+            # the terminal state: for permanent mode there is no commit of
+            # 'done' / 'hard-removed' without the exact receipt already
+            # durable. The prepare above is normally what satisfies this;
+            # this guard is what makes it unconditional, so no path — a
+            # skipped prepare, a predicate that moved underneath — can
+            # reach a terminal claim with nothing to account for it.
+            if record.mode == RemovalMode.PERMANENT and prepared is None:
+                conn.execute("ROLLBACK")
+                message = (
+                    "§12: refusing to commit a terminal lifecycle because no "
+                    "receipt content is durable for this removal — the "
+                    "terminal state and its receipt are recorded together or "
+                    "not at all"
+                )
+                return RemovalCompletionResult(
+                    False, message, record=record,
+                    outcome=RemovalAdvanceOutcome.REFUSED_PRECONDITION,
+                    refusal_key=REMOVAL_REFUSAL_RECEIPT_UNWRITABLE,
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    # Step 3: the receipt's content is already durable, so this is a state
+    # flip that cannot fail for content reasons. A failure here leaves the
+    # receipt PREPARED with the terminal state recorded — the interrupted
+    # direction :func:`resume_removal` resolves at P12 by applying it.
+    if prepared is not None:
+        applied, applied_reason = apply_prepared_removal_receipt(
+            slug, removal_id, expect_digest=prepared.digest,
+        )
+        if not applied:
+            message = (
+                "§12: the terminal state is recorded and the exact receipt "
+                "content is durable, but marking it applied did not commit: "
+                f"{applied_reason} — a re-drive rolls it forward"
+            )
+            return RemovalCompletionResult(
+                False, message, transitioned=True, record=advance.record,
+                outcome=RemovalAdvanceOutcome.REFUSED_PRECONDITION,
+                receipt=prepared,
+                refusal_key=REMOVAL_REFUSAL_RECEIPT_UNWRITABLE,
+            )
+        record_removal_archive_entry(slug, "permanent-removal", removal_id)
+
+    return RemovalCompletionResult(
+        True, "removal complete", transitioned=True, record=advance.record,
+        outcome=advance.outcome, receipt=prepared,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The terminal §12 receipt — built AFTER Done, from the finished state
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TerminalReceiptResult:
+    """Result of writing a permanent removal's terminal §12 receipt."""
+    success: bool
+    message: str
+    receipt: Optional[dict] = None
+    record: Optional[RemovalPhaseRecord] = None
+
+
+def write_terminal_removal_receipt(
+    board: str, *, removal_id: str
+) -> TerminalReceiptResult:
+    """Build and record the §12 receipt from the state AFTER Done (§12).
+
+    A receipt is a TERMINAL CLAIM: it says a board is hard-removed and
+    when. So it is built here and only here, from the durable record at
+    phase ``done`` and the register entry that Done transitioned — never
+    at Applied, where the terminal lifecycle has not been recorded, the
+    §6.6 marker may still be outstanding, and the operator-item list
+    still names work that has since been done. Building from the finished
+    state is what makes the receipt true rather than merely plausible.
+
+    Idempotent: re-running it after a crash between Done and the receipt
+    write recomputes the same payload and
+    :func:`record_permanent_removal_receipt` accepts the identical
+    digest. A payload that DIFFERS is refused there, not replaced.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return TerminalReceiptResult(False, "invalid board name")
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return TerminalReceiptResult(
+            False, f"no removal phase record for {slug!r}",
+        )
+    if record.removal_id != removal_id:
+        return TerminalReceiptResult(
+            False,
+            f"removal_id {removal_id!r} does not match the recorded "
+            f"removal {record.removal_id!r}", record=record,
+        )
+    if record.mode != RemovalMode.PERMANENT:
+        return TerminalReceiptResult(
+            False,
+            f"a §12 receipt is permanent mode's; this removal is "
+            f"{record.mode.value}", record=record,
+        )
+    if record.phase != RemovalPhase.DONE:
+        return TerminalReceiptResult(
+            False,
+            f"the removal is at {record.phase.value}: a §12 receipt is a "
+            "terminal claim and is written only after Done",
+            record=record,
+        )
+
+    prepared = get_prepared_removal_receipt(slug, removal_id)
+    if prepared is not None and prepared.payload:
+        # Recovery direction (b): the terminal state is recorded and the
+        # exact receipt content is already durable. Applying it is a state
+        # flip over committed bytes — it must NOT regenerate the payload,
+        # because the payload that was committed is the one this removal's
+        # terminal claim rests on.
+        applied, reason = apply_prepared_removal_receipt(
+            slug, removal_id, expect_digest=prepared.digest,
+        )
+        if not applied:
+            message = (
+                "§12: the prepared terminal removal receipt could not be "
+                f"marked applied, so this removal is NOT reported as "
+                f"successfully completed: {reason}"
+            )
+            _record_phase_refusal(
+                slug, record, REMOVAL_REFUSAL_RECEIPT_UNWRITABLE, message,
+            )
+            return TerminalReceiptResult(
+                False, message, receipt=prepared.payload, record=record,
+            )
+        record_removal_archive_entry(slug, "permanent-removal", removal_id)
+        return TerminalReceiptResult(
+            True,
+            "§12 terminal removal receipt applied from the prepared, "
+            "already-durable content",
+            receipt=prepared.payload, record=record,
+        )
+
+    # No prepared content at all. A removal driven through
+    # :func:`complete_removal` cannot reach Done in this state — the
+    # prepare is what admits the terminal transition — so this is the
+    # legacy shape: a record taken to Done before the protocol existed, or
+    # by a caller that bypassed it. Build the receipt from the finished
+    # state and record it, which is what the terminal claim owes.
+    entry = get_register_entry(slug)
+    receipt = build_terminal_removal_receipt_payload(slug, record, entry)
+    if not record_permanent_removal_receipt(
+        slug, removal_id,
+        terminal_lifecycle=_terminal_lifecycle_for(record.mode).value,
+        scope_declaration=record.scope_declaration_version
+        or SCOPE_DECLARATION_VERSION,
+        receipt_payload=receipt,
+    ):
+        message = (
+            "§12: the terminal removal receipt could not be recorded, so this "
+            "removal is NOT reported as successfully completed — the receipt "
+            "is part of the terminal claim, and a re-drive rolls it forward"
+        )
+        _record_phase_refusal(
+            slug, record, REMOVAL_REFUSAL_RECEIPT_UNWRITABLE, message,
+        )
+        return TerminalReceiptResult(False, message, receipt=receipt, record=record)
+    record_removal_archive_entry(slug, "permanent-removal", removal_id)
+    return TerminalReceiptResult(
+        True, "§12 terminal removal receipt recorded",
+        receipt=receipt, record=record,
+    )
+
+
+def build_terminal_removal_receipt_payload(
+    slug: str,
+    record: RemovalPhaseRecord,
+    entry: Optional[RegisterEntry],
+) -> dict:
+    """The §12 receipt payload for a permanent removal, from ONE builder.
+
+    Both users of the prepare-then-apply protocol come through here — the
+    prepare, which passes the PROJECTED terminal record and entry, and the
+    legacy post-Done write, which passes the ones it read — so the content
+    of a receipt never depends on which of them produced it.
+    """
+    journal = record.journal()
+    destroyed = [
+        item for item in journal["items"]
+        if item.get("ok") and item.get("step") in (
+            APPLY_JOURNAL_STORAGE_DESTROYED,
+            APPLY_JOURNAL_RESOURCE_DESTROYED,
+            APPLY_JOURNAL_WORK_AREA_DESTROYED,
+        )
+    ]
+    deregistered = [
+        item for item in journal["items"]
+        if item.get("ok") and item.get("step") == APPLY_JOURNAL_DEREGISTERED
+    ]
+    retained = [
+        item for item in journal["items"]
+        if item.get("ok") and item.get("step") == APPLY_JOURNAL_RETENTION_RECORDED
+    ]
+    failures = [item for item in journal["items"] if not item.get("ok")]
+    leftovers = check_scoped_leftovers(slug, record)
+    return _build_permanent_receipt(
+        slug, record, entry, destroyed, deregistered, retained, failures,
+        leftovers,
+    )
+
+
+def terminal_receipt_outstanding(record: RemovalPhaseRecord) -> bool:
+    """Does this finished permanent removal still owe its §12 receipt?
+
+    Status-aware: a receipt whose content is durable but still
+    :data:`RECEIPT_STATUS_PREPARED` is OUTSTANDING, because the terminal
+    claim is not yet accounted for by an applied receipt. That is the
+    interrupted direction where the terminal state was reached and the
+    apply did not commit, and saying "outstanding" here is what sends the
+    §9.3 roll-forward to finish it — without regenerating anything.
+    """
+    if record.mode != RemovalMode.PERMANENT:
+        return False
+    if record.phase != RemovalPhase.DONE:
+        return False
+    return not permanent_removal_receipt_committed(
+        record.board_name, record.removal_id
+    )
+
+
+# ---------------------------------------------------------------------------
+# Restart entry point (§9.3) — a pure function of durable state
+# ---------------------------------------------------------------------------
+
+class RemovalRecoveryPoint(str, Enum):
+    """Named crash points this function distinguishes (§9.3)."""
+    P1 = "P1"
+    P2 = "P2"
+    P2A = "P2a"
+    P3 = "P3"
+    # Phases at or beyond Quiesced (§9.3 table):
+    P6 = "P6"  # Quiesced, before any release
+    P7 = "P7"  # Mid-release
+    P8 = "P8"  # Released, before content applied
+    P9 = "P9"  # Mid-apply, before deregistration
+    P9A = "P9a"  # Mid-apply, content destroyed, registrations not yet deregistered
+    P9B = "P9b"  # Mid-apply, deregistered, retention records not yet written
+    P10 = "P10"  # Applied, records elsewhere not yet updated
+    P11 = "P11"  # Swept, not yet marked complete
+    P12 = "P12"  # Marked complete
+    BEYOND_FENCED = "beyond-fenced"
+    INDETERMINATE = "indeterminate"
+
+
+class RemovalRecoveryAction(str, Enum):
+    """The roll-forward action §9.3 prescribes for each recovery point."""
+    NONE = "none"
+    CLOSE_FENCE_AND_SETTLE = "close-fence-and-settle"
+    ROLL_FORWARD_INTO_QUIESCENCE = "roll-forward-into-quiescence"
+    # §9.3 actions at or beyond Quiesced:
+    ROLL_FORWARD_CARRY_AND_RELEASE = "carry-obligations-then-release"
+    ROLL_FORWARD_RETRY_RELEASE = "retry-release-by-exact-identity"
+    ROLL_FORWARD_INTO_APPLIED = "roll-forward-into-applied"
+    ROLL_FORWARD_APPLY_CONTENT = "re-run-apply-content"
+    ROLL_FORWARD_DEREGISTER = "deregister-remaining"
+    ROLL_FORWARD_RETENTION_RECORDS = "write-retention-records"
+    ROLL_FORWARD_INTO_SWEEP = "roll-forward-into-sweep"
+    ROLL_FORWARD_INTO_DONE = "roll-forward-into-done"
+    # Done committed but the terminal §12 receipt is not recorded: the
+    # terminal claim is incomplete, so the removal rolls forward by
+    # writing it rather than reporting a success it cannot account for.
+    ROLL_FORWARD_TERMINAL_RECEIPT = "write-terminal-receipt"
+    NO_ACTION_COMPLETE = "no-action-complete"
+    NO_ACTION_BEYOND_FENCED = "no-action-beyond-fenced"
+
+
+@dataclass
+class RemovalResumeDecision:
+    """What :func:`resume_removal` found and the action §9.3 prescribes."""
+    point: RemovalRecoveryPoint
+    action: RemovalRecoveryAction
+    message: str
+    record: Optional[RemovalPhaseRecord] = None
+    entry: Optional[RegisterEntry] = None
+
+
+def resume_removal(board: str) -> RemovalResumeDecision:
+    """The restart entry point (§9.3): decide, never act.
+
+    A function of DURABLE STATE ONLY — it reads the phase record, the
+    register entry, the durable apply journal, (when relevant) the
+    in-board gate and, for a finished permanent removal, the removal
+    archive. So two restarts observing the same durable state choose
+    identically, and none of them consults the filesystem to decide
+    whether a board still exists: a board mid-removal whose storage has
+    already been destroyed is a board being removed.
+
+    :func:`drive_removal` is the production caller — it asks this
+    function where the removal is, performs exactly the prescribed
+    roll-forward, and asks again — so the CLI and the dashboard reach it
+    on every invocation, fresh removal and restart alike.
+
+    * **P1** — no phase record: do nothing, the removal had not begun.
+    * **P2** — Intent recorded, the in-board gate is still ``open``: roll
+      forward by closing the fence (:func:`advance_removal_to_fenced`
+      performs exactly this and is itself idempotent).
+    * **P2a** — Intent recorded, but the gate is already ``closing`` (or
+      ``gate_move`` is already ``settled``): the same roll-forward action
+      applies — :func:`advance_removal_to_fenced` is safe to re-drive from
+      any point between the two commits it makes, and derives the
+      one-time deadline from the gate's own durable closing instant
+      rather than from the restart's clock (QB-2).
+    * **P3** — Fenced: roll forward into quiescence, reading the recorded
+      deadline, never recomputing it.
+    * Anything at or past Quiesced: the phases beyond the fence drive
+      themselves; this function reports the phase and takes no position.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RemovalResumeDecision(
+            RemovalRecoveryPoint.INDETERMINATE, RemovalRecoveryAction.NONE,
+            "invalid board name",
+        )
+
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return RemovalResumeDecision(
+            RemovalRecoveryPoint.P1, RemovalRecoveryAction.NONE,
+            "no removal was ever recorded: nothing to resume",
+        )
+
+    entry = get_register_entry(slug)
+
+    if record.phase == RemovalPhase.INTENT:
+        gate = _read_gate_instant(slug)
+        gate_closed = (
+            gate.status is DurableReadStatus.OK and gate.gate is not InBoardGate.OPEN
+        )
+        gate_move_settled = entry is not None and entry.gate_move == GateMove.SETTLED
+        if not gate_closed and not gate_move_settled:
+            point = RemovalRecoveryPoint.P2
+            message = (
+                "intent recorded, fence not yet closed: roll forward by "
+                "closing the fence, recording gate_move=settled, and "
+                "computing the deadline if absent"
+            )
+        else:
+            point = RemovalRecoveryPoint.P2A
+            message = (
+                "gate committed but gate_move/phase not yet settled: roll "
+                "forward by recording settled (re-recording is a no-op)"
+            )
+        return RemovalResumeDecision(
+            point, RemovalRecoveryAction.CLOSE_FENCE_AND_SETTLE, message,
+            record=record, entry=entry,
+        )
+
+    if record.phase == RemovalPhase.FENCED:
+        return RemovalResumeDecision(
+            RemovalRecoveryPoint.P3, RemovalRecoveryAction.ROLL_FORWARD_INTO_QUIESCENCE,
+            "fenced, no reservation resolved yet: roll forward into "
+            "quiescence, reading the recorded deadline, never recomputing it",
+            record=record, entry=entry,
+        )
+
+    # §9.3 — Phases at or beyond Quiesced: roll forward, never backwards.
+    # A stop always rolls forward (§9.1); only a durably recorded
+    # cancellation abandons, and only below Applied.
+
+    if record.phase == RemovalPhase.QUIESCED:
+        # P6: Quiesced, before any release — roll forward: carry, then release.
+        return RemovalResumeDecision(
+            RemovalRecoveryPoint.P6,
+            RemovalRecoveryAction.ROLL_FORWARD_CARRY_AND_RELEASE,
+            "quiesced, no carry yet: roll forward by carrying obligations, "
+            "ledger and inventory, then releasing",
+            record=record, entry=entry,
+        )
+
+    if record.phase == RemovalPhase.CARRIED:
+        # P7: Mid-release (possibly released without record updated)
+        # Roll forward: retry by exact recorded identity. AB-1 resolves
+        # the ambiguous case — no double release.
+        return RemovalResumeDecision(
+            RemovalRecoveryPoint.P7,
+            RemovalRecoveryAction.ROLL_FORWARD_RETRY_RELEASE,
+            "carried, release may be partial: roll forward by retrying "
+            "release by exact recorded identity (idempotent)",
+            record=record, entry=entry,
+        )
+
+    if record.phase == RemovalPhase.RELEASED:
+        # P8: Released, before content applied — roll forward into Applied.
+        # Re-evaluates TQ-2's predicate, so a reservation that became Held
+        # cannot be destroyed over.
+        return RemovalResumeDecision(
+            RemovalRecoveryPoint.P8,
+            RemovalRecoveryAction.ROLL_FORWARD_INTO_APPLIED,
+            "released, content not yet applied: roll forward into Applied "
+            "(re-evaluates TQ-2, so a reservation that became Held is not "
+            "destroyed over)",
+            record=record, entry=entry,
+        )
+
+    if record.phase == RemovalPhase.APPLIED:
+        # Applied is TWO durable facts: the transition, and §6.6's
+        # mode-specific content. While the content is outstanding the
+        # recovery point is INSIDE the apply, and which of §9.3's
+        # intra-apply points it is comes from the durable apply journal —
+        # not from a re-scan of a world that is mid-destruction.
+        if applied_mode_content_is_outstanding(record):
+            journal = record.journal()
+            destroyed = journalled_apply_identities(
+                record, action=APPLY_JOURNAL_WORK_AREA_DESTROYED
+            ) | journalled_apply_identities(
+                record, action=APPLY_JOURNAL_STORAGE_DESTROYED
+            ) | journalled_apply_identities(
+                record, action=APPLY_JOURNAL_RESOURCE_DESTROYED
+            )
+            deregistered = journalled_apply_identities(
+                record, action=APPLY_JOURNAL_DEREGISTERED
+            )
+            retained = journalled_apply_identities(
+                record, action=APPLY_JOURNAL_RETENTION_RECORDED
+            )
+            if not destroyed:
+                point = RemovalRecoveryPoint.P9
+                action = RemovalRecoveryAction.ROLL_FORWARD_APPLY_CONTENT
+                message = (
+                    "applied, the mode-specific content is outstanding and "
+                    "nothing is journalled destroyed: roll forward by "
+                    "re-running the apply (every step is idempotent by exact "
+                    "recorded identity)"
+                )
+            elif not deregistered and not retained:
+                point = RemovalRecoveryPoint.P9A
+                action = RemovalRecoveryAction.ROLL_FORWARD_DEREGISTER
+                message = (
+                    f"applied, {len(destroyed)} item(s) journalled destroyed "
+                    "but nothing deregistered yet: roll forward by "
+                    "deregistering the remaining registrations"
+                )
+            else:
+                point = RemovalRecoveryPoint.P9B
+                action = RemovalRecoveryAction.ROLL_FORWARD_RETENTION_RECORDS
+                message = (
+                    f"applied, {len(destroyed)} destroyed and "
+                    f"{len(deregistered)} deregistered but the content is "
+                    "still not recorded performed: roll forward by finishing "
+                    "the retention records and recording the application"
+                )
+            return RemovalResumeDecision(
+                point, action,
+                f"{message} ({len(journal['items'])} journal item(s) recorded)",
+                record=record, entry=entry,
+            )
+        # P10: Applied, records elsewhere not yet updated — roll forward
+        # into the sweep. Records are removed by exact key, so removing
+        # an already-removed one is a no-op.
+        return RemovalResumeDecision(
+            RemovalRecoveryPoint.P10,
+            RemovalRecoveryAction.ROLL_FORWARD_INTO_SWEEP,
+            "applied, sweep not yet started: roll forward into the sweep "
+            "(removing by exact key is idempotent)",
+            record=record, entry=entry,
+        )
+
+    if record.phase == RemovalPhase.SWEPT:
+        # P11: Swept, not yet marked complete — roll forward into Done.
+        return RemovalResumeDecision(
+            RemovalRecoveryPoint.P11,
+            RemovalRecoveryAction.ROLL_FORWARD_INTO_DONE,
+            "swept, not yet marked complete: roll forward by transitioning "
+            "to Done (success was never reported)",
+            record=record, entry=entry,
+        )
+
+    if record.phase == RemovalPhase.DONE:
+        # P12: Marked complete.  Every cached handle carries the epoch and
+        # revalidates it (EM-3); after destruction the store is absent and
+        # by GA-4 absence is refused.
+        #
+        # For a PERMANENT removal, "complete" includes its §12 receipt: a
+        # board recorded hard-removed with no durable account of what was
+        # destroyed is a terminal claim that cannot be checked. A crash
+        # between the Done commit and the receipt write lands here and
+        # rolls the receipt forward.
+        if terminal_receipt_outstanding(record):
+            return RemovalResumeDecision(
+                RemovalRecoveryPoint.P12,
+                RemovalRecoveryAction.ROLL_FORWARD_TERMINAL_RECEIPT,
+                "done, but the terminal §12 receipt is not recorded: roll "
+                "forward by writing it from the finished durable state",
+                record=record, entry=entry,
+            )
+        return RemovalResumeDecision(
+            RemovalRecoveryPoint.P12,
+            RemovalRecoveryAction.NO_ACTION_COMPLETE,
+            "done: removal is complete, no action needed",
+            record=record, entry=entry,
+        )
+
+    # Fallback for any unexpected phase value.
+    return RemovalResumeDecision(
+        RemovalRecoveryPoint.BEYOND_FENCED, RemovalRecoveryAction.NO_ACTION_BEYOND_FENCED,
+        f"at {record.phase.value}: unrecognised phase, no action prescribed",
+        record=record, entry=entry,
+    )
+
+
+# ---------------------------------------------------------------------------
+# In-transaction mutation guard (§3.1 Gate B applied to real writes)
+# ---------------------------------------------------------------------------
+#
+# A fence nobody calls is advice. This is the chokepoint that makes it a
+# fence: every mutating primitive in this module goes through
+# :func:`write_txn`, and every ``write_txn`` asserts Gate A + Gate B on the
+# SAME connection, INSIDE the already-open ``BEGIN IMMEDIATE`` — so the
+# gate read and the mutation are one atomic unit and there is no
+# check-then-act window for a fence close to slip through.
+#
+# What decides whether the fence applies is the presence of the in-board
+# ``board_fence_state`` table, not board identity alone:
+#
+#   * a store that HAS the table is FENCED. Everything is then required: a
+#     present, readable row, a present, readable, non-archived register
+#     entry, a gate of 'open', and a mirror EM-4 accepts.
+#   * a store with NO fence table — a board that predates the fence, or
+#     one nobody has armed yet, because nothing in creation arms a gate
+#     any more — is UNFENCED and admitted. So is a connection with NO
+#     board identity at all (``connect(db_path=...)`` on an arbitrary
+#     file, ``:memory:``, a DB-API double).
+#
+# Arming a board is what the GA-5 backfill and the fence-closing point do.
+# It is one-way per store: once armed, GOVERNED is permanent for that
+# store's lifetime.
+
+
+class BoardFenceClosedError(RuntimeError):
+    """Raised when the removal fence refuses a mutation (§3.4).
+
+    Carries the structured :class:`FenceRefusal` so callers can branch on
+    ``outcome``/``rule`` instead of parsing the message.
+    """
+
+    def __init__(self, refusal: FenceRefusal):
+        super().__init__(f"kanban fence refused: {refusal.message}")
+        self.refusal = refusal
+
+
+_FENCE_PROTOCOL = threading.local()
+
+
+@contextlib.contextmanager
+def _fence_protocol_scope():
+    """Mark this thread as running fence/schema infrastructure, not a caller.
+
+    The fence primitives themselves (arming Gate B, writing the epoch
+    mirror during backfill) and first-open schema initialisation have to
+    write to a board whose fence may not yet be — or may no longer be —
+    admitting ordinary work. They are the machinery, not a client of it.
+    """
+    depth = getattr(_FENCE_PROTOCOL, "depth", 0)
+    _FENCE_PROTOCOL.depth = depth + 1
+    try:
+        yield
+    finally:
+        _FENCE_PROTOCOL.depth = depth
+
+
+def _in_fence_protocol() -> bool:
+    return getattr(_FENCE_PROTOCOL, "depth", 0) > 0
+
+
+def _conn_cache_get(conn: sqlite3.Connection, name: str, default=None):
+    try:
+        return getattr(conn, name)
+    except AttributeError:
+        return default
+
+
+def _conn_cache_set(conn: sqlite3.Connection, name: str, value) -> None:
+    try:
+        setattr(conn, name, value)
+    except AttributeError:
+        # Plain ``sqlite3.Connection`` has no ``__dict__``. Caching is an
+        # optimisation, never a correctness requirement — recompute instead.
+        pass
+
+
+def _conn_main_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """The file backing ``main`` on *conn*, or None for :memory:."""
+    try:
+        cursor = conn.execute("PRAGMA database_list")
+        rows = cursor.fetchall() if cursor is not None else []
+    except (sqlite3.Error, AttributeError):
+        return None
+    for row in rows or ():
+        try:
+            name, filename = row[1], row[2]
+        except (IndexError, TypeError):
+            continue
+        if name == "main" and filename:
+            return Path(filename)
+    return None
+
+
+def board_slug_for_db_path(path: Path) -> Optional[str]:
+    """Map a kanban.db path back to its board slug, or None if unknown.
+
+    Needed because the fence authority is keyed by board NAME while a
+    connection only knows a file. ``connect(db_path=...)`` legitimately
+    points at arbitrary paths, and those simply have no board identity.
+    """
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return None
+    try:
+        if resolved == (kanban_home() / "kanban.db").resolve():
+            return DEFAULT_BOARD
+    except OSError:
+        pass
+    try:
+        root = boards_root().resolve()
+        if resolved.name == "kanban.db" and resolved.parent.parent == root:
+            try:
+                return _normalize_board_slug(resolved.parent.name)
+            except ValueError:
+                return None
+    except OSError:
+        pass
+    # HERMES_KANBAN_DB pins one file for whatever the active board is.
+    try:
+        current = get_current_board()
+        if kanban_db_path(board=current).resolve() == resolved:
+            return current
+    except Exception:
+        pass
+    return None
+
+
+_NO_BOARD = "\x00no-board"
+
+
+def _board_slug_for_connection(
+    conn: sqlite3.Connection, explicit: Optional[str] = None
+) -> Optional[str]:
+    if explicit:
+        return explicit
+    cached = _conn_cache_get(conn, "_hermes_fence_board")
+    if cached is not None:
+        return None if cached is _NO_BOARD else cached
+    path = _conn_main_db_path(conn)
+    slug = board_slug_for_db_path(path) if path is not None else None
+    _conn_cache_set(conn, "_hermes_fence_board", slug if slug else _NO_BOARD)
+    return slug
+
+
+def accepted_epoch_mirrors(entry: RegisterEntry) -> frozenset:
+    """Mirror values EM-4 accepts for *entry* right now (§3.9).
+
+    ``{epoch}`` normally (EM-4a); during the intent→fence window the
+    one-step lag to ``epoch_before`` is also accepted (EM-4b), which is
+    what keeps that window refusing nothing.
+    """
+    accepted = {int(entry.epoch)}
+    if (
+        entry.lifecycle == BoardLifecycle.REMOVING
+        and entry.gate_move == GateMove.PENDING
+        and entry.epoch_before is not None
+    ):
+        accepted.add(int(entry.epoch_before))
+    return frozenset(accepted)
+
+
+@dataclass(frozen=True)
+class FenceMutationVerdict:
+    """Outcome of the in-transaction mutation guard."""
+    fenced: bool
+    board: Optional[str] = None
+    accepted_mirrors: frozenset = frozenset()
+    refusal: Optional[FenceRefusal] = None
+
+
+def evaluate_fence_for_mutation(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> FenceMutationVerdict:
+    """Read Gate B on *conn* and Gate A for its board; decide admission.
+
+    Must be called with a write transaction already open on *conn* so the
+    Gate B read and the mutation that follows cannot be separated.
+
+    The presence of the ``board_fence_state`` table — not board identity
+    alone — decides whether the fence applies. A store with no gate table
+    is UNFENCED and admitted: this covers a board that predates the fence
+    and one created by the ordinary, unarmed creation path alike. Nothing
+    in creation arms a gate any more; only the recorded backfill migration
+    (GA-5) or the fence-closing point installs the table, and from then
+    on this store's writes are governed. A connection with no board
+    identity at all (``connect(db_path=...)`` on an arbitrary file, an
+    in-memory database, a DB-API double) is likewise outside the fence.
+    """
+    slug = _board_slug_for_connection(conn, board)
+
+    try:
+        cursor = conn.execute(
+            "SELECT gate, epoch_mirror FROM board_fence_state WHERE id = 1"
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            # No in-board gate at all: unfenced, admitted — whether this
+            # is a pre-fence board, a fresh one nobody has backfilled yet,
+            # or a connection with no board identity.
+            return FenceMutationVerdict(fenced=False)
+        if _is_deadline_error(exc):
+            return FenceMutationVerdict(
+                fenced=True,
+                board=slug,
+                refusal=fence_timeout_refusal(slug, "in-board gate read"),
+            )
+        return FenceMutationVerdict(
+            fenced=True,
+            board=slug,
+            refusal=FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=FenceRefusalRule.INDETERMINATE,
+                board=slug,
+                message=f"cannot read in-board gate: {exc}",
+            ),
+        )
+    except sqlite3.Error as exc:
+        if _is_deadline_error(exc):
+            return FenceMutationVerdict(
+                fenced=True,
+                board=slug,
+                refusal=fence_timeout_refusal(slug, "in-board gate read"),
+            )
+        return FenceMutationVerdict(
+            fenced=True,
+            board=slug,
+            refusal=FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=FenceRefusalRule.INDETERMINATE,
+                board=slug,
+                message=f"cannot read in-board gate: {exc}",
+            ),
+        )
+
+    # A real sqlite3 connection always hands back a cursor here. Anything
+    # else is a scripted DB-API double (the write_txn boundary tests use
+    # one) rather than a board store, and there is no fence on it.
+    if cursor is None or not hasattr(cursor, "fetchone"):
+        return FenceMutationVerdict(fenced=False)
+    row = cursor.fetchone()
+
+    if row is None:
+        # The store opted into the fence and then lost its only row. That
+        # is corruption of the gate itself, not a legacy unfenced store.
+        return FenceMutationVerdict(
+            fenced=True,
+            board=slug,
+            refusal=FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=FenceRefusalRule.INDETERMINATE,
+                board=slug or "?",
+                message="board_fence_state table present but its row is missing",
+            ),
+        )
+
+    try:
+        gate = InBoardGate(row["gate"])
+        mirror = int(row["epoch_mirror"])
+    except (ValueError, TypeError) as exc:
+        return FenceMutationVerdict(
+            fenced=True,
+            board=slug,
+            refusal=FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=FenceRefusalRule.INDETERMINATE,
+                board=slug or "?",
+                message=f"malformed in-board gate state: {exc}",
+            ),
+        )
+
+    if slug is None:
+        return FenceMutationVerdict(
+            fenced=True,
+            board=None,
+            refusal=FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=FenceRefusalRule.INDETERMINATE,
+                board="?",
+                message="fenced store at an unrecognised path: cannot resolve "
+                        "its register authority",
+                mirror_epoch=mirror,
+            ),
+        )
+
+    try:
+        entry = get_register_entry(slug)
+    except Exception as exc:
+        if _is_deadline_error(exc):
+            # Gate A held under an exclusive lock past the mutation's
+            # deadline: a TIMEOUT, distinct from "we read it and it was
+            # unusable". Waiting longer is the one thing not permitted.
+            refusal = fence_timeout_refusal(slug, "register authority read")
+            refusal.mirror_epoch = mirror
+            return FenceMutationVerdict(fenced=True, board=slug, refusal=refusal)
+        return FenceMutationVerdict(
+            fenced=True,
+            board=slug,
+            refusal=FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=FenceRefusalRule.INDETERMINATE,
+                board=slug,
+                message=f"cannot read register entry: {exc}",
+                mirror_epoch=mirror,
+            ),
+        )
+
+    if entry is None:
+        return FenceMutationVerdict(
+            fenced=True,
+            board=slug,
+            refusal=FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=FenceRefusalRule.GA_4,
+                board=slug,
+                message="fenced board has no register entry: refusing to mutate",
+                mirror_epoch=mirror,
+            ),
+        )
+
+    if entry.lifecycle in (BoardLifecycle.ARCHIVED, BoardLifecycle.HARD_REMOVED):
+        return FenceMutationVerdict(
+            fenced=True,
+            board=slug,
+            refusal=FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.CLOSED,
+                board=slug,
+                message=f"board is {entry.lifecycle.value}",
+                register_epoch=entry.epoch,
+                mirror_epoch=mirror,
+            ),
+        )
+
+    accepted = accepted_epoch_mirrors(entry)
+
+    if gate is not InBoardGate.OPEN:
+        return FenceMutationVerdict(
+            fenced=True,
+            board=slug,
+            accepted_mirrors=accepted,
+            refusal=FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.CLOSED,
+                board=slug,
+                message=f"in-board gate is {gate.value}",
+                register_epoch=entry.epoch,
+                mirror_epoch=mirror,
+            ),
+        )
+
+    if mirror not in accepted:
+        pair = validate_epoch_pair(entry.epoch, mirror, entry)
+        return FenceMutationVerdict(
+            fenced=True,
+            board=slug,
+            accepted_mirrors=accepted,
+            refusal=FenceRefusal(
+                outcome=FenceOutcome.REFUSED_INDETERMINATE,
+                rule=pair.rule or FenceRefusalRule.EM_4c,
+                board=slug,
+                message=pair.message or "epoch mirror does not match authority",
+                register_epoch=entry.epoch,
+                mirror_epoch=mirror,
+            ),
+        )
+
+    return FenceMutationVerdict(fenced=True, board=slug, accepted_mirrors=accepted)
+
+
+def assert_fence_admits_mutation(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> FenceMutationVerdict:
+    """Refuse the in-flight mutation if the fence is not open.
+
+    Raises :class:`BoardFenceClosedError` on refusal. Returns the verdict
+    (whose ``accepted_mirrors`` the caller can fold into a CAS predicate)
+    otherwise.
+    """
+    if _in_fence_protocol():
+        return FenceMutationVerdict(fenced=False)
+    verdict = evaluate_fence_for_mutation(conn, board=board)
+    if verdict.refusal is not None:
+        raise BoardFenceClosedError(verdict.refusal)
+    _conn_cache_set(conn, "_hermes_fence_verdict", verdict)
+    return verdict
+
+
+def fence_cas_conjunct(conn: sqlite3.Connection) -> tuple[str, list]:
+    """SQL fragment folding Gate B into a mutation's own WHERE clause.
+
+    Returns ``("", [])`` for an unfenced store. For a fenced one it returns
+    an ``AND EXISTS (...)`` conjunct plus its parameters, so that a
+    statement such as the ready→running claim CAS cannot succeed against a
+    closed gate — gate and mutation are then a single SQL predicate, not
+    two steps a close could get between.
+    """
+    verdict = _conn_cache_get(conn, "_hermes_fence_verdict")
+    if verdict is None:
+        verdict = evaluate_fence_for_mutation(conn)
+        if not verdict.fenced:
+            return "", []
+    if not verdict.fenced:
+        return "", []
+    accepted = sorted(verdict.accepted_mirrors)
+    if not accepted:
+        # Fenced but with no admissible epoch: make the predicate unsatisfiable.
+        return " AND 1 = 0", []
+    placeholders = ", ".join("?" for _ in accepted)
+    return (
+        " AND EXISTS (SELECT 1 FROM board_fence_state WHERE id = 1 "
+        f"AND gate = 'open' AND epoch_mirror IN ({placeholders}))",
+        list(accepted),
+    )
+
+
+def fence_insert_predicate(conn: sqlite3.Connection) -> tuple[str, list]:
+    """The Gate B predicate in ``INSERT``-carrying form.
+
+    ``INSERT ... VALUES`` has no WHERE clause, so a fenced insert is
+    written as ``INSERT ... SELECT <values> WHERE 1 = 1 <gate>``. Returns
+    ``("", [])`` for an unfenced (non-board) store, so the same call site
+    serves both.
+    """
+    gate_sql, gate_params = fence_cas_conjunct(conn)
+    if not gate_sql:
+        return "", []
+    return " WHERE 1 = 1" + gate_sql, gate_params
+
+
+def fence_write_refusal(
+    conn: sqlite3.Connection, what: str
+) -> BoardFenceClosedError:
+    """The error a write raises when its own gate predicate matched nothing.
+
+    Reached when the fence closed between the transaction's gate read and
+    the statement's own predicate — the statement is the one that noticed,
+    which is the whole point of carrying the gate in it.
+    """
+    verdict = _conn_cache_get(conn, "_hermes_fence_verdict")
+    board = getattr(verdict, "board", None) or _board_slug_for_connection(conn) or "?"
+    state = get_in_board_fence_state(conn)
+    return BoardFenceClosedError(
+        FenceRefusal(
+            outcome=FenceOutcome.REFUSED_CLOSED,
+            rule=FenceRefusalRule.CLOSED,
+            board=board,
+            message=f"{what} refused: the in-board gate closed under the statement",
+            mirror_epoch=None if state is None else state.epoch_mirror,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2962,34 +14971,43 @@ def connect(
                 conn.execute("PRAGMA cell_size_check=ON")
                 needs_init = resolved not in _INITIALIZED_PATHS
                 if needs_init:
-                    # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
-                    # migrations. Cached so subsequent connect() calls in the same
-                    # process are cheap. The lock prevents same-process dispatcher
-                    # threads from racing through the additive ALTER TABLE pass with
-                    # stale PRAGMA snapshots during gateway startup.
-                    conn.executescript(SCHEMA_SQL)
-                    # Which board this file IS, so the migration can read its
-                    # published owner metadata. An explicit ``db_path`` with no
-                    # board named resolves to None, which simply skips that
-                    # extra proof rather than guessing a slug.
-                    _migrate_add_optional_columns(
-                        conn,
-                        _normalize_board_slug(board)
-                        or (get_current_board() if db_path is None else None),
-                    )
-                    # A worker copy of a native attachment keeps its source for
-                    # as long as the row lives; ``attached`` events are
-                    # garbage-collected after 30 days. Added here, after the
-                    # schema, because the legacy pass above may run on
-                    # databases that have no task_attachments table yet.
-                    # One transaction: an interrupted upgrade rolls the column
-                    # back too, so the next startup retries the back-fill.
-                    with write_txn(conn):
-                        if _add_column_if_missing(
-                            conn, "task_attachments", "source_attachment_id",
-                            "source_attachment_id INTEGER",
-                        ):
-                            _backfill_attachment_sources(conn)
+                    # First-open schema creation and the additive migrations
+                    # are fence MACHINERY, not a caller of it: a brand new
+                    # board file has no register entry yet (create_board
+                    # hasn't returned) and a store mid-upgrade may not carry
+                    # a gate row either. Run the whole pass under the fence
+                    # protocol scope so the in-transaction chokepoint does
+                    # not refuse the write that brings the schema into
+                    # existence in the first place.
+                    with _fence_protocol_scope():
+                        # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
+                        # migrations. Cached so subsequent connect() calls in the same
+                        # process are cheap. The lock prevents same-process dispatcher
+                        # threads from racing through the additive ALTER TABLE pass with
+                        # stale PRAGMA snapshots during gateway startup.
+                        conn.executescript(SCHEMA_SQL)
+                        # Which board this file IS, so the migration can read its
+                        # published owner metadata. An explicit ``db_path`` with no
+                        # board named resolves to None, which simply skips that
+                        # extra proof rather than guessing a slug.
+                        _migrate_add_optional_columns(
+                            conn,
+                            _normalize_board_slug(board)
+                            or (get_current_board() if db_path is None else None),
+                        )
+                        # A worker copy of a native attachment keeps its source for
+                        # as long as the row lives; ``attached`` events are
+                        # garbage-collected after 30 days. Added here, after the
+                        # schema, because the legacy pass above may run on
+                        # databases that have no task_attachments table yet.
+                        # One transaction: an interrupted upgrade rolls the column
+                        # back too, so the next startup retries the back-fill.
+                        with write_txn(conn):
+                            if _add_column_if_missing(
+                                conn, "task_attachments", "source_attachment_id",
+                                "source_attachment_id INTEGER",
+                            ):
+                                _backfill_attachment_sources(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -4154,7 +16172,210 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
         except sqlite3.OperationalError as exc:
             if not _is_busy_error(exc) or attempt == _BUSY_MAX_RETRIES:
                 raise
+            # A fence budget is a HARD ceiling: retrying past it would turn a
+            # 5s bound into 5s + N sleeps, which is how the first repair let a
+            # claim be granted at 5.666s.
+            remaining = _fence_remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
+
+
+# ---------------------------------------------------------------------------
+# The mutation deadline (§3.8 — decision (d))
+# ---------------------------------------------------------------------------
+#
+# ONE hard deadline per production mutation, established BEFORE the first
+# blocking read of either store, and shared by BOTH of them: the board's
+# ``BEGIN IMMEDIATE`` takes its ``busy_timeout`` from the remaining budget,
+# and every register/archive connection opened inside the scope does the
+# same via ``_fence_bounded_busy_timeout_ms``. At expiry the mutation
+# refuses with the DISTINCT ``refused-timeout`` outcome rather than
+# waiting on the independently configurable ordinary busy timeout.
+
+FENCE_MUTATION_DEADLINE_SECONDS = MAX_FENCE_CONSULTATION_TIMEOUT_SECONDS
+
+
+def fence_timeout_refusal(board: Optional[str], what: str) -> FenceRefusal:
+    """The structured refusal a blown mutation deadline produces."""
+    return FenceRefusal(
+        outcome=FenceOutcome.REFUSED_TIMEOUT,
+        rule=FenceRefusalRule.TIMEOUT,
+        board=board or "?",
+        message=(
+            f"{what} exceeded the "
+            f"{_fence_consultation_timeout_seconds():g}s fence deadline"
+        ),
+    )
+
+
+def _raise_if_fence_deadline(
+    conn: sqlite3.Connection,
+    exc: BaseException,
+    deadline: Optional[float],
+    what: str,
+) -> None:
+    """Convert a lock-wait failure inside the budget into a timeout refusal."""
+    if deadline is None or not _is_deadline_error(exc):
+        return
+    try:
+        slug = _board_slug_for_connection(conn)
+    except Exception:
+        slug = None
+    raise BoardFenceClosedError(fence_timeout_refusal(slug, what)) from exc
+
+
+def _install_live_deadline_interrupt(conn: sqlite3.Connection) -> None:
+    """Abort statements once the budget IN FORCE RIGHT NOW is exhausted.
+
+    :func:`_install_deadline_interrupt` closes over a fixed deadline. This
+    variant reads the live remaining budget on every callback instead.
+    """
+    def _abort_past_deadline() -> int:
+        remaining = _fence_remaining_seconds()
+        return 1 if remaining is not None and remaining <= 0.0 else 0
+
+    try:
+        conn.set_progress_handler(_abort_past_deadline, 2000)
+    except Exception:  # pragma: no cover - very old sqlite builds
+        pass
+
+
+@contextlib.contextmanager
+def _mutation_deadline(conn: sqlite3.Connection, what: str):
+    """Open the ONE hard deadline for a mutation, at the mutator's ENTRY.
+
+    The deadline used to be minted inside :func:`write_txn`. Mutators
+    that read the board BEFORE opening their write transaction —
+    ``create_task``'s idempotency lookup, ``complete_task``'s task and
+    parent probes, ``reclaim_task``'s status probe, every dispatcher
+    sweep's candidate query — therefore did those reads under the
+    ORDINARY (two-minute, independently configurable) kanban busy
+    timeout. Under a real exclusive board lock one of them blocked for
+    6.21 s and surfaced a raw ``sqlite3.OperationalError``: past the hard
+    ceiling, and outside the structured refusal contract entirely.
+
+    So the budget starts here, before the first read, and ``write_txn``
+    REUSES it rather than starting a second one. A pre-read that blows it
+    — including a raw ``database is locked`` — is translated into the
+    project's structured timeout refusal.
+    """
+    if _in_fence_protocol() or getattr(_FENCE_DEADLINE, "value", None) is not None:
+        # Fence infrastructure, or a composition whose enclosing mutator
+        # already owns the budget: never a second five seconds.
+        yield None
+        return
+
+    deadline = time.monotonic() + _fence_consultation_timeout_seconds()
+    restore_ms = _resolve_busy_timeout_ms()
+    with _fence_deadline_scope(deadline):
+        _register_deadline_connection(conn)
+        try:
+            conn.execute(f"PRAGMA busy_timeout={_fence_bounded_busy_timeout_ms()}")
+        except Exception:
+            pass
+        _install_live_deadline_interrupt(conn)
+        try:
+            yield deadline
+        except BoardFenceClosedError:
+            raise
+        except Exception as exc:
+            # A blocking PRE-READ that ran out of budget is a fence
+            # timeout, not a raw SQLite fault.
+            _raise_if_fence_deadline(conn, exc, deadline, what)
+            raise
+        finally:
+            try:
+                conn.set_progress_handler(None, 0)
+            except Exception:
+                pass
+            try:
+                conn.execute(f"PRAGMA busy_timeout={restore_ms}")
+            except Exception:
+                pass
+
+
+def bounded_mutation(what: str):
+    """Open the ONE mutation deadline at a public mutator's ENTRY.
+
+    Applied to every mutator that reads the board before it opens its
+    write transaction. The wrapped call's FIRST database access is
+    already inside the budget, so a blocking pre-read refuses with the
+    structured timeout rather than waiting on the ordinary busy timeout
+    and raising a raw ``OperationalError``. ``write_txn`` then joins the
+    same deadline instead of minting a second one.
+
+    The board connection is the mutator's first positional argument (or
+    its ``conn`` keyword) throughout this module; a call that supplies
+    neither is passed straight through unbounded rather than guessed at.
+    """
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            conn = args[0] if args else kwargs.get("conn")
+            if not isinstance(conn, sqlite3.Connection):
+                return fn(*args, **kwargs)
+            with _mutation_deadline(conn, what):
+                return fn(*args, **kwargs)
+        return wrapper
+    return decorate
+
+
+@contextlib.contextmanager
+def _fence_mutation_budget(conn: sqlite3.Connection):
+    """Open (or join) the single fence deadline for one mutation.
+
+    Yields the deadline (a ``time.monotonic()`` value), or ``None`` only
+    for fence infrastructure. When a deadline is already in force —
+    because the public mutator opened it at its entry with
+    :func:`_mutation_deadline`, or because an enclosing mutation owns one
+    — that SAME deadline is yielded rather than a fresh one: the budget
+    is per mutation, not per statement, so no composition can buy itself
+    another five seconds. The board connection's ``busy_timeout`` is
+    narrowed to the remaining budget for the duration and restored
+    afterwards, so the deadline binds the blocking board read as well as
+    the register read.
+    """
+    if _in_fence_protocol():
+        yield None
+        return
+
+    existing = getattr(_FENCE_DEADLINE, "value", None)
+    if existing is not None:
+        # Re-narrow this connection's wait to what is LEFT of the budget:
+        # the transaction boundary must not outlive the deadline that was
+        # already ticking when the mutator did its pre-reads.
+        _register_deadline_connection(conn)
+        try:
+            conn.execute(f"PRAGMA busy_timeout={_fence_bounded_busy_timeout_ms()}")
+        except Exception:
+            pass
+        yield existing
+        return
+
+    deadline = time.monotonic() + _fence_consultation_timeout_seconds()
+    restore_ms = _resolve_busy_timeout_ms()
+    with _fence_deadline_scope(deadline):
+        _register_deadline_connection(conn)
+        try:
+            conn.execute(f"PRAGMA busy_timeout={_fence_bounded_busy_timeout_ms()}")
+        except Exception:
+            pass
+        try:
+            _install_deadline_interrupt(conn, deadline)
+        except Exception:
+            pass
+        try:
+            yield deadline
+        finally:
+            try:
+                conn.set_progress_handler(None, 0)
+            except Exception:
+                pass
+            try:
+                conn.execute(f"PRAGMA busy_timeout={restore_ms}")
+            except Exception:
+                pass
 
 
 @contextlib.contextmanager
@@ -4179,6 +16400,16 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     The explicit ROLLBACK on exception is wrapped in try/except so that
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
+
+    **Removal fence.** This is also the single chokepoint at which the
+    board removal fence is enforced. Once the transaction is open, and
+    before the body runs, Gate B is read on THIS connection and Gate A is
+    read for the board it belongs to; a closed gate, an absent or archived
+    register entry, or a mirror EM-4 rejects raises
+    :class:`BoardFenceClosedError` and nothing in the body ever executes.
+    Because the read happens inside the already-open ``BEGIN IMMEDIATE``,
+    a concurrent fence close cannot land between the check and the write.
+    Stores with no ``board_fence_state`` table are unfenced and unaffected.
     """
     _assert_not_delegated_child_mutation()
     if getattr(conn, "in_transaction", False):
@@ -4192,6 +16423,16 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         savepoint = f"hermes_nested_{secrets.token_hex(8)}"
         conn.execute(f"SAVEPOINT {savepoint}")
         try:
+            with _fence_mutation_budget(conn) as deadline:
+                try:
+                    assert_fence_admits_mutation(conn)
+                except BoardFenceClosedError:
+                    raise
+                except Exception as exc:
+                    _raise_if_fence_deadline(
+                        conn, exc, deadline, "register authority read"
+                    )
+                    raise
             yield conn
         except Exception:
             try:
@@ -4204,7 +16445,28 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             conn.execute(f"RELEASE {savepoint}")
         return
 
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    with _fence_mutation_budget(conn) as deadline:
+        # The board store is the FIRST blocking read: BEGIN IMMEDIATE waits
+        # for the write lock. It waits inside the budget, not beyond it.
+        try:
+            _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+        except Exception as exc:
+            _raise_if_fence_deadline(conn, exc, deadline, "board store write lock")
+            raise
+        try:
+            assert_fence_admits_mutation(conn)
+        except BaseException as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            _conn_cache_set(conn, "_hermes_fence_verdict", None)
+            if not isinstance(exc, BoardFenceClosedError):
+                _raise_if_fence_deadline(
+                    conn, exc, deadline, "register authority read"
+                )
+            raise
+
     try:
         yield conn
     except Exception:
@@ -4215,6 +16477,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             # under EIO, lock contention, or corruption). Nothing to undo;
             # do not let this secondary failure shadow the real one.
             pass
+        _conn_cache_set(conn, "_hermes_fence_verdict", None)
         raise
     else:
         try:
@@ -4226,7 +16489,9 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
                 conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
+            _conn_cache_set(conn, "_hermes_fence_verdict", None)
             raise
+        _conn_cache_set(conn, "_hermes_fence_verdict", None)
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
@@ -4352,6 +16617,7 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+@bounded_mutation("create_task")
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -4765,8 +17031,13 @@ def create_task(
                         except Exception:
                             branch_name = None
 
-                conn.execute(
-                    """
+                # Content write: Gate B and the accepted epoch mirror ride
+                # INSIDE this statement's own predicate, so a fence that
+                # closes under it inserts nothing rather than racing the
+                # transaction-level check.
+                gate_sql, gate_params = fence_insert_predicate(conn)
+                cur = conn.execute(
+                    f"""
                     INSERT INTO tasks (
                         id, title, body, assignee, responsibility, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
@@ -4777,7 +17048,7 @@ def create_task(
                         reasoning_effort, execution_tier, model_policy_lock,
                         goal_mode, goal_max_turns, session_id, task_kind,
                         owner_receipt_bound
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{gate_sql}
                     """,
                     (
                         task_id,
@@ -4810,8 +17081,11 @@ def create_task(
                         session_id,
                         "control" if control else "work",
                         1 if receipt_owned else 0,
+                        *gate_params,
                     ),
                 )
+                if cur.rowcount != 1:
+                    raise fence_write_refusal(conn, "create_task")
                 for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
@@ -6604,7 +18878,8 @@ def activate_owner_work(
             if cur.rowcount == 1:
                 released.append(task_id)
                 _append_event(conn, task_id, "owner_work_activated", None)
-    recompute_ready(conn)
+    with _after_durable_commit(f"activate_owner_work({generation})"):
+        recompute_ready(conn)
     return released
 
 
@@ -6885,7 +19160,8 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
         # child immediately.  Matches the contract of complete_task and
         # unblock_task; without this the child stays stuck in todo until the
         # next dispatcher tick or a manual `hermes kanban recompute` (issue #22459).
-        recompute_ready(conn)
+        with _after_durable_commit(f"unlink_tasks({parent_id}, {child_id})"):
+            recompute_ready(conn)
     return removed
 
 
@@ -7062,11 +19338,15 @@ def add_comment(
                         "different author/body"
                     )
                 return int(existing["id"])
+        # Content write: the gate rides in the INSERT's own predicate.
+        gate_sql, gate_params = fence_insert_predicate(conn)
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at, operation_key) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (task_id, author, body, now, operation_key),
+            f"SELECT ?, ?, ?, ?, ?{gate_sql}",
+            (task_id, author, body, now, operation_key, *gate_params),
         )
+        if cur.rowcount != 1:
+            raise fence_write_refusal(conn, "add_comment")
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
 
@@ -8014,6 +20294,7 @@ def _record_file_scope_deferral(
     )
 
 
+@bounded_mutation("claim_task")
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8102,8 +20383,13 @@ def claim_task(
                 """,
                 (now, int(stale["current_run_id"])),
             )
+        # Gate B rides INSIDE the claim's own CAS predicate: the
+        # ready→running transition and the "is the fence open at the
+        # authoritative epoch" test are one statement, so no ordering of
+        # events can grant a reservation on a fenced board.
+        gate_sql, gate_params = fence_cas_conjunct(conn)
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status        = 'running',
                    claim_lock    = ?,
@@ -8112,9 +20398,9 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
-               AND task_kind = 'work'
+               AND task_kind = 'work'{gate_sql}
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, *gate_params),
         )
         if cur.rowcount != 1:
             return None
@@ -8169,6 +20455,7 @@ def claim_task(
     return claimed
 
 
+@bounded_mutation("claim_review_task")
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8214,8 +20501,10 @@ def claim_review_task(
         if conflicts:
             _record_file_scope_deferral(conn, task_id, conflicts, now=now)
             return None
+        # Same in-predicate Gate B conjunct as the ready→running claim.
+        gate_sql, gate_params = fence_cas_conjunct(conn)
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status        = 'running',
                    claim_lock    = ?,
@@ -8224,9 +20513,9 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
-               AND task_kind = 'work'
+               AND task_kind = 'work'{gate_sql}
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, *gate_params),
         )
         if cur.rowcount != 1:
             return None
@@ -8390,6 +20679,7 @@ def goal_run_status(
     return task.status
 
 
+@bounded_mutation("heartbeat_claim")
 def heartbeat_claim(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8405,11 +20695,14 @@ def heartbeat_claim(
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
+        # Renewing a claim is a grant too: fold Gate B into its CAS so a
+        # closed fence cannot have its reservations extended.
+        gate_sql, gate_params = fence_cas_conjunct(conn)
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
             "WHERE id = ? AND status = 'running' AND claim_lock = ? "
-            "AND task_kind = 'work'",
-            (expires, task_id, lock),
+            f"AND task_kind = 'work'{gate_sql}",
+            (expires, task_id, lock, *gate_params),
         )
         if cur.rowcount == 1:
             run_id = _current_run_id(conn, task_id)
@@ -8422,6 +20715,7 @@ def heartbeat_claim(
         return False
 
 
+@bounded_mutation("release_stale_claims")
 def release_stale_claims(
     conn: sqlite3.Connection,
     *,
@@ -8589,6 +20883,7 @@ def release_stale_claims(
     return reclaimed
 
 
+@bounded_mutation("reclaim_task")
 def reclaim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8657,7 +20952,8 @@ def reclaim_task(
     # consecutive-failures counter is now stale. Give the next retry
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
     # so it runs after the enclosing one commits.)
-    _clear_failure_counter(conn, task_id)
+    with _after_durable_commit(f"reclaim_task({task_id})"):
+        _clear_failure_counter(conn, task_id)
     return True
 
 
@@ -8834,6 +21130,7 @@ class WorktreeScopeError(ValueError):
     """Raised when scoped git work cannot be proven clean and in-bounds."""
 
 
+@bounded_mutation("complete_task")
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9110,37 +21407,46 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
-    # Prose-scan the summary + result for t_<hex> references that do
-    # not resolve. Advisory — does not block the completion. Runs in
-    # its own txn so the completion itself is already durable by the
-    # time we emit the warning.
-    scan_text = " ".join(filter(None, [summary, result]))
-    if scan_text:
-        phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
-        # Drop any phantom refs that were already flagged as verified
-        # above (shouldn't happen — verified means they exist — but
-        # belt-and-suspenders).
-        phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
-        if phantom_refs:
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "suspected_hallucinated_references",
-                    {
-                        "phantom_refs": phantom_refs,
-                        "source": "completion_summary",
-                    },
-                    run_id=run_id,
-                )
-    # Successful completion — wipe the consecutive-failures counter.
-    # Failure history stays on the event log for audit; the counter
-    # just tracks "is there a current pathology the breaker should
-    # care about", and a success resets that question.
-    _clear_failure_counter(conn, task_id)
-    # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
-    # Clean up the scratch workspace and any stale tmux session for the worker.
-    _cleanup_workspace(conn, task_id)
-    _done_task = get_task(conn, task_id)
+    # Everything below this point runs AFTER the completion is durable, so
+    # none of it may turn into a refusal of the completion: a caller told
+    # "REFUSED_TIMEOUT" while the board says ``status='done'`` has been
+    # handed a contradiction it cannot act on. Each step still runs on the
+    # ONE live store budget; when that budget is gone the tail is
+    # abandoned and the durable result is returned.
+    _done_task = None
+    with _after_durable_commit(f"complete_task({task_id})"):
+        # Prose-scan the summary + result for t_<hex> references that do
+        # not resolve. Advisory — does not block the completion. Runs in
+        # its own txn so the completion itself is already durable by the
+        # time we emit the warning.
+        scan_text = " ".join(filter(None, [summary, result]))
+        if scan_text:
+            phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
+            # Drop any phantom refs that were already flagged as verified
+            # above (shouldn't happen — verified means they exist — but
+            # belt-and-suspenders).
+            phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
+            if phantom_refs:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "suspected_hallucinated_references",
+                        {
+                            "phantom_refs": phantom_refs,
+                            "source": "completion_summary",
+                        },
+                        run_id=run_id,
+                    )
+        # Successful completion — wipe the consecutive-failures counter.
+        # Failure history stays on the event log for audit; the counter
+        # just tracks "is there a current pathology the breaker should
+        # care about", and a success resets that question.
+        _clear_failure_counter(conn, task_id)
+        # Recompute ready status for dependents (separate txn so children see done).
+        recompute_ready(conn)
+        # Clean up the scratch workspace and any stale tmux session for the worker.
+        _cleanup_workspace(conn, task_id)
+        _resume_store_reads(conn)
+        _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_kanban_lifecycle_hook(
             "kanban_task_completed",
@@ -9447,6 +21753,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     when provably free of work (clean tree, every commit reachable from a
     remote-tracking ref); ``dir`` workspaces are intentionally preserved.
     """
+    _resume_store_reads(conn)
     try:
         row = conn.execute(
             "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
@@ -9587,6 +21894,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
     parent are now done/archived/failed/cancelled, the parent's scratch
     workspace is removed (#33774).
     """
+    _resume_store_reads(conn)
     try:
         parents = conn.execute(
             "SELECT parent_id FROM task_links WHERE child_id = ?",
@@ -9630,6 +21938,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
 
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
     """Kill the tmux session associated with a task's assignee, if dead."""
+    _resume_store_reads(conn)
     try:
         row = conn.execute(
             "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
@@ -10343,6 +22652,7 @@ def request_changes(
     return True, implementer
 
 
+@bounded_mutation("promote_task")
 def promote_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10885,7 +23195,8 @@ def specify_triage_task(
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
+    with _after_durable_commit(f"specify_triage_task({task_id})"):
+        recompute_ready(conn)
     return True
 
 
@@ -11228,7 +23539,8 @@ def decompose_triage_task(
     # stay in 'todo' until the user manually promotes them — useful
     # for manual-review-first workflows.
     if auto_promote:
-        recompute_ready(conn)
+        with _after_durable_commit(f"decompose_triage_task({task_id})"):
+            recompute_ready(conn)
     return child_ids
 
 
@@ -11882,20 +24194,25 @@ def apply_owner_project_plan(
     # archives released — is sitting in ``scheduled``, where neither this call
     # nor a concurrent dispatcher tick can promote it. ``activate_owner_work``
     # runs the recompute once the terminal receipt is durable.
-    if not parked:
-        recompute_ready(conn)
-    for task_id in archived_task_ids:
-        _cleanup_workspace(conn, task_id)
+    with _after_durable_commit(f"apply_owner_project_plan({idempotency_key})"):
+        if not parked:
+            recompute_ready(conn)
+        for task_id in archived_task_ids:
+            _cleanup_workspace(conn, task_id)
     return result
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        # A removal: same in-predicate Gate B as a claim. The row leaves the
+        # board only if the fence is open at an authoritative epoch.
+        gate_sql, gate_params = fence_cas_conjunct(conn)
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived' AND task_kind = 'work'",
-            (task_id,),
+            "WHERE id = ? AND status != 'archived' AND task_kind = 'work'"
+            f"{gate_sql}",
+            (task_id, *gate_params),
         )
         if cur.rowcount != 1:
             return False
@@ -11911,10 +24228,11 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
-    recompute_ready(conn)
-    # Reap the workspace on archive too — tasks archived without ever
-    # completing previously kept their scratch dir / worktree forever.
-    _cleanup_workspace(conn, task_id)
+    with _after_durable_commit(f"archive_task({task_id})"):
+        recompute_ready(conn)
+        # Reap the workspace on archive too — tasks archived without ever
+        # completing previously kept their scratch dir / worktree forever.
+        _cleanup_workspace(conn, task_id)
     return True
 
 
@@ -12051,8 +24369,11 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        # A removal: the decisive DELETE carries Gate B in its own predicate.
+        gate_sql, gate_params = fence_cas_conjunct(conn)
         cur = conn.execute(
-            "DELETE FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
+            f"DELETE FROM tasks WHERE id = ? AND task_kind = 'work'{gate_sql}",
+            (task_id, *gate_params),
         )
         return cur.rowcount == 1
 
@@ -12072,8 +24393,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         if _task_has_run_sandbox_deletion_guard(conn, task_id):
             return False
+        # A removal: the decisive DELETE carries Gate B in its own predicate.
+        gate_sql, gate_params = fence_cas_conjunct(conn)
         cur = conn.execute(
-            "DELETE FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,)
+            f"DELETE FROM tasks WHERE id = ? AND task_kind = 'work'{gate_sql}",
+            (task_id, *gate_params),
         )
         if cur.rowcount != 1:
             return False
@@ -12082,7 +24406,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-    recompute_ready(conn)
+    with _after_durable_commit(f"delete_task({task_id})"):
+        recompute_ready(conn)
     return True
 
 
@@ -14523,6 +26848,7 @@ def heartbeat_worker(
     return True
 
 
+@bounded_mutation("enforce_max_runtime")
 def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
@@ -14628,18 +26954,19 @@ def enforce_max_runtime(
         # emits a ``gave_up`` event on top of the ``timed_out`` we
         # already emitted.
         if cur.rowcount == 1:
-            _record_task_failure(
-                conn, tid,
-                error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
-                outcome="timed_out",
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={
-                    "pid": pid,
-                    "sigkill": killed,
-                    "retry_status": retry_status,
-                },
-            )
+            with _after_durable_commit(f"enforce_max_runtime({tid})"):
+                _record_task_failure(
+                    conn, tid,
+                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                    outcome="timed_out",
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={
+                        "pid": pid,
+                        "sigkill": killed,
+                        "retry_status": retry_status,
+                    },
+                )
     return timed_out
 
 
@@ -14650,6 +26977,7 @@ def enforce_max_runtime(
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
+@bounded_mutation("detect_stale_running")
 def detect_stale_running(
     conn: sqlite3.Connection,
     *,
@@ -14780,6 +27108,7 @@ def detect_stale_running(
     return reclaimed
 
 
+@bounded_mutation("reconcile_orphaned_running")
 def reconcile_orphaned_running(
     conn: sqlite3.Connection,
 ) -> list[str]:
@@ -14952,6 +27281,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+@bounded_mutation("detect_crashed_workers")
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -15197,35 +27527,39 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # ``_record_task_failure`` because the decision — including
                 # the per-task ``max_retries`` override — was already made
                 # against the violation streak above.
-                tripped = _record_task_failure(
-                    conn, tid,
-                    error=error_text,
-                    outcome="crashed",
-                    failure_limit=violation_limit,
-                    force_trip=True,
-                    release_claim=False,
-                    end_run=False,
-                    event_payload_extra={
-                        "pid": pid,
-                        "claimer": claimer,
-                        "protocol_violations": streak,
-                        "protocol_violation_limit": violation_limit,
-                    },
-                )
+                tripped = False
+                with _after_durable_commit(f"detect_crashed_workers({tid})"):
+                    tripped = _record_task_failure(
+                        conn, tid,
+                        error=error_text,
+                        outcome="crashed",
+                        failure_limit=violation_limit,
+                        force_trip=True,
+                        release_claim=False,
+                        end_run=False,
+                        event_payload_extra={
+                            "pid": pid,
+                            "claimer": claimer,
+                            "protocol_violations": streak,
+                            "protocol_violation_limit": violation_limit,
+                        },
+                    )
                 if tripped:
                     auto_blocked.append(tid)
                 continue
             fp = _error_fingerprint(error_text)
             is_systemic = _fp_counts.get(fp, 0) >= 3
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
-                failure_limit=1 if is_systemic else None,
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "claimer": claimer},
-            )
+            tripped = False
+            with _after_durable_commit(f"detect_crashed_workers({tid})"):
+                tripped = _record_task_failure(
+                    conn, tid,
+                    error=error_text,
+                    outcome="crashed",
+                    failure_limit=1 if is_systemic else None,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={"pid": pid, "claimer": claimer},
+                )
             if tripped:
                 auto_blocked.append(tid)
     # Stash auto-blocked ids on the function for the dispatch loop to pick up.
