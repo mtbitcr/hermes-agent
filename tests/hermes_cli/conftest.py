@@ -6,6 +6,43 @@ import pytest
 
 
 @pytest.fixture
+def fence_home(tmp_path, monkeypatch):
+    """An empty HERMES_HOME with no board, no register and no archive.
+
+    Every removal-fence test starts here, so "the board exists and is
+    fenced" is always something a REAL production API did during the
+    test, never something the fixture arranged.
+    """
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for var in (
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_HOME",
+        "HERMES_KANBAN_BOARD",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    kb._INITIALIZED_PATHS.clear()
+    kb._REGISTER_INITIALIZED = False
+    kb._REGISTER_INITIALIZED_PATHS.clear()
+    kb._ARCHIVE_INITIALIZED_PATHS.clear()
+    try:
+        import hermes_constants
+
+        hermes_constants._cached_default_hermes_root = None
+    except Exception:
+        pass
+
+    assert not (home / "kanban.db").exists()
+    assert not kb.register_db_path().exists()
+    return home
+
+
+@pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.
 

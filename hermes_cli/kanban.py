@@ -303,6 +303,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_rm.add_argument("--delete", action="store_true",
                       help="Hard-delete the board directory instead of archiving it. "
                            "Default is to move it to boards/_archived/ so it's recoverable.")
+    b_rm.add_argument(
+        "--confirm", default=None, metavar="LINE",
+        help="Non-interactive confirmation of a permanent removal: the EXACT "
+             "statement-bound line the permanence statement requires (run "
+             "without it once to be shown the statement and the line). There "
+             "is deliberately no bare --yes: a permanent removal is confirmed "
+             "by echoing the statement you were shown, or not at all.",
+    )
 
     b_switch = boards_sub.add_parser(
         "switch", aliases=["use"],
@@ -321,6 +329,41 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     b_rename.add_argument("slug")
     b_rename.add_argument("name", help="New display name")
+
+    b_backfill = boards_sub.add_parser(
+        "backfill-fence",
+        help="Arm the board removal fence on a board that predates it (run once at release)",
+        description=(
+            "Boards created before the removal fence remain unfenced and "
+            "writable until this one-time, recorded migration arms them. "
+            "It writes the board's register entry, its in-board gate and "
+            "epoch mirror, and a receipt in the removal archive — all or "
+            "nothing. A failed attempt compensates itself, so a board is "
+            "never left with a gate and no matching authority."
+        ),
+    )
+    b_backfill.add_argument(
+        "slug", nargs="?", default=None,
+        help="Board to backfill. Omit with --all to do every board.",
+    )
+    b_backfill.add_argument(
+        "--all", action="store_true",
+        help="Backfill every board on disk instead of a single one",
+    )
+    b_backfill.add_argument("--json", action="store_true")
+
+    b_removal_phase = boards_sub.add_parser(
+        "removal-phase",
+        help="Show the recorded board-removal phase for a board (read-only)",
+        description=(
+            "Reads the durable removal-phase record (design revision 5, §6) "
+            "for a board. Read-only: it never starts, advances, or abandons "
+            "a removal — driving the removal sequence is a separate, later "
+            "operation."
+        ),
+    )
+    b_removal_phase.add_argument("slug")
+    b_removal_phase.add_argument("--json", action="store_true")
 
     b_set_wd = boards_sub.add_parser(
         "set-default-workdir",
@@ -1191,6 +1234,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _cmd_repair(args)
         try:
             kb.init_db()
+        except kb.BoardFenceClosedError as exc:
+            print(_render_fence_refusal(exc), file=sys.stderr)
+            return 1
         except Exception as exc:
             print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
             return 1
@@ -1249,6 +1295,11 @@ def kanban_command(args: argparse.Namespace) -> int:
             return 2
         try:
             return int(handler(args) or 0)
+        except kb.BoardFenceClosedError as exc:
+            # A fence refusal is an expected outcome, not a crash: render it
+            # with its machine-readable outcome/rule instead of a traceback.
+            print(_render_fence_refusal(exc), file=sys.stderr)
+            return 1
         except (ValueError, RuntimeError) as exc:
             print(f"kanban: {exc}", file=sys.stderr)
             return 1
@@ -1336,6 +1387,17 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
 # Boards management (hermes kanban boards …)
 # ---------------------------------------------------------------------------
 
+def _render_fence_refusal(exc: "kb.BoardFenceClosedError") -> str:
+    """One-line, machine-readable rendering of a removal-fence refusal."""
+    refusal = exc.refusal
+    rule = refusal.rule.value if refusal.rule is not None else "?"
+    return (
+        f"kanban: refused by the board removal fence "
+        f"[{refusal.outcome.value}/{rule}] on board {refusal.board!r}: "
+        f"{refusal.message}"
+    )
+
+
 def _dispatch_boards(args: argparse.Namespace) -> int:
     """Handle ``hermes kanban boards <action>``.
 
@@ -1360,6 +1422,10 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "backfill-fence":
+        return _cmd_boards_backfill_fence(args)
+    if sub == "removal-phase":
+        return _cmd_boards_removal_phase(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1444,23 +1510,258 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_backfill_fence(args: argparse.Namespace) -> int:
+    """``hermes kanban boards backfill-fence [<slug>|--all]`` (GA-5).
+
+    The explicit, recorded migration an operator runs at release. A board
+    with no in-board gate table is unfenced and its writes are already
+    admitted; this arms Gate B (and the register entry that vouches for
+    it) so the board is governed by the removal fence from here on —
+    reads and writes both keep working throughout the migration itself.
+    """
+    do_all = bool(getattr(args, "all", False))
+    slug_arg = getattr(args, "slug", None)
+    if not do_all and not slug_arg:
+        print(
+            "kanban boards backfill-fence: name a board, or pass --all",
+            file=sys.stderr,
+        )
+        return 2
+    if do_all and slug_arg:
+        print(
+            "kanban boards backfill-fence: pass a board OR --all, not both",
+            file=sys.stderr,
+        )
+        return 2
+
+    if do_all:
+        outcomes = kb.backfill_all_boards()
+    else:
+        try:
+            normed = kb._normalize_board_slug(slug_arg)
+        except ValueError as exc:
+            print(f"kanban boards backfill-fence: {exc}", file=sys.stderr)
+            return 2
+        if not normed:
+            print("kanban boards backfill-fence: slug is required", file=sys.stderr)
+            return 2
+        outcomes = [(normed, kb.backfill_register_entry(normed))]
+
+    rows = []
+    for slug, result in outcomes:
+        entry = kb.get_register_entry(slug)
+        rows.append({
+            "board": slug,
+            "ok": bool(result.success),
+            "message": result.message,
+            "lifecycle": entry.lifecycle.value if entry is not None else None,
+            "epoch": entry.epoch if entry is not None else None,
+        })
+
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+    else:
+        for row in rows:
+            mark = "ok" if row["ok"] else "REFUSED"
+            suffix = ""
+            if row["lifecycle"] is not None:
+                suffix = f" [{row['lifecycle']}/epoch {row['epoch']}]"
+            print(f"{mark:8s} {row['board']}{suffix}: {row['message']}")
+    return 0 if all(r["ok"] for r in rows) else 1
+
+
+def _cmd_boards_removal_phase(args: argparse.Namespace) -> int:
+    """``hermes kanban boards removal-phase <slug>`` (design revision 5, §6).
+
+    Read-only: reports the last reached removal phase, or that no removal
+    has been recorded for this board. Never starts, advances, or abandons
+    a removal — driving the removal sequence is separate, later work.
+    """
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards removal-phase: {exc}", file=sys.stderr)
+        return 2
+    if not normed:
+        print("kanban boards removal-phase: slug is required", file=sys.stderr)
+        return 2
+
+    record = kb.get_removal_phase_record(normed)
+    if record is None:
+        if getattr(args, "json", False):
+            print(json.dumps({"board": normed, "removal": None}, indent=2))
+        else:
+            print(f"{normed}: no removal recorded")
+        return 0
+
+    operator_items = kb.removal_operator_items(record)
+    mode_content = kb.applied_mode_content_marker(record)
+    payload = {
+        "board": normed,
+        "removal_id": record.removal_id,
+        "mode": record.mode.value,
+        "phase": record.phase.value,
+        "epoch": record.epoch,
+        "quiescence_deadline": record.quiescence_deadline,
+        "deadline_basis": record.deadline_basis,
+        "outcome": record.outcome,
+        "gate_closed_at": record.gate_closed_at,
+        "scope_declaration_version": record.scope_declaration_version,
+        "permanent_confirmed_at": record.permanent_confirmed_at,
+        # IN-3: a recorded operator item is not merely recorded, it is
+        # surfaced — including after the board itself is gone. §6.6's
+        # mode-specific application, while it is outstanding, is one of
+        # them: it is why Done refuses and why the register entry is
+        # still 'removing'.
+        "operator_items": operator_items,
+        "applied_mode_content": mode_content,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"{normed}: {record.mode.value} removal {record.removal_id}")
+        print(f"  phase:   {record.phase.value}")
+        print(f"  epoch:   {record.epoch}")
+        if record.quiescence_deadline is not None:
+            print(f"  deadline: {record.quiescence_deadline} ({record.deadline_basis})")
+        if record.outcome is not None:
+            print(f"  outcome: {record.outcome}")
+        if kb.applied_mode_content_is_outstanding(record):
+            print(
+                f"  applied mode content: OUTSTANDING "
+                f"({mode_content.get('rule')}, {mode_content.get('mode')}) — "
+                f"{mode_content.get('requirement')}"
+            )
+        elif mode_content.get("state") == kb.APPLIED_MODE_CONTENT_APPLIED:
+            print(
+                f"  applied mode content: performed "
+                f"({mode_content.get('rule')}) at "
+                f"{mode_content.get('applied_at')}"
+            )
+        for item in operator_items:
+            print(f"  operator item: {item.get('identity')} — {item.get('detail')}")
+    return 0
+
+
+def _read_confirmation_line() -> Optional[str]:
+    """Read ONE line of operator confirmation from stdin, for real.
+
+    Returns ``None`` when there is nothing to read — stdin is closed, is
+    at EOF, or cannot be read. An absent answer is not an answer, so the
+    caller refuses; a permanent removal is never confirmed by the absence
+    of a reply.
+    """
+    stream = sys.stdin
+    if stream is None or getattr(stream, "closed", False):
+        return None
+    try:
+        line = stream.readline()
+    except (OSError, ValueError):
+        return None
+    if line == "":  # EOF: stdin was closed or empty
+        return None
+    return line.strip()
+
+
 def _cmd_boards_rm(args: argparse.Namespace) -> int:
     # When the user runs `hermes kanban boards delete <slug>` (alias), the
     # boards_action is 'delete' but args.delete is never set to True because
     # the --delete flag belongs to the 'rm' subparser only.  Detect the alias
     # and treat it identically to `boards rm --delete` (fixes #23139).
     force_delete = getattr(args, "delete", False) or getattr(args, "boards_action", "") == "delete"
+    mode = kb.RemovalMode.PERMANENT if force_delete else kb.RemovalMode.REVERSIBLE
+
     try:
-        res = kb.remove_board(args.slug, archive=not force_delete)
+        normed = kb._normalize_board_slug(args.slug)
     except ValueError as exc:
         print(f"kanban boards rm: {exc}", file=sys.stderr)
+        return 2
+    if not normed:
+        print("kanban boards rm: slug is required", file=sys.stderr)
+        return 2
+
+    # Permanent mode: show the exact statement, then really ask. The
+    # confirmation is minted by kanban_db from the answer — this surface
+    # cannot make one, so "the operator was shown the statement" is never
+    # something the CLI merely asserts.
+    #
+    # The statement is built from THIS board's frozen prospective
+    # inventory — the repository, references and commits that will
+    # survive, the transcript identities and where they live, and the
+    # registrations that will be removed — and the digest the answer is
+    # derived from binds that exact snapshot. So the whole statement is
+    # printed, never a summary of it: what is printed is what was
+    # confirmed.
+    permanent_confirmation = None
+    if mode == kb.RemovalMode.PERMANENT:
+        disclosure = kb.permanent_removal_disclosure(normed)
+        print(disclosure.statement_text)
+        print(disclosure.prompt)
+        response = getattr(args, "confirm", None)
+        if response is None:
+            sys.stdout.flush()
+            response = _read_confirmation_line()
+        checked = kb.confirm_permanent_removal(
+            normed,
+            response=response,
+            confirmed_by="cli-operator",
+            disclosure=disclosure,
+        )
+        if not checked.confirmed:
+            print(
+                f"kanban boards rm: {checked.message}", file=sys.stderr,
+            )
+            print(
+                f"  Reason: {checked.refusal.value}", file=sys.stderr,
+            )
+            print(
+                f"  Board {normed!r} is untouched.", file=sys.stderr,
+            )
+            return 1
+        permanent_confirmation = checked.confirmation
+
+    # One common driver for both surfaces and for both modes, including
+    # the resume of a removal an earlier run left mid-flight.
+    result = kb.remove_board_fenced(
+        normed,
+        mode=mode,
+        permanent_confirmation=permanent_confirmation,
+    )
+
+    if not result.success:
+        print(f"kanban boards rm: {result.message}", file=sys.stderr)
+        if result.refusal_reason:
+            print(f"  Reason: {result.refusal_reason}", file=sys.stderr)
+        for step in result.steps:
+            print(
+                f"  step: {step['point']} {step['action']} "
+                f"(at {step['phase']})",
+                file=sys.stderr,
+            )
         return 1
-    if res["action"] == "archived":
-        print(f"Board {res['slug']!r} archived → {res['new_path']}")
-        print("Recover by moving the directory back to "
-              "<root>/kanban/boards/<slug>/.")
+
+    if result.removal_id is None:
+        # The legacy (pre-fence) path: no removal record, no receipt.
+        if result.action == "archived":
+            print(f"Board {result.slug!r} archived → {result.new_path}")
+            print("Recover by moving the directory back to "
+                  "<root>/kanban/boards/<slug>/.")
+        else:
+            print(f"Board {result.slug!r} deleted.")
+        return 0
+
+    if result.resumed:
+        print(
+            f"Resumed the removal already in flight for {result.slug!r} "
+            f"({len(result.steps)} roll-forward step(s))."
+        )
+    if result.action == "archived":
+        print(f"Board {result.slug!r} archived via fenced removal")
+        print(f"  Removal ID: {result.removal_id}")
     else:
-        print(f"Board {res['slug']!r} deleted.")
+        print(f"Board {result.slug!r} permanently removed via fenced removal")
+        print(f"  Removal ID: {result.removal_id}")
+        print("  §12 receipt recorded in the removal archive")
     return 0
 
 
@@ -1753,7 +2054,13 @@ def _cmd_list(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        # It is opportunistic housekeeping, not what the user asked for: on a
+        # board whose removal fence has closed the promotion is correctly
+        # refused, and listing must still render rather than fail.
+        try:
+            kb.recompute_ready(conn)
+        except kb.BoardFenceClosedError:
+            pass
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,
