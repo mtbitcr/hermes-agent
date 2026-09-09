@@ -23734,7 +23734,127 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+# The two ways work STOPS without a human deciding to stop it, and the event
+# kind that records an owner asking for it to be tried again. Both stopped
+# states end in ``status='blocked'`` — which is exactly why "is it blocked?"
+# is the wrong question: an ordinary ``needs_input`` answer-wait, a
+# ``dependency`` wait and a ``transient`` hint all sit in the same column.
+STOPPED_WORK_GAVE_UP = "gave_up"
+STOPPED_WORK_CAPABILITY = "capability"
+OWNER_RETRY_EVENT_KIND = "owner_retry"
+
+
+def stopped_work_retry_evidence(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict]:
+    """Return the kernel's own evidence that this task's work stopped, else None.
+
+    Exactly two states qualify:
+
+    * **Gave up** — the dispatcher circuit breaker in
+      :func:`_record_task_failure` tripped after repeated spawn/crash/timeout
+      failures. It flips the task to ``blocked`` and appends a ``gave_up``
+      event.
+    * **Capability** — a worker hit a hard wall it cannot pass
+      (``block_task(kind='capability')``): no access, missing credentials, an
+      action no agent can perform. That flips the task to ``blocked`` with
+      ``block_kind='capability'`` and appends a ``blocked`` event.
+
+    The status alone therefore proves nothing. The distinguishing signal is
+    the one :func:`_has_sticky_block` already relies on — the most recent
+    block-transitioning event: the breaker emits ``gave_up``, an explicit
+    block emits ``blocked``, and an ``unblocked`` (or no such event at all)
+    means the current ``blocked`` status was not produced by either path.
+    ``block_kind`` is trusted only ALONGSIDE a ``blocked`` event, because it
+    is deliberately not cleared on unblock (see :func:`unblock_task`) and so
+    on its own can still be describing a block that is already over.
+
+    Returns ``{"kind": ..., "run_id": ...}``. ``run_id`` is the run the stop
+    was recorded against — the stopping event's OWN run id, never a run
+    inferred from the task plus a time window — and is ``None`` when that
+    event names no run at all (the breaker's crash/timeout path trips after
+    its caller already closed the run, and a block from ``ready`` with no
+    reason never opens one).
+    """
+    task = conn.execute(
+        "SELECT status, block_kind FROM tasks WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
+    ).fetchone()
+    if task is None or task["status"] != "blocked":
+        return None
+    event = conn.execute(
+        "SELECT kind, run_id FROM task_events WHERE task_id = ? "
+        "AND kind IN ('blocked', 'unblocked', 'gave_up') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if event is None:
+        return None
+    block_kind = task["block_kind"] if "block_kind" in task.keys() else None
+    if event["kind"] == "gave_up":
+        kind = STOPPED_WORK_GAVE_UP
+    elif event["kind"] == "blocked" and block_kind == STOPPED_WORK_CAPABILITY:
+        kind = STOPPED_WORK_CAPABILITY
+    else:
+        return None
+    run_id = event["run_id"]
+    return {"kind": kind, "run_id": int(run_id) if run_id is not None else None}
+
+
+def committed_owner_retry_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    profile: str,
+    idempotency_key: str,
+) -> Optional[Event]:
+    """Return the ``owner_retry`` event THIS exact owner receipt committed.
+
+    ``task_events`` is a board-wide log, so a bare idempotency_key match
+    would let one receipt claim a retry an entirely different actor/profile
+    performed (receipts are scoped per actor/profile/key; the event log is
+    not). All three identity fields must match. Used by the owner kernel to
+    recognize — after a crash between the board commit and the receipt's
+    finalization — that its transition already happened, so it is finalized
+    rather than attempted a second time.
+    """
+    for row in conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC",
+        (task_id, OWNER_RETRY_EVENT_KIND),
+    ):
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else None
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        if not isinstance(payload, dict):
+            continue
+        if (
+            payload.get("actor") == actor
+            and payload.get("profile") == profile
+            and payload.get("idempotency_key") == idempotency_key
+        ):
+            return Event(
+                id=int(row["id"]),
+                task_id=row["task_id"],
+                kind=row["kind"],
+                payload=payload,
+                created_at=int(row["created_at"]),
+                run_id=(
+                    int(row["run_id"])
+                    if "run_id" in row.keys() and row["run_id"] is not None
+                    else None
+                ),
+            )
+    return None
+
+
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    owner_retry: Optional[dict] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -23743,9 +23863,26 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     the leaked run is closed as ``reclaimed`` inside the same txn so the
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
+
+    ``owner_retry`` turns this very same transition into an owner-approved
+    RETRY of work that stopped, carrying the owner's stated reason plus the
+    receipt identity that authorised it (``{"reason", "actor", "profile",
+    "idempotency_key"}``). The task must still present the exact stopped-work
+    evidence (:func:`stopped_work_retry_evidence`) INSIDE this transaction,
+    so an ordinary ``needs_input``/``dependency``/``transient`` block — or a
+    state that changed after the caller looked — returns False having written
+    nothing. On success the reason is recorded as an ``owner_retry`` event in
+    the same transaction as the status flip, bound to the run the stop was
+    recorded against so a run receipt can show it against that exact attempt
+    and no other.
     """
     now = int(time.time())
     with write_txn(conn):
+        evidence = None
+        if owner_retry is not None:
+            evidence = stopped_work_retry_evidence(conn, task_id)
+            if evidence is None:
+                return False
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'",
             (task_id,),
@@ -23798,6 +23935,24 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 else None
             ),
         )
+        if owner_retry is not None:
+            # The owner's reason and the transition it authorised are ONE
+            # durable fact, so they commit together or not at all. The landing
+            # column travels in the payload too: a receipt replay after a
+            # crash must report the column THIS retry landed the work in, not
+            # wherever the work has since moved on to.
+            _append_event(
+                conn, task_id, OWNER_RETRY_EVENT_KIND,
+                {
+                    "reason": owner_retry.get("reason"),
+                    "actor": owner_retry.get("actor"),
+                    "profile": owner_retry.get("profile"),
+                    "idempotency_key": owner_retry.get("idempotency_key"),
+                    "stopped_because": evidence["kind"],
+                    "status": new_status,
+                },
+                run_id=evidence["run_id"],
+            )
         return True
 
 

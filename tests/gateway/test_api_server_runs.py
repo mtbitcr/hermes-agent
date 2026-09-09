@@ -983,7 +983,11 @@ class TestRunStatus:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "operation",
-        ["owner_task_graph_commit", "owner_project_plan_commit"],
+        [
+            "owner_task_graph_commit",
+            "owner_project_plan_commit",
+            "owner_task_retry",
+        ],
     )
     async def test_status_exposes_redacted_approval_then_clears_it(self, adapter, operation):
         app = _create_runs_app(adapter)
