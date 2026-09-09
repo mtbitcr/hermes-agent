@@ -12793,6 +12793,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "owner_project_plan_commit": "Approve Project changes",
             "owner_task_move": "Approve a work-state change",
             "owner_task_comment": "Approve an owner reply",
+            "owner_task_retry": "Approve trying stopped work again",
             "owner_project_lifecycle": "Approve the Project lifecycle change",
         }
         for run_id, status in self._run_statuses.items():
@@ -14191,6 +14192,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "owner_project_plan_commit",
                         "owner_task_move",
                         "owner_task_comment", "owner_project_lifecycle",
+                        "owner_task_retry",
                     }:
                         pending_approval["operation"] = operation
                     self._set_run_status(

@@ -8332,3 +8332,384 @@ def test_a_legacy_migration_that_loses_its_lease_mints_no_anchor(ctx):
             conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"],
             conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"],
         )
+
+
+# ---------------------------------------------------------------------------
+# owner_task_retry — trying stopped work again on the owner's stated reason
+# ---------------------------------------------------------------------------
+
+
+def _retry(ctx, **kwargs):
+    """Call the real owner action with the owner's confirmation answered."""
+    approver = _with_approver(ctx.session)
+    try:
+        return ow.retry_task(ctx, **kwargs)
+    finally:
+        approver.join()
+
+
+def _events_of(board: str, task_id: str, kind: str) -> list:
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        return [
+            json.loads(row["payload"]) if row["payload"] else None
+            for row in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+                "ORDER BY id ASC",
+                (task_id, kind),
+            )
+        ]
+
+
+def _receipt_rows(ctx, key: str) -> list:
+    with projects_db.connect_closing() as pconn:
+        ow._ensure_schema(pconn)
+        return pconn.execute(
+            "SELECT operation, status FROM owner_workspace_receipts "
+            "WHERE actor = ? AND profile = ? AND idempotency_key = ?",
+            (ctx.actor, ctx.profile, key),
+        ).fetchall()
+
+
+def _run_receipts(ctx, project_slug: str) -> list:
+    """Every owner-facing run receipt for a Project, newest attempt first."""
+    return [
+        run["receipt"]
+        for run in ow.read_project_snapshot(ctx, project_slug)["runs"]
+    ]
+
+
+def _capability_stopped_task(board: str, project_id: str, title: str) -> str:
+    """Drive real lifecycle calls until a worker gives up on a hard wall."""
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        task_id = kanban_db.create_task(
+            conn, title=title, assignee="default", project_id=project_id,
+        )
+        assert kanban_db.claim_task(conn, task_id) is not None
+        assert kanban_db.block_task(
+            conn, task_id,
+            reason="the provider account has no API credentials",
+            kind="capability",
+            expected_run_id=kanban_db.get_task(conn, task_id).current_run_id,
+        )
+        task = kanban_db.get_task(conn, task_id)
+        assert (task.status, task.block_kind) == ("blocked", "capability")
+    return task_id
+
+
+def _breaker_trips_on(board: str, task_id: str) -> None:
+    """Run a real dispatcher tick whose spawn fails, tripping the breaker."""
+    def _failing_spawn(task, workspace, board=None):
+        raise RuntimeError("the worker could not be started")
+
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        result = kanban_db.dispatch_once(
+            conn, spawn_fn=_failing_spawn, board=board, failure_limit=1,
+        )
+        assert task_id in result.auto_blocked
+        assert kanban_db.get_task(conn, task_id).status == "blocked"
+
+
+def _gave_up_task(board: str, project_id: str, title: str) -> str:
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        task_id = kanban_db.create_task(
+            conn, title=title, assignee="default", project_id=project_id,
+        )
+    _breaker_trips_on(board, task_id)
+    return task_id
+
+
+def test_retry_resumes_work_the_breaker_gave_up_on(ctx, all_assignees_spawnable):
+    """The dispatcher gave up; the owner says why it is worth another go."""
+    setup = _bootstrap_board(ctx)
+    task_id = _gave_up_task(
+        setup["board"], setup["project_id"], "B03 — Ship the first release",
+    )
+
+    result = _retry(
+        ctx,
+        idempotency_key="retry-gave-up",
+        project_id=setup["project_id"],
+        task_id=task_id,
+        reason="The build machine is fixed, so this is worth another attempt.",
+    )
+
+    assert result["ok"] is True
+    assert result["task_id"] == task_id
+    assert result["status"] == "ready"
+    assert result["retry_reason"] == (
+        "The build machine is fixed, so this is worth another attempt."
+    )
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        task = kanban_db.get_task(conn, task_id)
+        assert task.status == "ready"
+        # The dispatcher's own retry budget starts again; the unblock-loop
+        # counter is the kernel's to keep and this must not have reset it.
+        assert task.consecutive_failures == 0
+
+
+def test_retry_resumes_work_stopped_on_a_capability_block(ctx):
+    """A worker hit a wall only the owner can clear."""
+    setup = _bootstrap_board(ctx)
+    task_id = _capability_stopped_task(
+        setup["board"], setup["project_id"], "B03 — Connect the payment provider",
+    )
+
+    result = _retry(
+        ctx,
+        idempotency_key="retry-capability",
+        project_id=setup["project_id"],
+        task_id=task_id,
+        reason="I have added the provider credentials to the account.",
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "ready"
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        assert kanban_db.get_task(conn, task_id).status == "ready"
+
+
+def test_retry_reason_is_recorded_on_the_task_and_on_the_run_receipt(ctx):
+    """The stated reason must survive in BOTH durable owner-facing places."""
+    setup = _bootstrap_board(ctx)
+    task_id = _capability_stopped_task(
+        setup["board"], setup["project_id"], "B03 — Connect the payment provider",
+    )
+    reason = "I have added the provider credentials to the account."
+
+    before = _run_receipts(ctx, setup["board"])
+    assert [receipt["outcome"] for receipt in before] == ["attention"]
+    assert "owner_retry" not in before[0]
+
+    _retry(
+        ctx,
+        idempotency_key="retry-recorded",
+        project_id=setup["project_id"],
+        task_id=task_id,
+        reason=reason,
+    )
+
+    # On the task: its own event history carries the reason and what it was
+    # stopped by.
+    recorded = _events_of(setup["board"], task_id, "owner_retry")
+    assert [event["reason"] for event in recorded] == [reason]
+    assert recorded[0]["stopped_because"] == "capability"
+
+    # On the run receipt: the attempt that stopped now says why the owner
+    # asked for another one.
+    after = _run_receipts(ctx, setup["board"])
+    assert len(after) == 1
+    assert after[0]["outcome"] == "attention"
+    assert after[0]["owner_retry"] == {"state": "requested", "reason": reason}
+
+
+def test_retry_reason_reaches_only_the_attempt_it_was_written_about(ctx, all_assignees_spawnable):
+    """Two stopped attempts at the same work, two different reasons.
+
+    Each receipt may report only the reason the owner gave for THAT run.  A
+    reason that leaked onto a neighbouring attempt would tell the owner that
+    a run they never spoke about was retried for a reason they never gave.
+    """
+    setup = _bootstrap_board(ctx)
+    task_id = _gave_up_task(
+        setup["board"], setup["project_id"], "B03 — Ship the first release",
+    )
+    _retry(
+        ctx,
+        idempotency_key="retry-first-attempt",
+        project_id=setup["project_id"],
+        task_id=task_id,
+        reason="The build machine is fixed.",
+    )
+    # The same work stops again, on its own second attempt.
+    _breaker_trips_on(setup["board"], task_id)
+    _retry(
+        ctx,
+        idempotency_key="retry-second-attempt",
+        project_id=setup["project_id"],
+        task_id=task_id,
+        reason="The credentials were wrong; I have replaced them.",
+    )
+
+    receipts = _run_receipts(ctx, setup["board"])
+    assert len(receipts) == 2
+    # Newest attempt first, each carrying its own reason and no other.
+    assert [receipt["owner_retry"]["reason"] for receipt in receipts] == [
+        "The credentials were wrong; I have replaced them.",
+        "The build machine is fixed.",
+    ]
+
+
+def test_retry_without_a_stated_reason_is_rejected_before_anything_happens(ctx):
+    setup = _bootstrap_board(ctx)
+    task_id = _capability_stopped_task(
+        setup["board"], setup["project_id"], "B03 — Connect the payment provider",
+    )
+
+    # The last one looks like text but carries no owner-visible character at
+    # all, so it could never be shown back as the reason for the retry.
+    for index, blank in enumerate((None, "", "   ", "\t\n ", _ZERO_WIDTH_SPACE)):
+        key = f"retry-blank-{index}"
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            ow.retry_task(
+                ctx,
+                idempotency_key=key,
+                project_id=setup["project_id"],
+                task_id=task_id,
+                reason=blank,
+            )
+        assert excinfo.value.code == "invalid_argument"
+        # Rejected up front: no confirmation was requested, no receipt was
+        # claimed, and the work is exactly where the worker left it.
+        assert _receipt_rows(ctx, key) == []
+
+    assert _events_of(setup["board"], task_id, "owner_retry") == []
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        assert kanban_db.get_task(conn, task_id).status == "blocked"
+
+
+def test_retry_replayed_under_one_key_retries_once_and_records_one_reason(ctx):
+    setup = _bootstrap_board(ctx)
+    task_id = _capability_stopped_task(
+        setup["board"], setup["project_id"], "B03 — Connect the payment provider",
+    )
+    reason = "I have added the provider credentials to the account."
+    payload = {
+        "idempotency_key": "retry-once",
+        "project_id": setup["project_id"],
+        "task_id": task_id,
+        "reason": reason,
+    }
+
+    first = _retry(ctx, **payload)
+    # No approver registered for the replay — a second decision request would
+    # have nothing to answer it, proving none was made.
+    approval.unregister_gateway_notify(ctx.session)
+    second = ow.retry_task(ctx, **payload)
+
+    assert second == first
+    assert first["ok"] is True
+    assert [event["reason"] for event in
+            _events_of(setup["board"], task_id, "owner_retry")] == [reason]
+    assert len(_events_of(setup["board"], task_id, "unblocked")) == 1
+    assert [tuple(row) for row in _receipt_rows(ctx, "retry-once")] == [
+        ("owner_task_retry", "committed")
+    ]
+    receipts = _run_receipts(ctx, setup["board"])
+    assert [receipt["owner_retry"]["reason"] for receipt in receipts] == [reason]
+
+
+def _ready_task(conn, project_id: str, title: str) -> str:
+    return kanban_db.create_task(
+        conn, title=title, assignee="default", project_id=project_id,
+    )
+
+
+def _ineligible_tasks(board: str, project_id: str) -> dict:
+    """One task per state the owner may NOT retry, each reached for real."""
+    states: dict[str, str] = {}
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        states["ready"] = _ready_task(conn, project_id, "B03 — Draft the plan")
+
+        running = _ready_task(conn, project_id, "B04 — Write the release notes")
+        assert kanban_db.claim_task(conn, running) is not None
+        states["running"] = running
+
+        review = _ready_task(conn, project_id, "B05 — Check the release")
+        assert kanban_db.claim_task(conn, review) is not None
+        assert kanban_db.request_review(
+            conn, review, summary="ready for a look",
+            expected_run_id=kanban_db.get_task(conn, review).current_run_id,
+        )
+        states["review"] = review
+
+        done = _ready_task(conn, project_id, "B06 — Publish the summary")
+        assert kanban_db.complete_task(conn, done, result="published")
+        states["done"] = done
+
+        archived = _ready_task(conn, project_id, "B07 — Retire the old flow")
+        assert kanban_db.archive_task(conn, archived)
+        states["archived"] = archived
+
+        parent = _ready_task(conn, project_id, "B08 — Prepare the data")
+        states["todo"] = kanban_db.create_task(
+            conn, title="B09 — Use the prepared data", assignee="default",
+            project_id=project_id, parents=[parent],
+        )
+
+        # The case a naive "is it blocked?" check gets wrong: these sit in
+        # exactly the same column as work that gave up.
+        for kind in ("needs_input", "transient"):
+            blocked = _ready_task(
+                conn, project_id, f"B10 — Decide the {kind} question",
+            )
+            assert kanban_db.claim_task(conn, blocked) is not None
+            assert kanban_db.block_task(
+                conn, blocked, reason=f"stopped for {kind}", kind=kind,
+                expected_run_id=kanban_db.get_task(conn, blocked).current_run_id,
+            )
+            assert kanban_db.get_task(conn, blocked).status == "blocked"
+            states[f"blocked:{kind}"] = blocked
+
+        # Work the unblock-loop breaker escalated: capability-blocked, put
+        # back, and capability-blocked again for the same cause. The kernel
+        # deliberately routes that to ``triage`` for a human decision instead
+        # of leaving it retryable.
+        escalated = _ready_task(conn, project_id, "B12 — Reconnect the mailbox")
+        for _ in range(2):
+            assert kanban_db.claim_task(conn, escalated) is not None
+            assert kanban_db.block_task(
+                conn, escalated, reason="the mailbox login is not available",
+                kind="capability",
+                expected_run_id=kanban_db.get_task(conn, escalated).current_run_id,
+            )
+            if kanban_db.get_task(conn, escalated).status == "blocked":
+                assert kanban_db.unblock_task(conn, escalated)
+        assert kanban_db.get_task(conn, escalated).status == "triage"
+        states["triage"] = escalated
+
+        # A dependency block is not a stop either — the kernel routes it to
+        # ``todo`` so parents can release it.
+        dependency = _ready_task(conn, project_id, "B11 — Wait for the upstream")
+        assert kanban_db.claim_task(conn, dependency) is not None
+        assert kanban_db.block_task(
+            conn, dependency, reason="waiting on the upstream card",
+            kind="dependency",
+            expected_run_id=kanban_db.get_task(conn, dependency).current_run_id,
+        )
+        states["blocked:dependency"] = dependency
+    return states
+
+
+def test_retry_is_refused_with_a_clear_reason_in_every_other_state(ctx):
+    setup = _bootstrap_board(ctx)
+    states = _ineligible_tasks(setup["board"], setup["project_id"])
+
+    for state, task_id in states.items():
+        with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+            before = kanban_db.get_task(conn, task_id, include_control=True)
+        result = _retry(
+            ctx,
+            idempotency_key=f"retry-refused-{state}",
+            project_id=setup["project_id"],
+            task_id=task_id,
+            reason="I would like this tried again.",
+        )
+
+        # A refusal is a normal returned result that says why, not a crash.
+        assert result["ok"] is False, state
+        assert result["error"] == "not_retryable", state
+        assert result["task_id"] == task_id
+        assert result["current_status"] == before.status, state
+        assert "can be tried again" in result["reason"], state
+        if before.status == "blocked":
+            assert ow._OWNER_BLOCK_REASONS[before.block_kind] in result["reason"]
+        else:
+            assert ow._OWNER_STATE_LABELS.get(
+                before.status, before.status
+            ) in result["reason"], state
+
+        # Nothing moved and nothing was recorded on the work itself.
+        assert _events_of(setup["board"], task_id, "owner_retry") == []
+        with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+            after = kanban_db.get_task(conn, task_id, include_control=True)
+        assert after.status == before.status, state

@@ -2710,8 +2710,21 @@ def _owner_project_runtime_and_cost(
 
 
 def _owner_project_run_receipt(
-    run: kanban_db.Run, task_pin: Optional[OwnerTaskRoutePin],
+    run: kanban_db.Run,
+    task_pin: Optional[OwnerTaskRoutePin],
+    *,
+    owner_retry_reason: Any = None,
 ) -> dict:
+    """Project one run for the owner.
+
+    ``owner_retry_reason`` is the reason the owner gave for retrying THIS
+    exact run — resolved by the caller from an ``owner_retry`` event bound to
+    this run's own id, never from a run that merely belongs to the same task
+    or happened nearby. The key is present only when such a reason genuinely
+    exists for this run: a run nobody retried carries no ``owner_retry`` block
+    at all, so absent reads as absent and no reader inherits another run's
+    reason.
+    """
     outcome = (run.outcome or run.status or "").strip().lower()
     if run.status == "running":
         owner_outcome, summary = "running", "Work is still in progress."
@@ -2729,7 +2742,7 @@ def _owner_project_run_receipt(
     else:
         owner_outcome, summary = "unknown", "The final outcome could not be confirmed."
     runtime, cost = _owner_project_runtime_and_cost(run, task_pin)
-    return {
+    receipt = {
         "outcome": owner_outcome,
         "summary": summary,
         "external_effect": {
@@ -2740,6 +2753,12 @@ def _owner_project_run_receipt(
         "cost": cost,
         "evidence": {"state": "available", "kind": "project_activity"},
     }
+    retry_reason = _owner_display_text(
+        owner_retry_reason, limit=_OWNER_RETRY_REASON_LIMIT,
+    ) if owner_retry_reason is not None else ""
+    if retry_reason:
+        receipt["owner_retry"] = {"state": "requested", "reason": retry_reason}
+    return receipt
 
 
 def _owner_project_run_projection(
@@ -2749,11 +2768,15 @@ def _owner_project_run_projection(
     task_pin: Optional[OwnerTaskRoutePin],
     has_newer_run: bool,
     run_context: bool,
+    owner_retry_reason: Any = None,
 ) -> dict:
     """Project one run for the owner, carrying its retry fact but never its id.
 
     ``task_pin`` is the run's own task's persisted owner-approved route, so a
     recorded run that drifted off it reads as unknown rather than confirmed.
+
+    ``owner_retry_reason`` is the reason the owner gave for retrying THIS run,
+    bound by the run's own id; see :func:`_owner_project_run_receipt`.
 
     ``has_newer_run`` is decided by the caller from the exact native task id
     while it walks the newest-first run list — never from ``task_title``,
@@ -2769,7 +2792,9 @@ def _owner_project_run_projection(
     projection = {
         "started_at": _owner_timestamp(run.started_at),
         "finished_at": _owner_timestamp(run.ended_at),
-        "receipt": _owner_project_run_receipt(run, task_pin),
+        "receipt": _owner_project_run_receipt(
+            run, task_pin, owner_retry_reason=owner_retry_reason,
+        ),
     }
     if not run_context:
         return projection
@@ -2778,6 +2803,42 @@ def _owner_project_run_projection(
         "has_newer_run": bool(has_newer_run),
         **projection,
     }
+
+
+def _owner_run_retry_reasons(
+    conn: sqlite3.Connection, run_ids: list,
+) -> dict[int, str]:
+    """Map each of ``run_ids`` that an owner retried to the reason they gave.
+
+    The binding is the ``owner_retry`` event's own ``run_id``, which
+    :func:`kanban_db.unblock_task` copies from the very event that recorded
+    the stop — so a reason can only ever reach the attempt it was written
+    about. Runs with no such event are simply absent from the map. A run
+    retried more than once keeps the latest reason (ascending id, last write
+    wins): that is the reason the owner most recently stated for it.
+
+    The join re-proves in SQL that the named run is the event's own task's
+    run. Nothing on the board can currently record an event against another
+    task's run, and this read must not be the place that starts trusting it.
+    """
+    reasons: dict[int, str] = {}
+    if not run_ids:
+        return reasons
+    slots = ",".join("?" for _ in run_ids)
+    for row in conn.execute(
+        "SELECT e.run_id AS run_id, e.payload AS payload FROM task_events e "
+        "JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
+        f"WHERE e.kind = ? AND e.run_id IN ({slots}) ORDER BY e.id ASC",
+        (kanban_db.OWNER_RETRY_EVENT_KIND, *run_ids),
+    ):
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else None
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        if isinstance(reason, str) and reason.strip():
+            reasons[int(row["run_id"])] = reason
+    return reasons
 
 
 def owner_project_planning_context(
@@ -3097,6 +3158,13 @@ def read_project_snapshot(
             "ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
             (project_id, _OWNER_PROJECT_MAX_RUNS + 1),
         ).fetchall()
+        # An owner retry names the run its stop was recorded against, so the
+        # reason is looked up by that exact run id — never by task-and-time
+        # proximity, which would hand one attempt's reason to another. A run
+        # nobody retried resolves to nothing and says nothing.
+        retry_reasons = _owner_run_retry_reasons(
+            conn, [row["id"] for row in run_rows[:_OWNER_PROJECT_MAX_RUNS]],
+        )
         # The list is globally newest-first, so the first row carrying a given
         # exact task id is that task's newest run and every later row for the
         # SAME id is an older attempt at the same work. Decided here, from the
@@ -3115,6 +3183,7 @@ def read_project_snapshot(
                     task_pin=owner_task_route_pin(row),
                     has_newer_run=run_task_id in task_ids_with_newer_run,
                     run_context=run_context,
+                    owner_retry_reason=retry_reasons.get(int(row["id"])),
                 )
             )
             task_ids_with_newer_run.add(run_task_id)
@@ -3659,6 +3728,10 @@ _INTERNAL_TITLE_PREFIX = re.compile(
 )
 _OWNER_TITLE_LIMIT = 240
 _OWNER_PROJECT_NAME_LIMIT = 160
+# Owner-authored prose, bounded on the way in (``retry_task``) and projected
+# through the same egress on the way back out (the run receipt), so a reason
+# that was storable is never cut on the way back to the owner who wrote it.
+_OWNER_RETRY_REASON_LIMIT = 2_000
 # What a projection returns when the input canonicalizes to nothing. Read-side
 # placeholders for absent text, never a value to test against: an owner may
 # legitimately write either of these exact strings, so the native write boundary
@@ -5761,6 +5834,235 @@ def comment_task(
                     result = {
                         "ok": True, "task_id": task_id, "comment_id": comment_id,
                         "status": task.status, "revision": revision,
+                    }
+                _finalize_receipt(
+                    pconn, ctx, idempotency_key, token,
+                    status="committed", result=result,
+                )
+                return result
+        finally:
+            kconn.close()
+    finally:
+        pconn.close()
+
+
+# ---------------------------------------------------------------------------
+# owner_task_retry
+# ---------------------------------------------------------------------------
+
+
+def _retry_refusal_reason(task: kanban_db.Task) -> str:
+    """Say, in the owner's own vocabulary, why this work cannot be retried."""
+    retryable = (
+        "Only work that gave up after repeated failures, or that stopped "
+        "because a required capability is not available, can be tried again."
+    )
+    if task.status == "blocked":
+        return (
+            f"This work is blocked: "
+            f"{_OWNER_BLOCK_REASONS.get(task.block_kind or '', 'Blocked')}. "
+            + retryable
+        )
+    state = _OWNER_STATE_LABELS.get(task.status, task.status)
+    return f"This work is {state} and has not stopped. " + retryable
+
+
+def retry_task(
+    ctx: OwnerContext,
+    *,
+    idempotency_key: str,
+    project_id: str,
+    task_id: str,
+    reason: str,
+) -> dict:
+    """Try stopped work again, on the owner's stated reason.
+
+    The only two states this accepts are the two ways the kernel stops work
+    without a human deciding to stop it: the dispatcher's circuit breaker
+    gave up on the task, or a worker hit a capability wall it cannot pass.
+    Both end in ``blocked``, so eligibility is never "is it blocked?" — it is
+    ``kanban_db.stopped_work_retry_evidence``, which reads the kernel's own
+    record of HOW the task got there. Every other state, including a task
+    blocked for owner input, a dependency or a transient problem, is refused
+    as a normal returned result that says which state it is in and why that
+    one cannot be retried.
+
+    ``reason`` is required and is the owner's own account of why this work
+    deserves another attempt. It is recorded twice, both times durably: as an
+    ``owner_retry`` event on the task, in the SAME kanban transaction as the
+    transition (see ``kanban_db.unblock_task``), and — because that event is
+    bound to the run the stop was recorded against — on that exact run's
+    owner-facing receipt.
+
+    The transition itself is ``unblock_task``'s, not a parallel one: parent
+    re-gating, the defensive stale-run close, the executable-transition
+    authority check and the deliberately preserved ``block_recurrences``
+    counter all apply exactly as they do to an ordinary unblock.
+
+    Crash-safe replay: the ``owner_retry`` event carries this receipt's full
+    identity (actor, profile, idempotency_key), so a retry that committed on
+    the board but crashed before its receipt was finalized is RECOGNIZED by a
+    replay adopting the dead claim — it finalizes that same success instead of
+    refusing work it already retried, or retrying it twice.
+
+    Durability boundary: the retried work becomes claimable when the kanban
+    transaction commits, which is before this receipt is durable. That is
+    deliberate and safe here — the transition enables only the task the owner
+    named, and a crash before finalization is repaired by the recognition
+    above rather than by re-running anything.
+
+    Lease-fenced: the lease check, the eligibility read and the transition all
+    run inside one held ``projects.db`` write lock (see
+    :func:`_assert_owns_lease`) so a takeover cannot land between validating
+    the lease and committing the retry.
+    """
+    idempotency_key = _require_str(idempotency_key, "idempotency_key")
+    project_id = _bounded_text(project_id, "project_id", limit=100)
+    task_id = _require_str(task_id, "task_id")
+    # Required, and rejected up front: blank, whitespace-only, or text that
+    # carries no owner-visible characters at all never reaches the
+    # confirmation prompt, let alone the board. Canonicalized here — BEFORE
+    # the request digest, the approval description, the stored event and the
+    # returned result all bind to this exact string — so the reason recorded
+    # on the work IS the reason the run receipt projects back.
+    reason = _owner_display_text(
+        _bounded_text(reason, "reason", limit=_OWNER_RETRY_REASON_LIMIT),
+        limit=_OWNER_RETRY_REASON_LIMIT,
+    )
+    if not reason:
+        raise OwnerWorkspaceError(
+            "invalid_argument", "reason has no owner-visible text",
+        )
+
+    payload = {"project_id": project_id, "task_id": task_id, "reason": reason}
+    digest = _digest(payload)
+    operation = "owner_task_retry"
+
+    pconn = projects_db.connect()
+    try:
+        _ensure_schema(pconn)
+        replay = _terminal_replay(
+            pconn, ctx, idempotency_key, operation, digest,
+        )
+        if replay is not None:
+            return replay
+        pending = _get_receipt(pconn, ctx, idempotency_key)
+        recovery_pending = bool(
+            pending is not None
+            and pending["status"] == "in_progress"
+            and pending["operation"] == operation
+            and pending["request_digest"] == digest
+        )
+        _project, board_slug, task = _resolve_receipt_owned_task(
+            pconn, ctx, project_id, task_id,
+            allow_archived=recovery_pending,
+        )
+        state, row, token = _acquire_or_replay(pconn, ctx, idempotency_key, operation, digest)
+        if state == "terminal":
+            return json.loads(row["result_json"])
+
+        approval = _confirm(
+            ctx, operation=operation, digest=digest,
+            description=f"Try {owner_title(task.title)!r} again",
+        )
+        if not approval.get("approved"):
+            result = {"ok": False, "error": "confirmation_denied", "reason": approval.get("reason")}
+            _finalize_receipt(pconn, ctx, idempotency_key, token, status="denied", result=result)
+            return result
+
+        kconn = kanban_db.connect(board=board_slug)
+        try:
+            with _global_board_guard(board_slug):
+                with write_txn(pconn):
+                    _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                    if not _receipt_owns_project(pconn, ctx, project_id):
+                        raise OwnerWorkspaceError(
+                            "project_not_owned",
+                            "the Project ownership receipt changed before commit",
+                        )
+                    current_project = projects_db.get_project(pconn, project_id)
+                    current_task = kanban_db.get_task(
+                        kconn, task_id, include_control=True
+                    )
+                    # Adopting a dead claim: this receipt's own committed retry
+                    # event is proof the transition already happened.
+                    retried = (
+                        kanban_db.committed_owner_retry_event(
+                            kconn, task_id,
+                            actor=ctx.actor, profile=ctx.profile,
+                            idempotency_key=idempotency_key,
+                        )
+                        if row is not None and current_task is not None
+                        else None
+                    )
+                    refusal = None
+                    if (
+                        current_project is None
+                        or current_project.archived
+                        or current_project.board_slug != board_slug
+                    ):
+                        # The approval may have taken minutes. A Project
+                        # archived since then gets no new transition — only
+                        # recognition of one this receipt already made.
+                        if retried is None:
+                            refusal = (
+                                "This Project is no longer active, so nothing "
+                                "was retried."
+                            )
+                    else:
+                        _assert_board_ownership(board_slug, project_id)
+                        if current_task is None or current_task.project_id != project_id:
+                            raise OwnerWorkspaceError(
+                                "task_not_found",
+                                "the task is no longer part of this receipt-owned Project",
+                            )
+                        if retried is None:
+                            evidence = kanban_db.stopped_work_retry_evidence(
+                                kconn, task_id,
+                            )
+                            if evidence is None:
+                                refusal = _retry_refusal_reason(current_task)
+                            elif kanban_db.unblock_task(
+                                kconn, task_id,
+                                owner_retry={
+                                    "reason": reason,
+                                    "actor": ctx.actor,
+                                    "profile": ctx.profile,
+                                    "idempotency_key": idempotency_key,
+                                },
+                            ):
+                                retried = kanban_db.committed_owner_retry_event(
+                                    kconn, task_id,
+                                    actor=ctx.actor, profile=ctx.profile,
+                                    idempotency_key=idempotency_key,
+                                )
+                            else:
+                                refusal = (
+                                    "This work changed while you were "
+                                    "confirming, so nothing was retried."
+                                )
+
+                if retried is None:
+                    result = {
+                        "ok": False,
+                        "error": "not_retryable",
+                        "task_id": task_id,
+                        "current_status": (
+                            current_task.status if current_task else None
+                        ),
+                        "reason": refusal,
+                    }
+                else:
+                    # Both fields come from the committed event, so a replay
+                    # reports the column this retry landed the work in and the
+                    # revision it created — not wherever the work has moved
+                    # since.
+                    result = {
+                        "ok": True,
+                        "task_id": task_id,
+                        "status": (retried.payload or {}).get("status"),
+                        "revision": retried.id,
+                        "retry_reason": reason,
                     }
                 _finalize_receipt(
                     pconn, ctx, idempotency_key, token,
