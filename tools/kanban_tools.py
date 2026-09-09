@@ -1467,6 +1467,7 @@ def _handle_attach(args: dict, **kw) -> str:
                 content_type=content_type,
                 uploaded_by="agent",
                 board=board,
+                expected_run_id=_worker_run_id(tid),
             )
             return _ok(task_id=tid, attachment_id=att_id, size=len(data))
         finally:
@@ -1603,6 +1604,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
                 content_type=effective_content_type,
                 uploaded_by="agent",
                 board=board,
+                expected_run_id=_worker_run_id(tid),
             )
             return _ok(task_id=tid, attachment_id=att_id, size=len(data))
         finally:

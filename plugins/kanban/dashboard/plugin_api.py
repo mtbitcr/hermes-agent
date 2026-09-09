@@ -2000,6 +2000,70 @@ def reclaim_task_endpoint(
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Reviewer handback — typed findings document
+# ---------------------------------------------------------------------------
+
+class ReviewFindingsBody(BaseModel):
+    # ``findings`` is REQUIRED and must be an array. An explicitly empty array
+    # is the reviewer's clean verdict, which approves the task out of the
+    # review lane — so a body that simply omits the field must be a 422, not
+    # an approval. It used to default to an empty list.
+    candidate_digest: str
+    findings: list[dict]
+    expected_run_id: Optional[int] = None
+
+
+@router.post("/tasks/{task_id}/review-findings")
+def submit_review_findings_endpoint(
+    task_id: str,
+    payload: ReviewFindingsBody,
+    board: Optional[str] = Query(None),
+):
+    """Reviewer verdict: submit a typed findings document.
+
+    The single kernel handback entry point
+    (``kanban_db.submit_review_findings``) decides the outcome: no
+    surviving findings approves the task from the review lane; the same
+    findings repeated against the same candidate blocks the task for an
+    owner decision instead of re-running the implementer; otherwise the
+    document is attached to the implementer's task and handed back via
+    the existing ``request_changes`` transition. Maps 1:1 to
+    ``hermes kanban review-findings <task_id>``.
+
+    A malformed findings document (missing field, unknown severity,
+    mismatched candidate digest) is a 400. A kernel-level refusal (task
+    not in an active review run, stale ``expected_run_id``, a route
+    authority that will not admit the handback) is a 409 — including one
+    that reaches us as a ``RuntimeError``, which the fail-closed route
+    authority raises; reporting that as a 500 would present a legitimate
+    kernel refusal as a server fault. Everything else is reported inline
+    via ``outcome`` so the dashboard can render it without a page reload.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        try:
+            result = kanban_db.submit_review_findings(
+                conn, task_id,
+                findings=payload.findings,
+                candidate_digest=payload.candidate_digest,
+                expected_run_id=payload.expected_run_id,
+            )
+        except kanban_db.ReviewFindingsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        if result.get("outcome") == "error":
+            raise HTTPException(
+                status_code=409,
+                detail=result.get("reason", "cannot submit review findings"),
+            )
+        return {"ok": True, "task_id": task_id, **result}
+    finally:
+        conn.close()
+
+
 class SpecifyBody(BaseModel):
     """Optional author override. Nothing else is configurable from the
     dashboard — model + prompt come from ``auxiliary.triage_specifier``
