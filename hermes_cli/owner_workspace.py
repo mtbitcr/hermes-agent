@@ -2748,6 +2748,7 @@ def _owner_project_run_projection(
     *,
     task_pin: Optional[OwnerTaskRoutePin],
     has_newer_run: bool,
+    retry_origin: str = kanban_db.RETRY_ORIGIN_UNATTRIBUTED,
     run_context: bool,
 ) -> dict:
     """Project one run for the owner, carrying its retry fact but never its id.
@@ -2761,8 +2762,15 @@ def _owner_project_run_projection(
     itself never crosses this boundary, so this boolean is the only way a
     consumer can know a later attempt at the same work exists.
 
-    Both of those keys are withheld unless ``run_context`` is set: they are
-    served only to a reader that named
+    ``retry_origin`` is the honest ATTRIBUTION of that retry fact — one of
+    ``kanban_db.RETRY_ORIGIN_NONE`` / ``_AUTOMATIC`` / ``_OWNER`` /
+    ``_UNATTRIBUTED``, decided by :func:`kanban_db.run_retry_origins` from the
+    kernel's own run outcomes and event history, never guessed here. It must
+    agree with ``has_newer_run`` (``_NONE`` iff ``has_newer_run`` is False),
+    which is why the caller passes both from the same walk.
+
+    All three of those keys are withheld unless ``run_context`` is set: they
+    are served only to a reader that named
     ``OWNER_PROJECT_RUN_CONTEXT_CAPABILITY``, so an older reader keeps the
     exact run shape it validates as a closed schema.
     """
@@ -2776,6 +2784,7 @@ def _owner_project_run_projection(
     return {
         "task_title": owner_title(task_title),
         "has_newer_run": bool(has_newer_run),
+        "retry_origin": retry_origin,
         **projection,
     }
 
@@ -3052,6 +3061,11 @@ def read_project_snapshot(
                     child_map[parent_id].append(child_id)
                     parent_map[child_id].append(parent_id)
 
+        # Batched once for every visible task, never per task: see
+        # ``kanban_db.task_review_states`` for the closed vocabulary and its
+        # first-match-wins resolution order.
+        review_states = kanban_db.task_review_states(conn, tasks)
+
         columns = {status: [] for status in _OWNER_PROJECT_COLUMNS}
         for task in tasks:
             if task.status not in columns:
@@ -3064,6 +3078,9 @@ def read_project_snapshot(
                 "responsibility": task.responsibility,
                 "updated_at": _owner_timestamp(state["latest"] if state else task.created_at),
                 "event_revision": state["revision"] if state else 0,
+                "review_state": review_states.get(
+                    task.id, kanban_db.REVIEW_STATE_NONE
+                ),
                 "parent_ids": parent_map[task.id],
                 "child_ids": child_map[task.id],
             })
@@ -3103,10 +3120,21 @@ def read_project_snapshot(
         # native id, because a title cannot tell two distinct tasks apart —
         # and because a task absent from the visible columns (archived, or
         # past the task bound) leaves a reader nothing to disambiguate with.
+        bounded_run_objects = [
+            kanban_db.Run.from_row(row) for row in run_rows[:_OWNER_PROJECT_MAX_RUNS]
+        ]
+        # Honest retry attribution is only ever served under the same
+        # capability gate as ``has_newer_run`` itself, so it is only worth
+        # computing (one batched call, never per-run) when a reader asked
+        # for it.
+        retry_origins = (
+            kanban_db.run_retry_origins(conn, bounded_run_objects)
+            if run_context
+            else {}
+        )
         runs: list[dict] = []
         task_ids_with_newer_run: set[str] = set()
-        for row in run_rows[:_OWNER_PROJECT_MAX_RUNS]:
-            run = kanban_db.Run.from_row(row)
+        for row, run in zip(run_rows[:_OWNER_PROJECT_MAX_RUNS], bounded_run_objects):
             run_task_id = str(run.task_id)
             runs.append(
                 _owner_project_run_projection(
@@ -3114,6 +3142,9 @@ def read_project_snapshot(
                     row["task_title"],
                     task_pin=owner_task_route_pin(row),
                     has_newer_run=run_task_id in task_ids_with_newer_run,
+                    retry_origin=retry_origins.get(
+                        run.id, kanban_db.RETRY_ORIGIN_UNATTRIBUTED
+                    ),
                     run_context=run_context,
                 )
             )

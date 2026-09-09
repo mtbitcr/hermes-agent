@@ -755,8 +755,10 @@ def test_project_snapshot_is_exact_receipt_backed_and_read_only(ctx):
     assert len(tasks) == 3
     assert all(set(task) == {
         "id", "title", "assignee_name", "responsibility", "updated_at",
-        "event_revision", "parent_ids", "child_ids",
+        "event_revision", "review_state", "parent_ids", "child_ids",
     } for task in tasks)
+    # None of these three fresh tasks ever entered review.
+    assert all(task["review_state"] == "none" for task in tasks)
     assert snapshot["workers"] == []
     assert snapshot["attachments"] == []
     assert snapshot["runs"] == []
@@ -1834,10 +1836,12 @@ def test_project_snapshot_run_projection_has_sanitized_task_title(ctx):
     assert len(snapshot["runs"]) == 1
     run = snapshot["runs"][0]
     assert set(run) == {
-        "task_title", "started_at", "finished_at", "has_newer_run", "receipt",
+        "task_title", "started_at", "finished_at", "has_newer_run",
+        "retry_origin", "receipt",
     }
     assert run["task_title"] == "Ship the thing"
     assert run["has_newer_run"] is False
+    assert run["retry_origin"] == "none"
 
     # The task id is legitimately present elsewhere in the snapshot (the
     # board task list); only the run projection/receipt must not leak it.
@@ -1909,7 +1913,8 @@ def test_project_snapshot_run_retry_is_decided_per_exact_task_id(ctx):
 
     assert all(
         set(run) == {
-            "task_title", "started_at", "finished_at", "has_newer_run", "receipt",
+            "task_title", "started_at", "finished_at", "has_newer_run",
+            "retry_origin", "receipt",
         }
         for run in runs
     )
@@ -1919,6 +1924,10 @@ def test_project_snapshot_run_retry_is_decided_per_exact_task_id(ctx):
     # Newest first: the namesake task's only run, then the retried task's
     # newest run, then its older attempt — only the last has a newer run.
     assert [run["has_newer_run"] for run in runs] == [False, False, True]
+    # A plain "completed" outcome with a newer run proves nothing about who
+    # re-dispatched it, so the older attempt is honestly unattributed rather
+    # than guessed.
+    assert [run["retry_origin"] for run in runs] == ["none", "none", "unattributed"]
 
     payload = json.dumps(runs)
     assert retried_id not in payload
@@ -8332,3 +8341,329 @@ def test_a_legacy_migration_that_loses_its_lease_mints_no_anchor(ctx):
             conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"],
             conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"],
         )
+
+
+# ---------------------------------------------------------------------------
+# retry_origin / review_state (owner run-retry attribution + per-task review
+# state), driven end-to-end through the real kanban_db lifecycle functions
+# and read back through the real ``read_project_snapshot`` entry point.
+# ---------------------------------------------------------------------------
+
+
+def _create_ready_task(board: str, project_id: str, title: str) -> str:
+    with kanban_db.connect(board=board) as conn:
+        return kanban_db.create_task(
+            conn, title=title, assignee="default", project_id=project_id,
+        )
+
+
+def _runs_titled(runs: list, title: str) -> list:
+    return [run for run in runs if run["task_title"] == title]
+
+
+def _columns_task(snapshot: dict, title: str) -> dict:
+    for column in snapshot["columns"]:
+        for task in column["tasks"]:
+            if task["title"] == title:
+                return task
+    raise AssertionError(f"no task titled {title!r} in snapshot columns")
+
+
+def _retry_project(ctx, key: str, name: str) -> dict:
+    args = _task_graph_args(idempotency_key=key, project_name=name)
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+    return result
+
+
+def test_retry_origin_none_without_a_newer_run(ctx):
+    result = _retry_project(ctx, "graph-retry-none", "Retry None Project")
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Solo run task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, task_id, claimer="builder:none")
+        assert implementation is not None
+        assert kanban_db.complete_task(
+            conn, task_id, expected_run_id=implementation.current_run_id,
+        )
+
+    runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
+    matches = _runs_titled(runs, "Solo run task")
+    assert len(matches) == 1
+    assert matches[0]["has_newer_run"] is False
+    assert matches[0]["retry_origin"] == "none"
+
+
+def test_retry_origin_automatic_for_a_genuine_kernel_sweep(ctx):
+    result = _retry_project(ctx, "graph-retry-auto", "Retry Automatic Project")
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Stale sweep task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(
+            conn, task_id, claimer="builder:sweep", ttl_seconds=1,
+        )
+        assert implementation is not None
+        # Force the claim to look TTL-expired without waiting on the real
+        # clock, the same technique this suite already uses elsewhere (see
+        # test_kanban_worker_lifecycle_hooks.py) to drive
+        # release_stale_claims deterministically. claim_task never sets
+        # worker_pid, so the sweep reclaims immediately instead of
+        # extending a live PID's claim.
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 100, task_id),
+        )
+        conn.commit()
+        assert kanban_db.release_stale_claims(conn) == 1
+        retried = kanban_db.claim_task(conn, task_id, claimer="builder:sweep-2")
+        assert retried is not None
+
+    runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
+    matches = _runs_titled(runs, "Stale sweep task")
+    assert len(matches) == 2
+    newer, older = matches  # newest-first
+    assert newer["has_newer_run"] is False
+    assert newer["retry_origin"] == "none"
+    assert older["has_newer_run"] is True
+    assert older["retry_origin"] == "automatic"
+
+
+def test_retry_origin_owner_for_a_manual_reclaim(ctx):
+    """The case that proves automatic and owner are distinguishable.
+
+    ``reclaim_task`` is an OPERATOR action, but it writes the exact same
+    ``outcome="reclaimed"`` string as the automatic stale-lock sweep. The
+    naive "reclaimed means automatic" rule fails this test.
+    """
+    result = _retry_project(ctx, "graph-retry-manual", "Retry Manual Project")
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Manually reclaimed task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, task_id, claimer="builder:manual")
+        assert implementation is not None
+        assert kanban_db.reclaim_task(conn, task_id, reason="operator retry")
+        retried = kanban_db.claim_task(conn, task_id, claimer="builder:manual-2")
+        assert retried is not None
+
+    runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
+    matches = _runs_titled(runs, "Manually reclaimed task")
+    assert len(matches) == 2
+    newer, older = matches
+    assert newer["retry_origin"] == "none"
+    assert older["has_newer_run"] is True
+    assert older["retry_origin"] == "owner"
+
+
+def test_retry_origin_owner_for_an_unblock_driven_redispatch(ctx):
+    result = _retry_project(ctx, "graph-retry-unblock", "Retry Unblock Project")
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Unblocked redispatch task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, task_id, claimer="builder:blocked")
+        assert implementation is not None
+        assert kanban_db.block_task(
+            conn, task_id, reason="waiting on owner input", kind="needs_input",
+            expected_run_id=implementation.current_run_id,
+        )
+        assert kanban_db.unblock_task(conn, task_id)
+        retried = kanban_db.claim_task(conn, task_id, claimer="builder:blocked-2")
+        assert retried is not None
+
+    runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
+    matches = _runs_titled(runs, "Unblocked redispatch task")
+    assert len(matches) == 2
+    newer, older = matches
+    assert newer["retry_origin"] == "none"
+    assert older["has_newer_run"] is True
+    assert older["retry_origin"] == "owner"
+
+
+def test_retry_origin_unattributed_without_positive_proof(ctx):
+    """A reviewer's ordinary handback is explicitly NOT owner-retry evidence."""
+    result = _retry_project(
+        ctx, "graph-retry-unattributed", "Retry Unattributed Project",
+    )
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Reviewer handback task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, task_id, claimer="builder:impl")
+        assert implementation is not None
+        assert kanban_db.request_review(
+            conn, task_id, summary="ready for review",
+            expected_run_id=implementation.current_run_id,
+        )
+        review_claim = kanban_db.claim_review_task(conn, task_id, claimer="reviewer:1")
+        assert review_claim is not None
+        ok, _reason = kanban_db.request_changes(
+            conn, task_id, reason="needs another pass",
+            expected_run_id=review_claim.current_run_id,
+        )
+        assert ok
+        retried = kanban_db.claim_task(conn, task_id, claimer="builder:impl-2")
+        assert retried is not None
+
+    runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
+    matches = _runs_titled(runs, "Reviewer handback task")
+    assert len(matches) == 3
+    newest, review_run, impl_run = matches  # newest-first
+    assert newest["retry_origin"] == "none"
+    assert review_run["has_newer_run"] is True
+    assert review_run["retry_origin"] == "unattributed"
+    assert impl_run["has_newer_run"] is True
+    assert impl_run["retry_origin"] == "unattributed"
+
+
+def test_retry_origin_is_gated_behind_the_run_task_context_capability(ctx):
+    result = _retry_project(ctx, "graph-retry-gate", "Retry Gate Project")
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Gate check task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, task_id, claimer="builder:gate")
+        assert implementation is not None
+        assert kanban_db.complete_task(
+            conn, task_id, expected_run_id=implementation.current_run_id,
+        )
+
+    default_runs = ow.read_project_snapshot(ctx, result["project_slug"])["runs"]
+    matches = [run for run in default_runs if run["receipt"]["outcome"] == "completed"]
+    assert matches
+    assert set(matches[0]) == {"started_at", "finished_at", "receipt"}
+
+    gated_runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
+    gated = _runs_titled(gated_runs, "Gate check task")[0]
+    assert "retry_origin" in gated
+    assert gated["retry_origin"] in {"none", "automatic", "owner", "unattributed"}
+
+
+def test_review_state_awaiting_review_while_task_sits_in_review(ctx):
+    result = _retry_project(ctx, "graph-review-awaiting", "Review Awaiting Project")
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Awaiting review task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, task_id, claimer="builder:rv1")
+        assert implementation is not None
+        assert kanban_db.request_review(
+            conn, task_id, summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+    assert _columns_task(snapshot, "Awaiting review task")["review_state"] == "awaiting_review"
+
+
+def test_review_state_approved_only_after_actually_entering_review(ctx):
+    result = _retry_project(ctx, "graph-review-approved", "Review Approved Project")
+    reviewed_id = _create_ready_task(
+        result["board"], result["project_id"], "Reviewed then approved task",
+    )
+    skipped_id = _create_ready_task(
+        result["board"], result["project_id"], "Completed without review task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, reviewed_id, claimer="builder:rv2")
+        assert implementation is not None
+        assert kanban_db.request_review(
+            conn, reviewed_id, summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+        assert kanban_db.complete_task(conn, reviewed_id)
+
+        skipped_claim = kanban_db.claim_task(conn, skipped_id, claimer="builder:rv3")
+        assert skipped_claim is not None
+        assert kanban_db.complete_task(
+            conn, skipped_id, expected_run_id=skipped_claim.current_run_id,
+        )
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+    assert (
+        _columns_task(snapshot, "Reviewed then approved task")["review_state"]
+        == "approved"
+    )
+    # Deliberate carve-out: finishing WITHOUT ever entering review must never
+    # report an approval that never happened.
+    assert (
+        _columns_task(snapshot, "Completed without review task")["review_state"]
+        == "none"
+    )
+
+
+def test_review_state_changes_requested_after_a_review_handback(ctx):
+    result = _retry_project(ctx, "graph-review-changes", "Review Changes Project")
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Sent back for changes task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, task_id, claimer="builder:rv4")
+        assert implementation is not None
+        assert kanban_db.request_review(
+            conn, task_id, summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+        review_claim = kanban_db.claim_review_task(conn, task_id, claimer="reviewer:rv4")
+        assert review_claim is not None
+        ok, _reason = kanban_db.request_changes(
+            conn, task_id, reason="fix the thing",
+            expected_run_id=review_claim.current_run_id,
+        )
+        assert ok
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+    assert (
+        _columns_task(snapshot, "Sent back for changes task")["review_state"]
+        == "changes_requested"
+    )
+
+
+def test_review_state_changes_requested_via_explicit_reopen(ctx):
+    result = _retry_project(ctx, "graph-review-reopen", "Review Reopen Project")
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Explicitly reopened task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, task_id, claimer="builder:rv5")
+        assert implementation is not None
+        assert kanban_db.request_review(
+            conn, task_id, summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+        assert kanban_db.reopen_review_task(conn, task_id)
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+    assert (
+        _columns_task(snapshot, "Explicitly reopened task")["review_state"]
+        == "changes_requested"
+    )
+
+
+def test_review_state_values_are_members_of_the_closed_set(ctx):
+    result = _retry_project(
+        ctx, "graph-review-closed-set", "Review Closed Set Project",
+    )
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+    tasks = [task for column in snapshot["columns"] for task in column["tasks"]]
+    assert tasks
+    assert all(
+        task["review_state"]
+        in {"awaiting_review", "changes_requested", "approved", "none"}
+        for task in tasks
+    )

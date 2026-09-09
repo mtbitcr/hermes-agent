@@ -21067,6 +21067,160 @@ def reclaim_task(
     return True
 
 
+# Run outcomes the KERNEL itself decides, closing a run with no owner in the
+# loop: a stale-lock sweep, a runtime cap, a crash detector, a spawn failure,
+# or a provider rate limit. Note that ``reclaimed`` is deliberately in this
+# set even though :func:`reclaim_task` (an OPERATOR action) writes that exact
+# same outcome string — the outcome alone never proves which path closed the
+# run, so a member of this set is only a CANDIDATE for "automatic" and must
+# lose to positive owner evidence first. See :func:`run_retry_origins`.
+_KERNEL_SWEEP_RUN_OUTCOMES = frozenset({
+    "reclaimed", "stale", "timed_out", "crashed", "spawn_failed", "rate_limited",
+})
+
+# Event kinds that are positive proof a PERSON re-dispatched a task's work,
+# as opposed to the dispatcher's own retry machinery picking it back up.
+# ``changes_requested`` (a reviewer's ordinary handback to the implementer)
+# is deliberately excluded: that is a routine step of the review lifecycle,
+# not evidence an owner intervened.
+_OWNER_REDISPATCH_EVENT_KINDS = frozenset({"unblocked", "review_reopened"})
+
+RETRY_ORIGIN_NONE = "none"
+RETRY_ORIGIN_AUTOMATIC = "automatic"
+RETRY_ORIGIN_OWNER = "owner"
+RETRY_ORIGIN_UNATTRIBUTED = "unattributed"
+
+
+def run_retry_origins(
+    conn: sqlite3.Connection,
+    runs: "list[Run]",
+) -> dict[int, str]:
+    """Return each run's honest retry attribution, keyed by run id.
+
+    Exactly one of ``RETRY_ORIGIN_NONE`` / ``_AUTOMATIC`` / ``_OWNER`` /
+    ``_UNATTRIBUTED`` per run. ``_NONE`` holds iff this exact run has no
+    newer run of the same task among ``runs``; the newer-run fact is
+    re-derived here from each run's own ``task_id`` and ``started_at``
+    (never from a title), the same way the owner projection's own
+    ``has_newer_run`` is derived, so the two never disagree.
+
+    Both ``_AUTOMATIC`` and ``_OWNER`` require POSITIVE evidence. A
+    ``reclaimed`` outcome is never enough by itself: :func:`release_stale_claims`
+    (the automatic sweep) and :func:`reclaim_task` (an operator action) both
+    write ``outcome="reclaimed"``, and only the latter appends a ``reclaimed``
+    event whose payload carries ``"manual": true``. That event is bound to
+    THIS run by its own ``run_id`` column — never matched loosely by task and
+    time window, because that is exactly the ambiguity the two reclaim paths
+    create. Owner evidence is checked before any kernel outcome is folded
+    into ``_AUTOMATIC``, so a manual reclaim can never read as automatic.
+
+    A run that never closed (``ended_at`` is ``None``) but has a newer run
+    cannot be attributed either way: it reads ``_UNATTRIBUTED``.
+
+    Callers are expected to pass the full bounded run list they already
+    loaded (never one run at a time): every query here is batched once
+    across that whole list, not issued per run or per task.
+    """
+    origins: dict[int, str] = {}
+    if not runs:
+        return origins
+
+    by_task: dict[str, list[Run]] = {}
+    for run in runs:
+        by_task.setdefault(run.task_id, []).append(run)
+
+    # Re-derive "has a newer run" and "when did the newer run start" from the
+    # native task id, exactly as the owner projection's own newest-first walk
+    # does — so the two facts can never diverge for the same run.
+    has_newer: dict[int, bool] = {}
+    newer_started_at: dict[int, Optional[int]] = {}
+    for task_runs in by_task.values():
+        ordered = sorted(task_runs, key=lambda r: (r.started_at, r.id))
+        for index, run in enumerate(ordered):
+            newer = ordered[index + 1] if index + 1 < len(ordered) else None
+            has_newer[run.id] = newer is not None
+            newer_started_at[run.id] = newer.started_at if newer else None
+
+    run_ids = [run.id for run in runs]
+    task_ids = sorted(by_task)
+
+    # Evidence A: a `reclaimed` event bound to one of these exact run ids
+    # (by ``run_id``, never by task/time proximity) whose payload proves an
+    # operator, not the stale-lock sweep, closed it.
+    manual_reclaim_run_ids: set[int] = set()
+    try:
+        ev_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(task_events)")}
+    except sqlite3.Error:
+        ev_columns = set()
+    if run_ids and "run_id" in ev_columns:
+        placeholders = ",".join("?" for _ in run_ids)
+        try:
+            rows = conn.execute(
+                "SELECT run_id, payload FROM task_events "
+                f"WHERE kind = 'reclaimed' AND run_id IN ({placeholders})",
+                run_ids,
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"]) if row["payload"] else {}
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            if isinstance(payload, dict) and payload.get("manual") is True:
+                manual_reclaim_run_ids.add(int(row["run_id"]))
+
+    # Evidence B: an owner re-dispatch event on the SAME task. Fetched once
+    # for every task in this run set, then matched per run against that
+    # run's own (ended_at, newer_started_at) window in Python.
+    redispatch_by_task: dict[str, list[int]] = {task_id: [] for task_id in task_ids}
+    if task_ids:
+        placeholders = ",".join("?" for _ in task_ids)
+        kind_placeholders = ",".join("?" for _ in _OWNER_REDISPATCH_EVENT_KINDS)
+        try:
+            rows = conn.execute(
+                "SELECT task_id, created_at FROM task_events "
+                f"WHERE task_id IN ({placeholders}) AND kind IN ({kind_placeholders})",
+                (*task_ids, *_OWNER_REDISPATCH_EVENT_KINDS),
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        for row in rows:
+            redispatch_by_task[str(row["task_id"])].append(int(row["created_at"]))
+
+    for run in runs:
+        if not has_newer.get(run.id, False):
+            origins[run.id] = RETRY_ORIGIN_NONE
+            continue
+        if run.ended_at is None:
+            origins[run.id] = RETRY_ORIGIN_UNATTRIBUTED
+            continue
+        if run.id in manual_reclaim_run_ids:
+            origins[run.id] = RETRY_ORIGIN_OWNER
+            continue
+        # Bounds are inclusive, not strict: these timestamps are whole
+        # seconds, and the claim invariant already guarantees the causal
+        # order (a task cannot be re-claimed until the prior run ended, and
+        # an owner action on a still-running task ends that run first), so
+        # an unblock/reopen landing in the very same second as this run's
+        # close or the next run's claim is still genuinely inside this gap,
+        # not a coincidence to exclude.
+        window_end = newer_started_at.get(run.id)
+        redispatched = window_end is not None and any(
+            run.ended_at <= created_at <= window_end
+            for created_at in redispatch_by_task.get(run.task_id, [])
+        )
+        if redispatched:
+            origins[run.id] = RETRY_ORIGIN_OWNER
+            continue
+        outcome = (run.outcome or "").strip().lower()
+        if outcome in _KERNEL_SWEEP_RUN_OUTCOMES:
+            origins[run.id] = RETRY_ORIGIN_AUTOMATIC
+        else:
+            origins[run.id] = RETRY_ORIGIN_UNATTRIBUTED
+    return origins
+
+
 def reassign_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -23665,6 +23819,84 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             payload if payload != {"status": "ready"} else None,
         )
         return True
+
+
+# The review-lifecycle event kinds relevant to :func:`task_review_states`.
+# ``changes_requested`` and ``review_reopened`` both send work back for
+# rework; ``review_requested`` is the one proof that a task ever actually
+# entered review at all (see the "done without ever reviewing" carve-out
+# below).
+_REVIEW_LIFECYCLE_EVENT_KINDS = (
+    "review_requested", "changes_requested", "review_reopened",
+)
+
+REVIEW_STATE_AWAITING_REVIEW = "awaiting_review"
+REVIEW_STATE_CHANGES_REQUESTED = "changes_requested"
+REVIEW_STATE_APPROVED = "approved"
+REVIEW_STATE_NONE = "none"
+
+
+def task_review_states(
+    conn: sqlite3.Connection,
+    tasks: "list[Task]",
+) -> dict[str, str]:
+    """Return each task's honest review state, keyed by task id.
+
+    Exactly one of ``REVIEW_STATE_AWAITING_REVIEW`` / ``_CHANGES_REQUESTED``
+    / ``_APPROVED`` / ``_NONE`` per task, first match wins:
+
+    1. ``status == "review"``                                -> awaiting_review
+    2. ``status == "done"`` AND a ``review_requested`` event
+       ever fired for this task                               -> approved
+    3. the LATEST review-lifecycle event is ``changes_requested``
+       or ``review_reopened``                                 -> changes_requested
+    4. otherwise                                               -> none
+
+    Rule 2 is deliberate: a task that finished without ever entering review
+    reads ``none``, not ``approved`` — this surface must never report a
+    review approval that never happened.
+
+    Batched: one query across every task in ``tasks``, never one per task.
+    """
+    states: dict[str, str] = {}
+    if not tasks:
+        return states
+
+    task_ids = [task.id for task in tasks]
+    has_review_requested: set[str] = set()
+    latest_lifecycle: dict[str, tuple[int, str]] = {}
+    try:
+        placeholders = ",".join("?" for _ in task_ids)
+        kind_placeholders = ",".join("?" for _ in _REVIEW_LIFECYCLE_EVENT_KINDS)
+        rows = conn.execute(
+            "SELECT task_id, id, kind FROM task_events "
+            f"WHERE task_id IN ({placeholders}) AND kind IN ({kind_placeholders})",
+            (*task_ids, *_REVIEW_LIFECYCLE_EVENT_KINDS),
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+    for row in rows:
+        task_id = str(row["task_id"])
+        kind = str(row["kind"])
+        if kind == "review_requested":
+            has_review_requested.add(task_id)
+        event_id = int(row["id"])
+        current = latest_lifecycle.get(task_id)
+        if current is None or event_id > current[0]:
+            latest_lifecycle[task_id] = (event_id, kind)
+
+    for task in tasks:
+        if task.status == "review":
+            states[task.id] = REVIEW_STATE_AWAITING_REVIEW
+        elif task.status == "done" and task.id in has_review_requested:
+            states[task.id] = REVIEW_STATE_APPROVED
+        elif latest_lifecycle.get(task.id, (0, ""))[1] in (
+            "changes_requested", "review_reopened",
+        ):
+            states[task.id] = REVIEW_STATE_CHANGES_REQUESTED
+        else:
+            states[task.id] = REVIEW_STATE_NONE
+    return states
 
 
 def invalidate_descendants_for_parent_reopen(
