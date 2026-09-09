@@ -228,6 +228,26 @@ def _handle_task_comment(args: dict, **kw) -> str:
         return tool_error("owner_task_comment: internal error")
 
 
+def _handle_task_retry(args: dict, **kw) -> str:
+    try:
+        ctx = resolve_owner_context()
+        result = _kernel.retry_task(
+            ctx,
+            idempotency_key=args.get("idempotency_key"),
+            project_id=args.get("project_id"),
+            task_id=args.get("task_id"),
+            reason=args.get("reason"),
+        )
+        return _ok(result)
+    except OwnerWorkspaceError as e:
+        return _refused("owner_task_retry", e)
+    except ValueError as e:
+        return tool_error(f"owner_task_retry: {e}")
+    except Exception:
+        logger.exception("owner_task_retry failed")
+        return tool_error("owner_task_retry: internal error")
+
+
 registry.register(
     name="owner_workspace_bootstrap",
     toolset="owner_workspace",
@@ -767,4 +787,41 @@ registry.register(
         },
     },
     handler=lambda args, **kw: _handle_task_comment(args, **kw),
+)
+
+registry.register(
+    name="owner_task_retry",
+    toolset="owner_workspace",
+    schema={
+        "name": "owner_task_retry",
+        "description": (
+            "Retry work that stopped on its own — the system gave up (dispatcher "
+            "circuit-breaker exhausted) or a worker hit a capability wall it "
+            "cannot pass. Every other state is refused with a plain reason "
+            "explaining which state the task is in and why that state is not "
+            "retryable. The owner's reason is required and is recorded on the "
+            "task and on the exact stopped attempt. Idempotent; requires a fresh "
+            "human confirmation."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Stable client-chosen key so a retried call is safe.",
+                },
+                "project_id": {
+                    "type": "string",
+                    "description": "The receipt-owned Project containing the task.",
+                },
+                "task_id": {"type": "string", "description": "The stopped task to retry."},
+                "reason": {
+                    "type": "string",
+                    "description": "The owner's account of why this work should be retried.",
+                },
+            },
+            "required": ["idempotency_key", "project_id", "task_id", "reason"],
+        },
+    },
+    handler=lambda args, **kw: _handle_task_retry(args, **kw),
 )
