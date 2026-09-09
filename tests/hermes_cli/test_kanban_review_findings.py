@@ -459,6 +459,119 @@ def test_identical_findings_twice_blocks_for_owner_decision_without_rerun(
         assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_repeated_findings_stop_is_all_or_none_against_a_takeover(
+    kanban_home, monkeypatch,
+):
+    """The owner stop on repeated findings is ONE decision: the sticky block
+    (compare-and-swapped on the review run that raised them, which it also
+    closes) and the ``review_findings_repeated`` event commit together or
+    not at all.
+
+    Before this fix the event committed in a transaction of its own and the
+    block followed in a second one, so a reclaim and re-claim landing between
+    them left a successor review run active and unblocked, with the stale
+    event on its task. The barrier sits on the seam a takeover really uses:
+    the next write transaction opened once the repeated event is durable.
+    On the old code that is the block's own transaction, so the takeover
+    lands in the gap; on the fixed code no transaction opens between the
+    event and the block, so the takeover can only try after the stop and
+    finds a blocked task with no claim to take.
+    """
+    with kb.connect() as setup:
+        tid, review = _hand_off_to_review(setup)
+        first = kb.submit_review_findings(
+            setup, tid,
+            findings=[_finding(candidate_digest="digest-1")],
+            candidate_digest="digest-1",
+            expected_run_id=review.current_run_id,
+        )
+        assert first["outcome"] == "handed_back"
+        implementer = kb.claim_task(setup, tid, claimer="worker:2")
+        assert implementer is not None
+        assert kb.request_review(
+            setup, tid, summary="no-op resubmit", reviewer="reviewer",
+            expected_run_id=implementer.current_run_id,
+        )
+        review2 = kb.claim_review_task(setup, tid, claimer="reviewer:2")
+        assert review2 is not None
+    stale_run = int(review2.current_run_id)
+
+    takeover: dict = {}
+    probing = {"on": False}  # the probe and the takeover open transactions of their own
+    real_write_txn = kb.write_txn
+
+    def _repeated_event_is_durable() -> bool:
+        with kb.connect() as reader:
+            return reader.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? "
+                "AND kind = 'review_findings_repeated' LIMIT 1",
+                (tid,),
+            ).fetchone() is not None
+
+    def takeover_before_the_next_write_txn(conn_, **kwargs):
+        if not takeover and not probing["on"]:
+            probing["on"] = True
+            try:
+                if _repeated_event_is_durable():
+                    with kb.connect() as other:
+                        takeover["reclaimed"] = kb.reclaim_task(
+                            other, tid, reason="operator takeover",
+                            signal_fn=lambda *_: None,
+                        )
+                        successor = (
+                            kb.claim_review_task(other, tid, claimer="reviewer:3")
+                            if takeover["reclaimed"] else None
+                        )
+                        takeover["successor_run"] = (
+                            int(successor.current_run_id)
+                            if successor is not None else None
+                        )
+            finally:
+                probing["on"] = False
+        return real_write_txn(conn_, **kwargs)
+
+    monkeypatch.setattr(kb, "write_txn", takeover_before_the_next_write_txn)
+
+    with kb.connect() as conn:
+        verdict = kb.submit_review_findings(
+            conn, tid,
+            findings=[_finding(candidate_digest="digest-1")],
+            candidate_digest="digest-1",
+            expected_run_id=stale_run,
+        )
+        # The next write transaction anyone opens after the verdict is the
+        # earliest moment a takeover can try on the fixed code.
+        with kb.write_txn(conn):
+            pass
+
+    assert takeover, (
+        "the barrier never fired, so no takeover was attempted and this "
+        "test proved nothing"
+    )
+    assert verdict["outcome"] == "owner_decision_blocked", verdict
+    assert takeover.get("successor_run") is None, (
+        "a successor review run started around the owner stop"
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        assert kb._has_sticky_block(conn, tid) is True
+        repeated_runs = [
+            r["run_id"] for r in conn.execute(
+                "SELECT run_id FROM task_events WHERE task_id = ? "
+                "AND kind = 'review_findings_repeated' ORDER BY id",
+                (tid,),
+            ).fetchall()
+        ]
+        assert repeated_runs == [stale_run]
+        runs = {r.id: r for r in kb.list_runs(conn, tid)}
+        assert runs[stale_run].status == "blocked"
+        assert max(runs) == stale_run, "a later run exists on the task"
+
+
 def _stored_blobs(task_id) -> list[str]:
     directory = kb.task_attachments_dir(task_id)
     if not directory.exists():
