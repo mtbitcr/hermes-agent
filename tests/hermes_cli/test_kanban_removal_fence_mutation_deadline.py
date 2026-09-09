@@ -66,11 +66,26 @@ def running_board(fence_home):
     todo_id = kb.create_task(conn, title="todo work", assignee="worker")
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (todo_id,))
+    # A task parked in an ACTIVE REVIEW RUN, so the reviewer handback mutator
+    # reaches its own pre-transaction reads instead of being turned away by a
+    # lifecycle guard. Built through the real transitions an implementer and a
+    # reviewer take: claim -> request_review -> claim_review_task.
+    review_id = ready_task(conn, title="work awaiting review")
+    implementation = kb.claim_task(conn, review_id, claimer="host:worker")
+    assert implementation is not None
+    assert kb.request_review(
+        conn, review_id, summary="ready for review", reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review_run = kb.claim_review_task(conn, review_id, claimer="host:reviewer")
+    assert review_run is not None
     return {
         "conn": conn,
         "ready": ready_id,
         "running": running_id,
         "todo": todo_id,
+        "review": review_id,
+        "review_run": review_run.current_run_id,
         "db_path": kb.kanban_db_path(board="deadline-preread"),
     }
 
@@ -107,6 +122,20 @@ PRE_READ_MUTATORS = {
         b["conn"], b["running"], claimer="host:worker"
     ),
     "claim_review_task": lambda b: kb.claim_review_task(b["conn"], b["ready"]),
+    "submit_review_findings": lambda b: kb.submit_review_findings(
+        b["conn"], b["review"],
+        findings=[{
+            "severity": "blocking",
+            "file": "src/app.py",
+            "lines": "10-20",
+            "problem": "off-by-one in the loop bound",
+            "impact": "drops the last item of every batch",
+            "smallest_fix": "use `<=` instead of `<` in the range check",
+            "candidate_digest": "digest-1",
+        }],
+        candidate_digest="digest-1",
+        expected_run_id=b["review_run"],
+    ),
 }
 
 

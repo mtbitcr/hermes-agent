@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -56,22 +57,58 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 )
 
 
+def _worker_run_id(task_id: str) -> Optional[int]:
+    """Return this worker's dispatcher run id when it is scoped to task_id.
+
+    Same validated shape the rest of the codebase uses for this environment
+    (``tools.kanban_tools._worker_run_id``): ``HERMES_KANBAN_TASK`` must name
+    the task being acted on, and ``HERMES_KANBAN_RUN_ID`` must parse as an
+    int. Anything else — a missing, foreign or unparseable value — yields no
+    identity, and callers that need one must fail closed.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def _record_kanban_budget_exhausted(
     kanban_task: str,
     api_call_count: int,
     max_iterations: int,
     logger: logging.Logger,
 ) -> None:
-    """Record a terminal ``timed_out`` outcome for a kanban worker that
-    exhausted its iteration budget.
+    """Record a terminal ``timed_out`` outcome for THIS worker's own run,
+    which exhausted its iteration budget.
 
     This is a bounded fallback (#87096): the CAS invariant in ``_end_run``
     (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
     already closed the run this is a no-op — so it is safe to call from
     multiple exit paths.
+
+    The outcome is bound to the run identity this process was spawned with
+    (``_worker_run_id``) and passed to ``_record_task_failure`` as
+    ``expected_run_id``, so a SUPERSEDED worker whose budget ends late cannot
+    record anything against whichever LATER run now owns the task — neither
+    completing that successor from the successor's own handover nor timing it
+    out. With no valid identity the value passed is ``None`` and
+    ``_record_task_failure`` fails closed, writing nothing.
     """
     try:
         from hermes_cli import kanban_db as _kb
+        _expected_run_id = _worker_run_id(kanban_task)
+        if _expected_run_id is None:
+            logger.warning(
+                "Not recording budget-exhausted failure for task %s: this "
+                "process has no valid HERMES_KANBAN_RUN_ID for that task, so "
+                "the outcome cannot be bound to a run",
+                kanban_task,
+            )
         _conn = _kb.connect()
         try:
             _kb._record_task_failure(
@@ -90,6 +127,7 @@ def _record_kanban_budget_exhausted(
                     "budget_used": api_call_count,
                     "budget_max": max_iterations,
                 },
+                expected_run_id=_expected_run_id,
             )
         finally:
             try:

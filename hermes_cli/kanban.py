@@ -815,6 +815,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "reason", nargs="+", help="Concrete changes required before re-review",
     )
 
+    p_review_findings = sub.add_parser(
+        "review-findings",
+        help=(
+            "Reviewer verdict: submit a typed findings document. No "
+            "outstanding findings approves the task; otherwise hands it "
+            "back to the implementer with the document attached."
+        ),
+    )
+    p_review_findings.add_argument("task_id")
+    p_review_findings.add_argument(
+        "--file", default=None,
+        help=(
+            "Path to a JSON file with {\"candidate_digest\": ..., "
+            "\"findings\": [...]}. Reads stdin when omitted."
+        ),
+    )
+
     p_reopen_review = sub.add_parser(
         "reopen-review",
         help="Send one or more review tasks back for changes (review -> ready/todo)",
@@ -1269,6 +1286,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
+            "review-findings": _cmd_review_findings,
             "reopen-review":  _cmd_reopen_review,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
@@ -2650,6 +2668,7 @@ def _cmd_attach(args: argparse.Namespace) -> int:
                 data,
                 content_type=content_type,
                 uploaded_by=uploaded_by,
+                expected_run_id=_worker_run_id_for(args.task_id),
             )
     except kb.AttachmentTooLarge as exc:
         print(f"kanban: {exc}", file=sys.stderr)
@@ -3000,6 +3019,78 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             + (f"; routed to {detail}" if detail else "")
         )
     return 0
+
+
+def _cmd_review_findings(args: argparse.Namespace) -> int:
+    """Submit a typed review-findings document (the sole handback path)."""
+    tid = args.task_id
+    raw_path = getattr(args, "file", None)
+    try:
+        if raw_path:
+            raw_text = Path(raw_path).expanduser().read_text(encoding="utf-8")
+        else:
+            raw_text = sys.stdin.read()
+        payload = json.loads(raw_text)
+    except OSError as exc:
+        print(f"kanban: could not read {raw_path}: {exc}", file=sys.stderr)
+        return 2
+    except json.JSONDecodeError as exc:
+        print(f"kanban: invalid JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(payload, dict):
+        print("kanban: findings document must be a JSON object", file=sys.stderr)
+        return 2
+    # An explicitly empty ``findings`` array is the reviewer's clean verdict,
+    # and a clean verdict APPROVES the task out of the review lane. So an
+    # absent key, a null, or any non-array value is a malformed document —
+    # never a pass. It used to be coerced to ``[]`` here.
+    findings = payload.get("findings")
+    if not isinstance(findings, list):
+        print(
+            'kanban: findings document must carry a "findings" array; an '
+            "explicitly empty array is the only clean verdict (got "
+            f"{type(findings).__name__ if 'findings' in payload else 'no key'})",
+            file=sys.stderr,
+        )
+        return 2
+    candidate_digest = payload.get("candidate_digest")
+
+    with kb.connect_closing() as conn:
+        try:
+            result = kb.submit_review_findings(
+                conn, tid,
+                findings=findings,
+                candidate_digest=candidate_digest,
+                expected_run_id=_worker_run_id_for(tid),
+            )
+        except kb.ReviewFindingsError as exc:
+            print(f"kanban: malformed findings document: {exc}", file=sys.stderr)
+            return 2
+
+        outcome = result.get("outcome")
+        if outcome == "passed":
+            print(f"{tid}: review passed — approved")
+            return 0
+        if outcome == "handed_back":
+            print(
+                f"{tid}: review findings handed back to "
+                f"{result.get('implementer')} (attachment "
+                f"{result.get('attachment_id')})"
+            )
+            return 0
+        if outcome == "owner_decision_blocked":
+            print(
+                f"{tid}: identical findings repeated for the same candidate — "
+                "blocked for an owner decision",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"kanban: could not submit review findings for {tid}: "
+            f"{result.get('reason', 'unknown error')}",
+            file=sys.stderr,
+        )
+        return 1
 
 
 def _cmd_reopen_review(args: argparse.Namespace) -> int:
