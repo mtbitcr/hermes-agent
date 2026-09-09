@@ -21354,7 +21354,14 @@ def complete_task(
         execution_receipt = _verify_scoped_worktree_completion(conn, task_id)
     except WorktreeScopeError as exc:
         if materialization_start is not None:
-            _rollback_worktree_materialization(conn, task_id, materialization_start)
+            _rollback_worktree_materialization(
+                conn,
+                task_id,
+                materialization_start,
+                materialized_head=(materialization_receipt or {}).get(
+                    "materialized_head"
+                ),
+            )
         with write_txn(conn):
             # A caller bound to one run (a worker completing its own run) can
             # be SUPERSEDED between its own up-front validation and here, in
@@ -21395,7 +21402,12 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             if materialization_start is not None:
                 _rollback_worktree_materialization(
-                    conn, task_id, materialization_start
+                    conn,
+                    task_id,
+                    materialization_start,
+                    materialized_head=(materialization_receipt or {}).get(
+                        "materialized_head"
+                    ),
                 )
             return False
         prior = conn.execute(
@@ -21456,7 +21468,12 @@ def complete_task(
         if cur.rowcount != 1:
             if materialization_start is not None:
                 _rollback_worktree_materialization(
-                    conn, task_id, materialization_start
+                    conn,
+                    task_id,
+                    materialization_start,
+                    materialized_head=(materialization_receipt or {}).get(
+                        "materialized_head"
+                    ),
                 )
             return False
         if isinstance(metadata, dict):
@@ -25469,13 +25486,32 @@ def _git_mutation(path: Path, *args: str) -> str:
 
 
 def _rollback_worktree_materialization(
-    conn: sqlite3.Connection, task_id: str, original_head: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    original_head: str,
+    *,
+    materialized_head: Optional[str] = None,
 ) -> None:
-    """Restore only the isolated task worktree changed by this kernel call."""
+    """Restore only the isolated task worktree changed by this kernel call.
+
+    ``materialized_head`` is the commit this call itself produced. When it is
+    given and the worktree has moved on since — a different HEAD, or
+    uncommitted changes — a successor run owns the worktree now, and it is
+    left exactly as it is: resetting it would erase the successor's work.
+    """
     task = get_task(conn, task_id)
     if task is None or not task.workspace_path:
         raise WorktreeScopeError("cannot restore an unavailable task worktree")
     workspace = Path(task.workspace_path).expanduser()
+    if materialized_head is not None:
+        current_head = str(
+            _git_output(workspace, "rev-parse", "--verify", "HEAD")
+        ).strip()
+        moved_on = current_head != materialized_head or bool(
+            _git_output(workspace, "status", "--porcelain=v1", "-z", binary=True)
+        )
+        if moved_on:
+            return
     try:
         subprocess.run(
             ["git", "-C", str(workspace), "merge", "--abort"],

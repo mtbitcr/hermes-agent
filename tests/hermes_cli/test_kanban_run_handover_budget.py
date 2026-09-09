@@ -1017,7 +1017,7 @@ def test_takeover_inside_the_bound_handover_window_writes_no_event(
         leaked = {
             kind: _events(conn, task_id, kind=kind)
             for kind in (
-                "run_handover_completed", "run_handover_failed",
+                "completed", "run_handover_completed", "run_handover_failed",
                 "completion_blocked_file_scope", "timed_out", "gave_up",
             )
         }
@@ -1061,6 +1061,120 @@ def test_takeover_inside_the_bound_handover_window_writes_no_event(
     assert "src/owned/handover.py" not in _git(
         repo, "log", "--all", "--name-only", "--pretty=format:",
     )
+
+
+def test_takeover_after_materialization_leaves_the_successor_commit_intact(
+    default_board_home, tmp_path, monkeypatch,
+):
+    """A takeover landing AFTER the stale run has materialized and verified
+    its patch but BEFORE the final run compare-and-swap.
+
+    The stale completion is rejected by that compare-and-swap and rolls its
+    materialization back. Before this fix the rollback was an unconditional
+    ``git reset --hard`` to the head this call started from, which erased the
+    commit the successor had made on the shared worktree in the meantime,
+    silently: no event, no state change, just lost work. The rollback now
+    leaves a worktree alone once it has moved past the head this call
+    produced, so the successor's exact head and content survive (the stale
+    call's own materialized commit stays underneath it, as the successor
+    built on it).
+
+    The barrier sits on the module attribute the completion path really
+    calls between materialization and the compare-and-swap
+    (``kanban_db._verify_scoped_worktree_completion``); the takeover and the
+    successor's commit happen on a SECOND, independent connection.
+    """
+    from agent.turn_finalizer import _record_kanban_budget_exhausted
+
+    repo = _repo(tmp_path)
+    with contextlib.closing(kb.connect()) as conn:
+        task_id, stale_run, patch_id, report_id = _task_with_finished_handover(
+            conn, repo, title="takeover after materialization",
+            branch="feature/handover-post-materialization",
+        )
+
+    _worker_env(monkeypatch, task_id, stale_run)
+
+    barrier: dict = {"fired": False, "live_run": None, "successor_head": None}
+    real_verify = kb._verify_scoped_worktree_completion
+
+    def verify_then_takeover(conn_, tid):
+        receipt = real_verify(conn_, tid)
+        if not barrier["fired"]:
+            barrier["fired"] = True
+            with contextlib.closing(kb.connect()) as other:
+                assert kb.reclaim_task(
+                    other, tid, reason="operator abort",
+                    signal_fn=lambda *_: None,
+                ) is True
+                successor = kb.claim_task(other, tid)
+                assert successor is not None
+                assert successor.current_run_id is not None
+                assert successor.workspace_path
+                barrier["live_run"] = int(successor.current_run_id)
+                kb._set_worker_pid(other, tid, 555_013)
+            # The successor advances the SHARED task worktree (the isolated
+            # worktree the kernel materialized into, not the test repo's main
+            # checkout) with its own commit.
+            worktree = Path(successor.workspace_path)
+            (worktree / "src" / "owned").mkdir(parents=True, exist_ok=True)
+            (worktree / "src" / "owned" / "successor.py").write_text(
+                "successor = True\n", encoding="utf-8",
+            )
+            _git(worktree, "add", "src/owned/successor.py")
+            _git(worktree, "commit", "-m", "successor work")
+            barrier["successor_head"] = _git(worktree, "rev-parse", "HEAD")
+            barrier["worktree"] = worktree
+        return receipt
+
+    monkeypatch.setattr(
+        kb, "_verify_scoped_worktree_completion", verify_then_takeover,
+    )
+
+    _record_kanban_budget_exhausted(
+        task_id, 200, 200, logging.getLogger("test.turn_finalizer"),
+    )
+
+    assert barrier["fired"], (
+        "the barrier never fired, so no takeover happened after "
+        "materialization and this test proved nothing"
+    )
+    live_run = barrier["live_run"]
+    successor_head = barrier["successor_head"]
+    assert live_run is not None and live_run != stale_run
+    assert successor_head
+
+    # The successor's exact head and content survived the stale rollback.
+    worktree = barrier["worktree"]
+    assert _git(worktree, "rev-parse", "HEAD") == successor_head
+    assert (worktree / "src" / "owned" / "successor.py").read_text(
+        encoding="utf-8"
+    ) == "successor = True\n"
+
+    with contextlib.closing(kb.connect()) as conn:
+        leaked = {
+            kind: _events(conn, task_id, kind=kind)
+            for kind in (
+                "completed", "run_handover_completed", "run_handover_failed",
+                "completion_blocked_file_scope", "timed_out", "gave_up",
+            )
+        }
+        assert leaked == {kind: [] for kind in leaked}, (
+            "a superseded worker wrote durable events onto a task the "
+            "successor run owns"
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == live_run
+        assert task.worker_pid == 555_013, "the successor's claim was released"
+        assert task.completed_at is None
+
+        runs = {r.id: r for r in kb.list_runs(conn, task_id)}
+        assert runs[live_run].status == "running"
+        assert runs[live_run].outcome is None
+        assert runs[stale_run].status == "reclaimed"
 
 
 def test_bound_completion_still_records_a_genuine_scope_rejection(
