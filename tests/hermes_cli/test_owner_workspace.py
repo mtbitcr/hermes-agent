@@ -8414,6 +8414,10 @@ def test_retry_origin_automatic_for_a_genuine_kernel_sweep(ctx):
         # release_stale_claims deterministically. claim_task never sets
         # worker_pid, so the sweep reclaims immediately instead of
         # extending a live PID's claim.
+        # This direct UPDATE is deterministic precondition setup only (it
+        # forces claim expiry so the stale sweep fires without sleeping) —
+        # it does not substitute for driving the kernel through its real
+        # entry points, which is what the assertions below still do.
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
             (int(time.time()) - 100, task_id),
@@ -8489,6 +8493,102 @@ def test_retry_origin_owner_for_an_unblock_driven_redispatch(ctx):
     assert newer["retry_origin"] == "none"
     assert older["has_newer_run"] is True
     assert older["retry_origin"] == "owner"
+
+
+def test_retry_origin_owner_for_an_owner_move_closing_a_running_task(ctx):
+    """``cas_transition_task``'s owner path can also close a running task
+    with ``outcome="reclaimed"`` — the exact same string the automatic
+    stale-lock sweep writes. An owner move to ``archived`` followed by an
+    owner move back to ``ready`` and a new claim must still read ``owner``,
+    never fall back to ``automatic`` on the outcome string alone.
+    """
+    result = _retry_project(ctx, "graph-retry-owner-move", "Retry Owner Move Project")
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Owner-moved task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, task_id, claimer="builder:move")
+        assert implementation is not None
+        moved_out = kanban_db.cas_transition_task(
+            conn, task_id,
+            expected_status="running",
+            expected_revision=kanban_db.task_event_revision(conn, task_id),
+            to_status="archived", event_kind="owner_move",
+        )
+        assert moved_out["moved"]
+        moved_back = kanban_db.cas_transition_task(
+            conn, task_id,
+            expected_status="archived",
+            expected_revision=kanban_db.task_event_revision(conn, task_id),
+            to_status="ready", event_kind="owner_move",
+        )
+        assert moved_back["moved"]
+        retried = kanban_db.claim_task(conn, task_id, claimer="builder:move-2")
+        assert retried is not None
+
+    runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
+    matches = _runs_titled(runs, "Owner-moved task")
+    assert len(matches) == 2
+    newer, older = matches
+    assert newer["retry_origin"] == "none"
+    # "attention" is the owner-facing bucket both "reclaimed" and "blocked"
+    # normalize into (see ``_owner_project_run_receipt``); the raw kanban_db
+    # outcome string itself never crosses this projection boundary.
+    assert older["receipt"]["outcome"] == "attention"
+    assert older["has_newer_run"] is True
+    assert older["retry_origin"] == "owner"
+
+
+def test_retry_origin_is_not_double_attributed_across_same_second_gaps(ctx):
+    """A stale-sweep close, a block, and an unblock landing in the exact
+    same second must not let the unblock get attributed to more than one
+    prior run: only the run it actually followed reads ``owner``, and the
+    genuinely kernel-retried run still reads ``automatic``.
+    """
+    result = _retry_project(
+        ctx, "graph-retry-same-second", "Retry Same Second Project",
+    )
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Same second task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        with _temporarily_patch(kanban_db.time, "time", lambda: 1000.0):
+            run1 = kanban_db.claim_task(
+                conn, task_id, claimer="builder:s1", ttl_seconds=1,
+            )
+            assert run1 is not None
+            # Deterministic precondition setup: force claim_expires into
+            # the past so the stale sweep fires without sleeping — not a
+            # substitute for driving the sweep/block/unblock through their
+            # real entry points below.
+            conn.execute("UPDATE tasks SET claim_expires = 1 WHERE id = ?", (task_id,))
+            conn.commit()
+            assert kanban_db.release_stale_claims(conn) == 1
+            run2 = kanban_db.claim_task(conn, task_id, claimer="builder:s2")
+            assert run2 is not None
+            assert kanban_db.block_task(
+                conn, task_id, reason="needs input", kind="needs_input",
+                expected_run_id=run2.current_run_id,
+            )
+            assert kanban_db.unblock_task(conn, task_id)
+            run3 = kanban_db.claim_task(conn, task_id, claimer="builder:s3")
+            assert run3 is not None
+
+    runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
+    matches = _runs_titled(runs, "Same second task")
+    assert len(matches) == 3
+    newest, middle, oldest = matches  # newest-first
+    assert newest["retry_origin"] == "none"
+    # "attention" is the owner-facing bucket both "blocked" and "reclaimed"
+    # normalize into (see ``_owner_project_run_receipt``).
+    assert middle["receipt"]["outcome"] == "attention"
+    assert middle["retry_origin"] == "owner"
+    assert oldest["receipt"]["outcome"] == "attention"
+    assert oldest["retry_origin"] == "automatic"
 
 
 def test_retry_origin_unattributed_without_positive_proof(ctx):
@@ -8632,6 +8732,49 @@ def test_review_state_changes_requested_after_a_review_handback(ctx):
         _columns_task(snapshot, "Sent back for changes task")["review_state"]
         == "changes_requested"
     )
+
+
+def test_review_state_changes_requested_after_rework_completed_without_re_review(ctx):
+    """A historical ``review_requested`` event must never outrank a later
+    handback: completing the rework run without ever requesting re-review
+    must not report an approval that never happened.
+    """
+    result = _retry_project(
+        ctx, "graph-review-rework-no-rereview", "Review Rework No Rereview Project",
+    )
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Reworked without re-review task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, task_id, claimer="builder:rw1")
+        assert implementation is not None
+        assert kanban_db.request_review(
+            conn, task_id, summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+        review_claim = kanban_db.claim_review_task(conn, task_id, claimer="reviewer:rw1")
+        assert review_claim is not None
+        ok, _reason = kanban_db.request_changes(
+            conn, task_id, reason="needs another pass",
+            expected_run_id=review_claim.current_run_id,
+        )
+        assert ok
+        rework = kanban_db.claim_task(conn, task_id, claimer="builder:rw1-2")
+        assert rework is not None
+        assert kanban_db.complete_task(
+            conn, task_id, expected_run_id=rework.current_run_id,
+        )
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+    done_column = next(
+        column for column in snapshot["columns"] if column["name"] == "done"
+    )
+    assert any(
+        task["title"] == "Reworked without re-review task"
+        for task in done_column["tasks"]
+    )
+    task = _columns_task(snapshot, "Reworked without re-review task")
+    assert task["review_state"] == "changes_requested"
 
 
 def test_review_state_changes_requested_via_explicit_reopen(ctx):
