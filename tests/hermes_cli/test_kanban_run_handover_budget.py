@@ -1177,6 +1177,171 @@ def test_takeover_after_materialization_leaves_the_successor_commit_intact(
         assert runs[stale_run].status == "reclaimed"
 
 
+def test_takeover_during_materialization_with_a_failed_handoff_leaves_the_successor_commit_intact(
+    default_board_home, tmp_path, monkeypatch,
+):
+    """A takeover landing WHILE the stale run is still materializing, followed
+    by a materialization failure.
+
+    The materializer rolls its own partial work back from its exception path.
+    Before this fix that rollback was the unconditional ``git reset --hard``
+    to the head this call started from, with no run identity at all, so it
+    erased the commit the successor had made on the shared worktree in the
+    meantime while the successor's run stayed current and running. The
+    rollback now refuses to touch a worktree whose task is owned by a
+    different open run, decided under the write lock ``claim_task`` takes,
+    so the successor's exact head and content survive.
+
+    The barrier sits on the kernel's git mutation seam at the patch apply,
+    the first mutation of the materialization; the takeover and the
+    successor's commit happen on a SECOND, independent connection, then the
+    apply fails.
+    """
+    from agent.turn_finalizer import _record_kanban_budget_exhausted
+
+    repo = _repo(tmp_path)
+    with contextlib.closing(kb.connect()) as conn:
+        task_id, stale_run, patch_id, report_id = _task_with_finished_handover(
+            conn, repo, title="takeover during materialization",
+            branch="feature/handover-mid-materialization",
+        )
+
+    _worker_env(monkeypatch, task_id, stale_run)
+
+    barrier: dict = {"fired": False, "live_run": None, "successor_head": None}
+    real_mutation = kb._git_mutation
+
+    def takeover_then_fail_the_apply(path, *args):
+        if args[:1] == ("apply",) and not barrier["fired"]:
+            barrier["fired"] = True
+            with contextlib.closing(kb.connect()) as other:
+                assert kb.reclaim_task(
+                    other, task_id, reason="operator abort",
+                    signal_fn=lambda *_: None,
+                ) is True
+                successor = kb.claim_task(other, task_id)
+                assert successor is not None
+                assert successor.current_run_id is not None
+                assert successor.workspace_path
+                barrier["live_run"] = int(successor.current_run_id)
+                kb._set_worker_pid(other, task_id, 555_014)
+            worktree = Path(successor.workspace_path)
+            (worktree / "src" / "owned").mkdir(parents=True, exist_ok=True)
+            (worktree / "src" / "owned" / "successor.py").write_text(
+                "successor = True\n", encoding="utf-8",
+            )
+            _git(worktree, "add", "src/owned/successor.py")
+            _git(worktree, "commit", "-m", "successor work")
+            barrier["successor_head"] = _git(worktree, "rev-parse", "HEAD")
+            barrier["worktree"] = worktree
+            raise RuntimeError("injected materialization failure")
+        return real_mutation(path, *args)
+
+    monkeypatch.setattr(kb, "_git_mutation", takeover_then_fail_the_apply)
+
+    _record_kanban_budget_exhausted(
+        task_id, 200, 200, logging.getLogger("test.turn_finalizer"),
+    )
+
+    assert barrier["fired"], (
+        "the barrier never fired, so no takeover happened during "
+        "materialization and this test proved nothing"
+    )
+    live_run = barrier["live_run"]
+    successor_head = barrier["successor_head"]
+    assert live_run is not None and live_run != stale_run
+    assert successor_head
+
+    worktree = barrier["worktree"]
+    assert _git(worktree, "rev-parse", "HEAD") == successor_head
+    assert (worktree / "src" / "owned" / "successor.py").read_text(
+        encoding="utf-8"
+    ) == "successor = True\n"
+    assert _git(worktree, "status", "--porcelain") == ""
+
+    with contextlib.closing(kb.connect()) as conn:
+        leaked = {
+            kind: _events(conn, task_id, kind=kind)
+            for kind in (
+                "completed", "run_handover_completed", "run_handover_failed",
+                "completion_blocked_file_scope", "timed_out", "gave_up",
+            )
+        }
+        assert leaked == {kind: [] for kind in leaked}, (
+            "a superseded worker wrote durable events onto a task the "
+            "successor run owns"
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == live_run
+        assert task.worker_pid == 555_014, "the successor's claim was released"
+
+        runs = {r.id: r for r in kb.list_runs(conn, task_id)}
+        assert runs[live_run].status == "running"
+        assert runs[stale_run].status == "reclaimed"
+
+
+def test_rollback_leaves_a_head_that_moved_after_its_own_check_alone(
+    tmp_path, monkeypatch,
+):
+    """The rollback of a materialized commit only ever undoes that commit.
+
+    Before this fix the rollback read HEAD, read the status, and then reset
+    unconditionally, so a commit landing between those reads and the reset
+    was erased. The branch is now moved back with an old-value check, so a
+    HEAD that moved after the check is left exactly where it is.
+
+    The barrier sits on the kernel's git read seam: the status read the
+    rollback performs after its HEAD read lands one more commit on the
+    worktree before answering.
+    """
+    repo = _repo(tmp_path)
+    with contextlib.closing(kb.connect(tmp_path / "kanban.db")) as conn:
+        task_id = kb.create_task(
+            conn, title="rollback window", assignee="worker",
+            workspace_kind="worktree", workspace_path=str(repo),
+            branch_name="feature/rollback-window", owned_paths=["src/owned"],
+        )
+        worktree = _materialize(conn, task_id)
+        original_head = _git(worktree, "rev-parse", "HEAD")
+        (worktree / "src" / "owned").mkdir(parents=True, exist_ok=True)
+        (worktree / "src" / "owned" / "materialized.py").write_text(
+            "materialized = True\n", encoding="utf-8",
+        )
+        _git(worktree, "add", "src/owned/materialized.py")
+        _git(worktree, "commit", "-m", "kanban: materialize")
+        materialized_head = _git(worktree, "rev-parse", "HEAD")
+
+        real_output = kb._git_output
+        landed: dict = {}
+
+        def commit_between_the_check_and_the_reset(path, *args, **kwargs):
+            if args[:1] == ("status",) and not landed:
+                (worktree / "src" / "owned" / "later.py").write_text(
+                    "later = True\n", encoding="utf-8",
+                )
+                _git(worktree, "add", "src/owned/later.py")
+                _git(worktree, "commit", "-m", "landed in the window")
+                landed["head"] = _git(worktree, "rev-parse", "HEAD")
+            return real_output(path, *args, **kwargs)
+
+        monkeypatch.setattr(kb, "_git_output", commit_between_the_check_and_the_reset)
+        kb._rollback_worktree_materialization(
+            conn, task_id, original_head,
+            materialized_head=materialized_head,
+        )
+
+        assert landed, "the barrier never fired, so this test proved nothing"
+        assert _git(worktree, "rev-parse", "HEAD") == landed["head"]
+        assert (worktree / "src" / "owned" / "later.py").read_text(
+            encoding="utf-8"
+        ) == "later = True\n"
+        assert (worktree / "src" / "owned" / "materialized.py").exists()
+        assert _git(worktree, "status", "--porcelain") == ""
+
+
 def test_bound_completion_still_records_a_genuine_scope_rejection(
     tmp_path, monkeypatch,
 ):

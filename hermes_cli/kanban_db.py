@@ -21353,16 +21353,17 @@ def complete_task(
             )
         execution_receipt = _verify_scoped_worktree_completion(conn, task_id)
     except WorktreeScopeError as exc:
-        if materialization_start is not None:
-            _rollback_worktree_materialization(
-                conn,
-                task_id,
-                materialization_start,
-                materialized_head=(materialization_receipt or {}).get(
-                    "materialized_head"
-                ),
-            )
         with write_txn(conn):
+            if materialization_start is not None:
+                _rollback_worktree_materialization(
+                    conn,
+                    task_id,
+                    materialization_start,
+                    materialized_head=(materialization_receipt or {}).get(
+                        "materialized_head"
+                    ),
+                    expected_run_id=expected_run_id,
+                )
             # A caller bound to one run (a worker completing its own run) can
             # be SUPERSEDED between its own up-front validation and here, in
             # which case the rejection above is just "you are not the current
@@ -21408,6 +21409,7 @@ def complete_task(
                     materialized_head=(materialization_receipt or {}).get(
                         "materialized_head"
                     ),
+                    expected_run_id=expected_run_id,
                 )
             return False
         prior = conn.execute(
@@ -21474,6 +21476,7 @@ def complete_task(
                     materialized_head=(materialization_receipt or {}).get(
                         "materialized_head"
                     ),
+                    expected_run_id=expected_run_id,
                 )
             return False
         if isinstance(metadata, dict):
@@ -25491,17 +25494,33 @@ def _rollback_worktree_materialization(
     original_head: str,
     *,
     materialized_head: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> None:
     """Restore only the isolated task worktree changed by this kernel call.
 
+    Ownership first: when ``expected_run_id`` is given and the task has any
+    later run — open or already ended — a successor owned the worktree after
+    this call, and it is left exactly as it is. Every caller runs this inside
+    the ``BEGIN IMMEDIATE`` write transaction — the lock ``claim_task`` takes
+    — so no successor can be claimed between that check and the reset: the
+    write lock is the lease.
+
     ``materialized_head`` is the commit this call itself produced. When it is
     given and the worktree has moved on since — a different HEAD, or
-    uncommitted changes — a successor run owns the worktree now, and it is
-    left exactly as it is: resetting it would erase the successor's work.
+    uncommitted changes — nothing is touched, and the branch is moved back
+    with an old-value check (``git update-ref``), so a HEAD that moved after
+    that check is never reset either.
     """
     task = get_task(conn, task_id)
     if task is None or not task.workspace_path:
         raise WorktreeScopeError("cannot restore an unavailable task worktree")
+    if expected_run_id is not None:
+        later_run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND id > ? LIMIT 1",
+            (task_id, int(expected_run_id)),
+        ).fetchone()
+        if later_run is not None:
+            return
     workspace = Path(task.workspace_path).expanduser()
     if materialized_head is not None:
         current_head = str(
@@ -25513,13 +25532,28 @@ def _rollback_worktree_materialization(
         if moved_on:
             return
     try:
-        subprocess.run(
-            ["git", "-C", str(workspace), "merge", "--abort"],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        _git_mutation(workspace, "reset", "--hard", original_head)
+        if materialized_head is not None:
+            try:
+                _git_mutation(
+                    workspace, "update-ref", "-m", "kanban: roll back materialization",
+                    "HEAD", original_head, materialized_head,
+                )
+            except WorktreeScopeError:
+                current_head = str(
+                    _git_output(workspace, "rev-parse", "--verify", "HEAD")
+                ).strip()
+                if current_head != materialized_head:
+                    return
+                raise
+            _git_mutation(workspace, "reset", "--hard")
+        else:
+            subprocess.run(
+                ["git", "-C", str(workspace), "merge", "--abort"],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            _git_mutation(workspace, "reset", "--hard", original_head)
         dirty = _git_output(
             workspace, "status", "--porcelain=v1", "-z", binary=True
         )
@@ -25796,7 +25830,10 @@ def _materialize_remote_worktree_handoff(
         return receipt, original_head
     except Exception as exc:
         try:
-            _rollback_worktree_materialization(conn, task_id, original_head)
+            with write_txn(conn):
+                _rollback_worktree_materialization(
+                    conn, task_id, original_head, expected_run_id=expected_run_id,
+                )
         except WorktreeScopeError as rollback_exc:
             raise WorktreeScopeError(
                 f"{exc}; rollback also failed: {rollback_exc}"
