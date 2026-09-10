@@ -8594,6 +8594,67 @@ def test_retry_origin_is_not_double_attributed_across_same_second_gaps(ctx):
     assert oldest["retry_origin"] == "automatic"
 
 
+def test_retry_origin_fails_closed_when_event_bindings_are_missing(ctx):
+    """Migrated pre-binding history must never be guessed at by timestamp.
+
+    Once a run's own events have lost their ``run_id`` binding, the exact
+    gap this function windows against no longer exists — and a whole-second
+    ``created_at`` window would happily attribute the SAME unblock to two
+    different runs. The gap-bound owner inference must simply not fire, so
+    each run falls back to whatever it can still prove on its own: the swept
+    run keeps its own run-bound sweep evidence, the unbound run reads
+    ``unattributed``.
+    """
+    result = _retry_project(
+        ctx, "graph-retry-unbound-history", "Retry Unbound History Project",
+    )
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Unbound history task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        with _temporarily_patch(kanban_db.time, "time", lambda: 1000.0):
+            run1 = kanban_db.claim_task(
+                conn, task_id, claimer="builder:u1", ttl_seconds=1,
+            )
+            assert run1 is not None
+            # Deterministic precondition setup: force claim_expires into the
+            # past so the stale sweep fires without sleeping.
+            conn.execute("UPDATE tasks SET claim_expires = 1 WHERE id = ?", (task_id,))
+            conn.commit()
+            assert kanban_db.release_stale_claims(conn) == 1
+            run2 = kanban_db.claim_task(conn, task_id, claimer="builder:u2")
+            assert run2 is not None
+            assert kanban_db.block_task(
+                conn, task_id, reason="needs input", kind="needs_input",
+                expected_run_id=run2.current_run_id,
+            )
+            assert kanban_db.unblock_task(conn, task_id)
+            run3 = kanban_db.claim_task(conn, task_id, claimer="builder:u3")
+            assert run3 is not None
+            # Stand in for history migrated from before events carried a
+            # ``run_id``: run 2's own events lose their binding, so neither
+            # its closing event nor its claim event can bound a gap.
+            conn.execute(
+                "UPDATE task_events SET run_id = NULL WHERE run_id = ?",
+                (run2.current_run_id,),
+            )
+            conn.commit()
+
+    runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
+    matches = _runs_titled(runs, "Unbound history task")
+    assert len(matches) == 3
+    newest, middle, oldest = matches  # newest-first
+    assert newest["retry_origin"] == "none"
+    # Run 2 lost both of its own bounds — no owner inference is permitted,
+    # and a ``blocked`` close is not kernel-automatic evidence either.
+    assert middle["retry_origin"] == "unattributed"
+    # Run 1's stale-sweep evidence is still bound to run 1 itself, so it is
+    # unaffected by run 2's missing bindings.
+    assert oldest["retry_origin"] == "automatic"
+
+
 def test_retry_origin_unattributed_without_positive_proof(ctx):
     """A reviewer's ordinary handback is explicitly NOT owner-retry evidence."""
     result = _retry_project(
@@ -8630,6 +8691,53 @@ def test_retry_origin_unattributed_without_positive_proof(ctx):
     assert review_run["retry_origin"] == "unattributed"
     assert impl_run["has_newer_run"] is True
     assert impl_run["retry_origin"] == "unattributed"
+
+
+def test_retry_origin_unattributed_for_a_reclaimed_run_without_sweep_evidence(ctx):
+    """``outcome="reclaimed"`` alone is not proof a kernel sweep happened.
+
+    An archive-then-reactivate cycle driven through ``cas_transition_task``'s
+    DEFAULT (non-owner-authored) event kind closes the running run with the
+    exact same ``reclaimed`` outcome the stale-lock sweep writes, yet no
+    sweep ever ran and no recognised owner event exists either. With neither
+    side's positive evidence present the honest answer is ``unattributed``.
+    """
+    result = _retry_project(
+        ctx, "graph-retry-no-sweep-evidence", "Retry No Sweep Evidence Project",
+    )
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Reclaimed without sweep task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, task_id, claimer="builder:nosweep")
+        assert implementation is not None
+        archived = kanban_db.cas_transition_task(
+            conn, task_id,
+            expected_status="running",
+            expected_revision=kanban_db.task_event_revision(conn, task_id),
+            to_status="archived",
+        )
+        assert archived["moved"]
+        reactivated = kanban_db.cas_transition_task(
+            conn, task_id,
+            expected_status="archived",
+            expected_revision=kanban_db.task_event_revision(conn, task_id),
+            to_status="ready",
+        )
+        assert reactivated["moved"]
+        retried = kanban_db.claim_task(conn, task_id, claimer="builder:nosweep-2")
+        assert retried is not None
+
+    runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
+    matches = _runs_titled(runs, "Reclaimed without sweep task")
+    assert len(matches) == 2
+    newer, older = matches  # newest-first
+    assert newer["retry_origin"] == "none"
+    assert older["has_newer_run"] is True
+    assert older["retry_origin"] != "automatic"
+    assert older["retry_origin"] == "unattributed"
 
 
 def test_retry_origin_is_gated_behind_the_run_task_context_capability(ctx):
@@ -8778,6 +8886,57 @@ def test_review_state_changes_requested_after_rework_completed_without_re_review
     )
     task = _columns_task(snapshot, "Reworked without re-review task")
     assert task["review_state"] == "changes_requested"
+
+
+def test_review_state_not_approved_after_owner_reopen_and_unreviewed_rework(ctx):
+    """An owner reopen starts a NEW cycle whose work was never reviewed.
+
+    The first cycle's ``review_requested`` + ``completed`` pair is an honest
+    approval of the work as it stood then — but the owner then moved the task
+    back to ``ready`` and a fresh implementation run completed it with no new
+    review anywhere. The approval belonged to the retracted cycle, so the
+    done task must not still read ``approved``.
+    """
+    result = _retry_project(
+        ctx, "graph-review-owner-reopen", "Review Owner Reopen Project",
+    )
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Reopened then reworked task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        implementation = kanban_db.claim_task(conn, task_id, claimer="builder:or1")
+        assert implementation is not None
+        assert kanban_db.request_review(
+            conn, task_id, summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+        assert kanban_db.complete_task(conn, task_id)
+        reopened = kanban_db.cas_transition_task(
+            conn, task_id,
+            expected_status="done",
+            expected_revision=kanban_db.task_event_revision(conn, task_id),
+            to_status="ready", event_kind="owner_move",
+        )
+        assert reopened["moved"]
+        rework = kanban_db.claim_task(conn, task_id, claimer="builder:or1-2")
+        assert rework is not None
+        assert kanban_db.complete_task(
+            conn, task_id, expected_run_id=rework.current_run_id,
+        )
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+    done_column = next(
+        column for column in snapshot["columns"] if column["name"] == "done"
+    )
+    assert any(
+        task["title"] == "Reopened then reworked task"
+        for task in done_column["tasks"]
+    )
+    task = _columns_task(snapshot, "Reopened then reworked task")
+    assert task["review_state"] != "approved"
+    # No handback or reopen of a REVIEW ever happened — the owner move and
+    # the new implementation claim only invalidate the earlier approval.
+    assert task["review_state"] == "none"
 
 
 def test_review_state_changes_requested_via_explicit_reopen(ctx):

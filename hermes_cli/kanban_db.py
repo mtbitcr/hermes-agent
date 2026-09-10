@@ -21235,6 +21235,11 @@ def release_stale_claims(
             )
             payload = {
                 "stale_lock": row["claim_lock"],
+                # Positive, run-bound proof that THIS path — the automatic
+                # stale-lock sweep — closed the run. ``outcome="reclaimed"``
+                # is written by operator paths too, so :func:`run_retry_origins`
+                # requires this marker before calling a reclaim automatic.
+                "automatic": True,
                 "worker_pid": (
                     int(row["worker_pid"])
                     if row["worker_pid"] is not None else None
@@ -21353,11 +21358,11 @@ def reclaim_task(
 
 # Run outcomes the KERNEL itself decides, closing a run with no owner in the
 # loop: a stale-lock sweep, a runtime cap, a crash detector, a spawn failure,
-# or a provider rate limit. Note that ``reclaimed`` is deliberately in this
-# set even though :func:`reclaim_task` (an OPERATOR action) writes that exact
-# same outcome string — the outcome alone never proves which path closed the
-# run, so a member of this set is only a CANDIDATE for "automatic" and must
-# lose to positive owner evidence first. See :func:`run_retry_origins`.
+# or a provider rate limit. Every one of these EXCEPT ``reclaimed`` is written
+# only by kernel paths, so it is automatic on its own. ``reclaimed`` is in the
+# set only as a CANDIDATE: operator paths (:func:`reclaim_task`) and generic
+# CAS archives write that exact same string, so it additionally requires the
+# sweep's own run-bound marker. See :func:`run_retry_origins`.
 _KERNEL_SWEEP_RUN_OUTCOMES = frozenset({
     "reclaimed", "stale", "timed_out", "crashed", "spawn_failed", "rate_limited",
 })
@@ -21388,28 +21393,39 @@ def run_retry_origins(
     (never from a title), the same way the owner projection's own
     ``has_newer_run`` is derived, so the two never disagree.
 
-    Both ``_AUTOMATIC`` and ``_OWNER`` require POSITIVE evidence. A
-    ``reclaimed`` outcome is never enough by itself — three separate paths
-    all write it: :func:`release_stale_claims` (the automatic sweep),
-    :func:`reclaim_task` (an operator action, whose ``reclaimed`` event
-    payload carries ``"manual": true``), and :func:`cas_transition_task`
-    closing a running task with an owner-authored ``event_kind`` (e.g. the
-    owner-workspace kernel's ``owner_move`` / ``owner_project_plan_change``)
-    when it moves the task to ``archived``. Each of the latter two events is
-    bound to THIS run by its own ``run_id`` column — never matched loosely
-    by task and time window, because that is exactly the ambiguity the
-    reclaim paths create. Owner evidence is checked before any kernel
-    outcome is folded into ``_AUTOMATIC``, so neither can ever read as
-    automatic.
+    Both ``_AUTOMATIC`` and ``_OWNER`` require POSITIVE evidence, and each
+    piece of it is bound to THIS run by ``task_events.run_id`` — never
+    matched loosely by task and time window, because that is exactly the
+    ambiguity the reclaim paths create. A ``reclaimed`` outcome proves
+    nothing by itself: several unrelated paths write that same string —
+    :func:`release_stale_claims` (the automatic sweep, whose ``reclaimed``
+    event payload carries ``"automatic": true``), :func:`reclaim_task` (an
+    operator action, whose payload carries ``"manual": true``),
+    :func:`cas_transition_task` closing a running task on its way to
+    ``archived`` (with an owner-authored ``event_kind`` such as the
+    owner-workspace kernel's ``owner_move`` / ``owner_project_plan_change``,
+    or with its generic default kind, which proves nothing either way), and
+    :func:`archive_task`. So a ``reclaimed`` run reads ``_AUTOMATIC`` only
+    when the sweep's own run-bound marker is present, and ``_UNATTRIBUTED``
+    when neither side proved anything. Owner evidence is checked first, so
+    an owner-closed run can never read as automatic. The outcomes only
+    kernel paths ever write (``stale``, ``timed_out``, ``crashed``,
+    ``spawn_failed``, ``rate_limited``) stay automatic on their own.
 
     A second, gap-bound form of owner evidence covers an owner action that
     does NOT itself close a run — an unblock, a review reopen, or an
     ``owner_move``/``owner_project_plan_change`` that reactivates the task
     without ending anything (e.g. archived -> ready) — by checking whether
     it landed in the exact gap between this run's own closing event and the
-    next run's own claim event, bound by monotonic ``task_events.id``, never
-    by whole-second ``created_at``: two gaps that share a second would
-    otherwise overlap and let one event get attributed to more than one run.
+    next run's own claim event, bound by monotonic ``task_events.id``. That
+    gap is the ONLY admissible window: whole-second ``created_at`` bounds
+    would let two gaps sharing a second overlap and attribute one event to
+    more than one run, so when either id bound is unavailable (a legacy
+    schema without ``task_events.run_id``, or history migrated from before
+    events were bound) this evidence simply does not fire — it never falls
+    back to timestamps. Evidence proven independently of that gap still
+    stands: run-bound owner-closed and run-bound sweep evidence both apply
+    to such a run as usual.
 
     A run that never closed (``ended_at`` is ``None``) but has a newer run
     cannot be attributed either way: it reads ``_UNATTRIBUTED``.
@@ -21430,14 +21446,12 @@ def run_retry_origins(
     # native task id, exactly as the owner projection's own newest-first walk
     # does — so the two facts can never diverge for the same run.
     has_newer: dict[int, bool] = {}
-    newer_started_at: dict[int, Optional[int]] = {}
     newer_run_id: dict[int, Optional[int]] = {}
     for task_runs in by_task.values():
         ordered = sorted(task_runs, key=lambda r: (r.started_at, r.id))
         for index, run in enumerate(ordered):
             newer = ordered[index + 1] if index + 1 < len(ordered) else None
             has_newer[run.id] = newer is not None
-            newer_started_at[run.id] = newer.started_at if newer else None
             newer_run_id[run.id] = newer.id if newer else None
 
     run_ids = [run.id for run in runs]
@@ -21449,17 +21463,20 @@ def run_retry_origins(
         ev_columns = set()
 
     # Evidence A: events bound to one of these exact run ids (by ``run_id``,
-    # never by task/time proximity) that positively prove an owner — not the
-    # stale-lock sweep — closed that run. Two disjoint shapes both count:
-    # a `reclaimed` event whose payload carries `"manual": true`, or an
-    # `owner_move` / `owner_project_plan_change` event — ``cas_transition_task``
-    # binds one of those to a run's id ONLY when that very call just closed
-    # the run (moved it to ``archived``), so its presence is exact positive
-    # owner evidence regardless of the run's outcome string. The same rows
-    # give us, per run id, the id of its own last bound event (its closing
-    # event) and the id of its own first bound event (its claim event) — the
-    # monotonic bounds Evidence B windows against below.
+    # never by task/time proximity) that positively prove WHICH path closed
+    # that run. Two disjoint shapes prove an owner: a `reclaimed` event whose
+    # payload carries `"manual": true`, or an `owner_move` /
+    # `owner_project_plan_change` event — ``cas_transition_task`` binds one of
+    # those to a run's id ONLY when that very call just closed the run (moved
+    # it to ``archived``), so its presence is exact positive owner evidence
+    # regardless of the run's outcome string. One shape proves the kernel: a
+    # `reclaimed` event whose payload carries `"automatic": true`, which only
+    # :func:`release_stale_claims` writes. The same rows give us, per run id,
+    # the id of its own last bound event (its closing event) and the id of its
+    # own first bound event (its claim event) — the monotonic bounds Evidence
+    # B windows against below.
     owner_closed_run_ids: set[int] = set()
+    swept_run_ids: set[int] = set()
     closing_event_id: dict[int, int] = {}
     claim_event_id: dict[int, int] = {}
     if run_ids and "run_id" in ev_columns:
@@ -21487,6 +21504,8 @@ def run_retry_origins(
                     payload = {}
                 if isinstance(payload, dict) and payload.get("manual") is True:
                     owner_closed_run_ids.add(run_id)
+                elif isinstance(payload, dict) and payload.get("automatic") is True:
+                    swept_run_ids.add(run_id)
             elif kind in ("owner_move", "owner_project_plan_change"):
                 owner_closed_run_ids.add(run_id)
 
@@ -21494,9 +21513,7 @@ def run_retry_origins(
     # the exact (this run's closing event, next run's claim event) gap.
     # Fetched once for every task in this run set, then matched per run in
     # Python against that run's own monotonic ``task_events.id`` window.
-    redispatch_by_task: dict[str, list[tuple[int, int]]] = {
-        task_id: [] for task_id in task_ids
-    }
+    redispatch_by_task: dict[str, list[int]] = {task_id: [] for task_id in task_ids}
     if task_ids:
         redispatch_kinds = _OWNER_REDISPATCH_EVENT_KINDS | {
             "owner_move", "owner_project_plan_change",
@@ -21505,16 +21522,14 @@ def run_retry_origins(
         kind_placeholders = ",".join("?" for _ in redispatch_kinds)
         try:
             rows = conn.execute(
-                "SELECT task_id, id, created_at FROM task_events "
+                "SELECT task_id, id FROM task_events "
                 f"WHERE task_id IN ({placeholders}) AND kind IN ({kind_placeholders})",
                 (*task_ids, *redispatch_kinds),
             ).fetchall()
         except sqlite3.Error:
             rows = []
         for row in rows:
-            redispatch_by_task[str(row["task_id"])].append(
-                (int(row["id"]), int(row["created_at"]))
-            )
+            redispatch_by_task[str(row["task_id"])].append(int(row["id"]))
 
     for run in runs:
         if not has_newer.get(run.id, False):
@@ -21529,33 +21544,27 @@ def run_retry_origins(
         lower_id = closing_event_id.get(run.id)
         newer_id = newer_run_id.get(run.id)
         upper_id = claim_event_id.get(newer_id) if newer_id is not None else None
-        if lower_id is not None and upper_id is not None:
-            # Strict: the two boundary events themselves are this run's own
-            # closing event and the next run's own claim event, already
-            # accounted for above — never double-counted here.
-            redispatched = any(
-                lower_id < event_id < upper_id
-                for event_id, _created_at in redispatch_by_task.get(run.task_id, [])
-            )
-        else:
-            # No monotonic bound available for this run (a legacy schema
-            # without ``task_events.run_id``, or a run that closed without
-            # ever writing a bound event) — fall back to the whole-second
-            # window this function used before ids were available. Bounds
-            # are inclusive here: the claim invariant already guarantees
-            # causal order, so a redispatch landing in the very same second
-            # as this run's close or the next run's claim is still genuinely
-            # inside this gap.
-            window_end = newer_started_at.get(run.id)
-            redispatched = window_end is not None and any(
-                run.ended_at <= created_at <= window_end
-                for _event_id, created_at in redispatch_by_task.get(run.task_id, [])
-            )
+        # Fail closed: with either bound missing there is no gap to test, and
+        # a timestamp window would be a guess, not evidence. Strict bounds —
+        # the two boundary events themselves are this run's own closing event
+        # and the next run's own claim event, already accounted for above, so
+        # neither is double-counted here.
+        redispatched = lower_id is not None and upper_id is not None and any(
+            lower_id < event_id < upper_id
+            for event_id in redispatch_by_task.get(run.task_id, [])
+        )
         if redispatched:
             origins[run.id] = RETRY_ORIGIN_OWNER
             continue
         outcome = (run.outcome or "").strip().lower()
-        if outcome in _KERNEL_SWEEP_RUN_OUTCOMES:
+        if outcome == "reclaimed":
+            # Owner and kernel paths write this identical outcome, so only
+            # the sweep's own run-bound marker makes it automatic.
+            origins[run.id] = (
+                RETRY_ORIGIN_AUTOMATIC if run.id in swept_run_ids
+                else RETRY_ORIGIN_UNATTRIBUTED
+            )
+        elif outcome in _KERNEL_SWEEP_RUN_OUTCOMES:
             origins[run.id] = RETRY_ORIGIN_AUTOMATIC
         else:
             origins[run.id] = RETRY_ORIGIN_UNATTRIBUTED
@@ -24592,6 +24601,28 @@ _REVIEW_LIFECYCLE_EVENT_KINDS = (
     "review_requested", "changes_requested", "review_reopened",
 )
 
+# Event kinds that INVALIDATE an approval when they land after the review
+# request that approval belongs to: an explicit handback or reopen, an owner
+# reopen / rework transition, or a new implementation claim. ``claimed`` is
+# conditional — :func:`claim_review_task` writes that same kind for the
+# REVIEWER's own claim, and the reviewer looking at the cycle can't be what
+# invalidates it, so only a ``claimed`` event WITHOUT ``source_status ==
+# "review"`` in its payload counts.
+_REVIEW_APPROVAL_INVALIDATING_EVENT_KINDS = (
+    "changes_requested", "review_reopened",
+    "owner_move", "owner_project_plan_change",
+    "claimed",
+)
+
+# Every kind :func:`task_review_states` reads, in ONE batched query: the
+# lifecycle kinds above, the invalidating kinds, and ``completed`` (the event
+# that closes a review cycle with an approval).
+_REVIEW_STATE_EVENT_KINDS = tuple(dict.fromkeys(
+    _REVIEW_LIFECYCLE_EVENT_KINDS
+    + _REVIEW_APPROVAL_INVALIDATING_EVENT_KINDS
+    + ("completed",)
+))
+
 REVIEW_STATE_AWAITING_REVIEW = "awaiting_review"
 REVIEW_STATE_CHANGES_REQUESTED = "changes_requested"
 REVIEW_STATE_APPROVED = "approved"
@@ -24608,22 +24639,26 @@ def task_review_states(
     / ``_APPROVED`` / ``_NONE`` per task, first match wins:
 
     1. ``status == "review"``                                -> awaiting_review
-    2. ``status == "done"`` AND the LATEST review-lifecycle
-       event for this task is ``review_requested``            -> approved
+    2. ``status == "done"`` AND the FINAL review cycle was approved
+       and never invalidated (see below)                       -> approved
     3. the LATEST review-lifecycle event is ``changes_requested``
        or ``review_reopened``                                 -> changes_requested
     4. otherwise                                               -> none
 
-    Rule 2 requires the LATEST lifecycle event, not merely "some
-    ``review_requested`` fired at some point": a done task that finished
-    without ever entering review reads ``none`` (no lifecycle event at all,
-    so rule 2 and 3 both miss it) — this surface must never report a review
-    approval that never happened. And a done task whose most recent
-    lifecycle event is ``changes_requested``/``review_reopened`` — the
-    implementer completed its rework run without ever requesting re-review —
-    must not read ``approved`` either; only a completion that happened after
-    the latest review request, with no later handback, is honest positive
-    evidence of approval.
+    Rule 2 is bound to the FINAL review cycle's own approval evidence. Let
+    ``R`` be the id of the task's LATEST ``review_requested`` event; the task
+    is approved iff ``R`` exists, a ``completed`` event follows it (the
+    completion that closed that cycle), and NO invalidating event follows it
+    (see ``_REVIEW_APPROVAL_INVALIDATING_EVENT_KINDS``: a handback, a reopen,
+    an owner rework transition, or a new implementation claim). Anything
+    weaker reports an approval that never happened: a done task that finished
+    without ever entering review has no ``R`` at all; a rework run completed
+    without requesting re-review has its handback after ``R``; and an owner
+    move back out of ``done`` followed by a fresh implementation claim and a
+    completion retracts the earlier cycle's approval rather than inheriting
+    it. Rule 3 still reads only the lifecycle kinds, so a reopen with no
+    later re-review keeps reading ``changes_requested`` while an owner move —
+    which is not a review-lane event — leaves the task at ``none``.
 
     Batched: one query across every task in ``tasks``, never one per task.
     """
@@ -24633,13 +24668,16 @@ def task_review_states(
 
     task_ids = [task.id for task in tasks]
     latest_lifecycle: dict[str, tuple[int, str]] = {}
+    latest_review_request: dict[str, int] = {}
+    latest_completion: dict[str, int] = {}
+    latest_invalidation: dict[str, int] = {}
     try:
         placeholders = ",".join("?" for _ in task_ids)
-        kind_placeholders = ",".join("?" for _ in _REVIEW_LIFECYCLE_EVENT_KINDS)
+        kind_placeholders = ",".join("?" for _ in _REVIEW_STATE_EVENT_KINDS)
         rows = conn.execute(
-            "SELECT task_id, id, kind FROM task_events "
+            "SELECT task_id, id, kind, payload FROM task_events "
             f"WHERE task_id IN ({placeholders}) AND kind IN ({kind_placeholders})",
-            (*task_ids, *_REVIEW_LIFECYCLE_EVENT_KINDS),
+            (*task_ids, *_REVIEW_STATE_EVENT_KINDS),
         ).fetchall()
     except sqlite3.Error:
         rows = []
@@ -24647,15 +24685,43 @@ def task_review_states(
         task_id = str(row["task_id"])
         kind = str(row["kind"])
         event_id = int(row["id"])
-        current = latest_lifecycle.get(task_id)
-        if current is None or event_id > current[0]:
-            latest_lifecycle[task_id] = (event_id, kind)
+        if kind in _REVIEW_LIFECYCLE_EVENT_KINDS:
+            current = latest_lifecycle.get(task_id)
+            if current is None or event_id > current[0]:
+                latest_lifecycle[task_id] = (event_id, kind)
+        if kind == "review_requested":
+            if event_id > latest_review_request.get(task_id, 0):
+                latest_review_request[task_id] = event_id
+        elif kind == "completed":
+            if event_id > latest_completion.get(task_id, 0):
+                latest_completion[task_id] = event_id
+        if kind in _REVIEW_APPROVAL_INVALIDATING_EVENT_KINDS:
+            if kind == "claimed":
+                # The reviewer's own claim is part of the cycle it reviews,
+                # not a rework of it — skip it.
+                try:
+                    payload = json.loads(row["payload"]) if row["payload"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("source_status") == "review"
+                ):
+                    continue
+            if event_id > latest_invalidation.get(task_id, 0):
+                latest_invalidation[task_id] = event_id
 
     for task in tasks:
         latest_kind = latest_lifecycle.get(task.id, (0, ""))[1]
+        requested_id = latest_review_request.get(task.id, 0)
+        approved = (
+            requested_id > 0
+            and latest_completion.get(task.id, 0) > requested_id
+            and latest_invalidation.get(task.id, 0) < requested_id
+        )
         if task.status == "review":
             states[task.id] = REVIEW_STATE_AWAITING_REVIEW
-        elif task.status == "done" and latest_kind == "review_requested":
+        elif task.status == "done" and approved:
             states[task.id] = REVIEW_STATE_APPROVED
         elif latest_kind in ("changes_requested", "review_reopened"):
             states[task.id] = REVIEW_STATE_CHANGES_REQUESTED
