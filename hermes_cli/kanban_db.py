@@ -23741,7 +23741,52 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 # ``dependency`` wait and a ``transient`` hint all sit in the same column.
 STOPPED_WORK_GAVE_UP = "gave_up"
 STOPPED_WORK_CAPABILITY = "capability"
+STOPPED_WORK_NONE = "none"
 OWNER_RETRY_EVENT_KIND = "owner_retry"
+
+# The status-transitioning events that SUPERSEDE an older stop. Each one is a
+# deliberate transition someone else authored — an owner compare-and-swap move
+# (``cas_transition_task``'s ``owner_move``), a Project Steward plan applying a
+# change to this task (``owner_project_plan_change``), an archive, or a plan's
+# park being released again (``owner_work_activated``). Once any of them has
+# happened AFTER the stopping event, the stopping event no longer describes why
+# the task is in the state it is in NOW, so it is not evidence of stopped work
+# any more. Compared by the monotonic ``task_events.id`` the kernel already
+# relies on everywhere else — never by whole-second ``created_at``.
+_STOP_SUPERSEDING_EVENT_KINDS = (
+    "owner_move", "owner_project_plan_change", "archived",
+    "owner_work_activated",
+)
+
+# The event kinds that can be the most recent block-transitioning event.
+_STOP_TRANSITION_EVENT_KINDS = ("blocked", "unblocked", "gave_up")
+
+
+def _stopped_work_kind(
+    *,
+    status: Any,
+    block_kind: Any,
+    stop_kind: Any,
+    stop_event_id: Optional[int],
+    superseding_event_id: Optional[int],
+) -> Optional[str]:
+    """THE stopped-work classification rule, from already-read kernel rows.
+
+    Shared verbatim by :func:`stopped_work_retry_evidence` (what the owner
+    retry is allowed to act on) and :func:`task_stopped_work_states` (what the
+    owner snapshot shows), so the two can never disagree about whether a task
+    counts as stopped. Returns ``STOPPED_WORK_GAVE_UP`` /
+    ``STOPPED_WORK_CAPABILITY``, or ``None`` for "not stopped work".
+    """
+    if status != "blocked" or stop_kind is None or stop_event_id is None:
+        return None
+    if superseding_event_id is not None and superseding_event_id > stop_event_id:
+        return None
+    if stop_kind == "gave_up":
+        return STOPPED_WORK_GAVE_UP
+    if stop_kind == "blocked" and block_kind == STOPPED_WORK_CAPABILITY:
+        return STOPPED_WORK_CAPABILITY
+    return None
 
 
 def stopped_work_retry_evidence(
@@ -23769,12 +23814,18 @@ def stopped_work_retry_evidence(
     is deliberately not cleared on unblock (see :func:`unblock_task`) and so
     on its own can still be describing a block that is already over.
 
+    Eligibility is bound to the provenance of the CURRENT status transition,
+    not merely to the newest block-transitioning event: an ``owner_move``, an
+    ``owner_project_plan_change``, an archive or an ``owner_work_activated``
+    landing AFTER the stopping event means the task is where it is because
+    somebody put it there, so the older stop is superseded and this returns
+    None (see :data:`_STOP_SUPERSEDING_EVENT_KINDS`).
+
     Returns ``{"kind": ..., "run_id": ...}``. ``run_id`` is the run the stop
     was recorded against — the stopping event's OWN run id, never a run
     inferred from the task plus a time window — and is ``None`` when that
-    event names no run at all (the breaker's crash/timeout path trips after
-    its caller already closed the run, and a block from ``ready`` with no
-    reason never opens one).
+    event names no run at all (e.g. a block from ``ready`` with no reason
+    never opens one).
     """
     task = conn.execute(
         "SELECT status, block_kind FROM tasks WHERE id = ? AND task_kind = 'work'",
@@ -23783,22 +23834,95 @@ def stopped_work_retry_evidence(
     if task is None or task["status"] != "blocked":
         return None
     event = conn.execute(
-        "SELECT kind, run_id FROM task_events WHERE task_id = ? "
+        "SELECT id, kind, run_id FROM task_events WHERE task_id = ? "
         "AND kind IN ('blocked', 'unblocked', 'gave_up') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if event is None:
         return None
-    block_kind = task["block_kind"] if "block_kind" in task.keys() else None
-    if event["kind"] == "gave_up":
-        kind = STOPPED_WORK_GAVE_UP
-    elif event["kind"] == "blocked" and block_kind == STOPPED_WORK_CAPABILITY:
-        kind = STOPPED_WORK_CAPABILITY
-    else:
+    superseding = conn.execute(
+        "SELECT MAX(id) AS latest FROM task_events WHERE task_id = ? "
+        f"AND kind IN ({','.join('?' for _ in _STOP_SUPERSEDING_EVENT_KINDS)})",
+        (task_id, *_STOP_SUPERSEDING_EVENT_KINDS),
+    ).fetchone()
+    kind = _stopped_work_kind(
+        status=task["status"],
+        block_kind=task["block_kind"] if "block_kind" in task.keys() else None,
+        stop_kind=event["kind"],
+        stop_event_id=int(event["id"]),
+        superseding_event_id=(
+            int(superseding["latest"])
+            if superseding is not None and superseding["latest"] is not None
+            else None
+        ),
+    )
+    if kind is None:
         return None
     run_id = event["run_id"]
     return {"kind": kind, "run_id": int(run_id) if run_id is not None else None}
+
+
+def task_stopped_work_states(
+    conn: sqlite3.Connection,
+    tasks: "list[Task]",
+) -> dict[str, str]:
+    """Return each task's stopped-work state, keyed by task id.
+
+    Exactly one of ``STOPPED_WORK_GAVE_UP`` / ``STOPPED_WORK_CAPABILITY`` /
+    ``STOPPED_WORK_NONE`` per task, decided by the very same
+    :func:`_stopped_work_kind` rule — including its superseded-provenance
+    boundary — that :func:`stopped_work_retry_evidence` gates the owner retry
+    on, so a surface built from this can never disagree with what the retry
+    would actually accept.
+
+    Batched and read-only: two queries across every task in ``tasks``, never
+    one per task, and no writes, so it runs on a read-only connection.
+    """
+    states: dict[str, str] = {}
+    if not tasks:
+        return states
+
+    task_ids = [task.id for task in tasks]
+    placeholders = ",".join("?" for _ in task_ids)
+    latest_stop: dict[str, tuple[int, str]] = {}
+    latest_superseding: dict[str, int] = {}
+    try:
+        kind_placeholders = ",".join("?" for _ in _STOP_TRANSITION_EVENT_KINDS)
+        stop_rows = conn.execute(
+            "SELECT task_id, id, kind FROM task_events "
+            f"WHERE task_id IN ({placeholders}) AND kind IN ({kind_placeholders})",
+            (*task_ids, *_STOP_TRANSITION_EVENT_KINDS),
+        ).fetchall()
+        kind_placeholders = ",".join("?" for _ in _STOP_SUPERSEDING_EVENT_KINDS)
+        superseding_rows = conn.execute(
+            "SELECT task_id, MAX(id) AS latest FROM task_events "
+            f"WHERE task_id IN ({placeholders}) AND kind IN ({kind_placeholders}) "
+            "GROUP BY task_id",
+            (*task_ids, *_STOP_SUPERSEDING_EVENT_KINDS),
+        ).fetchall()
+    except sqlite3.Error:
+        stop_rows, superseding_rows = [], []
+    for row in stop_rows:
+        task_id = str(row["task_id"])
+        event_id = int(row["id"])
+        current = latest_stop.get(task_id)
+        if current is None or event_id > current[0]:
+            latest_stop[task_id] = (event_id, str(row["kind"]))
+    for row in superseding_rows:
+        if row["latest"] is not None:
+            latest_superseding[str(row["task_id"])] = int(row["latest"])
+
+    for task in tasks:
+        stop = latest_stop.get(task.id)
+        states[task.id] = _stopped_work_kind(
+            status=task.status,
+            block_kind=task.block_kind,
+            stop_kind=stop[1] if stop else None,
+            stop_event_id=stop[0] if stop else None,
+            superseding_event_id=latest_superseding.get(task.id),
+        ) or STOPPED_WORK_NONE
+    return states
 
 
 def committed_owner_retry_event(
@@ -28469,6 +28593,11 @@ def enforce_max_runtime(
                         "sigkill": killed,
                         "retry_status": retry_status,
                     },
+                    # The run this timeout was recorded against — the one
+                    # ``_end_run`` just closed above, not a run inferred from
+                    # the task or the clock. Carries into the ``gave_up``
+                    # event so an owner retry can name the exact attempt.
+                    stop_run_id=run_id,
                 )
     return timed_out
 
@@ -28821,8 +28950,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, Optional[int]]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, run_id)
+    # ``run_id`` is the run THIS crash was recorded against — the one
+    # ``_end_run`` closed for it inside the txn below — so a breaker trip can
+    # bind its ``gave_up`` event to that exact attempt.
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
@@ -28976,7 +29108,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, run_id)
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
@@ -28998,10 +29130,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for (
+            tid, pid, claimer, protocol_violation, error_text, crash_run_id,
+        ) in crash_details:
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -29046,6 +29180,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                             "protocol_violations": streak,
                             "protocol_violation_limit": violation_limit,
                         },
+                        # The run this crash was recorded against, taken from
+                        # the reclaim txn that closed it — never re-derived.
+                        stop_run_id=crash_run_id,
                     )
                 if tripped:
                     auto_blocked.append(tid)
@@ -29062,6 +29199,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     release_claim=False,
                     end_run=False,
                     event_payload_extra={"pid": pid, "claimer": claimer},
+                    # Same exact-run binding as the protocol-violation branch.
+                    stop_run_id=crash_run_id,
                 )
             if tripped:
                 auto_blocked.append(tid)
@@ -29102,6 +29241,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     expected_run_id: Any = NO_RUN_EXPECTATION,
+    stop_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -29130,6 +29270,15 @@ def _record_task_failure(
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
     context (e.g. pid on crash, elapsed on timeout).
+
+    ``stop_run_id`` is for the ``end_run=False`` timeout/crash paths only:
+    the caller has ALREADY closed the run this stop belongs to, so there is
+    no open run left here to name. It passes the exact run id the kernel
+    itself recorded that stop against — ``enforce_max_runtime``'s own closed
+    run, ``detect_crashed_workers``'s per-crash run — and the ``gave_up``
+    event is bound to it. Never inferred here from the task, the clock or
+    "the newest run": a path with no run id of its own leaves it ``None``
+    and the event names no run, exactly as before.
 
     Resolution order for the effective threshold:
       1. per-task ``max_retries`` if set (nothing else overrides)
@@ -29250,7 +29399,9 @@ def _record_task_failure(
                     + cas_sql,
                     (failures, error[:500], task_id, *cas_params),
                 )
-            run_id = None
+            # The timeout/crash paths closed their run before calling here, so
+            # they hand in the exact run that stop was recorded against.
+            run_id = None if end_run else stop_run_id
             if end_run:
                 # Only the spawn path has an open run to close.
                 run_id = _end_run(

@@ -755,10 +755,13 @@ def test_project_snapshot_is_exact_receipt_backed_and_read_only(ctx):
     assert len(tasks) == 3
     assert all(set(task) == {
         "id", "title", "assignee_name", "responsibility", "updated_at",
-        "event_revision", "review_state", "parent_ids", "child_ids",
+        "event_revision", "review_state", "stopped_work",
+        "parent_ids", "child_ids",
     } for task in tasks)
     # None of these three fresh tasks ever entered review.
     assert all(task["review_state"] == "none" for task in tasks)
+    # None of them ever stopped on their own either.
+    assert all(task["stopped_work"] == "none" for task in tasks)
     assert snapshot["workers"] == []
     assert snapshot["attachments"] == []
     assert snapshot["runs"] == []
@@ -8896,6 +8899,191 @@ def _gave_up_task(board: str, project_id: str, title: str) -> str:
     return task_id
 
 
+def _timed_out_task(board: str, project_id: str, title: str) -> tuple[str, int]:
+    """Give up via the REAL timeout path; return the task and its stopped run.
+
+    Nothing about the stop is asserted into place: the task is really claimed
+    (which opens the run), its start is really moved past the per-task runtime
+    limit, and ``enforce_max_runtime`` — the production sweep — is what kills
+    the attempt, closes the run ``timed_out`` and trips the breaker.
+    """
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        task_id = kanban_db.create_task(
+            conn, title=title, assignee="default", project_id=project_id,
+            max_runtime_seconds=1, max_retries=1,
+        )
+        assert kanban_db.claim_task(conn, task_id) is not None
+        run_id = int(kanban_db.get_task(conn, task_id).current_run_id)
+        kanban_db._set_worker_pid(conn, task_id, 555_001)
+        started = int(time.time()) - 1000
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?", (started, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?", (started, run_id),
+            )
+        assert task_id in kanban_db.enforce_max_runtime(
+            conn, signal_fn=lambda *_a: None,
+        )
+        assert kanban_db.get_task(conn, task_id).status == "blocked"
+    return task_id, run_id
+
+
+def _crashed_task(board: str, project_id: str, title: str) -> tuple[str, int]:
+    """Give up via the REAL crash path; return the task and its stopped run."""
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        task_id = kanban_db.create_task(
+            conn, title=title, assignee="default", project_id=project_id,
+            max_retries=1,
+        )
+        assert kanban_db.claim_task(conn, task_id) is not None
+        run_id = int(kanban_db.get_task(conn, task_id).current_run_id)
+        # A pid that is genuinely not alive, started long enough ago that the
+        # launch-window grace has passed — the two facts the reaper reads.
+        kanban_db._set_worker_pid(conn, task_id, 555_002)
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?",
+                (int(time.time()) - 1000, task_id),
+            )
+        assert task_id in kanban_db.detect_crashed_workers(conn)
+        assert kanban_db.get_task(conn, task_id).status == "blocked"
+    return task_id, run_id
+
+
+def test_timeout_and_crash_retries_reach_the_exact_attempt_they_stopped(
+    ctx, all_assignees_spawnable,
+):
+    """A retry after a timeout or a crash must name the run that stopped.
+
+    Both of these give up AFTER their caller already closed the run, so the
+    ``gave_up`` event has no open run to take an id from — it has to carry the
+    one the kernel itself recorded the stop against. If it does not, the
+    owner's reason is written against no run at all and the owner-facing
+    receipt for the very attempt they spoke about says nothing.
+
+    End to end in both directions: the stop is produced by the real
+    ``enforce_max_runtime`` / ``detect_crashed_workers`` sweeps, the retry is
+    the real ``retry_task``, and the reason is read back through the real
+    owner snapshot's run receipts.
+    """
+    setup = _bootstrap_board(ctx)
+    timeout_reason = "The build machine had stalled; it is restarted now."
+    crash_reason = "The worker host ran out of memory; it has more now."
+    cases = {
+        "Timed out release step": (_timed_out_task, "retry-timeout", timeout_reason),
+        "Crashed release step": (_crashed_task, "retry-crash", crash_reason),
+    }
+
+    stopped_runs = {}
+    for title, (factory, key, reason) in cases.items():
+        task_id, run_id = factory(setup["board"], setup["project_id"], title)
+        stopped_runs[title] = run_id
+
+        # The kernel's own evidence names the attempt it stopped.
+        with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+            assert kanban_db.stopped_work_retry_evidence(conn, task_id) == {
+                "kind": "gave_up", "run_id": run_id,
+            }, title
+
+        result = _retry(
+            ctx,
+            idempotency_key=key,
+            project_id=setup["project_id"],
+            task_id=task_id,
+            reason=reason,
+        )
+        assert result["ok"] is True, (title, result)
+
+        # The owner_retry event is bound to that same exact run, so the
+        # receipt query can join it.
+        with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+            assert ow._owner_run_retry_reasons(conn, [run_id]) == {
+                run_id: reason,
+            }, title
+
+    # And through the real owner-facing read path: each attempt reports the
+    # reason the owner gave for THAT attempt and no other.
+    snapshot = ow.read_project_snapshot(ctx, setup["board"], run_context=True)
+    receipts = {run["task_title"]: run["receipt"] for run in snapshot["runs"]}
+    assert set(receipts) == set(cases)
+    assert receipts["Timed out release step"]["owner_retry"] == {
+        "state": "requested", "reason": timeout_reason,
+    }
+    assert receipts["Crashed release step"]["owner_retry"] == {
+        "state": "requested", "reason": crash_reason,
+    }
+    assert stopped_runs["Timed out release step"] != stopped_runs["Crashed release step"]
+
+
+def test_snapshot_stopped_work_matches_the_state_the_kernel_produced(
+    ctx, all_assignees_spawnable,
+):
+    """Every card says whether its work stopped on its own, in three words.
+
+    All three values come from board states this test really produced: the
+    dispatcher giving up, a worker hitting a capability wall, and ordinary
+    work nobody stopped. The fourth assertion is the one that matters most —
+    an owner move that supersedes an old give-up flips the card back to
+    ``none``, because this field and the retry read the same kernel evidence
+    and must never disagree about whether work is stopped.
+    """
+    setup = _bootstrap_board(ctx)
+    board, project_id = setup["board"], setup["project_id"]
+
+    # Produced first: the dispatcher tick below would otherwise also spawn-fail
+    # the other two tasks.
+    gave_up_id = _gave_up_task(board, project_id, "Gave up release step")
+    capability_id = _capability_stopped_task(
+        board, project_id, "Capability walled step",
+    )
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        plain_id = kanban_db.create_task(
+            conn, title="Plain planned step", assignee="default",
+            project_id=project_id,
+        )
+
+    def _stopped_work():
+        snapshot = ow.read_project_snapshot(ctx, board)
+        return {
+            task["id"]: task["stopped_work"]
+            for column in snapshot["columns"]
+            for task in column["tasks"]
+        }
+
+    assert _stopped_work() == {
+        gave_up_id: "gave_up",
+        capability_id: "capability",
+        plain_id: "none",
+    }
+
+    # The owner moves the gave-up card out of blocked and back into it. It is
+    # blocked because THEY put it there now, so it is no longer stopped work —
+    # and the retry agrees.
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        revision = kanban_db.task_event_revision(conn, gave_up_id)
+    revision = _owner_move(
+        ctx, setup, gave_up_id, key="snapshot-move-out",
+        expected_status="blocked", to_status="todo", revision=revision,
+    )
+    _owner_move(
+        ctx, setup, gave_up_id, key="snapshot-move-back",
+        expected_status="todo", to_status="blocked", revision=revision,
+    )
+
+    assert _stopped_work()[gave_up_id] == "none"
+    refused = _retry(
+        ctx,
+        idempotency_key="snapshot-retry-after-move",
+        project_id=project_id,
+        task_id=gave_up_id,
+        reason="I would still like this tried again.",
+    )
+    assert refused["ok"] is False, refused
+    assert refused["error"] == "not_retryable"
+
+
 def test_retry_resumes_work_the_breaker_gave_up_on(ctx, all_assignees_spawnable):
     """The dispatcher gave up; the owner says why it is worth another go."""
     setup = _bootstrap_board(ctx)
@@ -9074,6 +9262,79 @@ def test_retry_replayed_under_one_key_retries_once_and_records_one_reason(ctx):
     ]
     receipts = _run_receipts(ctx, setup["board"])
     assert [receipt["owner_retry"]["reason"] for receipt in receipts] == [reason]
+
+
+def _owner_move(ctx, setup, task_id, *, key, expected_status, to_status, revision):
+    """One real public owner compare-and-swap move, confirmation answered."""
+    approver = _with_approver(ctx.session)
+    try:
+        result = ow.move_task(
+            ctx, idempotency_key=key, task_id=task_id, to_status=to_status,
+            expected_status=expected_status, expected_revision=revision,
+            project_id=setup["project_id"],
+        )
+    finally:
+        approver.join()
+    assert result["ok"] is True, result
+    return result["revision"]
+
+
+def test_retry_is_refused_once_an_owner_move_supersedes_the_give_up(
+    ctx, all_assignees_spawnable,
+):
+    """A task blocked because the OWNER put it there is not stopped work.
+
+    The dispatcher really gave up on this task, and the owner really moved it
+    out of ``blocked`` and back into it afterwards. It therefore sits in the
+    same column with the same old ``gave_up`` in its history — but that event
+    no longer describes why the work is where it is, so the retry must refuse
+    it and say so, rather than resuming work on superseded evidence.
+    """
+    setup = _bootstrap_board(ctx)
+    task_id = _gave_up_task(
+        setup["board"], setup["project_id"], "B03 — Ship the first release",
+    )
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        revision = kanban_db.task_event_revision(conn, task_id)
+
+    revision = _owner_move(
+        ctx, setup, task_id, key="supersede-move-out",
+        expected_status="blocked", to_status="todo", revision=revision,
+    )
+    _owner_move(
+        ctx, setup, task_id, key="supersede-move-back",
+        expected_status="todo", to_status="blocked", revision=revision,
+    )
+
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        # Exactly the shape the reviewer reproduced: still blocked, still
+        # carrying its own gave_up, with owner moves layered on top.
+        assert kanban_db.get_task(conn, task_id).status == "blocked"
+        assert [
+            row["kind"] for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id ASC",
+                (task_id,),
+            )
+        ][-3:] == ["gave_up", "owner_move", "owner_move"]
+
+    result = _retry(
+        ctx,
+        idempotency_key="retry-after-owner-move",
+        project_id=setup["project_id"],
+        task_id=task_id,
+        reason="I still think this is worth another attempt.",
+    )
+
+    assert result["ok"] is False, result
+    assert result["error"] == "not_retryable"
+    assert result["current_status"] == "blocked"
+    assert "can be tried again" in result["reason"]
+
+    # Nothing moved and nothing was recorded on the work.
+    assert _events_of(setup["board"], task_id, "owner_retry") == []
+    with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
+        assert kanban_db.get_task(conn, task_id).status == "blocked"
+        assert kanban_db.stopped_work_retry_evidence(conn, task_id) is None
 
 
 def _ready_task(conn, project_id: str, title: str) -> str:

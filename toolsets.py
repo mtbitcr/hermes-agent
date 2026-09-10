@@ -312,7 +312,8 @@ TOOLSETS = {
             "Owner-workspace mutation tools (bootstrap a Project + Kanban "
             "board + initial task; commit an approved Task graph or Project "
             "Steward plan; archive or restore a Project; move a task "
-            "via compare-and-swap; comment "
+            "via compare-and-swap; retry work that stopped on its own; "
+            "comment "
             "as the trusted caller). Opt-in, API-server-only — every "
             "mutation is idempotent and requires a fresh human confirmation."
         ),
@@ -320,6 +321,7 @@ TOOLSETS = {
             "owner_workspace_bootstrap", "owner_task_graph_commit",
             "owner_project_plan_commit",
             "owner_task_move", "owner_task_comment", "owner_project_lifecycle",
+            "owner_task_retry",
         ],
         "includes": [],
         # See _get_platform_tools()'s explicit_passthrough filtering — a

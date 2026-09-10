@@ -3126,6 +3126,12 @@ def read_project_snapshot(
         # ``kanban_db.task_review_states`` for the closed vocabulary and its
         # first-match-wins resolution order.
         review_states = kanban_db.task_review_states(conn, tasks)
+        # Same batched-once, read-only shape, and deliberately the SAME kernel
+        # evidence ``owner_task_retry`` gates on (``_stopped_work_kind``,
+        # superseded-provenance rule included) — so a card this snapshot shows
+        # as stopped is exactly a card the retry would accept, and one it shows
+        # as "none" is exactly one the retry would refuse.
+        stopped_work = kanban_db.task_stopped_work_states(conn, tasks)
 
         columns = {status: [] for status in _OWNER_PROJECT_COLUMNS}
         for task in tasks:
@@ -3141,6 +3147,9 @@ def read_project_snapshot(
                 "event_revision": state["revision"] if state else 0,
                 "review_state": review_states.get(
                     task.id, kanban_db.REVIEW_STATE_NONE
+                ),
+                "stopped_work": stopped_work.get(
+                    task.id, kanban_db.STOPPED_WORK_NONE
                 ),
                 "parent_ids": parent_map[task.id],
                 "child_ids": child_map[task.id],

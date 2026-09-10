@@ -960,6 +960,109 @@ class TestStartRun:
         assert handler.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_owner_workspace_toolset_retry_runs_under_the_real_approval(
+        self, adapter,
+    ):
+        """The retry the owner toolset offers IS the one the run layer dispatches.
+
+        Everything about the retry here is production's: the tool name comes
+        out of the ``owner_workspace`` toolset rather than being typed as a
+        literal, the handler is the registered one (nothing is patched onto
+        ``owner_workspace_tools``), and the confirmation is the real hidden
+        owner approval — raised by the kernel, surfaced on the run as an
+        ``owner_task_retry`` decision, and answered through the run's own
+        ``/approval`` endpoint. No private adapter or approval-queue state is
+        seeded. The effect is then read off the board, not off a return value.
+        """
+        from tools import owner_workspace_tools  # noqa: F401 — registers the tools
+        from tools.registry import registry as tool_registry
+
+        from toolsets import resolve_toolset
+
+        # A tool an agent can never be granted is not a capability. Every tool
+        # the registry carries for ``owner_workspace`` must also be OFFERED by
+        # that toolset's own static definition — that definition is what
+        # ``_get_platform_tools`` resolves an api_server profile against, so a
+        # tool missing from it never reaches an owner-workspace agent no
+        # matter what registered it.
+        registered = set(
+            tool_registry.get_tool_names_for_toolset("owner_workspace")
+        )
+        offered = set(resolve_toolset("owner_workspace", include_registry=False))
+        assert "owner_task_retry" in registered
+        assert registered <= offered, sorted(registered - offered)
+        retry_tool = "owner_task_retry"
+
+        idempotency_key = "owner-task-retry-toolset-approved"
+        created, task_id, retry_payload, body = _owner_retry_run_setup(
+            idempotency_key,
+        )
+        # The run authority names exactly the toolset's own tool.
+        assert body["owner_retry_authority"]["operation"] == retry_tool
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch.object(adapter, "_create_agent") as mock_create,
+        ):
+            mock_create.side_effect = RuntimeError("provider unavailable")
+            async with TestClient(TestServer(app)) as cli:
+                started = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                run_id = (await started.json())["run_id"]
+
+                # The kernel's own confirmation reaches the owner as a run
+                # decision naming this exact operation.
+                pending = None
+                for _ in range(400):
+                    polled = await cli.get(f"/v1/runs/{run_id}")
+                    status = await polled.json()
+                    if status["status"] == "waiting_for_approval":
+                        pending = status["pending_approval"]
+                        break
+                    await asyncio.sleep(0.05)
+                assert pending is not None, status
+                assert pending["operation"] == retry_tool
+
+                answered = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "once",
+                        "approval_id": pending["approval_id"],
+                    },
+                )
+                assert answered.status == 200, await answered.json()
+
+                for _ in range(400):
+                    polled = await cli.get(f"/v1/runs/{run_id}")
+                    status = await polled.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert started.status == 202
+        assert status["status"] == "completed", status
+        assert status["owner_mutation_committed"] is True
+        output = json.loads(status["output"])
+        assert output["ok"] is True, output
+        assert output["task_id"] == task_id
+        assert output["retry_reason"] == retry_payload["reason"]
+        # No model was ever asked to produce that call.
+        mock_create.assert_not_called()
+
+        # The work really left the state the worker stopped it in, and the
+        # owner's reason is durable on the board.
+        assert _task_status(created["board"], task_id) == "ready"
+        assert [
+            event["reason"]
+            for event in _owner_retry_events(created["board"], task_id)
+        ] == [_RETRY_REASON]
+
+    @pytest.mark.asyncio
     async def test_owner_retry_transport_retry_recovers_a_committed_run(
         self, adapter,
     ):
