@@ -3917,6 +3917,14 @@ def _workspace_board_response(*, owner_titles: bool = False) -> dict:
             if row["parent_id"] in visible and row["child_id"] in visible:
                 child_map[row["parent_id"]].append(row["child_id"])
                 parent_map[row["child_id"]].append(row["parent_id"])
+        # Batched once for every visible task, never per task: see
+        # ``kanban_db.task_review_states`` for the closed vocabulary and its
+        # first-match-wins resolution order.
+        review_states = kanban_db.task_review_states(conn, tasks)
+        # Same batched-once, read-only shape, and deliberately the SAME kernel
+        # evidence the owner snapshot reports — so a card this window shows
+        # as stopped is exactly a card the owner snapshot shows as stopped.
+        stopped_work = kanban_db.task_stopped_work_states(conn, tasks)
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         for t in tasks:
             col = t.status if t.status in columns else "todo"
@@ -3935,6 +3943,12 @@ def _workspace_board_response(*, owner_titles: bool = False) -> dict:
                         state["latest"] if state else t.created_at
                     ),
                     "event_revision": state["revision"] if state else 0,
+                    "review_state": review_states.get(
+                        t.id, kanban_db.REVIEW_STATE_NONE
+                    ),
+                    "stopped_work": stopped_work.get(
+                        t.id, kanban_db.STOPPED_WORK_NONE
+                    ),
                     "parent_ids": parent_map[t.id],
                     "child_ids": child_map[t.id],
                 }
