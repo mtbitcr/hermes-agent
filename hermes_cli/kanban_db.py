@@ -23739,6 +23739,23 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
                 reviewer = prior_reviewer
+        if reviewer is None and not unassign_reviewer and trow["requires_review"]:
+            # A committed review requirement promises INDEPENDENT review, so an
+            # omitted reviewer means the policy's nominee — never "keep whoever
+            # holds it", which would park the card under its own implementer
+            # for the review dispatcher to re-claim as its reviewer. The
+            # nominee still answers to independent_review_target_error below;
+            # a policy that nominates nobody fails closed here, before any
+            # write, rather than parking the work under the profile that
+            # wrote it.
+            reviewer = policy_resolved_reviewer()
+            if reviewer is None:
+                return _ret(
+                    False,
+                    f"cannot park {task_id} for review without a reviewer: its "
+                    "committed specification requires independent review and "
+                    "the model policy nominates no reviewer right now",
+                )
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
         # WHO may hold this card for review, decided before anything is
         # authorized or written. Checked for every named reviewer, including

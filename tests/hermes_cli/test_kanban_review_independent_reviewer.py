@@ -148,6 +148,49 @@ def test_review_request_must_name_the_policys_current_reviewer(
         assert handover[0]["reviewer"] == REVIEWER
 
 
+def test_an_omitted_reviewer_on_required_review_work_is_the_policys_nominee(
+    kanban_home, monkeypatch,
+):
+    """The ordinary request shape omits its optional reviewer; for work that
+    carries the committed requirement that means the policy's nominee, and
+    nobody nominated fails closed before anything is written."""
+    _nominate(monkeypatch, REVIEWER)
+    with kb.connect() as conn:
+        tid, run = _claimed_implementation(conn)
+        assert kb.request_review(
+            conn, tid, summary="ready", expected_run_id=run.current_run_id,
+        ) is True
+        parked = kb.get_task(conn, tid)
+        assert (parked.status, parked.assignee) == ("review", REVIEWER)
+        assert parked.owned_paths == []
+        handover = _events(conn, tid, "review_requested")[-1]
+        assert handover["implementer"] == IMPLEMENTER
+        assert handover["reviewer"] == REVIEWER
+        # The review run belongs to the nominated reviewer role, not to the
+        # profile that wrote the code.
+        review = kb.claim_review_task(conn, tid, claimer=f"{IMPLEMENTER}:2")
+        assert review is not None
+        review_run = conn.execute(
+            "SELECT profile FROM task_runs WHERE id = ?",
+            (review.current_run_id,),
+        ).fetchone()
+        assert review_run["profile"] == REVIEWER
+
+        _nominate(monkeypatch)
+        other, other_run = _claimed_implementation(conn, title="second work")
+        ok, reason = kb.request_review(
+            conn, other,
+            summary="ready",
+            expected_run_id=other_run.current_run_id,
+            with_reason=True,
+        )
+        assert ok is False
+        assert "nominates no reviewer" in (reason or "")
+        after = kb.get_task(conn, other)
+        assert (after.status, after.assignee) == ("running", IMPLEMENTER)
+        assert _events(conn, other, "review_requested") == []
+
+
 def test_review_lane_reassignment_cannot_target_the_implementer(
     kanban_home, monkeypatch,
 ):
