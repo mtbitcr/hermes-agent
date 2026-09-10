@@ -4392,23 +4392,23 @@ def _normalize_project_task_spec(
     body_mode = value.get("body_mode") if allow_body_mode and isinstance(value, dict) else None
     if body_mode == "preserve":
         required = {"title", "body_mode", "assignee", "execution_tier", "owned_paths"}
-        allowed = required | {"responsibility"}
+        allowed = required | {"responsibility", "requires_review"}
     elif body_mode == "rewrite":
         required = {
             "title", "body_mode", "body", "assignee", "execution_tier",
             "owned_paths",
         }
-        allowed = required | {"responsibility"}
+        allowed = required | {"responsibility", "requires_review"}
     else:
         required = {
             "title", "body", "assignee", "execution_tier",
         } | ({"parents"} if parent_limit is not None else set())
-        allowed = required | {"responsibility", "owned_paths"}
+        allowed = required | {"responsibility", "owned_paths", "requires_review"}
     if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(allowed):
         raise OwnerWorkspaceError(
             "invalid_argument",
             f"{field} must contain {sorted(required)} and only optional "
-            "responsibility and owned_paths",
+            f"{sorted(allowed - required)}",
         )
     raw = value
     from agent.redact import redact_sensitive_text
@@ -4431,7 +4431,30 @@ def _normalize_project_task_spec(
         )
     except ValueError as exc:
         raise OwnerWorkspaceError("invalid_argument", str(exc)) from exc
+    requires_review = raw.get("requires_review", False)
+    if not isinstance(requires_review, bool):
+        raise OwnerWorkspaceError(
+            "invalid_argument", f"{field}.requires_review must be a boolean",
+        )
+    if requires_review:
+        # The committed review requirement: THAT this work is independently
+        # reviewed before it is done, never WHO reviews it — the reviewer is
+        # resolved from the team's policy at handover time
+        # (kanban_db.policy_resolved_reviewer). Carried only when the approved
+        # change states it (same rule as ``owned_paths``), so the request
+        # digest of every plan that does not ask for review is unchanged.
+        result["requires_review"] = True
     if result["assignee"] == "raphael-verifier":
+        # The read-only audit review task IS the independent-review lane, so it
+        # can never itself be parked awaiting one. Refused before any other
+        # verifier-specific handling, so a change that is wrong in two ways
+        # still reports this refusal.
+        if requires_review:
+            raise OwnerWorkspaceError(
+                "invalid_argument",
+                f"{field}.requires_review is not accepted for raphael-verifier: "
+                "a read-only review task is the review, not work awaiting one",
+            )
         scope = (
             _normalize_ownership_scope(raw["owned_paths"], field)
             if "owned_paths" in raw
@@ -4494,12 +4517,14 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
                 "action", "reason", "title", "body", "assignee", "execution_tier",
                 "existing_parents", "new_parents",
             }
-            allowed = required | {"responsibility", "owned_paths"}
+            allowed = required | {
+                "responsibility", "owned_paths", "requires_review",
+            }
             if not required.issubset(item) or not set(item).issubset(allowed):
                 raise OwnerWorkspaceError(
                     "invalid_argument",
                     f"{field} must contain {sorted(required)} and only optional "
-                    "responsibility and owned_paths",
+                    f"{sorted(allowed - required)}",
                 )
             raw = item
             existing = raw["existing_parents"]
@@ -4531,6 +4556,11 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
                     **(
                         {"owned_paths": raw["owned_paths"]}
                         if "owned_paths" in raw
+                        else {}
+                    ),
+                    **(
+                        {"requires_review": raw["requires_review"]}
+                        if "requires_review" in raw
                         else {}
                     ),
                 },
@@ -4683,6 +4713,127 @@ def _plan_ownership_scopes(changes: list[dict]) -> list[Optional[list[str]]]:
             if "owned_paths" in spec:
                 scopes.append(spec["owned_paths"])
     return scopes
+
+
+def _plan_created_task_specs(changes: list[dict]) -> list[dict]:
+    """Every task specification one normalized plan creates, in apply order.
+
+    Exactly the order ``kanban_db.apply_owner_project_plan`` creates rows in:
+    per change, ``add`` creates one task from the change itself, ``split``
+    creates one per entry of ``replacements`` in order, and ``replace`` and
+    ``merge`` each create their single ``replacement``. ``move``, ``postpone``
+    and ``cancel`` create nothing. That correspondence is what lets
+    :func:`_commit_plan_review_requirements` pair a created task id with the
+    approved specification it came from instead of guessing.
+    """
+    specs: list[dict] = []
+    for change in changes:
+        action = change["action"]
+        if action == "add":
+            specs.append(change)
+        elif action == "split":
+            specs.extend(change["replacements"])
+        elif action in {"replace", "merge"}:
+            specs.append(change["replacement"])
+    return specs
+
+
+def _commit_plan_review_requirements(
+    kconn: sqlite3.Connection,
+    changes: list[dict],
+    created_task_ids: Any,
+    *,
+    project_id: str,
+) -> None:
+    """Write this plan's committed review requirement onto the rows it created.
+
+    ``kanban_db.create_task`` accepts ``requires_review``, but the kernel's own
+    plan-application helper (``create_planned_task``) does not forward it, and
+    that helper is outside this change's ownership scope. So the owner kernel
+    commits the requirement itself, here, from the same normalized changes the
+    owner approved and the request digest binds.
+
+    Ordering: this runs while every created row is still parked in
+    :data:`kanban_db.PARKED_STATUS` — un-promotable and un-claimable — inside
+    the plan's board guard, BEFORE the terminal receipt is finalized and before
+    :func:`_activate_committed_owner_work` releases anything. A failure here
+    therefore fails the whole commit with the new work still parked, rather
+    than activating a task without the requirement its specification carries.
+
+    Every row is verified against its approved specification before it is
+    written: an id that is not a receipt-bound ``work`` row of this Project
+    carrying that specification's exact title and assignee is a mis-alignment,
+    not a task to write to, and is reported as ``crash_recovery_failed``. So is
+    a row that must carry the requirement but is neither parked nor already
+    carrying it — the requirement is never silently dropped. A row that already
+    carries it is left alone, so a recovered result replays as a no-op.
+    """
+    specs = _plan_created_task_specs(changes)
+    task_ids = [
+        task_id
+        for task_id in (created_task_ids if isinstance(created_task_ids, list) else [])
+        if isinstance(task_id, str)
+    ]
+    if len(task_ids) != len(specs):
+        raise OwnerWorkspaceError(
+            "crash_recovery_failed",
+            f"the applied plan reports {len(task_ids)} created task(s) where the "
+            f"approved changes create {len(specs)}; the committed review "
+            "requirement cannot be aligned",
+        )
+
+    pending: list[str] = []
+    for spec, task_id in zip(specs, task_ids):
+        row = kconn.execute(
+            "SELECT title, assignee, status, task_kind, project_id, "
+            "owner_receipt_bound, requires_review FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["task_kind"] != "work"
+            or row["project_id"] != project_id
+            or not row["owner_receipt_bound"]
+            or row["title"] != spec["title"]
+            or row["assignee"] != spec["assignee"]
+        ):
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                f"created task {task_id!r} is not the receipt-owned work this "
+                "approved change specifies",
+            )
+        if not spec.get("requires_review"):
+            continue
+        if row["requires_review"]:
+            # Already committed by this same receipt: an exact replay.
+            continue
+        if row["status"] != kanban_db.PARKED_STATUS:
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                f"created task {task_id!r} left the parked column before its "
+                "committed review requirement was written",
+            )
+        pending.append(task_id)
+
+    if not pending:
+        return
+    with kanban_db.write_txn(kconn):
+        for task_id in pending:
+            # One guarded UPDATE per task, touching no other column: the row
+            # must still be exactly the parked, receipt-owned work of this
+            # Project that was just verified.
+            cursor = kconn.execute(
+                "UPDATE tasks SET requires_review = 1 "
+                "WHERE id = ? AND task_kind = 'work' AND project_id = ? "
+                "AND owner_receipt_bound = 1 AND status = ?",
+                (task_id, project_id, kanban_db.PARKED_STATUS),
+            )
+            if cursor.rowcount != 1:
+                raise OwnerWorkspaceError(
+                    "crash_recovery_failed",
+                    f"the committed review requirement could not be written to "
+                    f"created task {task_id!r}",
+                )
 
 
 def _inherit_replaced_ownership_scopes(
@@ -5289,6 +5440,17 @@ def commit_project_plan(
                     "risk_level": risk_level,
                     **recovered,
                 }
+                # The same requirement write the fresh path performs, on the
+                # same still-parked rows: a crash between the board write and
+                # this receipt must not leave a task the owner approved for
+                # review running without it. Idempotent, so a row that already
+                # carries it is untouched.
+                _commit_plan_review_requirements(
+                    kconn,
+                    normalized_changes,
+                    recovered.get("created_task_ids"),
+                    project_id=project_id,
+                )
                 _finalize_receipt(
                     pconn, ctx, idempotency_key, token, status="committed", result=result,
                 )
@@ -5357,6 +5519,18 @@ def commit_project_plan(
                             later_milestones=normalized_later,
                             board=board_slug,
                         )
+
+                if applied["applied"]:
+                    # Still inside the board guard and before the terminal
+                    # receipt: the created work is parked, so committing the
+                    # approved review requirement here either succeeds or
+                    # fails the whole plan with nothing runnable behind it.
+                    _commit_plan_review_requirements(
+                        kconn,
+                        normalized_changes,
+                        applied.get("created_task_ids"),
+                        project_id=project_id,
+                    )
 
                 if not applied["applied"]:
                     result = {
