@@ -42,17 +42,13 @@ class TestToolSurface:
         assert registry.get_tool_names_for_toolset("owner_workspace") == sorted(TOOL_NAMES)
 
     def test_toolset_definition_lists_exactly_these_tools(self):
-        # owner_task_retry is registry-registered (sufficient for api_server's
-        # include_registry=True path) but not yet in toolsets.py's static list,
-        # which is owned by a separate change.  Assert the weaker but truthful
-        # invariant: every statically declared tool is registered, and the
-        # registry surface (what api_server actually exposes) is a superset.
+        # The static list in toolsets.py and the registry surface (what
+        # api_server actually exposes) must name the same tools: a tool
+        # registered but not declared, or declared but not registered, is a
+        # gap the owner workspace would hit at runtime.
         static_tools = set(TOOLSETS["owner_workspace"]["tools"])
         registered_tools = set(registry.get_tool_names_for_toolset("owner_workspace"))
-        assert static_tools <= registered_tools
-        # Named explicitly, so an unintended extra registration under this
-        # toolset still fails here rather than passing a blanket superset.
-        assert registered_tools - static_tools == {"owner_task_retry"}
+        assert static_tools == registered_tools == set(TOOL_NAMES)
 
     def test_no_other_toolset_exposes_owner_tools(self):
         for name, ts in TOOLSETS.items():
