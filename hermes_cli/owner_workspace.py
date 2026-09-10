@@ -1189,6 +1189,13 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
             if parent not in clean_parents:
                 clean_parents.append(parent)
 
+        requires_review = raw.get("requires_review", False)
+        if not isinstance(requires_review, bool):
+            raise OwnerWorkspaceError(
+                "invalid_argument",
+                f"tasks[{index}].requires_review must be a boolean",
+            )
+
         entry = {
             "title": title,
             "body": redact_sensitive_text(body, force=True),
@@ -1197,7 +1204,27 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
             "parents": clean_parents,
             **route_pin,
         }
+        if requires_review:
+            # The committed review requirement: THAT this work is independently
+            # reviewed before it is done. Deliberately not WHO reviews it — the
+            # reviewer is resolved from the team's policy at handover time
+            # (kanban_db.policy_resolved_reviewer), so a name captured here
+            # could never go stale. Carried only when the approved proposal
+            # states it (same rule as ``owned_paths``), so the request digest
+            # of every proposal that does not ask for review is unchanged.
+            entry["requires_review"] = True
         if assignee == "raphael-verifier":
+            # The pre-existing read-only audit review task. It IS the
+            # independent-review lane, so it can never itself be parked for
+            # review: refusing here keeps the new requirement from leaking into
+            # a task type whose semantics must not change.
+            if requires_review:
+                raise OwnerWorkspaceError(
+                    "invalid_argument",
+                    f"tasks[{index}].requires_review is not accepted for "
+                    "raphael-verifier: a read-only review task is the review, "
+                    "not work awaiting one",
+                )
             scope = (
                 _normalize_ownership_scope(
                     raw.get("owned_paths"), f"tasks[{index}]",
