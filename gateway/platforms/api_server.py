@@ -13218,7 +13218,15 @@ class APIServerAdapter(BasePlatformAdapter):
             or not isinstance(context.get("project_slug"), str)
         ):
             raise ValueError("owner retry context mismatch")
-        payload = authority["payload"]
+        # ONE canonical payload, bound and forwarded. Crash recovery rebuilds
+        # this run's digest from the cleaned payload (see
+        # :meth:`_owner_authority_digest_for_recovery`), so hashing the raw
+        # request instead committed the native receipt under a digest recovery
+        # could never look it up by: a valid retry whose reason merely carried
+        # surrounding whitespace read as failed forever. Trimming is all that
+        # happens here — the reason's owner-visible form is still the kernel's
+        # own to derive from what this forwards.
+        payload = self._owner_authority_clean(authority["payload"])
         project_id = payload.get("project_id")
         task_id = payload.get("task_id")
         reason = payload.get("reason")
@@ -13410,15 +13418,34 @@ class APIServerAdapter(BasePlatformAdapter):
                 retry_fingerprint,
             )
         )
+        # The one record that says this run ENDED somewhere we wrote down (see
+        # :meth:`ResponseStore.persist_terminal_run_status`), as opposed to a
+        # transport status this process happens to still hold. Absent for the
+        # crash window recovery exists for: a run whose terminal was never
+        # written has no durable outcome at all, and only its native receipt
+        # can decide it.
+        durable_terminal = (
+            self._response_store.run_idempotency_status(profile, retry_run_id)
+            if retry_run_id is not None else None
+        )
+        durable_replay = (
+            retry_state == "existing"
+            and retry_run_id is not None
+            and (durable_terminal or {}).get("status") in _TERMINAL_RUN_STATUSES
+        )
         retry_status = (
             self._response_store.owner_run_completion(profile, retry_run_id)
             if retry_run_id is not None else None
-        ) or self._run_statuses.get(retry_run_id or "") or (
-            self._response_store.run_idempotency_status(profile, retry_run_id)
-            if retry_run_id is not None else None
-        ) or {}
+        ) or self._run_statuses.get(retry_run_id or "") or durable_terminal or {}
+        # A run that durably ended is already its own answer. Reading a native
+        # receipt for it could only ever fail closed: the kernel records its
+        # own deterministic refusal as a COMMITTED receipt whose result is not
+        # ok, which the successful-receipt reader refuses to read, so an exact
+        # re-delivery of a known refused run answered "outcome unconfirmed"
+        # instead of returning the run the owner already has.
         if (
-            retry_state == "existing"
+            not durable_replay
+            and retry_state == "existing"
             and retry_run_id is not None
             and not (
                 retry_status.get("status") == "completed"
@@ -13443,7 +13470,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=503,
                 )
-        if (
+        if durable_replay or (
             retry_state == "existing"
             and retry_run_id is not None
             and retry_status.get("status") == "completed"
