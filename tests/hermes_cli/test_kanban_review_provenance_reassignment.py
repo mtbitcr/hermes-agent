@@ -25,6 +25,21 @@ import pytest
 from hermes_cli import kanban_db as kb
 from plugins.dashboard_auth.raphael_workspace import model_policy
 
+# The governed shape: a REAL owner-approved (policy-locked, receipt-bound) card
+# committed through the approval kernel, the only shape whose handback
+# authority consults the durable provenance at all.
+from tests.hermes_cli.test_kanban_review_handback_policy_drift import (  # noqa: F401
+    _finding,
+    _review_required_graph_args,
+)
+from tests.hermes_cli.test_owner_workspace import (  # noqa: F401
+    _commit_task_graph,
+    _configured_provider,
+    _install_profiles,
+    _with_approver,
+    ctx,
+)
+
 
 INITIAL_REVIEWER = "raphael-verifier"
 REPLACEMENT_REVIEWER = "raphael-planner"
@@ -227,3 +242,84 @@ def test_review_lane_assignment_to_same_reviewer_does_not_duplicate_provenance(
         assert len(requested_events) == 1, (
             "assigning to the same reviewer must not duplicate provenance"
         )
+
+
+def test_review_lane_reassignment_lands_the_handback_on_a_governed_card(
+    ctx, monkeypatch,
+):
+    """The reroute -> claim -> policy-drift -> handback race on a governed card.
+
+    Only a policy-governed row consults the durable provenance when the
+    reviewer hands back, so this is the shape the atomic provenance update
+    exists for: with the update absent the handback is refused (the
+    provenance still names the first reviewer, the policy no longer names
+    anyone), with it the findings land — all three records, once.
+    """
+    _install_profiles(INITIAL_REVIEWER, REPLACEMENT_REVIEWER)
+    _nominate(monkeypatch, INITIAL_REVIEWER)
+    args = _review_required_graph_args(idempotency_key="graph-reassign-drift")
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+
+    task_id = result["task_ids"][0]
+    with kb.connect(board=result["board"]) as conn:
+        governed = conn.execute(
+            "SELECT execution_tier, model_policy_lock, owner_receipt_bound "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert kb.task_is_policy_governed(governed), (
+            "this test proves nothing on an ungoverned card"
+        )
+        run = kb.claim_task(conn, task_id, claimer="default:1")
+        assert run is not None
+        assert kb.complete_task(
+            conn, task_id, summary="implemented",
+            expected_run_id=run.current_run_id,
+        ) is True
+        assert kb.get_task(conn, task_id).assignee == INITIAL_REVIEWER
+
+        # Reroute on the review lane to the reviewer the policy now names.
+        _nominate(monkeypatch, REPLACEMENT_REVIEWER)
+        assert kb.assign_task(conn, task_id, REPLACEMENT_REVIEWER) is True
+        parked = kb.get_task(conn, task_id)
+        assert parked.status == "review"
+        assert parked.assignee == REPLACEMENT_REVIEWER
+
+        review = kb.claim_review_task(
+            conn, task_id, claimer=f"{REPLACEMENT_REVIEWER}:1",
+        )
+        assert review is not None
+
+        # The policy moves while the new reviewer is mid-run.
+        _nominate(monkeypatch, "nobody-exists")
+        assert kb.policy_resolved_reviewer() is None, (
+            "this test proves nothing unless the policy actually moved"
+        )
+        handback = kb.submit_review_findings(
+            conn, task_id,
+            findings=[_finding()],
+            candidate_digest="digest-1",
+            expected_run_id=review.current_run_id,
+        )
+
+        # The landing is judged first: on a governed card a stale provenance
+        # (the reassignment not recorded) refuses this handback outright.
+        assert handback["outcome"] == "handed_back", handback
+        back = kb.get_task(conn, task_id)
+        requested = _events(conn, task_id, "review_requested")
+        changes = _events(conn, task_id, "changes_requested")
+        delivered = _events(conn, task_id, "review_findings_delivered")
+        attachments = kb.list_attachments(conn, task_id)
+
+    assert requested[-1]["reviewer"] == REPLACEMENT_REVIEWER
+    assert requested[-1]["implementer"] == "default"
+    assert back.assignee == "default"
+    assert back.status in ("ready", "todo")
+    assert len(changes) == 1
+    assert changes[0]["implementer"] == "default"
+    assert changes[0]["reviewer"] == REPLACEMENT_REVIEWER
+    assert len(delivered) == 1
+    assert len(attachments) == 1
+    assert attachments[0].id == delivered[0]["attachment_id"]

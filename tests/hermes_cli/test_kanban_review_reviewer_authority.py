@@ -16,9 +16,9 @@ dispatcher:
   implementer, because the review dispatcher would then re-claim the card for
   the very profile that wrote the code and call that an independent review.
 
-A policy module that exposes no selector at all keeps today's behaviour (the
-kernel's own read-only reviewer registry, intersected with the admitted
-roster), so the shipped policy is unaffected.
+A policy module that exposes no selector, or one whose selector cannot be
+read, fails closed the same way: the work is parked with no assignee. The
+kernel never falls back to its own read-only reviewer registry.
 """
 
 from __future__ import annotations
