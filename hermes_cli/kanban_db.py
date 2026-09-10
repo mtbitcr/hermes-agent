@@ -21374,6 +21374,17 @@ _KERNEL_SWEEP_RUN_OUTCOMES = frozenset({
 # not evidence an owner intervened.
 _OWNER_REDISPATCH_EVENT_KINDS = frozenset({"unblocked", "review_reopened"})
 
+# Event kinds a run's own closing path binds to the run it has just ended. The
+# gap-bound owner inference in ``run_retry_origins`` takes a run's lower bound
+# from one of these and its upper bound from the next run's ``claimed`` event
+# only: any other bound event (a heartbeat, a spawn, an attachment) is never
+# a boundary, so a missing exact row means no gap, not a guess.
+_RUN_CLOSING_EVENT_KINDS = frozenset({
+    "completed", "blocked", "gave_up", "reclaimed", "timed_out", "crashed",
+    "spawn_failed", "rate_limited", "stale", "review_requested",
+    "changes_requested", "archived", "run_handover_completed",
+})
+
 RETRY_ORIGIN_NONE = "none"
 RETRY_ORIGIN_AUTOMATIC = "automatic"
 RETRY_ORIGIN_OWNER = "owner"
@@ -21472,9 +21483,10 @@ def run_retry_origins(
     # regardless of the run's outcome string. One shape proves the kernel: a
     # `reclaimed` event whose payload carries `"automatic": true`, which only
     # :func:`release_stale_claims` writes. The same rows give us, per run id,
-    # the id of its own last bound event (its closing event) and the id of its
-    # own first bound event (its claim event) — the monotonic bounds Evidence
-    # B windows against below.
+    # the id of its own closing event (a run-terminal kind bound to it) and
+    # the id of its own ``claimed`` event — the monotonic bounds Evidence B
+    # windows against below. Only those exact kinds count: when either row
+    # is missing, no other bound event stands in for it.
     owner_closed_run_ids: set[int] = set()
     swept_run_ids: set[int] = set()
     closing_event_id: dict[int, int] = {}
@@ -21493,9 +21505,11 @@ def run_retry_origins(
             run_id = int(row["run_id"])
             event_id = int(row["id"])
             kind = row["kind"]
-            if event_id > closing_event_id.get(run_id, -1):
+            if kind in _RUN_CLOSING_EVENT_KINDS and event_id > closing_event_id.get(run_id, -1):
                 closing_event_id[run_id] = event_id
-            if run_id not in claim_event_id or event_id < claim_event_id[run_id]:
+            if kind == "claimed" and (
+                run_id not in claim_event_id or event_id < claim_event_id[run_id]
+            ):
                 claim_event_id[run_id] = event_id
             if kind == "reclaimed":
                 try:

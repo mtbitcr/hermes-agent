@@ -8655,6 +8655,123 @@ def test_retry_origin_fails_closed_when_event_bindings_are_missing(ctx):
     assert oldest["retry_origin"] == "automatic"
 
 
+def test_retry_origin_fails_closed_when_only_the_close_binding_is_missing(ctx):
+    """A surviving ``claimed`` row must not stand in for a missing close.
+
+    The lower bound of the owner gap is this run's own closing event; when
+    only that row has lost its binding, no other event bound to the run may
+    be substituted, or the unblock lands inside a gap that never existed.
+    """
+    result = _retry_project(
+        ctx, "graph-retry-unbound-close", "Retry Unbound Close Project",
+    )
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Unbound close task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        with _temporarily_patch(kanban_db.time, "time", lambda: 1000.0):
+            run1 = kanban_db.claim_task(
+                conn, task_id, claimer="builder:c1", ttl_seconds=1,
+            )
+            assert run1 is not None
+            conn.execute("UPDATE tasks SET claim_expires = 1 WHERE id = ?", (task_id,))
+            conn.commit()
+            assert kanban_db.release_stale_claims(conn) == 1
+            run2 = kanban_db.claim_task(conn, task_id, claimer="builder:c2")
+            assert run2 is not None
+            assert kanban_db.block_task(
+                conn, task_id, reason="needs input", kind="needs_input",
+                expected_run_id=run2.current_run_id,
+            )
+            assert kanban_db.unblock_task(conn, task_id)
+            run3 = kanban_db.claim_task(conn, task_id, claimer="builder:c3")
+            assert run3 is not None
+            # Only run 2's closing row loses its binding; its claim survives.
+            cur = conn.execute(
+                "UPDATE task_events SET run_id = NULL "
+                "WHERE run_id = ? AND kind = 'blocked'",
+                (run2.current_run_id,),
+            )
+            assert cur.rowcount == 1
+            conn.commit()
+
+    runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
+    matches = _runs_titled(runs, "Unbound close task")
+    assert len(matches) == 3
+    newest, middle, oldest = matches  # newest-first
+    assert newest["retry_origin"] == "none"
+    # Run 2's owner gap has no exact bound on that side, so no owner
+    # inference fires; a ``blocked`` close is not kernel evidence either.
+    assert middle["retry_origin"] == "unattributed"
+    # Run 1's stale-sweep evidence is bound to run 1 itself and unaffected.
+    assert oldest["retry_origin"] == "automatic"
+
+
+def test_retry_origin_fails_closed_when_only_the_next_claim_binding_is_missing(ctx):
+    """A later run's heartbeat must not stand in for its missing claim.
+
+    The upper bound of the owner gap is the next run's own ``claimed``
+    event; when only that row has lost its binding, a later heartbeat bound
+    to the same run is not a boundary either.
+    """
+    result = _retry_project(
+        ctx, "graph-retry-unbound-claim", "Retry Unbound Claim Project",
+    )
+    task_id = _create_ready_task(
+        result["board"], result["project_id"], "Unbound claim task",
+    )
+    with kanban_db.connect(board=result["board"]) as conn:
+        with _temporarily_patch(kanban_db.time, "time", lambda: 1000.0):
+            run1 = kanban_db.claim_task(
+                conn, task_id, claimer="builder:n1", ttl_seconds=1,
+            )
+            assert run1 is not None
+            conn.execute("UPDATE tasks SET claim_expires = 1 WHERE id = ?", (task_id,))
+            conn.commit()
+            assert kanban_db.release_stale_claims(conn) == 1
+            run2 = kanban_db.claim_task(conn, task_id, claimer="builder:n2")
+            assert run2 is not None
+            assert kanban_db.block_task(
+                conn, task_id, reason="needs input", kind="needs_input",
+                expected_run_id=run2.current_run_id,
+            )
+            assert kanban_db.unblock_task(conn, task_id)
+            run3 = kanban_db.claim_task(conn, task_id, claimer="builder:n3")
+            assert run3 is not None
+            # A real heartbeat bound to run 3 lands after its claim.
+            kanban_db.heartbeat_worker(
+                conn, task_id, expected_run_id=run3.current_run_id,
+            )
+            bound_heartbeats = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE run_id = ? AND kind = 'heartbeat'",
+                (run3.current_run_id,),
+            ).fetchone()[0]
+            assert bound_heartbeats >= 1
+            # Only run 3's claim row loses its binding; the heartbeat survives.
+            cur = conn.execute(
+                "UPDATE task_events SET run_id = NULL "
+                "WHERE run_id = ? AND kind = 'claimed'",
+                (run3.current_run_id,),
+            )
+            assert cur.rowcount == 1
+            conn.commit()
+
+    runs = ow.read_project_snapshot(
+        ctx, result["project_slug"], run_context=True,
+    )["runs"]
+    matches = _runs_titled(runs, "Unbound claim task")
+    assert len(matches) == 3
+    newest, middle, oldest = matches  # newest-first
+    assert newest["retry_origin"] == "none"
+    # Run 2's owner gap has no exact bound on that side, so no owner
+    # inference fires; a ``blocked`` close is not kernel evidence either.
+    assert middle["retry_origin"] == "unattributed"
+    # Run 1's stale-sweep evidence is bound to run 1 itself and unaffected.
+    assert oldest["retry_origin"] == "automatic"
+
+
 def test_retry_origin_unattributed_without_positive_proof(ctx):
     """A reviewer's ordinary handback is explicitly NOT owner-retry evidence."""
     result = _retry_project(
