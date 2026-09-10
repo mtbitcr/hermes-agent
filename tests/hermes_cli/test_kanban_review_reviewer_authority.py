@@ -68,9 +68,14 @@ def _hand_over(conn, task_id, *, claimer="worker:1", summary="ready for review")
 
 
 def _nominate(monkeypatch, *profiles):
-    """Make the model policy nominate exactly these reviewer roles."""
+    """Make the model policy nominate exactly these reviewer roles.
+
+    Uses ``raising=True`` because the selector is a real, shipped attribute
+    on the policy module — :func:`reviewer_profile_ids` — so monkeypatching
+    must confirm the target exists rather than inventing it.
+    """
     monkeypatch.setattr(
-        model_policy, SELECTOR, lambda: tuple(profiles), raising=False,
+        model_policy, SELECTOR, lambda: tuple(profiles), raising=True,
     )
 
 
@@ -125,17 +130,25 @@ def test_the_reviewer_identity_follows_the_policy_owned_selector(
         assert (second, "raphael-planner") in spawned
 
 
-def test_a_policy_without_a_selector_keeps_the_read_only_reviewer_registry(
-    kanban_home
-):
-    """Degradation contract: the shipped policy module is unaffected.
+def test_the_shipped_policy_module_exposes_the_reviewer_selector(kanban_home):
+    """The policy module owns the reviewer identity — the selector MUST exist.
 
-    ``model_policy`` exposes no reviewer selector today, so the kernel falls
-    back to its own read-only reviewer registry intersected with the admitted
-    roster. (This asserts EXISTING behaviour on purpose — it is the guard that
-    the new selector lookup cannot break the shipped policy.)
+    ``model_policy.reviewer_profile_ids()`` is the single source of truth for
+    which role(s) perform independent review. The kernel calls it on every
+    handover and intersects its answer with the admitted roster. Today that is
+    the read-only audit reviewer; tomorrow the policy could name a different
+    roster without any kernel change.
     """
-    assert not hasattr(model_policy, SELECTOR)
+    assert hasattr(model_policy, SELECTOR), (
+        "the shipped policy module must expose the reviewer selector — "
+        "the kernel's fail-closed path is for ABSENT or BROKEN selectors, "
+        "not an alternative to shipping one"
+    )
+    assert callable(getattr(model_policy, SELECTOR))
+    result = model_policy.reviewer_profile_ids()
+    assert isinstance(result, tuple)
+    assert READ_ONLY_REVIEWER in result
+
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="shipped policy", assignee="worker", requires_review=True,
@@ -229,3 +242,84 @@ def test_a_nomination_outside_the_admitted_roster_resolves_nobody(
         parked = kb.get_task(conn, tid)
         assert parked.status == "review"
         assert parked.assignee is None
+
+
+def test_kernel_read_only_profiles_constant_has_no_reviewer_identity_effect(
+    kanban_home, monkeypatch
+):
+    """The kernel's _READ_ONLY_PROFILES is NOT a reviewer-identity fallback.
+
+    The constant names roles that may never own repository writes (used by the
+    write-scope guards in assign_task and create_task), but it is NOT consulted
+    for reviewer identity. That decision belongs entirely to the policy's
+    reviewer_profile_ids() selector.
+
+    Reproduction: if mutating _READ_ONLY_PROFILES changed the resolved reviewer,
+    the kernel — not the policy — would be deciding who reviews. After the fix,
+    the selector alone controls the identity.
+    """
+    original_reviewer = kb.policy_resolved_reviewer()
+    assert original_reviewer == READ_ONLY_REVIEWER, (
+        "baseline: the shipped policy nominates the read-only reviewer"
+    )
+
+    monkeypatch.setattr(kb, "_READ_ONLY_PROFILES", frozenset({"raphael-planner"}))
+
+    after_mutation = kb.policy_resolved_reviewer()
+    assert after_mutation == READ_ONLY_REVIEWER, (
+        f"mutating _READ_ONLY_PROFILES must NOT change the resolved reviewer; "
+        f"got {after_mutation!r} instead of {READ_ONLY_REVIEWER!r}. "
+        f"The selector — not the kernel constant — decides who reviews."
+    )
+
+
+def test_a_selector_that_raises_resolves_nobody(kanban_home, monkeypatch):
+    """An unreadable nomination is not a licence to pick a kernel reviewer.
+
+    If the policy's selector raises, the kernel fails closed — it returns None
+    rather than inventing a reviewer of its own choosing.
+    """
+    def broken_selector():
+        raise RuntimeError("transient policy failure")
+
+    monkeypatch.setattr(model_policy, SELECTOR, broken_selector, raising=True)
+    assert kb.policy_resolved_reviewer() is None, (
+        "a selector that raises must resolve None (fail closed), "
+        "never a kernel-chosen fallback"
+    )
+
+
+def test_an_absent_selector_resolves_nobody_not_a_kernel_identity(
+    kanban_home, monkeypatch, all_assignees_spawnable
+):
+    """A policy with no selector fails closed — the kernel invents nobody.
+
+    The reviewer identity is the POLICY's decision. If the selector is absent
+    (deleted, not-yet-shipped, or deliberately removed for a lockdown), the
+    kernel returns None, and the handover parks the card with no assignee. It
+    never falls back to _READ_ONLY_PROFILES or any other kernel-owned constant.
+    """
+    monkeypatch.delattr(model_policy, SELECTOR, raising=True)
+    assert not hasattr(model_policy, SELECTOR), "sanity: selector is gone"
+
+    assert kb.policy_resolved_reviewer() is None, (
+        "an absent selector must resolve None (fail closed), "
+        "never a kernel-chosen fallback like _READ_ONLY_PROFILES"
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="no selector", assignee="worker", requires_review=True,
+        )
+        assert _hand_over(conn, tid) is True
+        parked = kb.get_task(conn, tid)
+        assert parked.status == "review", "the requirement is still honoured"
+        assert parked.assignee is None, (
+            "with no selector the card must park unassigned, not under a "
+            "kernel-invented reviewer identity"
+        )
+
+        _, spawned = _dispatch_capturing(conn)
+        assert spawned == [], (
+            "unassigned review cards must not dispatch to anyone"
+        )

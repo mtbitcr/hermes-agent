@@ -456,6 +456,34 @@ def admitted_profile_ids() -> tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
+# Reviewer-role selector
+# ---------------------------------------------------------------------------
+#
+# WHO performs independent review is the POLICY's decision, not the kernel's.
+# The kernel asks for it through this single, duck-typed selector — the one
+# source of truth for which role(s) may accept a review handover.  Today that
+# is the read-only audit reviewer role; tomorrow the policy could name a
+# different roster.  The kernel intersects this answer with
+# ``admitted_profile_ids()`` so a nomination the policy does not admit can
+# never widen the reviewer pool, and it resolves ``None`` (fail closed) when
+# the result is empty or ambiguous.
+
+_REVIEWER_PROFILE_IDS = ("raphael-verifier",)
+
+
+def reviewer_profile_ids() -> tuple[str, ...]:
+    """Return the role(s) that perform independent review.
+
+    The kernel resolves one exactly-one candidate from this nomination,
+    intersected with the admitted roster.  An empty or ambiguous result fails
+    closed (no reviewer assigned, card parked unassigned).  Returning multiple
+    roles is reserved for future fan-out or tiebreaker logic — today only a
+    single-element tuple is expected to resolve.
+    """
+    return _REVIEWER_PROFILE_IDS
+
+
+# ---------------------------------------------------------------------------
 # Explicit Raphael policy enrollment
 # ---------------------------------------------------------------------------
 #
