@@ -5419,41 +5419,59 @@ def commit_project_plan(
                 board_slug=board_slug,
             )
             anchor_task_id = anchor.task_id
-            recovered = (
-                _committed_project_plan_result(
-                    kconn,
-                    anchor_task_id=anchor_task_id,
-                    digest=digest,
-                    idempotency_key=idempotency_key,
-                    ctx=ctx,
+            # Recovery of a committed-but-unreceipted plan is a board mutation
+            # like the fresh apply below (the requirement write on the parked
+            # rows), so it runs under the same cross-process board guard and
+            # the same receipt-lease fence: a claimant whose lease expired and
+            # was adopted by another caller must not write task state before
+            # the token-predicated finalization rejects it.
+            with _global_board_guard(board_slug):
+                recovered = (
+                    _committed_project_plan_result(
+                        kconn,
+                        anchor_task_id=anchor_task_id,
+                        digest=digest,
+                        idempotency_key=idempotency_key,
+                        ctx=ctx,
+                    )
+                    if anchor_task_id is not None
+                    else None
                 )
-                if anchor_task_id is not None
-                else None
-            )
+                if recovered is not None:
+                    result = {
+                        "ok": True,
+                        "project_id": project_id,
+                        "project_slug": project.slug,
+                        "board": board_slug,
+                        "anchor_task_id": anchor_task_id,
+                        "risk_level": risk_level,
+                        **recovered,
+                    }
+                    with write_txn(pconn):
+                        _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                        if not _receipt_owns_project(pconn, ctx, project_id):
+                            raise OwnerWorkspaceError(
+                                "project_not_owned",
+                                "the Project ownership receipt changed before commit",
+                            )
+                        # The same requirement write the fresh path performs,
+                        # on the same still-parked rows: a crash between the
+                        # board write and this receipt must not leave a task
+                        # the owner approved for review running without it.
+                        # Idempotent, so a row that already carries it is
+                        # untouched.
+                        _commit_plan_review_requirements(
+                            kconn,
+                            normalized_changes,
+                            recovered.get("created_task_ids"),
+                            project_id=project_id,
+                        )
+                    _finalize_receipt(
+                        pconn, ctx, idempotency_key, token, status="committed", result=result,
+                    )
             if recovered is not None:
-                result = {
-                    "ok": True,
-                    "project_id": project_id,
-                    "project_slug": project.slug,
-                    "board": board_slug,
-                    "anchor_task_id": anchor_task_id,
-                    "risk_level": risk_level,
-                    **recovered,
-                }
-                # The same requirement write the fresh path performs, on the
-                # same still-parked rows: a crash between the board write and
-                # this receipt must not leave a task the owner approved for
-                # review running without it. Idempotent, so a row that already
-                # carries it is untouched.
-                _commit_plan_review_requirements(
-                    kconn,
-                    normalized_changes,
-                    recovered.get("created_task_ids"),
-                    project_id=project_id,
-                )
-                _finalize_receipt(
-                    pconn, ctx, idempotency_key, token, status="committed", result=result,
-                )
+                # Outside the guard and only after the terminal receipt, as
+                # for a fresh apply.
                 _activate_committed_owner_work(result)
                 return result
 

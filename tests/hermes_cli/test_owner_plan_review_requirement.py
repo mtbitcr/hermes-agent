@@ -18,6 +18,8 @@ real approval kernel:
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 from hermes_cli import kanban_db as kb
@@ -290,6 +292,86 @@ def test_a_crash_before_the_requirement_is_written_leaves_the_work_parked(ctx):
     assert len(recovered) == 1, "the replay must not create a second task"
     assert recovered[0].requires_review is True
     assert recovered[0].status != kb.PARKED_STATUS
+
+
+def test_the_recovered_requirement_write_holds_the_board_guard_and_the_lease(ctx):
+    """The replay's requirement write is fenced exactly like a fresh apply.
+
+    Recovery mutates task state (the requirement on the parked rows), so it
+    must run inside the cross-process board guard and inside the receipt
+    lease fence: the lease is asserted in the same projects.db write
+    transaction that performs the write, so an expired lease adopted by
+    another claimant is refused before any task state changes.
+    """
+    setup = _bootstrap_board(ctx)
+    args = _project_plan_args(
+        setup,
+        [_add_change("Fenced deliverable", requires_review=True)],
+        idempotency_key="plan-review-fence",
+    )
+
+    def crash(*a, **k):
+        raise _CrashInjected("plan_review_requirement")
+
+    approver = _with_approver(ctx.session)
+    with _temporarily_patch(ow, "_commit_plan_review_requirements", crash):
+        with pytest.raises(_CrashInjected):
+            _commit_project_plan(ctx, **args)
+    approver.join()
+    approval.unregister_gateway_notify(ctx.session)
+    _expire_lock(ctx, "plan-review-fence")
+
+    observed: list[tuple] = []
+    guard_depth = 0
+    real_guard = ow._global_board_guard
+    real_assert = ow._assert_owns_lease
+    real_write = ow._commit_plan_review_requirements
+
+    @contextlib.contextmanager
+    def guard(board_slug):
+        nonlocal guard_depth
+        with real_guard(board_slug):
+            guard_depth += 1
+            try:
+                yield
+            finally:
+                guard_depth -= 1
+
+    def assert_lease(conn, *a, **k):
+        observed.append(("lease", conn.in_transaction, guard_depth))
+        return real_assert(conn, *a, **k)
+
+    def write(*a, **k):
+        observed.append(("write", guard_depth))
+        return real_write(*a, **k)
+
+    with _temporarily_patch(ow, "_global_board_guard", guard), \
+            _temporarily_patch(ow, "_assert_owns_lease", assert_lease), \
+            _temporarily_patch(ow, "_commit_plan_review_requirements", write):
+        replayed = _commit_project_plan(ctx, **args)
+
+    assert replayed["ok"] is True
+    writes = [entry for entry in observed if entry[0] == "write"]
+    assert writes == [("write", 1)], (
+        "the recovered requirement write must run inside the board guard: "
+        f"{observed}"
+    )
+    write_index = observed.index(writes[0])
+    fences = [
+        entry for entry in observed[:write_index]
+        if entry[0] == "lease" and entry[1] is True and entry[2] == 1
+    ]
+    assert fences, (
+        "the lease must be asserted inside a projects.db write transaction, "
+        f"under the guard, before the recovered requirement write: {observed}"
+    )
+    with kb.connect(board=setup["board"]) as conn:
+        recovered = [
+            task for task in kb.list_tasks(conn)
+            if task.title == "Fenced deliverable"
+        ]
+    assert len(recovered) == 1
+    assert recovered[0].requires_review is True
 
 
 # ---------------------------------------------------------------------------
