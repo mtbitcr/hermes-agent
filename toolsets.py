@@ -312,16 +312,23 @@ TOOLSETS = {
             "Owner-workspace mutation tools (bootstrap a Project + Kanban "
             "board + initial task; commit an approved Task graph or Project "
             "Steward plan; archive or restore a Project; move a task "
-            "via compare-and-swap; retry work that stopped on its own; "
+            "via compare-and-swap; "
             "comment "
             "as the trusted caller). Opt-in, API-server-only — every "
             "mutation is idempotent and requires a fresh human confirmation."
         ),
+        # ``owner_task_retry`` is deliberately ABSENT here AND from the tool
+        # registry (see tools/owner_workspace_tools.py). It records the OWNER's
+        # own stated reason for trying stopped work again, so it is dispatched
+        # natively from an already authenticated owner run and is never offered
+        # to a model as a callable schema. Listing it here would not be enough
+        # to expose it and removing it here would not be enough to hide it —
+        # ``get_toolset()`` merges the registry's entries for this toolset into
+        # this list — which is why the registration is gone too.
         "tools": [
             "owner_workspace_bootstrap", "owner_task_graph_commit",
             "owner_project_plan_commit",
             "owner_task_move", "owner_task_comment", "owner_project_lifecycle",
-            "owner_task_retry",
         ],
         "includes": [],
         # See _get_platform_tools()'s explicit_passthrough filtering — a

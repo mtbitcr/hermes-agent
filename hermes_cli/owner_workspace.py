@@ -257,6 +257,38 @@ def _digest(payload: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def canonical_owner_retry_payload(
+    *,
+    idempotency_key: Any,
+    project_id: Any,
+    task_id: Any,
+    reason: Any,
+) -> dict:
+    """The ONE canonical form of a retry payload, for BOTH sides of the digest.
+
+    The gateway validates and forwards a retry run's closed payload
+    (``{"idempotency_key", "project_id", "task_id", "reason"}``, semantically
+    trimmed) and hashes exactly that to mint the run's ``payload_digest``; the
+    kernel has to hash the byte-identical dict or the authority binding is
+    unverifiable — which is what made the retry kernel reachable with no
+    authority at all. So the canonical form is stated once, here, and both the
+    authority digest and the shape check read it from this function rather than
+    each rebuilding a form that can drift.
+
+    Deliberately trimming only. The kernel's own bounding/owner-visible
+    derivation of ``reason`` (see :func:`retry_task`) is what the confirmation
+    prompt, the stored event and the receipt bind to — a DIFFERENT question
+    from which exact request the owner's run authorized, and folding it in here
+    would make the authority digest unreproducible by the run that minted it.
+    """
+    return {
+        "idempotency_key": _require_str(idempotency_key, "idempotency_key"),
+        "project_id": str(project_id).strip() if project_id is not None else "",
+        "task_id": str(task_id).strip() if task_id is not None else "",
+        "reason": str(reason).strip() if reason is not None else "",
+    }
+
+
 def _require_owner_run_authority(
     ctx: OwnerContext,
     *,
@@ -6136,6 +6168,15 @@ def retry_task(
 ) -> dict:
     """Try stopped work again, on the owner's stated reason.
 
+    **Native owner-run authority only, checked first.** The retry is a hidden
+    run authority, not a model capability: the reason it records is the
+    OWNER's, so the call has to be bound to the authenticated owner run that
+    carries this exact operation, idempotency key and canonical payload
+    (:func:`canonical_owner_retry_payload`, the one canonical form the gateway
+    also digests). That check runs before the receipt read, the replay, every
+    state read and every state mutation, so an unbound call writes nothing at
+    all — no receipt row, no event, no task or run change.
+
     The only two states this accepts are the two ways the kernel stops work
     without a human deciding to stop it: the dispatcher's circuit breaker
     gave up on the task, or a worker hit a capability wall it cannot pass.
@@ -6175,6 +6216,26 @@ def retry_task(
     :func:`_assert_owns_lease`) so a takeover cannot land between validating
     the lease and committing the retry.
     """
+    operation = "owner_task_retry"
+    # The authority check is the FIRST thing that happens after the arguments
+    # are put in their one canonical form, and it is deliberately ahead of the
+    # receipt read, the replay, every state read and every state mutation: a
+    # retry that is not bound to the authenticated owner run must leave the
+    # board, the runs and the receipt table exactly as it found them. Reaching
+    # the receipt claim first would persist an in_progress row — and then a
+    # model-chosen reason — as the owner's own retry.
+    _require_owner_run_authority(
+        ctx,
+        operation=operation,
+        idempotency_key=_require_str(idempotency_key, "idempotency_key"),
+        payload=canonical_owner_retry_payload(
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+            task_id=task_id,
+            reason=reason,
+        ),
+    )
+
     idempotency_key = _require_str(idempotency_key, "idempotency_key")
     project_id = _bounded_text(project_id, "project_id", limit=100)
     task_id = _require_str(task_id, "task_id")
@@ -6195,7 +6256,6 @@ def retry_task(
 
     payload = {"project_id": project_id, "task_id": task_id, "reason": reason}
     digest = _digest(payload)
-    operation = "owner_task_retry"
 
     pconn = projects_db.connect()
     try:

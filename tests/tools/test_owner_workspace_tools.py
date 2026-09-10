@@ -24,10 +24,15 @@ from hermes_cli.owner_workspace import OwnerContext, OwnerWorkspaceError
 from tools.registry import registry
 from toolsets import TOOLSETS, get_kernel_gated_toolsets, resolve_toolset
 
+# Every tool a model may be OFFERED under the owner-workspace toolset. The
+# owner retry is deliberately absent: it is a native run authority dispatched
+# from an authenticated owner run, never a callable schema — see
+# ``TestRetryIsNotModelFacing`` below and
+# tests/hermes_cli/test_owner_retry_native_authority.py.
 TOOL_NAMES = (
     "owner_workspace_bootstrap", "owner_task_graph_commit",
     "owner_project_plan_commit",
-    "owner_task_move", "owner_task_comment", "owner_task_retry",
+    "owner_task_move", "owner_task_comment",
     "owner_project_lifecycle",
 )
 
@@ -38,7 +43,7 @@ TOOL_NAMES = (
 
 
 class TestToolSurface:
-    def test_exactly_seven_tools_registered_under_owner_workspace(self):
+    def test_exactly_these_tools_are_registered_under_owner_workspace(self):
         assert registry.get_tool_names_for_toolset("owner_workspace") == sorted(TOOL_NAMES)
 
     def test_toolset_definition_lists_exactly_these_tools(self):
@@ -73,8 +78,8 @@ class TestToolSurface:
 
     def test_resolve_toolset_returns_exactly_these_tools(self):
         # include_registry=True is how api_server resolves the toolset, and it
-        # includes registry-only tools (e.g. owner_task_retry) not yet in the
-        # static toolsets.py list.
+        # merges in whatever the registry carries for the toolset — so this is
+        # the list an owner-workspace agent is actually offered.
         assert set(resolve_toolset("owner_workspace", include_registry=True)) == set(TOOL_NAMES)
 
     def test_project_steward_is_one_separate_read_only_tool(self):
@@ -300,13 +305,7 @@ class TestSchemas:
             "idempotency_key", "project_id", "task_id", "body",
         }
 
-    def test_task_retry_requires_task_id_and_reason(self):
-        entry = registry.get_entry("owner_task_retry")
-        required = set(entry.schema["parameters"]["required"])
-        assert required == {"idempotency_key", "project_id", "task_id", "reason"}
-        assert set(entry.schema["parameters"]["properties"]) == {
-            "idempotency_key", "project_id", "task_id", "reason",
-        }
+
 
 
 # ---------------------------------------------------------------------------

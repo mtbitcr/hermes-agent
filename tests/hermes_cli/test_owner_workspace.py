@@ -9096,11 +9096,38 @@ def test_review_state_values_are_members_of_the_closed_set(ctx):
 # ---------------------------------------------------------------------------
 
 
+def _retry_authorized_context(ctx, **kwargs):
+    """The hidden owner-run authority one retry is dispatched under.
+
+    The retry is never a model-callable tool: the API server mints this exact
+    authority from the owner's own run and hands the frozen payload to the
+    native handler. The digest is minted from the SAME canonical payload the
+    gateway digests (:func:`ow.canonical_owner_retry_payload`), so this is the
+    real binding rather than a test-only shape.
+    """
+    payload = ow.canonical_owner_retry_payload(**kwargs)
+    return ow.OwnerContext(
+        actor=ctx.actor,
+        profile=ctx.profile,
+        session=ctx.session,
+        authority=ow.OwnerProposalAuthority(
+            actor=ctx.actor,
+            profile=ctx.profile,
+            session=ctx.session,
+            conversation="raphael-owner-" + "a" * 32,
+            response_id="resp_" + "b" * 32,
+            operation="owner_task_retry",
+            idempotency_key=payload["idempotency_key"],
+            payload_digest=ow._digest(payload),
+        ),
+    )
+
+
 def _retry(ctx, **kwargs):
     """Call the real owner action with the owner's confirmation answered."""
     approver = _with_approver(ctx.session)
     try:
-        return ow.retry_task(ctx, **kwargs)
+        return ow.retry_task(_retry_authorized_context(ctx, **kwargs), **kwargs)
     finally:
         approver.join()
 
@@ -9491,14 +9518,17 @@ def test_retry_without_a_stated_reason_is_rejected_before_anything_happens(ctx):
     # all, so it could never be shown back as the reason for the retry.
     for index, blank in enumerate((None, "", "   ", "\t\n ", _ZERO_WIDTH_SPACE)):
         key = f"retry-blank-{index}"
+        args = {
+            "idempotency_key": key,
+            "project_id": setup["project_id"],
+            "task_id": task_id,
+            "reason": blank,
+        }
         with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
-            ow.retry_task(
-                ctx,
-                idempotency_key=key,
-                project_id=setup["project_id"],
-                task_id=task_id,
-                reason=blank,
-            )
+            # Authorized for this exact (blank) request, so the refusal under
+            # test is the kernel's own "no owner-visible reason" rule and not
+            # the authority binding standing in front of it.
+            ow.retry_task(_retry_authorized_context(ctx, **args), **args)
         assert excinfo.value.code == "invalid_argument"
         # Rejected up front: no confirmation was requested, no receipt was
         # claimed, and the work is exactly where the worker left it.
@@ -9526,7 +9556,7 @@ def test_retry_replayed_under_one_key_retries_once_and_records_one_reason(ctx):
     # No approver registered for the replay — a second decision request would
     # have nothing to answer it, proving none was made.
     approval.unregister_gateway_notify(ctx.session)
-    second = ow.retry_task(ctx, **payload)
+    second = ow.retry_task(_retry_authorized_context(ctx, **payload), **payload)
 
     assert second == first
     assert first["ok"] is True
