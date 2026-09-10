@@ -13230,6 +13230,10 @@ class APIServerAdapter(BasePlatformAdapter):
         project_id = payload.get("project_id")
         task_id = payload.get("task_id")
         reason = payload.get("reason")
+        # The Project identity is matched on the value exactly as submitted:
+        # cleaning is for the payload this run forwards, not for widening what
+        # authorizes it, so a padded id stays as stale as an unknown one.
+        raw_project_id = authority["payload"].get("project_id")
 
         from hermes_cli.owner_workspace import (
             _OWNER_RETRY_REASON_LIMIT,
@@ -13261,7 +13265,7 @@ class APIServerAdapter(BasePlatformAdapter):
         matches = [
             project for project in projects
             if project.get("slug") == context["project_slug"]
-            and project.get("project_id") == project_id
+            and project.get("project_id") == raw_project_id
         ]
         if len(matches) != 1:
             raise ValueError("owner retry Project state is stale")

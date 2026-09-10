@@ -1460,9 +1460,12 @@ class TestStartRun:
         ):
             mock_create.side_effect = RuntimeError("provider unavailable")
             async with TestClient(TestServer(app)) as cli:
+                # A padded id is as stale as an unknown one: the identity is
+                # matched as submitted, never after cleaning.
                 for label, project_id in (
                     ("foreign", other["project_id"]),
                     ("unknown", "p_no_such_project"),
+                    ("padded", f"  {created['project_id']}  "),
                 ):
                     stale_body = json.loads(json.dumps(body))
                     stale_body["owner_retry_authority"]["payload"][
