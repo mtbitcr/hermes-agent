@@ -622,36 +622,47 @@ def test_mid_write_failure_leaves_nothing_behind(kanban_home, monkeypatch):
 def test_post_create_path_boundary_failure_leaves_no_orphan(
     kanban_home, monkeypatch,
 ):
-    """A fault at the FIRST operation after the exclusive create — before the
-    write, before the close — must not orphan the reserved blob.
+    """A fault at the FIRST operation after the exclusive create — the first
+    write, before a single byte lands and before the close — must not orphan
+    the reserved blob.
 
     ``os.open(..., O_CREAT | O_EXCL)`` returning means the file already
     exists on disk. Any statement executed between that moment and the
     moment a cleanup handler owns both the descriptor and the reserved name
-    is a gap: a plain ``dest_dir / candidate`` path join is itself an
-    operation that can raise, and one performed after the create leaves an
-    untracked ``review_findings.json`` behind with the descriptor still open.
+    is a gap, and the very first such statement is what this test has to
+    catch. In ``_write_exclusive_stage_blob`` that statement is the first
+    ``os.write`` through the reserving descriptor: the candidate path is
+    built BEFORE the create, so no path join happens afterwards.
 
-    The fault here is armed by the successful exclusive create and fires on
-    the FIRST path-level operation on the reserved path afterwards:
+    Trapping only path-level operations is therefore NOT enough — the
+    earliest reserved-path join is the caller's ``staged_path.resolve()``,
+    which happens after the write AND after the close, so a fault there
+    observes a much later moment and says nothing about the boundary. The
+    trap below is armed by the successful exclusive create, records the
+    descriptor that create returned, and fires on whichever of these comes
+    FIRST:
 
-    * a helper that joins ``dest_dir / candidate`` again after the create
-      takes the hit inside that gap (the reserved name is not yet held by
-      any cleanup handler), and orphans the blob; while
-    * a helper that computes the path BEFORE the create and enters its
-      cleanup region immediately performs no such join, so the first
-      post-create path operation on the reserved path is the caller's
-      ``staged_path.resolve()``, which is inside
-      ``submit_review_findings``'s own ``_unlink_staged_blob`` region.
+    * a ``dest_dir / candidate`` join repeated after the create — the gap a
+      helper that re-derives its own path would open; or
+    * the first ``os.write`` to the reserved descriptor — what the current
+      helper actually reaches first, still inside the armed window; or
+    * ``resolve()`` of the reserved path — strictly later, and asserted
+      against so a regression that moves the first write cannot pass
+      silently.
 
-    Either way the handback must be all-or-nothing. Neither the write nor
-    the close is touched (those are covered by
-    ``test_mid_write_failure_leaves_nothing_behind`` and
-    ``test_close_failure_after_exclusive_create_leaves_no_orphan``).
+    The specific operation that fired is asserted by name below, so "the
+    boundary held" can never degrade into "something, somewhere, raised".
+    The fault is a ``RuntimeError`` (reported structurally by
+    ``submit_review_findings``); the OSError-on-write and OSError-on-close
+    variants are covered by ``test_mid_write_failure_leaves_nothing_behind``
+    and ``test_close_failure_after_exclusive_create_leaves_no_orphan``.
     """
     real_open = kb.os.open
+    real_write = kb.os.write
     real_div = Path.__truediv__
     real_resolve = Path.resolve
+
+    _FIRST_WRITE = "first write to the descriptor the exclusive create returned"
 
     with kb.connect() as conn:
         tid, review = _hand_off_to_review(conn)
@@ -663,13 +674,22 @@ def test_post_create_path_boundary_failure_leaves_no_orphan(
         safe_name = kb.REVIEW_FINDINGS_ATTACHMENT_FILENAME
         reserved = real_div(dest_dir, safe_name)
 
-        state = {"armed": False, "post_create_joins": 0, "fired": None}
+        state = {
+            "armed": False,
+            "reserved_fd": None,
+            "post_create_joins": 0,
+            "bytes_written": 0,
+            "fired": None,
+        }
 
         def _arming_open(path, flags, *args, **kwargs):
             fd = real_open(path, flags, *args, **kwargs)
-            # The create SUCCEEDED: from this instant on, the file exists.
+            # The create SUCCEEDED: from this instant on, the file exists and
+            # the trap is live. Remember the descriptor it handed back so the
+            # write trap can recognise the reserved blob's own writes.
             if flags & os.O_EXCL and str(path) == str(reserved):
                 state["armed"] = True
+                state["reserved_fd"] = fd
             return fd
 
         def _trapped_div(self, other):
@@ -684,6 +704,22 @@ def test_post_create_path_boundary_failure_leaves_no_orphan(
                 raise RuntimeError("simulated post-create boundary fault")
             return real_div(self, other)
 
+        def _trapped_write(fd, data):
+            if (
+                state["armed"]
+                and state["fired"] is None
+                and fd == state["reserved_fd"]
+            ):
+                # Raise BEFORE any byte reaches the file: the fault is still
+                # armed at the moment the first write is attempted, which is
+                # the whole point of this test.
+                state["fired"] = _FIRST_WRITE
+                raise RuntimeError("simulated post-create boundary fault")
+            written = real_write(fd, data)
+            if fd == state["reserved_fd"]:
+                state["bytes_written"] += written
+            return written
+
         def _trapped_resolve(self, *args, **kwargs):
             if (
                 state["armed"]
@@ -695,6 +731,7 @@ def test_post_create_path_boundary_failure_leaves_no_orphan(
             return real_resolve(self, *args, **kwargs)
 
         monkeypatch.setattr(kb.os, "open", _arming_open)
+        monkeypatch.setattr(kb.os, "write", _trapped_write)
         monkeypatch.setattr(Path, "__truediv__", _trapped_div)
         monkeypatch.setattr(Path, "resolve", _trapped_resolve)
         try:
@@ -710,10 +747,24 @@ def test_post_create_path_boundary_failure_leaves_no_orphan(
             # fixture's HERMES_HOME and silently redirect every later lookup.
             state["armed"] = False
 
-        assert state["fired"] is not None, (
-            "the post-create boundary fault never fired — the reserved path "
-            "was never touched after the exclusive create, so this test "
-            "proves nothing"
+        assert state["reserved_fd"] is not None, (
+            "the exclusive create of the reserved path never happened, so the "
+            "post-create boundary was never entered and this test proves "
+            "nothing"
+        )
+        # Name the immediate operation, rather than accepting that "something"
+        # raised: the first thing the helper does after the exclusive create
+        # is write the payload through that same descriptor.
+        assert state["fired"] == _FIRST_WRITE, (
+            f"the fault fired on {state['fired']!r}, not on the immediate "
+            f"post-create operation ({_FIRST_WRITE!r}); the first write is no "
+            f"longer the first thing to happen after the exclusive create, so "
+            f"this test is no longer trapping the boundary it claims to "
+            f"(post-create joins: {state['post_create_joins']})"
+        )
+        assert state["bytes_written"] == 0, (
+            "the fault was armed too late: bytes reached the reserved blob "
+            "before the first trapped write"
         )
         assert result["outcome"] == "error", result
 

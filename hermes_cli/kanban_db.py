@@ -13548,6 +13548,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # True when the committed specification requires independent review, so
+    # the implementer's handover parks the card on the review lane instead of
+    # completing it. See the ``requires_review`` column comment in SCHEMA_SQL.
+    requires_review: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -13674,6 +13678,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            requires_review=(
+                bool(row["requires_review"])
+                if "requires_review" in keys and row["requires_review"] is not None
+                else False
             ),
         )
 
@@ -13902,6 +13911,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- 1 when this work task's committed specification requires independent
+    -- review: the implementer's handover PARKS the card on the existing review
+    -- lane (request_review) instead of completing it, and only a clean reviewer
+    -- verdict approves it. Deliberately NOT ``review_policy`` — that column is
+    -- the owner-review policy of a ``task_kind='recommendation'`` card and is
+    -- NULL on every work row; overloading it would put work rows inside the
+    -- recommendation lifecycle's own (task_kind, review_policy) scope. 0 (the
+    -- default) is every ordinary/manual/CLI task and every previously
+    -- committed graph, which keep their historical complete-on-handover
+    -- behaviour.
+    requires_review      INTEGER NOT NULL DEFAULT 0,
     -- Discriminates ordinary work tasks ('work', the create_task default) from native
     -- recommendation cards (see create_recommendation). recommendation_* / target_profile /
     -- review_policy / provenance_* are populated only when task_kind='recommendation' (NULL otherwise).
@@ -15186,6 +15206,16 @@ def _migrate_add_optional_columns(
     if "responsibility" not in cols:
         _add_column_if_missing(
             conn, "tasks", "responsibility", "responsibility TEXT"
+        )
+    if "requires_review" not in cols:
+        # Committed-specification review requirement (see SCHEMA_SQL). Existing
+        # rows get 0, which is exactly their historical behaviour: handover
+        # completes the task.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "requires_review",
+            "requires_review INTEGER NOT NULL DEFAULT 0",
         )
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
@@ -16654,6 +16684,7 @@ def create_task(
     integrates_parent_heads: bool = False,
     control: bool = False,
     receipt_owned: bool = False,
+    requires_review: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -16743,6 +16774,15 @@ def create_task(
         # carry any of the fields that only mean something for executable work.
         raise ValueError(
             "a control task cannot carry an assignee or a route"
+        )
+    if requires_review and (control or assignee in _READ_ONLY_PROFILES):
+        # A control anchor is never executed, and a read-only reviewer card IS
+        # the independent-audit lane already — parking it for review would make
+        # the reviewer its own reviewer. Both are refused so the committed
+        # review requirement can never leak onto them.
+        raise ValueError(
+            "requires_review is only meaningful for executable implementation "
+            "work, not for a control anchor or a read-only reviewer task"
         )
     responsibility = normalize_responsibility(responsibility)
     owned_paths_list = normalize_owned_paths(owned_paths)
@@ -17048,8 +17088,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, execution_tier, model_policy_lock,
                         goal_mode, goal_max_turns, session_id, task_kind,
-                        owner_receipt_bound
-                    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{gate_sql}
+                        owner_receipt_bound, requires_review
+                    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{gate_sql}
                     """,
                     (
                         task_id,
@@ -17082,6 +17122,7 @@ def create_task(
                         session_id,
                         "control" if control else "work",
                         1 if receipt_owned else 0,
+                        1 if requires_review else 0,
                         *gate_params,
                     ),
                 )
@@ -18232,6 +18273,68 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+def policy_resolved_reviewer() -> Optional[str]:
+    """Who the team's model policy says reviews work RIGHT NOW, or ``None``.
+
+    Resolved LIVE on every call, never captured on a task row: the review
+    requirement a committed specification carries says only THAT the work is
+    reviewed, so the reviewer identity has to come from the policy as it stands
+    at the moment of the handover. The answer is the read-only reviewer role
+    (:data:`_READ_ONLY_PROFILES` — the kernel's own registry of roles that may
+    never own repository writes) that the model policy currently admits. If the
+    policy admits none of them, or admits more than one so the choice is
+    genuinely ambiguous, this returns ``None`` and the caller parks the work
+    without a role change rather than guessing.
+    """
+    try:
+        admitted = set(_model_policy().admitted_profile_ids())
+    except Exception:
+        return None
+    candidates = sorted(_READ_ONLY_PROFILES & admitted)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _live_policy_route_assignments(
+    task_id: str, target: Optional[str], row: Any
+) -> tuple[list[tuple[str, Any]], Optional[dict]]:
+    """Re-derive one role's route from the model policy AS IT STANDS NOW.
+
+    The same shape :func:`_approved_route_assignments` returns, but the route
+    is resolved from the live policy instead of supplied by the caller. Used
+    only for the review round-trip of a task whose committed specification
+    already carries the review requirement, which is what authorizes the
+    re-pin: the owner approved review for this exact card, so handing it to the
+    reviewer and back is approved work, not a silent re-route.
+    """
+    policy = _model_policy()
+    tier = policy.normalize_execution_tier(row["execution_tier"])
+    assignment = policy.resolve_task_assignment(target, tier)
+    lock = mint_policy_lock(
+        target,
+        assignment.provider,
+        assignment.model,
+        assignment.reasoning_effort,
+        tier,
+    )
+    return (
+        [
+            ("model_override", assignment.model),
+            ("provider_override", assignment.provider),
+            ("reasoning_effort", assignment.reasoning_effort),
+            ("execution_tier", tier),
+            ("model_policy_lock", lock),
+        ],
+        {
+            "assignee": target,
+            "model": assignment.model,
+            "provider": assignment.provider,
+            "reasoning_effort": assignment.reasoning_effort,
+            "execution_tier": tier,
+            "source": "committed_review_requirement",
+        },
+    )
+
+
 def role_transition_route(
     conn: sqlite3.Connection,
     task_id: str,
@@ -18273,6 +18376,16 @@ def role_transition_route(
     approved it again. Only ``approved_route`` gets it moving, and that
     installs its exact lock in the same write.
 
+    A locked task whose committed specification carries the review requirement
+    (``requires_review``) is the one case that authorizes itself: the owner
+    approved independent review for that exact card, so the transition to the
+    reviewer the policy resolves RIGHT NOW (:func:`policy_resolved_reviewer`)
+    and the handback to the implementer are approved work. The replacement
+    route is re-derived from the live policy at that moment
+    (:func:`_live_policy_route_assignments`), never inherited from the commit.
+    Every other role change on a locked task is refused exactly as before, and
+    a task with no such requirement sees no change at all.
+
     ``approved_route`` is the one exception, and it is not a re-derivation: a
     fresh owner-approved mutation supplies the exact replacement
     ``{"assignee", "provider", "model", "reasoning_effort", "execution_tier",
@@ -18285,7 +18398,8 @@ def role_transition_route(
     """
     row = conn.execute(
         "SELECT assignee, execution_tier, model_policy_lock, model_override, "
-        "provider_override, reasoning_effort, owner_receipt_bound FROM tasks "
+        "provider_override, reasoning_effort, owner_receipt_bound, "
+        "requires_review FROM tasks "
         "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
@@ -18312,6 +18426,19 @@ def role_transition_route(
 
     if approved_route is not None:
         return _approved_route_assignments(task_id, target, approved_route)
+
+    # The ONE role transition a locked task authorizes on its own: the review
+    # round-trip of a card whose committed specification already carries the
+    # review requirement. The owner approved review for this exact task, so
+    # handing it to the policy's current reviewer and handing it back to the
+    # implementer are approved work rather than a silent re-pin — and the
+    # replacement route is re-derived from the live policy here, never carried
+    # over from the commit. Everything else stays refused, including a task
+    # that carries no such requirement (see the two raises below).
+    if target is not None and row["requires_review"]:
+        reviewer = policy_resolved_reviewer()
+        if reviewer is not None and reviewer in (target, row["assignee"]):
+            return _live_policy_route_assignments(task_id, target, row)
 
     if target is None:
         raise RuntimeError(
@@ -21451,6 +21578,42 @@ class WorktreeScopeError(ValueError):
     """Raised when scoped git work cannot be proven clean and in-bounds."""
 
 
+def _review_park_target(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple[bool, Optional[str]]:
+    """Decide whether this handover parks for review, and under whom.
+
+    Returns ``(park, reviewer)``. ``park`` is True only for the IMPLEMENTER's
+    handover of a task whose committed specification carries the review
+    requirement. The two arrivals that must still complete are excluded:
+
+    * a card already sitting in the ``review`` lane — that call is the human
+      (or reviewer) APPROVING it, the pass that ends the requirement; and
+    * a run claimed from ``review`` — that is the reviewer's own clean verdict
+      arriving through :func:`submit_review_findings`, which approves the task
+      via this same function. Re-parking there would loop forever.
+
+    ``reviewer`` is resolved LIVE by :func:`policy_resolved_reviewer` at this
+    moment, never read off the row. When the policy resolves nobody, the task's
+    current assignee is returned instead so the role transition is a no-op: the
+    requirement is still honoured (the card parks on the review lane rather
+    than completing) and a human picks the reviewer from the board.
+    """
+    row = conn.execute(
+        "SELECT assignee, status, current_run_id, requires_review FROM tasks "
+        "WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["requires_review"]:
+        return False, None
+    if row["status"] == "review":
+        return False, None
+    run_id = row["current_run_id"]
+    if run_id is not None and run_claimed_from_review(conn, task_id, int(run_id)):
+        return False, None
+    return True, policy_resolved_reviewer() or row["assignee"]
+
+
 @bounded_mutation("complete_task")
 def complete_task(
     conn: sqlite3.Connection,
@@ -21466,6 +21629,16 @@ def complete_task(
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    **A committed review requirement parks the handover instead.** When the
+    task's specification carries ``requires_review``, the IMPLEMENTER's
+    handover does not complete the card: it is routed onto the existing review
+    lane through :func:`request_review`, assigned to the reviewer
+    :func:`policy_resolved_reviewer` resolves at that moment, and ``True``
+    means "handover accepted and parked for review". The reviewer's own clean
+    verdict — and a human approving a card already sitting in ``review`` —
+    still complete it here, which is what ends the requirement. See
+    :func:`_review_park_target` for the exact discrimination.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -21607,6 +21780,31 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # A committed review requirement turns this handover into a PARK, not a
+    # completion. Everything above still runs — the worktree materialization,
+    # the file-scope proof and the derived execution receipt are exactly the
+    # facts the reviewer needs — but the terminal write is replaced by the
+    # existing review lane. The reviewer is resolved live here, and the
+    # transition goes through ``request_review``'s own authority path.
+    park_for_review, reviewer = _review_park_target(conn, task_id)
+    if park_for_review:
+        return bool(
+            request_review(
+                conn,
+                task_id,
+                summary=summary if summary is not None else result,
+                metadata={
+                    **(metadata or {}),
+                    "handover_parked_for_review": True,
+                },
+                reviewer=reviewer,
+                expected_run_id=expected_run_id,
+                # A caller that proves no run ownership is a human/CLI
+                # handover; ``complete_task`` accepts those today, so the park
+                # must not become the one thing that refuses them.
+                force=expected_run_id is None,
+            )
+        )
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -23015,9 +23213,18 @@ def request_review(
         # task refuses the handoff: its route was approved for one assignee for
         # its whole run, so independent review has to be separately approved
         # work rather than a silent re-pin of this task.
-        role_transition_route(conn, task_id, reviewer)
-        assignee_sql = ", assignee = ?" if reviewer is not None else ""
-        lead: tuple[Any, ...] = (reviewer,) if reviewer is not None else ()
+        assignments, repin = role_transition_route(conn, task_id, reviewer)
+        # The pairs the authority helper hands back MUST ride in the same
+        # UPDATE as the assignee write, or the lock would be left describing a
+        # role the row no longer has. Empty for every task that is not
+        # policy-governed, which is why this was previously a no-op.
+        route_sql, route_params = _route_assignment_sql(assignments)
+        assignee_sql = (
+            ", assignee = ?" + route_sql if reviewer is not None else route_sql
+        )
+        lead: tuple[Any, ...] = (
+            (reviewer, *route_params) if reviewer is not None else route_params
+        )
         params: tuple[Any, ...]
         if expected_run_id is None:
             params = (*lead, task_id)
@@ -23060,6 +23267,8 @@ def request_review(
                 summary=summary,
                 metadata=metadata,
             )
+        if repin is not None:
+            _append_event(conn, task_id, "model_route_repinned", repin)
         lines = (summary or "").strip().splitlines()
         event_summary = lines[0][:400] if lines else ""
         _append_event(
@@ -23189,7 +23398,11 @@ def _request_changes_within_txn(
     # itself. A policy-locked task refuses the handback: its route was
     # approved for one assignee for its whole run, and rework has to be
     # separately approved work.
-    role_transition_route(conn, task_id, implementer)
+    assignments, repin = role_transition_route(conn, task_id, implementer)
+    # Same rule as every other assignee write: whatever the authority helper
+    # hands back rides in THIS statement. Empty (and therefore a no-op) for
+    # every task that is not policy-governed.
+    route_sql, route_params = _route_assignment_sql(assignments)
     # NOTE: consecutive_failures is deliberately PRESERVED (neither
     # reset nor incremented). Review transitions are not evidence the
     # pathology cleared — only complete_task's success path resets the
@@ -23202,12 +23415,15 @@ def _request_changes_within_txn(
                claim_lock = NULL,
                claim_expires = NULL,
                worker_pid = NULL
+        """ + route_sql + """
          WHERE id = ? AND status = 'running' AND current_run_id = ?
         """,
-        (new_status, implementer, task_id, int(current_run_id)),
+        (new_status, implementer, *route_params, task_id, int(current_run_id)),
     )
     if cur.rowcount != 1:
         return False, "task changed during review handoff"
+    if repin is not None:
+        _append_event(conn, task_id, "model_route_repinned", repin)
     run_id = _end_run(
         conn,
         task_id,
@@ -24693,6 +24909,12 @@ def decompose_triage_task(
             )
             owned_paths = normalize_owned_paths(child.get("owned_paths"))
             integrates_parent_heads = child.get("integrates_parent_heads", False)
+            requires_review = bool(child.get("requires_review", False))
+            if requires_review and assignee in _READ_ONLY_PROFILES:
+                raise ValueError(
+                    f"child[{idx}] read-only reviewer work cannot itself "
+                    "require review"
+                )
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -24736,8 +24958,9 @@ def decompose_triage_task(
                 " workspace_path, tenant, project_id, owned_paths, "
                 " integrates_parent_heads, model_override, provider_override, "
                 " reasoning_effort, execution_tier, model_policy_lock, "
-                " owner_receipt_bound, park_generation, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " owner_receipt_bound, requires_review, park_generation, "
+                " created_at, created_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -24757,6 +24980,7 @@ def decompose_triage_task(
                     execution_tier,
                     model_policy_lock,
                     1 if receipt_owned else 0,
+                    1 if requires_review else 0,
                     generation,
                     now,
                     (author or "decomposer"),
@@ -24769,6 +24993,7 @@ def decompose_triage_task(
                     "from_decompose_of": task_id,
                     "owned_paths": owned_paths,
                     "integrates_parent_heads": integrates_parent_heads or None,
+                    "requires_review": requires_review or None,
                     "execution_tier": execution_tier,
                     "model_route_pinned": bool(model_policy_lock),
                     "parked_for_activation": True if parked else None,
