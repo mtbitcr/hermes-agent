@@ -167,6 +167,10 @@ def test_values_are_drawn_from_the_owner_snapshots_closed_vocabulary(
         kb.STOPPED_WORK_GAVE_UP,
         kb.STOPPED_WORK_CAPABILITY,
     }
+    # The serialized spellings are the contract the owner workspace parses:
+    # a renamed or added constant must fail here, not in the owner's browser.
+    assert review_vocabulary == {"none", "awaiting_review", "changes_requested", "approved"}
+    assert stopped_work_vocabulary == {"none", "gave_up", "capability"}
     assert tasks
     for task in tasks:
         assert task["review_state"] in review_vocabulary
