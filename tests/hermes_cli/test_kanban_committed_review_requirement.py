@@ -212,11 +212,14 @@ def test_a_human_approving_from_the_review_lane_is_not_re_parked(kanban_home):
 
 
 def test_the_reviewer_is_resolved_live_on_the_handover_path(kanban_home, monkeypatch):
-    """Nothing about WHO reviews is read off the row.
+    """Nothing about WHO reviews is read off the row, and it fails CLOSED.
 
-    The policy roster is consulted at the moment of the handover: when it
-    admits no read-only reviewer role, the requirement is still honoured (the
-    card parks) but no role change is invented.
+    The policy roster is consulted at the moment of the handover. When it
+    admits no read-only reviewer role there is no independent reviewer, so the
+    requirement is still honoured — the card parks instead of completing — but
+    the work is parked with NO assignee. Selecting the implementer instead
+    would leave the review dispatcher free to re-claim the card for the very
+    profile that wrote the code.
     """
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -234,9 +237,9 @@ def test_the_reviewer_is_resolved_live_on_the_handover_path(kanban_home, monkeyp
         assert _hand_over(conn, tid) is True
         task = kb.get_task(conn, tid)
         assert task.status == "review"
-        assert task.assignee == "worker", (
-            "with no reviewer resolvable the kernel must park without "
-            "inventing a role change"
+        assert task.assignee is None, (
+            "with no reviewer resolvable the kernel must park UNASSIGNED "
+            "(fail closed) instead of with the implementer"
         )
 
         # Restore the roster: the very next handover resolves a reviewer.

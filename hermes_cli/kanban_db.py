@@ -18279,19 +18279,90 @@ def policy_resolved_reviewer() -> Optional[str]:
     Resolved LIVE on every call, never captured on a task row: the review
     requirement a committed specification carries says only THAT the work is
     reviewed, so the reviewer identity has to come from the policy as it stands
-    at the moment of the handover. The answer is the read-only reviewer role
-    (:data:`_READ_ONLY_PROFILES` — the kernel's own registry of roles that may
-    never own repository writes) that the model policy currently admits. If the
-    policy admits none of them, or admits more than one so the choice is
-    genuinely ambiguous, this returns ``None`` and the caller parks the work
-    without a role change rather than guessing.
+    at the moment of the handover.
+
+    WHICH role reviews is the POLICY's decision, not the kernel's. The kernel
+    asks for it through one optional, duck-typed, policy-owned selector —
+    ``reviewer_profile_ids()``, the reviewer-role nomination this function is
+    the only caller of. When the policy module exposes it, its answer decides
+    the reviewer identity (intersected with
+    ``admitted_profile_ids()``, because a nomination the policy does not admit
+    is not a route anyone may run). A selector that nominates nobody, that
+    nominates only unadmitted roles, or that raises therefore resolves NOBODY —
+    it never silently reverts to the kernel's own idea of who reviews.
+
+    A policy module that exposes NO such selector — the shipped one — keeps
+    today's behaviour exactly: the kernel's own :data:`_READ_ONLY_PROFILES`
+    registry (roles that may never own repository writes) intersected with the
+    admitted roster.
+
+    Either way, if nothing resolves, or more than one role does so the choice
+    is genuinely ambiguous, this returns ``None``, and the caller must FAIL
+    CLOSED — see :func:`_review_park_target`. Falling back to the implementer
+    would make the implementer its own reviewer.
     """
     try:
-        admitted = set(_model_policy().admitted_profile_ids())
+        policy = _model_policy()
+        admitted = set(policy.admitted_profile_ids())
     except Exception:
         return None
-    candidates = sorted(_READ_ONLY_PROFILES & admitted)
+
+    selector = getattr(policy, "reviewer_profile_ids", None)
+    if callable(selector):
+        try:
+            nominated = {
+                str(profile).strip()
+                for profile in selector()
+                if str(profile or "").strip()
+            }
+        except Exception:
+            # An unreadable nomination is not a licence to pick a reviewer of
+            # the kernel's own choosing.
+            return None
+    else:
+        nominated = set(_READ_ONLY_PROFILES)
+
+    candidates = sorted(nominated & admitted)
     return candidates[0] if len(candidates) == 1 else None
+
+
+def _latest_review_provenance(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple[Optional[str], Optional[str]]:
+    """The ``(implementer, reviewer)`` the latest accepted handover recorded.
+
+    Read off the newest ``review_requested`` event — the durable record
+    :func:`request_review` writes when a handover is ACCEPTED — so it describes
+    the review round-trip actually in flight, not whatever the policy happens
+    to resolve later. That is what makes it usable as an authority for the
+    return leg: unlike a live re-resolution, it cannot drift while the reviewer
+    is mid-run.
+
+    Returns ``(None, None)`` when there is no such event, when its payload is
+    unreadable, or when it names no usable pair. Callers treat that as "no
+    provenance" and fall back to their own rule rather than inventing one.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+
+    def _recorded(value: Any) -> Optional[str]:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return _canonical_assignee(value)
+
+    return _recorded(payload.get("implementer")), _recorded(payload.get("reviewer"))
 
 
 def _live_policy_route_assignments(
@@ -18379,12 +18450,24 @@ def role_transition_route(
     A locked task whose committed specification carries the review requirement
     (``requires_review``) is the one case that authorizes itself: the owner
     approved independent review for that exact card, so the transition to the
-    reviewer the policy resolves RIGHT NOW (:func:`policy_resolved_reviewer`)
-    and the handback to the implementer are approved work. The replacement
-    route is re-derived from the live policy at that moment
-    (:func:`_live_policy_route_assignments`), never inherited from the commit.
-    Every other role change on a locked task is refused exactly as before, and
-    a task with no such requirement sees no change at all.
+    reviewer and the handback to the implementer are approved work. The two
+    legs are authorized from different facts, deliberately:
+
+    * OUTBOUND, to the reviewer the policy resolves RIGHT NOW
+      (:func:`policy_resolved_reviewer`) — the only fact available, since the
+      handover's own provenance is written by that same transition; and
+    * RETURN, from the DURABLE provenance of the accepted handover
+      (:func:`_latest_review_provenance`): the implementer and reviewer the
+      latest ``review_requested`` event recorded. Re-resolving the policy here
+      instead would let a roster change made WHILE the reviewer is mid-run
+      refuse that reviewer's handback and strand its findings.
+
+    The replacement route is re-derived from the live policy in both cases
+    (:func:`_live_policy_route_assignments`), never inherited from the commit —
+    which route a role runs on is a separate question from whether the role
+    change is authorized. Every other role change on a locked task is refused
+    exactly as before, and a task with no such requirement sees no change at
+    all.
 
     ``approved_route`` is the one exception, and it is not a re-derivation: a
     fresh owner-approved mutation supplies the exact replacement
@@ -18436,6 +18519,35 @@ def role_transition_route(
     # over from the commit. Everything else stays refused, including a task
     # that carries no such requirement (see the two raises below).
     if target is not None and row["requires_review"]:
+        # The RETURN leg of the active review run is authorized by the DURABLE
+        # provenance the accepted handover recorded — the latest
+        # ``review_requested`` event names the implementer that handed the work
+        # over and the reviewer that received it — and never by re-resolving
+        # who the policy says reviews right now. The policy is free to move
+        # while a reviewer is mid-run; re-resolving there refuses the handback,
+        # and the reviewer's findings are stranded (the card stays running
+        # under the reviewer with no ``changes_requested`` event and no
+        # document behind it). Provenance is the fact that was true when the
+        # handover was ACCEPTED, so it cannot drift under the run it governs.
+        #
+        # The OUTBOUND leg carries no provenance yet — the event is written by
+        # that very transition — so it stays authorized by the live resolution.
+        #
+        # Either leg re-derives the replacement ROUTE from the live policy
+        # below: which route a role runs on is a different question from
+        # whether this role change is authorized, and only the second one is
+        # answered from provenance.
+        provenance_implementer, provenance_reviewer = _latest_review_provenance(
+            conn, task_id
+        )
+        returns_to_its_implementer = (
+            provenance_implementer is not None
+            and provenance_reviewer is not None
+            and target == provenance_implementer
+            and row["assignee"] == provenance_reviewer
+        )
+        if returns_to_its_implementer:
+            return _live_policy_route_assignments(task_id, target, row)
         reviewer = policy_resolved_reviewer()
         if reviewer is not None and reviewer in (target, row["assignee"]):
             return _live_policy_route_assignments(task_id, target, row)
@@ -18529,11 +18641,35 @@ def assign_task(
     ``approved_route`` carries the exact owner-approved replacement route and
     lock, which are then installed in the SAME write — see
     :func:`role_transition_route`.
+
+    **Implementation work that carries a committed review requirement refuses
+    the read-only reviewer profile.** :func:`create_task` already refuses to
+    attach ``requires_review`` to a read-only reviewer card, because such a
+    card IS the independent audit and would become its own reviewer. That
+    refusal is worth nothing if the same row can be reached one call later, so
+    the reassignment that would produce it — ``assignee`` in
+    :data:`_READ_ONLY_PROFILES`, ``owned_paths`` forced to ``[]``, and the
+    committed ``requires_review`` still standing — is refused here too, with a
+    ``RuntimeError`` (the same kernel-refusal shape the route-authority
+    refusals use, which the dashboard maps to its documented 409).
+
+    The refusal is deliberately narrow, because two things must keep working:
+
+    * a card on the GENUINE review lane (``status == 'review'``) is past its
+      handover and is being routed to its reviewer, which is the supported
+      action — :func:`request_review` does exactly that; and
+    * ordinary work that carries no requirement can still be reassigned to the
+      read-only reviewer, which is how the pre-existing read-only audit review
+      card is created and re-routed.
+
+    Clearing ``requires_review`` to make the assignment legal is never the
+    answer: it is the owner's committed specification, not a flag the kernel
+    may downgrade on its own.
     """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks "
+            "SELECT status, claim_lock, assignee, requires_review FROM tasks "
             "WHERE id = ? AND task_kind = 'work'",
             (task_id,),
         ).fetchone()
@@ -18543,6 +18679,27 @@ def assign_task(
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
+            )
+        # The creation-time exclusion, enforced for the whole life of the row:
+        # implementation work that carries the committed review requirement may
+        # not be handed to the read-only reviewer role, because the read-only
+        # conversion below would leave exactly the row create_task refuses —
+        # assignee=<reviewer>, owned_paths=[], requires_review=true — whose own
+        # handover then parks with implementer == reviewer. A card already on
+        # the genuine review lane is past its handover and is excluded: routing
+        # it to its reviewer is the supported action, not the bypass.
+        if (
+            profile in _READ_ONLY_PROFILES
+            and row["requires_review"]
+            and row["status"] != "review"
+        ):
+            raise RuntimeError(
+                f"cannot assign {task_id} to {profile}: it is implementation "
+                "work whose committed specification carries requires_review, "
+                "and a read-only reviewer card cannot require its own review. "
+                "Hand it over for review instead — the requirement is the "
+                "owner's specification and is never cleared to make an "
+                "assignment legal."
             )
         assignments, repin = role_transition_route(
             conn, task_id, profile, approved_route=approved_route
@@ -21593,11 +21750,32 @@ def _review_park_target(
       arriving through :func:`submit_review_findings`, which approves the task
       via this same function. Re-parking there would loop forever.
 
-    ``reviewer`` is resolved LIVE by :func:`policy_resolved_reviewer` at this
-    moment, never read off the row. When the policy resolves nobody, the task's
-    current assignee is returned instead so the role transition is a no-op: the
-    requirement is still honoured (the card parks on the review lane rather
-    than completing) and a human picks the reviewer from the board.
+    ``reviewer`` is resolved LIVE by :func:`policy_resolved_reviewer` — the
+    policy's own ``reviewer_profile_ids()`` nomination — at this moment, never
+    read off the row.
+
+    **This resolution FAILS CLOSED, and that is the whole point.** A reviewer
+    of ``None`` here does NOT mean "leave it where it is": it means the card
+    parks on the review lane with NO assignee at all (see ``complete_task``'s
+    park, which turns it into ``request_review(unassign_reviewer=True)``). Two
+    answers are treated as "no independent reviewer":
+
+    * the policy resolves nobody (no nomination, none admitted, or an ambiguous
+      set); and
+    * the policy resolves the IMPLEMENTER itself, which is not review at all.
+
+    Selecting the implementer instead — the old behaviour — parked the card
+    still assigned to the profile that wrote the code, and the review
+    dispatcher then re-claimed it for that same profile as its own reviewer.
+    An unassigned card cannot be dispatched (the review lane skips rows with no
+    assignee), so the requirement is still honoured — the card is parked, not
+    completed — and a human names the reviewer from the board.
+
+    An owner-governed (policy-locked) card cannot be parked unassigned at all:
+    its lock names the role that holds it, so :func:`role_transition_route`
+    refuses to strand it and the park is refused outright rather than
+    completing the card. Both shapes of the failure keep the same promise —
+    the work never silently completes and never reviews itself.
     """
     row = conn.execute(
         "SELECT assignee, status, current_run_id, requires_review FROM tasks "
@@ -21611,7 +21789,13 @@ def _review_park_target(
     run_id = row["current_run_id"]
     if run_id is not None and run_claimed_from_review(conn, task_id, int(run_id)):
         return False, None
-    return True, policy_resolved_reviewer() or row["assignee"]
+
+    reviewer = policy_resolved_reviewer()
+    if reviewer is None or reviewer == row["assignee"]:
+        # No INDEPENDENT reviewer resolved: park unassigned. Never the
+        # implementer — that is self-review wearing the review lane's name.
+        return True, None
+    return True, reviewer
 
 
 @bounded_mutation("complete_task")
@@ -21786,6 +21970,9 @@ def complete_task(
     # facts the reviewer needs — but the terminal write is replaced by the
     # existing review lane. The reviewer is resolved live here, and the
     # transition goes through ``request_review``'s own authority path.
+    # ``reviewer is None`` is the FAIL-CLOSED park: no independent reviewer
+    # resolved, so the card goes onto the review lane with no assignee at all
+    # rather than back to its own implementer.
     park_for_review, reviewer = _review_park_target(conn, task_id)
     if park_for_review:
         return bool(
@@ -21798,6 +21985,7 @@ def complete_task(
                     "handover_parked_for_review": True,
                 },
                 reviewer=reviewer,
+                unassign_reviewer=reviewer is None,
                 expected_run_id=expected_run_id,
                 # A caller that proves no run ownership is a human/CLI
                 # handover; ``complete_task`` accepts those today, so the park
@@ -23116,6 +23304,7 @@ def request_review(
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
     reviewer: Optional[str] = None,
+    unassign_reviewer: bool = False,
     expected_run_id: Optional[int] = None,
     force: bool = False,
     with_reason: bool = False,
@@ -23128,6 +23317,15 @@ def request_review(
     right profile.  Supplying ``reviewer`` reassigns the task before it is
     exposed to the review dispatcher.  On re-review, omitting it reuses the
     reviewer provenance persisted by the latest ``changes_requested`` event.
+
+    ``unassign_reviewer=True`` is the one way to park a card on the review lane
+    with NO assignee, and it is deliberately explicit: omitting ``reviewer``
+    means "keep whoever holds it (or reuse the durable provenance)", which is
+    what every ordinary review handoff wants.  Only the fail-closed handover of
+    :func:`_review_park_target` — a committed review requirement for which the
+    policy resolves no INDEPENDENT reviewer — asks for the unassigned park, so
+    that auto-dispatch cannot hand the work back to its own implementer.  The
+    two are mutually exclusive; supplying both is a caller error.
 
     When the task is ``running`` under a live claim, a caller that supplies no
     ``expected_run_id`` must pass ``force=True`` (explicit human/CLI override)
@@ -23169,7 +23367,13 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
-        if reviewer is None:
+        if unassign_reviewer and reviewer is not None:
+            return _ret(
+                False,
+                "unassign_reviewer=True cannot be combined with an explicit "
+                "reviewer",
+            )
+        if reviewer is None and not unassign_reviewer:
             changes_run = conn.execute(
                 "SELECT id FROM task_runs "
                 "WHERE task_id = ? AND outcome = 'changes_requested' "
@@ -23219,11 +23423,17 @@ def request_review(
         # role the row no longer has. Empty for every task that is not
         # policy-governed, which is why this was previously a no-op.
         route_sql, route_params = _route_assignment_sql(assignments)
+        # The assignee column is written when a reviewer was resolved, and when
+        # the caller explicitly asked for the unassigned park (``reviewer`` is
+        # then NULL, which is the fail-closed handover of a committed review
+        # requirement with no independent reviewer). Omitting both leaves the
+        # role untouched, exactly as every ordinary review handoff expects.
+        writes_assignee = reviewer is not None or unassign_reviewer
         assignee_sql = (
-            ", assignee = ?" + route_sql if reviewer is not None else route_sql
+            ", assignee = ?" + route_sql if writes_assignee else route_sql
         )
         lead: tuple[Any, ...] = (
-            (reviewer, *route_params) if reviewer is not None else route_params
+            (reviewer, *route_params) if writes_assignee else route_params
         )
         params: tuple[Any, ...]
         if expected_run_id is None:
