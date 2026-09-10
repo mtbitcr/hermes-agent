@@ -18282,24 +18282,27 @@ def policy_resolved_reviewer() -> Optional[str]:
     at the moment of the handover.
 
     WHICH role reviews is the POLICY's decision, not the kernel's. The kernel
-    asks for it through one optional, duck-typed, policy-owned selector —
+    asks for it through one required, duck-typed, policy-owned selector —
     ``reviewer_profile_ids()``, the reviewer-role nomination this function is
-    the only caller of. When the policy module exposes it, its answer decides
-    the reviewer identity (intersected with
-    ``admitted_profile_ids()``, because a nomination the policy does not admit
-    is not a route anyone may run). A selector that nominates nobody, that
-    nominates only unadmitted roles, or that raises therefore resolves NOBODY —
-    it never silently reverts to the kernel's own idea of who reviews.
+    the only caller of. The selector's answer decides the reviewer identity
+    (intersected with ``admitted_profile_ids()``, because a nomination the
+    policy does not admit is not a route anyone may run). A selector that
+    nominates nobody, that nominates only unadmitted roles, or that raises
+    therefore resolves NOBODY — it never silently reverts to the kernel's own
+    idea of who reviews.
 
-    A policy module that exposes NO such selector — the shipped one — keeps
-    today's behaviour exactly: the kernel's own :data:`_READ_ONLY_PROFILES`
-    registry (roles that may never own repository writes) intersected with the
-    admitted roster.
+    A policy module that exposes NO such selector, or one that is not callable,
+    FAILS CLOSED — the kernel returns ``None``, and the handover parks the card
+    with no assignee. This is the explicit design: the reviewer identity is the
+    policy's to decide, not the kernel's to invent. The kernel's own
+    :data:`_READ_ONLY_PROFILES` constant names roles that may never own
+    repository writes (used by the write-scope guards in :func:`assign_task`
+    and :func:`create_task`), but it is NOT a reviewer-identity fallback.
 
-    Either way, if nothing resolves, or more than one role does so the choice
-    is genuinely ambiguous, this returns ``None``, and the caller must FAIL
-    CLOSED — see :func:`_review_park_target`. Falling back to the implementer
-    would make the implementer its own reviewer.
+    If nothing resolves, or more than one role does so the choice is genuinely
+    ambiguous, this returns ``None``, and the caller must FAIL CLOSED — see
+    :func:`_review_park_target`. Falling back to the implementer would make
+    the implementer its own reviewer.
     """
     try:
         policy = _model_policy()
@@ -18308,19 +18311,21 @@ def policy_resolved_reviewer() -> Optional[str]:
         return None
 
     selector = getattr(policy, "reviewer_profile_ids", None)
-    if callable(selector):
-        try:
-            nominated = {
-                str(profile).strip()
-                for profile in selector()
-                if str(profile or "").strip()
-            }
-        except Exception:
-            # An unreadable nomination is not a licence to pick a reviewer of
-            # the kernel's own choosing.
-            return None
-    else:
-        nominated = set(_READ_ONLY_PROFILES)
+    if not callable(selector):
+        # A policy with no selector is not a licence to pick a reviewer of the
+        # kernel's own choosing. Fail closed — the handover will park the card
+        # with no assignee rather than inventing a reviewer.
+        return None
+    try:
+        nominated = {
+            str(profile).strip()
+            for profile in selector()
+            if str(profile or "").strip()
+        }
+    except Exception:
+        # An unreadable nomination is not a licence to pick a reviewer of
+        # the kernel's own choosing.
+        return None
 
     candidates = sorted(nominated & admitted)
     return candidates[0] if len(candidates) == 1 else None
@@ -18735,6 +18740,36 @@ def assign_task(
         )
         if repin is not None:
             _append_event(conn, task_id, "model_route_repinned", repin)
+
+        # REVIEW-LANE REASSIGNMENT PROVENANCE UPDATE
+        #
+        # When a card parked on the review lane is reassigned to a different
+        # reviewer, the durable return authority — what _latest_review_provenance
+        # reads — must be updated ATOMICALLY in this same transaction.  Without
+        # this, the reviewer provenance stays whatever the original handover
+        # recorded, and if the policy moves while the NEW reviewer is mid-run,
+        # the handback will be refused (provenance says the old reviewer,
+        # current assignee is the new one, policy now says something else — no
+        # match).  The implementer half is unchanged: the work returns to
+        # whoever originally handed it over.
+        #
+        # This applies ONLY to genuine review-lane reassignment: status is
+        # 'review' AND the assignee is actually changing.  Other assignment
+        # paths (implementation-lane work, routing during the original handover)
+        # are unaffected.
+        if row["status"] == "review" and row["assignee"] != profile:
+            prior_impl, _ = _latest_review_provenance(conn, task_id)
+            if prior_impl is not None:
+                _append_event(
+                    conn,
+                    task_id,
+                    "review_requested",
+                    {
+                        "summary": None,
+                        "implementer": prior_impl,
+                        "reviewer": profile,
+                    },
+                )
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
     # has committed so subscribers always observe durable board state.
     notify_task_updated(
