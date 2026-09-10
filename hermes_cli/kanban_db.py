@@ -18370,6 +18370,168 @@ def _latest_review_provenance(
     return _recorded(payload.get("implementer")), _recorded(payload.get("reviewer"))
 
 
+# The keys the accepted handover records so the IMPLEMENTATION's mutable write
+# scope survives the review round-trip. A review run is read-only (see
+# :func:`request_review`, which parks the card with ``owned_paths = []``), so
+# the scope the implementer held has to live somewhere durable for the length
+# of the review or the handback would have nothing to restore. It lives on the
+# same ``review_requested`` event that already carries the return authority,
+# which is what makes reviewer reassignment carry it forward for free.
+_REVIEW_SCOPE_PATHS_KEY = "implementer_owned_paths"
+_REVIEW_SCOPE_INTEGRATES_KEY = "implementer_integrates_parent_heads"
+
+
+def _latest_review_scope_provenance(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    """The implementation write scope the latest accepted handover parked.
+
+    ``None`` when the newest ``review_requested`` event records no scope at all
+    — a card handed over by a build that predates this record, which therefore
+    has nothing to restore and must be left exactly as it is rather than
+    "restored" to a scope nobody ever wrote down.
+
+    A recorded scope is returned as ``{"owned_paths": <list|None>,
+    "integrates_parent_heads": <bool>}``; ``owned_paths`` of ``None`` is the
+    legacy unscoped task and is deliberately distinguishable from ``[]`` (an
+    explicitly read-only one), because restoring the wrong one of those two
+    either widens or destroys the implementer's boundary.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict) or _REVIEW_SCOPE_PATHS_KEY not in payload:
+        return None
+    raw_paths = payload.get(_REVIEW_SCOPE_PATHS_KEY)
+    if raw_paths is None:
+        owned_paths = None
+    else:
+        try:
+            owned_paths = normalize_owned_paths(raw_paths)
+        except (TypeError, ValueError):
+            return None
+    return {
+        "owned_paths": owned_paths,
+        "integrates_parent_heads": bool(
+            payload.get(_REVIEW_SCOPE_INTEGRATES_KEY)
+        ),
+    }
+
+
+def _review_scope_event_fields(
+    owned_paths: Any, integrates_parent_heads: Any
+) -> dict[str, Any]:
+    """Render one implementation scope for a ``review_requested`` payload."""
+    return {
+        _REVIEW_SCOPE_PATHS_KEY: (
+            None if owned_paths is None else list(owned_paths)
+        ),
+        _REVIEW_SCOPE_INTEGRATES_KEY: bool(integrates_parent_heads),
+    }
+
+
+def _restored_implementation_scope_sql(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple[str, tuple[Any, ...]]:
+    """Render the parked implementation scope as a trailing SET fragment.
+
+    The counterpart of the read-only park: every leg that takes the card back
+    out of the reviewer's hands — changes requested, explicit reopen, and the
+    approval that ends the requirement — restores the EXACT scope the handover
+    recorded, in the SAME ``UPDATE`` that moves the card, so no window exists
+    in which the row's status and its write boundary disagree.
+
+    Empty (and therefore a no-op) when nothing was recorded.
+    """
+    scope = _latest_review_scope_provenance(conn, task_id)
+    if scope is None:
+        return "", ()
+    owned_paths = scope["owned_paths"]
+    return (
+        ", owned_paths = ?, integrates_parent_heads = ?",
+        (
+            json.dumps(owned_paths) if owned_paths is not None else None,
+            1 if scope["integrates_parent_heads"] else 0,
+        ),
+    )
+
+
+def independent_review_target_error(
+    conn: sqlite3.Connection,
+    task_id: str,
+    target: Optional[str],
+    *,
+    implementer: Optional[str],
+    requires_review: bool,
+) -> Optional[str]:
+    """Why this profile may NOT hold the card for review, or ``None``.
+
+    The one rule both review-target writes answer to — entry into review
+    (:func:`request_review`) and reassignment while the card sits on the review
+    lane (:func:`assign_task`) — so "who may review this" cannot be answered
+    two different ways by two callers:
+
+    * the target is never the work's own implementer. Both the implementer
+      handing the work over NOW and the durable implementer provenance of the
+      round-trip already in flight (:func:`_latest_review_provenance`) count,
+      because a re-review names the second and an initial handover names the
+      first. A card parked under its implementer is self-review whatever the
+      lane is called: the review dispatcher re-claims it for the profile that
+      wrote the code, and that profile then approves its own work.
+    * for work whose committed specification carries the review requirement,
+      the target is additionally the reviewer the POLICY nominates right now
+      (:func:`policy_resolved_reviewer`). That requirement is a promise of
+      INDEPENDENT review, so the identity that satisfies it is the policy's to
+      name — and an unresolved nomination fails closed here exactly as it does
+      in :func:`_review_park_target`, rather than admitting whoever was asked
+      for. Work carrying no such requirement keeps its free-form reviewer: the
+      policy makes no claim about who reviews it.
+
+    The handback legs are deliberately NOT routed through here — returning the
+    work to its implementer is the whole point of ``changes_requested`` and
+    :func:`reopen_review_task`, and those go to
+    :func:`role_transition_route`'s provenance-authorized return leg instead.
+    """
+    if target is None:
+        return None
+    target = _canonical_assignee(target)
+    provenance_implementer, _ = _latest_review_provenance(conn, task_id)
+    for owner in (implementer, provenance_implementer):
+        if owner is None:
+            continue
+        if target == _canonical_assignee(owner):
+            return (
+                f"cannot hand {task_id} to {target!r} for review: that is the "
+                "work's own implementer, and a card parked under its "
+                "implementer reviews itself"
+            )
+    if not requires_review:
+        return None
+    nominated = policy_resolved_reviewer()
+    if nominated is None:
+        return (
+            f"cannot hand {task_id} to {target!r} for review: its committed "
+            "specification requires independent review and the model policy "
+            "nominates no reviewer right now"
+        )
+    if target != nominated:
+        return (
+            f"cannot hand {task_id} to {target!r} for review: its committed "
+            f"specification requires independent review, which the model "
+            f"policy nominates {nominated!r} to perform"
+        )
+    return None
+
+
 def _live_policy_route_assignments(
     task_id: str, target: Optional[str], row: Any
 ) -> tuple[list[tuple[str, Any]], Optional[dict]]:
@@ -18460,7 +18622,9 @@ def role_transition_route(
 
     * OUTBOUND, to the reviewer the policy resolves RIGHT NOW
       (:func:`policy_resolved_reviewer`) — the only fact available, since the
-      handover's own provenance is written by that same transition; and
+      handover's own provenance is written by that same transition. The TARGET
+      must be that reviewer; a card whose current holder happens to be the
+      nominee does not thereby authorize a move to some other role; and
     * RETURN, from the DURABLE provenance of the accepted handover
       (:func:`_latest_review_provenance`): the implementer and reviewer the
       latest ``review_requested`` event recorded. Re-resolving the policy here
@@ -18553,8 +18717,14 @@ def role_transition_route(
         )
         if returns_to_its_implementer:
             return _live_policy_route_assignments(task_id, target, row)
+        # OUTBOUND, and ONLY outbound: the target itself has to be the role the
+        # policy nominates for review right now. Admitting any target merely
+        # because the CURRENT holder is the live nominee is what let a card
+        # already parked with the reviewer be re-pinned onto an arbitrary
+        # replacement — including the implementer — under the review
+        # requirement's own authority.
         reviewer = policy_resolved_reviewer()
-        if reviewer is not None and reviewer in (target, row["assignee"]):
+        if reviewer is not None and target == reviewer:
             return _live_policy_route_assignments(task_id, target, row)
 
     if target is None:
@@ -18628,6 +18798,35 @@ def _route_assignment_sql(
         "".join(f", {column} = ?" for column, _ in assignments),
         tuple(value for _, value in assignments),
     )
+
+
+def _authorized_role_write(
+    conn: sqlite3.Connection,
+    task_id: str,
+    target: Optional[str],
+    *,
+    approved_route: Optional[dict] = None,
+) -> tuple[str, tuple[Any, ...], Optional[dict]]:
+    """Authorize one role change and render it as ONE ``UPDATE`` fragment.
+
+    :func:`role_transition_route` answers whether the change is allowed and
+    what else must be written with it; this pairs that answer with the SQL
+    fragment carrying it, so a caller cannot obtain the authorization and then
+    forget the route columns and the repin the authorization was granted FOR.
+    Dropping them leaves ``provider_override``/``model_override``/
+    ``model_policy_lock`` describing the role the row no longer has, and the
+    next claim of that task is refused by its own lock.
+
+    Returns ``(route_sql, route_params, repin)``. The caller MUST append
+    ``route_sql`` to the same statement that writes ``assignee`` and, when
+    ``repin`` is not ``None``, append the ``model_route_repinned`` event in the
+    same transaction.
+    """
+    assignments, repin = role_transition_route(
+        conn, task_id, target, approved_route=approved_route
+    )
+    route_sql, route_params = _route_assignment_sql(assignments)
+    return route_sql, route_params, repin
 
 
 def assign_task(
@@ -18706,10 +18905,26 @@ def assign_task(
                 "owner's specification and is never cleared to make an "
                 "assignment legal."
             )
-        assignments, repin = role_transition_route(
+        # REVIEW-LANE REASSIGNMENT IS A REVIEW TARGET, not an ordinary move.
+        # The card is mid-round-trip: the durable provenance names the
+        # implementer that is waiting for a verdict on its own work, and the
+        # requirement (where there is one) named an INDEPENDENT reviewer. Both
+        # facts have to hold for the replacement too, or the reassignment is
+        # the way around the handover's own rule — see
+        # :func:`independent_review_target_error`.
+        if row["status"] == "review" and row["assignee"] != profile:
+            refusal = independent_review_target_error(
+                conn,
+                task_id,
+                profile,
+                implementer=None,
+                requires_review=bool(row["requires_review"]),
+            )
+            if refusal:
+                raise RuntimeError(refusal)
+        route_sql, route_params, repin = _authorized_role_write(
             conn, task_id, profile, approved_route=approved_route
         )
-        route_sql, route_params = _route_assignment_sql(assignments)
         read_only_sql = (
             ", owned_paths = '[]', integrates_parent_heads = 0"
             if profile in _READ_ONLY_PROFILES
@@ -18760,6 +18975,14 @@ def assign_task(
         if row["status"] == "review" and row["assignee"] != profile:
             prior_impl, _ = _latest_review_provenance(conn, task_id)
             if prior_impl is not None:
+                # The parked IMPLEMENTATION scope rides across with the return
+                # authority. The new event supersedes the old one as the row
+                # both readers consult, so omitting the scope here would erase
+                # the implementer's write boundary at the moment a reviewer is
+                # swapped — and the handback would restore nothing (worse, the
+                # read-only conversion above may have just overwritten the
+                # column it would otherwise have been read back from).
+                prior_scope = _latest_review_scope_provenance(conn, task_id)
                 _append_event(
                     conn,
                     task_id,
@@ -18768,6 +18991,14 @@ def assign_task(
                         "summary": None,
                         "implementer": prior_impl,
                         "reviewer": profile,
+                        **(
+                            _review_scope_event_fields(
+                                prior_scope["owned_paths"],
+                                prior_scope["integrates_parent_heads"],
+                            )
+                            if prior_scope is not None
+                            else {}
+                        ),
                     },
                 )
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
@@ -22068,10 +22299,29 @@ def complete_task(
                 )
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'",
+            "SELECT status, current_run_id FROM tasks "
+            "WHERE id = ? AND task_kind = 'work'",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        prior_run_id = prior["current_run_id"] if prior else None
+        # The approval is the other way a card leaves the reviewer's hands, so
+        # it restores the implementation scope the read-only park replaced —
+        # in this same statement. A completed card that keeps the reviewer's
+        # empty scope no longer records what the work was allowed to touch,
+        # and a later reopen would hand the implementer an empty boundary.
+        # BOTH approval shapes count: a human approving a card still sitting in
+        # ``review``, and the reviewer's own clean verdict, which arrives from
+        # a run claimed OUT of review and therefore reads as ``running``.
+        approves_from_review = prior_status == "review" or (
+            prior_run_id is not None
+            and run_claimed_from_review(conn, task_id, int(prior_run_id))
+        )
+        scope_sql, scope_params = (
+            _restored_implementation_scope_sql(conn, task_id)
+            if approves_from_review
+            else ("", ())
+        )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -22085,6 +22335,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0,
                        head_commit   = COALESCE(?, head_commit)
+                """ + scope_sql + """
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND task_kind = 'work'
@@ -22093,6 +22344,7 @@ def complete_task(
                     result,
                     now,
                     execution_receipt.get("head_commit") if execution_receipt else None,
+                    *scope_params,
                     task_id,
                 ),
             )
@@ -22109,6 +22361,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0,
                        head_commit   = COALESCE(?, head_commit)
+                """ + scope_sql + """
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
@@ -22118,6 +22371,7 @@ def complete_task(
                     result,
                     now,
                     execution_receipt.get("head_commit") if execution_receipt else None,
+                    *scope_params,
                     task_id,
                     int(expected_run_id),
                 ),
@@ -23376,6 +23630,21 @@ def request_review(
     exposed to the review dispatcher.  On re-review, omitting it reuses the
     reviewer provenance persisted by the latest ``changes_requested`` event.
 
+    **A named reviewer is never the implementer**, and for work whose committed
+    specification carries the review requirement it is the reviewer the policy
+    nominates right now — :func:`independent_review_target_error` is the one
+    rule, shared with review-lane reassignment. Naming the implementer used to
+    slip through as a no-op role change (same assignee in, same assignee out),
+    parking the card on the review lane under the very profile that wrote the
+    code, which the review dispatcher then re-claimed as its own reviewer.
+
+    **The parked review run is READ-ONLY.** The card enters review with
+    ``owned_paths = []`` and no parent-head integration, so the reviewer
+    inherits the right to read the work and none of the implementer's right to
+    write it. The scope it replaces is recorded on this handover's own
+    ``review_requested`` event and restored EXACTLY — by the handback, by an
+    explicit reopen, and by the approval that ends the requirement.
+
     ``unassign_reviewer=True`` is the one way to park a card on the review lane
     with NO assignee, and it is deliberately explicit: omitting ``reviewer``
     means "keep whoever holds it (or reuse the durable provenance)", which is
@@ -23405,7 +23674,8 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, "
+            "requires_review, owned_paths, integrates_parent_heads "
             "FROM tasks WHERE id = ? AND task_kind = 'work'", (task_id,),
         ).fetchone()
         if trow is None:
@@ -23470,17 +23740,43 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        # WHO may hold this card for review, decided before anything is
+        # authorized or written. Checked for every named reviewer, including
+        # one that happens to equal the current assignee: that shape is not a
+        # harmless no-op reassignment, it is the handover parking the work
+        # under its own implementer, and the role-transition fast path (same
+        # target as current holder -> nothing to authorize) cannot see the
+        # difference.
+        if reviewer is not None:
+            refusal = independent_review_target_error(
+                conn,
+                task_id,
+                reviewer,
+                implementer=implementer,
+                requires_review=bool(trow["requires_review"]),
+            )
+            if refusal:
+                return _ret(False, refusal)
         # The independent reviewer is a different role, so this is a role
         # transition and goes through the one authority helper. A policy-locked
         # task refuses the handoff: its route was approved for one assignee for
         # its whole run, so independent review has to be separately approved
         # work rather than a silent re-pin of this task.
-        assignments, repin = role_transition_route(conn, task_id, reviewer)
+        #
         # The pairs the authority helper hands back MUST ride in the same
         # UPDATE as the assignee write, or the lock would be left describing a
         # role the row no longer has. Empty for every task that is not
         # policy-governed, which is why this was previously a no-op.
-        route_sql, route_params = _route_assignment_sql(assignments)
+        route_sql, route_params, repin = _authorized_role_write(
+            conn, task_id, reviewer
+        )
+        # The review run is read-only: the reviewer reads the implementation,
+        # it does not inherit the right to rewrite it. The scope being replaced
+        # is carried on this handover's own event (below) and restored exactly
+        # when the card leaves the reviewer's hands.
+        parked_owned_paths = _decode_owned_paths(trow["owned_paths"])
+        parked_integrates = bool(trow["integrates_parent_heads"])
+        read_only_sql = ", owned_paths = '[]', integrates_parent_heads = 0"
         # The assignee column is written when a reviewer was resolved, and when
         # the caller explicitly asked for the unassigned park (``reviewer`` is
         # then NULL, which is the fail-closed handover of a committed review
@@ -23488,7 +23784,8 @@ def request_review(
         # role untouched, exactly as every ordinary review handoff expects.
         writes_assignee = reviewer is not None or unassign_reviewer
         assignee_sql = (
-            ", assignee = ?" + route_sql if writes_assignee else route_sql
+            (", assignee = ?" + route_sql if writes_assignee else route_sql)
+            + read_only_sql
         )
         lead: tuple[Any, ...] = (
             (reviewer, *route_params) if writes_assignee else route_params
@@ -23547,6 +23844,13 @@ def request_review(
                 "summary": event_summary or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
+                # The implementation scope this park replaced, so the return
+                # leg has something exact to restore. Recorded on the SAME
+                # event as the return authority, in the same transaction as
+                # the read-only conversion itself.
+                **_review_scope_event_fields(
+                    parked_owned_paths, parked_integrates,
+                ),
             },
             run_id=run_id,
         )
@@ -23665,12 +23969,15 @@ def _request_changes_within_txn(
     # goes through the one authority helper rather than writing `assignee`
     # itself. A policy-locked task refuses the handback: its route was
     # approved for one assignee for its whole run, and rework has to be
-    # separately approved work.
-    assignments, repin = role_transition_route(conn, task_id, implementer)
-    # Same rule as every other assignee write: whatever the authority helper
-    # hands back rides in THIS statement. Empty (and therefore a no-op) for
-    # every task that is not policy-governed.
-    route_sql, route_params = _route_assignment_sql(assignments)
+    # separately approved work. Whatever that helper hands back rides in THIS
+    # statement; it is empty (and therefore a no-op) for every task that is
+    # not policy-governed.
+    route_sql, route_params, repin = _authorized_role_write(
+        conn, task_id, implementer
+    )
+    # The implementer gets its write boundary back in the same statement that
+    # gets the work back — the review run held it read-only.
+    scope_sql, scope_params = _restored_implementation_scope_sql(conn, task_id)
     # NOTE: consecutive_failures is deliberately PRESERVED (neither
     # reset nor incremented). Review transitions are not evidence the
     # pathology cleared — only complete_task's success path resets the
@@ -23683,10 +23990,13 @@ def _request_changes_within_txn(
                claim_lock = NULL,
                claim_expires = NULL,
                worker_pid = NULL
-        """ + route_sql + """
+        """ + route_sql + scope_sql + """
          WHERE id = ? AND status = 'running' AND current_run_id = ?
         """,
-        (new_status, implementer, *route_params, task_id, int(current_run_id)),
+        (
+            new_status, implementer, *route_params, *scope_params,
+            task_id, int(current_run_id),
+        ),
     )
     if cur.rowcount != 1:
         return False, "task changed during review handoff"
@@ -24577,6 +24887,12 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     not a block, so there is no loop counter to reset. (A stale counter from a
     genuine block *before* review is left intact — only :func:`complete_task`
     clears it.) Returns False when the task is missing or not in ``review``.
+
+    Route, repin and restored write scope all land in the SAME ``UPDATE`` as
+    the assignee, the way :func:`_request_changes_within_txn` does it: a reopen
+    that moved only the assignee left an owner-governed card pinned to the
+    reviewer's provider, model and lock, and its next implementation claim was
+    refused by that lock.
     """
     now = int(time.time())
     with write_txn(conn):
@@ -24603,19 +24919,29 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if not isinstance(implementer, str) or not implementer.strip():
             implementer = None
         # Handing the work back to the implementer is a role transition too, so
-        # it goes through the same authority helper; a policy-locked task
-        # refuses it rather than being silently re-pinned.
-        role_transition_route(conn, task_id, implementer)
+        # it goes through the same authority helper as the changes-requested
+        # handback — and, exactly as there, whatever that helper hands back is
+        # written WITH the assignee, not discarded. Applying only the assignee
+        # left provider, model, effort, tier and lock still describing the
+        # reviewer, so the route no longer matched the role that held the card
+        # and the next implementation claim was refused by the task's own lock.
+        route_sql, route_params, repin = _authorized_role_write(
+            conn, task_id, implementer
+        )
+        # The review run was read-only; the implementer gets its exact write
+        # boundary back in the same statement.
+        scope_sql, scope_params = _restored_implementation_scope_sql(conn, task_id)
         if new_status in EXECUTABLE_STATUSES and not authorize_executable_transition(
             conn, task_id
         ):
             # Parked for re-approval rather than handed back into the pool.
             return False
         assignee_sql = ", assignee = ?" if implementer else ""
+        lead: tuple[Any, ...] = (
+            (new_status, implementer) if implementer else (new_status,)
+        )
         params: tuple[Any, ...] = (
-            (new_status, implementer, task_id)
-            if implementer
-            else (new_status, task_id)
+            *lead, *route_params, *scope_params, task_id,
         )
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
@@ -24624,11 +24950,15 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             # not a success signal; only complete_task resets the breaker
             # counter (mirrors unblock_task, #35072).
             + assignee_sql
+            + route_sql
+            + scope_sql
             + " WHERE id = ? AND status = 'review' AND task_kind = 'work'",
             params,
         )
         if cur.rowcount != 1:
             return False
+        if repin is not None:
+            _append_event(conn, task_id, "model_route_repinned", repin)
         payload: dict[str, Any] = {"status": new_status}
         if implementer:
             payload["implementer"] = implementer

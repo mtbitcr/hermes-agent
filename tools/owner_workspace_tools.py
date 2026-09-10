@@ -10,6 +10,12 @@ Every tool schema is deliberately narrow: no author/profile/actor/session/
 path/scope field is accepted from the model. Identity is resolved from
 trusted request context (``resolve_owner_context``) inside the kernel.
 
+One handler here is NOT a tool at all: ``_handle_task_retry`` carries no
+registration and no schema, because the owner retry states the OWNER's own
+reason for trying stopped work again. It is reached only by the API server's
+native run dispatch, from a run whose owner authority the kernel re-verifies
+before it reads or writes anything.
+
 The separate ``project_steward`` toolset exposes one read-only, owner-safe
 snapshot without granting any owner-workspace mutation authority.
 """
@@ -229,6 +235,16 @@ def _handle_task_comment(args: dict, **kw) -> str:
 
 
 def _handle_task_retry(args: dict, **kw) -> str:
+    """Apply ONE authenticated owner retry run. Never a model-facing tool.
+
+    Deliberately not registered: there is no ``owner_task_retry`` schema in
+    any toolset, so no model can call it. The only caller is the API server's
+    native run dispatch (``_OWNER_NATIVE_RUN_HANDLERS``), which resolves this
+    function by name and hands it the frozen payload the owner's run authority
+    was minted from. The kernel re-checks that authority before it reads or
+    writes anything (:func:`hermes_cli.owner_workspace.retry_task`), so this
+    wrapper stays exactly as thin as its siblings.
+    """
     try:
         ctx = resolve_owner_context()
         result = _kernel.retry_task(
@@ -789,39 +805,12 @@ registry.register(
     handler=lambda args, **kw: _handle_task_comment(args, **kw),
 )
 
-registry.register(
-    name="owner_task_retry",
-    toolset="owner_workspace",
-    schema={
-        "name": "owner_task_retry",
-        "description": (
-            "Retry work that stopped on its own — the system gave up (dispatcher "
-            "circuit-breaker exhausted) or a worker hit a capability wall it "
-            "cannot pass. Every other state is refused with a plain reason "
-            "explaining which state the task is in and why that state is not "
-            "retryable. The owner's reason is required and is recorded on the "
-            "task and on the exact stopped attempt. Idempotent; requires a fresh "
-            "human confirmation."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "idempotency_key": {
-                    "type": "string",
-                    "description": "Stable client-chosen key so a retried call is safe.",
-                },
-                "project_id": {
-                    "type": "string",
-                    "description": "The receipt-owned Project containing the task.",
-                },
-                "task_id": {"type": "string", "description": "The stopped task to retry."},
-                "reason": {
-                    "type": "string",
-                    "description": "The owner's account of why this work should be retried.",
-                },
-            },
-            "required": ["idempotency_key", "project_id", "task_id", "reason"],
-        },
-    },
-    handler=lambda args, **kw: _handle_task_retry(args, **kw),
-)
+# NO registration for owner_task_retry, and that is the point. The retry
+# records the OWNER's stated reason for trying stopped work again, so it is a
+# hidden run authority the API server dispatches natively from an already
+# authenticated owner run (``_OWNER_NATIVE_RUN_HANDLERS`` -> the
+# ``_handle_task_retry`` above), never a capability a model may reach. A
+# registered schema would be enough to expose it: ``get_toolset()`` merges
+# every registry entry of a toolset into that toolset's tool list, so
+# registering it under ``owner_workspace`` would hand it to every agent the
+# owner-workspace gate admits — regardless of what toolsets.py lists.
