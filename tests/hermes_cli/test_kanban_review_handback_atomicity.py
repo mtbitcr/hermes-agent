@@ -624,7 +624,8 @@ def test_post_create_path_boundary_failure_leaves_no_orphan(
 ):
     """A fault at the FIRST operation after the exclusive create — the first
     write, before a single byte lands and before the close — must not orphan
-    the reserved blob.
+    the reserved blob. The close of the reserving descriptor is also observed:
+    neither the write nor the close may complete before the fault fires.
 
     ``os.open(..., O_CREAT | O_EXCL)`` returning means the file already
     exists on disk. Any statement executed between that moment and the
@@ -659,6 +660,7 @@ def test_post_create_path_boundary_failure_leaves_no_orphan(
     """
     real_open = kb.os.open
     real_write = kb.os.write
+    real_close = kb.os.close
     real_div = Path.__truediv__
     real_resolve = Path.resolve
 
@@ -679,6 +681,8 @@ def test_post_create_path_boundary_failure_leaves_no_orphan(
             "reserved_fd": None,
             "post_create_joins": 0,
             "bytes_written": 0,
+            "closes_before_fault": 0,
+            "close_observations": 0,
             "fired": None,
         }
 
@@ -730,8 +734,16 @@ def test_post_create_path_boundary_failure_leaves_no_orphan(
                 raise RuntimeError("simulated post-create boundary fault")
             return real_resolve(self, *args, **kwargs)
 
+        def _observing_close(fd):
+            if state["armed"] and fd == state["reserved_fd"]:
+                state["close_observations"] += 1
+                if state["fired"] is None:
+                    state["closes_before_fault"] += 1
+            return real_close(fd)
+
         monkeypatch.setattr(kb.os, "open", _arming_open)
         monkeypatch.setattr(kb.os, "write", _trapped_write)
+        monkeypatch.setattr(kb.os, "close", _observing_close)
         monkeypatch.setattr(Path, "__truediv__", _trapped_div)
         monkeypatch.setattr(Path, "resolve", _trapped_resolve)
         try:
@@ -765,6 +777,16 @@ def test_post_create_path_boundary_failure_leaves_no_orphan(
         assert state["bytes_written"] == 0, (
             "the fault was armed too late: bytes reached the reserved blob "
             "before the first trapped write"
+        )
+        assert state["close_observations"] >= 1, (
+            "the close observer never saw the reserving descriptor's close — "
+            "the observer must be active to prove the close did not precede "
+            "the fault"
+        )
+        assert state["closes_before_fault"] == 0, (
+            "the reserving descriptor was closed before the fault fired — "
+            "neither the exclusive write nor the close may complete before "
+            "the boundary fault"
         )
         assert result["outcome"] == "error", result
 
