@@ -402,6 +402,15 @@ class TestOwnerWorkspaceRunContext:
                 "owned_paths": [],
                 "requires_review": True,
             }, False),
+            ({
+                "title": "Re-plan the milestone",
+                "body_mode": "preserve",
+                "assignee": " Raphael-Planner ",
+                "responsibility": "R01",
+                "execution_tier": "routine",
+                "owned_paths": [],
+                "requires_review": True,
+            }, False),
         ],
     )
     def test_stored_replace_proposal_validates_exact_native_run_payload(
@@ -545,6 +554,10 @@ class TestOwnerWorkspaceRunContext:
             # invalid stored proposal, before any run is reserved.
             ("raphael-planner", "R01", True, "stored proposal change is invalid"),
             ("raphael-verifier", "R15", True, "stored proposal change is invalid"),
+            # The apply path canonicalizes the assignee before it refuses, so
+            # the authority refuses the same spellings.
+            (" raphael-planner ", "R01", True, "stored proposal change is invalid"),
+            ("RAPHAEL-VERIFIER", "R15", True, "stored proposal change is invalid"),
         ],
     )
     def test_a_review_requirement_on_a_plan_add_is_part_of_the_authority(

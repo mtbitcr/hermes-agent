@@ -1449,7 +1449,16 @@ def _owner_review_requirement(value: Dict[str, Any]) -> Dict[str, Any]:
     """
     if value.get("requires_review") is not True:
         return {}
-    if value.get("assignee") in _OWNER_REVIEW_REFUSED_ASSIGNEES:
+    # The apply path canonicalizes the assignee (strip, lowercase) before its
+    # refusal, so a spaced or mixed-case spelling of a read-only role is the
+    # same role here too.
+    from hermes_cli.profiles import normalize_profile_name
+
+    try:
+        assignee = normalize_profile_name(value.get("assignee"))
+    except ValueError:
+        assignee = ""
+    if assignee in _OWNER_REVIEW_REFUSED_ASSIGNEES:
         raise ValueError("stored proposal change is invalid")
     return {"requires_review": True}
 
