@@ -705,6 +705,9 @@ class TestOwnerWorkspaceRunContext:
         """
         conversation = "raphael-owner-" + "4" * 32
         response_id = "resp_native_reviewed_new_project"
+        idempotency_key = "conversation-" + hashlib.sha256(
+            response_id.encode("utf-8")
+        ).hexdigest()
         proposal = _owner_new_proposal(tasks=[{
             "title": "Draft the workshop plan",
             "body": "Prepare the private workshop plan.",
@@ -720,7 +723,7 @@ class TestOwnerWorkspaceRunContext:
             "response_id": response_id,
             "claim_id": "claim_" + "6" * 32,
             "operation": "owner_task_graph_commit",
-            "idempotency_key": "conversation-" + "a" * 64,
+            "idempotency_key": idempotency_key,
             "payload": {},
         }
         context = {
