@@ -18471,6 +18471,32 @@ def _latest_review_head_provenance(
     return head
 
 
+def _latest_review_handover_id(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[int]:
+    """The exact IDENTITY of the newest accepted handover, or ``None``.
+
+    The sibling of the three provenance readers above, and the only one that
+    answers with an identity rather than a value: the ``task_events`` row id of
+    the newest ``review_requested`` event.
+
+    A decision taken from a park and consumed later has to name the exact park
+    it was taken from. A re-derived predicate — "is this row still a park?" —
+    is satisfied all over again by the NEXT park, which is precisely the state
+    a reopen, a successor run and a fresh handover produce while a stale
+    decision is still in flight. Identities do not have that property: the new
+    handover writes a new event, so the id moves and the stale decision is
+    refused.
+    """
+    row = conn.execute(
+        "SELECT id FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return int(row["id"]) if row is not None else None
+
+
 def _review_scope_event_fields(
     owned_paths: Any,
     integrates_parent_heads: Any,
@@ -18643,14 +18669,16 @@ def role_transition_route(
     new_assignee: Optional[str],
     *,
     approved_route: Optional[dict] = None,
+    review_round_trip: bool = False,
 ) -> tuple[list[tuple[str, Any]], Optional[dict]]:
     """Authorize one assignee write on a possibly policy-locked task.
 
     Every path that writes ``assignee`` — direct reassignment, unassignment,
     review handoff, rework handback (``request_changes``), specify, decompose,
-    and the dispatcher's default assignee — goes through here rather than
-    writing the column on its own, because a locked task's route authority is
-    bound to the role that holds it. Centralising it is the point: a direct
+    and the dispatcher's default assignee — reaches here through
+    :func:`_authorized_assignment_write`, the one lifetime invariant, rather
+    than writing the column on its own, because a locked task's route authority
+    is bound to the role that holds it. Centralising it is the point: a direct
     ``UPDATE tasks SET assignee`` elsewhere would mint nothing and leave the
     lock describing a role the task no longer has.
 
@@ -18679,10 +18707,17 @@ def role_transition_route(
     installs its exact lock in the same write.
 
     A locked task whose committed specification carries the review requirement
-    (``requires_review``) is the one case that authorizes itself: the owner
-    approved independent review for that exact card, so the transition to the
-    reviewer and the handback to the implementer are approved work. The two
-    legs are authorized from different facts, deliberately:
+    (``requires_review``) is the one case that authorizes itself, and ONLY when
+    the caller declares ``review_round_trip``: the owner approved independent
+    review for that exact card, so the transition to the reviewer and the
+    handback to the implementer are approved work. That authorization is never
+    inherited — a caller that merely happens to name the configured reviewer
+    (specify, decompose, the dispatcher's default assignee) is not performing a
+    review handover, and used to be granted the re-pin anyway because the
+    branch keyed off the TARGET rather than off the caller's intent. The
+    round-trip legs name themselves; everything else is refused exactly as any
+    other role change on a locked task is. The two legs are authorized from
+    different facts, deliberately:
 
     * OUTBOUND, to the reviewer the policy resolves RIGHT NOW
       (:func:`policy_resolved_reviewer`) — the only fact available, since the
@@ -18745,13 +18780,15 @@ def role_transition_route(
 
     # The ONE role transition a locked task authorizes on its own: the review
     # round-trip of a card whose committed specification already carries the
-    # review requirement. The owner approved review for this exact task, so
-    # handing it to the policy's current reviewer and handing it back to the
-    # implementer are approved work rather than a silent re-pin — and the
-    # replacement route is re-derived from the live policy here, never carried
-    # over from the commit. Everything else stays refused, including a task
-    # that carries no such requirement (see the two raises below).
-    if target is not None and row["requires_review"]:
+    # review requirement, DECLARED as such by the caller making it. The owner
+    # approved review for this exact task, so handing it to the policy's
+    # current reviewer and handing it back to the implementer are approved work
+    # rather than a silent re-pin — and the replacement route is re-derived
+    # from the live policy here, never carried over from the commit. Everything
+    # else stays refused, including a task that carries no such requirement and
+    # a caller that never said it was performing the round-trip (see the two
+    # raises below).
+    if review_round_trip and target is not None and row["requires_review"]:
         # The RETURN leg of the active review run is authorized by the DURABLE
         # provenance the accepted handover recorded — the latest
         # ``review_requested`` event names the implementer that handed the work
@@ -18864,33 +18901,126 @@ def _route_assignment_sql(
     )
 
 
-def _authorized_role_write(
+@dataclass(frozen=True)
+class _AssignmentWrite:
+    """One authorized assignee change, rendered for ONE ``UPDATE``.
+
+    ``route_sql``/``params`` are the route columns the authority granted,
+    ``scope_sql`` the write boundary the new role is entitled to, ``repin`` the
+    ``model_route_repinned`` payload recording both, and ``read_only_scope``
+    whether the boundary was narrowed to the read-only one.
+
+    Most callers append :attr:`sql` — route AND scope together — because they
+    write no scope of their own. The review round-trip is the exception: the
+    park converts the card to the reviewer's read-only boundary whoever holds
+    it, and the two handbacks restore the implementation boundary the park
+    persisted, so those callers append ``route_sql`` and write the scope
+    themselves, in the same statement, from their own authority.
+    """
+
+    route_sql: str
+    scope_sql: str
+    params: tuple[Any, ...]
+    repin: Optional[dict]
+    read_only_scope: bool
+
+    @property
+    def sql(self) -> str:
+        """The whole fragment: route columns and the entitled write scope."""
+        return self.route_sql + self.scope_sql
+
+
+def _authorized_assignment_write(
     conn: sqlite3.Connection,
     task_id: str,
     target: Optional[str],
     *,
     approved_route: Optional[dict] = None,
-) -> tuple[str, tuple[Any, ...], Optional[dict]]:
-    """Authorize one role change and render it as ONE ``UPDATE`` fragment.
+    review_round_trip: bool = False,
+) -> _AssignmentWrite:
+    """THE lifetime invariant every writer of ``assignee`` answers to.
 
-    :func:`role_transition_route` answers whether the change is allowed and
-    what else must be written with it; this pairs that answer with the SQL
-    fragment carrying it, so a caller cannot obtain the authorization and then
-    forget the route columns and the repin the authorization was granted FOR.
-    Dropping them leaves ``provider_override``/``model_override``/
-    ``model_policy_lock`` describing the role the row no longer has, and the
-    next claim of that task is refused by its own lock.
+    One place decides whether a given ``(task, new assignee)`` pair is allowed
+    at all and what route, scope and repin must be written WITH it. It exists
+    because the rules kept being enforced by whichever caller happened to
+    remember them: the read-only-reviewer exclusion lived only in
+    :func:`assign_task`, so the triage specification, the triage decomposition
+    and the dispatcher's default assignee each reached the exact row
+    :func:`create_task` refuses — implementation work carrying a committed
+    ``requires_review`` held by a role that may only read, whose scope is then
+    erased at claim time and whose own handover parks an unassigned review with
+    no head. The same three called :func:`role_transition_route`, DISCARDED the
+    route it handed back and wrote the assignee alone, leaving governed work
+    pinned to the previous role's lock for its next claim to be refused by.
 
-    Returns ``(route_sql, route_params, repin)``. The caller MUST append
-    ``route_sql`` to the same statement that writes ``assignee`` and, when
-    ``repin`` is not ``None``, append the ``model_route_repinned`` event in the
-    same transaction.
+    Both halves are answered here, in this order, so no caller can obtain one
+    without the other:
+
+    * whether the target may hold this card at all. Implementation work whose
+      committed specification carries the review requirement refuses a
+      :data:`_READ_ONLY_PROFILES` target outright (``RuntimeError``, the kernel
+      refusal shape the route authority already uses, which the dashboard maps
+      to its documented 409). Clearing ``requires_review`` to make the
+      assignment legal is never the answer: it is the owner's committed
+      specification, not a flag the kernel may downgrade on its own. A card on
+      the GENUINE review lane is past its handover and excluded — routing it to
+      its reviewer is the supported action, not the bypass; and
+    * what must ride along: the route columns :func:`role_transition_route`
+      grants, and the read-only write boundary a read-only role is entitled to.
+
+    ``review_round_trip`` is the caller DECLARING that this write is a leg of
+    the review round-trip — the handover (:func:`request_review`), the
+    reviewer's handback (:func:`submit_review_findings`) and the reopen that
+    returns the card to its implementer. It is never inferred from the target:
+    a caller does not become a review handover merely because the profile it
+    names happens to be the one the policy nominates.
+
+    Fails closed by raising; on success the caller MUST append the returned
+    fragment to the SAME statement that writes ``assignee`` and, when ``repin``
+    is not ``None``, append the ``model_route_repinned`` event in the same
+    transaction.
     """
+    target = _canonical_assignee(target)
+    row = conn.execute(
+        "SELECT status, requires_review FROM tasks "
+        "WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
+    ).fetchone()
+    if (
+        row is not None
+        and not review_round_trip
+        and target in _READ_ONLY_PROFILES
+        and row["requires_review"]
+        and row["status"] != "review"
+    ):
+        raise RuntimeError(
+            f"cannot assign {task_id} to {target}: it is implementation "
+            "work whose committed specification carries requires_review, "
+            "and a read-only reviewer card cannot require its own review. "
+            "Hand it over for review instead — the requirement is the "
+            "owner's specification and is never cleared to make an "
+            "assignment legal."
+        )
     assignments, repin = role_transition_route(
-        conn, task_id, target, approved_route=approved_route
+        conn,
+        task_id,
+        target,
+        approved_route=approved_route,
+        review_round_trip=review_round_trip,
     )
     route_sql, route_params = _route_assignment_sql(assignments)
-    return route_sql, route_params, repin
+    read_only_scope = target in _READ_ONLY_PROFILES
+    return _AssignmentWrite(
+        route_sql=route_sql,
+        scope_sql=(
+            ", owned_paths = '[]', integrates_parent_heads = 0"
+            if read_only_scope
+            else ""
+        ),
+        params=route_params,
+        repin=repin,
+        read_only_scope=read_only_scope,
+    )
 
 
 def assign_task(
@@ -18911,28 +19041,9 @@ def assign_task(
     :func:`role_transition_route`.
 
     **Implementation work that carries a committed review requirement refuses
-    the read-only reviewer profile.** :func:`create_task` already refuses to
-    attach ``requires_review`` to a read-only reviewer card, because such a
-    card IS the independent audit and would become its own reviewer. That
-    refusal is worth nothing if the same row can be reached one call later, so
-    the reassignment that would produce it — ``assignee`` in
-    :data:`_READ_ONLY_PROFILES`, ``owned_paths`` forced to ``[]``, and the
-    committed ``requires_review`` still standing — is refused here too, with a
-    ``RuntimeError`` (the same kernel-refusal shape the route-authority
-    refusals use, which the dashboard maps to its documented 409).
-
-    The refusal is deliberately narrow, because two things must keep working:
-
-    * a card on the GENUINE review lane (``status == 'review'``) is past its
-      handover and is being routed to its reviewer, which is the supported
-      action — :func:`request_review` does exactly that; and
-    * ordinary work that carries no requirement can still be reassigned to the
-      read-only reviewer, which is how the pre-existing read-only audit review
-      card is created and re-routed.
-
-    Clearing ``requires_review`` to make the assignment legal is never the
-    answer: it is the owner's committed specification, not a flag the kernel
-    may downgrade on its own.
+    the read-only reviewer profile** — the lifetime invariant every assignee
+    writer shares (:func:`_authorized_assignment_write`) answers that, so the
+    refusal is the same one the triage, decomposition and dispatcher paths get.
     """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
@@ -18947,27 +19058,6 @@ def assign_task(
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
-            )
-        # The creation-time exclusion, enforced for the whole life of the row:
-        # implementation work that carries the committed review requirement may
-        # not be handed to the read-only reviewer role, because the read-only
-        # conversion below would leave exactly the row create_task refuses —
-        # assignee=<reviewer>, owned_paths=[], requires_review=true — whose own
-        # handover then parks with implementer == reviewer. A card already on
-        # the genuine review lane is past its handover and is excluded: routing
-        # it to its reviewer is the supported action, not the bypass.
-        if (
-            profile in _READ_ONLY_PROFILES
-            and row["requires_review"]
-            and row["status"] != "review"
-        ):
-            raise RuntimeError(
-                f"cannot assign {task_id} to {profile}: it is implementation "
-                "work whose committed specification carries requires_review, "
-                "and a read-only reviewer card cannot require its own review. "
-                "Hand it over for review instead — the requirement is the "
-                "owner's specification and is never cleared to make an "
-                "assignment legal."
             )
         # REVIEW-LANE REASSIGNMENT IS A REVIEW TARGET, not an ordinary move.
         # The card is mid-round-trip: the durable provenance names the
@@ -18986,13 +19076,17 @@ def assign_task(
             )
             if refusal:
                 raise RuntimeError(refusal)
-        route_sql, route_params, repin = _authorized_role_write(
-            conn, task_id, profile, approved_route=approved_route
-        )
-        read_only_sql = (
-            ", owned_paths = '[]', integrates_parent_heads = 0"
-            if profile in _READ_ONLY_PROFILES
-            else ""
+        # A card on the GENUINE review lane is mid-round-trip and this write is
+        # its reviewer leg — the swap the line above has just said is a
+        # permissible review target. That is the declaration, made here by the
+        # caller that knows the lane it is on; every other assignment reaching
+        # this function is an ordinary role change and is authorized as one.
+        write = _authorized_assignment_write(
+            conn,
+            task_id,
+            profile,
+            approved_route=approved_route,
+            review_round_trip=row["status"] == "review",
         )
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
@@ -19000,13 +19094,13 @@ def assign_task(
             # new profile should not inherit the previous profile's streak.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL" + route_sql + read_only_sql + " WHERE id = ?",
-                (profile, *route_params, task_id),
+                "last_failure_error = NULL" + write.sql + " WHERE id = ?",
+                (profile, *write.params, task_id),
             )
         else:
             conn.execute(
-                "UPDATE tasks SET assignee = ?" + route_sql + read_only_sql + " WHERE id = ?",
-                (profile, *route_params, task_id),
+                "UPDATE tasks SET assignee = ?" + write.sql + " WHERE id = ?",
+                (profile, *write.params, task_id),
             )
         _append_event(
             conn,
@@ -19014,11 +19108,15 @@ def assign_task(
             "assigned",
             {
                 "assignee": profile,
-                **({"read_only_scope_enforced": True} if read_only_sql else {}),
+                **(
+                    {"read_only_scope_enforced": True}
+                    if write.read_only_scope
+                    else {}
+                ),
             },
         )
-        if repin is not None:
-            _append_event(conn, task_id, "model_route_repinned", repin)
+        if write.repin is not None:
+            _append_event(conn, task_id, "model_route_repinned", write.repin)
 
         # REVIEW-LANE REASSIGNMENT PROVENANCE UPDATE
         #
@@ -22187,7 +22285,12 @@ def _unassignable_review_park_error(
     therefore parks unassigned exactly as before.
     """
     try:
-        role_transition_route(conn, task_id, None)
+        # Asked exactly as :func:`request_review` will ask it one statement
+        # later — same invariant, same declared review round-trip leg — so the
+        # probe and the write it is predicting can never answer differently.
+        _authorized_assignment_write(
+            conn, task_id, None, review_round_trip=True
+        )
     except RuntimeError as exc:
         return str(exc)
     return None
@@ -22211,13 +22314,31 @@ def _is_review_approval(
     return run_id is not None and run_claimed_from_review(conn, task_id, int(run_id))
 
 
-def _is_parked_review_approval(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Whether this completion is the HUMAN approval of a card parked for review.
+def _parked_review_approval_handover(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[int]:
+    """The EXACT park this completion would approve, or ``None``.
 
-    The narrower of the two shapes :func:`_is_review_approval` admits, and the
-    only one that is authorized WITHOUT a live scope proof — so it is asked as
-    its own question, from the persisted row alone, BEFORE
-    :func:`complete_task` derives any implementation receipt.
+    Not a boolean, on purpose. This is the HUMAN approval of a card parked for
+    review — the narrower of the two shapes :func:`_is_review_approval` admits,
+    and the only one authorized WITHOUT a live scope proof — so what it answers
+    with is the identity of the park it is authorized against
+    (:func:`_latest_review_handover_id`), never a bare "yes, some park".
+
+    The decision is taken from the persisted row BEFORE :func:`complete_task`
+    derives any implementation receipt, and consumed by a write transaction
+    opened well after that. A boolean cannot survive that gap. In it, a second
+    connection can reopen the review (:func:`reopen_review_task`), let the
+    dispatcher claim a successor run, and let that run commit outside its
+    declared ownership; the stale decision then skipped the scope proof, the
+    terminal ``UPDATE`` accepted ``running`` along with ``review``, and the card
+    finished with an empty head, a live successor run ended under it and no
+    ``completion_blocked_file_scope`` event anywhere. Answering with the exact
+    handover id lets :func:`complete_task` re-require this WHOLE decision —
+    every conjunct below AND that identity — inside the transaction that writes
+    ``done``, and refuse with no write at all when any of it has moved. The
+    caller retries through the fully verified completion path, which is the
+    only thing that can authorize the successor's work.
 
     Why it cannot be authorized by a live proof at all: the park converted the
     card to the reviewer's READ-ONLY scope (``owned_paths = []``,
@@ -22236,8 +22357,8 @@ def _is_parked_review_approval(conn: sqlite3.Connection, task_id: str) -> bool:
     against the parents as they stand now and re-read byte for byte inside the
     write transaction (:func:`_review_approval_head`).
 
-    So this answers ``True`` only for a row that IS a park awaiting a verdict,
-    and every conjunct is load-bearing rather than defensive dressing:
+    So this answers with a handover id only for a row that IS a park awaiting a
+    verdict, and every conjunct is load-bearing rather than defensive dressing:
 
     * ``status == 'review'`` — the card is literally sitting on the review
       lane. Any other status is an ordinary completion and keeps the scope
@@ -22273,17 +22394,19 @@ def _is_parked_review_approval(conn: sqlite3.Connection, task_id: str) -> bool:
         (task_id,),
     ).fetchone()
     if row is None:
-        return False
+        return None
     if row["status"] != "review" or row["current_run_id"] is not None:
-        return False
+        return None
     if _decode_owned_paths(row["owned_paths"]) != [] or row[
         "integrates_parent_heads"
     ]:
-        return False
+        return None
     # The park's own record of what the implementation was allowed to touch.
     # Its absence means this row was never parked by this kernel, which is
     # exactly the case that must not reach the relaxed path.
-    return _latest_review_scope_provenance(conn, task_id) is not None
+    if _latest_review_scope_provenance(conn, task_id) is None:
+        return None
+    return _latest_review_handover_id(conn, task_id)
 
 
 def _review_approval_head(
@@ -22304,7 +22427,8 @@ def _review_approval_head(
     a head proven before the review. The persisted head is the fallback, not
     the override.
 
-    For the human approval of a parked card (:func:`_is_parked_review_approval`)
+    For the human approval of a parked card
+    (:func:`_parked_review_approval_handover`)
     there is no live receipt at all, by construction rather than by accident:
     the row carries the reviewer's empty scope, nothing on it could prove the
     implementation, and :func:`complete_task` therefore derives no receipt for
@@ -22432,7 +22556,8 @@ def complete_task(
     writes ``done``.
 
     **A human approval of a parked card is classified BEFORE any live
-    implementation receipt is derived** (:func:`_is_parked_review_approval`),
+    implementation receipt is derived**
+    (:func:`_parked_review_approval_handover`),
     and it derives none. The park left the row holding the reviewer's EMPTY
     read-only scope, so a worktree proof against that row reads every
     implementation commit as out of bounds and refuses the very approval the
@@ -22443,6 +22568,20 @@ def complete_task(
     other completion is relaxed: a reviewer's own verdict (a run claimed out of
     review) and an ordinary scoped worker completion keep the full scope proof,
     with identical refusals and identical receipts.
+
+    That relaxation is BOUND to the exact park it was granted against — the
+    identity of the ``review_requested`` event the classification read, which
+    :func:`_parked_review_approval_handover` answers with instead of a bare
+    boolean. The whole decision is re-required inside the transaction that
+    writes ``done``, under the same write lock: the same handover id, the same
+    review state, still no claimed run, still the empty read-only scope, still
+    no integration flag. If any of it moved — a reopen, a successor run claimed
+    by the dispatcher, a fresh handover — the completion is refused with NO
+    WRITE AT ALL and the caller must retry through the fully verified path,
+    which is the only thing that can authorize what the successor did. The
+    terminal ``UPDATE`` carries the same binding, so the broad
+    ``running``/``ready``/``blocked``/``review`` status set that every other
+    completion is entitled to can never consume a stale relaxed decision.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -22561,12 +22700,21 @@ def complete_task(
     # containment, is re-proven below against the parents AS THEY STAND NOW and
     # re-read byte for byte inside the transaction that writes ``done``.
     #
-    # Only that one shape is relaxed (:func:`_is_parked_review_approval` names
-    # every conjunct). A reviewer's own verdict arrives from a run claimed out
-    # of review and an ordinary scoped worker completion arrives from its own
-    # run; both keep the proof, unchanged, and so does every shape this gate
+    # Only that one shape is relaxed (:func:`_parked_review_approval_handover`
+    # names every conjunct). A reviewer's own verdict arrives from a run claimed
+    # out of review and an ordinary scoped worker completion arrives from its
+    # own run; both keep the proof, unchanged, and so does every shape this gate
     # does not recognise.
-    parked_review_approval = _is_parked_review_approval(conn, task_id)
+    #
+    # The classification answers with the IDENTITY of the park it authorizes —
+    # the exact ``review_requested`` event id — and not with a bare yes. The
+    # relaxed path is bound to that one park for the rest of this call: the
+    # whole decision is re-required, unchanged and byte for byte, inside the
+    # transaction that writes ``done``, so the window between here and there
+    # cannot be used to reopen the review, claim a successor run, commit
+    # outside its ownership and then have this call end it.
+    parked_handover_id = _parked_review_approval_handover(conn, task_id)
+    parked_review_approval = parked_handover_id is not None
 
     # Exact git evidence is derived by the kernel, never trusted from worker
     # prose/metadata. Legacy tasks (owned_paths=NULL) retain their historical
@@ -22726,6 +22874,44 @@ def complete_task(
             )
             return False
     with write_txn(conn):
+        # THE RELAXED PATH'S WHOLE DECISION, RE-REQUIRED UNDER THE WRITE LOCK.
+        #
+        # Skipping the scoped-worktree proof was authorized by a park that was
+        # read a long way above this line: before the receipt derivation, before
+        # the containment re-proof, before this transaction existed. Everything
+        # that made it a park can move in that window, and the moves compose —
+        # ``reopen_review_task`` sends the card back out of the lane, the
+        # dispatcher claims a successor run for the implementer, that run
+        # commits wherever it likes, and this call then ends a run it never
+        # proved anything about, with the terminal ``UPDATE`` below happily
+        # accepting ``running`` and ``ready`` alongside ``review``.
+        #
+        # So the classification is asked again, here, holding the same write
+        # lock as the done-update, and its answer must be the SAME park: the
+        # identity of the exact ``review_requested`` event the decision was
+        # taken from, plus — because the classifier answers with an id only for
+        # a row that still satisfies all of them — the review state unchanged,
+        # no claimed run, the empty read-only scope, and no integration flag. A
+        # re-derived predicate would not do: the next park satisfies it too.
+        #
+        # Any difference fails CLOSED with no write at all: no done-update, no
+        # head write, no scope restore, no ended run, no event. The caller
+        # retries through the fully verified completion path, which is the only
+        # thing that can authorize whatever the successor run did. Nothing is
+        # staged to roll back — a parked approval derives no receipt and
+        # materializes no remote handoff (both refuse an unclaimed read-only
+        # card), which is why this needs no rollback arm.
+        if parked_review_approval and (
+            _parked_review_approval_handover(conn, task_id) != parked_handover_id
+        ):
+            _log.warning(
+                "kanban: refusing review approval for %s: the park it was "
+                "authorized against (handover %s) is no longer the card's "
+                "state; complete it through the verified path instead",
+                task_id,
+                parked_handover_id,
+            )
+            return False
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
@@ -22809,6 +22995,21 @@ def complete_task(
         head_receipt = (
             execution_receipt.get("head_commit") if execution_receipt else None
         ) or (review_head if approves_from_review else None)
+        # The broad status set below is what an ORDINARY completion is entitled
+        # to — ``running``, ``ready``, ``blocked`` and ``review`` all complete,
+        # and every one of them arrived here having proven its worktree. The
+        # relaxed approval proved nothing of the kind: its authority is one
+        # specific parked row, so its terminal write is bound to that row's
+        # state and may not fall back on the broad set. Redundant with the
+        # re-classification above — deliberately, because this is the statement
+        # that would consume a stale decision, and a guard on the statement
+        # itself cannot be reached around.
+        parked_guard = (
+            " AND status = 'review' AND current_run_id IS NULL"
+            " AND integrates_parent_heads = 0"
+            if parked_review_approval
+            else ""
+        )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -22826,7 +23027,7 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND task_kind = 'work'
-                """,
+                """ + parked_guard,
                 (
                     result,
                     now,
@@ -22853,7 +23054,7 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
                    AND task_kind = 'work'
-                """,
+                """ + parked_guard,
                 (
                     result,
                     now,
@@ -24389,22 +24590,31 @@ def request_review(
             if refusal:
                 return _ret(False, refusal)
         # The independent reviewer is a different role, so this is a role
-        # transition and goes through the one authority helper. A policy-locked
-        # task refuses the handoff: its route was approved for one assignee for
-        # its whole run, so independent review has to be separately approved
-        # work rather than a silent re-pin of this task.
+        # transition and goes through the one lifetime assignment invariant.
+        # THIS call is the OUTBOUND leg of the review round-trip and says so:
+        # the authority the committed review requirement grants is the
+        # handover's own, never something a caller inherits by naming the
+        # profile the policy happens to nominate. A policy-locked task with no
+        # such requirement still refuses the handoff — its route was approved
+        # for one assignee for its whole run, so independent review has to be
+        # separately approved work rather than a silent re-pin of this task.
         #
-        # The pairs the authority helper hands back MUST ride in the same
-        # UPDATE as the assignee write, or the lock would be left describing a
-        # role the row no longer has. Empty for every task that is not
-        # policy-governed, which is why this was previously a no-op.
-        route_sql, route_params, repin = _authorized_role_write(
-            conn, task_id, reviewer
+        # The pairs the invariant hands back MUST ride in the same UPDATE as
+        # the assignee write, or the lock would be left describing a role the
+        # row no longer has. Empty for every task that is not policy-governed,
+        # which is why this was previously a no-op.
+        write = _authorized_assignment_write(
+            conn, task_id, reviewer, review_round_trip=True
         )
+        route_sql, route_params, repin = write.route_sql, write.params, write.repin
         # The review run is read-only: the reviewer reads the implementation,
-        # it does not inherit the right to rewrite it. The scope being replaced
-        # is carried on this handover's own event (below) and restored exactly
-        # when the card leaves the reviewer's hands.
+        # it does not inherit the right to rewrite it. That boundary belongs to
+        # the PARK rather than to the role that receives it — whoever holds the
+        # card for review holds it read-only — so this handover writes it
+        # itself, in the same statement, instead of taking the invariant's
+        # role-derived one. The scope being replaced is carried on this
+        # handover's own event (below) and restored exactly when the card
+        # leaves the reviewer's hands.
         parked_owned_paths = _decode_owned_paths(trow["owned_paths"])
         parked_integrates = bool(trow["integrates_parent_heads"])
         read_only_sql = ", owned_paths = '[]', integrates_parent_heads = 0"
@@ -24598,17 +24808,23 @@ def _request_changes_within_txn(
 
     new_status = _landing_status_after_parents(conn, task_id)
     # Handing the work back to the implementer is a role transition, so it
-    # goes through the one authority helper rather than writing `assignee`
-    # itself. A policy-locked task refuses the handback: its route was
-    # approved for one assignee for its whole run, and rework has to be
-    # separately approved work. Whatever that helper hands back rides in THIS
-    # statement; it is empty (and therefore a no-op) for every task that is
-    # not policy-governed.
-    route_sql, route_params, repin = _authorized_role_write(
-        conn, task_id, implementer
+    # goes through the one lifetime assignment invariant rather than writing
+    # `assignee` itself — and it is the RETURN leg of the review round-trip,
+    # which it declares, because that authority is the round-trip's own and is
+    # never inherited by a caller that merely names a familiar profile. A
+    # policy-locked task with no review requirement refuses the handback: its
+    # route was approved for one assignee for its whole run, and rework has to
+    # be separately approved work. Whatever the invariant hands back rides in
+    # THIS statement; it is empty (and therefore a no-op) for every task that
+    # is not policy-governed.
+    write = _authorized_assignment_write(
+        conn, task_id, implementer, review_round_trip=True
     )
+    route_sql, route_params, repin = write.route_sql, write.params, write.repin
     # The implementer gets its write boundary back in the same statement that
-    # gets the work back — the review run held it read-only.
+    # gets the work back — the review run held it read-only. That restored
+    # boundary is the park's own provenance, so it is written here rather than
+    # taken from the invariant's role-derived scope.
     scope_sql, scope_params = _restored_implementation_scope_sql(conn, task_id)
     # NOTE: consecutive_failures is deliberately PRESERVED (neither
     # reset nor incremented). Review transitions are not evidence the
@@ -25551,17 +25767,20 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if not isinstance(implementer, str) or not implementer.strip():
             implementer = None
         # Handing the work back to the implementer is a role transition too, so
-        # it goes through the same authority helper as the changes-requested
-        # handback — and, exactly as there, whatever that helper hands back is
-        # written WITH the assignee, not discarded. Applying only the assignee
-        # left provider, model, effort, tier and lock still describing the
-        # reviewer, so the route no longer matched the role that held the card
-        # and the next implementation claim was refused by the task's own lock.
-        route_sql, route_params, repin = _authorized_role_write(
-            conn, task_id, implementer
+        # it goes through the same lifetime assignment invariant as the
+        # changes-requested handback, and declares the same RETURN leg of the
+        # review round-trip — and, exactly as there, whatever the invariant
+        # hands back is written WITH the assignee, not discarded. Applying only
+        # the assignee left provider, model, effort, tier and lock still
+        # describing the reviewer, so the route no longer matched the role that
+        # held the card and the next implementation claim was refused by the
+        # task's own lock.
+        write = _authorized_assignment_write(
+            conn, task_id, implementer, review_round_trip=True
         )
+        route_sql, route_params, repin = write.route_sql, write.params, write.repin
         # The review run was read-only; the implementer gets its exact write
-        # boundary back in the same statement.
+        # boundary back in the same statement, from the park's provenance.
         scope_sql, scope_params = _restored_implementation_scope_sql(conn, task_id)
         if new_status in EXECUTABLE_STATUSES and not authorize_executable_transition(
             conn, task_id
@@ -25951,6 +26170,7 @@ def specify_triage_task(
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
+        repin: Optional[dict] = None
         if title is not None and title.strip() != (existing["title"] or ""):
             sets.append("title = ?")
             params.append(title.strip())
@@ -25960,13 +26180,22 @@ def specify_triage_task(
             params.append(body)
             changed_fields.append("body")
         if assignee is not None and assignee != (existing["assignee"] or None):
-            # Specifying a triage task can move it to a different role, which is
-            # a role transition: the authority helper refuses it outright on a
-            # policy-locked task.
-            role_transition_route(conn, task_id, assignee)
-            sets.append("assignee = ?")
+            # Specifying a triage task can move it to a different role, so it
+            # answers to the one lifetime assignment invariant like every other
+            # writer of this column: it refuses implementation work carrying a
+            # committed review requirement to a read-only reviewer, refuses the
+            # move outright on a policy-locked task, and hands back the route
+            # and scope that must be written WITH the assignee. Discarding
+            # those — which this path used to do — left a governed row pinned
+            # to the previous role's lock, and its next claim was refused by
+            # that lock. Specification is NOT a leg of the review round-trip,
+            # so it inherits none of that round-trip's authority.
+            write = _authorized_assignment_write(conn, task_id, assignee)
+            sets.append("assignee = ?" + write.sql)
             params.append(assignee)
+            params.extend(write.params)
             changed_fields.append("assignee")
+            repin = write.repin
         params.append(task_id)
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
@@ -25975,6 +26204,8 @@ def specify_triage_task(
         )
         if cur.rowcount != 1:
             return False
+        if repin is not None:
+            _append_event(conn, task_id, "model_route_repinned", repin)
         if changed_fields and author and author.strip():
             # Inline INSERT (rather than ``add_comment``) because we're
             # already inside this function's write_txn — nested BEGIN
@@ -26316,19 +26547,31 @@ def decompose_triage_task(
             )
 
         # Flip the root: triage -> todo, set assignee to the orchestrator.
-        # Moving the root to a different role is a role transition, so it goes
-        # through the authority helper; a policy-locked root refuses it.
+        # Moving the root to a different role answers to the one lifetime
+        # assignment invariant, like every other writer of this column: the
+        # decomposed root is implementation work too, so a committed review
+        # requirement on it refuses a read-only reviewer, a policy-locked root
+        # refuses the move outright, and the route and scope the invariant
+        # grants are written WITH the assignee rather than discarded — writing
+        # the assignee alone left a governed root pinned to the previous role's
+        # lock. Decomposition is NOT a leg of the review round-trip, so it
+        # inherits none of that round-trip's authority.
         sets = ["status = 'todo'"]
         params: list[Any] = []
+        root_repin: Optional[dict] = None
         if root_assignee is not None:
-            role_transition_route(conn, task_id, root_assignee)
-            sets.append("assignee = ?")
+            write = _authorized_assignment_write(conn, task_id, root_assignee)
+            sets.append("assignee = ?" + write.sql)
             params.append(root_assignee)
+            params.extend(write.params)
+            root_repin = write.repin
         params.append(task_id)
         conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
             tuple(params),
         )
+        if root_repin is not None:
+            _append_event(conn, task_id, "model_route_repinned", root_repin)
 
         # Audit comment + event on the root so the timeline shows the fan-out.
         if author and author.strip():
@@ -31923,26 +32166,43 @@ def _dispatch_once_locked(
                 if not dry_run:
                     try:
                         with write_txn(conn):
-                            # The default assignee is a role transition like any
-                            # other, so it goes through the authority helper: a
-                            # policy-locked task refuses to be adopted onto a
-                            # route the owner did not approve for it.
-                            role_transition_route(
+                            # The default assignee is an assignee write like any
+                            # other, so it answers to the one lifetime
+                            # invariant: a policy-locked task refuses to be
+                            # adopted onto a route the owner did not approve for
+                            # it, implementation work carrying a committed
+                            # review requirement refuses a read-only reviewer as
+                            # its fallback owner, and the route and scope the
+                            # invariant grants ride in THIS statement instead of
+                            # being discarded. The fallback is not a leg of the
+                            # review round-trip, so it inherits none of that
+                            # round-trip's authority either.
+                            write = _authorized_assignment_write(
                                 conn, row["id"], _default_assignee
                             )
                             conn.execute(
-                                "UPDATE tasks SET assignee = ?"
-                                " WHERE id = ? "
+                                "UPDATE tasks SET assignee = ?" + write.sql
+                                + " WHERE id = ? "
                                 "AND (assignee IS NULL OR assignee = '')",
-                                (_default_assignee, row["id"]),
+                                (_default_assignee, *write.params, row["id"]),
                             )
                             _append_event(
                                 conn, row["id"], "assigned",
                                 {
                                     "assignee": _default_assignee,
                                     "source": "kanban.default_assignee",
+                                    **(
+                                        {"read_only_scope_enforced": True}
+                                        if write.read_only_scope
+                                        else {}
+                                    ),
                                 },
                             )
+                            if write.repin is not None:
+                                _append_event(
+                                    conn, row["id"], "model_route_repinned",
+                                    write.repin,
+                                )
                     except Exception:
                         _log.debug(
                             "kanban dispatch: failed to apply default_assignee=%r "

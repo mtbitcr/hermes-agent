@@ -1083,6 +1083,133 @@ def test_a_human_approval_still_refuses_a_parked_head_that_lost_its_parent(
         assert approved.integrates_parent_heads is True
 
 
+def test_a_reopened_and_reclaimed_card_refuses_the_approval_it_authorized(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The relaxed approval is bound to the EXACT park that authorized it.
+
+    The human approval is classified from the persisted row, and that
+    classification is what buys it the one thing no other completion gets: the
+    scoped-worktree proof is skipped. The decision is taken before any receipt
+    is derived and consumed by a write transaction opened well after — and the
+    whole park can move in between. A reopen sends the card back out of the
+    lane, the dispatcher claims a successor run for the implementer, and that
+    run commits wherever it likes. The stale decision then had the terminal
+    ``UPDATE`` accept ``running`` alongside ``review``: the card finished with
+    an empty head, the successor's live run was ended under it, and no
+    ``completion_blocked_file_scope`` event existed anywhere, because the proof
+    that would have written one was skipped on the strength of a park that no
+    longer existed.
+
+    The window is opened deterministically here, the same way the parent-drift
+    window above is: the real resolver runs, and only then — with no
+    transaction yet open — the interposition performs the whole race through
+    the PUBLIC paths (``reopen_review_task``, ``claim_task``, a real commit
+    outside the declared ownership).
+    """
+    _nominate(monkeypatch, REVIEWER)
+    repo = _repo(tmp_path)
+    with kb.connect() as conn:
+        impl = _scoped_task(
+            conn, repo,
+            title="implement, then get reopened under the approval",
+            branch="feature/stale-approval",
+            owned_paths=["src/impl"],
+            requires_review=True,
+            assignee="builder",
+        )
+        workspace = _materialize(conn, impl, claimer="builder:1")
+        reviewed_head = _commit_file(
+            workspace, "src/impl/feature.py", "ok = True\n", "feat: implement",
+        )
+        handover_run = kb.get_task(conn, impl).current_run_id
+        assert kb.complete_task(
+            conn, impl, summary="ready for review", expected_run_id=handover_run,
+        ) is True
+        parked = kb.get_task(conn, impl)
+        assert (parked.status, parked.current_run_id) == ("review", None)
+
+        real_resolver = kb._review_approval_head
+        window: dict = {"opened": 0}
+
+        def _reopen_and_reclaim_after_the_classification(*args, **kwargs):
+            """Let the approval classify, then move the park behind its back."""
+            resolved = real_resolver(*args, **kwargs)
+            window["opened"] += 1
+            assert kb.reopen_review_task(conn, impl) is True
+            successor = kb.claim_task(conn, impl, claimer="builder:2")
+            assert successor is not None
+            window["run_id"] = successor.current_run_id
+            # The successor holds the implementer's restored boundary and
+            # commits straight through it — exactly what the proof the stale
+            # decision skipped exists to catch.
+            assert kb.get_task(conn, impl).owned_paths == ["src/impl"]
+            window["stray_head"] = _commit_file(
+                workspace, "src/other/theirs.py", "mine = True\n",
+                "feat: outside declared ownership",
+            )
+            return resolved
+
+        monkeypatch.setattr(
+            kb, "_review_approval_head",
+            _reopen_and_reclaim_after_the_classification,
+        )
+        assert kb.complete_task(
+            conn, impl, summary="approved from the board",
+        ) is False, (
+            "an approval authorized by a park that has since been reopened, "
+            "reclaimed and committed over must be refused, not committed"
+        )
+        assert window["opened"] == 1, (
+            "the interposition must actually have run inside the window"
+        )
+
+        # NOTHING was written: the card is still the successor's, the successor
+        # run is still open, and no completion was recorded.
+        refused = kb.get_task(conn, impl)
+        assert refused.status == "running"
+        assert refused.current_run_id == window["run_id"]
+        assert refused.completed_at is None
+        assert refused.head_commit is None
+        assert refused.owned_paths == ["src/impl"]
+        assert kb.latest_run(conn, impl).outcome is None, (
+            "the stale approval may not end the successor's live run"
+        )
+        assert _events(conn, impl, "completed") == []
+
+        # The refusal is not a dead end: the successor completes through the
+        # FULLY VERIFIED path, which is the only thing that can authorize what
+        # it did — and here that path proves the stray commit out of bounds.
+        monkeypatch.setattr(kb, "_review_approval_head", real_resolver)
+        with pytest.raises(kb.WorktreeScopeError, match="outside declared ownership"):
+            kb.complete_task(
+                conn, impl, summary="hand back over",
+                expected_run_id=window["run_id"],
+            )
+        assert kb.list_events(conn, impl)[-1].kind == (
+            "completion_blocked_file_scope"
+        )
+
+        # …and with the stray commit dropped, the same verified path parks the
+        # card again and the SAME approval call, with the window shut, lands.
+        _git(workspace, "reset", "--hard", reviewed_head)
+        assert kb.complete_task(
+            conn, impl, summary="ready for review again",
+            expected_run_id=window["run_id"],
+        ) is True
+        reparked = kb.get_task(conn, impl)
+        assert (reparked.status, reparked.assignee) == ("review", REVIEWER)
+
+        assert kb.complete_task(
+            conn, impl, summary="approved from the board",
+        ) is True
+        approved = kb.get_task(conn, impl)
+        assert approved.status == "done"
+        assert approved.head_commit == reviewed_head
+        assert approved.owned_paths == ["src/impl"]
+        assert len(_events(conn, impl, "completed")) == 1
+
+
 def test_control_a_a_reviewer_run_approval_is_unchanged(
     kanban_home, tmp_path, monkeypatch,
 ):
