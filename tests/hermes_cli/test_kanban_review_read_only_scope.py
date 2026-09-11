@@ -13,11 +13,18 @@ handover's own ``review_requested`` event so it can be given back EXACTLY:
 
 and so that it survives a reviewer swap mid-review, which used to overwrite the
 column outright with nothing anywhere to restore it from.
+
+The implementation here is a REAL scoped git worktree with a real commit inside
+its declared boundary, because that is the only shape a scoped card can
+legitimately hand over: the handover derives the kernel's own execution receipt
+from that worktree before it converts the card to read-only, and a declared
+write boundary the kernel cannot prove is refused rather than parked.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -60,8 +67,43 @@ def _nominate(monkeypatch, *profiles):
     )
 
 
-def _scoped_implementation(conn, *, title="scoped implementation"):
-    """A claimed card with a real mutable write boundary and a review duty."""
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        [
+            "git", "-C", str(cwd),
+            "-c", "user.name=Test User",
+            "-c", "user.email=test@example.com",
+            "-c", "commit.gpgsign=false",
+            *args,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+@pytest.fixture
+def repo(tmp_path) -> Path:
+    origin = tmp_path / "repo"
+    origin.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(origin)],
+        check=True, capture_output=True, text=True,
+    )
+    (origin / "README.md").write_text("base\n", encoding="utf-8")
+    _git(origin, "add", "README.md")
+    _git(origin, "commit", "-m", "init")
+    return origin
+
+
+def _scoped_implementation(conn, repo: Path, *, title="scoped implementation"):
+    """A claimed card with a real mutable write boundary and a review duty.
+
+    The boundary is real all the way down: a per-task git worktree, a recorded
+    base commit, and one commit that lands inside ``IMPLEMENTATION_SCOPE`` —
+    the work the reviewer is being handed.
+    """
     tid = kb.create_task(
         conn,
         title=title,
@@ -69,10 +111,20 @@ def _scoped_implementation(conn, *, title="scoped implementation"):
         requires_review=True,
         owned_paths=IMPLEMENTATION_SCOPE,
         workspace_kind="worktree",
+        workspace_path=str(repo),
+        branch_name="feature/scoped",
     )
     assert kb.get_task(conn, tid).owned_paths == IMPLEMENTATION_SCOPE
     run = kb.claim_task(conn, tid, claimer=f"{IMPLEMENTER}:1")
     assert run is not None
+    workspace, branch = kb._resolve_worktree_workspace(run)
+    kb.set_workspace_path(conn, tid, workspace)
+    kb.set_branch_name(conn, tid, branch)
+    kb.record_worktree_base(conn, tid, workspace)
+    (workspace / "src").mkdir(parents=True, exist_ok=True)
+    (workspace / "src" / "app.py").write_text("value = 1\n", encoding="utf-8")
+    _git(workspace, "add", "src/app.py")
+    _git(workspace, "commit", "-m", "feat: implement inside the boundary")
     return tid, run
 
 
@@ -86,12 +138,12 @@ def _hand_over(conn, tid, run, *, reviewer=REVIEWER):
 
 
 def test_a_review_run_cannot_write_the_implementers_paths(
-    kanban_home, monkeypatch,
+    kanban_home, repo, monkeypatch,
 ):
     """The scope enforcement helper refuses every implementation path."""
     _nominate(monkeypatch, REVIEWER)
     with kb.connect() as conn:
-        tid, run = _scoped_implementation(conn)
+        tid, run = _scoped_implementation(conn, repo)
         _hand_over(conn, tid, run)
 
         parked = kb.get_task(conn, tid)
@@ -114,12 +166,12 @@ def test_a_review_run_cannot_write_the_implementers_paths(
 
 
 def test_the_implementation_scope_is_restored_on_handback_and_on_approval(
-    kanban_home, monkeypatch,
+    kanban_home, repo, monkeypatch,
 ):
     """Read-only for the review, and given back exactly, on both exits."""
     _nominate(monkeypatch, REVIEWER)
     with kb.connect() as conn:
-        tid, run = _scoped_implementation(conn)
+        tid, run = _scoped_implementation(conn, repo)
         _hand_over(conn, tid, run)
         assert kb.get_task(conn, tid).owned_paths == []
 
@@ -158,12 +210,12 @@ def test_the_implementation_scope_is_restored_on_handback_and_on_approval(
 
 
 def test_the_implementation_scope_survives_a_reviewer_swap(
-    kanban_home, monkeypatch,
+    kanban_home, repo, monkeypatch,
 ):
     """A mid-review reviewer change carries the parked scope with it."""
     _nominate(monkeypatch, OTHER_REVIEWER)
     with kb.connect() as conn:
-        tid, run = _scoped_implementation(conn)
+        tid, run = _scoped_implementation(conn, repo)
         _hand_over(conn, tid, run, reviewer=OTHER_REVIEWER)
 
         # The policy moves, and the card is re-routed to the reviewer it now
@@ -188,12 +240,12 @@ def test_the_implementation_scope_survives_a_reviewer_swap(
 
 
 def test_an_explicit_reopen_restores_the_implementation_scope(
-    kanban_home, monkeypatch,
+    kanban_home, repo, monkeypatch,
 ):
     """The reopen leg gives the boundary back exactly like the handback."""
     _nominate(monkeypatch, REVIEWER)
     with kb.connect() as conn:
-        tid, run = _scoped_implementation(conn)
+        tid, run = _scoped_implementation(conn, repo)
         _hand_over(conn, tid, run)
         assert kb.get_task(conn, tid).owned_paths == []
 

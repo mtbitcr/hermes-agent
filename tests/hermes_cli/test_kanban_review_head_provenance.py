@@ -156,6 +156,208 @@ def _commit_file(workspace: Path, relative: str, content: str, message: str) -> 
 # ---------------------------------------------------------------------------
 
 
+def test_the_direct_review_request_derives_the_head_the_approval_keeps(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The handover primitive proves the head itself, on every surface.
+
+    ``kb.request_review`` is the ONE kernel handover entry point, and the three
+    surfaces that are not ``complete_task`` — the ``kanban_request_review``
+    tool, the CLI status-to-review change and the dashboard's review route —
+    reach it exactly like this call does: no receipt, no head, nothing but the
+    task id and a summary. It used to park them with EMPTY provenance, so the
+    approval wrote ``head_commit`` NULL over work that had been proven at an
+    exact commit and an integrating child then refused the parent it depends
+    on. The head is the kernel's own now, derived from the task's worktree
+    before the read-only conversion, whichever surface asks.
+    """
+    _nominate(monkeypatch, REVIEWER)
+    repo = _repo(tmp_path)
+    with kb.connect() as conn:
+        impl = _scoped_task(
+            conn, repo,
+            title="implement, hand over directly",
+            branch="feature/direct",
+            owned_paths=["src/impl"],
+            requires_review=True,
+        )
+        workspace = _materialize(conn, impl, claimer=f"{IMPLEMENTER}:1")
+        reviewed_head = _commit_file(
+            workspace, "src/impl/feature.py", "ok = True\n", "feat: implement",
+        )
+
+        run_id = kb.get_task(conn, impl).current_run_id
+        ok, reason = kb.request_review(
+            conn, impl,
+            summary="ready for review",
+            expected_run_id=run_id,
+            with_reason=True,
+        )
+        assert (ok, reason) == (True, None)
+
+        parked = kb.get_task(conn, impl)
+        assert (parked.status, parked.assignee) == ("review", REVIEWER)
+        assert parked.owned_paths == []
+        assert kb._latest_review_head_provenance(conn, impl) == reviewed_head, (
+            "a handover that supplies no head must still park the exact head "
+            "the kernel proved from the worktree"
+        )
+
+        review = kb.claim_review_task(conn, impl, claimer=f"{REVIEWER}:1")
+        assert review is not None
+        assert kb.submit_review_findings(
+            conn, impl,
+            findings=[],
+            candidate_digest="digest-clean",
+            expected_run_id=review.current_run_id,
+        )["outcome"] == "passed"
+
+        approved = kb.get_task(conn, impl)
+        assert approved.status == "done"
+        assert approved.head_commit == reviewed_head
+        assert approved.owned_paths == ["src/impl"]
+
+        # …and the receipt is usable downstream, which is the whole point: a
+        # child that must contain every exact parent head completes against it.
+        child = _scoped_task(
+            conn, repo,
+            title="integrate the directly-handed-over slice",
+            branch="feature/direct-integrate",
+            owned_paths=["."],
+            parents=[impl],
+            integrates_parent_heads=True,
+            assignee="builder",
+        )
+        child_workspace = _materialize(conn, child, claimer="builder:1")
+        _git(child_workspace, "merge", "--no-edit", reviewed_head)
+        assert kb.complete_task(conn, child, summary="integrated") is True
+        run = kb.latest_run(conn, child)
+        assert run.metadata["execution_receipt"]["parent_heads"] == [
+            {"task_id": impl, "head_commit": reviewed_head},
+        ]
+
+
+def test_a_second_handover_parks_the_new_head_and_never_the_prior_cycles(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """Rework control: provenance is re-derived per cycle, not carried over.
+
+    A head that is merely "whatever the last accepted handover recorded" would
+    survive a rework round untouched, and the reviewer would approve commit #2
+    while the board finished the card at commit #1. Each handover through the
+    same public handler proves the worktree afresh, so the second cycle parks
+    the second commit and the first can never reappear.
+    """
+    _nominate(monkeypatch, REVIEWER)
+    repo = _repo(tmp_path)
+    with kb.connect() as conn:
+        impl = _scoped_task(
+            conn, repo,
+            title="implement, rework, hand over again",
+            branch="feature/rework",
+            owned_paths=["src/impl"],
+            requires_review=True,
+        )
+        workspace = _materialize(conn, impl, claimer=f"{IMPLEMENTER}:1")
+        first_head = _commit_file(
+            workspace, "src/impl/feature.py", "ok = 1\n", "feat: first pass",
+        )
+
+        first_run = kb.get_task(conn, impl).current_run_id
+        assert kb.request_review(
+            conn, impl, summary="v1", expected_run_id=first_run,
+        ) is True
+        assert kb._latest_review_head_provenance(conn, impl) == first_head
+
+        review = kb.claim_review_task(conn, impl, claimer=f"{REVIEWER}:1")
+        assert review is not None
+        ok, implementer = kb.request_changes(
+            conn, impl, reason="extract the helper",
+            expected_run_id=review.current_run_id,
+        )
+        assert (ok, implementer) == (True, IMPLEMENTER)
+
+        # Round two: real rework, a real second commit, the same handler.
+        rework = kb.claim_task(conn, impl, claimer=f"{IMPLEMENTER}:2")
+        assert rework is not None
+        second_head = _commit_file(
+            workspace, "src/impl/feature.py", "ok = 2\n", "fix: address review",
+        )
+        assert second_head != first_head
+        assert kb.request_review(
+            conn, impl, summary="v2", expected_run_id=rework.current_run_id,
+        ) is True
+
+        assert kb._latest_review_head_provenance(conn, impl) == second_head, (
+            "the second handover must park the commit it actually handed over"
+        )
+
+        second_review = kb.claim_review_task(conn, impl, claimer=f"{REVIEWER}:2")
+        assert second_review is not None
+        assert kb.submit_review_findings(
+            conn, impl,
+            findings=[],
+            candidate_digest="digest-clean-2",
+            expected_run_id=second_review.current_run_id,
+        )["outcome"] == "passed"
+
+        approved = kb.get_task(conn, impl)
+        assert approved.status == "done"
+        assert approved.head_commit == second_head
+        assert approved.head_commit != first_head
+
+
+def test_a_scoped_handover_with_an_unprovable_worktree_is_refused(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """Fail closed: no provable head, no park, no write.
+
+    The card declares a write boundary, so the kernel must be able to prove
+    what it produced. An uncommitted worktree cannot yield a receipt, and a
+    review parked from it would carry no head into an approval that writes one
+    — so the handover is refused with the scope diagnostic instead, and the
+    card stays with its implementer holding its own scope.
+    """
+    _nominate(monkeypatch, REVIEWER)
+    repo = _repo(tmp_path)
+    with kb.connect() as conn:
+        impl = _scoped_task(
+            conn, repo,
+            title="nothing committed yet",
+            branch="feature/dirty",
+            owned_paths=["src/impl"],
+            requires_review=True,
+        )
+        workspace = _materialize(conn, impl, claimer=f"{IMPLEMENTER}:1")
+        (workspace / "src" / "impl").mkdir(parents=True, exist_ok=True)
+        (workspace / "src" / "impl" / "feature.py").write_text(
+            "work_in_progress = True\n", encoding="utf-8",
+        )
+
+        run_id = kb.get_task(conn, impl).current_run_id
+        ok, reason = kb.request_review(
+            conn, impl, summary="ready for review",
+            expected_run_id=run_id, with_reason=True,
+        )
+        assert ok is False
+        assert reason is not None and "file scope" in reason
+
+        unchanged = kb.get_task(conn, impl)
+        assert unchanged.status == "running"
+        assert unchanged.assignee == IMPLEMENTER
+        assert unchanged.owned_paths == ["src/impl"]
+        assert _events(conn, impl, "review_requested") == []
+
+        # Not a blanket refusal: committing the work parks it immediately.
+        committed_head = _commit_file(
+            workspace, "src/impl/feature.py", "done = True\n", "feat: commit it",
+        )
+        assert kb.request_review(
+            conn, impl, summary="ready for review", expected_run_id=run_id,
+        ) is True
+        assert kb._latest_review_head_provenance(conn, impl) == committed_head
+
+
 def test_the_approved_card_keeps_the_exact_reviewed_implementation_head(
     kanban_home, tmp_path, monkeypatch,
 ):
@@ -375,6 +577,208 @@ def test_a_parent_head_that_drifts_during_the_review_refuses_the_approval(
         approved = kb.get_task(conn, integrator)
         assert approved.status == "done"
         assert approved.head_commit == reintegrated_head
+
+
+def test_a_parent_head_that_moves_after_the_proof_still_refuses_the_approval(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The re-proof must hold at the COMMIT, not merely at the check.
+
+    The containment walk shells out to git, so it runs before the approval's
+    write transaction opens — which leaves a window. A parent that reopens, is
+    reclaimed, recommits and completes inside that window is ``done`` again by
+    the time the transaction starts, so "are the parents satisfied" is happy
+    and the child would finish holding a head the parent no longer contains.
+    The proof therefore hands back the exact receipt set it proved and the
+    transaction that writes ``done`` re-reads it and requires equality.
+
+    The window is opened deterministically here: the real resolver runs, and
+    only then — with no transaction yet open — the parent's recorded head moves
+    to a different REAL commit while the parent stays ``done``.
+    """
+    _nominate(monkeypatch, REVIEWER)
+    repo = _repo(tmp_path)
+    with kb.connect() as conn:
+        parent = _scoped_task(
+            conn, repo,
+            title="parent slice",
+            branch="feature/window-parent",
+            owned_paths=["src/parent"],
+        )
+        parent_workspace = _materialize(conn, parent, claimer=f"{IMPLEMENTER}:1")
+        first_head = _commit_file(
+            parent_workspace, "src/parent/first.py", "first = True\n", "feat: first",
+        )
+        assert kb.complete_task(conn, parent, summary="parent done") is True
+
+        integrator = _scoped_task(
+            conn, repo,
+            title="integrate under review",
+            branch="feature/window-integrator",
+            owned_paths=["."],
+            parents=[parent],
+            integrates_parent_heads=True,
+            requires_review=True,
+            assignee="builder",
+        )
+        integration_workspace = _materialize(conn, integrator, claimer="builder:1")
+        _git(integration_workspace, "merge", "--no-edit", first_head)
+        integrated_head = _git(integration_workspace, "rev-parse", "HEAD")
+
+        handover_run = kb.get_task(conn, integrator).current_run_id
+        assert kb.complete_task(
+            conn, integrator, summary="ready for review",
+            expected_run_id=handover_run,
+        ) is True
+        assert kb.get_task(conn, integrator).status == "review"
+
+        # The parent's second commit is real work the child never merged.
+        moved_head = _commit_file(
+            parent_workspace, "src/parent/second.py", "second = True\n",
+            "feat: second",
+        )
+        assert moved_head not in (first_head, integrated_head)
+
+        real_resolver = kb._review_approval_head
+        window = {"opened": 0}
+
+        def _move_the_parent_after_the_proof(*args, **kwargs):
+            """Let the proof succeed, then move the parent behind its back."""
+            resolved = real_resolver(*args, **kwargs)
+            window["opened"] += 1
+            conn.execute(
+                "UPDATE tasks SET head_commit = ? WHERE id = ?",
+                (moved_head, parent),
+            )
+            conn.commit()
+            return resolved
+
+        monkeypatch.setattr(
+            kb, "_review_approval_head", _move_the_parent_after_the_proof,
+        )
+
+        review = kb.claim_review_task(conn, integrator, claimer=f"{REVIEWER}:1")
+        assert review is not None
+        assert kb.complete_task(
+            conn, integrator, summary="approved",
+            expected_run_id=review.current_run_id,
+        ) is False, (
+            "an approval whose proven parent receipts changed before the "
+            "done-update must be refused, not committed"
+        )
+        assert window["opened"] == 1, (
+            "the interposition must actually have run inside the window"
+        )
+        # The parent is still done, so parent gating alone could not have
+        # caught this — only the byte-for-byte re-read of the proven set.
+        assert kb.get_task(conn, parent).status == "done"
+
+        refused = kb.get_task(conn, integrator)
+        assert refused.status != "done"
+        assert refused.completed_at is None
+        assert refused.head_commit is None
+        # Still exactly where the reviewer left it: the read-only review run is
+        # untouched, and no scope was restored.
+        assert refused.current_run_id == review.current_run_id
+        assert kb.run_claimed_from_review(
+            conn, integrator, int(refused.current_run_id),
+        ) is True
+        assert refused.owned_paths == []
+        assert refused.integrates_parent_heads is False
+        assert _events(conn, integrator, "completed") == []
+
+        # And with the window shut, the same approval is fine — provided the
+        # parent has not actually moved.
+        monkeypatch.setattr(kb, "_review_approval_head", real_resolver)
+        conn.execute(
+            "UPDATE tasks SET head_commit = ? WHERE id = ?", (first_head, parent),
+        )
+        conn.commit()
+        assert kb.complete_task(
+            conn, integrator, summary="approved",
+            expected_run_id=review.current_run_id,
+        ) is True
+        approved = kb.get_task(conn, integrator)
+        assert approved.status == "done"
+        assert approved.head_commit == integrated_head
+        assert approved.owned_paths == ["."]
+
+
+def test_an_ordinary_completion_also_refuses_a_parent_that_moves_in_the_window(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The same window, the same refusal, on the leg that has no review at all.
+
+    A scoped completion proves containment inside its own execution receipt,
+    which is derived before its write transaction for the same reason the
+    approval's re-proof is: it shells out to git. So it has the identical
+    window, and the identical guard — the proven receipt set is re-read under
+    the write lock and must still match.
+    """
+    repo = _repo(tmp_path)
+    with kb.connect() as conn:
+        parent = _scoped_task(
+            conn, repo,
+            title="parent slice",
+            branch="feature/plain-parent",
+            owned_paths=["src/parent"],
+        )
+        parent_workspace = _materialize(conn, parent, claimer=f"{IMPLEMENTER}:1")
+        first_head = _commit_file(
+            parent_workspace, "src/parent/first.py", "first = True\n", "feat: first",
+        )
+        assert kb.complete_task(conn, parent, summary="parent done") is True
+
+        child = _scoped_task(
+            conn, repo,
+            title="integrate without a review requirement",
+            branch="feature/plain-child",
+            owned_paths=["."],
+            parents=[parent],
+            integrates_parent_heads=True,
+            assignee="builder",
+        )
+        child_workspace = _materialize(conn, child, claimer="builder:1")
+        _git(child_workspace, "merge", "--no-edit", first_head)
+
+        moved_head = _commit_file(
+            parent_workspace, "src/parent/second.py", "second = True\n",
+            "feat: second",
+        )
+        real_proof = kb._verify_scoped_worktree_completion
+        window = {"opened": 0}
+
+        def _move_the_parent_after_the_proof(*args, **kwargs):
+            receipt = real_proof(*args, **kwargs)
+            if args[1] == child:
+                window["opened"] += 1
+                conn.execute(
+                    "UPDATE tasks SET head_commit = ? WHERE id = ?",
+                    (moved_head, parent),
+                )
+                conn.commit()
+            return receipt
+
+        monkeypatch.setattr(
+            kb, "_verify_scoped_worktree_completion",
+            _move_the_parent_after_the_proof,
+        )
+        assert kb.complete_task(conn, child, summary="integrated") is False
+        assert window["opened"] == 1
+        assert kb.get_task(conn, parent).status == "done"
+
+        refused = kb.get_task(conn, child)
+        assert refused.status != "done"
+        assert refused.head_commit is None
+        assert _events(conn, child, "completed") == []
+
+        # Merging what the parent actually holds now completes cleanly.
+        monkeypatch.setattr(kb, "_verify_scoped_worktree_completion", real_proof)
+        _git(child_workspace, "merge", "--no-edit", moved_head)
+        assert kb.complete_task(conn, child, summary="re-integrated") is True
+        assert kb.latest_run(conn, child).metadata["execution_receipt"][
+            "parent_heads"
+        ] == [{"task_id": parent, "head_commit": moved_head}]
 
 
 # ---------------------------------------------------------------------------

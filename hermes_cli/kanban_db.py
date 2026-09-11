@@ -22216,8 +22216,8 @@ def _review_approval_head(
     task_id: str,
     *,
     execution_receipt: Optional[dict[str, Any]],
-) -> tuple[Optional[str], Optional[str]]:
-    """Resolve ``(head, refusal)`` for a completion that ends a review.
+) -> tuple[Optional[str], Optional[str], Optional[list[dict[str, str]]]]:
+    """Resolve ``(head, refusal, proven_parents)`` for a completion ending a review.
 
     The review run is read-only, so it derives no execution receipt of its own
     and the terminal ``UPDATE`` would write ``head_commit`` NULL over a card
@@ -22238,6 +22238,22 @@ def _review_approval_head(
     the approval instead of finishing a card whose integration promise has
     quietly lapsed.
 
+    That re-proof runs HERE, before the approval's write transaction opens,
+    because it shells out to git and must not hold the board's write lock. So
+    it proves a fact about a moment strictly BEFORE the commit, and this
+    function therefore hands back the EXACT receipt set it proved
+    (``proven_parents``) as the third item. :func:`complete_task` re-reads that
+    same set inside the transaction that writes ``done`` and requires it to be
+    byte-for-byte identical: a parent that reopens, is reclaimed, recommits and
+    completes in the window between the two would still be ``done`` — so
+    ``_parents_satisfied`` is satisfied and only this equality can catch it —
+    while the head this approval is about to write no longer contains it.
+
+    ``proven_parents`` is ``None`` when no containment proof applies (no head,
+    no recorded scope, or a handover that never claimed parent-head
+    integration); there is nothing that has to still be true, so there is
+    nothing to re-read.
+
     A card parked by a build that recorded no head has nothing to restore and
     nothing to re-prove, and keeps its historical completion — the same rule
     :func:`_latest_review_scope_provenance` applies to an unrecorded scope.
@@ -22247,11 +22263,11 @@ def _review_approval_head(
     head = live_head or parked_head
     scope = _latest_review_scope_provenance(conn, task_id)
     if head is None or scope is None or not scope["integrates_parent_heads"]:
-        return head, None
+        return head, None, None
 
     task = get_task(conn, task_id)
     if task is None:
-        return None, f"unknown task {task_id}"
+        return None, f"unknown task {task_id}", None
     # Re-proving needs a checkout that can see both commits. The task's own
     # worktree is that checkout and it outlives the park (cleanup happens on
     # completion, not on the handover). If it is gone, the integration claim
@@ -22270,9 +22286,9 @@ def _review_approval_head(
         return None, (
             f"cannot re-prove parent-head integration for {task_id}: its "
             "scoped worktree is unavailable"
-        )
+        ), None
     try:
-        _verify_parent_head_containment(
+        proven_parents = _verify_parent_head_containment(
             conn,
             task_id,
             project_id=task.project_id,
@@ -22280,8 +22296,8 @@ def _review_approval_head(
             head=head,
         )
     except WorktreeScopeError as exc:
-        return None, str(exc)
-    return head, None
+        return None, str(exc), None
+    return head, None, proven_parents
 
 
 @bounded_mutation("complete_task")
@@ -22322,7 +22338,11 @@ def complete_task(
     * the approval of a card whose parked head no longer contains a parent that
       MOVED while the reviewer was reading
       (:func:`_review_approval_head`). Approving it would finish work whose
-      kernel-checked integration promise has lapsed.
+      kernel-checked integration promise has lapsed. The proof runs outside the
+      write transaction (it shells out to git), so the exact receipt set it
+      proved is re-read INSIDE the transaction that writes ``done`` and must
+      still match byte for byte — a parent that moves in that window is
+      ``done`` again by then, and nothing else would notice.
 
     The approval otherwise restores what the read-only park replaced — the
     implementation's ``owned_paths``, its ``integrates_parent_heads`` flag and
@@ -22510,14 +22530,14 @@ def complete_task(
                 },
                 reviewer=reviewer,
                 unassign_reviewer=reviewer is None,
-                # The park is the ONLY moment this head is provable: the
-                # reviewer's run is read-only, so nothing downstream of here
-                # derives it again. Persisting the receipt's own head as review
-                # provenance is what lets the approval finish the card with the
-                # exact commit that was reviewed instead of a NULL receipt.
-                implementation_head=(
-                    (execution_receipt or {}).get("head_commit")
-                ),
+                # The park derives this head itself for every OTHER surface;
+                # this one call already proved it, one statement above, against
+                # the same worktree and after any remote materialization. So
+                # the receipt rides forward on the kernel-internal channel
+                # rather than being re-proven by a second identical git walk.
+                # It is the receipt object, not a head: nothing here is in a
+                # position to name a commit the kernel did not verify.
+                _kernel_execution_receipt=execution_receipt,
                 expected_run_id=expected_run_id,
                 # A caller that proves no run ownership is a human/CLI
                 # handover; ``complete_task`` accepts those today, so the park
@@ -22538,6 +22558,20 @@ def complete_task(
     # run at all, and ``_materialize_remote_worktree_handoff`` refuses both.
     # So there is nothing staged to roll back on this refusal.
     review_head: Optional[str] = None
+    # Every parent-head containment proof this completion made, whichever leg
+    # made it, so the transaction below can insist it is STILL true. The
+    # ordinary scoped completion above proves containment inside
+    # ``_verify_scoped_worktree_completion``, which is also outside the write
+    # transaction and has exactly the same window; its receipt carries a
+    # non-empty ``parent_heads`` precisely when it proved one (a task that does
+    # not integrate parent heads records ``[]``, and the proof refuses to
+    # return an empty set).
+    proven_parent_heads: Optional[list[dict[str, str]]] = (
+        list(execution_receipt["parent_heads"])
+        if execution_receipt and execution_receipt.get("parent_heads")
+        else None
+    )
+    proof_leg = "completion"
     approval_row = conn.execute(
         "SELECT status, current_run_id FROM tasks "
         "WHERE id = ? AND task_kind = 'work'",
@@ -22546,9 +22580,15 @@ def complete_task(
     if approval_row is not None and _is_review_approval(
         conn, task_id, approval_row["status"], approval_row["current_run_id"],
     ):
-        review_head, approval_refusal = _review_approval_head(
+        review_head, approval_refusal, approval_parents = _review_approval_head(
             conn, task_id, execution_receipt=execution_receipt,
         )
+        # The approval's own re-proof is the newer of the two and supersedes
+        # it; ``None`` means it had nothing to prove, which never cancels a
+        # proof the live receipt above did make.
+        if approval_parents is not None:
+            proven_parent_heads = approval_parents
+            proof_leg = "review approval"
         if approval_refusal is not None:
             _log.warning(
                 "kanban: refusing review approval for %s: %s",
@@ -22572,6 +22612,45 @@ def complete_task(
                     expected_run_id=expected_run_id,
                 )
             return False
+        # ... and "the parents are DONE" is a strictly weaker statement than
+        # "the parents are still at the heads this completion just proved". A
+        # parent that reopened, was reclaimed, recommitted and completed inside
+        # the window between the containment proof and this transaction is
+        # ``done`` again by now, so the check above waves it through — while
+        # the head about to be written no longer contains it. Both proofs live
+        # outside this transaction because both shell out to git, so both are
+        # re-read HERE, under the same write lock as the done-update, through
+        # the same query shape, the same mutating-parent filter and the same
+        # ordering they used, and must match BYTE FOR BYTE. A mismatch refuses
+        # the completion outright: no done-update, no head write, no scope
+        # restore, and an approved card stays exactly where the reviewer left
+        # it.
+        if proven_parent_heads is not None:
+            live = get_task(conn, task_id)
+            current_parent_heads = _mutating_parent_head_receipts(
+                conn, task_id, project_id=live.project_id if live else None,
+            )
+            if current_parent_heads != proven_parent_heads:
+                _log.warning(
+                    "kanban: refusing %s for %s: a parent head moved between "
+                    "the integration proof and the write transaction "
+                    "(proved %s, now %s)",
+                    proof_leg,
+                    task_id,
+                    proven_parent_heads,
+                    current_parent_heads,
+                )
+                if materialization_start is not None:
+                    _rollback_worktree_materialization(
+                        conn,
+                        task_id,
+                        materialization_start,
+                        materialized_head=(materialization_receipt or {}).get(
+                            "materialized_head"
+                        ),
+                        expected_run_id=expected_run_id,
+                    )
+                return False
         prior = conn.execute(
             "SELECT status, current_run_id FROM tasks "
             "WHERE id = ? AND task_kind = 'work'",
@@ -23888,6 +23967,68 @@ def parse_review_findings_document(raw: Any) -> dict:
     )
 
 
+def _kernel_review_handover_head(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kernel_receipt: Optional[dict[str, Any]],
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve ``(head, refusal)`` — the ONE head a review park may record.
+
+    A review park is a HANDOVER of implementation work, and the head it
+    records is the only statement anybody downstream ever gets about which
+    commit was handed over: the reviewer's run is read-only, so nothing after
+    this moment derives it again, and the approval writes whatever this park
+    persisted onto the finished card for an integrating child to trust.
+
+    So the head is the kernel's own, always. It is derived HERE, with the same
+    authority and the same helper the completion path uses
+    (:func:`_verify_scoped_worktree_completion`): the exact worktree HEAD,
+    proven clean, proven descended from the task's base commit and proven to
+    touch nothing outside the declared ownership scope. A head that arrived
+    from a caller — a tool argument, a CLI flag, worker prose in ``metadata``,
+    a dashboard payload — proves none of that, and the three non-completion
+    handover surfaces used to park with no head at all, which is the same
+    hole reached from the other side.
+
+    ``kernel_receipt`` is the one inbound channel and it is KERNEL-ONLY: it
+    carries a receipt THIS SAME kernel call already derived one step earlier
+    (:func:`complete_task` materializes a remote handoff and verifies the
+    scoped worktree just above its park), so re-deriving it would re-run git
+    to reach the identical answer. It is never a way to supply a head — it is
+    a way to avoid proving the same one twice.
+
+    Returns no head, and no refusal, for every shape
+    :func:`_verify_scoped_worktree_completion` answers ``None`` to: a legacy
+    unscoped task (``owned_paths`` NULL), a read-only run, and a non-worktree
+    task with ``owned_paths == []``. Those park exactly as they always have,
+    with nothing to restore and nothing to re-prove.
+
+    A refusal is returned when the scope proof RAISES: the task declares a
+    write boundary the kernel cannot prove the worktree stayed inside. The
+    handover fails closed there rather than parking a review whose head is
+    unprovable — an approval consuming such a head would finish a card whose
+    git receipt nobody ever verified.
+    """
+    receipt = kernel_receipt
+    if receipt is None:
+        try:
+            receipt = _verify_scoped_worktree_completion(conn, task_id)
+        except WorktreeScopeError as exc:
+            return None, (
+                f"cannot park {task_id} for review: its declared file scope "
+                f"could not be proven: {exc}"
+            )
+    if not isinstance(receipt, dict):
+        return None, None
+    head = str(receipt.get("head_commit") or "").strip()
+    # The proof above only ever yields an exact object id; anything else is a
+    # receipt this kernel did not derive, and it authorizes nothing.
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
+        return None, None
+    return head, None
+
+
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -23896,10 +24037,10 @@ def request_review(
     metadata: Optional[dict] = None,
     reviewer: Optional[str] = None,
     unassign_reviewer: bool = False,
-    implementation_head: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     force: bool = False,
     with_reason: bool = False,
+    _kernel_execution_receipt: Optional[dict[str, Any]] = None,
 ):
     """Transition implementation work into the first-class review phase.
 
@@ -23925,14 +24066,43 @@ def request_review(
     ``review_requested`` event and restored EXACTLY — by the handback, by an
     explicit reopen, and by the approval that ends the requirement.
 
-    ``implementation_head`` is the other half of that record: the exact
-    execution head the caller has ALREADY verified (``complete_task`` passes
-    the ``head_commit`` of the receipt it derived from the clean, in-bounds
-    worktree just above its park). A read-only review run derives no receipt of
-    its own, so without this the approval has nothing to write to
-    ``head_commit`` and the finished card loses the identity of the very commit
-    that was reviewed. It is stored as provenance only — it authorizes nothing
-    by itself, and the approval re-proves whatever still has to hold.
+    **This is the ONE kernel handover primitive**, and every surface that hands
+    implementation work to a reviewer already comes through it: the automatic
+    park inside :func:`complete_task`, the model-facing ``kanban_request_review``
+    tool, the CLI status-to-review change and the dashboard's review route. So
+    the implementation head recorded below is derived HERE
+    (:func:`_kernel_review_handover_head`), from the task's own worktree, with
+    the same authority the completion path uses — never accepted from a caller.
+    It used to be a caller-supplied argument, which meant exactly one of the
+    four surfaces (the completion park) supplied a proven head and the other
+    three parked with none: the approval then wrote NULL over a card whose work
+    WAS proven at an exact commit, and an integrating child either refused a
+    finished parent or trusted a head nobody had verified.
+
+    That head is the other half of the scope record: a read-only review run
+    derives no receipt of its own, so without it the approval has nothing to
+    write to ``head_commit`` and the finished card loses the identity of the
+    very commit that was reviewed. It is stored as provenance only — it
+    authorizes nothing by itself, and the approval re-proves whatever still has
+    to hold.
+
+    The derivation FAILS CLOSED and it happens BEFORE the read-only conversion:
+    a task whose declared write boundary cannot be proven is refused with that
+    diagnostic and nothing at all is written, and the proof runs against the
+    implementer's scope rather than the empty one the park is about to install.
+    Everything the scope proof answers ``None`` to — a legacy unscoped task, a
+    read-only run, a non-worktree task with ``owned_paths == []`` — parks with
+    no head exactly as it always did.
+
+    ``_kernel_execution_receipt`` is KERNEL-INTERNAL and is not part of this
+    function's public contract: nothing outside this module may pass it. It
+    exists so :func:`complete_task`, which has already materialized any remote
+    handoff and run :func:`_verify_scoped_worktree_completion` in this same
+    call, can hand that exact receipt object forward instead of re-running git
+    to prove the identical head a second time. It is not an inbound channel for
+    a head — a receipt that this kernel did not derive proves nothing, and the
+    park records only ``receipt["head_commit"]`` after re-checking it is an
+    exact git object id.
 
     ``unassign_reviewer=True`` is the one way to park a card on the review lane
     with NO assignee, and it is deliberately explicit: omitting ``reviewer``
@@ -23959,6 +24129,32 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    # The handover's git evidence is proven BEFORE the transaction opens, and
+    # before the read-only conversion below zeroes the very scope it has to be
+    # proven against. Two reasons for the ordering, both load-bearing:
+    #
+    # * the proof shells out to git (status, rev-parse, diff, merge-base), and
+    #   holding the board's write lock across those subprocesses would stall
+    #   every other mutator for the length of a repository walk; and
+    # * ``owned_paths``/``integrates_parent_heads`` still describe the
+    #   IMPLEMENTER here. One statement later they are ``[]``/``0``, and a
+    #   receipt derived from those would prove an empty boundary — which
+    #   proves nothing at all.
+    #
+    # The park itself stays atomic: nothing is written until the transaction
+    # below, and a refusal here writes nothing whatsoever.
+    if get_task(conn, task_id) is None:
+        return _ret(False, "task not found")
+    implementation_head, handover_refusal = _kernel_review_handover_head(
+        conn, task_id, kernel_receipt=_kernel_execution_receipt,
+    )
+    if handover_refusal is not None:
+        _log.warning(
+            "kanban: refusing review handover for %s: %s",
+            task_id,
+            handover_refusal,
+        )
+        return _ret(False, handover_refusal)
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -28634,6 +28830,45 @@ def _path_is_owned(path: str, owned_paths: list[str]) -> bool:
     return any(path == owner or path.startswith(f"{owner}/") for owner in owned_paths)
 
 
+def _mutating_parent_head_receipts(
+    conn: sqlite3.Connection, task_id: str, *, project_id: Optional[str]
+) -> list[dict[str, str]]:
+    """The mutating same-Project parent receipts of ``task_id``, in proof order.
+
+    The ONE query shape behind the parent-head integration invariant: one
+    SELECT, one mutating-parent filter (a parent with ``owned_paths == []``
+    wrote no code, so there is nothing for a child to contain), and one
+    ordering. It is read twice and the two reads are COMPARED — by
+    :func:`_verify_parent_head_containment`, which proves containment against
+    it, and by the approval transaction, which re-reads it and requires
+    byte-for-byte equality before it finishes the card. Two hand-written copies
+    of this query could drift in their filter or their ordering, and either
+    drift would make that comparison silently meaningless.
+
+    Values are returned verbatim (a missing head is ``""``) so a parent that
+    LOST its receipt between the two reads compares unequal rather than
+    vanishing from the set. Validation belongs to the proof, not here.
+    """
+    if not project_id:
+        return []
+    rows = conn.execute(
+        "SELECT p.id, p.head_commit, p.owned_paths FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND p.project_id = ? "
+        "AND p.task_kind = 'work' "
+        "ORDER BY p.id",
+        (task_id, project_id),
+    ).fetchall()
+    return [
+        {
+            "task_id": str(row["id"]),
+            "head_commit": str(row["head_commit"] or "").strip(),
+        }
+        for row in rows
+        if _decode_owned_paths(row["owned_paths"]) != []
+    ]
+
+
 def _verify_parent_head_containment(
     conn: sqlite3.Connection,
     task_id: str,
@@ -28658,42 +28893,39 @@ def _verify_parent_head_containment(
     about a card the read-only park has already zeroed it on, and answers from
     the provenance the handover recorded instead.
 
-    Returns the exact receipts proven contained (for the execution receipt),
-    and raises :class:`WorktreeScopeError` on anything it cannot prove.
+    Returns the exact receipt set proven contained — the same value
+    :func:`_mutating_parent_head_receipts` yields, so the approval can re-read
+    it inside its own write transaction and compare byte for byte. That return
+    value is not decoration: proving containment here and committing the
+    approval later are two different moments, and a parent is free to reopen,
+    be reclaimed, recommit and complete in between. The proof says what was
+    true; the equality check inside :func:`complete_task`'s transaction is what
+    says it is STILL true at the instant the card is finished.
+
+    Raises :class:`WorktreeScopeError` on anything it cannot prove.
     """
     if not project_id:
         raise WorktreeScopeError(
             "parent-head integration requires a Project-linked task"
         )
-    rows = conn.execute(
-        "SELECT p.id, p.head_commit, p.owned_paths FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? AND p.project_id = ? "
-        "AND p.task_kind = 'work' "
-        "ORDER BY p.id",
-        (task_id, project_id),
-    ).fetchall()
-    receipt_rows = []
-    for row in rows:
-        parent_scope = _decode_owned_paths(row["owned_paths"])
-        if parent_scope == []:
-            continue
-        parent_head = str(row["head_commit"] or "").strip()
-        if not parent_head:
+    parent_heads = _mutating_parent_head_receipts(
+        conn, task_id, project_id=project_id
+    )
+    for receipt in parent_heads:
+        if not receipt["head_commit"]:
             raise WorktreeScopeError(
-                f"mutating parent {row['id']} is missing its git head receipt"
+                f"mutating parent {receipt['task_id']} is missing its git head "
+                "receipt"
             )
-        receipt_rows.append(row)
-    if not receipt_rows:
+    if not parent_heads:
         raise WorktreeScopeError(
             "parent-head integration requires at least one parent git receipt"
         )
-    parent_heads: list[dict[str, str]] = []
-    for row in receipt_rows:
-        parent_head = str(row["head_commit"] or "").strip()
+    for receipt in parent_heads:
+        parent_head = receipt["head_commit"]
         if not re.fullmatch(r"[0-9a-fA-F]{40,64}", parent_head):
             raise WorktreeScopeError(
-                f"parent {row['id']} has an invalid git head receipt"
+                f"parent {receipt['task_id']} has an invalid git head receipt"
             )
         contains_parent = subprocess.run(
             [
@@ -28711,16 +28943,31 @@ def _verify_parent_head_containment(
         )
         if contains_parent.returncode != 0:
             raise WorktreeScopeError(
-                f"completed head does not contain parent head from {row['id']}"
+                "completed head does not contain parent head from "
+                f"{receipt['task_id']}"
             )
-        parent_heads.append({"task_id": str(row["id"]), "head_commit": parent_head})
     return parent_heads
 
 
 def _verify_scoped_worktree_completion(
     conn: sqlite3.Connection, task_id: str
 ) -> Optional[dict[str, Any]]:
-    """Derive an exact completion receipt for an explicitly scoped task."""
+    """Derive an exact completion receipt for an explicitly scoped task.
+
+    The ONE scope proof in the kernel, and now the ONE source of a review
+    handover's head as well: :func:`request_review` runs it before it converts
+    a card to the reviewer's read-only scope, so the head a review parks is
+    derived with exactly the authority a completion's is — never named by a
+    caller. ``None`` still means "nothing to prove here" for the three shapes
+    that have always meant it (a legacy task with ``owned_paths`` NULL, a
+    read-only run, and a non-worktree task with ``owned_paths == []``), and
+    those park and complete exactly as before.
+
+    The receipt's ``parent_heads`` is the exact set proven contained, and it is
+    load-bearing beyond the audit trail: :func:`complete_task` re-reads it
+    inside the transaction that writes ``done`` and refuses if a parent has
+    moved since, because this proof runs outside that transaction.
+    """
     task = get_task(conn, task_id)
     if task is None:
         raise WorktreeScopeError(f"unknown task {task_id}")
