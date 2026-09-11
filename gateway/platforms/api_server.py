@@ -1447,7 +1447,10 @@ def _owner_review_requirement(value: Dict[str, Any]) -> Dict[str, Any]:
     absent key derive the same expected payload; a read-only role that states
     it makes the whole stored proposal unusable as authority.
     """
-    if value.get("requires_review") is not True:
+    flag = value.get("requires_review", False)
+    if not isinstance(flag, bool):
+        raise ValueError("stored proposal change is invalid")
+    if flag is not True:
         return {}
     # The apply path canonicalizes the assignee (strip, lowercase) before its
     # refusal, so a spaced or mixed-case spelling of a read-only role is the
@@ -12982,6 +12985,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 owner_project_name,
             )
 
+            # The stored tasks travel into the expected payload as they are, so
+            # the one rule the apply path enforces per task before it commits
+            # (the review requirement: a boolean, never true on a read-only
+            # role) is enforced here too, before any run is reserved.
+            tasks = candidate.get("tasks")
+            if not isinstance(tasks, list):
+                raise ValueError("stored proposal task is invalid")
+            for task in tasks:
+                if not isinstance(task, dict):
+                    raise ValueError("stored proposal task is invalid")
+                try:
+                    _owner_review_requirement(task)
+                except ValueError:
+                    raise ValueError("stored proposal task is invalid") from None
             try:
                 stored_project_name = owner_project_name(
                     _native_owner_project_name(

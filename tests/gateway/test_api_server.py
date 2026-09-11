@@ -683,6 +683,73 @@ class TestOwnerWorkspaceRunContext:
         finally:
             store.close()
 
+    @pytest.mark.parametrize(
+        ("assignee", "requires_review", "refusal"),
+        [
+            ("raphael-planner", True, "stored proposal task is invalid"),
+            (" Raphael-Verifier ", True, "stored proposal task is invalid"),
+            ("raphael-claude-worker", "yes", "stored proposal task is invalid"),
+            # The control: a worker may carry it, so the validation passes and
+            # the authority moves on to its next check.
+            ("raphael-claude-worker", True, "owner Project context does not match"),
+        ],
+    )
+    def test_a_new_project_task_carrying_the_requirement_on_a_read_only_role_authorizes_no_run(
+        self, assignee, requires_review, refusal,
+    ):
+        """A stored new-Project proposal is validated per task before any run.
+
+        The apply path refuses the review requirement on a read-only role and
+        a non-boolean value; the authority refuses the same stored proposal
+        first, so no run is reserved for work that can never be committed.
+        """
+        conversation = "raphael-owner-" + "4" * 32
+        response_id = "resp_native_reviewed_new_project"
+        proposal = _owner_new_proposal(tasks=[{
+            "title": "Draft the workshop plan",
+            "body": "Prepare the private workshop plan.",
+            "assignee": assignee,
+            "responsibility": "R14",
+            "execution_tier": "deep",
+            "parents": [],
+            "requires_review": requires_review,
+        }])
+        authority = {
+            "proposal_profile": "default",
+            "conversation": conversation,
+            "response_id": response_id,
+            "claim_id": "claim_" + "6" * 32,
+            "operation": "owner_task_graph_commit",
+            "idempotency_key": "conversation-" + "a" * 64,
+            "payload": {},
+        }
+        context = {
+            "profile": "default",
+            "mode": "new",
+            "project_slug": None,
+            "project_name": "Another project",
+        }
+        store = ResponseStore(max_size=10)
+        adapter = APIServerAdapter.__new__(APIServerAdapter)
+        adapter._response_store = store
+        try:
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": "Prepare the workshop"},
+                    {"role": "assistant", "content": json.dumps(proposal)},
+                ],
+            })
+            assert store.set_conversation(
+                conversation, response_id, owner_proposal=True,
+            ) is True
+            with pytest.raises(ValueError, match=refusal):
+                adapter._validated_owner_proposal_authority(
+                    authority, context, "default",
+                )
+        finally:
+            store.close()
+
     @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
     def test_new_mode_still_requires_a_name(self, blank):
         config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
