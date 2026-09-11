@@ -1426,11 +1426,26 @@ _OWNER_PROPOSAL_REWRITTEN_TASK_KEYS = _OWNER_PROPOSAL_TASK_KEYS | frozenset({
 
 
 def _owner_current_task_shape(value: Any, expected_keys: frozenset[str]) -> bool:
+    # The review requirement is the one optional key of a current task shape:
+    # the Workspace admits it as a boolean and forwards it only when true.
     return (
         isinstance(value, dict)
-        and set(value) == expected_keys
+        and set(value) - {"requires_review"} == expected_keys
         and isinstance(value.get("owned_paths"), list)
+        and isinstance(value.get("requires_review", False), bool)
     )
+
+
+def _owner_task_payload(value: Dict[str, Any]) -> Dict[str, Any]:
+    """The created-task shape as the Workspace forwards it in the run payload.
+
+    ``requires_review`` travels only when true, so a stored ``false`` and an
+    absent key derive the same expected payload.
+    """
+    payload = {key: item for key, item in value.items() if key != "requires_review"}
+    if value.get("requires_review") is True:
+        payload["requires_review"] = True
+    return payload
 
 
 def _owner_current_replace_shape(value: Any) -> bool:
@@ -13066,6 +13081,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         "responsibility": clean(raw.get("responsibility")),
                         "execution_tier": clean(raw.get("execution_tier")),
                         "owned_paths": clean(raw.get("owned_paths")),
+                        **(
+                            {"requires_review": True}
+                            if raw.get("requires_review") is True else {}
+                        ),
                         "existing_parents": [native(ref) for ref in raw["existing_parent_refs"]],
                         "new_parents": clean(raw.get("new_parents")),
                     })
@@ -13075,7 +13094,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     changes.append({
                         "action": "replace", "reason": reason,
                         "target": native(raw.get("target_ref")),
-                        "replacement": clean(raw.get("replacement")),
+                        "replacement": clean(_owner_task_payload(raw["replacement"])),
                     })
                 elif action == "split" and set(raw) == {
                     "action", "reason", "target_ref", "replacements",
@@ -13088,7 +13107,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     changes.append({
                         "action": "split", "reason": reason,
                         "target": native(raw.get("target_ref")),
-                        "replacements": clean(raw.get("replacements")),
+                        "replacements": [
+                            clean(_owner_task_payload(replacement))
+                            for replacement in raw["replacements"]
+                        ],
                     })
                 elif action == "merge" and set(raw) == {
                     "action", "reason", "target_refs", "replacement",
@@ -13098,7 +13120,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     changes.append({
                         "action": "merge", "reason": reason,
                         "targets": [native(ref) for ref in raw["target_refs"]],
-                        "replacement": clean(raw.get("replacement")),
+                        "replacement": clean(_owner_task_payload(raw["replacement"])),
                     })
                 elif action == "move" and set(raw) == {
                     "action", "reason", "target_ref", "to_status",

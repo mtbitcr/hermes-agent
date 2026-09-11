@@ -380,6 +380,17 @@ class TestOwnerWorkspaceRunContext:
                 "responsibility": "R07",
                 "execution_tier": "deep",
             }, False),
+            # The review requirement rides inside the replacement, exactly as
+            # the Workspace forwards it.
+            ({
+                "title": "Complete the bounded recovery",
+                "body_mode": "preserve",
+                "assignee": "raphael-claude-worker",
+                "responsibility": "R07",
+                "execution_tier": "deep",
+                "owned_paths": [],
+                "requires_review": True,
+            }, True),
         ],
     )
     def test_stored_replace_proposal_validates_exact_native_run_payload(
@@ -511,6 +522,129 @@ class TestOwnerWorkspaceRunContext:
 
             assert binding["operation"] == "owner_project_plan_commit"
             assert binding["idempotency_key"] == idempotency_key
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("carried", [True, False])
+    def test_a_review_requirement_on_a_plan_add_is_part_of_the_authority(
+        self, carried,
+    ):
+        """A plan add that requires a review is approved with that requirement.
+
+        The Workspace forwards ``requires_review`` on an add only when true, so
+        the payload derived here from the stored proposal carries it the same
+        way, and a run payload without it is a different approval.
+        """
+        conversation = "raphael-owner-" + "4" * 32
+        response_id = "resp_native_reviewed_add_proposal"
+        idempotency_key = "conversation-" + hashlib.sha256(
+            response_id.encode("utf-8")
+        ).hexdigest()
+        secret = "owner-executor-test-key"
+        anchor = {
+            "id": "task_anchor",
+            "title": "Coordinate the milestone",
+            "status": "todo",
+            "event_revision": 3,
+            "parent_ids": [],
+            "child_ids": [],
+            "omitted_parent_count": 0,
+            "omitted_child_count": 0,
+        }
+        add = {
+            "action": "add",
+            "reason": "The owner asked for an independently reviewed follow-up.",
+            "title": "Trap the low-level write in the atomicity regression",
+            "body": "Make the regression trap the write while the fault is armed.",
+            "assignee": "raphael-claude-worker",
+            "responsibility": "R14",
+            "execution_tier": "deep",
+            "owned_paths": ["tests/hermes_cli"],
+            "existing_parent_refs": [],
+            "new_parents": [],
+            "requires_review": True,
+        }
+        proposal = _owner_existing_proposal(changes=[add])
+        change = {
+            key: value for key, value in add.items()
+            if key != "existing_parent_refs"
+        }
+        change["existing_parents"] = []
+        if not carried:
+            del change["requires_review"]
+        payload = {
+            "idempotency_key": idempotency_key,
+            "project_id": "project_raphael",
+            "trigger": "owner_request",
+            "request_title": proposal["request_title"],
+            "summary": proposal["summary"],
+            "specification": proposal["specification"],
+            "current_milestone": proposal["current_milestone"],
+            "owner_visible_result": proposal["owner_visible_result"],
+            "later_milestones": proposal["later_milestones"],
+            "changes": [change],
+        }
+        authority = {
+            "proposal_profile": "default",
+            "conversation": conversation,
+            "response_id": response_id,
+            "claim_id": "claim_" + "6" * 32,
+            "operation": "owner_project_plan_commit",
+            "idempotency_key": idempotency_key,
+            "payload": payload,
+        }
+        context = {
+            "profile": "default",
+            "mode": "existing",
+            "project_slug": "raphael-workspace",
+            "project_name": "Raphael Workspace",
+        }
+        snapshot = {
+            "project": {"id": "project_raphael"},
+            "planning_context": {
+                "schema_version": 1,
+                "actionable_count": 1,
+                "omitted_terminal_count": 0,
+                "actionable_truncated": False,
+                "relations_truncated": False,
+                "tasks": [anchor],
+            },
+        }
+        store = ResponseStore(max_size=10)
+        adapter = APIServerAdapter.__new__(APIServerAdapter)
+        adapter._response_store = store
+        adapter._expected_api_key = lambda: secret
+        try:
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": "Start the reviewed follow-up."},
+                    {"role": "assistant", "content": json.dumps(proposal)},
+                ],
+            })
+            assert store.set_conversation(
+                conversation, response_id, owner_proposal=True,
+            ) is True
+            with (
+                patch(
+                    "hermes_cli.owner_workspace.resolve_owner_context",
+                    return_value=object(),
+                ),
+                patch(
+                    "hermes_cli.owner_workspace.read_project_snapshot",
+                    return_value=snapshot,
+                ),
+            ):
+                if carried:
+                    binding = adapter._validated_owner_proposal_authority(
+                        authority, context, "default",
+                    )
+                    assert binding["operation"] == "owner_project_plan_commit"
+                else:
+                    with pytest.raises(ValueError, match="run payload differs"):
+                        adapter._validated_owner_proposal_authority(
+                            authority, context, "default",
+                        )
         finally:
             store.close()
 
