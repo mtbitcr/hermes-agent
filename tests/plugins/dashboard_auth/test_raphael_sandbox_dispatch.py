@@ -2114,8 +2114,18 @@ def test_review_run_gets_read_only_scope_and_no_patch_authority(
     # scope is kept as durable provenance and restored on handback and on
     # approval (tests/hermes_cli/test_kanban_review_read_only_scope.py). The
     # sandbox therefore sees an empty scope and no patch authority.
+    #
+    # The handover derives the kernel's own execution receipt from the scoped
+    # worktree before it parks the card (a declared boundary it cannot prove
+    # is refused), so the implementation here is real: the task branch and
+    # base commit recorded, one commit inside the declared scope.
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, host.task_id).owned_paths == ["."]
+        kb.set_branch_name(conn, host.task_id, f"wt/{host.task_id}")
+        kb.record_worktree_base(conn, host.task_id, host.worktree)
+        (host.worktree / "app.py").write_text("print('reviewed')\n", encoding="utf-8")
+        _git(host.worktree, "add", "app.py")
+        _git(host.worktree, "commit", "-m", "feat: implementation ready for review")
         assert kb.request_review(
             conn,
             host.task_id,
