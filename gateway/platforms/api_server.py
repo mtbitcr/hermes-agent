@@ -442,6 +442,45 @@ def _resolve_owner_lifecycle_run_authority(value: Any) -> "dict[str, Any] | None
     }
 
 
+def _resolve_owner_retry_run_authority(value: Any) -> "dict[str, Any] | None":
+    """Validate the closed transport shape for one owner retry run."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "operation", "idempotency_key", "payload",
+    }:
+        raise ValueError("invalid owner retry authority")
+    operation = value.get("operation")
+    idempotency_key = value.get("idempotency_key")
+    payload = value.get("payload")
+    if (
+        operation != "owner_task_retry"
+        or not isinstance(idempotency_key, str)
+        or re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", idempotency_key) is None
+        or not isinstance(payload, dict)
+        or set(payload) != {
+            "idempotency_key", "project_id", "task_id", "reason",
+        }
+        or payload.get("idempotency_key") != idempotency_key
+    ):
+        raise ValueError("invalid owner retry authority")
+    return {
+        "operation": operation,
+        "idempotency_key": idempotency_key,
+        "payload": payload,
+    }
+
+
+# Native run handlers resolved by name at dispatch time rather than imported
+# with the module: ``owner_task_retry``'s registered handler ships with the
+# retry tool in ``tools.owner_workspace_tools``, so binding it eagerly here
+# would make this transport depend on a symbol that may not be present yet.
+# An absent handler is refused (see ``_run_sync``), never substituted.
+_OWNER_NATIVE_RUN_HANDLERS = {
+    "owner_task_retry": "_handle_task_retry",
+}
+
+
 def _normalize_api_route_rule(value: str) -> "str | None":
     """Normalize one legacy path prefix or exact METHOD route-template."""
     rule = value.strip()
@@ -12793,6 +12832,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "owner_project_plan_commit": "Approve Project changes",
             "owner_task_move": "Approve a work-state change",
             "owner_task_comment": "Approve an owner reply",
+            "owner_task_retry": "Approve trying stopped work again",
             "owner_project_lifecycle": "Approve the Project lifecycle change",
         }
         for run_id, status in self._run_statuses.items():
@@ -13165,6 +13205,82 @@ class APIServerAdapter(BasePlatformAdapter):
             ).hexdigest(),
         }
 
+    def _validated_owner_retry_authority(
+        self,
+        authority: "dict[str, Any]",
+        context: "dict[str, Any]",
+        profile: str,
+    ) -> "dict[str, Any]":
+        """Bind one retry run to exact receipt-backed Project state."""
+        if (
+            context.get("profile") != profile
+            or context.get("mode") != "existing"
+            or not isinstance(context.get("project_slug"), str)
+        ):
+            raise ValueError("owner retry context mismatch")
+        # ONE canonical payload, bound and forwarded. Crash recovery rebuilds
+        # this run's digest from the cleaned payload (see
+        # :meth:`_owner_authority_digest_for_recovery`), so hashing the raw
+        # request instead committed the native receipt under a digest recovery
+        # could never look it up by: a valid retry whose reason merely carried
+        # surrounding whitespace read as failed forever. Trimming is all that
+        # happens here — the reason's owner-visible form is still the kernel's
+        # own to derive from what this forwards.
+        payload = self._owner_authority_clean(authority["payload"])
+        project_id = payload.get("project_id")
+        task_id = payload.get("task_id")
+        reason = payload.get("reason")
+        # The Project identity is matched on the value exactly as submitted:
+        # cleaning is for the payload this run forwards, not for widening what
+        # authorizes it, so a padded id stays as stale as an unknown one.
+        raw_project_id = authority["payload"].get("project_id")
+
+        from hermes_cli.owner_workspace import (
+            _OWNER_RETRY_REASON_LIMIT,
+            list_committed_projects,
+            resolve_owner_context,
+        )
+
+        # Only the shape the kernel bounds, and only as a shape: the reason's
+        # canonical owner-visible form is the kernel's to derive (it is what
+        # the confirmation prompt, the recorded event and the receipt all bind
+        # to), so this layer rejects what it must not forward and re-derives
+        # nothing.
+        if (
+            not isinstance(project_id, str)
+            or not project_id.strip()
+            or len(project_id.strip()) > 100
+            or not isinstance(task_id, str)
+            or not task_id.strip()
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason.strip()) > _OWNER_RETRY_REASON_LIMIT
+        ):
+            raise ValueError("owner retry payload is invalid")
+
+        # A retry carries no expected revision in its closed payload, so the
+        # binding is mode + slug + Project id: a stale or foreign Project
+        # authorizes nothing.
+        projects = list_committed_projects(resolve_owner_context())
+        matches = [
+            project for project in projects
+            if project.get("slug") == context["project_slug"]
+            and project.get("project_id") == raw_project_id
+        ]
+        if len(matches) != 1:
+            raise ValueError("owner retry Project state is stale")
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        return {
+            "operation": "owner_task_retry",
+            "payload": copy.deepcopy(payload),
+            "idempotency_key": authority["idempotency_key"],
+            "payload_digest": hashlib.sha256(
+                canonical.encode("utf-8")
+            ).hexdigest(),
+        }
+
     def _owner_authority_digest_for_recovery(
         self, authority: "dict[str, Any]",
     ) -> str:
@@ -13268,6 +13384,113 @@ class APIServerAdapter(BasePlatformAdapter):
                 "a committed native receipt could not be recorded"
             ) from exc
 
+    def _replayed_native_owner_run(
+        self,
+        *,
+        request: "web.Request",
+        body: "dict[str, Any]",
+        authority: "dict[str, Any]",
+        profile: str,
+        gateway_session_key: "str | None",
+    ) -> "web.Response | None":
+        """Replay one already-committed native owner run from durable state.
+
+        Shared by the closed authorities whose own success changes the very
+        state they were bound to — a lifecycle command's revision, a retry's
+        stopped work — so an exact transport retry has to resolve from the
+        persisted terminal receipt BEFORE fresh-state validation, which would
+        otherwise reject the successful retry merely because the change landed.
+        ``None`` means this request is not such a replay and must be validated
+        as fresh authority.
+        """
+        retry_key = request.headers.get("Idempotency-Key")
+        if retry_key != authority["idempotency_key"]:
+            return None
+        retry_scope = hashlib.sha256(
+            (gateway_session_key or "").encode("utf-8")
+        ).hexdigest()
+        retry_body = dict(body)
+        retry_body["_session_scope"] = retry_scope
+        retry_fingerprint = _make_request_fingerprint(
+            retry_body, keys=sorted(retry_body),
+        )
+        retry_state, retry_run_id = (
+            self._response_store.lookup_run_idempotency(
+                profile,
+                retry_scope,
+                retry_key,
+                retry_fingerprint,
+            )
+        )
+        # The one record that says this run ENDED somewhere we wrote down (see
+        # :meth:`ResponseStore.persist_terminal_run_status`), as opposed to a
+        # transport status this process happens to still hold. Absent for the
+        # crash window recovery exists for: a run whose terminal was never
+        # written has no durable outcome at all, and only its native receipt
+        # can decide it.
+        durable_terminal = (
+            self._response_store.run_idempotency_status(profile, retry_run_id)
+            if retry_run_id is not None else None
+        )
+        durable_replay = (
+            retry_state == "existing"
+            and retry_run_id is not None
+            and (durable_terminal or {}).get("status") in _TERMINAL_RUN_STATUSES
+        )
+        retry_status = (
+            self._response_store.owner_run_completion(profile, retry_run_id)
+            if retry_run_id is not None else None
+        ) or self._run_statuses.get(retry_run_id or "") or durable_terminal or {}
+        # A run that durably ended is already its own answer. Reading a native
+        # receipt for it could only ever fail closed: the kernel records its
+        # own deterministic refusal as a COMMITTED receipt whose result is not
+        # ok, which the successful-receipt reader refuses to read, so an exact
+        # re-delivery of a known refused run answered "outcome unconfirmed"
+        # instead of returning the run the owner already has.
+        if (
+            not durable_replay
+            and retry_state == "existing"
+            and retry_run_id is not None
+            and not (
+                retry_status.get("status") == "completed"
+                and retry_status.get("owner_mutation_committed") is True
+            )
+        ):
+            try:
+                retry_status = self._recover_native_owner_completion(
+                    profile=profile,
+                    session_scope=retry_scope,
+                    run_id=retry_run_id,
+                    authority=authority,
+                    owner=None,
+                ) or retry_status
+            except _OwnerNativeReceiptUnreadable:
+                return web.json_response(
+                    _openai_error(
+                        "The earlier attempt's outcome could not be "
+                        "confirmed",
+                        err_type="server_error",
+                        code="owner_run_outcome_unconfirmed",
+                    ),
+                    status=503,
+                )
+        if durable_replay or (
+            retry_state == "existing"
+            and retry_run_id is not None
+            and retry_status.get("status") == "completed"
+            and retry_status.get("owner_mutation_committed") is True
+        ):
+            response_headers = (
+                {"X-Hermes-Session-Key": gateway_session_key}
+                if gateway_session_key else {}
+            )
+            return web.json_response(
+                {"run_id": retry_run_id, "status": "started"},
+                status=202,
+                headers=response_headers,
+            )
+        return None
+
     @staticmethod
     def _owner_mutation_receipt(
         operation: str, result: Any,
@@ -13289,6 +13512,37 @@ class APIServerAdapter(BasePlatformAdapter):
             return None
         if not isinstance(value, dict) or value.get("ok") is not True:
             return None
+        if operation == "owner_task_retry":
+            # A retry names the stopped work it resumed, not a Project: the
+            # kernel's result carries no ``project_slug``, so this operation
+            # is admitted here rather than by loosening the slug the Project
+            # operations below all must record.
+            task_id = value.get("task_id")
+            status = value.get("status")
+            revision = value.get("revision")
+            retry_reason = value.get("retry_reason")
+            if (
+                not isinstance(task_id, str)
+                or not task_id
+                or not isinstance(status, str)
+                or re.fullmatch(r"[a-z][a-z_]{0,31}", status) is None
+                or isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or not isinstance(retry_reason, str)
+                or not retry_reason
+            ):
+                return None
+            return json.dumps(
+                {
+                    "ok": True,
+                    "task_id": task_id,
+                    "status": status,
+                    "revision": revision,
+                    "retry_reason": retry_reason,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         project_slug = value.get("project_slug")
         if (
             not isinstance(project_slug, str)
@@ -13375,19 +13629,24 @@ class APIServerAdapter(BasePlatformAdapter):
             owner_lifecycle_authority = _resolve_owner_lifecycle_run_authority(
                 body.get("owner_lifecycle_authority")
             )
+            owner_retry_authority = _resolve_owner_retry_run_authority(
+                body.get("owner_retry_authority")
+            )
         except ValueError:
             return web.json_response(
                 _openai_error("Invalid owner-workspace authority"), status=400
             )
-        if (
-            owner_proposal_authority is not None
-            and owner_lifecycle_authority is not None
-        ):
+        owner_authorities = (
+            owner_proposal_authority,
+            owner_lifecycle_authority,
+            owner_retry_authority,
+        )
+        if sum(authority is not None for authority in owner_authorities) > 1:
             return web.json_response(
                 _openai_error("Owner authorities cannot be combined"), status=400
             )
         if (
-            (owner_proposal_authority is not None or owner_lifecycle_authority is not None)
+            any(authority is not None for authority in owner_authorities)
             and owner_workspace_context is None
         ):
             return web.json_response(
@@ -13502,76 +13761,15 @@ class APIServerAdapter(BasePlatformAdapter):
             # A completed lifecycle command changes the revision it was bound
             # to. An exact transport retry must therefore resolve from the
             # persisted terminal receipt before fresh-state validation.
-            retry_key = request.headers.get("Idempotency-Key")
-            if retry_key == owner_lifecycle_authority["idempotency_key"]:
-                retry_scope = hashlib.sha256(
-                    (gateway_session_key or "").encode("utf-8")
-                ).hexdigest()
-                retry_body = dict(body)
-                retry_body["_session_scope"] = retry_scope
-                retry_fingerprint = _make_request_fingerprint(
-                    retry_body, keys=sorted(retry_body),
-                )
-                retry_state, retry_run_id = (
-                    self._response_store.lookup_run_idempotency(
-                        request_owner_profile,
-                        retry_scope,
-                        retry_key,
-                        retry_fingerprint,
-                    )
-                )
-                retry_status = (
-                    self._response_store.owner_run_completion(
-                        request_owner_profile, retry_run_id,
-                    )
-                    if retry_run_id is not None else None
-                ) or self._run_statuses.get(retry_run_id or "") or (
-                    self._response_store.run_idempotency_status(
-                        request_owner_profile, retry_run_id,
-                    )
-                    if retry_run_id is not None else None
-                ) or {}
-                if (
-                    retry_state == "existing"
-                    and retry_run_id is not None
-                    and not (
-                        retry_status.get("status") == "completed"
-                        and retry_status.get("owner_mutation_committed") is True
-                    )
-                ):
-                    try:
-                        retry_status = self._recover_native_owner_completion(
-                            profile=request_owner_profile,
-                            session_scope=retry_scope,
-                            run_id=retry_run_id,
-                            authority=owner_lifecycle_authority,
-                            owner=None,
-                        ) or retry_status
-                    except _OwnerNativeReceiptUnreadable:
-                        return web.json_response(
-                            _openai_error(
-                                "The earlier attempt's outcome could not be "
-                                "confirmed",
-                                err_type="server_error",
-                                code="owner_run_outcome_unconfirmed",
-                            ),
-                            status=503,
-                        )
-                if (
-                    retry_state == "existing"
-                    and retry_run_id is not None
-                    and retry_status.get("status") == "completed"
-                    and retry_status.get("owner_mutation_committed") is True
-                ):
-                    response_headers = (
-                        {"X-Hermes-Session-Key": gateway_session_key}
-                        if gateway_session_key else {}
-                    )
-                    return web.json_response(
-                        {"run_id": retry_run_id, "status": "started"},
-                        status=202,
-                        headers=response_headers,
-                    )
+            replayed = self._replayed_native_owner_run(
+                request=request,
+                body=body,
+                authority=owner_lifecycle_authority,
+                profile=request_owner_profile,
+                gateway_session_key=gateway_session_key,
+            )
+            if replayed is not None:
+                return replayed
         if owner_lifecycle_authority is not None:
             try:
                 owner_lifecycle_authority = (
@@ -13589,8 +13787,39 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=409,
                 )
+        if owner_retry_authority is not None:
+            # A committed retry moves the stopped work the authority was bound
+            # to out of the state that made it retryable, so an exact
+            # transport retry resolves from the persisted terminal receipt
+            # before fresh-state validation, exactly like a lifecycle command.
+            replayed = self._replayed_native_owner_run(
+                request=request,
+                body=body,
+                authority=owner_retry_authority,
+                profile=request_owner_profile,
+                gateway_session_key=gateway_session_key,
+            )
+            if replayed is not None:
+                return replayed
+        if owner_retry_authority is not None:
+            try:
+                owner_retry_authority = self._validated_owner_retry_authority(
+                    owner_retry_authority,
+                    owner_workspace_context,
+                    request_owner_profile,
+                )
+            except ValueError:
+                return web.json_response(
+                    _openai_error(
+                        "Owner retry state does not authorize this run",
+                        code="owner_retry_authority_conflict",
+                    ),
+                    status=409,
+                )
         owner_mutation_authority = (
-            owner_proposal_authority or owner_lifecycle_authority
+            owner_proposal_authority
+            or owner_lifecycle_authority
+            or owner_retry_authority
         )
 
         raw_input = body.get("input")
@@ -13811,7 +14040,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "claim_id": owner_proposal_authority["claim_id"],
                 "operation": owner_proposal_authority["operation"],
             }
-        native_authority = owner_proposal_authority or owner_lifecycle_authority
+        native_authority = (
+            owner_proposal_authority
+            or owner_lifecycle_authority
+            or owner_retry_authority
+        )
         if native_authority is not None and idempotency_key is not None:
             recovery_job_payload["native"] = {
                 "operation": native_authority["operation"],
@@ -14191,6 +14424,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "owner_project_plan_commit",
                         "owner_task_move",
                         "owner_task_comment", "owner_project_lifecycle",
+                        "owner_task_retry",
                     }:
                         pending_approval["operation"] = operation
                     self._set_run_status(
@@ -14267,7 +14501,28 @@ class APIServerAdapter(BasePlatformAdapter):
                                 arguments = copy.deepcopy(
                                     owner_mutation_authority["payload"]
                                 )
-                                result = handlers[operation](arguments)
+                                handler = handlers.get(operation) or getattr(
+                                    owner_workspace_tools,
+                                    _OWNER_NATIVE_RUN_HANDLERS.get(
+                                        operation, "",
+                                    ),
+                                    None,
+                                )
+                                if handler is None:
+                                    # No native handler for an admitted
+                                    # authority: refuse in the kernel's own
+                                    # refusal shape so nothing is committed and
+                                    # no receipt is projected, rather than
+                                    # dispatching some other operation.
+                                    result = json.dumps({
+                                        "error": (
+                                            f"{operation}: this build has no "
+                                            "native handler for this operation"
+                                        ),
+                                        "code": "unsupported_operation",
+                                    })
+                                else:
+                                    result = handler(arguments)
                                 _owner_tool_complete(
                                     run_id, operation, arguments, result,
                                 )

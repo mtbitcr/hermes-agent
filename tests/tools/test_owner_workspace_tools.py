@@ -24,10 +24,16 @@ from hermes_cli.owner_workspace import OwnerContext, OwnerWorkspaceError
 from tools.registry import registry
 from toolsets import TOOLSETS, get_kernel_gated_toolsets, resolve_toolset
 
+# Every tool a model may be OFFERED under the owner-workspace toolset. The
+# owner retry is deliberately absent: it is a native run authority dispatched
+# from an authenticated owner run, never a callable schema — see
+# ``TestRetryIsNotModelFacing`` below and
+# tests/hermes_cli/test_owner_retry_native_authority.py.
 TOOL_NAMES = (
     "owner_workspace_bootstrap", "owner_task_graph_commit",
     "owner_project_plan_commit",
-    "owner_task_move", "owner_task_comment", "owner_project_lifecycle",
+    "owner_task_move", "owner_task_comment",
+    "owner_project_lifecycle",
 )
 
 
@@ -37,11 +43,17 @@ TOOL_NAMES = (
 
 
 class TestToolSurface:
-    def test_exactly_six_tools_registered_under_owner_workspace(self):
+    def test_exactly_these_tools_are_registered_under_owner_workspace(self):
         assert registry.get_tool_names_for_toolset("owner_workspace") == sorted(TOOL_NAMES)
 
     def test_toolset_definition_lists_exactly_these_tools(self):
-        assert set(TOOLSETS["owner_workspace"]["tools"]) == set(TOOL_NAMES)
+        # The static list in toolsets.py and the registry surface (what
+        # api_server actually exposes) must name the same tools: a tool
+        # registered but not declared, or declared but not registered, is a
+        # gap the owner workspace would hit at runtime.
+        static_tools = set(TOOLSETS["owner_workspace"]["tools"])
+        registered_tools = set(registry.get_tool_names_for_toolset("owner_workspace"))
+        assert static_tools == registered_tools == set(TOOL_NAMES)
 
     def test_no_other_toolset_exposes_owner_tools(self):
         for name, ts in TOOLSETS.items():
@@ -65,7 +77,10 @@ class TestToolSurface:
         } <= get_kernel_gated_toolsets()
 
     def test_resolve_toolset_returns_exactly_these_tools(self):
-        assert set(resolve_toolset("owner_workspace", include_registry=False)) == set(TOOL_NAMES)
+        # include_registry=True is how api_server resolves the toolset, and it
+        # merges in whatever the registry carries for the toolset — so this is
+        # the list an owner-workspace agent is actually offered.
+        assert set(resolve_toolset("owner_workspace", include_registry=True)) == set(TOOL_NAMES)
 
     def test_project_steward_is_one_separate_read_only_tool(self):
         assert registry.get_tool_names_for_toolset("project_steward") == [
@@ -102,7 +117,7 @@ _ALLOWED_PARAM_NAMES = {
     "body", "mode", "project_name", "project_description", "project_id",
     "request_title", "specification", "current_milestone",
     "owner_visible_result", "root_assignee", "tasks", "later_milestones",
-    "trigger", "summary", "changes", "action",
+    "trigger", "summary", "changes", "action", "reason",
 }
 
 
@@ -291,6 +306,8 @@ class TestSchemas:
         }
 
 
+
+
 # ---------------------------------------------------------------------------
 # Trusted context resolution — never from tool-call arguments
 # ---------------------------------------------------------------------------
@@ -430,6 +447,24 @@ class TestTrustedContextResolution:
         ctx, kwargs = kernel.calls[0]
         assert ctx is trusted_ctx
         assert "profile" not in kwargs
+
+    def test_task_retry_uses_resolved_context_not_args(self, monkeypatch, trusted_ctx):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+        kernel = _RecordingKernel()
+        monkeypatch.setattr(owt._kernel, "retry_task", kernel)
+
+        owt._handle_task_retry({
+            "idempotency_key": "r1", "project_id": "p1", "task_id": "t1",
+            "reason": "capability gap resolved",
+            "actor": "attacker", "profile": "attacker-profile", "session": "attacker-session",
+        })
+
+        ctx, kwargs = kernel.calls[0]
+        assert ctx is trusted_ctx
+        assert ctx.actor == "trusted-actor"
+        assert "actor" not in kwargs
+        assert "profile" not in kwargs
+        assert "session" not in kwargs
 
     def test_context_is_resolved_fresh_each_call_not_cached_from_first_call(self, monkeypatch):
         ctxs = [
@@ -593,6 +628,38 @@ class TestFieldDelegation:
             "idempotency_key": "k3", "project_id": "p1", "task_id": "t1", "body": "hi there",
         }
 
+    def test_task_retry_passes_through_exact_fields(self, monkeypatch, trusted_ctx):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+        kernel = _RecordingKernel()
+        monkeypatch.setattr(owt._kernel, "retry_task", kernel)
+
+        owt._handle_task_retry({
+            "idempotency_key": "r1", "project_id": "p1",
+            "task_id": "t1", "reason": "capability gap resolved",
+        })
+
+        ctx, kwargs = kernel.calls[0]
+        assert ctx is trusted_ctx
+        assert kwargs == {
+            "idempotency_key": "r1", "project_id": "p1",
+            "task_id": "t1", "reason": "capability gap resolved",
+        }
+
+    def test_task_retry_result_is_returned_verbatim_as_json(self, monkeypatch, trusted_ctx):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+        result = {
+            "ok": True, "task_id": "t1", "status": "ready",
+            "revision": 12, "attempt": 3,
+        }
+        monkeypatch.setattr(owt._kernel, "retry_task", _RecordingKernel(return_value=result))
+
+        out = owt._handle_task_retry({
+            "idempotency_key": "r1", "project_id": "p1",
+            "task_id": "t1", "reason": "capability gap resolved",
+        })
+
+        assert json.loads(out) == result
+
     def test_successful_result_is_returned_verbatim_as_json(self, monkeypatch, trusted_ctx):
         monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
         result = {"ok": True, "task_id": "t1", "status": "done", "revision": 7}
@@ -664,3 +731,52 @@ class TestErrorHandling:
         payload = json.loads(out)
         assert "internal error" in payload["error"]
         assert "/secret/path" not in payload["error"]
+
+    def test_task_retry_owner_workspace_error_carries_code_and_prefixed_message(
+        self, monkeypatch, trusted_ctx,
+    ):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+
+        def _raise(ctx, **kwargs):
+            raise OwnerWorkspaceError("task_not_stopped", "task is running, not stopped")
+
+        monkeypatch.setattr(owt._kernel, "retry_task", _raise)
+
+        payload = json.loads(owt._handle_task_retry({
+            "idempotency_key": "r1", "project_id": "p1",
+            "task_id": "t1", "reason": "give it another go",
+        }))
+        assert payload["code"] == "task_not_stopped"
+        assert payload["error"].startswith("owner_task_retry: task is running")
+
+    def test_task_retry_value_error_message_is_surfaced(self, monkeypatch, trusted_ctx):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+
+        def _raise(ctx, **kwargs):
+            raise ValueError("task_id must not be empty")
+
+        monkeypatch.setattr(owt._kernel, "retry_task", _raise)
+
+        payload = json.loads(owt._handle_task_retry({
+            "idempotency_key": "r1", "project_id": "p1",
+            "task_id": "", "reason": "retry",
+        }))
+        assert "owner_task_retry: " in payload["error"]
+        assert "task_id must not be empty" in payload["error"]
+
+    def test_task_retry_unexpected_exception_does_not_leak_internal_details(
+        self, monkeypatch, trusted_ctx,
+    ):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+
+        def _raise(ctx, **kwargs):
+            raise RuntimeError("sqlite file /secret/internal/tasks.db is locked")
+
+        monkeypatch.setattr(owt._kernel, "retry_task", _raise)
+
+        payload = json.loads(owt._handle_task_retry({
+            "idempotency_key": "r1", "project_id": "p1",
+            "task_id": "t1", "reason": "retry",
+        }))
+        assert "internal error" in payload["error"]
+        assert "/secret/internal" not in payload["error"]

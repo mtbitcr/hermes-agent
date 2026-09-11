@@ -257,6 +257,38 @@ def _digest(payload: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def canonical_owner_retry_payload(
+    *,
+    idempotency_key: Any,
+    project_id: Any,
+    task_id: Any,
+    reason: Any,
+) -> dict:
+    """The ONE canonical form of a retry payload, for BOTH sides of the digest.
+
+    The gateway validates and forwards a retry run's closed payload
+    (``{"idempotency_key", "project_id", "task_id", "reason"}``, semantically
+    trimmed) and hashes exactly that to mint the run's ``payload_digest``; the
+    kernel has to hash the byte-identical dict or the authority binding is
+    unverifiable — which is what made the retry kernel reachable with no
+    authority at all. So the canonical form is stated once, here, and both the
+    authority digest and the shape check read it from this function rather than
+    each rebuilding a form that can drift.
+
+    Deliberately trimming only. The kernel's own bounding/owner-visible
+    derivation of ``reason`` (see :func:`retry_task`) is what the confirmation
+    prompt, the stored event and the receipt bind to — a DIFFERENT question
+    from which exact request the owner's run authorized, and folding it in here
+    would make the authority digest unreproducible by the run that minted it.
+    """
+    return {
+        "idempotency_key": _require_str(idempotency_key, "idempotency_key"),
+        "project_id": str(project_id).strip() if project_id is not None else "",
+        "task_id": str(task_id).strip() if task_id is not None else "",
+        "reason": str(reason).strip() if reason is not None else "",
+    }
+
+
 def _require_owner_run_authority(
     ctx: OwnerContext,
     *,
@@ -1189,6 +1221,13 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
             if parent not in clean_parents:
                 clean_parents.append(parent)
 
+        requires_review = raw.get("requires_review", False)
+        if not isinstance(requires_review, bool):
+            raise OwnerWorkspaceError(
+                "invalid_argument",
+                f"tasks[{index}].requires_review must be a boolean",
+            )
+
         entry = {
             "title": title,
             "body": redact_sensitive_text(body, force=True),
@@ -1197,7 +1236,27 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
             "parents": clean_parents,
             **route_pin,
         }
+        if requires_review:
+            # The committed review requirement: THAT this work is independently
+            # reviewed before it is done. Deliberately not WHO reviews it — the
+            # reviewer is resolved from the team's policy at handover time
+            # (kanban_db.policy_resolved_reviewer), so a name captured here
+            # could never go stale. Carried only when the approved proposal
+            # states it (same rule as ``owned_paths``), so the request digest
+            # of every proposal that does not ask for review is unchanged.
+            entry["requires_review"] = True
         if assignee == "raphael-verifier":
+            # The pre-existing read-only audit review task. It IS the
+            # independent-review lane, so it can never itself be parked for
+            # review: refusing here keeps the new requirement from leaking into
+            # a task type whose semantics must not change.
+            if requires_review:
+                raise OwnerWorkspaceError(
+                    "invalid_argument",
+                    f"tasks[{index}].requires_review is not accepted for "
+                    "raphael-verifier: a read-only review task is the review, "
+                    "not work awaiting one",
+                )
             scope = (
                 _normalize_ownership_scope(
                     raw.get("owned_paths"), f"tasks[{index}]",
@@ -2710,8 +2769,21 @@ def _owner_project_runtime_and_cost(
 
 
 def _owner_project_run_receipt(
-    run: kanban_db.Run, task_pin: Optional[OwnerTaskRoutePin],
+    run: kanban_db.Run,
+    task_pin: Optional[OwnerTaskRoutePin],
+    *,
+    owner_retry_reason: Any = None,
 ) -> dict:
+    """Project one run for the owner.
+
+    ``owner_retry_reason`` is the reason the owner gave for retrying THIS
+    exact run — resolved by the caller from an ``owner_retry`` event bound to
+    this run's own id, never from a run that merely belongs to the same task
+    or happened nearby. The key is present only when such a reason genuinely
+    exists for this run: a run nobody retried carries no ``owner_retry`` block
+    at all, so absent reads as absent and no reader inherits another run's
+    reason.
+    """
     outcome = (run.outcome or run.status or "").strip().lower()
     if run.status == "running":
         owner_outcome, summary = "running", "Work is still in progress."
@@ -2729,7 +2801,7 @@ def _owner_project_run_receipt(
     else:
         owner_outcome, summary = "unknown", "The final outcome could not be confirmed."
     runtime, cost = _owner_project_runtime_and_cost(run, task_pin)
-    return {
+    receipt = {
         "outcome": owner_outcome,
         "summary": summary,
         "external_effect": {
@@ -2740,6 +2812,12 @@ def _owner_project_run_receipt(
         "cost": cost,
         "evidence": {"state": "available", "kind": "project_activity"},
     }
+    retry_reason = _owner_display_text(
+        owner_retry_reason, limit=_OWNER_RETRY_REASON_LIMIT,
+    ) if owner_retry_reason is not None else ""
+    if retry_reason:
+        receipt["owner_retry"] = {"state": "requested", "reason": retry_reason}
+    return receipt
 
 
 def _owner_project_run_projection(
@@ -2748,12 +2826,17 @@ def _owner_project_run_projection(
     *,
     task_pin: Optional[OwnerTaskRoutePin],
     has_newer_run: bool,
+    retry_origin: str = kanban_db.RETRY_ORIGIN_UNATTRIBUTED,
     run_context: bool,
+    owner_retry_reason: Any = None,
 ) -> dict:
     """Project one run for the owner, carrying its retry fact but never its id.
 
     ``task_pin`` is the run's own task's persisted owner-approved route, so a
     recorded run that drifted off it reads as unknown rather than confirmed.
+
+    ``owner_retry_reason`` is the reason the owner gave for retrying THIS run,
+    bound by the run's own id; see :func:`_owner_project_run_receipt`.
 
     ``has_newer_run`` is decided by the caller from the exact native task id
     while it walks the newest-first run list — never from ``task_title``,
@@ -2761,23 +2844,69 @@ def _owner_project_run_projection(
     itself never crosses this boundary, so this boolean is the only way a
     consumer can know a later attempt at the same work exists.
 
-    Both of those keys are withheld unless ``run_context`` is set: they are
-    served only to a reader that named
+    ``retry_origin`` is the honest ATTRIBUTION of that retry fact — one of
+    ``kanban_db.RETRY_ORIGIN_NONE`` / ``_AUTOMATIC`` / ``_OWNER`` /
+    ``_UNATTRIBUTED``, decided by :func:`kanban_db.run_retry_origins` from the
+    kernel's own run outcomes and event history, never guessed here. It must
+    agree with ``has_newer_run`` (``_NONE`` iff ``has_newer_run`` is False),
+    which is why the caller passes both from the same walk.
+
+    All three of those keys are withheld unless ``run_context`` is set: they
+    are served only to a reader that named
     ``OWNER_PROJECT_RUN_CONTEXT_CAPABILITY``, so an older reader keeps the
     exact run shape it validates as a closed schema.
     """
     projection = {
         "started_at": _owner_timestamp(run.started_at),
         "finished_at": _owner_timestamp(run.ended_at),
-        "receipt": _owner_project_run_receipt(run, task_pin),
+        "receipt": _owner_project_run_receipt(
+            run, task_pin, owner_retry_reason=owner_retry_reason,
+        ),
     }
     if not run_context:
         return projection
     return {
         "task_title": owner_title(task_title),
         "has_newer_run": bool(has_newer_run),
+        "retry_origin": retry_origin,
         **projection,
     }
+
+
+def _owner_run_retry_reasons(
+    conn: sqlite3.Connection, run_ids: list,
+) -> dict[int, str]:
+    """Map each of ``run_ids`` that an owner retried to the reason they gave.
+
+    The binding is the ``owner_retry`` event's own ``run_id``, which
+    :func:`kanban_db.unblock_task` copies from the very event that recorded
+    the stop — so a reason can only ever reach the attempt it was written
+    about. Runs with no such event are simply absent from the map. A run
+    retried more than once keeps the latest reason (ascending id, last write
+    wins): that is the reason the owner most recently stated for it.
+
+    The join re-proves in SQL that the named run is the event's own task's
+    run. Nothing on the board can currently record an event against another
+    task's run, and this read must not be the place that starts trusting it.
+    """
+    reasons: dict[int, str] = {}
+    if not run_ids:
+        return reasons
+    slots = ",".join("?" for _ in run_ids)
+    for row in conn.execute(
+        "SELECT e.run_id AS run_id, e.payload AS payload FROM task_events e "
+        "JOIN task_runs r ON r.id = e.run_id AND r.task_id = e.task_id "
+        f"WHERE e.kind = ? AND e.run_id IN ({slots}) ORDER BY e.id ASC",
+        (kanban_db.OWNER_RETRY_EVENT_KIND, *run_ids),
+    ):
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else None
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        if isinstance(reason, str) and reason.strip():
+            reasons[int(row["run_id"])] = reason
+    return reasons
 
 
 def owner_project_planning_context(
@@ -3052,6 +3181,17 @@ def read_project_snapshot(
                     child_map[parent_id].append(child_id)
                     parent_map[child_id].append(parent_id)
 
+        # Batched once for every visible task, never per task: see
+        # ``kanban_db.task_review_states`` for the closed vocabulary and its
+        # first-match-wins resolution order.
+        review_states = kanban_db.task_review_states(conn, tasks)
+        # Same batched-once, read-only shape, and deliberately the SAME kernel
+        # evidence ``owner_task_retry`` gates on (``_stopped_work_kind``,
+        # superseded-provenance rule included) — so a card this snapshot shows
+        # as stopped is exactly a card the retry would accept, and one it shows
+        # as "none" is exactly one the retry would refuse.
+        stopped_work = kanban_db.task_stopped_work_states(conn, tasks)
+
         columns = {status: [] for status in _OWNER_PROJECT_COLUMNS}
         for task in tasks:
             if task.status not in columns:
@@ -3064,6 +3204,12 @@ def read_project_snapshot(
                 "responsibility": task.responsibility,
                 "updated_at": _owner_timestamp(state["latest"] if state else task.created_at),
                 "event_revision": state["revision"] if state else 0,
+                "review_state": review_states.get(
+                    task.id, kanban_db.REVIEW_STATE_NONE
+                ),
+                "stopped_work": stopped_work.get(
+                    task.id, kanban_db.STOPPED_WORK_NONE
+                ),
                 "parent_ids": parent_map[task.id],
                 "child_ids": child_map[task.id],
             })
@@ -3097,16 +3243,34 @@ def read_project_snapshot(
             "ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
             (project_id, _OWNER_PROJECT_MAX_RUNS + 1),
         ).fetchall()
+        # An owner retry names the run its stop was recorded against, so the
+        # reason is looked up by that exact run id — never by task-and-time
+        # proximity, which would hand one attempt's reason to another. A run
+        # nobody retried resolves to nothing and says nothing.
+        retry_reasons = _owner_run_retry_reasons(
+            conn, [row["id"] for row in run_rows[:_OWNER_PROJECT_MAX_RUNS]],
+        )
         # The list is globally newest-first, so the first row carrying a given
         # exact task id is that task's newest run and every later row for the
         # SAME id is an older attempt at the same work. Decided here, from the
         # native id, because a title cannot tell two distinct tasks apart —
         # and because a task absent from the visible columns (archived, or
         # past the task bound) leaves a reader nothing to disambiguate with.
+        bounded_run_objects = [
+            kanban_db.Run.from_row(row) for row in run_rows[:_OWNER_PROJECT_MAX_RUNS]
+        ]
+        # Honest retry attribution is only ever served under the same
+        # capability gate as ``has_newer_run`` itself, so it is only worth
+        # computing (one batched call, never per-run) when a reader asked
+        # for it.
+        retry_origins = (
+            kanban_db.run_retry_origins(conn, bounded_run_objects)
+            if run_context
+            else {}
+        )
         runs: list[dict] = []
         task_ids_with_newer_run: set[str] = set()
-        for row in run_rows[:_OWNER_PROJECT_MAX_RUNS]:
-            run = kanban_db.Run.from_row(row)
+        for row, run in zip(run_rows[:_OWNER_PROJECT_MAX_RUNS], bounded_run_objects):
             run_task_id = str(run.task_id)
             runs.append(
                 _owner_project_run_projection(
@@ -3114,7 +3278,11 @@ def read_project_snapshot(
                     row["task_title"],
                     task_pin=owner_task_route_pin(row),
                     has_newer_run=run_task_id in task_ids_with_newer_run,
+                    retry_origin=retry_origins.get(
+                        run.id, kanban_db.RETRY_ORIGIN_UNATTRIBUTED
+                    ),
                     run_context=run_context,
+                    owner_retry_reason=retry_reasons.get(int(row["id"])),
                 )
             )
             task_ids_with_newer_run.add(run_task_id)
@@ -3659,6 +3827,10 @@ _INTERNAL_TITLE_PREFIX = re.compile(
 )
 _OWNER_TITLE_LIMIT = 240
 _OWNER_PROJECT_NAME_LIMIT = 160
+# Owner-authored prose, bounded on the way in (``retry_task``) and projected
+# through the same egress on the way back out (the run receipt), so a reason
+# that was storable is never cut on the way back to the owner who wrote it.
+_OWNER_RETRY_REASON_LIMIT = 2_000
 # What a projection returns when the input canonicalizes to nothing. Read-side
 # placeholders for absent text, never a value to test against: an owner may
 # legitimately write either of these exact strings, so the native write boundary
@@ -4252,23 +4424,23 @@ def _normalize_project_task_spec(
     body_mode = value.get("body_mode") if allow_body_mode and isinstance(value, dict) else None
     if body_mode == "preserve":
         required = {"title", "body_mode", "assignee", "execution_tier", "owned_paths"}
-        allowed = required | {"responsibility"}
+        allowed = required | {"responsibility", "requires_review"}
     elif body_mode == "rewrite":
         required = {
             "title", "body_mode", "body", "assignee", "execution_tier",
             "owned_paths",
         }
-        allowed = required | {"responsibility"}
+        allowed = required | {"responsibility", "requires_review"}
     else:
         required = {
             "title", "body", "assignee", "execution_tier",
         } | ({"parents"} if parent_limit is not None else set())
-        allowed = required | {"responsibility", "owned_paths"}
+        allowed = required | {"responsibility", "owned_paths", "requires_review"}
     if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(allowed):
         raise OwnerWorkspaceError(
             "invalid_argument",
             f"{field} must contain {sorted(required)} and only optional "
-            "responsibility and owned_paths",
+            f"{sorted(allowed - required)}",
         )
     raw = value
     from agent.redact import redact_sensitive_text
@@ -4291,7 +4463,30 @@ def _normalize_project_task_spec(
         )
     except ValueError as exc:
         raise OwnerWorkspaceError("invalid_argument", str(exc)) from exc
+    requires_review = raw.get("requires_review", False)
+    if not isinstance(requires_review, bool):
+        raise OwnerWorkspaceError(
+            "invalid_argument", f"{field}.requires_review must be a boolean",
+        )
+    if requires_review:
+        # The committed review requirement: THAT this work is independently
+        # reviewed before it is done, never WHO reviews it — the reviewer is
+        # resolved from the team's policy at handover time
+        # (kanban_db.policy_resolved_reviewer). Carried only when the approved
+        # change states it (same rule as ``owned_paths``), so the request
+        # digest of every plan that does not ask for review is unchanged.
+        result["requires_review"] = True
     if result["assignee"] == "raphael-verifier":
+        # The read-only audit review task IS the independent-review lane, so it
+        # can never itself be parked awaiting one. Refused before any other
+        # verifier-specific handling, so a change that is wrong in two ways
+        # still reports this refusal.
+        if requires_review:
+            raise OwnerWorkspaceError(
+                "invalid_argument",
+                f"{field}.requires_review is not accepted for raphael-verifier: "
+                "a read-only review task is the review, not work awaiting one",
+            )
         scope = (
             _normalize_ownership_scope(raw["owned_paths"], field)
             if "owned_paths" in raw
@@ -4354,12 +4549,14 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
                 "action", "reason", "title", "body", "assignee", "execution_tier",
                 "existing_parents", "new_parents",
             }
-            allowed = required | {"responsibility", "owned_paths"}
+            allowed = required | {
+                "responsibility", "owned_paths", "requires_review",
+            }
             if not required.issubset(item) or not set(item).issubset(allowed):
                 raise OwnerWorkspaceError(
                     "invalid_argument",
                     f"{field} must contain {sorted(required)} and only optional "
-                    "responsibility and owned_paths",
+                    f"{sorted(allowed - required)}",
                 )
             raw = item
             existing = raw["existing_parents"]
@@ -4391,6 +4588,11 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
                     **(
                         {"owned_paths": raw["owned_paths"]}
                         if "owned_paths" in raw
+                        else {}
+                    ),
+                    **(
+                        {"requires_review": raw["requires_review"]}
+                        if "requires_review" in raw
                         else {}
                     ),
                 },
@@ -4543,6 +4745,127 @@ def _plan_ownership_scopes(changes: list[dict]) -> list[Optional[list[str]]]:
             if "owned_paths" in spec:
                 scopes.append(spec["owned_paths"])
     return scopes
+
+
+def _plan_created_task_specs(changes: list[dict]) -> list[dict]:
+    """Every task specification one normalized plan creates, in apply order.
+
+    Exactly the order ``kanban_db.apply_owner_project_plan`` creates rows in:
+    per change, ``add`` creates one task from the change itself, ``split``
+    creates one per entry of ``replacements`` in order, and ``replace`` and
+    ``merge`` each create their single ``replacement``. ``move``, ``postpone``
+    and ``cancel`` create nothing. That correspondence is what lets
+    :func:`_commit_plan_review_requirements` pair a created task id with the
+    approved specification it came from instead of guessing.
+    """
+    specs: list[dict] = []
+    for change in changes:
+        action = change["action"]
+        if action == "add":
+            specs.append(change)
+        elif action == "split":
+            specs.extend(change["replacements"])
+        elif action in {"replace", "merge"}:
+            specs.append(change["replacement"])
+    return specs
+
+
+def _commit_plan_review_requirements(
+    kconn: sqlite3.Connection,
+    changes: list[dict],
+    created_task_ids: Any,
+    *,
+    project_id: str,
+) -> None:
+    """Write this plan's committed review requirement onto the rows it created.
+
+    ``kanban_db.create_task`` accepts ``requires_review``, but the kernel's own
+    plan-application helper (``create_planned_task``) does not forward it, and
+    that helper is outside this change's ownership scope. So the owner kernel
+    commits the requirement itself, here, from the same normalized changes the
+    owner approved and the request digest binds.
+
+    Ordering: this runs while every created row is still parked in
+    :data:`kanban_db.PARKED_STATUS` — un-promotable and un-claimable — inside
+    the plan's board guard, BEFORE the terminal receipt is finalized and before
+    :func:`_activate_committed_owner_work` releases anything. A failure here
+    therefore fails the whole commit with the new work still parked, rather
+    than activating a task without the requirement its specification carries.
+
+    Every row is verified against its approved specification before it is
+    written: an id that is not a receipt-bound ``work`` row of this Project
+    carrying that specification's exact title and assignee is a mis-alignment,
+    not a task to write to, and is reported as ``crash_recovery_failed``. So is
+    a row that must carry the requirement but is neither parked nor already
+    carrying it — the requirement is never silently dropped. A row that already
+    carries it is left alone, so a recovered result replays as a no-op.
+    """
+    specs = _plan_created_task_specs(changes)
+    task_ids = [
+        task_id
+        for task_id in (created_task_ids if isinstance(created_task_ids, list) else [])
+        if isinstance(task_id, str)
+    ]
+    if len(task_ids) != len(specs):
+        raise OwnerWorkspaceError(
+            "crash_recovery_failed",
+            f"the applied plan reports {len(task_ids)} created task(s) where the "
+            f"approved changes create {len(specs)}; the committed review "
+            "requirement cannot be aligned",
+        )
+
+    pending: list[str] = []
+    for spec, task_id in zip(specs, task_ids):
+        row = kconn.execute(
+            "SELECT title, assignee, status, task_kind, project_id, "
+            "owner_receipt_bound, requires_review FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["task_kind"] != "work"
+            or row["project_id"] != project_id
+            or not row["owner_receipt_bound"]
+            or row["title"] != spec["title"]
+            or row["assignee"] != spec["assignee"]
+        ):
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                f"created task {task_id!r} is not the receipt-owned work this "
+                "approved change specifies",
+            )
+        if not spec.get("requires_review"):
+            continue
+        if row["requires_review"]:
+            # Already committed by this same receipt: an exact replay.
+            continue
+        if row["status"] != kanban_db.PARKED_STATUS:
+            raise OwnerWorkspaceError(
+                "crash_recovery_failed",
+                f"created task {task_id!r} left the parked column before its "
+                "committed review requirement was written",
+            )
+        pending.append(task_id)
+
+    if not pending:
+        return
+    with kanban_db.write_txn(kconn):
+        for task_id in pending:
+            # One guarded UPDATE per task, touching no other column: the row
+            # must still be exactly the parked, receipt-owned work of this
+            # Project that was just verified.
+            cursor = kconn.execute(
+                "UPDATE tasks SET requires_review = 1 "
+                "WHERE id = ? AND task_kind = 'work' AND project_id = ? "
+                "AND owner_receipt_bound = 1 AND status = ?",
+                (task_id, project_id, kanban_db.PARKED_STATUS),
+            )
+            if cursor.rowcount != 1:
+                raise OwnerWorkspaceError(
+                    "crash_recovery_failed",
+                    f"the committed review requirement could not be written to "
+                    f"created task {task_id!r}",
+                )
 
 
 def _inherit_replaced_ownership_scopes(
@@ -5128,30 +5451,59 @@ def commit_project_plan(
                 board_slug=board_slug,
             )
             anchor_task_id = anchor.task_id
-            recovered = (
-                _committed_project_plan_result(
-                    kconn,
-                    anchor_task_id=anchor_task_id,
-                    digest=digest,
-                    idempotency_key=idempotency_key,
-                    ctx=ctx,
+            # Recovery of a committed-but-unreceipted plan is a board mutation
+            # like the fresh apply below (the requirement write on the parked
+            # rows), so it runs under the same cross-process board guard and
+            # the same receipt-lease fence: a claimant whose lease expired and
+            # was adopted by another caller must not write task state before
+            # the token-predicated finalization rejects it.
+            with _global_board_guard(board_slug):
+                recovered = (
+                    _committed_project_plan_result(
+                        kconn,
+                        anchor_task_id=anchor_task_id,
+                        digest=digest,
+                        idempotency_key=idempotency_key,
+                        ctx=ctx,
+                    )
+                    if anchor_task_id is not None
+                    else None
                 )
-                if anchor_task_id is not None
-                else None
-            )
+                if recovered is not None:
+                    result = {
+                        "ok": True,
+                        "project_id": project_id,
+                        "project_slug": project.slug,
+                        "board": board_slug,
+                        "anchor_task_id": anchor_task_id,
+                        "risk_level": risk_level,
+                        **recovered,
+                    }
+                    with write_txn(pconn):
+                        _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                        if not _receipt_owns_project(pconn, ctx, project_id):
+                            raise OwnerWorkspaceError(
+                                "project_not_owned",
+                                "the Project ownership receipt changed before commit",
+                            )
+                        # The same requirement write the fresh path performs,
+                        # on the same still-parked rows: a crash between the
+                        # board write and this receipt must not leave a task
+                        # the owner approved for review running without it.
+                        # Idempotent, so a row that already carries it is
+                        # untouched.
+                        _commit_plan_review_requirements(
+                            kconn,
+                            normalized_changes,
+                            recovered.get("created_task_ids"),
+                            project_id=project_id,
+                        )
+                    _finalize_receipt(
+                        pconn, ctx, idempotency_key, token, status="committed", result=result,
+                    )
             if recovered is not None:
-                result = {
-                    "ok": True,
-                    "project_id": project_id,
-                    "project_slug": project.slug,
-                    "board": board_slug,
-                    "anchor_task_id": anchor_task_id,
-                    "risk_level": risk_level,
-                    **recovered,
-                }
-                _finalize_receipt(
-                    pconn, ctx, idempotency_key, token, status="committed", result=result,
-                )
+                # Outside the guard and only after the terminal receipt, as
+                # for a fresh apply.
                 _activate_committed_owner_work(result)
                 return result
 
@@ -5217,6 +5569,18 @@ def commit_project_plan(
                             later_milestones=normalized_later,
                             board=board_slug,
                         )
+
+                if applied["applied"]:
+                    # Still inside the board guard and before the terminal
+                    # receipt: the created work is parked, so committing the
+                    # approved review requirement here either succeeds or
+                    # fails the whole plan with nothing runnable behind it.
+                    _commit_plan_review_requirements(
+                        kconn,
+                        normalized_changes,
+                        applied.get("created_task_ids"),
+                        project_id=project_id,
+                    )
 
                 if not applied["applied"]:
                     result = {
@@ -5761,6 +6125,263 @@ def comment_task(
                     result = {
                         "ok": True, "task_id": task_id, "comment_id": comment_id,
                         "status": task.status, "revision": revision,
+                    }
+                _finalize_receipt(
+                    pconn, ctx, idempotency_key, token,
+                    status="committed", result=result,
+                )
+                return result
+        finally:
+            kconn.close()
+    finally:
+        pconn.close()
+
+
+# ---------------------------------------------------------------------------
+# owner_task_retry
+# ---------------------------------------------------------------------------
+
+
+def _retry_refusal_reason(task: kanban_db.Task) -> str:
+    """Say, in the owner's own vocabulary, why this work cannot be retried."""
+    retryable = (
+        "Only work that gave up after repeated failures, or that stopped "
+        "because a required capability is not available, can be tried again."
+    )
+    if task.status == "blocked":
+        return (
+            f"This work is blocked: "
+            f"{_OWNER_BLOCK_REASONS.get(task.block_kind or '', 'Blocked')}. "
+            + retryable
+        )
+    state = _OWNER_STATE_LABELS.get(task.status, task.status)
+    return f"This work is {state} and has not stopped. " + retryable
+
+
+def retry_task(
+    ctx: OwnerContext,
+    *,
+    idempotency_key: str,
+    project_id: str,
+    task_id: str,
+    reason: str,
+) -> dict:
+    """Try stopped work again, on the owner's stated reason.
+
+    **Native owner-run authority only, checked first.** The retry is a hidden
+    run authority, not a model capability: the reason it records is the
+    OWNER's, so the call has to be bound to the authenticated owner run that
+    carries this exact operation, idempotency key and canonical payload
+    (:func:`canonical_owner_retry_payload`, the one canonical form the gateway
+    also digests). That check runs before the receipt read, the replay, every
+    state read and every state mutation, so an unbound call writes nothing at
+    all — no receipt row, no event, no task or run change.
+
+    The only two states this accepts are the two ways the kernel stops work
+    without a human deciding to stop it: the dispatcher's circuit breaker
+    gave up on the task, or a worker hit a capability wall it cannot pass.
+    Both end in ``blocked``, so eligibility is never "is it blocked?" — it is
+    ``kanban_db.stopped_work_retry_evidence``, which reads the kernel's own
+    record of HOW the task got there. Every other state, including a task
+    blocked for owner input, a dependency or a transient problem, is refused
+    as a normal returned result that says which state it is in and why that
+    one cannot be retried.
+
+    ``reason`` is required and is the owner's own account of why this work
+    deserves another attempt. It is recorded twice, both times durably: as an
+    ``owner_retry`` event on the task, in the SAME kanban transaction as the
+    transition (see ``kanban_db.unblock_task``), and — because that event is
+    bound to the run the stop was recorded against — on that exact run's
+    owner-facing receipt.
+
+    The transition itself is ``unblock_task``'s, not a parallel one: parent
+    re-gating, the defensive stale-run close, the executable-transition
+    authority check and the deliberately preserved ``block_recurrences``
+    counter all apply exactly as they do to an ordinary unblock.
+
+    Crash-safe replay: the ``owner_retry`` event carries this receipt's full
+    identity (actor, profile, idempotency_key), so a retry that committed on
+    the board but crashed before its receipt was finalized is RECOGNIZED by a
+    replay adopting the dead claim — it finalizes that same success instead of
+    refusing work it already retried, or retrying it twice.
+
+    Durability boundary: the retried work becomes claimable when the kanban
+    transaction commits, which is before this receipt is durable. That is
+    deliberate and safe here — the transition enables only the task the owner
+    named, and a crash before finalization is repaired by the recognition
+    above rather than by re-running anything.
+
+    Lease-fenced: the lease check, the eligibility read and the transition all
+    run inside one held ``projects.db`` write lock (see
+    :func:`_assert_owns_lease`) so a takeover cannot land between validating
+    the lease and committing the retry.
+    """
+    operation = "owner_task_retry"
+    # The authority check is the FIRST thing that happens after the arguments
+    # are put in their one canonical form, and it is deliberately ahead of the
+    # receipt read, the replay, every state read and every state mutation: a
+    # retry that is not bound to the authenticated owner run must leave the
+    # board, the runs and the receipt table exactly as it found them. Reaching
+    # the receipt claim first would persist an in_progress row — and then a
+    # model-chosen reason — as the owner's own retry.
+    _require_owner_run_authority(
+        ctx,
+        operation=operation,
+        idempotency_key=_require_str(idempotency_key, "idempotency_key"),
+        payload=canonical_owner_retry_payload(
+            idempotency_key=idempotency_key,
+            project_id=project_id,
+            task_id=task_id,
+            reason=reason,
+        ),
+    )
+
+    idempotency_key = _require_str(idempotency_key, "idempotency_key")
+    project_id = _bounded_text(project_id, "project_id", limit=100)
+    task_id = _require_str(task_id, "task_id")
+    # Required, and rejected up front: blank, whitespace-only, or text that
+    # carries no owner-visible characters at all never reaches the
+    # confirmation prompt, let alone the board. Canonicalized here — BEFORE
+    # the request digest, the approval description, the stored event and the
+    # returned result all bind to this exact string — so the reason recorded
+    # on the work IS the reason the run receipt projects back.
+    reason = _owner_display_text(
+        _bounded_text(reason, "reason", limit=_OWNER_RETRY_REASON_LIMIT),
+        limit=_OWNER_RETRY_REASON_LIMIT,
+    )
+    if not reason:
+        raise OwnerWorkspaceError(
+            "invalid_argument", "reason has no owner-visible text",
+        )
+
+    payload = {"project_id": project_id, "task_id": task_id, "reason": reason}
+    digest = _digest(payload)
+
+    pconn = projects_db.connect()
+    try:
+        _ensure_schema(pconn)
+        replay = _terminal_replay(
+            pconn, ctx, idempotency_key, operation, digest,
+        )
+        if replay is not None:
+            return replay
+        pending = _get_receipt(pconn, ctx, idempotency_key)
+        recovery_pending = bool(
+            pending is not None
+            and pending["status"] == "in_progress"
+            and pending["operation"] == operation
+            and pending["request_digest"] == digest
+        )
+        _project, board_slug, task = _resolve_receipt_owned_task(
+            pconn, ctx, project_id, task_id,
+            allow_archived=recovery_pending,
+        )
+        state, row, token = _acquire_or_replay(pconn, ctx, idempotency_key, operation, digest)
+        if state == "terminal":
+            return json.loads(row["result_json"])
+
+        approval = _confirm(
+            ctx, operation=operation, digest=digest,
+            description=f"Try {owner_title(task.title)!r} again",
+        )
+        if not approval.get("approved"):
+            result = {"ok": False, "error": "confirmation_denied", "reason": approval.get("reason")}
+            _finalize_receipt(pconn, ctx, idempotency_key, token, status="denied", result=result)
+            return result
+
+        kconn = kanban_db.connect(board=board_slug)
+        try:
+            with _global_board_guard(board_slug):
+                with write_txn(pconn):
+                    _assert_owns_lease(pconn, ctx, idempotency_key, token)
+                    if not _receipt_owns_project(pconn, ctx, project_id):
+                        raise OwnerWorkspaceError(
+                            "project_not_owned",
+                            "the Project ownership receipt changed before commit",
+                        )
+                    current_project = projects_db.get_project(pconn, project_id)
+                    current_task = kanban_db.get_task(
+                        kconn, task_id, include_control=True
+                    )
+                    # Adopting a dead claim: this receipt's own committed retry
+                    # event is proof the transition already happened.
+                    retried = (
+                        kanban_db.committed_owner_retry_event(
+                            kconn, task_id,
+                            actor=ctx.actor, profile=ctx.profile,
+                            idempotency_key=idempotency_key,
+                        )
+                        if row is not None and current_task is not None
+                        else None
+                    )
+                    refusal = None
+                    if (
+                        current_project is None
+                        or current_project.archived
+                        or current_project.board_slug != board_slug
+                    ):
+                        # The approval may have taken minutes. A Project
+                        # archived since then gets no new transition — only
+                        # recognition of one this receipt already made.
+                        if retried is None:
+                            refusal = (
+                                "This Project is no longer active, so nothing "
+                                "was retried."
+                            )
+                    else:
+                        _assert_board_ownership(board_slug, project_id)
+                        if current_task is None or current_task.project_id != project_id:
+                            raise OwnerWorkspaceError(
+                                "task_not_found",
+                                "the task is no longer part of this receipt-owned Project",
+                            )
+                        if retried is None:
+                            evidence = kanban_db.stopped_work_retry_evidence(
+                                kconn, task_id,
+                            )
+                            if evidence is None:
+                                refusal = _retry_refusal_reason(current_task)
+                            elif kanban_db.unblock_task(
+                                kconn, task_id,
+                                owner_retry={
+                                    "reason": reason,
+                                    "actor": ctx.actor,
+                                    "profile": ctx.profile,
+                                    "idempotency_key": idempotency_key,
+                                },
+                            ):
+                                retried = kanban_db.committed_owner_retry_event(
+                                    kconn, task_id,
+                                    actor=ctx.actor, profile=ctx.profile,
+                                    idempotency_key=idempotency_key,
+                                )
+                            else:
+                                refusal = (
+                                    "This work changed while you were "
+                                    "confirming, so nothing was retried."
+                                )
+
+                if retried is None:
+                    result = {
+                        "ok": False,
+                        "error": "not_retryable",
+                        "task_id": task_id,
+                        "current_status": (
+                            current_task.status if current_task else None
+                        ),
+                        "reason": refusal,
+                    }
+                else:
+                    # Both fields come from the committed event, so a replay
+                    # reports the column this retry landed the work in and the
+                    # revision it created — not wherever the work has moved
+                    # since.
+                    result = {
+                        "ok": True,
+                        "task_id": task_id,
+                        "status": (retried.payload or {}).get("status"),
+                        "revision": retried.id,
+                        "retry_reason": reason,
                     }
                 _finalize_receipt(
                     pconn, ctx, idempotency_key, token,

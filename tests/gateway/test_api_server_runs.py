@@ -10,6 +10,7 @@ Covers:
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -127,6 +128,167 @@ def _new_owner_payload(idempotency_key: str, proposal: dict):
         "tasks": proposal["tasks"],
         "later_milestones": proposal["later_milestones"],
     }
+
+
+# ---------------------------------------------------------------------------
+# owner_task_retry — the hidden run authority that tries stopped work again
+# ---------------------------------------------------------------------------
+
+_RETRY_REASON = "I have added the provider credentials to the account."
+
+
+def _committed_owner_project(session: str, key: str, proposal: dict) -> dict:
+    """Create one real receipt-backed Project through the owner kernel."""
+    from hermes_cli import owner_workspace as ow
+
+    setup_payload = _new_owner_payload(key, proposal)
+    setup_context = ow.OwnerContext(
+        actor="default",
+        profile="default",
+        session=session,
+        authority=ow.OwnerProposalAuthority(
+            actor="default",
+            profile="default",
+            session=session,
+            conversation="raphael-owner-" + "7" * 32,
+            response_id="resp_" + "6" * 32,
+            operation="owner_task_graph_commit",
+            idempotency_key=key,
+            payload_digest=ow._digest(setup_payload),
+        ),
+    )
+    with (
+        patch(
+            "hermes_cli.profiles.list_profiles",
+            return_value=[SimpleNamespace(name="default")],
+        ),
+        patch(
+            "hermes_cli.owner_workspace._confirm",
+            return_value={"approved": True, "reason": None},
+        ),
+    ):
+        return ow.commit_task_graph(setup_context, **setup_payload)
+
+
+def _capability_stopped_task(board: str, project_id: str, title: str) -> str:
+    """Drive real kernel transitions until a worker hits a hard wall.
+
+    The same technique tests/hermes_cli/test_owner_workspace.py uses to make a
+    task genuinely retryable: claim it, then block it on a capability wall, so
+    the eligibility ``kanban_db.stopped_work_retry_evidence`` reads is the
+    kernel's own record of HOW the work stopped rather than a state this test
+    asserted into place.
+    """
+    from hermes_cli import kanban_db
+
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        task_id = kanban_db.create_task(
+            conn, title=title, assignee="default", project_id=project_id,
+        )
+        assert kanban_db.claim_task(conn, task_id) is not None
+        assert kanban_db.block_task(
+            conn, task_id,
+            reason="the provider account has no API credentials",
+            kind="capability",
+            expected_run_id=kanban_db.get_task(conn, task_id).current_run_id,
+        )
+        task = kanban_db.get_task(conn, task_id)
+        assert (task.status, task.block_kind) == ("blocked", "capability")
+    return task_id
+
+
+def _task_status(board: str, task_id: str) -> str:
+    from hermes_cli import kanban_db
+
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        return kanban_db.get_task(conn, task_id).status
+
+
+def _owner_retry_events(board: str, task_id: str) -> list:
+    """Every durable ``owner_retry`` event on one task, oldest first."""
+    from hermes_cli import kanban_db
+
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        return [
+            json.loads(row["payload"]) if row["payload"] else None
+            for row in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'owner_retry' ORDER BY id ASC",
+                (task_id,),
+            )
+        ]
+
+
+def _owner_retry_run_setup(idempotency_key: str, *, reason: str = _RETRY_REASON):
+    """A real Project, genuinely stopped work, and the run body that retries it."""
+    proposal = _new_owner_proposal()
+    created = _committed_owner_project(
+        f"setup-{idempotency_key}", f"setup-{idempotency_key}", proposal,
+    )
+    task_id = _capability_stopped_task(
+        created["board"],
+        created["project_id"],
+        "B03 — Connect the payment provider",
+    )
+    payload = {
+        "idempotency_key": idempotency_key,
+        "project_id": created["project_id"],
+        "task_id": task_id,
+        "reason": reason,
+    }
+    body = {
+        "input": "Try the stopped work again now.",
+        "owner_workspace_context": {
+            "mode": "existing",
+            "project_slug": created["project_slug"],
+            "project_name": proposal["project_name"],
+        },
+        "owner_retry_authority": {
+            "operation": "owner_task_retry",
+            "idempotency_key": idempotency_key,
+            "payload": payload,
+        },
+    }
+    return created, task_id, payload, body
+
+
+def _native_retry_handler():
+    """The native ``owner_task_retry`` handler the run layer resolves by name.
+
+    ``tools/owner_workspace_tools.py`` is outside this change's scope and does
+    not carry ``_handle_task_retry`` yet, so these tests install the same thin
+    kernel delegation its sibling owner handlers already are, and the run layer
+    resolves it exactly as it will resolve the shipped one. Everything beneath
+    it is production code: the confirmation, the board transition and the
+    receipt are all ``hermes_cli.owner_workspace.retry_task``'s.
+    """
+    from hermes_cli import owner_workspace as ow
+    from tools.registry import tool_error
+
+    def _handle_task_retry(args, **kw):
+        try:
+            return json.dumps(
+                ow.retry_task(
+                    ow.resolve_owner_context(),
+                    idempotency_key=args.get("idempotency_key"),
+                    project_id=args.get("project_id"),
+                    task_id=args.get("task_id"),
+                    reason=args.get("reason"),
+                ),
+                ensure_ascii=False,
+            )
+        except ow.OwnerWorkspaceError as exc:
+            return tool_error(f"owner_task_retry: {exc.message}", code=exc.code)
+
+    return MagicMock(side_effect=_handle_task_retry)
+
+
+def _retry_payload_digest(payload: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 @pytest.fixture(autouse=True)
@@ -712,6 +874,720 @@ class TestStartRun:
             restarted_store.close()
 
     @pytest.mark.asyncio
+    async def test_owner_retry_run_is_exact_native_and_transport_retry_safe(
+        self, adapter,
+    ):
+        """One retry authority, one native call, and no model in the middle.
+
+        The accepted shape end to end against the real kernel: a committed
+        Project, work the kernel itself recorded as stopped, and a run that
+        applies the authority's exact payload once. The transport retry half
+        is asserted against durable state — the board's own ``owner_retry``
+        events — not merely against the second response body.
+        """
+        from tools import owner_workspace_tools
+
+        idempotency_key = "owner-task-retry-exact-run"
+        created, task_id, retry_payload, body = _owner_retry_run_setup(
+            idempotency_key,
+        )
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        handler = _native_retry_handler()
+
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch.object(adapter, "_create_agent") as mock_create,
+            patch.object(
+                owner_workspace_tools, "_handle_task_retry", handler, create=True,
+            ),
+            patch(
+                "hermes_cli.owner_workspace._confirm",
+                return_value={"approved": True, "reason": None},
+            ),
+        ):
+            mock_create.side_effect = RuntimeError("provider unavailable")
+            async with TestClient(TestServer(app)) as cli:
+                first = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                first_run_id = (await first.json())["run_id"]
+                for _ in range(200):
+                    polled = await cli.get(f"/v1/runs/{first_run_id}")
+                    status = await polled.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+                replay = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                replay_data = await replay.json()
+
+        assert first.status == 202
+        assert status["status"] == "completed", status
+        assert status["owner_mutation_committed"] is True
+        # The tool's own result, read back to the caller.
+        output = json.loads(status["output"])
+        assert set(output) == {
+            "ok", "task_id", "status", "revision", "retry_reason",
+        }
+        assert output["ok"] is True
+        assert output["task_id"] == task_id
+        assert output["status"] == "ready"
+        assert output["retry_reason"] == _RETRY_REASON
+        assert isinstance(output["revision"], int)
+        assert not isinstance(output["revision"], bool)
+
+        # Exactly one native call, carrying exactly the authority's payload.
+        assert handler.call_count == 1
+        assert handler.call_args.args[0] == retry_payload
+        # No agent was ever created, so no model produced that payload.
+        mock_create.assert_not_called()
+
+        # The work really moved, once, on the owner's stated reason.
+        assert _task_status(created["board"], task_id) == "ready"
+        assert [
+            event["reason"]
+            for event in _owner_retry_events(created["board"], task_id)
+        ] == [_RETRY_REASON]
+
+        assert replay.status == 202, replay_data
+        assert replay_data["run_id"] == first_run_id
+        assert handler.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_owner_retry_runs_natively_and_is_offered_to_no_model(
+        self, adapter,
+    ):
+        """The run layer dispatches a retry NO agent could ever have called.
+
+        Everything about the retry here is production's: the handler is the
+        shipped one (nothing is patched onto ``owner_workspace_tools``), and
+        the confirmation is the real hidden owner approval — raised by the
+        kernel, surfaced on the run as an ``owner_task_retry`` decision, and
+        answered through the run's own ``/approval`` endpoint. No private
+        adapter or approval-queue state is seeded. The effect is then read off
+        the board, not off a return value.
+
+        And the operation the run dispatches is offered to no model anywhere:
+        the retry states the OWNER's reason for trying stopped work again, so
+        it exists as a native run authority and NOT as a callable schema. Both
+        halves belong in one test — a capability that is reachable natively is
+        only safe while it is unreachable as a tool.
+        """
+        from tools import owner_workspace_tools  # noqa: F401 — registers the tools
+        from tools.registry import registry as tool_registry
+
+        from toolsets import get_toolset_names, resolve_toolset
+
+        retry_tool = "owner_task_retry"
+        assert tool_registry.get_entry(retry_tool) is None
+        for toolset_name in get_toolset_names():
+            assert retry_tool not in resolve_toolset(
+                toolset_name, include_registry=True,
+            ), toolset_name
+        # Every tool the registry DOES carry for ``owner_workspace`` must also
+        # be OFFERED by that toolset's own static definition — that definition
+        # is what ``_get_platform_tools`` resolves an api_server profile
+        # against, so a tool missing from it never reaches an owner-workspace
+        # agent no matter what registered it.
+        registered = set(
+            tool_registry.get_tool_names_for_toolset("owner_workspace")
+        )
+        offered = set(resolve_toolset("owner_workspace", include_registry=False))
+        assert registered <= offered, sorted(registered - offered)
+
+        idempotency_key = "owner-task-retry-toolset-approved"
+        created, task_id, retry_payload, body = _owner_retry_run_setup(
+            idempotency_key,
+        )
+        # The run authority names exactly the toolset's own tool.
+        assert body["owner_retry_authority"]["operation"] == retry_tool
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch.object(adapter, "_create_agent") as mock_create,
+        ):
+            mock_create.side_effect = RuntimeError("provider unavailable")
+            async with TestClient(TestServer(app)) as cli:
+                started = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                run_id = (await started.json())["run_id"]
+
+                # The kernel's own confirmation reaches the owner as a run
+                # decision naming this exact operation.
+                pending = None
+                for _ in range(400):
+                    polled = await cli.get(f"/v1/runs/{run_id}")
+                    status = await polled.json()
+                    if status["status"] == "waiting_for_approval":
+                        pending = status["pending_approval"]
+                        break
+                    await asyncio.sleep(0.05)
+                assert pending is not None, status
+                assert pending["operation"] == retry_tool
+
+                answered = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "once",
+                        "approval_id": pending["approval_id"],
+                    },
+                )
+                assert answered.status == 200, await answered.json()
+
+                for _ in range(400):
+                    polled = await cli.get(f"/v1/runs/{run_id}")
+                    status = await polled.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert started.status == 202
+        assert status["status"] == "completed", status
+        assert status["owner_mutation_committed"] is True
+        output = json.loads(status["output"])
+        assert output["ok"] is True, output
+        assert output["task_id"] == task_id
+        assert output["retry_reason"] == retry_payload["reason"]
+        # No model was ever asked to produce that call.
+        mock_create.assert_not_called()
+
+        # The work really left the state the worker stopped it in, and the
+        # owner's reason is durable on the board.
+        assert _task_status(created["board"], task_id) == "ready"
+        assert [
+            event["reason"]
+            for event in _owner_retry_events(created["board"], task_id)
+        ] == [_RETRY_REASON]
+
+    @pytest.mark.asyncio
+    async def test_owner_retry_transport_retry_recovers_a_committed_run(
+        self, adapter,
+    ):
+        """A crash between the board commit and the run terminal is recovered.
+
+        The committed retry has already moved the work out of the state the
+        authority was bound to, so the exact transport retry may neither
+        re-validate as fresh authority nor retry the work again: it resolves
+        the SAME run from the native receipt.
+        """
+        from tools import owner_workspace_tools
+
+        idempotency_key = "owner-task-retry-recovered-run"
+        created, task_id, _payload, body = _owner_retry_run_setup(idempotency_key)
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        handler = _native_retry_handler()
+
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch.object(adapter, "_create_agent") as mock_create,
+            patch.object(
+                owner_workspace_tools, "_handle_task_retry", handler, create=True,
+            ),
+            patch(
+                "hermes_cli.owner_workspace._confirm",
+                return_value={"approved": True, "reason": None},
+            ),
+        ):
+            mock_create.side_effect = RuntimeError("provider unavailable")
+            async with TestClient(TestServer(app)) as cli:
+                first = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                first_run_id = (await first.json())["run_id"]
+                for _ in range(200):
+                    polled = await cli.get(f"/v1/runs/{first_run_id}")
+                    status = await polled.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert first.status == 202
+        assert status["status"] == "completed", status
+        assert handler.call_count == 1
+
+        db_path = adapter._response_store._db_path
+        assert db_path is not None
+        # The gateway died after the board committed and before its own run
+        # terminal was stored.
+        adapter._response_store._conn.execute(
+            "UPDATE run_idempotency SET terminal_json = NULL "
+            "WHERE idempotency_key = ?",
+            (idempotency_key,),
+        )
+        adapter._response_store._conn.commit()
+        adapter._response_store.close()
+        restarted_store = ResponseStore(db_path=db_path, default_profile="default")
+        try:
+            adapter._response_store = restarted_store
+            adapter._run_statuses[first_run_id] = {
+                "run_id": first_run_id,
+                "status": "failed",
+                "updated_at": time.time(),
+                "error": "stale transport state",
+            }
+            restarted_app = _create_runs_app(adapter)
+            with (
+                patch("gateway.run._load_gateway_config", return_value=config),
+                patch.object(adapter, "_create_agent") as restarted_create,
+                patch.object(
+                    owner_workspace_tools,
+                    "_handle_task_retry",
+                    handler,
+                    create=True,
+                ),
+            ):
+                async with TestClient(TestServer(restarted_app)) as cli:
+                    replay = await cli.post(
+                        "/v1/runs",
+                        json=body,
+                        headers={"Idempotency-Key": idempotency_key},
+                    )
+                    replay_data = await replay.json()
+                    restored = await cli.get(f"/v1/runs/{first_run_id}")
+                    restored_status = await restored.json()
+            assert replay.status == 202, replay_data
+            assert replay_data["run_id"] == first_run_id
+            assert restored.status == 200
+            assert restored_status["status"] == "completed"
+            assert restored_status["owner_mutation_committed"] is True
+            assert restored_status["output"] == status["output"]
+            assert restored_status["created_at"] == status["created_at"]
+            restarted_create.assert_not_called()
+            # Durable proof the work was not retried a second time.
+            assert handler.call_count == 1
+            assert [
+                event["reason"]
+                for event in _owner_retry_events(created["board"], task_id)
+            ] == [_RETRY_REASON]
+        finally:
+            restarted_store.close()
+
+    @pytest.mark.asyncio
+    async def test_owner_retry_recovery_finds_a_padded_reason_receipt(
+        self, adapter,
+    ):
+        """One canonical payload binds the receipt AND finds it again.
+
+        A reason the owner typed with surrounding whitespace is accepted, so
+        the same crash between the board commit and the run terminal has to
+        resolve the SAME run from the native receipt. It only can when the
+        payload the run bound its digest to and the payload recovery hashes
+        are the same one: binding the raw text while recovery rebuilt the
+        trimmed text left the committed retry findable under neither digest.
+        """
+        from tools import owner_workspace_tools
+
+        idempotency_key = "owner-task-retry-padded-reason"
+        created, task_id, _payload, body = _owner_retry_run_setup(
+            idempotency_key, reason=f"  {_RETRY_REASON}\n",
+        )
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        handler = _native_retry_handler()
+
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch.object(adapter, "_create_agent") as mock_create,
+            patch.object(
+                owner_workspace_tools, "_handle_task_retry", handler, create=True,
+            ),
+            patch(
+                "hermes_cli.owner_workspace._confirm",
+                return_value={"approved": True, "reason": None},
+            ),
+        ):
+            mock_create.side_effect = RuntimeError("provider unavailable")
+            async with TestClient(TestServer(app)) as cli:
+                first = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                first_run_id = (await first.json())["run_id"]
+                for _ in range(200):
+                    polled = await cli.get(f"/v1/runs/{first_run_id}")
+                    status = await polled.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert first.status == 202
+        assert status["status"] == "completed", status
+        assert handler.call_count == 1
+
+        db_path = adapter._response_store._db_path
+        assert db_path is not None
+        # The gateway died after the board committed and before its own run
+        # terminal was stored.
+        adapter._response_store._conn.execute(
+            "UPDATE run_idempotency SET terminal_json = NULL "
+            "WHERE idempotency_key = ?",
+            (idempotency_key,),
+        )
+        adapter._response_store._conn.commit()
+        adapter._response_store.close()
+        restarted_store = ResponseStore(db_path=db_path, default_profile="default")
+        try:
+            adapter._response_store = restarted_store
+            adapter._run_statuses[first_run_id] = {
+                "run_id": first_run_id,
+                "status": "failed",
+                "updated_at": time.time(),
+                "error": "stale transport state",
+            }
+            restarted_app = _create_runs_app(adapter)
+            with (
+                patch("gateway.run._load_gateway_config", return_value=config),
+                patch.object(adapter, "_create_agent") as restarted_create,
+                patch.object(
+                    owner_workspace_tools,
+                    "_handle_task_retry",
+                    handler,
+                    create=True,
+                ),
+            ):
+                async with TestClient(TestServer(restarted_app)) as cli:
+                    replay = await cli.post(
+                        "/v1/runs",
+                        json=body,
+                        headers={"Idempotency-Key": idempotency_key},
+                    )
+                    replay_data = await replay.json()
+                    restored = await cli.get(f"/v1/runs/{first_run_id}")
+                    restored_status = await restored.json()
+            assert replay.status == 202, replay_data
+            assert replay_data["run_id"] == first_run_id
+            assert restored.status == 200
+            assert restored_status["status"] == "completed"
+            assert restored_status["owner_mutation_committed"] is True
+            assert restored_status["output"] == status["output"]
+            restarted_create.assert_not_called()
+            # Durable proof the work was not retried a second time.
+            assert handler.call_count == 1
+            assert [
+                event["reason"]
+                for event in _owner_retry_events(created["board"], task_id)
+            ] == [_RETRY_REASON]
+        finally:
+            restarted_store.close()
+
+    @pytest.mark.asyncio
+    async def test_owner_retry_re_delivery_replays_a_refused_run(self, adapter):
+        """A durably refused retry re-delivers as itself, not as an unknown.
+
+        The kernel records its own deterministic refusal as a COMMITTED
+        receipt whose result is not ok, which the successful-receipt reader
+        cannot read at all. A run that already reached the durable terminal
+        state we recorded needs no receipt to decide it: answering "outcome
+        unconfirmed" for the exact re-delivery left the owner with a refusal
+        the transport would no longer report.
+        """
+        from hermes_cli import kanban_db
+        from tools import owner_workspace_tools
+
+        idempotency_key = "owner-task-retry-refused-run"
+        created, _stopped_task_id, _payload, body = _owner_retry_run_setup(
+            idempotency_key,
+        )
+        # Work nobody stopped: the kernel refuses to retry it, deterministically
+        # and with a committed receipt, which is the state this replay is about.
+        with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
+            task_id = kanban_db.create_task(
+                conn, title="B04 — Write the runbook", assignee="default",
+                project_id=created["project_id"],
+            )
+        body["owner_retry_authority"]["payload"]["task_id"] = task_id
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        handler = _native_retry_handler()
+
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch.object(adapter, "_create_agent") as mock_create,
+            patch.object(
+                owner_workspace_tools, "_handle_task_retry", handler, create=True,
+            ),
+            patch(
+                "hermes_cli.owner_workspace._confirm",
+                return_value={"approved": True, "reason": None},
+            ),
+        ):
+            mock_create.side_effect = RuntimeError("provider unavailable")
+            async with TestClient(TestServer(app)) as cli:
+                first = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                first_run_id = (await first.json())["run_id"]
+                for _ in range(200):
+                    polled = await cli.get(f"/v1/runs/{first_run_id}")
+                    status = await polled.json()
+                    durable = adapter._response_store.run_idempotency_status(
+                        "default", first_run_id,
+                    ) or {}
+                    if durable.get("status") == "failed":
+                        break
+                    await asyncio.sleep(0.05)
+                re_delivery = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                re_delivery_data = await re_delivery.json()
+                replayed = await cli.get(f"/v1/runs/{first_run_id}")
+                replayed_status = await replayed.json()
+
+        assert first.status == 202
+        assert status["status"] == "failed", status
+        assert status["owner_mutation_committed"] is False
+        # The refusal really is durable: it is the record the re-delivery reads.
+        assert durable["status"] == "failed"
+
+        assert re_delivery.status == 202, re_delivery_data
+        assert re_delivery_data["run_id"] == first_run_id
+        assert replayed.status == 200
+        assert replayed_status["status"] == "failed"
+        # Durable proof the refusal was neither re-run nor re-decided.
+        assert handler.call_count == 1
+        # The work is exactly where nobody stopped it.
+        assert _task_status(created["board"], task_id) == "ready"
+        assert _owner_retry_events(created["board"], task_id) == []
+
+    @pytest.mark.asyncio
+    async def test_owner_retry_payload_digest_binds_the_single_native_call(
+        self, adapter,
+    ):
+        """The run is bound to the sha256 of exactly this payload, nothing else.
+
+        The digest the gateway computed is the one the kernel wrote against the
+        receipt its single tool call committed, so the committed receipt is
+        readable under that digest and under no other.
+        """
+        from hermes_cli.owner_workspace import read_committed_owner_run_receipt
+        from tools import owner_workspace_tools
+
+        idempotency_key = "owner-task-retry-digest-bound"
+        _created, task_id, retry_payload, body = _owner_retry_run_setup(
+            idempotency_key,
+        )
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        handler = _native_retry_handler()
+
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch.object(adapter, "_create_agent") as mock_create,
+            patch.object(
+                owner_workspace_tools, "_handle_task_retry", handler, create=True,
+            ),
+            patch(
+                "hermes_cli.owner_workspace._confirm",
+                return_value={"approved": True, "reason": None},
+            ),
+        ):
+            mock_create.side_effect = RuntimeError("provider unavailable")
+            async with TestClient(TestServer(app)) as cli:
+                started = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                run_id = (await started.json())["run_id"]
+                for _ in range(200):
+                    polled = await cli.get(f"/v1/runs/{run_id}")
+                    status = await polled.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["status"] == "completed", status
+        assert handler.call_count == 1
+        assert handler.call_args.args[0] == retry_payload
+
+        committed = read_committed_owner_run_receipt(
+            profile="default",
+            idempotency_key=idempotency_key,
+            operation="owner_task_retry",
+            authority_digest=_retry_payload_digest(retry_payload),
+        )
+        assert committed is not None
+        assert committed["task_id"] == task_id
+        # Any other payload digest — even one differing only in the reason —
+        # names no committed run.
+        assert read_committed_owner_run_receipt(
+            profile="default",
+            idempotency_key=idempotency_key,
+            operation="owner_task_retry",
+            authority_digest=_retry_payload_digest(
+                {**retry_payload, "reason": _RETRY_REASON + "."},
+            ),
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_owner_retry_refuses_a_stale_or_foreign_project(self, adapter):
+        """Slug plus Project id must both name one committed Project."""
+        from tools import owner_workspace_tools
+
+        idempotency_key = "owner-task-retry-stale-project"
+        created, task_id, _payload, body = _owner_retry_run_setup(idempotency_key)
+        other_proposal = _new_owner_proposal()
+        other_proposal["project_name"] = "Second workshop"
+        other = _committed_owner_project(
+            "setup-owner-retry-other", "setup-retry-other", other_proposal,
+        )
+        assert other["project_id"] != created["project_id"]
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        handler = _native_retry_handler()
+
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch.object(adapter, "_create_agent") as mock_create,
+            patch.object(
+                owner_workspace_tools, "_handle_task_retry", handler, create=True,
+            ),
+            patch(
+                "hermes_cli.owner_workspace._confirm",
+                return_value={"approved": True, "reason": None},
+            ),
+        ):
+            mock_create.side_effect = RuntimeError("provider unavailable")
+            async with TestClient(TestServer(app)) as cli:
+                # A padded id is as stale as an unknown one: the identity is
+                # matched as submitted, never after cleaning.
+                for label, project_id in (
+                    ("foreign", other["project_id"]),
+                    ("unknown", "p_no_such_project"),
+                    ("padded", f"  {created['project_id']}  "),
+                ):
+                    stale_body = json.loads(json.dumps(body))
+                    stale_body["owner_retry_authority"]["payload"][
+                        "project_id"
+                    ] = project_id
+                    response = await cli.post(
+                        "/v1/runs",
+                        json=stale_body,
+                        headers={"Idempotency-Key": idempotency_key},
+                    )
+                    assert response.status == 409, label
+                    assert (await response.json())["error"]["code"] == (
+                        "owner_retry_authority_conflict"
+                    ), label
+
+        assert mock_create.call_count == 0
+        assert handler.call_count == 0
+        assert adapter._run_statuses == {}
+        # The work is exactly where the worker left it.
+        assert _task_status(created["board"], task_id) == "blocked"
+        assert _owner_retry_events(created["board"], task_id) == []
+
+    @pytest.mark.asyncio
+    async def test_owner_retry_authority_cannot_be_combined_or_unscoped(
+        self, adapter,
+    ):
+        """Two owner authorities never share a run, and none runs unscoped."""
+        idempotency_key = "owner-task-retry-exclusive"
+        retry_authority = {
+            "operation": "owner_task_retry",
+            "idempotency_key": idempotency_key,
+            "payload": {
+                "idempotency_key": idempotency_key,
+                "project_id": "p_workshop",
+                "task_id": "t_workshop",
+                "reason": _RETRY_REASON,
+            },
+        }
+        proposal_authority = {
+            "proposal_profile": "raphael-planner",
+            "conversation": "raphael-owner-" + "a" * 32,
+            "response_id": "resp_owner_retry_exclusive",
+            "claim_id": "claim_" + "b" * 32,
+            "operation": "owner_task_graph_commit",
+            "idempotency_key": idempotency_key,
+            "payload": {"idempotency_key": idempotency_key},
+        }
+        lifecycle_authority = {
+            "operation": "owner_project_lifecycle",
+            "idempotency_key": idempotency_key,
+            "payload": {
+                "idempotency_key": idempotency_key,
+                "project_id": "p_workshop",
+                "expected_revision": 0,
+                "action": "archive",
+            },
+        }
+        cases = (
+            (
+                "retry+proposal",
+                {"owner_proposal_authority": proposal_authority},
+                "Owner authorities cannot be combined",
+            ),
+            (
+                "retry+lifecycle",
+                {"owner_lifecycle_authority": lifecycle_authority},
+                "Owner authorities cannot be combined",
+            ),
+            (
+                "retry without context",
+                {},
+                "Owner authority requires owner workspace context",
+            ),
+        )
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            for label, extra, message in cases:
+                response = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "Try the stopped work again now.",
+                        "owner_retry_authority": retry_authority,
+                        **extra,
+                    },
+                    headers={"Idempotency-Key": idempotency_key},
+                )
+                assert response.status == 400, label
+                assert (await response.json())["error"]["message"] == message, label
+
+        assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_owner_retry_authority_of_the_wrong_shape_is_a_400(self, adapter):
+        """A shape this transport does not accept never reaches validation."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs",
+                json={
+                    "input": "Try the stopped work again now.",
+                    "owner_retry_authority": {
+                        "operation": "owner_task_retry",
+                        "idempotency_key": "shape-400",
+                        "payload": {"idempotency_key": "shape-400"},
+                    },
+                },
+            )
+            body = await response.json()
+        assert response.status == 400
+        assert body["error"]["message"] == "Invalid owner-workspace authority"
+        assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
     async def test_failed_owner_run_retries_same_request_with_a_new_run(self, adapter):
         conversation = "raphael-owner-" + "f" * 32
         response_id = "resp_owner_provider_retry"
@@ -974,6 +1850,240 @@ class TestStartRun:
 
 
 # ---------------------------------------------------------------------------
+# owner_retry_authority — the closed transport shape and its payload bounds
+# ---------------------------------------------------------------------------
+
+
+# The kernel's own bound, at module scope because the payload-bounds
+# parametrization below is built from it at import time.
+from hermes_cli.owner_workspace import _OWNER_RETRY_REASON_LIMIT  # noqa: E402
+
+_RETRY_AUTHORITY_SHAPE = {
+    "operation": "owner_task_retry",
+    "idempotency_key": "owner-retry-shape",
+    "payload": {
+        "idempotency_key": "owner-retry-shape",
+        "project_id": "p_workshop",
+        "task_id": "t_workshop",
+        "reason": _RETRY_REASON,
+    },
+}
+
+
+def _retry_authority_shape(case: str):
+    """One authority per shape this transport must refuse."""
+    authority = json.loads(json.dumps(_RETRY_AUTHORITY_SHAPE))
+    if case == "not_a_dict":
+        return [_RETRY_AUTHORITY_SHAPE]
+    if case == "missing_key":
+        del authority["payload"]
+        return authority
+    if case == "extra_key":
+        authority["owner"] = "default"
+        return authority
+    if case == "wrong_operation":
+        authority["operation"] = "owner_task_move"
+        return authority
+    if case == "malformed_idempotency_key":
+        authority["idempotency_key"] = "owner retry shape"
+        authority["payload"]["idempotency_key"] = "owner retry shape"
+        return authority
+    if case == "payload_not_a_dict":
+        authority["payload"] = [authority["payload"]]
+        return authority
+    if case == "payload_missing_key":
+        del authority["payload"]["reason"]
+        return authority
+    if case == "payload_extra_key":
+        authority["payload"]["expected_revision"] = 0
+        return authority
+    if case == "payload_key_disagrees":
+        authority["payload"]["idempotency_key"] = "owner-retry-other"
+        return authority
+    raise AssertionError(f"unknown case {case!r}")
+
+
+class TestOwnerRetryRunAuthorityShape:
+    # Imported per test rather than at module scope so a tree without the
+    # authority fails these tests one by one instead of failing collection.
+    @staticmethod
+    def _resolve(value):
+        from gateway.platforms.api_server import (
+            _resolve_owner_retry_run_authority,
+        )
+
+        return _resolve_owner_retry_run_authority(value)
+
+    @pytest.mark.parametrize("case", [
+        "not_a_dict",
+        "missing_key",
+        "extra_key",
+        "wrong_operation",
+        "malformed_idempotency_key",
+        "payload_not_a_dict",
+        "payload_missing_key",
+        "payload_extra_key",
+        "payload_key_disagrees",
+    ])
+    def test_refuses_every_shape_it_is_not(self, case):
+        with pytest.raises(ValueError, match="invalid owner retry authority"):
+            self._resolve(_retry_authority_shape(case))
+
+    def test_absent_authority_stays_absent(self):
+        assert self._resolve(None) is None
+
+    def test_accepts_exactly_the_closed_shape(self):
+        assert self._resolve(
+            json.loads(json.dumps(_RETRY_AUTHORITY_SHAPE))
+        ) == _RETRY_AUTHORITY_SHAPE
+
+    @pytest.mark.parametrize(("field", "value"), [
+        ("project_id", ""),
+        ("project_id", "   "),
+        ("project_id", "p" * 101),
+        ("project_id", None),
+        ("task_id", ""),
+        ("task_id", "   "),
+        ("task_id", None),
+        ("reason", ""),
+        ("reason", "   "),
+        ("reason", "r" * (_OWNER_RETRY_REASON_LIMIT + 1)),
+        ("reason", None),
+    ])
+    def test_payload_bounds_are_the_kernels_own(self, adapter, field, value):
+        """The gateway refuses exactly the payloads ``retry_task`` bounds out.
+
+        The bound comes from ``hermes_cli.owner_workspace`` rather than a
+        number copied into this transport, so the two cannot drift apart.
+        """
+        authority = json.loads(json.dumps(_RETRY_AUTHORITY_SHAPE))
+        authority["payload"][field] = value
+        with pytest.raises(ValueError, match="owner retry payload is invalid"):
+            adapter._validated_owner_retry_authority(
+                authority,
+                {
+                    "profile": "default",
+                    "mode": "existing",
+                    "project_slug": "workshop-pilot",
+                    "project_name": "Workshop pilot",
+                },
+                "default",
+            )
+
+    @pytest.mark.parametrize("context", [
+        {"profile": "other", "mode": "existing", "project_slug": "workshop-pilot"},
+        {"profile": "default", "mode": "new", "project_slug": None},
+        {"profile": "default", "mode": "existing", "project_slug": None},
+    ])
+    def test_context_must_bind_this_profile_and_an_existing_project(
+        self, adapter, context,
+    ):
+        with pytest.raises(ValueError, match="owner retry context mismatch"):
+            adapter._validated_owner_retry_authority(
+                json.loads(json.dumps(_RETRY_AUTHORITY_SHAPE)), context, "default",
+            )
+
+
+_RETRY_SUCCESS_RESULT = {
+    "ok": True,
+    "task_id": "t_workshop",
+    "status": "ready",
+    "revision": 12,
+    "retry_reason": _RETRY_REASON,
+}
+
+
+class TestOwnerRetryMutationReceipt:
+    """The minimal receipt projection for a retry, which names no Project."""
+
+    @staticmethod
+    def _admits_a_retry_at_all(adapter) -> None:
+        """A genuine retry success projects something.
+
+        The anchor every "projects nothing" case below needs: without it those
+        cases also hold for an operation this projection does not know, which
+        is exactly the state they exist to distinguish a refusal from.
+        """
+        assert adapter._owner_mutation_receipt(
+            "owner_task_retry", dict(_RETRY_SUCCESS_RESULT),
+        ) is not None
+
+    def test_a_genuine_success_projects_only_the_bound_fields(self, adapter):
+        receipt = adapter._owner_mutation_receipt("owner_task_retry", {
+            **_RETRY_SUCCESS_RESULT,
+            "internal_board": "workshop-pilot",
+        })
+        assert json.loads(receipt) == {
+            "ok": True,
+            "task_id": "t_workshop",
+            "status": "ready",
+            "revision": 12,
+            "retry_reason": _RETRY_REASON,
+        }
+        # The tool answers with a JSON string; both forms project identically.
+        assert adapter._owner_mutation_receipt(
+            "owner_task_retry", json.dumps(_RETRY_SUCCESS_RESULT),
+        ) == receipt
+
+    @pytest.mark.parametrize("result", [
+        {
+            "ok": False,
+            "error": "not_retryable",
+            "task_id": "t_workshop",
+            "current_status": "running",
+            "reason": "This work is running and has not stopped.",
+        },
+        {"ok": True, "status": "ready", "revision": 1, "retry_reason": "r"},
+        {"ok": True, "task_id": "", "status": "ready", "revision": 1,
+         "retry_reason": "r"},
+        {"ok": True, "task_id": "t", "status": "", "revision": 1,
+         "retry_reason": "r"},
+        {"ok": True, "task_id": "t", "status": "Ready!", "revision": 1,
+         "retry_reason": "r"},
+        {"ok": True, "task_id": "t", "status": "ready", "revision": True,
+         "retry_reason": "r"},
+        {"ok": True, "task_id": "t", "status": "ready", "revision": "1",
+         "retry_reason": "r"},
+        {"ok": True, "task_id": "t", "status": "ready", "revision": 1,
+         "retry_reason": ""},
+        {"ok": True, "task_id": "t", "status": "ready", "revision": 1},
+        "not json at all",
+    ])
+    def test_a_refusal_or_malformed_result_projects_nothing(self, adapter, result):
+        self._admits_a_retry_at_all(adapter)
+        assert adapter._owner_mutation_receipt("owner_task_retry", result) is None
+
+    def test_the_project_operations_still_require_their_slug(self, adapter):
+        """Admitting a retry must not loosen the branches that name a Project."""
+        self._admits_a_retry_at_all(adapter)
+        assert adapter._owner_mutation_receipt("owner_project_lifecycle", {
+            "ok": True,
+            "action": "archive",
+            "archived": True,
+            "execution_paused": True,
+        }) is None
+        assert adapter._owner_mutation_receipt("owner_task_graph_commit", {
+            "ok": True, "task_count": 1,
+        }) is None
+        assert json.loads(adapter._owner_mutation_receipt(
+            "owner_project_lifecycle",
+            {
+                "ok": True,
+                "action": "archive",
+                "project_slug": "workshop-pilot",
+                "archived": True,
+                "execution_paused": True,
+            },
+        )) == {
+            "ok": True,
+            "action": "archive",
+            "project_slug": "workshop-pilot",
+            "archived": True,
+            "execution_paused": True,
+        }
+
+
+# ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id} — poll run status
 # ---------------------------------------------------------------------------
 
@@ -983,7 +2093,11 @@ class TestRunStatus:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "operation",
-        ["owner_task_graph_commit", "owner_project_plan_commit"],
+        [
+            "owner_task_graph_commit",
+            "owner_project_plan_commit",
+            "owner_task_retry",
+        ],
     )
     async def test_status_exposes_redacted_approval_then_clears_it(self, adapter, operation):
         app = _create_runs_app(adapter)

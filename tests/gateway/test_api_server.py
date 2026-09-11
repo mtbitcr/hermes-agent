@@ -4258,6 +4258,54 @@ class TestOwnerWorkspaceDecisionsEndpoint:
         assert "private internal operation detail" not in json.dumps(data)
 
     @pytest.mark.asyncio
+    async def test_a_pending_retry_confirmation_reaches_the_owner(self, adapter):
+        """An owner asked to confirm trying stopped work again must see it.
+
+        An operation this surface does not recognise is dropped from the
+        inbox entirely, so the owner is never told a run is waiting on them.
+        """
+        adapter._run_statuses["run_retry_native_id"] = {
+            "run_id": "run_retry_native_id",
+            "status": "waiting_for_approval",
+            "created_at": 1_787_227_200,
+            "pending_approval": {
+                "approval_id": "approval_retry_native_id",
+                "operation": "owner_task_retry",
+                "description": "private internal operation detail",
+            },
+            "owner_workspace_context": {
+                "mode": "existing",
+                "project_slug": "workshop-pilot",
+                "project_name": "Workshop pilot",
+                "profile": "default",
+            },
+        }
+        app = _create_app(adapter)
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch(
+                "hermes_cli.owner_workspace.resolve_owner_context",
+                return_value=types.SimpleNamespace(profile="default"),
+            ),
+            patch(
+                "hermes_cli.owner_workspace.list_owner_decisions",
+                return_value={"data": [], "truncated": False},
+            ),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/owner-workspace/decisions")
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert len(data["data"]) == 1
+        assert data["data"][0]["authority"] == "run"
+        assert data["data"][0]["kind"] == "run_approval"
+        assert data["data"][0]["project_slug"] == "workshop-pilot"
+        assert data["data"][0]["title"] == "Approve trying stopped work again"
+        assert "private internal operation detail" not in json.dumps(data)
+
+    @pytest.mark.asyncio
     async def test_surface_requires_bearer_auth(self, auth_adapter):
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:

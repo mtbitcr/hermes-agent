@@ -10,6 +10,12 @@ Every tool schema is deliberately narrow: no author/profile/actor/session/
 path/scope field is accepted from the model. Identity is resolved from
 trusted request context (``resolve_owner_context``) inside the kernel.
 
+One handler here is NOT a tool at all: ``_handle_task_retry`` carries no
+registration and no schema, because the owner retry states the OWNER's own
+reason for trying stopped work again. It is reached only by the API server's
+native run dispatch, from a run whose owner authority the kernel re-verifies
+before it reads or writes anything.
+
 The separate ``project_steward`` toolset exposes one read-only, owner-safe
 snapshot without granting any owner-workspace mutation authority.
 """
@@ -226,6 +232,36 @@ def _handle_task_comment(args: dict, **kw) -> str:
     except Exception:
         logger.exception("owner_task_comment failed")
         return tool_error("owner_task_comment: internal error")
+
+
+def _handle_task_retry(args: dict, **kw) -> str:
+    """Apply ONE authenticated owner retry run. Never a model-facing tool.
+
+    Deliberately not registered: there is no ``owner_task_retry`` schema in
+    any toolset, so no model can call it. The only caller is the API server's
+    native run dispatch (``_OWNER_NATIVE_RUN_HANDLERS``), which resolves this
+    function by name and hands it the frozen payload the owner's run authority
+    was minted from. The kernel re-checks that authority before it reads or
+    writes anything (:func:`hermes_cli.owner_workspace.retry_task`), so this
+    wrapper stays exactly as thin as its siblings.
+    """
+    try:
+        ctx = resolve_owner_context()
+        result = _kernel.retry_task(
+            ctx,
+            idempotency_key=args.get("idempotency_key"),
+            project_id=args.get("project_id"),
+            task_id=args.get("task_id"),
+            reason=args.get("reason"),
+        )
+        return _ok(result)
+    except OwnerWorkspaceError as e:
+        return _refused("owner_task_retry", e)
+    except ValueError as e:
+        return tool_error(f"owner_task_retry: {e}")
+    except Exception:
+        logger.exception("owner_task_retry failed")
+        return tool_error("owner_task_retry: internal error")
 
 
 registry.register(
@@ -768,3 +804,13 @@ registry.register(
     },
     handler=lambda args, **kw: _handle_task_comment(args, **kw),
 )
+
+# NO registration for owner_task_retry, and that is the point. The retry
+# records the OWNER's stated reason for trying stopped work again, so it is a
+# hidden run authority the API server dispatches natively from an already
+# authenticated owner run (``_OWNER_NATIVE_RUN_HANDLERS`` -> the
+# ``_handle_task_retry`` above), never a capability a model may reach. A
+# registered schema would be enough to expose it: ``get_toolset()`` merges
+# every registry entry of a toolset into that toolset's tool list, so
+# registering it under ``owner_workspace`` would hand it to every agent the
+# owner-workspace gate admits — regardless of what toolsets.py lists.

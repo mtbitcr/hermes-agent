@@ -2107,11 +2107,25 @@ def test_planner_role_gets_read_only_sandbox_from_unscoped_task(host, sdk, monke
     assert out["policy"]["automatic_run_cleanup"] is True
 
 
-def test_review_run_keeps_implementer_scope_but_gets_no_patch_authority(
+def test_review_run_gets_read_only_scope_and_no_patch_authority(
     host, sdk, monkeypatch,
 ):
+    # The review claim parks a read-only scope on the row; the implementation
+    # scope is kept as durable provenance and restored on handback and on
+    # approval (tests/hermes_cli/test_kanban_review_read_only_scope.py). The
+    # sandbox therefore sees an empty scope and no patch authority.
+    #
+    # The handover derives the kernel's own execution receipt from the scoped
+    # worktree before it parks the card (a declared boundary it cannot prove
+    # is refused), so the implementation here is real: the task branch and
+    # base commit recorded, one commit inside the declared scope.
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, host.task_id).owned_paths == ["."]
+        kb.set_branch_name(conn, host.task_id, f"wt/{host.task_id}")
+        kb.record_worktree_base(conn, host.task_id, host.worktree)
+        (host.worktree / "app.py").write_text("print('reviewed')\n", encoding="utf-8")
+        _git(host.worktree, "add", "app.py")
+        _git(host.worktree, "commit", "-m", "feat: implementation ready for review")
         assert kb.request_review(
             conn,
             host.task_id,
@@ -2125,7 +2139,7 @@ def test_review_run_keeps_implementer_scope_but_gets_no_patch_authority(
         assert claimed is not None
         review_run_id = claimed.current_run_id
         assert review_run_id is not None
-        assert kb.get_task(conn, host.task_id).owned_paths == ["."]
+        assert kb.get_task(conn, host.task_id).owned_paths == []
 
     monkeypatch.setenv("HERMES_PROFILE", "raphael-verifier")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review_run_id))
@@ -2167,7 +2181,7 @@ def test_review_run_keeps_implementer_scope_but_gets_no_patch_authority(
                 fire_lifecycle_hook=False,
             )
         assert kb.get_task(conn, host.task_id).status == "running"
-        assert kb.get_task(conn, host.task_id).owned_paths == ["."]
+        assert kb.get_task(conn, host.task_id).owned_paths == []
 
 
 def test_standalone_verifier_run_cannot_materialize_patch_or_parent_heads(host):
