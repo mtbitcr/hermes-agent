@@ -1423,6 +1423,10 @@ _OWNER_PROPOSAL_PRESERVED_TASK_KEYS = (
 _OWNER_PROPOSAL_REWRITTEN_TASK_KEYS = _OWNER_PROPOSAL_TASK_KEYS | frozenset({
     "body_mode",
 })
+# Read-only roles never carry the review requirement (the same rule the apply
+# path enforces, hermes_cli.owner_workspace.REVIEW_REQUIREMENT_REFUSED_ASSIGNEES):
+# a stored proposal that states it for them authorizes nothing.
+_OWNER_REVIEW_REFUSED_ASSIGNEES = frozenset({"raphael-planner", "raphael-verifier"})
 
 
 def _owner_current_task_shape(value: Any, expected_keys: frozenset[str]) -> bool:
@@ -1436,15 +1440,24 @@ def _owner_current_task_shape(value: Any, expected_keys: frozenset[str]) -> bool
     )
 
 
-def _owner_task_payload(value: Dict[str, Any]) -> Dict[str, Any]:
-    """The created-task shape as the Workspace forwards it in the run payload.
+def _owner_review_requirement(value: Dict[str, Any]) -> Dict[str, Any]:
+    """The review-requirement fragment of a created-task payload.
 
     ``requires_review`` travels only when true, so a stored ``false`` and an
-    absent key derive the same expected payload.
+    absent key derive the same expected payload; a read-only role that states
+    it makes the whole stored proposal unusable as authority.
     """
+    if value.get("requires_review") is not True:
+        return {}
+    if value.get("assignee") in _OWNER_REVIEW_REFUSED_ASSIGNEES:
+        raise ValueError("stored proposal change is invalid")
+    return {"requires_review": True}
+
+
+def _owner_task_payload(value: Dict[str, Any]) -> Dict[str, Any]:
+    """The created-task shape as the Workspace forwards it in the run payload."""
     payload = {key: item for key, item in value.items() if key != "requires_review"}
-    if value.get("requires_review") is True:
-        payload["requires_review"] = True
+    payload.update(_owner_review_requirement(value))
     return payload
 
 
@@ -13081,10 +13094,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "responsibility": clean(raw.get("responsibility")),
                         "execution_tier": clean(raw.get("execution_tier")),
                         "owned_paths": clean(raw.get("owned_paths")),
-                        **(
-                            {"requires_review": True}
-                            if raw.get("requires_review") is True else {}
-                        ),
+                        **_owner_review_requirement(raw),
                         "existing_parents": [native(ref) for ref in raw["existing_parent_refs"]],
                         "new_parents": clean(raw.get("new_parents")),
                     })

@@ -391,6 +391,17 @@ class TestOwnerWorkspaceRunContext:
                 "owned_paths": [],
                 "requires_review": True,
             }, True),
+            # A read-only role can never carry it: the stored proposal
+            # authorizes nothing, before any run is reserved.
+            ({
+                "title": "Re-plan the milestone",
+                "body_mode": "preserve",
+                "assignee": "raphael-planner",
+                "responsibility": "R01",
+                "execution_tier": "routine",
+                "owned_paths": [],
+                "requires_review": True,
+            }, False),
         ],
     )
     def test_stored_replace_proposal_validates_exact_native_run_payload(
@@ -525,15 +536,26 @@ class TestOwnerWorkspaceRunContext:
         finally:
             store.close()
 
-    @pytest.mark.parametrize("carried", [True, False])
+    @pytest.mark.parametrize(
+        ("assignee", "responsibility", "carried", "refusal"),
+        [
+            ("raphael-claude-worker", "R14", True, None),
+            ("raphael-claude-worker", "R14", False, "run payload differs"),
+            # A read-only role never carries the requirement: refused as an
+            # invalid stored proposal, before any run is reserved.
+            ("raphael-planner", "R01", True, "stored proposal change is invalid"),
+            ("raphael-verifier", "R15", True, "stored proposal change is invalid"),
+        ],
+    )
     def test_a_review_requirement_on_a_plan_add_is_part_of_the_authority(
-        self, carried,
+        self, assignee, responsibility, carried, refusal,
     ):
         """A plan add that requires a review is approved with that requirement.
 
         The Workspace forwards ``requires_review`` on an add only when true, so
         the payload derived here from the stored proposal carries it the same
-        way, and a run payload without it is a different approval.
+        way, and a run payload without it is a different approval; a read-only
+        role stating it makes the stored proposal unusable as authority.
         """
         conversation = "raphael-owner-" + "4" * 32
         response_id = "resp_native_reviewed_add_proposal"
@@ -556,10 +578,10 @@ class TestOwnerWorkspaceRunContext:
             "reason": "The owner asked for an independently reviewed follow-up.",
             "title": "Trap the low-level write in the atomicity regression",
             "body": "Make the regression trap the write while the fault is armed.",
-            "assignee": "raphael-claude-worker",
-            "responsibility": "R14",
+            "assignee": assignee,
+            "responsibility": responsibility,
             "execution_tier": "deep",
-            "owned_paths": ["tests/hermes_cli"],
+            "owned_paths": ["tests/hermes_cli"] if assignee == "raphael-claude-worker" else [],
             "existing_parent_refs": [],
             "new_parents": [],
             "requires_review": True,
@@ -635,13 +657,13 @@ class TestOwnerWorkspaceRunContext:
                     return_value=snapshot,
                 ),
             ):
-                if carried:
+                if refusal is None:
                     binding = adapter._validated_owner_proposal_authority(
                         authority, context, "default",
                     )
                     assert binding["operation"] == "owner_project_plan_commit"
                 else:
-                    with pytest.raises(ValueError, match="run payload differs"):
+                    with pytest.raises(ValueError, match=refusal):
                         adapter._validated_owner_proposal_authority(
                             authority, context, "default",
                         )
