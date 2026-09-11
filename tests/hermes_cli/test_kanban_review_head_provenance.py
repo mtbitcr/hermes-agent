@@ -924,6 +924,75 @@ def test_a_human_approval_from_the_review_lane_needs_no_live_scope_proof(
         ] == [{"task_id": impl, "head_commit": implementation_head}]
 
 
+def test_a_human_approval_of_a_voluntary_scoped_review_needs_no_live_scope_proof(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The same approval for a review nobody REQUIRED.
+
+    The default review path: ``requires_review`` is false, the implementer
+    hands the scoped work to a named reviewer through the public review
+    request, and a human approves it from ``review`` with no reviewer run. The
+    park wrote the reviewer's empty read-only scope and the implementation
+    provenance exactly as it does for mandated work, so the approval is
+    authorized the same way — the requirement flag is not what makes a parked
+    review a parked review.
+    """
+    _nominate(monkeypatch, REVIEWER)
+    repo = _repo(tmp_path)
+    with kb.connect() as conn:
+        impl = _scoped_task(
+            conn, repo,
+            title="voluntary review, approved by a human",
+            branch="feature/voluntary-review",
+            owned_paths=["src"],
+            assignee="builder",
+        )
+        workspace = _materialize(conn, impl, claimer="builder:1")
+        implementation_head = _commit_file(
+            workspace, "src/a.py", "ok = True\n", "feat: implement",
+        )
+        handover_run = kb.get_task(conn, impl).current_run_id
+        assert kb.request_review(
+            conn, impl,
+            summary="ready for review",
+            reviewer=REVIEWER,
+            expected_run_id=handover_run,
+        ) is True
+
+        parked = kb.get_task(conn, impl)
+        assert parked.status == "review"
+        assert parked.requires_review is False
+        assert parked.owned_paths == []
+        assert parked.current_run_id is None
+        assert parked.head_commit is None
+        assert kb._latest_review_head_provenance(conn, impl) == implementation_head
+        assert kb._latest_review_scope_provenance(conn, impl) == {
+            "owned_paths": ["src"],
+            "integrates_parent_heads": False,
+        }
+
+        assert kb.complete_task(
+            conn, impl, summary="approved from the board",
+        ) is True, (
+            "a human approving a voluntarily parked review must not be refused "
+            "by a scope proof run against the reviewer's empty read-only scope"
+        )
+        row = conn.execute(
+            "SELECT status, head_commit, owned_paths, integrates_parent_heads, "
+            "completed_at FROM tasks WHERE id = ?",
+            (impl,),
+        ).fetchone()
+        assert (
+            row["status"],
+            row["head_commit"],
+            json.loads(row["owned_paths"]),
+            row["integrates_parent_heads"],
+        ) == ("done", implementation_head, ["src"], 0)
+        assert row["completed_at"] is not None
+        assert len(_events(conn, impl, "completed")) == 1
+        assert _events(conn, impl, "completion_blocked_file_scope") == []
+
+
 def test_a_human_approval_still_refuses_a_parked_head_that_lost_its_parent(
     kanban_home, tmp_path, monkeypatch,
 ):

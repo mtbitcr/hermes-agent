@@ -22249,9 +22249,10 @@ def _is_parked_review_approval(conn: sqlite3.Connection, task_id: str) -> bool:
       consulted: the classification reads the row, so a forged
       ``expected_run_id`` cannot reach this path — and one that does not match
       the row still fails the terminal ``UPDATE``'s run guard exactly as before.
-    * ``requires_review`` — only work whose committed specification carries the
-      review requirement. That requirement is what makes the park a mandated
-      phase of the work rather than an optional detour.
+    * whether the review was mandated by the committed specification or
+      requested voluntarily does not matter: the park writes the same row
+      shape and the same provenance either way, and the approval contract
+      admits both, so the requirement flag is deliberately NOT a conjunct.
     * the reviewer's empty read-only scope is actually installed — the exact
       shape :func:`request_review` writes, and the exact shape the proof cannot
       speak about. A row in ``review`` still holding a mutating boundary is not
@@ -22262,12 +22263,11 @@ def _is_parked_review_approval(conn: sqlite3.Connection, task_id: str) -> bool:
       consume, so there is no relaxed authorization to grant.
 
     Anything else — any other status, any claimed run, a card that was never
-    parked, a card whose specification never required review — falls through to
-    the unchanged verification path. The gate fails CLOSED: an unrecognised
+    parked — falls through to the unchanged verification path. The gate fails CLOSED: an unrecognised
     shape keeps the scope proof rather than skipping it.
     """
     row = conn.execute(
-        "SELECT status, current_run_id, requires_review, owned_paths, "
+        "SELECT status, current_run_id, owned_paths, "
         "integrates_parent_heads FROM tasks "
         "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
@@ -22275,8 +22275,6 @@ def _is_parked_review_approval(conn: sqlite3.Connection, task_id: str) -> bool:
     if row is None:
         return False
     if row["status"] != "review" or row["current_run_id"] is not None:
-        return False
-    if not row["requires_review"]:
         return False
     if _decode_owned_paths(row["owned_paths"]) != [] or row[
         "integrates_parent_heads"
