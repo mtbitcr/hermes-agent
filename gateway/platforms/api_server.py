@@ -1423,14 +1423,54 @@ _OWNER_PROPOSAL_PRESERVED_TASK_KEYS = (
 _OWNER_PROPOSAL_REWRITTEN_TASK_KEYS = _OWNER_PROPOSAL_TASK_KEYS | frozenset({
     "body_mode",
 })
+# Read-only roles never carry the review requirement (the same rule the apply
+# path enforces, hermes_cli.owner_workspace.REVIEW_REQUIREMENT_REFUSED_ASSIGNEES):
+# a stored proposal that states it for them authorizes nothing.
+_OWNER_REVIEW_REFUSED_ASSIGNEES = frozenset({"raphael-planner", "raphael-verifier"})
 
 
 def _owner_current_task_shape(value: Any, expected_keys: frozenset[str]) -> bool:
+    # The review requirement is the one optional key of a current task shape:
+    # the Workspace admits it as a boolean and forwards it only when true.
     return (
         isinstance(value, dict)
-        and set(value) == expected_keys
+        and set(value) - {"requires_review"} == expected_keys
         and isinstance(value.get("owned_paths"), list)
+        and isinstance(value.get("requires_review", False), bool)
     )
+
+
+def _owner_review_requirement(value: Dict[str, Any]) -> Dict[str, Any]:
+    """The review-requirement fragment of a created-task payload.
+
+    ``requires_review`` travels only when true, so a stored ``false`` and an
+    absent key derive the same expected payload; a read-only role that states
+    it makes the whole stored proposal unusable as authority.
+    """
+    flag = value.get("requires_review", False)
+    if not isinstance(flag, bool):
+        raise ValueError("stored proposal change is invalid")
+    if flag is not True:
+        return {}
+    # The apply path canonicalizes the assignee (strip, lowercase) before its
+    # refusal, so a spaced or mixed-case spelling of a read-only role is the
+    # same role here too.
+    from hermes_cli.profiles import normalize_profile_name
+
+    try:
+        assignee = normalize_profile_name(value.get("assignee"))
+    except ValueError:
+        assignee = ""
+    if assignee in _OWNER_REVIEW_REFUSED_ASSIGNEES:
+        raise ValueError("stored proposal change is invalid")
+    return {"requires_review": True}
+
+
+def _owner_task_payload(value: Dict[str, Any]) -> Dict[str, Any]:
+    """The created-task shape as the Workspace forwards it in the run payload."""
+    payload = {key: item for key, item in value.items() if key != "requires_review"}
+    payload.update(_owner_review_requirement(value))
+    return payload
 
 
 def _owner_current_replace_shape(value: Any) -> bool:
@@ -12945,6 +12985,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 owner_project_name,
             )
 
+            # The stored tasks travel into the expected payload as the
+            # Workspace forwards them: the review requirement only when true
+            # (an explicit false and an absent key derive the same payload),
+            # and the one rule the apply path enforces per task before it
+            # commits (a boolean, never true on a read-only role) is enforced
+            # here too, before any run is reserved.
+            stored_tasks = candidate.get("tasks")
+            if not isinstance(stored_tasks, list):
+                raise ValueError("stored proposal task is invalid")
+            expected_tasks: List[Dict[str, Any]] = []
+            for task in stored_tasks:
+                if not isinstance(task, dict):
+                    raise ValueError("stored proposal task is invalid")
+                try:
+                    expected_tasks.append(clean(_owner_task_payload(task)))
+                except ValueError:
+                    raise ValueError("stored proposal task is invalid") from None
             try:
                 stored_project_name = owner_project_name(
                     _native_owner_project_name(
@@ -12972,7 +13029,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "current_milestone": clean(candidate.get("current_milestone")),
                 "owner_visible_result": clean(candidate.get("owner_visible_result")),
                 "root_assignee": root_assignee,
-                "tasks": clean(candidate.get("tasks")),
+                "tasks": expected_tasks,
                 "later_milestones": clean(candidate.get("later_milestones")),
             }
         else:
@@ -13066,6 +13123,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "responsibility": clean(raw.get("responsibility")),
                         "execution_tier": clean(raw.get("execution_tier")),
                         "owned_paths": clean(raw.get("owned_paths")),
+                        **_owner_review_requirement(raw),
                         "existing_parents": [native(ref) for ref in raw["existing_parent_refs"]],
                         "new_parents": clean(raw.get("new_parents")),
                     })
@@ -13075,7 +13133,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     changes.append({
                         "action": "replace", "reason": reason,
                         "target": native(raw.get("target_ref")),
-                        "replacement": clean(raw.get("replacement")),
+                        "replacement": clean(_owner_task_payload(raw["replacement"])),
                     })
                 elif action == "split" and set(raw) == {
                     "action", "reason", "target_ref", "replacements",
@@ -13088,7 +13146,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     changes.append({
                         "action": "split", "reason": reason,
                         "target": native(raw.get("target_ref")),
-                        "replacements": clean(raw.get("replacements")),
+                        "replacements": [
+                            clean(_owner_task_payload(replacement))
+                            for replacement in raw["replacements"]
+                        ],
                     })
                 elif action == "merge" and set(raw) == {
                     "action", "reason", "target_refs", "replacement",
@@ -13098,7 +13159,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     changes.append({
                         "action": "merge", "reason": reason,
                         "targets": [native(ref) for ref in raw["target_refs"]],
-                        "replacement": clean(raw.get("replacement")),
+                        "replacement": clean(_owner_task_payload(raw["replacement"])),
                     })
                 elif action == "move" and set(raw) == {
                     "action", "reason", "target_ref", "to_status",

@@ -44,6 +44,7 @@ from tests.hermes_cli.test_owner_workspace import (  # noqa: F401
 from tools import approval
 
 REVIEWER = "raphael-verifier"
+PLANNER = "raphael-planner"
 
 
 def _spec(title: str, *, requires_review: bool | None = None, **overrides) -> dict:
@@ -380,9 +381,16 @@ def test_the_recovered_requirement_write_holds_the_board_guard_and_the_lease(ctx
 
 
 @pytest.mark.parametrize("action", ["add", "replace", "split", "merge"])
-def test_a_plan_refuses_the_requirement_on_a_read_only_review_task(ctx, action):
-    """REGRESSION: the requirement can never leak onto the audit review task."""
-    _install_profiles(REVIEWER)
+@pytest.mark.parametrize("assignee", [REVIEWER, PLANNER])
+def test_a_plan_refuses_the_requirement_on_a_read_only_review_task(
+    ctx, action, assignee,
+):
+    """REGRESSION: the requirement can never leak onto a read-only role's task.
+
+    The audit review task IS the review and the planner only reads the
+    Project; the owner workspace refuses both, so the apply path must too.
+    """
+    _install_profiles(assignee)
     setup = _bootstrap_board(ctx)
     with kb.connect(board=setup["board"]) as conn:
         left_id = kb.create_task(
@@ -399,13 +407,13 @@ def test_a_plan_refuses_the_requirement_on_a_read_only_review_task(ctx, action):
     audit = _spec(
         "Confirm the owner-visible result",
         requires_review=True,
-        assignee=REVIEWER,
+        assignee=assignee,
     )
     if action == "add":
         change = _add_change(
             "Confirm the owner-visible result",
             requires_review=True,
-            assignee=REVIEWER,
+            assignee=assignee,
         )
     elif action == "replace":
         change = {
@@ -436,12 +444,13 @@ def test_a_plan_refuses_the_requirement_on_a_read_only_review_task(ctx, action):
         _commit_project_plan(
             ctx,
             **_project_plan_args(
-                setup, [change], idempotency_key=f"plan-{action}-verifier",
+                setup, [change], idempotency_key=f"plan-{action}-{assignee}",
             ),
         )
 
     assert excinfo.value.code == "invalid_argument"
     assert "requires_review" in str(excinfo.value)
+    assert assignee in str(excinfo.value)
     # Refused before the owner is ever asked, so nothing was created and no
     # existing task was archived.
     titles = _project_titles(setup["board"], setup["project_id"])

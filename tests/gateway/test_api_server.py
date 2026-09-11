@@ -380,6 +380,37 @@ class TestOwnerWorkspaceRunContext:
                 "responsibility": "R07",
                 "execution_tier": "deep",
             }, False),
+            # The review requirement rides inside the replacement, exactly as
+            # the Workspace forwards it.
+            ({
+                "title": "Complete the bounded recovery",
+                "body_mode": "preserve",
+                "assignee": "raphael-claude-worker",
+                "responsibility": "R07",
+                "execution_tier": "deep",
+                "owned_paths": [],
+                "requires_review": True,
+            }, True),
+            # A read-only role can never carry it: the stored proposal
+            # authorizes nothing, before any run is reserved.
+            ({
+                "title": "Re-plan the milestone",
+                "body_mode": "preserve",
+                "assignee": "raphael-planner",
+                "responsibility": "R01",
+                "execution_tier": "routine",
+                "owned_paths": [],
+                "requires_review": True,
+            }, False),
+            ({
+                "title": "Re-plan the milestone",
+                "body_mode": "preserve",
+                "assignee": " Raphael-Planner ",
+                "responsibility": "R01",
+                "execution_tier": "routine",
+                "owned_paths": [],
+                "requires_review": True,
+            }, False),
         ],
     )
     def test_stored_replace_proposal_validates_exact_native_run_payload(
@@ -511,6 +542,300 @@ class TestOwnerWorkspaceRunContext:
 
             assert binding["operation"] == "owner_project_plan_commit"
             assert binding["idempotency_key"] == idempotency_key
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        ("assignee", "responsibility", "carried", "refusal"),
+        [
+            ("raphael-claude-worker", "R14", True, None),
+            ("raphael-claude-worker", "R14", False, "run payload differs"),
+            # A read-only role never carries the requirement: refused as an
+            # invalid stored proposal, before any run is reserved.
+            ("raphael-planner", "R01", True, "stored proposal change is invalid"),
+            ("raphael-verifier", "R15", True, "stored proposal change is invalid"),
+            # The apply path canonicalizes the assignee before it refuses, so
+            # the authority refuses the same spellings.
+            (" raphael-planner ", "R01", True, "stored proposal change is invalid"),
+            ("RAPHAEL-VERIFIER", "R15", True, "stored proposal change is invalid"),
+        ],
+    )
+    def test_a_review_requirement_on_a_plan_add_is_part_of_the_authority(
+        self, assignee, responsibility, carried, refusal,
+    ):
+        """A plan add that requires a review is approved with that requirement.
+
+        The Workspace forwards ``requires_review`` on an add only when true, so
+        the payload derived here from the stored proposal carries it the same
+        way, and a run payload without it is a different approval; a read-only
+        role stating it makes the stored proposal unusable as authority.
+        """
+        conversation = "raphael-owner-" + "4" * 32
+        response_id = "resp_native_reviewed_add_proposal"
+        idempotency_key = "conversation-" + hashlib.sha256(
+            response_id.encode("utf-8")
+        ).hexdigest()
+        secret = "owner-executor-test-key"
+        anchor = {
+            "id": "task_anchor",
+            "title": "Coordinate the milestone",
+            "status": "todo",
+            "event_revision": 3,
+            "parent_ids": [],
+            "child_ids": [],
+            "omitted_parent_count": 0,
+            "omitted_child_count": 0,
+        }
+        add = {
+            "action": "add",
+            "reason": "The owner asked for an independently reviewed follow-up.",
+            "title": "Trap the low-level write in the atomicity regression",
+            "body": "Make the regression trap the write while the fault is armed.",
+            "assignee": assignee,
+            "responsibility": responsibility,
+            "execution_tier": "deep",
+            "owned_paths": ["tests/hermes_cli"] if assignee == "raphael-claude-worker" else [],
+            "existing_parent_refs": [],
+            "new_parents": [],
+            "requires_review": True,
+        }
+        proposal = _owner_existing_proposal(changes=[add])
+        change = {
+            key: value for key, value in add.items()
+            if key != "existing_parent_refs"
+        }
+        change["existing_parents"] = []
+        if not carried:
+            del change["requires_review"]
+        payload = {
+            "idempotency_key": idempotency_key,
+            "project_id": "project_raphael",
+            "trigger": "owner_request",
+            "request_title": proposal["request_title"],
+            "summary": proposal["summary"],
+            "specification": proposal["specification"],
+            "current_milestone": proposal["current_milestone"],
+            "owner_visible_result": proposal["owner_visible_result"],
+            "later_milestones": proposal["later_milestones"],
+            "changes": [change],
+        }
+        authority = {
+            "proposal_profile": "default",
+            "conversation": conversation,
+            "response_id": response_id,
+            "claim_id": "claim_" + "6" * 32,
+            "operation": "owner_project_plan_commit",
+            "idempotency_key": idempotency_key,
+            "payload": payload,
+        }
+        context = {
+            "profile": "default",
+            "mode": "existing",
+            "project_slug": "raphael-workspace",
+            "project_name": "Raphael Workspace",
+        }
+        snapshot = {
+            "project": {"id": "project_raphael"},
+            "planning_context": {
+                "schema_version": 1,
+                "actionable_count": 1,
+                "omitted_terminal_count": 0,
+                "actionable_truncated": False,
+                "relations_truncated": False,
+                "tasks": [anchor],
+            },
+        }
+        store = ResponseStore(max_size=10)
+        adapter = APIServerAdapter.__new__(APIServerAdapter)
+        adapter._response_store = store
+        adapter._expected_api_key = lambda: secret
+        try:
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": "Start the reviewed follow-up."},
+                    {"role": "assistant", "content": json.dumps(proposal)},
+                ],
+            })
+            assert store.set_conversation(
+                conversation, response_id, owner_proposal=True,
+            ) is True
+            with (
+                patch(
+                    "hermes_cli.owner_workspace.resolve_owner_context",
+                    return_value=object(),
+                ),
+                patch(
+                    "hermes_cli.owner_workspace.read_project_snapshot",
+                    return_value=snapshot,
+                ),
+            ):
+                if refusal is None:
+                    binding = adapter._validated_owner_proposal_authority(
+                        authority, context, "default",
+                    )
+                    assert binding["operation"] == "owner_project_plan_commit"
+                else:
+                    with pytest.raises(ValueError, match=refusal):
+                        adapter._validated_owner_proposal_authority(
+                            authority, context, "default",
+                        )
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        ("assignee", "requires_review", "refusal"),
+        [
+            ("raphael-planner", True, "stored proposal task is invalid"),
+            (" Raphael-Verifier ", True, "stored proposal task is invalid"),
+            ("raphael-claude-worker", "yes", "stored proposal task is invalid"),
+            # The control: a worker may carry it, so the validation passes and
+            # the authority moves on to its next check.
+            ("raphael-claude-worker", True, "owner Project context does not match"),
+        ],
+    )
+    def test_a_new_project_task_carrying_the_requirement_on_a_read_only_role_authorizes_no_run(
+        self, assignee, requires_review, refusal,
+    ):
+        """A stored new-Project proposal is validated per task before any run.
+
+        The apply path refuses the review requirement on a read-only role and
+        a non-boolean value; the authority refuses the same stored proposal
+        first, so no run is reserved for work that can never be committed.
+        """
+        conversation = "raphael-owner-" + "4" * 32
+        response_id = "resp_native_reviewed_new_project"
+        idempotency_key = "conversation-" + hashlib.sha256(
+            response_id.encode("utf-8")
+        ).hexdigest()
+        proposal = _owner_new_proposal(tasks=[{
+            "title": "Draft the workshop plan",
+            "body": "Prepare the private workshop plan.",
+            "assignee": assignee,
+            "responsibility": "R14",
+            "execution_tier": "deep",
+            "parents": [],
+            "requires_review": requires_review,
+        }])
+        authority = {
+            "proposal_profile": "default",
+            "conversation": conversation,
+            "response_id": response_id,
+            "claim_id": "claim_" + "6" * 32,
+            "operation": "owner_task_graph_commit",
+            "idempotency_key": idempotency_key,
+            "payload": {},
+        }
+        context = {
+            "profile": "default",
+            "mode": "new",
+            "project_slug": None,
+            "project_name": "Another project",
+        }
+        store = ResponseStore(max_size=10)
+        adapter = APIServerAdapter.__new__(APIServerAdapter)
+        adapter._response_store = store
+        try:
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": "Prepare the workshop"},
+                    {"role": "assistant", "content": json.dumps(proposal)},
+                ],
+            })
+            assert store.set_conversation(
+                conversation, response_id, owner_proposal=True,
+            ) is True
+            with pytest.raises(ValueError, match=refusal):
+                adapter._validated_owner_proposal_authority(
+                    authority, context, "default",
+                )
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("retained", [False, True])
+    def test_a_new_project_task_stating_false_authorizes_the_payload_without_it(
+        self, retained,
+    ):
+        """An explicit ``requires_review: false`` derives the same payload as
+        an absent key, exactly as the Workspace forwards it; a run payload that
+        retains the false is a different approval.
+        """
+        conversation = "raphael-owner-" + "4" * 32
+        response_id = "resp_native_new_project_false"
+        idempotency_key = "conversation-" + hashlib.sha256(
+            response_id.encode("utf-8")
+        ).hexdigest()
+        task = {
+            "title": "Draft the workshop plan",
+            "body": "Prepare the private workshop plan.",
+            "assignee": "raphael-claude-worker",
+            "responsibility": "R14",
+            "execution_tier": "deep",
+            "parents": [],
+            "requires_review": False,
+        }
+        proposal = _owner_new_proposal(tasks=[task])
+        forwarded = {key: value for key, value in task.items() if key != "requires_review"}
+        if retained:
+            forwarded["requires_review"] = False
+        payload = {
+            "idempotency_key": idempotency_key,
+            "mode": "new",
+            "project_name": proposal["project_name"],
+            "project_description": proposal["project_description"],
+            "project_id": None,
+            "request_title": proposal["request_title"],
+            "specification": proposal["specification"],
+            "current_milestone": proposal["current_milestone"],
+            "owner_visible_result": proposal["owner_visible_result"],
+            "root_assignee": "default",
+            "tasks": [forwarded],
+            "later_milestones": proposal["later_milestones"],
+        }
+        authority = {
+            "proposal_profile": "default",
+            "conversation": conversation,
+            "response_id": response_id,
+            "claim_id": "claim_" + "6" * 32,
+            "operation": "owner_task_graph_commit",
+            "idempotency_key": idempotency_key,
+            "payload": payload,
+        }
+        context = {
+            "profile": "default",
+            "mode": "new",
+            "project_slug": None,
+            "project_name": proposal["project_name"],
+        }
+        store = ResponseStore(max_size=10)
+        adapter = APIServerAdapter.__new__(APIServerAdapter)
+        adapter._response_store = store
+        try:
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": "Prepare the workshop"},
+                    {"role": "assistant", "content": json.dumps(proposal)},
+                ],
+            })
+            assert store.set_conversation(
+                conversation, response_id, owner_proposal=True,
+            ) is True
+            with patch(
+                "hermes_cli.profiles.list_profiles",
+                return_value=[types.SimpleNamespace(name="default")],
+            ):
+                if retained:
+                    with pytest.raises(ValueError, match="run payload differs"):
+                        adapter._validated_owner_proposal_authority(
+                            authority, context, "default",
+                        )
+                else:
+                    binding = adapter._validated_owner_proposal_authority(
+                        authority, context, "default",
+                    )
+                    assert binding["operation"] == "owner_task_graph_commit"
         finally:
             store.close()
 

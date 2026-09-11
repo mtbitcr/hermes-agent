@@ -475,17 +475,25 @@ def test_a_committed_task_without_the_requirement_still_refuses_review_handoff(c
         assert after[column] == before[column]
 
 
-def test_commit_refuses_the_requirement_on_a_read_only_audit_review_task(ctx):
-    """REGRESSION: the requirement can never leak onto the audit review task."""
-    _install_profiles(REVIEWER)
-    args = _task_graph_args(idempotency_key="graph-verifier-requires-review")
-    args["tasks"][1]["assignee"] = REVIEWER
+@pytest.mark.parametrize("assignee", [REVIEWER, "raphael-planner"])
+def test_commit_refuses_the_requirement_on_a_read_only_audit_review_task(
+    ctx, assignee,
+):
+    """REGRESSION: the requirement can never leak onto a read-only role's task.
+
+    The audit review task IS the review and the planner only reads the
+    Project; the owner workspace refuses both, so the commit path must too.
+    """
+    _install_profiles(assignee)
+    args = _task_graph_args(idempotency_key=f"graph-{assignee}-requires-review")
+    args["tasks"][1]["assignee"] = assignee
     args["tasks"][1]["requires_review"] = True
 
     with pytest.raises(Exception) as excinfo:
         _commit_task_graph(ctx, **args)
     assert getattr(excinfo.value, "code", None) == "invalid_argument"
     assert "requires_review" in str(excinfo.value)
+    assert assignee in str(excinfo.value)
 
 
 def test_a_committed_read_only_audit_review_task_is_unchanged(ctx):

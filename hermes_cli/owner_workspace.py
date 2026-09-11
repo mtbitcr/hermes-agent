@@ -137,6 +137,13 @@ CREATE TABLE IF NOT EXISTS owner_workspace_receipts (
 """
 
 
+# Profiles that only read the Project: the planner shapes the plan and the
+# verifier IS the independent-review lane, so neither can be work awaiting a
+# review. Mirrored by the owner workspace's proposal parser and by the API
+# server's proposal authority.
+REVIEW_REQUIREMENT_REFUSED_ASSIGNEES = frozenset({"raphael-planner", "raphael-verifier"})
+
+
 class OwnerWorkspaceError(Exception):
     """A validation/conflict/recovery failure the tool layer renders as an error."""
 
@@ -1245,18 +1252,19 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
             # states it (same rule as ``owned_paths``), so the request digest
             # of every proposal that does not ask for review is unchanged.
             entry["requires_review"] = True
+        if requires_review and assignee in REVIEW_REQUIREMENT_REFUSED_ASSIGNEES:
+            # A read-only role is never parked for review: the verifier IS the
+            # independent-review lane and the planner only reads the Project.
+            # Refused here, before any verifier-specific handling, so the
+            # requirement cannot leak into a task type whose semantics must
+            # not change.
+            raise OwnerWorkspaceError(
+                "invalid_argument",
+                f"tasks[{index}].requires_review is not accepted for "
+                f"{assignee}: a read-only role is the review or the plan, "
+                "not work awaiting a review",
+            )
         if assignee == "raphael-verifier":
-            # The pre-existing read-only audit review task. It IS the
-            # independent-review lane, so it can never itself be parked for
-            # review: refusing here keeps the new requirement from leaking into
-            # a task type whose semantics must not change.
-            if requires_review:
-                raise OwnerWorkspaceError(
-                    "invalid_argument",
-                    f"tasks[{index}].requires_review is not accepted for "
-                    "raphael-verifier: a read-only review task is the review, "
-                    "not work awaiting one",
-                )
             scope = (
                 _normalize_ownership_scope(
                     raw.get("owned_paths"), f"tasks[{index}]",
@@ -4476,17 +4484,17 @@ def _normalize_project_task_spec(
         # change states it (same rule as ``owned_paths``), so the request
         # digest of every plan that does not ask for review is unchanged.
         result["requires_review"] = True
+    if requires_review and result["assignee"] in REVIEW_REQUIREMENT_REFUSED_ASSIGNEES:
+        # A read-only role is never parked awaiting a review: the verifier IS
+        # the independent-review lane and the planner only reads the Project.
+        # Refused before any other role-specific handling, so a change that is
+        # wrong in two ways still reports this refusal.
+        raise OwnerWorkspaceError(
+            "invalid_argument",
+            f"{field}.requires_review is not accepted for {result['assignee']}: "
+            "a read-only role is the review or the plan, not work awaiting a review",
+        )
     if result["assignee"] == "raphael-verifier":
-        # The read-only audit review task IS the independent-review lane, so it
-        # can never itself be parked awaiting one. Refused before any other
-        # verifier-specific handling, so a change that is wrong in two ways
-        # still reports this refusal.
-        if requires_review:
-            raise OwnerWorkspaceError(
-                "invalid_argument",
-                f"{field}.requires_review is not accepted for raphael-verifier: "
-                "a read-only review task is the review, not work awaiting one",
-            )
         scope = (
             _normalize_ownership_scope(raw["owned_paths"], field)
             if "owned_paths" in raw
