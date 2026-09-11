@@ -753,6 +753,92 @@ class TestOwnerWorkspaceRunContext:
         finally:
             store.close()
 
+    @pytest.mark.parametrize("retained", [False, True])
+    def test_a_new_project_task_stating_false_authorizes_the_payload_without_it(
+        self, retained,
+    ):
+        """An explicit ``requires_review: false`` derives the same payload as
+        an absent key, exactly as the Workspace forwards it; a run payload that
+        retains the false is a different approval.
+        """
+        conversation = "raphael-owner-" + "4" * 32
+        response_id = "resp_native_new_project_false"
+        idempotency_key = "conversation-" + hashlib.sha256(
+            response_id.encode("utf-8")
+        ).hexdigest()
+        task = {
+            "title": "Draft the workshop plan",
+            "body": "Prepare the private workshop plan.",
+            "assignee": "raphael-claude-worker",
+            "responsibility": "R14",
+            "execution_tier": "deep",
+            "parents": [],
+            "requires_review": False,
+        }
+        proposal = _owner_new_proposal(tasks=[task])
+        forwarded = {key: value for key, value in task.items() if key != "requires_review"}
+        if retained:
+            forwarded["requires_review"] = False
+        payload = {
+            "idempotency_key": idempotency_key,
+            "mode": "new",
+            "project_name": proposal["project_name"],
+            "project_description": proposal["project_description"],
+            "project_id": None,
+            "request_title": proposal["request_title"],
+            "specification": proposal["specification"],
+            "current_milestone": proposal["current_milestone"],
+            "owner_visible_result": proposal["owner_visible_result"],
+            "root_assignee": "default",
+            "tasks": [forwarded],
+            "later_milestones": proposal["later_milestones"],
+        }
+        authority = {
+            "proposal_profile": "default",
+            "conversation": conversation,
+            "response_id": response_id,
+            "claim_id": "claim_" + "6" * 32,
+            "operation": "owner_task_graph_commit",
+            "idempotency_key": idempotency_key,
+            "payload": payload,
+        }
+        context = {
+            "profile": "default",
+            "mode": "new",
+            "project_slug": None,
+            "project_name": proposal["project_name"],
+        }
+        store = ResponseStore(max_size=10)
+        adapter = APIServerAdapter.__new__(APIServerAdapter)
+        adapter._response_store = store
+        try:
+            store.put(response_id, {
+                "response": {"id": response_id, "created_at": 1},
+                "conversation_history": [
+                    {"role": "user", "content": "Prepare the workshop"},
+                    {"role": "assistant", "content": json.dumps(proposal)},
+                ],
+            })
+            assert store.set_conversation(
+                conversation, response_id, owner_proposal=True,
+            ) is True
+            with patch(
+                "hermes_cli.profiles.list_profiles",
+                return_value=[types.SimpleNamespace(name="default")],
+            ):
+                if retained:
+                    with pytest.raises(ValueError, match="run payload differs"):
+                        adapter._validated_owner_proposal_authority(
+                            authority, context, "default",
+                        )
+                else:
+                    binding = adapter._validated_owner_proposal_authority(
+                        authority, context, "default",
+                    )
+                    assert binding["operation"] == "owner_task_graph_commit"
+        finally:
+            store.close()
+
     @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
     def test_new_mode_still_requires_a_name(self, blank):
         config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}

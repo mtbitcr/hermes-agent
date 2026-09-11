@@ -12985,18 +12985,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 owner_project_name,
             )
 
-            # The stored tasks travel into the expected payload as they are, so
-            # the one rule the apply path enforces per task before it commits
-            # (the review requirement: a boolean, never true on a read-only
-            # role) is enforced here too, before any run is reserved.
-            tasks = candidate.get("tasks")
-            if not isinstance(tasks, list):
+            # The stored tasks travel into the expected payload as the
+            # Workspace forwards them: the review requirement only when true
+            # (an explicit false and an absent key derive the same payload),
+            # and the one rule the apply path enforces per task before it
+            # commits (a boolean, never true on a read-only role) is enforced
+            # here too, before any run is reserved.
+            stored_tasks = candidate.get("tasks")
+            if not isinstance(stored_tasks, list):
                 raise ValueError("stored proposal task is invalid")
-            for task in tasks:
+            expected_tasks: List[Dict[str, Any]] = []
+            for task in stored_tasks:
                 if not isinstance(task, dict):
                     raise ValueError("stored proposal task is invalid")
                 try:
-                    _owner_review_requirement(task)
+                    expected_tasks.append(clean(_owner_task_payload(task)))
                 except ValueError:
                     raise ValueError("stored proposal task is invalid") from None
             try:
@@ -13026,7 +13029,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "current_milestone": clean(candidate.get("current_milestone")),
                 "owner_visible_result": clean(candidate.get("owner_visible_result")),
                 "root_assignee": root_assignee,
-                "tasks": clean(candidate.get("tasks")),
+                "tasks": expected_tasks,
                 "later_milestones": clean(candidate.get("later_milestones")),
             }
         else:
