@@ -782,6 +782,385 @@ def test_an_ordinary_completion_also_refuses_a_parent_that_moves_in_the_window(
 
 
 # ---------------------------------------------------------------------------
+# Finding 1b: the human approval is authorized from the parked provenance,
+# never from a scope proof against the reviewer's EMPTY scope
+#
+# The park leaves the row holding ``owned_paths = []`` — the reviewer's
+# read-only boundary — while the worktree still carries the implementation
+# commits. Proving that worktree against that row asks "which of these commits
+# are inside the empty set", so every implementation path reads as outside the
+# declared ownership and the proof refuses the approval. The documented human
+# approval (a completion made directly from ``review`` with no reviewer run
+# claimed — the dashboard's status-to-done route) must therefore be classified
+# and authorized BEFORE any live receipt is derived, from the provenance the
+# park persisted.
+#
+# The regression scenario is followed by its two controls, so the pair
+# "relaxed / not relaxed" differs in exactly one variable each time and the
+# scope proof is proven to be still armed everywhere else.
+# ---------------------------------------------------------------------------
+
+
+def test_a_human_approval_from_the_review_lane_needs_no_live_scope_proof(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """THE REGRESSION: approving a parked card with no reviewer run claimed.
+
+    This is the shape the committed-review-requirement contract asserts and
+    the dashboard's status-to-done route uses: the card sits in ``review``, no
+    reviewer run has been claimed, and a human says "done". Nothing on that row
+    can prove the implementation — the park converted it to the reviewer's
+    empty read-only scope on purpose — so the approval is authorized from the
+    kernel-proven provenance the park persisted, and the empty-scope proof is
+    not consulted at all.
+
+    All four facts the approval owes the board land in ONE transaction, which
+    is why they are read back from the committed row in a single ``SELECT`` and
+    asserted as one tuple: the exact implementation head, the restored
+    implementation ``owned_paths``, the restored ``integrates_parent_heads``
+    flag, and ``done``.
+    """
+    _nominate(monkeypatch, REVIEWER)
+    repo = _repo(tmp_path)
+    with kb.connect() as conn:
+        parent = _scoped_task(
+            conn, repo,
+            title="parent slice",
+            branch="feature/human-approval-parent",
+            owned_paths=["src/parent"],
+        )
+        parent_workspace = _materialize(conn, parent, claimer=f"{IMPLEMENTER}:1")
+        parent_head = _commit_file(
+            parent_workspace, "src/parent/first.py", "first = True\n", "feat: first",
+        )
+        assert kb.complete_task(conn, parent, summary="parent done") is True
+        assert kb.get_task(conn, parent).head_commit == parent_head
+
+        impl = _scoped_task(
+            conn, repo,
+            title="implement under review, approved by a human",
+            branch="feature/human-approval",
+            owned_paths=["."],
+            parents=[parent],
+            integrates_parent_heads=True,
+            requires_review=True,
+            assignee="builder",
+        )
+        workspace = _materialize(conn, impl, claimer="builder:1")
+        _git(workspace, "merge", "--no-edit", parent_head)
+        implementation_head = _commit_file(
+            workspace, "src/app/main.py", "ok = True\n", "feat: implement",
+        )
+
+        handover_run = kb.get_task(conn, impl).current_run_id
+        assert kb.complete_task(
+            conn, impl, summary="ready for review", expected_run_id=handover_run,
+        ) is True
+
+        # The park this approval has to be able to end: the reviewer's empty
+        # read-only scope on the row, the implementation provenance beside it,
+        # and NO run claimed by anyone.
+        parked = kb.get_task(conn, impl)
+        assert parked.status == "review"
+        assert parked.assignee == REVIEWER
+        assert parked.owned_paths == []
+        assert parked.integrates_parent_heads is False
+        assert parked.current_run_id is None
+        assert parked.head_commit is None
+        assert kb._latest_review_head_provenance(conn, impl) == implementation_head
+        assert kb._latest_review_scope_provenance(conn, impl) == {
+            "owned_paths": ["."],
+            "integrates_parent_heads": True,
+        }
+
+        # The approval itself: straight from ``review``, no reviewer run, no
+        # run expectation — exactly what a human clicking "done" sends.
+        assert kb.complete_task(
+            conn, impl, summary="approved from the board",
+        ) is True, (
+            "a human approving a parked review must not be refused by a scope "
+            "proof run against the reviewer's empty read-only scope"
+        )
+
+        row = conn.execute(
+            "SELECT status, head_commit, owned_paths, integrates_parent_heads, "
+            "completed_at FROM tasks WHERE id = ?",
+            (impl,),
+        ).fetchone()
+        assert (
+            row["status"],
+            row["head_commit"],
+            json.loads(row["owned_paths"]),
+            row["integrates_parent_heads"],
+        ) == ("done", implementation_head, ["."], 1), (
+            "the head, the restored scope, the restored integration flag and "
+            "``done`` must all land together"
+        )
+        assert row["completed_at"] is not None
+
+        # One park, one completion, and the empty-scope proof never ran against
+        # this call: a scope refusal would have left its own durable event.
+        assert len(_events(conn, impl, "review_requested")) == 1
+        assert len(_events(conn, impl, "completed")) == 1
+        assert _events(conn, impl, "completion_blocked_file_scope") == []
+
+        # The restored receipt is usable downstream, which is the point of
+        # restoring it: a child that must contain every exact parent head
+        # completes against the approved commit.
+        child = _scoped_task(
+            conn, repo,
+            title="integrate the human-approved slice",
+            branch="feature/human-approval-child",
+            owned_paths=["."],
+            parents=[impl],
+            integrates_parent_heads=True,
+            assignee="builder",
+        )
+        child_workspace = _materialize(conn, child, claimer="builder:2")
+        _git(child_workspace, "merge", "--no-edit", implementation_head)
+        assert kb.complete_task(conn, child, summary="integrated") is True
+        assert kb.latest_run(conn, child).metadata["execution_receipt"][
+            "parent_heads"
+        ] == [{"task_id": impl, "head_commit": implementation_head}]
+
+
+def test_a_human_approval_still_refuses_a_parked_head_that_lost_its_parent(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The relaxed path drops the empty-scope proof and nothing else.
+
+    Skipping a proof that can only ever answer "outside the empty set" is not
+    the same as skipping the proofs that still mean something. The approval-time
+    parent-head containment re-proof is exactly such a proof — containment was
+    a claim about the parents AS THEY WERE at the park, and a parent is free to
+    move while the card waits for a human — so it must still refuse the
+    no-reviewer-run approval, and refuse it with no state change at all.
+    """
+    _nominate(monkeypatch, REVIEWER)
+    repo = _repo(tmp_path)
+    with kb.connect() as conn:
+        parent = _scoped_task(
+            conn, repo,
+            title="parent slice",
+            branch="feature/human-drift-parent",
+            owned_paths=["src/parent"],
+        )
+        parent_workspace = _materialize(conn, parent, claimer=f"{IMPLEMENTER}:1")
+        first_head = _commit_file(
+            parent_workspace, "src/parent/first.py", "first = True\n", "feat: first",
+        )
+        assert kb.complete_task(conn, parent, summary="parent done") is True
+
+        integrator = _scoped_task(
+            conn, repo,
+            title="integrate, then wait for a human",
+            branch="feature/human-drift",
+            owned_paths=["."],
+            parents=[parent],
+            integrates_parent_heads=True,
+            requires_review=True,
+            assignee="builder",
+        )
+        integration_workspace = _materialize(conn, integrator, claimer="builder:1")
+        _git(integration_workspace, "merge", "--no-edit", first_head)
+        integrated_head = _git(integration_workspace, "rev-parse", "HEAD")
+
+        handover_run = kb.get_task(conn, integrator).current_run_id
+        assert kb.complete_task(
+            conn, integrator, summary="ready for review",
+            expected_run_id=handover_run,
+        ) is True
+        assert kb.get_task(conn, integrator).current_run_id is None
+
+        # The dependency moves while the card waits on the review lane.
+        drifted_head = _commit_file(
+            parent_workspace, "src/parent/second.py", "second = True\n",
+            "feat: second",
+        )
+        conn.execute(
+            "UPDATE tasks SET head_commit = ? WHERE id = ?",
+            (drifted_head, parent),
+        )
+        conn.commit()
+        assert drifted_head != integrated_head
+
+        assert kb.complete_task(
+            conn, integrator, summary="approved from the board",
+        ) is False, (
+            "a human approval may not finish a card whose parent-head "
+            "integration promise has lapsed"
+        )
+        refused = kb.get_task(conn, integrator)
+        assert refused.status == "review"
+        assert refused.completed_at is None
+        assert refused.head_commit is None
+        assert refused.owned_paths == []
+        assert refused.integrates_parent_heads is False
+        assert _events(conn, integrator, "completed") == []
+
+        # And the refusal is about the drift alone: with the parent back at the
+        # head the parked commit actually contains, the same call approves.
+        conn.execute(
+            "UPDATE tasks SET head_commit = ? WHERE id = ?", (first_head, parent),
+        )
+        conn.commit()
+        assert kb.complete_task(
+            conn, integrator, summary="approved from the board",
+        ) is True
+        approved = kb.get_task(conn, integrator)
+        assert approved.status == "done"
+        assert approved.head_commit == integrated_head
+        assert approved.owned_paths == ["."]
+        assert approved.integrates_parent_heads is True
+
+
+def test_control_a_a_reviewer_run_approval_is_unchanged(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """CONTROL A: the same card, approved from a genuine reviewer run.
+
+    One variable apart from the regression scenario above — the reviewer
+    actually claims the card out of the review lane, so the completion arrives
+    from a run the kernel recognises as read-only. That leg was never broken
+    and must stay exactly as it is: the read-only run derives no receipt, the
+    parked head fills the gap, and the same four facts land together.
+    """
+    _nominate(monkeypatch, REVIEWER)
+    repo = _repo(tmp_path)
+    with kb.connect() as conn:
+        parent = _scoped_task(
+            conn, repo,
+            title="parent slice",
+            branch="feature/reviewer-run-parent",
+            owned_paths=["src/parent"],
+        )
+        parent_workspace = _materialize(conn, parent, claimer=f"{IMPLEMENTER}:1")
+        parent_head = _commit_file(
+            parent_workspace, "src/parent/first.py", "first = True\n", "feat: first",
+        )
+        assert kb.complete_task(conn, parent, summary="parent done") is True
+
+        impl = _scoped_task(
+            conn, repo,
+            title="implement under review, approved by its reviewer",
+            branch="feature/reviewer-run",
+            owned_paths=["."],
+            parents=[parent],
+            integrates_parent_heads=True,
+            requires_review=True,
+            assignee="builder",
+        )
+        workspace = _materialize(conn, impl, claimer="builder:1")
+        _git(workspace, "merge", "--no-edit", parent_head)
+        implementation_head = _commit_file(
+            workspace, "src/app/main.py", "ok = True\n", "feat: implement",
+        )
+        handover_run = kb.get_task(conn, impl).current_run_id
+        assert kb.complete_task(
+            conn, impl, summary="ready for review", expected_run_id=handover_run,
+        ) is True
+
+        review = kb.claim_review_task(conn, impl, claimer=f"{REVIEWER}:1")
+        assert review is not None
+        # A run genuinely claimed OUT of review, which is what makes this the
+        # other approval shape rather than the relaxed one.
+        assert kb.run_claimed_from_review(
+            conn, impl, int(review.current_run_id),
+        ) is True
+        assert kb.get_task(conn, impl).status == "running"
+
+        assert kb.complete_task(
+            conn, impl, summary="reviewed and approved",
+            expected_run_id=review.current_run_id,
+        ) is True
+
+        row = conn.execute(
+            "SELECT status, head_commit, owned_paths, integrates_parent_heads "
+            "FROM tasks WHERE id = ?",
+            (impl,),
+        ).fetchone()
+        assert (
+            row["status"],
+            row["head_commit"],
+            json.loads(row["owned_paths"]),
+            row["integrates_parent_heads"],
+        ) == ("done", implementation_head, ["."], 1)
+        assert _events(conn, impl, "completion_blocked_file_scope") == []
+        assert len(_events(conn, impl, "completed")) == 1
+
+
+def test_control_b_an_ordinary_scoped_completion_still_proves_its_scope(
+    kanban_home, tmp_path,
+):
+    """CONTROL B: no review requirement, so nothing about the proof changes.
+
+    This is the test that would catch a fix which "solved" the regression by
+    disabling the scope proof. An ordinary scoped worker completion still
+    derives its exact receipt from the worktree, and a commit that touches a
+    path outside the declared ownership is still refused — with the same
+    diagnostic, the same durable ``completion_blocked_file_scope`` event, and
+    the card left running.
+    """
+    repo = _repo(tmp_path)
+    with kb.connect() as conn:
+        clean = _scoped_task(
+            conn, repo,
+            title="ordinary scoped work",
+            branch="feature/plain-clean",
+            owned_paths=["src/app"],
+        )
+        clean_workspace = _materialize(conn, clean, claimer=f"{IMPLEMENTER}:1")
+        clean_base = kb.get_task(conn, clean).base_commit
+        clean_head = _commit_file(
+            clean_workspace, "src/app/main.py", "ok = True\n", "feat: in scope",
+        )
+        clean_run = kb.get_task(conn, clean).current_run_id
+        assert kb.complete_task(
+            conn, clean, summary="done", expected_run_id=clean_run,
+        ) is True
+
+        landed = kb.get_task(conn, clean)
+        assert landed.status == "done"
+        assert landed.head_commit == clean_head
+        assert landed.owned_paths == ["src/app"]
+        receipt = kb.latest_run(conn, clean).metadata["execution_receipt"]
+        assert receipt["base_commit"] == clean_base
+        assert receipt["head_commit"] == clean_head
+        assert receipt["owned_paths"] == ["src/app"]
+        assert receipt["changed_paths"] == ["src/app/main.py"]
+
+        # …and the boundary is still enforced, on a card with no review
+        # requirement anywhere near it.
+        strays = _scoped_task(
+            conn, repo,
+            title="ordinary scoped work that strays",
+            branch="feature/plain-stray",
+            owned_paths=["src/app"],
+        )
+        stray_workspace = _materialize(conn, strays, claimer=f"{IMPLEMENTER}:2")
+        _commit_file(
+            stray_workspace, "src/app/main.py", "ok = True\n", "feat: in scope",
+        )
+        _commit_file(
+            stray_workspace, "src/other/theirs.py", "mine = True\n",
+            "feat: out of scope",
+        )
+        stray_run = kb.get_task(conn, strays).current_run_id
+        with pytest.raises(kb.WorktreeScopeError, match="outside declared ownership"):
+            kb.complete_task(
+                conn, strays, summary="done", expected_run_id=stray_run,
+            )
+        refused = kb.get_task(conn, strays)
+        assert refused.status == "running"
+        assert refused.head_commit is None
+        assert refused.completed_at is None
+        assert _events(conn, strays, "completed") == []
+        assert kb.list_events(conn, strays)[-1].kind == (
+            "completion_blocked_file_scope"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Finding 2: the absent-reviewer park on owner-governed work
 # ---------------------------------------------------------------------------
 

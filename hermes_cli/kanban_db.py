@@ -22211,6 +22211,83 @@ def _is_review_approval(
     return run_id is not None and run_claimed_from_review(conn, task_id, int(run_id))
 
 
+def _is_parked_review_approval(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether this completion is the HUMAN approval of a card parked for review.
+
+    The narrower of the two shapes :func:`_is_review_approval` admits, and the
+    only one that is authorized WITHOUT a live scope proof — so it is asked as
+    its own question, from the persisted row alone, BEFORE
+    :func:`complete_task` derives any implementation receipt.
+
+    Why it cannot be authorized by a live proof at all: the park converted the
+    card to the reviewer's READ-ONLY scope (``owned_paths = []``,
+    ``integrates_parent_heads = 0``) while the worktree still carries the
+    implementation commits. Running :func:`_verify_scoped_worktree_completion`
+    against that row asks "which of these commits are inside the empty set",
+    and the answer for a real implementation is always "none of them" — so the
+    proof raises :class:`WorktreeScopeError` on work the kernel had ALREADY
+    proven clean and in-bounds one handover earlier. There is nothing
+    legitimate left for it to prove here: the scope on the row is the
+    reviewer's, not the implementer's, and the implementer's scope and head are
+    durable provenance on the park's own ``review_requested`` event
+    (:func:`_latest_review_scope_provenance`,
+    :func:`_latest_review_head_provenance`). The approval consumes those and
+    re-proves what can still lapse — parent-head containment, re-checked
+    against the parents as they stand now and re-read byte for byte inside the
+    write transaction (:func:`_review_approval_head`).
+
+    So this answers ``True`` only for a row that IS a park awaiting a verdict,
+    and every conjunct is load-bearing rather than defensive dressing:
+
+    * ``status == 'review'`` — the card is literally sitting on the review
+      lane. Any other status is an ordinary completion and keeps the scope
+      proof, whatever else it looks like.
+    * ``current_run_id IS NULL`` — nobody has claimed it. A reviewer run is
+      claimed OUT of review (:func:`claim_review_task` moves the row to
+      ``running``), so its own verdict is the other approval shape entirely and
+      keeps the current path unchanged. An expectation the CALLER passes is not
+      consulted: the classification reads the row, so a forged
+      ``expected_run_id`` cannot reach this path — and one that does not match
+      the row still fails the terminal ``UPDATE``'s run guard exactly as before.
+    * ``requires_review`` — only work whose committed specification carries the
+      review requirement. That requirement is what makes the park a mandated
+      phase of the work rather than an optional detour.
+    * the reviewer's empty read-only scope is actually installed — the exact
+      shape :func:`request_review` writes, and the exact shape the proof cannot
+      speak about. A row in ``review`` still holding a mutating boundary is not
+      a park this kernel made, and it keeps its proof.
+    * the park recorded implementation provenance. This is the proof that the
+      card was PARKED and not merely moved: without a ``review_requested``
+      event carrying the implementer's scope there is nothing kernel-proven to
+      consume, so there is no relaxed authorization to grant.
+
+    Anything else — any other status, any claimed run, a card that was never
+    parked, a card whose specification never required review — falls through to
+    the unchanged verification path. The gate fails CLOSED: an unrecognised
+    shape keeps the scope proof rather than skipping it.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id, requires_review, owned_paths, "
+        "integrates_parent_heads FROM tasks "
+        "WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if row["status"] != "review" or row["current_run_id"] is not None:
+        return False
+    if not row["requires_review"]:
+        return False
+    if _decode_owned_paths(row["owned_paths"]) != [] or row[
+        "integrates_parent_heads"
+    ]:
+        return False
+    # The park's own record of what the implementation was allowed to touch.
+    # Its absence means this row was never parked by this kernel, which is
+    # exactly the case that must not reach the relaxed path.
+    return _latest_review_scope_provenance(conn, task_id) is not None
+
+
 def _review_approval_head(
     conn: sqlite3.Connection,
     task_id: str,
@@ -22228,6 +22305,13 @@ def _review_approval_head(
     because a run that actually proved a head just now is a stronger fact than
     a head proven before the review. The persisted head is the fallback, not
     the override.
+
+    For the human approval of a parked card (:func:`_is_parked_review_approval`)
+    there is no live receipt at all, by construction rather than by accident:
+    the row carries the reviewer's empty scope, nothing on it could prove the
+    implementation, and :func:`complete_task` therefore derives no receipt for
+    that call. The persisted head is that approval's whole answer — which is
+    why the re-proof below is not optional for it.
 
     The head is also re-PROVEN, not merely restored. When the handover recorded
     ``integrates_parent_heads``, containment is a claim about the parents as
@@ -22349,6 +22433,19 @@ def complete_task(
     the exact ``head_commit`` the handover proved — in the one ``UPDATE`` that
     writes ``done``.
 
+    **A human approval of a parked card is classified BEFORE any live
+    implementation receipt is derived** (:func:`_is_parked_review_approval`),
+    and it derives none. The park left the row holding the reviewer's EMPTY
+    read-only scope, so a worktree proof against that row reads every
+    implementation commit as out of bounds and refuses the very approval the
+    review lane exists to accept. Its authority is the park's persisted
+    provenance instead — the implementation head and scope the kernel proved at
+    the handover — plus the approval-time re-proof of parent-head containment
+    and its in-transaction byte-for-byte re-read, both of which still run. No
+    other completion is relaxed: a reviewer's own verdict (a run claimed out of
+    review) and an ordinary scoped worker completion keep the full scope proof,
+    with identical refusals and identical receipts.
+
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
     a claim/start/complete sequence. ``review`` is accepted so a human
@@ -22447,11 +22544,38 @@ def complete_task(
             )
             return False
 
+    # ... and WHAT this call is, likewise, before any of it is acted on. The
+    # human approval of a card parked for review is classified HERE, ahead of
+    # every scope derivation below, because the row it arrives on cannot answer
+    # the question the derivation would ask. The park replaced the
+    # implementer's boundary with the reviewer's READ-ONLY one, so proving the
+    # worktree against the row proves the implementation is outside an EMPTY
+    # scope — which is true, and meaningless, and used to raise
+    # ``WorktreeScopeError`` over work this kernel had already proven clean and
+    # in-bounds at the handover one step earlier.
+    #
+    # The approval is authorized from that earlier proof instead: the exact
+    # implementation head and the exact implementation scope the park persisted
+    # on its own ``review_requested`` event, which the kernel derived itself and
+    # no caller can name. That is strictly stronger than what a proof against
+    # this row could say, and it is not taken on trust either — the one thing
+    # that can still have lapsed while the reviewer read, parent-head
+    # containment, is re-proven below against the parents AS THEY STAND NOW and
+    # re-read byte for byte inside the transaction that writes ``done``.
+    #
+    # Only that one shape is relaxed (:func:`_is_parked_review_approval` names
+    # every conjunct). A reviewer's own verdict arrives from a run claimed out
+    # of review and an ordinary scoped worker completion arrives from its own
+    # run; both keep the proof, unchanged, and so does every shape this gate
+    # does not recognise.
+    parked_review_approval = _is_parked_review_approval(conn, task_id)
+
     # Exact git evidence is derived by the kernel, never trusted from worker
     # prose/metadata. Legacy tasks (owned_paths=NULL) retain their historical
     # completion behaviour; explicitly scoped tasks fail closed.
     materialization_receipt: Optional[dict[str, Any]] = None
     materialization_start: Optional[str] = None
+    execution_receipt: Optional[dict[str, Any]] = None
     try:
         if patch_attachment_id is not None or merge_parent_heads:
             materialization_receipt, materialization_start = (
@@ -22463,7 +22587,14 @@ def complete_task(
                     expected_run_id=expected_run_id,
                 )
             )
-        execution_receipt = _verify_scoped_worktree_completion(conn, task_id)
+        if not parked_review_approval:
+            # Every OTHER completion, including the reviewer's own verdict,
+            # derives its receipt exactly as before. The remote handoff above
+            # is deliberately still attempted for the approval too: it refuses
+            # a read-only/unclaimed card on its own authority, and silently
+            # ignoring an uploaded patch would be a weaker answer than the
+            # refusal callers get today.
+            execution_receipt = _verify_scoped_worktree_completion(conn, task_id)
     except WorktreeScopeError as exc:
         with write_txn(conn):
             if materialization_start is not None:
