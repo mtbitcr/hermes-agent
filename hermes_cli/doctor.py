@@ -686,14 +686,14 @@ def check_certificates(should_fix: bool = False, issues: "list | None" = None) -
     re-verifying.
     """
     try:
-        from agent.ssl_guard import verify_ca_bundle
+        from agent.ssl_guard import verify_ca_bundle as verify_ca_bundle_with_fallback
         from agent.errors import SSLConfigurationError
     except Exception as e:
         check_warn("SSL certificate check skipped", str(e))
         return
 
     try:
-        verify_ca_bundle()
+        verify_ca_bundle_with_fallback()
         check_ok("SSL CA certificate bundle is valid")
         return
     except SSLConfigurationError as e:
@@ -748,7 +748,7 @@ def check_certificates(should_fix: bool = False, issues: "list | None" = None) -
     importlib.invalidate_caches()
 
     try:
-        verify_ca_bundle()
+        verify_ca_bundle_with_fallback()
         check_ok("SSL CA certificate bundle repaired (certifi reinstalled)")
     except SSLConfigurationError as e:
         check_fail("SSL CA certificate bundle still broken after reinstall", str(e))

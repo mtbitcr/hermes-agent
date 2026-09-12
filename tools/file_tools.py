@@ -1083,6 +1083,7 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
     try:
         from agent.file_safety import (
             get_container_mirror_warning,
+            get_cross_profile_warning,
             get_sandbox_mirror_warning,
         )
     except Exception:
@@ -1097,6 +1098,10 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
         resolved = str(_resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):
         resolved = filepath
+
+    warning = get_cross_profile_warning(resolved)
+    if warning is not None:
+        return warning
 
     warning = get_sandbox_mirror_warning(resolved)
     if warning is not None:
