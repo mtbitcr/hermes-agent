@@ -25,6 +25,24 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "compat_manifest.json"
 SKIP_DIRS = {".git", "node_modules", "website", "skills", "optional-skills", "apps", "evals", "build", "MagicMock", ".worktrees", "__pycache__"}
 
+# Fork-canonical facades: these modules define their names in this fork (upstream decomposed
+# them), so manifest entries naming them are skipped. Covers the nine fork-canonical modules
+# named by the migration policy plus agent.file_safety, whose three manifest entries are all
+# kind: "restored-def" with target "(deleted; BASE body restored)" — the fork restored the
+# real bodies, so there is no defining module to migrate to.
+FORK_CANONICAL_FACADES = frozenset({
+    "agent.auxiliary_client",             # auxiliary client
+    "agent.file_safety",                  # file-safety / cross-profile write guard
+    "cron.scheduler",                     # cron scheduler
+    "hermes_cli.dashboard_auth.audit",    # dashboard audit module
+    "hermes_cli.kanban_db",               # kanban kernel
+    "hermes_cli.web_server",              # dashboard/web server
+    "hermes_state",                       # state facade
+    "tools.approval",                     # approvals module
+    "tools.browser_tool",                 # browser tool
+    "tools.mcp_tool",                     # MCP tool
+})
+
 
 def _py_files():
     for p in ROOT.rglob("*.py"):
@@ -44,6 +62,8 @@ def main() -> int:
     entries = json.loads(MANIFEST.read_text(encoding="utf-8"))["entries"]
     compat: dict[str, set[str]] = {}
     for e in entries:
+        if e["facade"] in FORK_CANONICAL_FACADES:
+            continue
         compat.setdefault(e["facade"], set()).add(e["name"])
     facades = set(compat)
     hits: list[str] = []

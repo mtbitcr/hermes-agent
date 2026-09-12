@@ -835,7 +835,7 @@ def _fast_model_from_catalog(provider_id: str) -> str:
     """
     try:
         from hermes_cli.auth import resolve_api_key_provider_credentials
-        from hermes_cli.models import fetch_models_with_pricing
+        from hermes_cli.models_pricing import fetch_models_with_pricing
         from providers import get_provider_profile
 
         # The provider's own credentials, because most ``/v1/models`` endpoints
@@ -3855,7 +3855,8 @@ def _try_azure_foundry(
 
 def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
     try:
-        from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+        from agent.anthropic_adapter import build_anthropic_client
+        from agent.anthropic_credentials import resolve_anthropic_token
     except ImportError:
         return None, None
 
@@ -5145,7 +5146,7 @@ def _refresh_provider_credentials(provider: str) -> bool:
             _evict_cached_clients(normalized)
             return True
         if normalized == "anthropic":
-            from agent.anthropic_adapter import read_claude_code_credentials, _refresh_oauth_token, resolve_anthropic_token
+            from agent.anthropic_credentials import read_claude_code_credentials, _refresh_oauth_token, resolve_anthropic_token
 
             creds = read_claude_code_credentials()
             token = _refresh_oauth_token(creds) if isinstance(creds, dict) and creds.get("refreshToken") else None

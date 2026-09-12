@@ -7001,13 +7001,13 @@ def get_recommended_default_model(provider: str = ""):
         try:
             from hermes_cli.models import (
                 get_curated_nous_model_ids,
-                get_pricing_for_provider,
                 check_nous_free_tier,
                 partition_nous_models_by_tier,
                 pick_silent_default_model,
                 union_with_portal_free_recommendations,
                 union_with_portal_paid_recommendations,
             )
+            from hermes_cli.models_pricing import get_pricing_for_provider
             from hermes_cli.auth import get_provider_auth_state
 
             model_ids = get_curated_nous_model_ids()
@@ -10274,7 +10274,7 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
     double-counts the token and shadows a real ANTHROPIC_API_KEY.
     """
     try:
-        from agent.anthropic_adapter import (
+        from agent.anthropic_credentials import (
             read_hermes_oauth_credentials,
             _get_hermes_oauth_file,
         )
@@ -10339,7 +10339,7 @@ def _claude_code_only_status() -> Dict[str, Any]:
     when they also have a separate Hermes-managed PKCE login.
     """
     try:
-        from agent.anthropic_adapter import read_claude_code_credentials
+        from agent.anthropic_credentials import read_claude_code_credentials
         creds = read_claude_code_credentials()
     except Exception:
         creds = None
