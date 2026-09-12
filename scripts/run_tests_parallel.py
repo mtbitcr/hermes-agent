@@ -212,6 +212,20 @@ def _discover_files(roots: List[Path]) -> List[Path]:
     ``pytest tests/docker/`` does — the CI-level skip exists to keep
     the sharded matrix from blowing up, not to block targeted runs.
     """
+    # Fork (2026-09 sync): upstream test files whose subject implementation is dormant
+    # in this fork are listed in tests/fork_dormant_skips.txt and are excluded from
+    # sharded discovery (explicit CI file lists bypass conftest collect_ignore).
+    # A file the user names directly as a root still runs.
+    _fork_skips: set[Path] = set()
+    _skips_file = Path(__file__).resolve().parent.parent / "tests" / "fork_dormant_skips.txt"
+    try:
+        for _line in _skips_file.read_text(encoding="utf-8").splitlines():
+            _line = _line.strip()
+            if _line and not _line.startswith("#"):
+                _fork_skips.add((_skips_file.parent.parent / _line).resolve())
+    except OSError:
+        pass
+
     seen: set[Path] = set()
     out: List[Path] = []
     for root in roots:
@@ -238,6 +252,8 @@ def _discover_files(roots: List[Path]) -> List[Path]:
             if any(part in effective_skips for part in path.parts):
                 continue
             real = path.resolve()
+            if real in _fork_skips:
+                continue
             if real in seen:
                 continue
             seen.add(real)
