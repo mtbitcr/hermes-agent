@@ -36,6 +36,7 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 from tools import approval as approval_mod
+from tools import approval_gateway_wait
 
 
 # ---------------------------------------------------------------------------
@@ -44,21 +45,27 @@ from tools import approval as approval_mod
 
 
 @pytest.mark.parametrize(
-    ("smart_denied", "allow_permanent", "expected"),
+    ("smart_denied", "allow_session", "allow_permanent", "expected"),
     [
-        (False, True, ["once", "session", "always", "deny"]),
-        (False, False, ["once", "session", "deny"]),
-        (True, True, ["once", "deny"]),
-        (True, False, ["once", "deny"]),
+        (False, True, True, ["once", "session", "always", "deny"]),
+        (False, True, False, ["once", "session", "deny"]),
+        (False, False, True, ["once", "deny"]),
+        (False, False, False, ["once", "deny"]),
+        (True, True, True, ["once", "deny"]),
+        (True, False, False, ["once", "deny"]),
     ],
 )
 def test_approval_event_choices_follow_backend_capabilities(
-    smart_denied, allow_permanent, expected
+    smart_denied, allow_session, allow_permanent, expected
 ):
-    assert _approval_event_choices(
-        smart_denied=smart_denied,
-        allow_permanent=allow_permanent,
-    ) == expected
+    assert (
+        _approval_event_choices(
+            smart_denied=smart_denied,
+            allow_session=allow_session,
+            allow_permanent=allow_permanent,
+        )
+        == expected
+    )
 
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:
@@ -71,12 +78,35 @@ def _make_adapter(api_key: str = "") -> APIServerAdapter:
     return adapter
 
 
+def _claim_run(adapter: APIServerAdapter, run_id: str) -> None:
+    """Stamp *run_id* as owned by the unprefixed (default) request scope."""
+    request = MagicMock()
+    request.headers = {}
+    adapter._run_owners[run_id] = adapter._run_idempotency_scope(request)
+
+
 def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     """Create an aiohttp app with /v1/runs routes registered."""
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_post(
+        "/v1/room-members/invitations",
+        adapter._handle_room_member_invitation,
+    )
+    app.router.add_get(
+        "/v1/room-members/capabilities",
+        adapter._handle_room_member_capabilities,
+    )
+    app.router.add_post(
+        "/v1/room-members/grants/refresh",
+        adapter._handle_room_member_grant_refresh,
+    )
+    app.router.add_post(
+        "/v1/room-members/grants/revoke",
+        adapter._handle_room_member_grant_revoke,
+    )
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
@@ -336,7 +366,7 @@ def _make_slow_agent(**kwargs):
         ready.set()
         # Block until interrupt() is called
         interrupted.wait(timeout=10)
-        return {"final_response": "interrupted"}
+        return {"final_response": "interrupted", "interrupted": True}
 
     mock_agent.run_conversation.side_effect = _slow_run
     mock_agent.session_prompt_tokens = 0
@@ -362,6 +392,31 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_room_auth_is_validated_before_body_parse_or_work_reservation(
+        self, auth_adapter
+    ):
+        from gateway.platforms import api_server_runs
+
+        app = _create_runs_app(auth_adapter)
+        handler = AsyncMock()
+        with patch.object(api_server_runs, "_handle_runs", handler):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs",
+                    data="{this body must never be parsed",
+                    headers={
+                        "Authorization": "HermesRoom invalid-token",
+                        "Content-Type": "application/json",
+                    },
+                )
+                body = await response.json()
+
+        assert response.status == 401
+        assert body["error"]["code"] == "invalid_room_grant"
+        assert auth_adapter._pending_agent_requests == 0
+        handler.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
@@ -1780,6 +1835,59 @@ class TestStartRun:
             "runs route must bind chat_id so delegation dispatch sees a wake target"
         )
 
+    @staticmethod
+    async def _wait_completed(cli, run_id: str) -> None:
+        for _ in range(40):
+            status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+            if status["status"] == "completed":
+                return
+            await asyncio.sleep(0.05)
+        raise AssertionError(f"run {run_id} did not complete")
+
+    @staticmethod
+    def _capturing_agent(captured):
+        agent = MagicMock()
+        agent.run_conversation.side_effect = lambda **kwargs: captured.update(kwargs) or {"final_response": "done"}
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        return agent
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body, expected", [
+        ({"input": "hello", "author": {"id": "bot:dixie", "name": " dixie ", "is_bot": True, "role": "admin"}},
+         {"id": "bot:dixie", "name": "dixie", "is_bot": True}),
+        ({"input": "hello", "author": {"id": "bot:dixie", "name": "dixie", "is_bot": True, "origin": "cloud-1"}},
+         {"id": "bot:cloud-1/dixie", "name": "dixie", "is_bot": True}),
+        ({"input": "hello"}, "absent"),
+    ], ids=["author", "author with origin", "no author"])
+    async def test_start_passes_normalized_author_to_run_conversation(self, adapter, body, expected):
+        """A body ``author`` reaches ``run_conversation`` normalized; it labels memory only. Without one the
+        call keeps today's shape."""
+        app = _create_runs_app(adapter)
+        captured = {}
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=self._capturing_agent(captured)):
+                resp = await cli.post("/v1/runs", json=body)
+                assert resp.status == 202
+                await self._wait_completed(cli, (await resp.json())["run_id"])
+
+        assert captured["user_message"] == "hello"
+        assert captured.get("turn_author", "absent") == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("author", ["dixie", ["dixie"], 7])
+    async def test_start_rejects_non_object_author(self, adapter, author):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post("/v1/runs", json={"input": "hello", "author": author})
+                assert resp.status == 400
+                body = await resp.json()
+        assert body["error"]["code"] == "invalid_author"
+        assert body["error"]["message"] == "author must be an object"
+        mock_create.assert_not_called()
+        assert adapter._run_statuses == {}
+
 
     @pytest.mark.asyncio
     async def test_start_rejects_conflicting_route_and_request_provider(self):
@@ -2249,12 +2357,12 @@ class TestRunEvents:
                 assert auth_adapter._run_approval_sessions[attacker_run] == attacker_run
                 assert auth_adapter._run_approval_sessions[victim_run] != auth_adapter._run_approval_sessions[attacker_run]
 
-                victim_entry = approval_mod._ApprovalEntry({
+                victim_entry = approval_gateway_wait._ApprovalEntry({
                     "command": "bash -c victim-danger",
                     "description": "victim approval",
                     "pattern_keys": ["shell-c"],
                 })
-                attacker_entry = approval_mod._ApprovalEntry({
+                attacker_entry = approval_gateway_wait._ApprovalEntry({
                     "command": "bash -c attacker-danger",
                     "description": "attacker approval",
                     "pattern_keys": ["shell-c"],
@@ -2304,6 +2412,7 @@ class TestSteerRun:
         adapter._active_run_agents["run_123"] = agent
         adapter._run_streams["run_123"] = queue
         adapter._set_run_status("run_123", "running")
+        _claim_run(adapter, "run_123")
 
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post("/v1/runs/run_123/steer", json={"input": "tighten the ending"})
@@ -2336,6 +2445,7 @@ class TestSteerRun:
     async def test_steer_inactive_run_returns_409(self, adapter):
         app = _create_runs_app(adapter)
         adapter._set_run_status("run_done", "completed")
+        _claim_run(adapter, "run_done")
 
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post("/v1/runs/run_done/steer", json={"input": "hello"})
@@ -2351,6 +2461,7 @@ class TestSteerRun:
         agent.steer.return_value = True
         adapter._active_run_agents["run_123"] = agent
         adapter._set_run_status("run_123", "running")
+        _claim_run(adapter, "run_123")
 
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post("/v1/runs/run_123/steer", json={"input": ""})
@@ -2477,7 +2588,7 @@ class TestRunLifecycleSweep:
                 assert isinstance(task, asyncio.Task)
                 assert not task.done()
 
-                pending = approval_mod._ApprovalEntry({
+                pending = approval_gateway_wait._ApprovalEntry({
                     "command": "bash -c long-running",
                     "description": "approval after stream TTL",
                     "pattern_keys": ["shell-c"],
@@ -2518,6 +2629,92 @@ class TestRunLifecycleSweep:
 
 
 # ---------------------------------------------------------------------------
+# Run ownership across served profiles (#93689 / #90415)
+# ---------------------------------------------------------------------------
+
+
+class TestRunOwnershipAcrossProfiles:
+    """Every served profile holds a valid key under multiplex; only the
+    creating profile may see or control a run."""
+
+    KEYS = {"victim": "sk-victim-profile-key-0001", "attacker": "sk-attacker-profile-key-01"}
+
+    @classmethod
+    def _profile_app(cls, adapter: APIServerAdapter) -> web.Application:
+        """Runs routes behind a stand-in for the /p/<profile>/ middleware:
+        the routed profile arrives in ``X-Test-Profile`` and each profile
+        authenticates with its own key, as under gateway.multiplex_profiles."""
+
+        @web.middleware
+        async def stamp_profile(request, handler):
+            token = _api_request_profile.set(request.headers.get("X-Test-Profile"))
+            try:
+                return await handler(request)
+            finally:
+                _api_request_profile.reset(token)
+
+        adapter._expected_api_key = lambda: cls.KEYS.get(_api_request_profile.get(), "")
+        app = _create_runs_app(adapter)
+        app.middlewares.append(stamp_profile)
+        app.router.add_post(
+            "/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream
+        )
+        return app
+
+    @pytest.mark.asyncio
+    async def test_unstamped_run_state_fails_closed(self, adapter):
+        """Run state with no owner stamp is nobody's — not everybody's."""
+        app = _create_runs_app(adapter)
+        adapter._active_run_agents["run_unstamped"] = MagicMock()
+        adapter._set_run_status("run_unstamped", "running")
+
+        async with TestClient(TestServer(app)) as cli:
+            get_resp = await cli.get("/v1/runs/run_unstamped")
+            stop_resp = await cli.post("/v1/runs/run_unstamped/stop")
+
+        assert (get_resp.status, stop_resp.status) == (404, 404)
+
+    @pytest.mark.asyncio
+    async def test_session_chat_stream_run_is_owned_by_creating_profile(self, adapter):
+        """The session-chat-stream run mint claims ownership like /v1/runs does."""
+        app = self._profile_app(adapter)
+        victim = {"X-Test-Profile": "victim", "Authorization": f"Bearer {self.KEYS['victim']}"}
+        attacker = {"X-Test-Profile": "attacker", "Authorization": f"Bearer {self.KEYS['attacker']}"}
+        gate = asyncio.Event()
+
+        async def slow_run_agent(**kwargs):
+            await gate.wait()
+            return {"final_response": "ok"}, {}
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_get_existing_session_or_404", new=AsyncMock(return_value=({"id": "s1"}, None))),
+                patch.object(adapter, "_conversation_history_for_session", new=AsyncMock(return_value=[])),
+                patch.object(adapter, "_run_agent", new=slow_run_agent),
+            ):
+                stream = await cli.post(
+                    "/api/sessions/s1/chat/stream", json={"message": "hi"}, headers=victim
+                )
+                await stream.content.readline()
+                (run_id,) = list(adapter._run_statuses)
+                assert run_id in adapter._run_owners
+
+                foreign_get = await cli.get(f"/v1/runs/{run_id}", headers=attacker)
+                foreign_stop = await cli.post(f"/v1/runs/{run_id}/stop", headers=attacker)
+                own_get = await cli.get(f"/v1/runs/{run_id}", headers=victim)
+                assert (foreign_get.status, foreign_stop.status, own_get.status) == (404, 404, 200)
+
+                gate.set()
+                await stream.text()
+
+        # The owner outlives the terminal status and goes with the last surface.
+        assert run_id in adapter._run_owners
+        adapter._run_statuses.pop(run_id)
+        adapter._release_run_owner_if_forgotten(run_id)
+        assert run_id not in adapter._run_owners
+
+
+# ---------------------------------------------------------------------------
 # POST /v1/runs/{run_id}/stop — interrupt a running agent
 # ---------------------------------------------------------------------------
 
@@ -2525,8 +2722,10 @@ class TestRunLifecycleSweep:
 class TestStopRun:
 
     @pytest.mark.asyncio
-    async def test_stop_keeps_uncooperative_executor_tracked_until_exit(self, adapter):
-        """Cancelling an asyncio wrapper must not hide its live executor thread."""
+    async def test_completion_wins_before_uncooperative_stop_is_acknowledged(
+        self, adapter
+    ):
+        """A provisional Stop cannot discard a real completion."""
         app = _create_runs_app(adapter)
         run_can_finish = threading.Event()
         run_finished = threading.Event()
@@ -2569,7 +2768,8 @@ class TestStopRun:
 
                 assert run_id not in adapter._active_run_agents
                 assert run_id not in adapter._active_run_tasks
-                assert adapter._run_statuses[run_id]["status"] == "cancelled"
+                assert adapter._run_statuses[run_id]["status"] == "completed"
+                assert adapter._run_statuses[run_id]["output"] == "late result"
 
     @pytest.mark.asyncio
     async def test_stop_running_agent(self, adapter):
@@ -2682,7 +2882,10 @@ class TestRunsProviderAuthFailure:
                     await asyncio.sleep(0.05)
 
                 assert status["status"] == "failed"
-                assert status["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
+                assert (
+                    status["error"]
+                    == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
+                )
                 assert status["last_event"] == "run.failed"
 
 

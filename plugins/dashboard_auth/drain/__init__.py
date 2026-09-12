@@ -1,64 +1,11 @@
 """DrainSecretProvider — shared-bearer-secret auth for the drain-control endpoint.
 
-Task 2.0b of the safe-shutdown plan, and the FIRST consumer of the generic
-non-interactive token-auth capability added in Task 2.0a
-(``supports_token`` / ``verify_token`` on the ``DashboardAuthProvider`` ABC +
-the route-agnostic ``token_auth`` middleware seam).
-
-What it is
-----------
-A service-to-service auth provider. ``nous-account-service`` (NAS) provisions a
-**per-agent unique** shared secret into each deployed agent's environment; this
-provider verifies an inbound ``Authorization`` bearer token against that secret
-with a constant-time compare and, on a match, vouches for the caller as the
-``drain-control`` principal. It is NOT an interactive identity provider — there
-is no login, cookie, session, or refresh. It implements ONLY the token
-capability (``supports_token = True`` + ``verify_token``); the five interactive
-ABC methods raise ``NotImplementedError``.
-
-Why a plugin (not an ad-hoc header check on the drain route)
-------------------------------------------------------------
-Decisions.md Q-A: the drain credential MUST be a real auth plugin in the
-dashboard auth framework, not a bolt-on. Q-C: the framework widening that
-hosts it is generic (Task 2.0a) and this plugin is merely its first consumer.
-
-Security properties (decisions.md Q-A)
---------------------------------------
-* **Per-agent unique secret** — each agent gets a distinct secret; a leak's
-  blast radius is one agent.
-* **Entropy gate at registration** — a weak/short/low-entropy secret fails
-  CLOSED at load (the plugin declines to register and records a skip reason);
-  it is never silently accepted. Bar: >= 256 bits of entropy / >= 43
-  url-safe-base64 chars, and the value must not be obviously structured
-  (all-one-character, too few distinct characters).
-* **Constant-time compare** — ``hmac.compare_digest`` on the request path, so
-  the endpoint is not a timing oracle.
-
-Configuration
--------------
-The secret is a CREDENTIAL, so it is carried via an env var (the ``.env``-is-
-for-secrets-only rule), provisioned by NAS at deploy time (Phase 3):
-
-    HERMES_DASHBOARD_DRAIN_SECRET   # the per-agent shared secret (>=43 url-safe-b64 chars)
-
-Behavioural knobs live in config.yaml (canonical surface):
-
-    dashboard:
-      drain_auth:
-        scope: drain            # optional; MUST be the fixed drain scope
-        min_secret_chars: 43    # entropy bar (optional; default 43 ~= 256 bits)
-
-The scope is NOT a knob: it is the authority boundary this credential exists to
-enforce, so it is pinned to the exported :data:`DRAIN_SCOPE` constant. The key
-may be omitted, or spelled out as exactly ``drain`` (so an existing config that
-states it keeps working); any other value — notably the recommendations reader's
-``kanban:recommendations:read`` — is refused and the plugin registers NOTHING
-(no provider, no route). An operator-editable scope would otherwise be a way to
-mint a drain credential carrying another endpoint's capability, or to widen the
-drain route to accept another endpoint's credential.
-
-When ``HERMES_DASHBOARD_DRAIN_SECRET`` is unset, the plugin is a no-op (records
-a skip reason) — agents that don't want NAS-driven drain just don't set it.
+Non-interactive token capability of the ``DashboardAuthProvider`` ABC (``verify_token`` +
+the ``token_auth`` middleware seam): ``nous-account-service`` provisions a per-agent unique
+secret (``HERMES_DASHBOARD_DRAIN_SECRET``, env-only — it is a credential); an inbound bearer
+is compared constant-time and vouched for as the ``drain-control`` principal. Fail-CLOSED
+entropy gate at registration (length, distinct chars, Shannon bits); interactive ABC methods
+raise. Knobs ``scope`` / ``min_secret_chars`` live under ``dashboard.drain_auth``.
 """
 from __future__ import annotations
 
@@ -66,31 +13,21 @@ import logging
 import os
 from typing import Optional
 
-from hermes_cli.dashboard_auth import TokenPrincipal
-from hermes_cli.dashboard_auth.static_secret import (
-    DEFAULT_MIN_SECRET_CHARS,
-    StaticBearerSecretProvider,
-    assess_secret_strength,
-)
+from hermes_cli.dashboard_auth import DashboardAuthProvider, Session, TokenPrincipal
+from plugins.dashboard_auth._shared import NonInteractiveMixin, SkipRegistration, load_config_section, register_provider
 
 logger = logging.getLogger(__name__)
+_TAG = "dashboard-auth-drain"
 
-# The entropy gate and the constant-time secret compare live in the shared
-# ``hermes_cli.dashboard_auth.static_secret`` helper so this plugin and the
-# bundled ``dashboard_auth/recommendations`` plugin cannot drift apart on
-# security logic. ``assess_secret_strength`` is re-exported here because it is
-# part of this module's public surface
-# (``plugins.dashboard_auth.drain.assess_secret_strength``).
-_DEFAULT_MIN_SECRET_CHARS = DEFAULT_MIN_SECRET_CHARS
+# token_urlsafe(32) produces exactly 43 chars, so a correctly-provisioned
+# secret clears the default bar exactly.
+_DEFAULT_MIN_SECRET_CHARS = 43
+# Rejects degenerate values like "aaaa..." that are long but trivially low-entropy.
+_MIN_DISTINCT_CHARS = 16
+# Distribution-aware second guard on top of length + distinct-count.
+_MIN_SHANNON_BITS = 128.0
 
-# The exact method + path the begin/cancel-drain endpoint lives on, and the ONE
-# capability it grants. Registered as a token-authable route by ``register()``
-# under exactly this scope, so the generic seam guards it and no other machine
-# credential can drive it. All three are fixed constants, not configuration:
-# the provider vouches for ``DRAIN_SCOPE`` and the route demands ``DRAIN_SCOPE``,
-# so the credential and the policy are minted from one immutable value and
-# cannot drift or be widened. Kept here (not imported from web_server) to avoid
-# a heavy import at plugin load.
+# Kept here (not imported from web_server) to avoid a heavy import at plugin load.
 DRAIN_ROUTE_PATH = "/api/gateway/drain"
 DRAIN_ROUTE_METHOD = "POST"
 DRAIN_SCOPE = "drain"
@@ -108,115 +45,91 @@ __all__ = [
     "register",
 ]
 
-
-def _pin_drain_scope(scope: Optional[str]) -> str:
-    """Return :data:`DRAIN_SCOPE`, or raise for a request for any other scope.
-
-    ``None`` means "unspecified" and resolves to the fixed drain scope; the
-    literal fixed scope is accepted so an existing config/caller that states it
-    explicitly keeps working. Everything else — another endpoint's scope, a
-    renamed scope, a blank string — raises ``ValueError``, because the scope is
-    the authority boundary and no caller gets to choose it.
-    """
-    if scope is None:
-        return DRAIN_SCOPE
-    candidate = str(scope).strip()
-    if candidate == DRAIN_SCOPE:
-        return DRAIN_SCOPE
-    raise ValueError(
-        f"drain scope is fixed at {DRAIN_SCOPE!r} and cannot be configured; "
-        f"got {candidate!r}"
-    )
+def _shannon_bits(value: str) -> float:
+    """Total Shannon entropy (bits) of ``value`` over its character distribution."""
+    if not value:
+        return 0.0
+    n = len(value)
+    per_char = -sum((c / n) * math.log2(c / n) for c in Counter(value).values())
+    return per_char * n
 
 
-class DrainSecretProvider(StaticBearerSecretProvider):
-    """Non-interactive shared-bearer-secret provider for drain control.
+def assess_secret_strength(secret: str, *, min_chars: int = _DEFAULT_MIN_SECRET_CHARS) -> Optional[str]:
+    """Human-readable rejection reason if ``secret`` is too weak, else ``None``. Checks, in
+    order: length >= ``min_chars``, distinct chars >= ``_MIN_DISTINCT_CHARS``, Shannon
+    entropy >= ``_MIN_SHANNON_BITS``."""
+    if not secret:
+        return "secret is empty"
+    if len(secret) < min_chars:
+        return (
+            f"secret too short: {len(secret)} chars (need >= {min_chars}; "
+            "use a >=256-bit value, e.g. `python -c \"import secrets; "
+            "print(secrets.token_urlsafe(32))\"`)")
+    distinct = len(set(secret))
+    if distinct < _MIN_DISTINCT_CHARS:
+        return f"secret has only {distinct} distinct characters (need >= {_MIN_DISTINCT_CHARS}); looks structured/low-entropy"
+    bits = _shannon_bits(secret)
+    if bits < _MIN_SHANNON_BITS:
+        return f"secret entropy too low: {bits:.0f} bits (need >= {_MIN_SHANNON_BITS:.0f}); looks structured/repeated"
+    return None
 
-    Everything security-relevant — the entropy gate enforced at construction
-    and the ``hmac.compare_digest`` verify on the request path — is inherited
-    from :class:`~hermes_cli.dashboard_auth.static_secret.StaticBearerSecretProvider`.
-    This class only pins the drain identity: the provider name, the
-    ``drain-control`` principal, and the fixed :data:`DRAIN_SCOPE` capability.
 
-    ``scope`` is not caller-chosen authority: it may be omitted, or passed as
-    exactly :data:`DRAIN_SCOPE`, and anything else raises ``ValueError``. A
-    provider carrying some other scope would either stand in for a different
-    endpoint's credential or leave the drain route demanding a capability no
-    drain credential holds.
-    """
+class DrainSecretProvider(NonInteractiveMixin, DashboardAuthProvider):
+    """Non-interactive shared-bearer-secret provider for drain control."""
 
     name = "drain-secret"
     display_name = "Drain Control (service credential)"
-    principal_id = DRAIN_PRINCIPAL
-    credential_label = "drain"
+    supports_token = True
+    supports_session = False
+    _NOT_INTERACTIVE = "DrainSecretProvider is a non-interactive service credential."
+    _NO_START_LOGIN = "DrainSecretProvider is a non-interactive service credential; there is no login flow."
 
-    def __init__(self, *, secret: str, scope: Optional[str] = None) -> None:
-        # Defence in depth: the base constructor also enforces the entropy
-        # bar, so a caller that bypasses register()'s check still can't build
-        # a weak provider. register() does the friendly skip-reason path; this
-        # raises. The scope pin is checked first, so a mis-scoped construction
-        # fails even for a perfectly strong secret.
-        super().__init__(secret=secret, scope=_pin_drain_scope(scope))
+    def __init__(self, *, secret: str, scope: str = "drain") -> None:
+        # Defence in depth: construction enforces the entropy bar too, so a
+        # caller bypassing register() still can't build a weak provider.
+        reason = assess_secret_strength(secret)
+        if reason is not None:
+            raise ValueError(f"drain secret rejected: {reason}")
+        self._secret = secret
+        self._scope = scope or "drain"
+
+    # ---- token capability (the only thing this provider implements) --------
 
     def verify_token(self, *, token: str) -> Optional[TokenPrincipal]:
-        """Constant-time compare against the per-agent shared secret.
+        """Constant-time compare; ``drain-control`` principal on match, else
+        ``None`` so the generic seam falls through / fails closed."""
+        if token and hmac.compare_digest(token.encode("utf-8"), self._secret.encode("utf-8")):
+            return TokenPrincipal(principal="drain-control", provider=self.name, scopes=(self._scope,))
+        return None
 
-        Returns a ``drain-control`` principal scoped to :data:`DRAIN_SCOPE` on
-        an exact match, else ``None`` (the generic seam falls through / fails
-        closed).
-        """
-        return super().verify_token(token=token)
+    # ---- interactive methods: unsupported (service credential only) --------
+
+    def verify_session(self, *, access_token: str) -> Optional[Session]:
+        # Never mints a Session, so never recognises a cookie. Return None (don't raise)
+        # so it stacks harmlessly in the cookie-verify loop.
+        return None
+
+    def refresh_session(self, *, refresh_token: str) -> Session:
+        raise NotImplementedError(self._NOT_INTERACTIVE)
+
+    def revoke_session(self, *, refresh_token: str) -> None:
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Plugin entry point
-# ---------------------------------------------------------------------------
-
+# ---- Plugin entry point ----
 
 def _load_config_drain_auth_section() -> dict:
-    """Return ``dashboard.drain_auth`` from config.yaml, or ``{}``."""
-    try:
-        from hermes_cli.config import cfg_get, load_config
-
-        cfg = load_config()
-    except Exception as exc:  # noqa: BLE001 — broad catch is intentional
-        logger.debug(
-            "dashboard-auth-drain: load_config() raised %s; "
-            "falling back to env-only configuration",
-            exc,
-        )
-        return {}
-    section = cfg_get(cfg, "dashboard", "drain_auth", default=None)
-    return section if isinstance(section, dict) else {}
+    return load_config_section(logger, _TAG, "dashboard", "drain_auth")
 
 
-def register(ctx) -> None:
-    """Plugin entry — registers DrainSecretProvider when a strong secret is set.
-
-    No-op (records a skip reason) when ``HERMES_DASHBOARD_DRAIN_SECRET`` is
-    unset, fails the entropy gate, or when ``dashboard.drain_auth.scope`` asks
-    for anything other than the fixed :data:`DRAIN_SCOPE`. On success, also
-    registers the begin/cancel-drain route as token-authable via the generic
-    seam, under that same fixed scope.
-
-    Every rejection path returns before ``ctx.register_dashboard_auth_provider``
-    and before ``register_token_route``, so a refused configuration never
-    leaves a half-registered endpoint behind.
-    """
-    global LAST_SKIP_REASON
-    LAST_SKIP_REASON = ""
-
+def _settings() -> dict:
+    """Resolve DrainSecretProvider kwargs from env/config; raises ``SkipRegistration``."""
     secret = os.environ.get("HERMES_DASHBOARD_DRAIN_SECRET", "").strip()
     if not secret:
-        LAST_SKIP_REASON = (
-            "HERMES_DASHBOARD_DRAIN_SECRET is not set. Set a per-agent "
-            ">=256-bit secret (e.g. `python -c \"import secrets; "
-            "print(secrets.token_urlsafe(32))\"`) to enable NAS-driven drain "
-            "coordination; leave it unset to disable the drain endpoint."
-        )
-        logger.debug("dashboard-auth-drain: %s", LAST_SKIP_REASON)
-        return
-
+        raise SkipRegistration(
+            "HERMES_DASHBOARD_DRAIN_SECRET is not set. Set a per-agent >=256-bit secret "
+            "(e.g. `python -c \"import secrets; print(secrets.token_urlsafe(32))\"`) to enable "
+            "NAS-driven drain coordination; leave it unset to disable the drain endpoint.")
     section = _load_config_drain_auth_section()
     # Resolve the scope BEFORE anything is registered: a config that asks for
     # any scope other than the fixed one is a configuration error, not a
@@ -237,33 +150,25 @@ def register(ctx) -> None:
         min_chars = int(section.get("min_secret_chars", _DEFAULT_MIN_SECRET_CHARS))
     except (TypeError, ValueError):
         min_chars = _DEFAULT_MIN_SECRET_CHARS
-
     reason = assess_secret_strength(secret, min_chars=min_chars)
     if reason is not None:
-        LAST_SKIP_REASON = (
-            f"HERMES_DASHBOARD_DRAIN_SECRET rejected — {reason}. "
-            "The drain endpoint stays disabled (fail-closed)."
-        )
-        logger.warning("dashboard-auth-drain: %s", LAST_SKIP_REASON)
+        raise SkipRegistration(
+            f"HERMES_DASHBOARD_DRAIN_SECRET rejected — {reason}. The drain endpoint stays disabled (fail-closed).",
+            level="warning")
+    return {"secret": secret, "scope": scope}
+
+
+def register(ctx) -> None:
+    """Register ``DrainSecretProvider`` when a strong secret is set; no-op (records a skip
+    reason) when ``HERMES_DASHBOARD_DRAIN_SECRET`` is unset or fails the entropy gate. On
+    success also registers the drain route as token-authable via the generic seam."""
+    global LAST_SKIP_REASON
+    LAST_SKIP_REASON = ""
+    kwargs, LAST_SKIP_REASON = register_provider(ctx, logger, _TAG, DrainSecretProvider, _settings)
+    if kwargs is None:
         return
-
-    try:
-        provider = DrainSecretProvider(secret=secret, scope=scope)
-    except ValueError as exc:
-        LAST_SKIP_REASON = f"DrainSecretProvider construction failed: {exc}"
-        logger.warning("dashboard-auth-drain: %s", LAST_SKIP_REASON)
-        return
-
-    ctx.register_dashboard_auth_provider(provider)
-
-    # Opt the begin/cancel-drain endpoint into the generic token-auth seam so
-    # the dashboard's interactive cookie gate doesn't bounce NAS's bearer call.
-    # Registered ONLY here, after the strong credential provider was accepted,
-    # and only for POST with the fixed drain scope: a caller holding some other
-    # machine credential (e.g. the recommendations reader) is recognised but
-    # not authorised, and gets the seam's generic 403. When this plugin is a
-    # no-op the route is not a token route at all, preserving the existing
-    # browser-session fallback for dashboard-driven drain.
+    # Opt the drain endpoint into the token-auth seam so the interactive cookie gate
+    # doesn't bounce NAS's bearer call.
     try:
         from hermes_cli.dashboard_auth.token_auth import register_token_route
 
@@ -271,13 +176,29 @@ def register(ctx) -> None:
             DRAIN_ROUTE_PATH, method=DRAIN_ROUTE_METHOD, required_scope=scope
         )
     except Exception as exc:  # noqa: BLE001 — seam import must not crash plugin load
-        logger.warning(
-            "dashboard-auth-drain: could not register token route %s %s: %s",
-            DRAIN_ROUTE_METHOD, DRAIN_ROUTE_PATH, exc,
-        )
-
+        logger.warning("dashboard-auth-drain: could not register token route %s: %s", DRAIN_ROUTE_PATH, exc)
     logger.info(
-        "dashboard-auth-drain: registered drain service-credential provider "
-        "(scope=%s, route=%s %s)",
-        scope, DRAIN_ROUTE_METHOD, DRAIN_ROUTE_PATH,
-    )
+        "dashboard-auth-drain: registered drain service-credential provider (scope=%s, route=%s)",
+        kwargs["scope"], DRAIN_ROUTE_PATH)
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'LoginStart': ('hermes_cli.dashboard_auth', 'LoginStart'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----
