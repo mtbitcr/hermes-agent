@@ -1,13 +1,16 @@
-"""MCP dashboard routes.
+"""MCP dashboard routes (extracted verbatim from web_server.py).
 
-The OAuth flow registry (``_mcp_oauth_flows``) and the worker/helpers stay in
-web_server — reached via the late-binding seam so tests that mutate
-``web_server._mcp_oauth_flows`` or monkeypatch its helpers keep working.
+Handler bodies are byte-identical.  The OAuth flow registry
+(``_mcp_oauth_flows`` + lock + pending cap) and the worker/helpers stay in
+web_server - reached via the late-binding seam in :mod:`hermes_cli.web_deps`
+(``late`` for callables, ``LateState`` for the mutable registry/lock/limit) so
+tests that mutate ``web_server._mcp_oauth_flows`` or
+``monkeypatch.setattr(web_server, "_run_dashboard_mcp_oauth", ...)`` keep
+working unchanged.
 """
 
 import asyncio  # noqa: F401 — used by handlers
 import logging
-import time
 import secrets  # noqa: F401
 import threading  # noqa: F401
 from typing import Any, Dict, Optional  # noqa: F401
@@ -16,8 +19,6 @@ from fastapi import APIRouter, HTTPException, Request  # noqa: F401
 from fastapi.responses import HTMLResponse  # noqa: F401
 
 from hermes_cli.dashboard_auth.audit import AuditEvent, AuditWriteError, audit_log
-
-_log = logging.getLogger(__name__)
 from hermes_cli.dashboard_auth.token_auth import (
     register_machine_token_family,
     register_token_route,
@@ -33,6 +34,9 @@ from hermes_cli.web_models import (
     MCPServerCreate,
     MCPServersReplace,
 )
+
+# Same logger the handlers used before extraction (identical logger object).
+_log = logging.getLogger("hermes_cli.web_server")
 
 router = APIRouter()
 
@@ -159,49 +163,20 @@ _normalize_mcp_server_create = late("_normalize_mcp_server_create")
 _profile_cli_args = late("_profile_cli_args")
 _profile_scope = late("_profile_scope")
 _require_token = late("_require_token")
-_run_dashboard_mcp_oauth = late("_run_dashboard_mcp_oauth", "hermes_cli.web_server_mcp")
-load_config = late("load_config", "hermes_cli.config")
-save_config = late("save_config", "hermes_cli.config")
-save_env_value = late("save_env_value", "hermes_cli.config")
+_run_dashboard_mcp_oauth = late("_run_dashboard_mcp_oauth")
+_spawn_hermes_action = late("_spawn_hermes_action")
+load_config = late("load_config")
+save_config = late("save_config")
+save_env_value = late("save_env_value")
 
-_mcp_oauth_flows_lock = threading.Lock()
-_MCP_DASHBOARD_OAUTH_TTL = 15 * 60
-_MAX_PENDING_MCP_OAUTH_FLOWS = 8
-
-
-def _gc_mcp_oauth_flows() -> None:
-    cutoff = time.time() - _MCP_DASHBOARD_OAUTH_TTL
-    with _mcp_oauth_flows_lock:
-        stale = [fid for fid, flow in _mcp_oauth_flows.items() if getattr(flow, "created_at", 0) < cutoff]
-        for flow_id in stale:
-            _mcp_oauth_flows.pop(flow_id, None)
-
-
-def _mcp_oauth_callback_url(request: Request, server_name: str) -> str:
-    """Externally reachable callback URL for a dashboard flow."""
-    from urllib.parse import quote, urlparse, urlunparse
-
-    from hermes_cli.dashboard_auth.prefix import prefix_from_request, resolve_public_url
-
-    suffix = f"/api/mcp/oauth/callback/{quote(server_name, safe='')}"
-    public_url = resolve_public_url()
-    if public_url:
-        return f"{public_url}{suffix}"
-    base = urlparse(str(request.base_url))
-    prefix = prefix_from_request(request)
-    return urlunparse(base._replace(path=f"{prefix}{suffix}", params="", query="", fragment=""))
-
-
-def _mcp_install_action_name(name: str) -> str:
-    """Unique per-entry mcp-install action name (+ registered log file), so a
-    re-click or a second catalog install doesn't overwrite the first's tracked
-    process/log while its git clone is still running."""
-    from hermes_cli.web_server_gateway import _ACTION_LOG_FILES
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:48] or "server"
-    digest = hashlib.sha1(name.encode()).hexdigest()[:8]
-    action = f"mcp-install-{slug}-{digest}"
-    _ACTION_LOG_FILES.setdefault(action, f"action-{action}.log")
-    return action
+# Live proxies for web_server-owned module state (mutations/monkeypatches
+# on web_server remain authoritative; resolved at operation time).
+_mcp_oauth_flows = LateState("_mcp_oauth_flows")
+_mcp_oauth_flows_lock = LateState("_mcp_oauth_flows_lock")
+_MAX_PENDING_MCP_OAUTH_FLOWS = LateState("_MAX_PENDING_MCP_OAUTH_FLOWS")
+# Config read-modify-write serialization for off-loop handlers (defined in
+# web_server.py; LateState supports ``with``-blocks, so this is the live lock).
+_CONFIG_MUTATION_LOCK = LateState("_CONFIG_MUTATION_LOCK")
 
 
 def _cancel_connection_oauth_flows_locked(name: str, hermes_home: str) -> None:
@@ -237,7 +212,11 @@ async def list_mcp_servers(request: Request, profile: Optional[str] = None):
 
 @router.post("/api/mcp/servers")
 async def add_mcp_server(body: MCPServerCreate, profile: Optional[str] = None):
-    from hermes_cli.mcp_config import _get_mcp_servers, _save_bearer_auth_token, _save_mcp_server
+    from hermes_cli.mcp_config import (
+        _get_mcp_servers,
+        _save_bearer_auth_token,
+        _save_mcp_server,
+    )
 
     try:
         name, server_config, bearer_token = _normalize_mcp_server_create(body)
@@ -277,14 +256,20 @@ async def add_mcp_server(body: MCPServerCreate, profile: Optional[str] = None):
 
 @router.put("/api/mcp/servers")
 async def replace_mcp_servers(body: MCPServersReplace, profile: Optional[str] = None):
-    """Replace the entire ``mcp_servers`` map (the mcp.json editor's save) —
-    the deep-merging ``/api/config`` can never delete a key or drop an
-    ``enabled: false``, so removals wouldn't persist through it."""
+    """Replace the entire ``mcp_servers`` map (the GUI mcp.json editor's save).
+
+    The generic ``/api/config`` endpoint deep-merges maps, so it can never
+    delete a server key, drop an ``enabled: false`` flag, or remove a nested
+    field — edits looked saved but the stale entry survived on disk.  This
+    endpoint sets the whole map so removals actually persist.  Storage stays
+    the config.yaml ``mcp_servers`` key the CLI/TUI already read.
+    """
     from hermes_cli.mcp_config import _replace_mcp_servers
 
     def _run():
-        with config_write_scope(body.profile or profile):
-            return _replace_mcp_servers(body.servers)
+        with _profile_scope(body.profile or profile):
+            with _CONFIG_MUTATION_LOCK:
+                return _replace_mcp_servers(body.servers)
 
     ok, issues = await asyncio.to_thread(_run)
     if not ok:
@@ -326,35 +311,62 @@ async def remove_mcp_server(
 
 @router.post("/api/mcp/servers/{name}/test")
 async def test_mcp_server(name: str, profile: Optional[str] = None):
-    """Connect to the server, list its tools, disconnect."""
-    from hermes_cli.mcp_config import _get_mcp_servers, _oauth_tokens_present, _probe_single_server
+    """Connect to the server, list its tools, disconnect.  Returns tool list."""
+    from hermes_cli.mcp_config import (
+        _get_mcp_servers,
+        _oauth_tokens_present,
+        _probe_single_server,
+    )
 
-    servers = await scoped_to_thread(profile, _get_mcp_servers)
+    def _read():
+        with _profile_scope(profile):
+            return _get_mcp_servers()
+
+    servers = await asyncio.to_thread(_read)
     if name not in servers:
         raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
 
     details: Dict[str, Any] = {}
     # An `auth: oauth` server that serves tools/list anonymously would probe OK
-    # with no token — a false green. Require a token on disk, matching /auth.
+    # with no token — a false green. Require a token on disk for it, matching the
+    # /auth verification (some providers don't enforce auth on tools/list).
     needs_oauth_token = servers[name].get("auth") == "oauth"
 
     def _probe_scoped():
-        # Home-only scope (contextvar), NOT _profile_scope: a probe can block for
-        # seconds (stdio `npx` cold start) and _profile_scope holds the
-        # process-global skills lock for its whole body, serializing every other
-        # endpoint. The probe only needs HERMES_HOME for .env + token resolution.
+        # Home-only scope (contextvar), NOT _profile_scope. A probe blocks for
+        # as long as the server takes to spawn/connect — a stdio `npx` cold
+        # start is many seconds — and _profile_scope holds a process-global
+        # skills lock for its ENTIRE body. Holding that across the probe
+        # serialized every other endpoint (config/skills/toolsets all take the
+        # same lock), so a slow server made unrelated requests time out at 15s.
+        # The probe touches no skills globals; it only needs the HERMES_HOME
+        # override for .env interpolation + OAuth token resolution, which the
+        # contextvar provides (copied into this to_thread worker; and
+        # _run_on_mcp_loop re-wraps it onto the MCP event-loop thread).
         with _config_profile_scope(profile):
             tools = _probe_single_server(name, servers[name], details=details)
-            return tools, (_oauth_tokens_present(name) if needs_oauth_token else True)
+            token_present = _oauth_tokens_present(name) if needs_oauth_token else True
+            return tools, token_present
 
-    try:  # probe blocks on a dedicated MCP event loop — keep it off the FastAPI loop
+    try:
+        # Probe blocks on a dedicated MCP event loop — run in a thread so the
+        # FastAPI event loop is never blocked.
         tools, token_present = await asyncio.to_thread(_probe_scoped)
     except Exception as exc:
-        return {"ok": False, "error": str(exc), "tools": []}
+        return {
+            "ok": False,
+            "error": str(exc),
+            "tools": [],
+        }
     if not token_present:
-        return {"ok": False, "error": "OAuth authentication required — no token found.", "tools": []}
-    # Optional per-tool schema size (chars) for the desktop's cost overlay;
-    # failed probes simply omit it.
+        return {
+            "ok": False,
+            "error": "OAuth authentication required — no token found.",
+            "tools": [],
+        }
+    # Additive-optional per-tool schema size (chars of the converted registry
+    # schema) — the desktop's cost overlay estimates tokens from it. Older
+    # renderers ignore the extra key; failed probes simply omit it.
     schema_chars = details.get("schema_chars") or {}
     return {
         "ok": True,
@@ -362,7 +374,11 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
             {
                 "name": t,
                 "description": d,
-                **({"schema_chars": schema_chars[t]} if isinstance(schema_chars.get(t), int) else {}),
+                **(
+                    {"schema_chars": schema_chars[t]}
+                    if isinstance(schema_chars.get(t), int)
+                    else {}
+                ),
             }
             for t, d in tools
         ],
@@ -380,22 +396,19 @@ async def auth_mcp_server(
 ):
     """Start MCP OAuth and hand the authorization URL to the dashboard browser."""
     from hermes_cli.mcp_config import _get_mcp_servers
-    from hermes_constants import get_hermes_home
     from tools.mcp_dashboard_oauth import DashboardOAuthFlow
 
     _enforce_connections_machine_profile(request, name=name, profile=profile)
 
     _require_token(request)
     _gc_mcp_oauth_flows()
+    from hermes_constants import get_hermes_home
 
-    def _home() -> str:
-        return str(get_hermes_home().expanduser().resolve(strict=False))
-
-    process_home = _home()
+    process_home = str(get_hermes_home().expanduser().resolve(strict=False))
 
     def _read():
         with _profile_scope(profile):
-            return _get_mcp_servers(), _home()
+            return _get_mcp_servers(), str(get_hermes_home().expanduser().resolve(strict=False))
 
     servers, flow_home = await asyncio.to_thread(_read)
     if name not in servers:
@@ -636,7 +649,8 @@ async def cancel_mcp_oauth_flow(flow_id: str, request: Request):
     as-is (approved stays approved)."""
     _require_token(request)
     flow = _mcp_oauth_flows.get(flow_id)
-    if flow is None:  # expired/GC'd is the goal state of a cancel — not an error
+    if flow is None:
+        # Expired/GC'd is the goal state of a cancel — not an error.
         return {"ok": True, "status": "expired"}
     flow.cancel("Cancelled by user")
     return {"ok": True, "status": flow.snapshot()["status"]}
@@ -663,8 +677,13 @@ async def mcp_oauth_callback(
             and flow.redirect_uri != CLAUDE_DESIGN_REDIRECT_URI
         ]
     flow = next(
-        (c for c in candidates
-         if c.expected_state is not None and state is not None and secrets.compare_digest(c.expected_state, state)),
+        (
+            candidate
+            for candidate in candidates
+            if candidate.expected_state is not None
+            and state is not None
+            and secrets.compare_digest(candidate.expected_state, state)
+        ),
         None,
     )
     if flow is None:
@@ -672,9 +691,12 @@ async def mcp_oauth_callback(
     try:
         flow.deliver_callback(code=code, state=state, error=error)
     except ValueError as exc:
+        reason = str(exc)
+        status_code = 409 if "already received" in reason else 400
         return HTMLResponse(
-            "<h1>OAuth callback rejected</h1><p>The callback was invalid or already used.</p>",
-            status_code=409 if "already received" in str(exc) else 400,
+            "<h1>OAuth callback rejected</h1>"
+            "<p>The callback was invalid or already used.</p>",
+            status_code=status_code,
         )
     if error:
         return HTMLResponse("<h1>Authorization failed</h1><p>Return to Hermes for details.</p>", status_code=400)
@@ -716,41 +738,6 @@ async def set_mcp_server_enabled(
     result = await asyncio.to_thread(_run)
     _audit_connections_machine_success(request, connection=name)
     return result
-
-
-def _catalog_entry_json(entry: Any, installed: bool, enabled: bool) -> Dict[str, Any]:
-    auth = entry.auth
-    transport = entry.transport
-    install = entry.install
-    return {
-        "name": entry.name,
-        "description": entry.description,
-        "source": entry.source,
-        "transport": transport.type,
-        "auth_type": getattr(auth, "type", "none"),
-        # Env vars the user must supply (names + prompts only, never values).
-        "required_env": [
-            {"name": e.name, "prompt": e.prompt, "required": e.required}
-            for e in getattr(auth, "env", []) or []
-        ],
-        # Transport details surfaced on purpose: the trust model asks users to
-        # inspect command/args/url + bootstrap before installing.
-        "command": transport.command,
-        "args": list(transport.args or []),
-        "url": transport.url,
-        # Git bootstrap (present only for entries that clone + build).
-        "install_url": install.url if install else None,
-        "install_ref": install.ref if install else None,
-        "bootstrap": list(install.bootstrap) if install else [],
-        "default_enabled": list(entry.tools.default_enabled) if entry.tools.default_enabled is not None else None,
-        "post_install": entry.post_install or "",
-        # Composer-suggestion triggers (desktop brand pills), only when the
-        # manifest declares a `suggest` block.
-        "suggest": {"keywords": list(entry.suggest.keywords), "hosts": list(entry.suggest.hosts)} if entry.suggest else None,
-        "needs_install": install is not None,
-        "installed": installed,
-        "enabled": enabled,
-    }
 
 
 @router.get("/api/mcp/catalog")
@@ -858,30 +845,14 @@ async def install_mcp_catalog_entry(
     the CLI action path because the clone can take time.
     """
     from hermes_cli import mcp_catalog
-    from hermes_cli.config import validate_env_var_name_for_write
 
     name = (body.name or "").strip()
     entry = mcp_catalog.get_entry(name)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"No catalog entry '{name}'")
 
-    # Catalog credentials are a closed schema: configuring one MCP must not
-    # become a generic write primitive for unrelated process environment.
-    declared_env = {spec.name for spec in (entry.auth.env or [])}
-    undeclared_env = sorted(set(body.env) - declared_env)
-    if undeclared_env:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Catalog entry '{name}' does not declare environment variable(s): {', '.join(undeclared_env)}",
-        )
-    # Validate the complete map before the first write so a mixed
-    # valid+invalid request cannot partially persist credentials.
-    try:
-        for key in body.env:
-            validate_env_var_name_for_write(key)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
+    # Persist any supplied env vars first (catalog entries declare which names
+    # they need; we only write the ones the user provided).
     effective_profile = body.profile or profile
     _enforce_connections_machine_profile(
         request, name=name, profile=effective_profile
@@ -895,12 +866,19 @@ async def install_mcp_catalog_entry(
 
         await asyncio.to_thread(_write_env)
 
-    # Git-bootstrap entries can take a while to clone — background action so
-    # the request returns immediately (per-entry action name, see helper).
+    # Git-bootstrap entries can take a while to clone — run via the background
+    # action path so the request returns immediately and the UI can tail logs.
+    # The -p subprocess rebinds HERMES_HOME-derived paths in the child.
     if entry.install is not None:
+        # Unique per-entry action name: a shared "mcp-install" would let a
+        # re-click (or a second entry) overwrite the tracked process/log while
+        # the first clone is still running.
         action = _mcp_install_action_name(name)
         try:
-            _spawn_hermes_action(_profile_cli_args(effective_profile) + ["mcp", "install", name], action)
+            _spawn_hermes_action(
+                _profile_cli_args(effective_profile) + ["mcp", "install", name],
+                action,
+            )
         except HTTPException:
             raise
         except Exception as exc:
@@ -909,10 +887,18 @@ async def install_mcp_catalog_entry(
         _audit_connections_machine_success(request, connection=name)
         return result
 
-    # No git step — install synchronously; install_entry goes through the
-    # call-time config/env resolvers so the profile scope covers it.
+    # No git step — install synchronously via the catalog API. install_entry
+    # routes through load_config/save_config + save_env_value, all call-time
+    # resolvers, so the context override scopes it. Wrap the to_thread body
+    # in the scope INSIDE the thread (contextvars don't propagate into
+    # to_thread the other way around — asyncio.to_thread copies context, so
+    # setting it here works; keep it explicit for clarity).
+    def _install_scoped():
+        with _profile_scope(effective_profile):
+            mcp_catalog.install_entry(entry, enable=body.enable)
+
     try:
-        await scoped_to_thread(effective_profile, lambda: mcp_catalog.install_entry(entry, enable=body.enable))
+        await asyncio.to_thread(_install_scoped)
     except HTTPException:
         raise
     except Exception as exc:

@@ -300,13 +300,12 @@ def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
     """Claim + format this session's unseen events on one board. One poller per live session: the board is not opened
     writable unless it has a subscription owned by this exact session (a failed read-only probe — locked/corrupt DB —
     falls through so delivery is preserved)."""
-    from hermes_cli import kanban_db_connect as _kbc
     from hermes_cli import kanban_db_notify as _kbn
     with contextlib.suppress(Exception):
         if _kbn.count_notify_subs(board=slug, platform="tui", chat_id=session_key) == 0:
             return []
     try:
-        conn = _kbc.connect(board=slug)
+        conn = _kb.connect(board=slug)  # fork sync note: live kanban wiring goes through the monolith
     except Exception:
         return []
     texts: list = []
