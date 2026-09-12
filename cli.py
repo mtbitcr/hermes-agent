@@ -4021,7 +4021,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         logger.warning("invalid HERMES_KANBAN_RUN_ID=%r", raw_run_id)
 
     from hermes_cli import kanban_db as _kb
-    from hermes_cli import kanban_db_connect as _kbc
+    from hermes_cli import kanban_db as _kbc
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
 
     # Goal text = title + body (the acceptance criteria the judge evaluates against).
@@ -4170,7 +4170,7 @@ def _collect_kanban_task_images(single_query_images):
         return single_query_image_urls
     try:
         from hermes_cli import kanban_db as _kb
-        from hermes_cli import kanban_db_connect as _kbc
+        from hermes_cli import kanban_db as _kbc
         from agent.image_routing import extract_image_refs as _extract_refs
 
         with _kbc.connect_closing() as _conn:

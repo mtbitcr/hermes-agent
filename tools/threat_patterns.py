@@ -178,6 +178,7 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     if (patterns := _COMPILED.get(scope)) is None:
         raise ValueError(f"scan_for_threats: unknown scope {scope!r}")
     content = content[:MAX_SCAN_CHARS]
+    findings: List[str] = []
 
     # Invisible unicode — single pass through the content set, not one ``in``
     # lookup per entry.  Run this on the RAW content before NFKC
@@ -204,9 +205,6 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     normalised = unicodedata.normalize("NFKC", content.replace("\u200c", ""))
 
     # Threat patterns
-    patterns = _COMPILED.get(scope)
-    if patterns is None:
-        raise ValueError(f"scan_for_threats: unknown scope {scope!r}")
     for compiled, pid in patterns:
         if compiled.search(normalised):
             findings.append(pid)
