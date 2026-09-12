@@ -4135,6 +4135,16 @@ def _cron_model_impact_result(available: bool) -> Dict[str, Any]:
     return {"available": available, "affected_count": 0, "truncated": False, "jobs": []}
 
 
+def _unavailable_cron_model_impact(guard_enabled: bool) -> Dict[str, Any]:
+    return {
+        "available": False,
+        "guard_enabled": guard_enabled,
+        "affected_count": 0,
+        "truncated": False,
+        "jobs": [],
+    }
+
+
 def build_cron_model_impact(
     *,
     current_provider: Any = "",
