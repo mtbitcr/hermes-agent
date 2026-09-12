@@ -686,7 +686,7 @@ def check_certificates(should_fix: bool = False, issues: "list | None" = None) -
     re-verifying.
     """
     try:
-        from agent.ssl_guard import verify_ca_bundle_with_fallback
+        from agent.ssl_guard import verify_ca_bundle as verify_ca_bundle_with_fallback
         from agent.errors import SSLConfigurationError
     except Exception as e:
         check_warn("SSL certificate check skipped", str(e))

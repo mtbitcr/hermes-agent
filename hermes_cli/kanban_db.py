@@ -13774,6 +13774,27 @@ class Event:
     created_at: int
     run_id: Optional[int] = None
 
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Event":
+        """Fork note (2026-09 sync): upstream's TUI session notifications build events
+        through this constructor on the facade; provided here so the dormant-adjacent
+        upstream callers work against the fork monolith."""
+        try:
+            run_id = row["run_id"]
+        except (IndexError, KeyError):
+            run_id = None
+        payload = row["payload"]
+        if isinstance(payload, (str, bytes)):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = None
+        return cls(
+            id=row["id"], task_id=row["task_id"], kind=row["kind"],
+            payload=payload, created_at=row["created_at"],
+            run_id=int(run_id) if run_id is not None else None,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -14096,6 +14117,24 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    """Integer env override: absent/empty/non-integer/below ``minimum`` falls back to ``default``.
+
+    Fork note: upstream's decomposed modules (kanban_db_connect and siblings) call this
+    through the ``hermes_cli.kanban_db`` facade; the fork monolith provides it so those
+    modules stay importable while dormant.
+    """
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return default
+        if parsed >= minimum:
+            return parsed
+    return default
+
+
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
 # Maximum number of ``<db>.corrupt.<hash>.bak`` quarantine files retained per

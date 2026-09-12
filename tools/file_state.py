@@ -330,3 +330,17 @@ __all__ = [
     "writes_since",
     "known_reads",
 ]
+
+
+# --- Fork compat (2026-09 sync): upstream read-tracking imports this ---
+def _evict_oldest(container, cap: int) -> None:
+    """Pop entries until *container* is within *cap* (sets: arbitrary; dicts: oldest
+    by insertion order). An eviction only costs one redundant re-send or staleness check."""
+    for _ in range(len(container) - cap):
+        try:
+            if isinstance(container, set):
+                container.pop()
+            else:
+                container.pop(next(iter(container)))
+        except (StopIteration, KeyError):
+            break

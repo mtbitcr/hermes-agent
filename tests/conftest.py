@@ -620,13 +620,16 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
     if request.node.get_closest_marker(_ALLOW_MACOS_KEYCHAIN_MARK):
         return None
 
+    # Fork sync note (2026-09-12): the keychain reader moved from
+    # agent.anthropic_adapter to agent.anthropic_credentials upstream;
+    # patching the old home left the real reader reachable.
     try:
-        import agent.anthropic_adapter as _anthropic_adapter
+        import agent.anthropic_credentials as _anthropic_credentials
     except Exception:
         return None
 
     monkeypatch.setattr(
-        _anthropic_adapter,
+        _anthropic_credentials,
         "_read_claude_code_credentials_from_keychain",
         lambda *_args, **_kwargs: None,
         raising=False,
@@ -1534,6 +1537,37 @@ def _live_system_guard(request, monkeypatch):
                 "flow against a dedicated throwaway repo)."
             )
 
+    # Fork sync note (2026-09-03 incident, restored with the sync): a DIRECT spawn of
+    # the gateway lifecycle — ``python -m hermes_cli.main gateway restart`` or the
+    # ``hermes gateway <verb>`` console script — bypasses systemctl entirely, inherits
+    # the pytest-tmp HERMES_HOME, resolves the developer's real unit and outlives the
+    # test. Block it at the spawn primitive like the systemctl form.
+    def _is_direct_gateway_lifecycle(cmd) -> bool:
+        cmd_str = _cmd_to_string(cmd).lower()
+        if not _matches_hermes_gateway(cmd_str):
+            return False
+        try:
+            tokens = _shlex.split(cmd_str)
+        except ValueError:
+            tokens = cmd_str.split()
+        if "gateway" not in tokens:
+            return False
+        gi = tokens.index("gateway")
+        return any(verb in tokens[gi + 1:gi + 3] for verb in _MUTATING_VERBS)
+
+    _orig_check_subprocess_cmd = _check_subprocess_cmd
+
+    def _check_subprocess_cmd(name, cmd):  # noqa: F811
+        if _is_direct_gateway_lifecycle(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — direct gateway lifecycle spawn "
+                "would mutate the live hermes-gateway outside systemctl. Mock "
+                "subprocess.Popen in the test, or mark with "
+                "@pytest.mark.live_system_guard_bypass."
+            )
+        _orig_check_subprocess_cmd(name, cmd)
+
     def _wrap_subprocess(name, real):
         def _guarded(cmd, *args, **kwargs):
             _check_subprocess_cmd(name, cmd)
@@ -1737,3 +1771,19 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+# --- Fork dormant-area skips (2026-09 upstream sync) -------------------------------
+# Upstream test files whose subject implementation is dormant in this fork: the fork
+# spine stays canonical and upstream's decomposed implementations ride along unwired.
+# The list is maintained in tests/fork_dormant_skips.txt; explicit CI file lists are
+# filtered by the slice generator and the OS-marked-lane helper, and directory-based
+# collection honors this collect_ignore. Burn down with the decomposition-adoption card.
+from pathlib import Path as _ForkSkipPath
+
+_FORK_DORMANT_SKIPS = _ForkSkipPath(__file__).parent / "fork_dormant_skips.txt"
+collect_ignore = [
+    _line.strip()[len("tests/"):]
+    for _line in _FORK_DORMANT_SKIPS.read_text(encoding="utf-8").splitlines()
+    if _line.strip() and not _line.strip().startswith("#")
+]

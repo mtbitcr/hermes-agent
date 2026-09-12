@@ -333,6 +333,16 @@ def _prune_check_fn_caches(now: float) -> None:
         _check_fn_last_good.pop(next(iter(_check_fn_last_good)))
 
 
+# Fork compat (2026-09 sync): upstream marks some availability checks uncached.
+_NO_CACHE_CHECK_FNS: set = set()
+
+
+def no_cache_check_fn(fn: Callable) -> Callable:
+    """Mark a local, config-backed availability check as uncached."""
+    _NO_CACHE_CHECK_FNS.add(fn)
+    return fn
+
+
 def check_fn_cache_scope() -> Optional[str]:
     """Return the active profile key when availability is profile-scoped.
 
@@ -367,6 +377,11 @@ def _check_fn_cached(fn: Callable) -> bool:
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
     """
+    if fn in _NO_CACHE_CHECK_FNS:  # fork compat: upstream uncached checks
+        try:
+            return bool(fn())
+        except Exception:
+            return False
     now = time.monotonic()
     scope = check_fn_cache_scope()
     if scope == CHECK_FN_CACHE_BYPASS:

@@ -835,7 +835,7 @@ def _fast_model_from_catalog(provider_id: str) -> str:
     """
     try:
         from hermes_cli.auth import resolve_api_key_provider_credentials
-        from hermes_cli.models import fetch_models_with_pricing
+        from hermes_cli.models_pricing import fetch_models_with_pricing
         from providers import get_provider_profile
 
         # The provider's own credentials, because most ``/v1/models`` endpoints
@@ -3855,7 +3855,8 @@ def _try_azure_foundry(
 
 def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
     try:
-        from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+        from agent.anthropic_adapter import build_anthropic_client
+        from agent.anthropic_credentials import resolve_anthropic_token
     except ImportError:
         return None, None
 
@@ -5145,7 +5146,7 @@ def _refresh_provider_credentials(provider: str) -> bool:
             _evict_cached_clients(normalized)
             return True
         if normalized == "anthropic":
-            from agent.anthropic_adapter import read_claude_code_credentials, _refresh_oauth_token, resolve_anthropic_token
+            from agent.anthropic_credentials import read_claude_code_credentials, _refresh_oauth_token, resolve_anthropic_token
 
             creds = read_claude_code_credentials()
             token = _refresh_oauth_token(creds) if isinstance(creds, dict) and creds.get("refreshToken") else None
@@ -10376,7 +10377,7 @@ def _call_llm_impl(
         raise
 
 
-def extract_content_or_reasoning(response) -> str:
+def extract_content_or_reasoning(response, *, max_reasoning_chars: "int | None" = None) -> str:
     """Extract content from an LLM response, falling back to reasoning fields.
 
     Mirrors the main agent loop's behavior when a reasoning model (DeepSeek-R1,
@@ -10427,7 +10428,13 @@ def extract_content_or_reasoning(response) -> str:
                     reasoning_parts.append(summary.strip() if isinstance(summary, str) else str(summary))
 
     if reasoning_parts:
-        return "\n\n".join(reasoning_parts)
+        joined = "\n\n".join(reasoning_parts)
+        # Upstream contract (2026-09 sync): bound a reasoning FALLBACK so unbounded
+        # chain-of-thought can't become the compaction summary. Real content above
+        # is never truncated by this cap.
+        if isinstance(max_reasoning_chars, int) and max_reasoning_chars > 0:
+            return joined[:max_reasoning_chars]
+        return joined
 
     return ""
 
@@ -11092,3 +11099,80 @@ async def _async_call_llm_impl(
                 logger.debug("Auxiliary (async): cache eviction after connection error failed",
                              exc_info=True)
         raise
+
+
+# --- Fork compat appendix (2026-09-12 upstream sync) -------------------------------------
+# The resolver above is the fork-canonical auxiliary client. Upstream's September
+# decomposition added sibling modules (agent_runtime_helpers, conversation_compression,
+# review_idle_queue) that import a handful of small helpers from this module; the fork
+# resolver does not use them, but the siblings are live in the merged tree, so the names
+# are provided here verbatim from the pinned upstream snapshot. The published stream
+# deadline is not consulted by the fork resolver's provider daemon (fork behavior
+# unchanged); it exists so upstream callers keep working.
+import contextlib as _fork_compat_contextlib
+
+_aux_stream_deadline = threading.local()
+
+_GEMINI_NATIVE_PROVIDER_NAMES = {"gemini", "google", "google-gemini", "google-ai-studio"}
+
+_MANAGED_LOCAL_STATE_TTL_S = 15.0
+_managed_local_cache: "tuple[float, str]" = (0.0, "")
+
+
+def _coerce_positive_timeout(raw: Any) -> Optional[float]:
+    """Coerce a config ``timeout`` to a positive float, or None (rejects bools, which are ints)."""
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return float(raw)
+    return None
+
+
+@_fork_compat_contextlib.contextmanager
+def aux_stream_deadline(deadline: Optional[float]):
+    """Publish the host's absolute ``time.monotonic()`` deadline to the stream consumer.
+
+    ``None`` is a passthrough; re-entrant-safe. Upstream's compression path publishes the
+    host ceiling through this context manager; the fork resolver does not read it.
+    """
+    previous = getattr(_aux_stream_deadline, "value", None)
+    _aux_stream_deadline.value = deadline if isinstance(deadline, (int, float)) else previous
+    try:
+        yield
+    finally:
+        _aux_stream_deadline.value = previous
+
+
+def _current_aux_stream_deadline() -> Optional[float]:
+    """The published stream deadline, or None."""
+    return getattr(_aux_stream_deadline, "value", None)
+
+
+def _managed_local_netloc() -> str:
+    """host:port of the managed local llama-server ("" when none), read with a short TTL from
+    the supervisor state file provider resolution also uses (exact match)."""
+    global _managed_local_cache
+    now = time.monotonic()
+    ts, cached = _managed_local_cache
+    if now - ts < _MANAGED_LOCAL_STATE_TTL_S:
+        return cached
+    try:
+        from hermes_cli.local_runtime.supervisor import state_path
+        raw = state_path().read_text(encoding="utf-8")
+        base = str((json.loads(raw) or {}).get("base_url", ""))
+        netloc = urlparse(base).netloc.lower()
+    except Exception:
+        netloc = ""
+    _managed_local_cache = (now, netloc)
+    return netloc
+
+
+def _is_managed_local_endpoint(base_url: Optional[str]) -> bool:
+    """True when *base_url* targets the llama-server this Hermes manages."""
+    if not base_url:
+        return False
+    managed = _managed_local_netloc()
+    if not managed:
+        return False
+    try:
+        return urlparse(str(base_url)).netloc.lower() == managed
+    except Exception:
+        return False

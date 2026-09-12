@@ -544,3 +544,92 @@ def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:
 
 # Backward-compat alias — existing call sites/tests import the historical name.
 _kill_git_process_tree = kill_process_tree
+
+
+# --- Fork compat (2026-09 sync): helpers upstream's live callers import ---
+def _text_names_hermes(text: str) -> bool:
+    r"""True when *text* names Hermes at a path-segment / token boundary.
+
+    A bare ``"hermes" in text`` substring test would also match unrelated processes whose paths
+    merely contain the letters (``...\shermesa\...``) — the false-positive class this prevents.
+    """
+    return any(token.startswith(("hermes", ".hermes"))
+               for token in re.split(r"[\\/\s=,;\"']+", text.lower()))
+
+NO_DRIVER_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
+
+_DIFF_RENDERING_SUBCOMMANDS = frozenset({"diff", "show", "log", "blame"})
+
+_GIT_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+
+def _process_command_is_hermes(pid: int) -> bool:
+    """Best-effort check that *pid* currently runs Hermes code."""
+    try:
+        import psutil
+
+        process = psutil.Process(pid)
+        command = " ".join(process.cmdline() or [])
+        executable = process.exe() or ""
+        return _text_names_hermes(f"{command} {executable}")
+    except Exception:
+        return False
+
+def _process_start_time(pid: int) -> int | None:
+    """The repository's stable process-start fingerprint, if available."""
+    try:
+        from gateway.status import get_process_start_time
+
+        return get_process_start_time(pid)
+    except Exception:
+        return None
+
+def harden_git_argv(args: Sequence[str]) -> list[str]:
+    """Copy of subcommand-first git *args* (no leading ``"git"``) with :data:`NO_DRIVER_DIFF_FLAGS`
+    inserted right after a diff-rendering subcommand; other subcommands are returned unchanged.
+
+    Pair with :func:`noninteractive_git_env`: the env layer disables fsmonitor/hooks/pager/editor/
+    credential sinks, this closes the one class (attacker-named attribute drivers) env cannot reach.
+    """
+    out = list(args)
+    i = 0
+    while i < len(out):
+        tok = out[i]
+        if tok in _GIT_VALUE_OPTS:
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        if tok in _DIFF_RENDERING_SUBCOMMANDS:
+            return out[: i + 1] + list(NO_DRIVER_DIFF_FLAGS) + out[i + 1 :]
+        return out  # first non-option token is a non-diff subcommand
+    return out
+
+def pid_is_hermes(pid: int, *, expected_start_time: int | None = None) -> bool:
+    """Whether it is safe to use ``taskkill`` for *pid*.
+
+    The PID must be valid, currently exist, and identify a Hermes process. When the caller captured
+    a start-time fingerprint before the destructive action, the live process must still have the
+    same ``(pid, start_time)`` identity. Any ambiguity fails closed.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if not IS_WINDOWS:
+        if expected_start_time is None:
+            return True
+        try:
+            return _process_start_time(pid) == expected_start_time
+        except Exception:
+            return False
+    try:
+        current_start_time = _process_start_time(pid)
+    except Exception:
+        return False
+    if current_start_time is None:
+        return False
+    if expected_start_time is not None and current_start_time != expected_start_time:
+        return False
+    try:
+        return _process_command_is_hermes(pid)
+    except Exception:
+        return False

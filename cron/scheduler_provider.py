@@ -574,3 +574,102 @@ class InProcessCronScheduler(CronScheduler):
             if ok:
                 consecutive_failures = 0
             stop_event.wait(_backoff_wait_seconds(interval, consecutive_failures))
+
+
+# --- Fork compat (2026-09 sync): misfire backstop the gateway housekeeping loop
+# calls; verbatim from the pinned upstream snapshot (its lazy imports resolve against
+# the fork cron.jobs).
+def _misfire_grace_minutes() -> float:
+    """``cron.misfire_grace_minutes`` from config; non-positive disables the catch-up sweep."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        config = load_config()
+        return float(
+            cfg_get(config, "cron", "misfire_grace_minutes", default=DEFAULT_MISFIRE_GRACE_MINUTES)
+        )
+    except Exception:
+        return float(DEFAULT_MISFIRE_GRACE_MINUTES)
+
+def fire_overdue_jobs(
+    provider: "CronScheduler", *, adapters: Any = None, loop: Any = None, now: Any = None,
+) -> int:
+    """Misfire backstop (gateway housekeeping loop): fire jobs whose external HTTP fire never
+    arrived, else ``next_run_at`` stays parked in the past forever. No-op for the built-in (its tick
+    loop self-heals). Routes through the provider's own two-phase path so re-arm logic runs and a
+    concurrent late external retry is de-duplicated by the store CAS; waits out
+    ``cron.misfire_grace_minutes`` so the external retry gets first right. Returns jobs dispatched.
+    """
+    from datetime import datetime
+
+    if isinstance(provider, InProcessCronScheduler):
+        return 0
+
+    grace_minutes = _misfire_grace_minutes()
+    if grace_minutes <= 0:
+        return 0
+
+    from cron.jobs import (
+        ONESHOT_GRACE_SECONDS, _ensure_aware, _hermes_now, is_job_runnable, load_jobs,
+    )
+
+    if now is None:
+        now = _hermes_now()
+
+    fired = 0
+    for job in load_jobs():
+        if not is_job_runnable(job):
+            continue
+        next_run_at = job.get("next_run_at")
+        if not next_run_at:
+            continue
+        try:
+            due_dt = _ensure_aware(datetime.fromisoformat(next_run_at))
+        except (ValueError, TypeError):
+            continue
+        overdue_seconds = (now - due_dt).total_seconds()
+        if overdue_seconds < grace_minutes * 60:
+            continue
+        job_id = str(job.get("id") or "")
+        # One-shots past ONESHOT_GRACE_SECONDS "will never fire"; don't resurrect them hours late.
+        # One-shot jobs share the module-wide policy: more than ONESHOT_GRACE_SECONDS past their run time
+        # means "will never fire" (create/update/resume/recovery and, since #89571, the due-scan all enforce
+        # it). The misfire backstop must not resurrect them hours late after downtime — that's #93526.
+        schedule = job.get("schedule") or {}
+        if str(schedule.get("kind") or "") == "once" and overdue_seconds > ONESHOT_GRACE_SECONDS:
+            logger.warning(
+                "Misfire catch-up: one-shot job %s (%s) was due %s "
+                "(%.0f min overdue) — outside the %ss one-shot grace "
+                "window, not firing.",
+                job_id,
+                job.get("name") or "unnamed",
+                next_run_at,
+                overdue_seconds / 60,
+                ONESHOT_GRACE_SECONDS,
+            )
+            continue
+        logger.warning(
+            "Misfire catch-up: job %s (%s) was due %s (%.0f min overdue) and "
+            "no external fire arrived — firing locally.",
+            job_id,
+            job.get("name") or "unnamed",
+            next_run_at,
+            overdue_seconds / 60,
+        )
+        try:
+            # Claim synchronously (CAS loss = external retry beat us), run off-thread: never block.
+            claimed = provider.claim_fire(job_id)
+            if claimed is None:
+                continue
+            threading.Thread(
+                target=provider.fire_claimed, args=(claimed,),
+                kwargs={"adapters": adapters, "loop": loop}, daemon=True,
+                name=f"cron-misfire-{job_id[:12]}",
+            ).start()
+            fired += 1
+        except Exception as exc:
+            logger.warning(
+                "Misfire catch-up failed for job %s: %s: %s",
+                job_id, type(exc).__name__, exc,
+            )
+    return fired

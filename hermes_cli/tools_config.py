@@ -1160,7 +1160,7 @@ def install_cua_driver(
     if binary and not repair_existing:
         _state = None
         try:
-            from tools.computer_use.cua_backend import cua_driver_update_check
+            from tools.computer_use.cua_backend_driver import cua_driver_update_check
             _state = cua_driver_update_check()
         except Exception:
             _state = None

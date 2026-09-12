@@ -8180,3 +8180,23 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
         # since the loop is gone and no session can still be in flight.
         _kill_orphaned_mcp_children(include_active=True)
     return True
+
+
+# --- Fork compat (2026-09 sync) ----------------------------------------------------
+def _server_visible_in_scope(key, scope=None) -> bool:
+    """Upstream's turn loop gates MCP tool visibility by connection scope. The fork
+    MCP layer has no scope registry (connections are process-wide, the pre-split
+    behavior), so every live connection is visible regardless of scope. Revisit with
+    the decomposition-adoption card."""
+    return True
+
+
+def _mcp_registry_scope():
+    """Upstream helper used by hermes_cli.mcp_discovery: the registry scope for MCP
+    registrations — a profile overlay key under an active multiplexer, else None.
+    Verbatim upstream logic against the fork registry (same public surface)."""
+    from agent.secret_scope import is_multiplex_active
+    if not is_multiplex_active():
+        return None
+    from tools.registry import registry
+    return registry.current_scope_key()
