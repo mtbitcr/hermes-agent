@@ -87,8 +87,8 @@ def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
-        return True
+        import psutil
+        return psutil.pid_exists(pid)
     except Exception as exc:
         return isinstance(exc, PermissionError)
 
@@ -472,7 +472,7 @@ class HostSupervisor:
         deadline = time.monotonic() + timeout
         while _pid_alive(pid):
             if time.monotonic() >= deadline:
-                _signal_pid(pid, signal.SIGKILL, "SIGKILL")
+                _signal_pid(pid, getattr(signal, "SIGKILL", signal.SIGTERM), "SIGKILL")
                 return
             time.sleep(0.05)
 
