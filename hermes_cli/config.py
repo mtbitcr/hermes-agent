@@ -4136,44 +4136,68 @@ def _cron_model_impact_result(available: bool) -> Dict[str, Any]:
 
 
 def build_cron_model_impact(
-    *, current_provider: Any = "", current_model: Any = "", config: Any = None, jobs: Any = None
+    *,
+    current_provider: Any = "",
+    current_model: Any = "",
+    config: Any = None,
+    jobs: Any = None,
 ) -> Dict[str, Any]:
-    """Build a bounded, profile-local summary of unpinned jobs that stay on their creation snapshot
-    after a global model/provider change. Job-store inspection is best effort: the model assignment
-    has already succeeded when Desktop requests this, so an unreadable store is reported as
-    unavailable rather than failing."""
+    """Build a bounded, profile-local summary of jobs blocked by model drift.
+
+    Job-store inspection is deliberately best effort: a model assignment has
+    already succeeded by the time Desktop requests this summary, so an unreadable
+    store is represented as unavailable instead of failing or rolling back it.
+    """
+    guard_enabled = cron_model_drift_guard_enabled(config)
     if jobs is None:
         try:
             from cron.jobs import load_jobs
 
             jobs = load_jobs()
         except Exception:
-            return _cron_model_impact_result(False)
+            return _unavailable_cron_model_impact(guard_enabled)
     if not isinstance(jobs, list):
-        return _cron_model_impact_result(False)
+        return _unavailable_cron_model_impact(guard_enabled)
 
-    result = _cron_model_impact_result(True)
+    result: Dict[str, Any] = {
+        "available": True,
+        "guard_enabled": guard_enabled,
+        "affected_count": 0,
+        "truncated": False,
+        "jobs": [],
+    }
+    if not guard_enabled:
+        return result
 
     from cron.jobs import is_job_runnable
 
     seen_ids: Set[str] = set()
     for job in jobs:
-        if not isinstance(job, dict) or not is_job_runnable(job) or job.get("no_agent"):
+        if not isinstance(job, dict):
+            continue
+        if not is_job_runnable(job) or job.get("no_agent"):
             continue
         job_id = _valid_cron_impact_job_id(job.get("id"))
         if not job_id or job_id in seen_ids:
             continue
         seen_ids.add(job_id)
         axes = cron_model_drift_axes(
-            job, current_provider=current_provider, current_model=current_model, config=config)
+            job,
+            current_provider=current_provider,
+            current_model=current_model,
+            config=config,
+        )
         if not axes:
             continue
         result["affected_count"] += 1
         if len(result["jobs"]) < _CRON_MODEL_IMPACT_JOB_LIMIT:
-            result["jobs"].append({
-                "id": job_id,
-                "name": _cron_impact_job_name(job.get("name"), job_id),
-                "drifted_axes": axes})
+            result["jobs"].append(
+                {
+                    "id": job_id,
+                    "name": _cron_impact_job_name(job.get("name"), job_id),
+                    "drifted_axes": axes,
+                }
+            )
 
     result["truncated"] = result["affected_count"] > len(result["jobs"])
     return result
@@ -4556,6 +4580,29 @@ def _guard_section_overwrite(key: str, value: Any, user_config: Dict[str, Any], 
                 skin_file.touch()
         except Exception:
             pass
+
+
+def cron_model_drift_guard_enabled(
+    config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return whether cron must fail closed on unpinned inference drift.
+
+    Only the literal YAML boolean ``false`` disables this spend-safety guard.
+    Missing, malformed, or non-boolean values stay fail-closed. When *config*
+    is omitted, load the active merged configuration so CLI warnings honor the
+    same user/managed setting as the scheduler.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            return True
+    if not isinstance(config, dict):
+        return True
+    cron_config = config.get("cron")
+    if not isinstance(cron_config, dict):
+        return True
+    return cron_config.get("model_drift_guard", True) is not False
 
 
 def _touch_skin_file(key: str, value: Any) -> None:
