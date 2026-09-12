@@ -71,6 +71,7 @@ tests/gateway/test_kanban_changes_requested_notifier.py
 tests/gateway/test_kanban_multiplex_served_profile_parity.py
 tests/gateway/test_kanban_routed_transport.py
 tests/gateway/test_kanban_wake_acceptance.py
+tests/gateway/test_multiplex_mcp_discovery.py
 tests/gateway/test_multiplex_process_memo_scope.py
 tests/gateway/test_multiplex_toolsets_profile_isolation.py
 tests/gateway/test_output_caps_removed.py
@@ -81,6 +82,7 @@ tests/gateway/test_slash_config_writes_routed_profile.py
 tests/gateway/test_transcript_read_failure_100788.py
 tests/gateway/test_webhook_profile_egress.py
 tests/hermes_cli/test_anon_desktop_signin.py
+tests/hermes_cli/test_deleted_profile_tombstone.py
 tests/hermes_cli/test_desktop_cron_ticker_profiles.py
 tests/hermes_cli/test_env_custom_keys.py
 tests/hermes_cli/test_gpt56_registration.py
@@ -161,6 +163,7 @@ tests/tools/test_allowlist_legacy_config.py
 tests/tools/test_blocked_command_guidance.py
 tests/tools/test_browser_use_cli.py
 tests/tools/test_code_kernel.py
+tests/tools/test_code_kernel_remote.py
 tests/tools/test_connections_tool.py
 tests/tools/test_connector_session_scope.py
 tests/tools/test_delegate.py
@@ -171,10 +174,13 @@ tests/tools/test_kanban_descendant_scope.py
 tests/tools/test_kanban_provenance.py
 tests/tools/test_llm_content_none_guard.py
 tests/tools/test_mcp_cimd.py
+tests/tools/test_mcp_death_supervisor.py
 tests/tools/test_mcp_device_flow.py
 tests/tools/test_mcp_dynamic_discovery.py
 tests/tools/test_mcp_multiplex_connection_keys.py
 tests/tools/test_mcp_oauth_user_agent.py
+tests/tools/test_mcp_stdio_children_dead.py
+tests/tools/test_mcp_stdio_fastfail_reconnect.py
 tests/tools/test_modal_sandbox_fixes.py
 tests/tools/test_multiplex_turn_parity.py
 tests/tools/test_plugin_guard.py

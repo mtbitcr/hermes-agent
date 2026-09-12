@@ -7,6 +7,7 @@ web_server — reached via the late-binding seam so tests that mutate
 
 import asyncio  # noqa: F401 — used by handlers
 import logging
+import time
 import secrets  # noqa: F401
 import threading  # noqa: F401
 from typing import Any, Dict, Optional  # noqa: F401
