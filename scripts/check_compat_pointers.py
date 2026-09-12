@@ -25,6 +25,26 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "compat_manifest.json"
 SKIP_DIRS = {".git", "node_modules", "website", "skills", "optional-skills", "apps", "evals", "build", "MagicMock", ".worktrees", "__pycache__"}
 
+# Fork-canonical facades: upstream's manifest lists these modules because upstream decomposed
+# them into separate defining modules. THIS fork did not decompose them — these modules define
+# the names themselves, so imports through them are correct and must not be flagged. Any manifest
+# entry whose facade matches one of these is skipped by the checker.
+#
+# NOTE: hermes_state is deliberately EXCLUDED. In this fork hermes_state.py carries a real
+# `# ---- BEGIN PLUGIN-COMPAT ----` block with a `_PLUGIN_COMPAT_LAZY` map and `__getattr__`
+# that forwards its manifest names to hermes_state_* siblings with a deprecation warning.
+# Those names ARE genuine compat pointers here and disappear when the block is reverted.
+FORK_CANONICAL_FACADES = frozenset({
+    "hermes_cli.kanban_db",               # kanban kernel
+    "hermes_cli.web_server",              # dashboard/web server
+    "hermes_cli.dashboard_auth.audit",    # dashboard audit module
+    "agent.auxiliary_client",             # auxiliary client
+    "tools.approval",                     # approvals module
+    "tools.browser_tool",                 # browser tool
+    "tools.mcp_tool",                     # MCP tool
+    "cron.scheduler",                     # cron scheduler
+})
+
 
 def _py_files():
     for p in ROOT.rglob("*.py"):
@@ -44,6 +64,8 @@ def main() -> int:
     entries = json.loads(MANIFEST.read_text(encoding="utf-8"))["entries"]
     compat: dict[str, set[str]] = {}
     for e in entries:
+        if e["facade"] in FORK_CANONICAL_FACADES:
+            continue
         compat.setdefault(e["facade"], set()).add(e["name"])
     facades = set(compat)
     hits: list[str] = []

@@ -703,7 +703,7 @@ def _load_connection_secret() -> str:
 def _resolve_host_credential() -> str:
     """The existing host-owned Anthropic resolver — never a tool argument."""
     try:
-        from agent.anthropic_adapter import resolve_anthropic_token
+        from agent.anthropic_credentials import resolve_anthropic_token
 
         return (resolve_anthropic_token() or "").strip()
     except Exception:
@@ -724,7 +724,7 @@ def _credential_is_oauth(secret: str) -> bool:
 def _claude_account_credentials() -> Optional[dict]:
     """The host's refreshable Claude *account* credential record, if any."""
     try:
-        from agent.anthropic_adapter import read_claude_code_credentials
+        from agent.anthropic_credentials import read_claude_code_credentials
 
         record = read_claude_code_credentials()
     except Exception:

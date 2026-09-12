@@ -2749,7 +2749,7 @@ def _release_permission_mode_dependents(session_key: str) -> None:
     immediately, even when no later computer-use call occurs.
     """
     try:
-        from tools.computer_use import release_computer_use_session
+        from tools.computer_use.tool import release_computer_use_session
 
         release_computer_use_session(session_key)
     except Exception:
