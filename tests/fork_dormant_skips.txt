@@ -156,6 +156,7 @@ tests/hermes_cli/test_shared_metrics_tools_toggle.py
 tests/hermes_cli/test_spawn_gateway_restart_cooldown.py
 tests/hermes_cli/test_spawn_gateway_restart_reap.py
 tests/hermes_cli/test_ssh_ownership_endpoint.py
+tests/hermes_cli/test_stale_pid_guard.py
 tests/hermes_cli/test_stt_picker.py
 tests/hermes_cli/test_update_behind_count_recovery.py
 tests/hermes_cli/test_update_check.py
@@ -228,6 +229,7 @@ tests/tools/test_kanban_descendant_scope.py
 tests/tools/test_kanban_provenance.py
 tests/tools/test_llm_content_none_guard.py
 tests/tools/test_local_setsid_descendant_sweep.py
+tests/tools/test_local_temp_dir.py
 tests/tools/test_macos_protected_search.py
 tests/tools/test_managed_browserbase_and_modal.py
 tests/tools/test_mcp_cimd.py
