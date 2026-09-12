@@ -4088,22 +4088,25 @@ def resolve_cron_model_drift_defaults(
 
 
 def cron_model_drift_axes(
-    job: Any, *, current_provider: Any = "", current_model: Any = "", config: Any = None
+    job: Any,
+    *,
+    current_provider: Any = "",
+    current_model: Any = "",
+    config: Any = None,
 ) -> List[str]:
-    """Return the unpinned axes on which *job* will keep running on its creation snapshot rather
-    than the new global assignment (the scheduler treats the snapshot as the effective pin)."""
-    if not isinstance(job, dict):
+    """Return the unpinned axes that the fail-closed cron guard would block."""
+    if not isinstance(job, dict) or not cron_model_drift_guard_enabled(config):
         return []
 
     current = {
         "provider": _model_assignment_text(current_provider).lower(),
-        "model": _model_assignment_text(current_model).lower()}
-    # A cron.model / cron.model_provider fleet default covers its axis: that axis never reads the
-    # snapshot at fire time, so reporting it would be false.
-    fleet = _cron_section(config) or {}
+        "model": _model_assignment_text(current_model).lower(),
+    }
     drifted: List[str] = []
-    for axis, fleet_key in (("provider", "model_provider"), ("model", "model")):
-        if _model_assignment_text(fleet.get(fleet_key)) or _model_assignment_text(job.get(axis)):
+    for axis in ("provider", "model"):
+        if _cron_fleet_default_covers_axis(axis, config):
+            continue
+        if _model_assignment_text(job.get(axis)):
             continue
         snapshot = _model_assignment_text(job.get(f"{axis}_snapshot")).lower()
         if snapshot and current[axis] and snapshot != current[axis]:

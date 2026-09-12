@@ -1534,6 +1534,37 @@ def _live_system_guard(request, monkeypatch):
                 "flow against a dedicated throwaway repo)."
             )
 
+    # Fork sync note (2026-09-03 incident, restored with the sync): a DIRECT spawn of
+    # the gateway lifecycle — ``python -m hermes_cli.main gateway restart`` or the
+    # ``hermes gateway <verb>`` console script — bypasses systemctl entirely, inherits
+    # the pytest-tmp HERMES_HOME, resolves the developer's real unit and outlives the
+    # test. Block it at the spawn primitive like the systemctl form.
+    def _is_direct_gateway_lifecycle(cmd) -> bool:
+        cmd_str = _cmd_to_string(cmd).lower()
+        if not _matches_hermes_gateway(cmd_str):
+            return False
+        try:
+            tokens = _shlex.split(cmd_str)
+        except ValueError:
+            tokens = cmd_str.split()
+        if "gateway" not in tokens:
+            return False
+        gi = tokens.index("gateway")
+        return any(verb in tokens[gi + 1:gi + 3] for verb in _MUTATING_VERBS)
+
+    _orig_check_subprocess_cmd = _check_subprocess_cmd
+
+    def _check_subprocess_cmd(name, cmd):  # noqa: F811
+        if _is_direct_gateway_lifecycle(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — direct gateway lifecycle spawn "
+                "would mutate the live hermes-gateway outside systemctl. Mock "
+                "subprocess.Popen in the test, or mark with "
+                "@pytest.mark.live_system_guard_bypass."
+            )
+        _orig_check_subprocess_cmd(name, cmd)
+
     def _wrap_subprocess(name, real):
         def _guarded(cmd, *args, **kwargs):
             _check_subprocess_cmd(name, cmd)
