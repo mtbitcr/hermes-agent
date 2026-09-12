@@ -1826,7 +1826,7 @@ def _moa_caches_isolated():
 # would exercise code this fork does not run. The list is maintained in
 # tests/fork_dormant_skips.txt; burn it down with the decomposition-adoption card.
 _FORK_DORMANT_SKIPS = Path(__file__).parent / "fork_dormant_skips.txt"
-collect_ignore_glob = [
+collect_ignore = [
     _line.strip()[len("tests/"):]
     for _line in _FORK_DORMANT_SKIPS.read_text(encoding="utf-8").splitlines()
     if _line.strip() and not _line.strip().startswith("#")
