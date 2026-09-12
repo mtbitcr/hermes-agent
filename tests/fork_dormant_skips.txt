@@ -228,6 +228,7 @@ tests/tools/test_kanban_descendant_scope.py
 tests/tools/test_kanban_provenance.py
 tests/tools/test_llm_content_none_guard.py
 tests/tools/test_local_setsid_descendant_sweep.py
+tests/tools/test_macos_protected_search.py
 tests/tools/test_managed_browserbase_and_modal.py
 tests/tools/test_mcp_cimd.py
 tests/tools/test_mcp_death_supervisor.py

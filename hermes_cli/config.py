@@ -4087,6 +4087,31 @@ def resolve_cron_model_drift_defaults(
     return provider, configured_model or _model_assignment_text(env.get("HERMES_MODEL", ""))
 
 
+def _cron_fleet_default_covers_axis(
+    axis: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when cron.model / cron.model_provider covers *axis*.
+
+    An axis covered by the explicit cron-fleet default no longer follows the
+    global model/provider at fire time, so the drift guard never engages for
+    it and switch-time warnings would be false alarms.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            return False
+    if not isinstance(config, dict):
+        return False
+    cron_config = config.get("cron")
+    if not isinstance(cron_config, dict):
+        return False
+    key = "model" if axis == "model" else "model_provider"
+    value = cron_config.get(key)
+    return isinstance(value, str) and bool(value.strip())
+
+
 def cron_model_drift_axes(
     job: Any,
     *,

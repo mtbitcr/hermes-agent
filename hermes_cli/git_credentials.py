@@ -90,7 +90,8 @@ def _credential_fill(origin: str) -> Optional[tuple[str, str]]:
         return None
     if result.returncode != 0:
         return None
-    fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    # Fork note: test fakes may omit stdout; treat as empty rather than raising.
+    fields = dict(line.split("=", 1) for line in (getattr(result, "stdout", None) or "").splitlines() if "=" in line)
     if fields.get("password"):
         return fields.get("username", ""), fields["password"]
     return None
