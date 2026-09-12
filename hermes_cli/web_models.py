@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, SecretStr, StrictBool, field_validator
+from pydantic import BaseModel, ConfigDict, SecretStr, StrictBool, field_validator
 
 
 class ConfigUpdate(BaseModel):

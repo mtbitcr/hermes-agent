@@ -10,6 +10,7 @@ redirect_host, client_name, client_metadata_url, cimd, user_agent, timeout."""
 
 import asyncio
 import contextlib
+from contextlib import contextmanager
 import contextvars
 import importlib.util as _importlib_util
 import json
@@ -1048,7 +1049,6 @@ def build_oauth_auth(server_name: str, server_url: str, oauth_config: dict | Non
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
 # The whole block is removed by reverting the commit that added it.
-from contextlib import contextmanager  # noqa: F401,E402
 
 OAuthClientInformationFull: Any = None
 

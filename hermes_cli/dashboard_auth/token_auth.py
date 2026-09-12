@@ -56,8 +56,10 @@ seam remembers and surfaces as 503 only if NO provider accepts the token.
 from __future__ import annotations
 
 import logging
+import re
 import threading
-from typing import Awaitable, Callable, Optional, Tuple
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Dict, Optional, Tuple
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response

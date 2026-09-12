@@ -14096,6 +14096,24 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    """Integer env override: absent/empty/non-integer/below ``minimum`` falls back to ``default``.
+
+    Fork note: upstream's decomposed modules (kanban_db_connect and siblings) call this
+    through the ``hermes_cli.kanban_db`` facade; the fork monolith provides it so those
+    modules stay importable while dormant.
+    """
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return default
+        if parsed >= minimum:
+            return parsed
+    return default
+
+
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
 # Maximum number of ``<db>.corrupt.<hash>.bak`` quarantine files retained per

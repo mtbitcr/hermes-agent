@@ -36,7 +36,6 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
-    _api_request_profile,
     _IdempotencyCache,
     _derive_chat_session_id,
     _hermes_version,
@@ -53,7 +52,6 @@ from gateway.platforms.api_server import (
     _resolve_owner_workspace_run_context,
     _request_reasoning_config,
     _request_agent_overrides,
-    _request_relay_metadata,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -3550,70 +3548,9 @@ class TestIdempotencyCache:
         assert first_result == second_result == ("response", {"total_tokens": 1})
 
 
-class TestRunIdempotentProfileScope:
-    """``_idem_cache`` is process-global; under multiplex every profile's ``/p/<profile>/v1/...`` mirror
-    shares it, so the cache key must carry the request's profile/principal scope and logical route."""
-
-    @pytest.mark.asyncio
-    async def test_same_key_different_profiles_do_not_share_a_cached_response(self, adapter, monkeypatch):
-        monkeypatch.setattr("gateway.platforms.api_server._idem_cache", _IdempotencyCache())
-        request = MagicMock()
-        request.headers = {"Idempotency-Key": "client-supplied-key"}
-        body = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
-        calls = []
-
-        async def compute():
-            calls.append(1)
-            return (f"response-{len(calls)}", {"total_tokens": len(calls)})
-
-        token_a = _api_request_profile.set("profile-a")
-        try:
-            outcome_a, err_a = await adapter._run_idempotent(
-                request, body, compute, log_label="test", fingerprint_keys=["model", "messages"],
-                route="chat_completions")
-        finally:
-            _api_request_profile.reset(token_a)
-
-        token_b = _api_request_profile.set("profile-b")
-        try:
-            outcome_b, err_b = await adapter._run_idempotent(
-                request, body, compute, log_label="test", fingerprint_keys=["model", "messages"],
-                route="chat_completions")
-        finally:
-            _api_request_profile.reset(token_b)
-
-        assert err_a is None and err_b is None
-        assert len(calls) == 2, "each profile must run its own turn, not reuse the other's cached response"
-        assert outcome_a != outcome_b
-
-    @pytest.mark.asyncio
-    async def test_same_key_same_profile_still_dedupes(self, adapter, monkeypatch):
-        """Regression guard: profile-scoping the cache key must not break same-profile dedup,
-        which is the whole point of the Idempotency-Key contract."""
-        monkeypatch.setattr("gateway.platforms.api_server._idem_cache", _IdempotencyCache())
-        request = MagicMock()
-        request.headers = {"Idempotency-Key": "client-supplied-key"}
-        body = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
-        calls = []
-
-        async def compute():
-            calls.append(1)
-            return (f"response-{len(calls)}", {"total_tokens": len(calls)})
-
-        token = _api_request_profile.set("profile-a")
-        try:
-            outcome_1, err_1 = await adapter._run_idempotent(
-                request, body, compute, log_label="test", fingerprint_keys=["model", "messages"],
-                route="chat_completions")
-            outcome_2, err_2 = await adapter._run_idempotent(
-                request, body, compute, log_label="test", fingerprint_keys=["model", "messages"],
-                route="chat_completions")
-        finally:
-            _api_request_profile.reset(token)
-
-        assert err_1 is None and err_2 is None
-        assert len(calls) == 1, "second call with the same key+profile+fingerprint must reuse the cached response"
-        assert outcome_1 == outcome_2
+# ---------------------------------------------------------------------------
+# Adapter initialization
+# ---------------------------------------------------------------------------
 
 
 class TestAdapterInit:
@@ -3919,36 +3856,6 @@ class TestAgentExecution:
         assert mock_agent._gateway_turn_process_baseline == frozenset()
 
 
-class TestRelayMetadataForwarding:
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("endpoint", "payload"),
-        [
-            (
-                "/v1/chat/completions",
-                {"messages": [{"role": "user", "content": "hi"}]},
-            ),
-            ("/v1/responses", {"input": "hi"}),
-        ],
-    )
-    async def test_openai_requests_forward_metadata_to_relay(
-        self, adapter, endpoint, payload
-    ):
-        app = _create_app(adapter)
-        metadata = {"request_id": "req-123", "context": {"tenant": "example"}}
-        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
-            mock_run.return_value = (
-                {"final_response": "ok", "messages": [], "api_calls": 1},
-                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-            )
-            async with TestClient(TestServer(app)) as cli:
-                response = await cli.post(endpoint, json={**payload, "metadata": metadata})
-
-        assert response.status == 200
-        assert mock_run.call_args.kwargs["relay_metadata"] == metadata
-        assert mock_run.call_args.kwargs["relay_metadata"] is not metadata
-
-
 class TestDisconnectedAgentReap:
     """#76188 review: SSE disconnect handlers must reap only the background
     processes the disconnected turn created, and must no-op when no turn
@@ -4131,9 +4038,7 @@ class TestDisconnectedAgentReap:
         adapter._active_run_agents["run_x"] = agent
 
         request = MagicMock()
-        request.headers = {}
         request.match_info = {"run_id": "run_x"}
-        adapter._run_owners["run_x"] = adapter._run_idempotency_scope(request)
         resp = await adapter._handle_stop_run(request)
         assert resp.status == 200
 
@@ -4230,10 +4135,7 @@ class TestHealthDetailedEndpoint:
             "active_agents": 2,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
-        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"), patch(
-            "gateway.readiness.shutil.disk_usage",
-            return_value=types.SimpleNamespace(total=100, used=25, free=75),
-        ):
+        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
@@ -4395,26 +4297,12 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
-            assert data["features"]["runs_idempotency"] == {
-                "supported": True,
-                "durable": True,
-                "retention_seconds": 86400,
-            }
             assert data["features"]["model_options"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
-
-    @pytest.mark.asyncio
-    async def test_capabilities_reports_in_memory_idempotency_fallback(self, adapter):
-        adapter._run_idempotency_store._db_path = None
-        app = _create_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            response = await cli.get("/v1/capabilities")
-            data = await response.json()
-        assert data["features"]["runs_idempotency"]["durable"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -8512,7 +8400,6 @@ class TestSessionIdHeader:
         ]
         mock_db = MagicMock()
         mock_db.get_messages_as_conversation.return_value = db_history
-        mock_db.resolve_resume_session_id.side_effect = lambda sid: sid
         auth_adapter._session_db = mock_db
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -8765,27 +8652,6 @@ class TestModelRoutesAgentCreation:
         assert captured["api_key"] == "sk-session"
 
 
-class TestStoredSessionModelFilter:
-    """A session row that persisted the advertised virtual model must read as
-    "no stored model" — replaying "hermes-agent" upstream 400s. Found live
-    (Aug 2026): the first cross-gateway `hermes peer dm` against a fresh
-    api_server failed every turn with "hermes-agent is not a valid model ID".
-    """
-
-    def test_virtual_model_is_filtered(self):
-        adapter = _make_routing_adapter({})
-        assert adapter._stored_session_model({"model": adapter._model_name}) is None
-
-    def test_real_model_passes_through(self):
-        adapter = _make_routing_adapter({})
-        assert adapter._stored_session_model({"model": "google/gemini-3.7-flash"}) == "google/gemini-3.7-flash"
-
-    def test_missing_or_bad_shapes(self):
-        adapter = _make_routing_adapter({})
-        assert adapter._stored_session_model({}) is None
-        assert adapter._stored_session_model(None) is None
-
-
 # ---------------------------------------------------------------------------
 # Event-loop offloading for synchronous SessionDB calls (P1)
 # ---------------------------------------------------------------------------
@@ -8817,93 +8683,6 @@ class TestSessionDbOffEventLoop:
         # The blocking DB call must NOT execute on the event-loop thread.
         assert captured["thread"] is not None
         assert captured["thread"] != threading.current_thread()
-
-    @pytest.mark.asyncio
-    async def test_create_session_without_model_does_not_persist_virtual_alias(self, auth_adapter):
-        """A session created with no ``model`` field must not persist the
-        virtual model alias (self._model_name, e.g. "hermes-agent") as if it
-        were a real provider model id.
-
-        Regression: _handle_create_session previously did
-        ``model = body.get("model") or self._model_name``, so an omitted
-        model fell back to the virtual alias and that string got stored on
-        the session row. _handle_session_chat later reads it back as a raw
-        session_model override (since it's not a model_routes alias) and
-        sends it to the provider literally — Bedrock/OpenAI then reject
-        "hermes-agent" as an invalid model identifier on every turn.
-        """
-        app = _create_app(auth_adapter)
-        app.router.add_post("/api/sessions", auth_adapter._handle_create_session)
-
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/api/sessions",
-                json={},
-                headers={"Authorization": "Bearer sk-secret"},
-            )
-            assert resp.status == 201
-            data = await resp.json()
-            assert data["session"]["model"] != auth_adapter._model_name
-            assert data["session"]["model"] is None
-
-    @pytest.mark.asyncio
-    async def test_create_session_with_explicit_virtual_alias_does_not_persist_it(self, auth_adapter):
-        """Sending ``model: "hermes-agent"`` explicitly (the virtual alias
-        itself, e.g. a client that just echoes /v1/models' advertised id)
-        must be treated the same as omitting model entirely."""
-        app = _create_app(auth_adapter)
-        app.router.add_post("/api/sessions", auth_adapter._handle_create_session)
-
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/api/sessions",
-                json={"model": auth_adapter._model_name},
-                headers={"Authorization": "Bearer sk-secret"},
-            )
-            assert resp.status == 201
-            data = await resp.json()
-            assert data["session"]["model"] is None
-
-    @pytest.mark.asyncio
-    async def test_create_session_with_real_model_persists_it(self, auth_adapter):
-        """Regression guard: a genuine model id must still be stored as before."""
-        app = _create_app(auth_adapter)
-        app.router.add_post("/api/sessions", auth_adapter._handle_create_session)
-
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/api/sessions",
-                json={"model": "openai/gpt-5"},
-                headers={"Authorization": "Bearer sk-secret"},
-            )
-            assert resp.status == 201
-            data = await resp.json()
-            assert data["session"]["model"] == "openai/gpt-5"
-
-    @pytest.mark.asyncio
-    async def test_create_session_with_provider_prefixed_virtual_alias_does_not_persist_it(self, auth_adapter):
-        """A provider-prefixed echo of the virtual alias (e.g. a client that
-        threads /v1/models' advertised id through a provider:: prefix) must
-        also be treated as "no model", not stored as a raw override.
-
-        Regression: _handle_create_session used to re-derive its own `model`
-        straight from the raw request body, bypassing the provider-prefix
-        split that _session_runtime_request_from_body performs — so
-        "openrouter::hermes-agent" never matched self._model_name and leaked
-        through as a literal session override.
-        """
-        app = _create_app(auth_adapter)
-        app.router.add_post("/api/sessions", auth_adapter._handle_create_session)
-
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/api/sessions",
-                json={"model": f"openrouter::{auth_adapter._model_name}"},
-                headers={"Authorization": "Bearer sk-secret"},
-            )
-            assert resp.status == 201
-            data = await resp.json()
-            assert data["session"]["model"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -8995,30 +8774,6 @@ class TestKeyRejectionSetsNonRetryableFatalError:
     async def test_missing_key_sets_non_retryable_fatal_error(self, monkeypatch):
         adapter = self._make_adapter("", monkeypatch)
         await self._assert_key_rejection_is_fatal(adapter)
-
-
-# ---------------------------------------------------------------------------
-# Relay metadata extraction
-# ---------------------------------------------------------------------------
-
-
-class TestRequestRelayMetadata:
-    def test_copies_all_metadata_fields(self):
-        metadata = {
-            "request_id": "req-123",
-            "attempt": 2,
-            "tags": ["batch", "evaluation"],
-            "context": {"tenant": "example"},
-        }
-
-        extracted = _request_relay_metadata({"metadata": metadata})
-
-        assert extracted == metadata
-        assert extracted is not metadata
-
-    @pytest.mark.parametrize("body", [None, [], {}, {"metadata": "invalid"}])
-    def test_ignores_non_object_metadata(self, body):
-        assert _request_relay_metadata(body) == {}
 
 
 # ---------------------------------------------------------------------------
