@@ -197,6 +197,7 @@ tests/plugins/test_memory_hook_registration.py
 tests/run_agent/test_authorization_gate.py
 tests/run_agent/test_run_agent.py
 tests/run_agent/test_sanitiser_escalation.py
+tests/run_agent/test_skill_applied_notifications.py
 tests/run_agent/test_tool_executor_contextvar_propagation.py
 tests/security/test_gitspawn_config_injection.py
 tests/skills/test_openclaw_migration.py
@@ -257,6 +258,8 @@ tests/tools/test_search_giant_line_containment.py
 tests/tools/test_search_native_rg.py
 tests/tools/test_skill_bundle_provenance.py
 tests/tools/test_skill_create_dir.py
+tests/tools/test_skill_manage_batch.py
+tests/tools/test_skill_manage_schema_diet.py
 tests/tools/test_skills_guard_agent_config.py
 tests/tools/test_strict_provider_selection.py
 tests/tools/test_terminal_scope_multiplex.py
