@@ -912,6 +912,10 @@ class TestSharedBoardPaths:
 # NFS / network-filesystem fallback (see hermes_state.apply_wal_with_fallback)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(
+    __import__("hermes_state_wal").is_sqlite_wal_reset_vulnerable(),
+    reason="linked SQLite has the WAL-reset bug (fork sync note): connects choose journal_mode=DELETE up front, so the WAL attempt this test exercises never happens; production links a fixed SQLite",
+)
 def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch, caplog):
     """kanban_db.connect() must handle ``locking protocol`` on NFS/SMB.
 
@@ -988,6 +992,10 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     conn.close()
 
 
+@pytest.mark.skipif(
+    __import__("hermes_state_wal").is_sqlite_wal_reset_vulnerable(),
+    reason="linked SQLite has the WAL-reset bug (fork sync note): connects choose journal_mode=DELETE up front, so the WAL attempt this test exercises never happens; production links a fixed SQLite",
+)
 def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplog):
     """kanban_db.connect() must stay usable when WAL silently no-ops to DELETE."""
     import sqlite3 as _sqlite3

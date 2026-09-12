@@ -81,6 +81,10 @@ def _first_open_worker(db_path, barrier, lock, active, peak, queue):
             connection.close()
 
 
+@pytest.mark.skipif(
+    __import__("hermes_state_wal").is_sqlite_wal_reset_vulnerable(),
+    reason="linked SQLite has the WAL-reset bug (fork sync note): connects choose journal_mode=DELETE up front, so the WAL attempt this test exercises never happens; production links a fixed SQLite",
+)
 def test_concurrent_first_open_serializes_wal_and_schema_across_processes(tmp_path):
     """First open is single-writer HOST-wide, not just inside one process.
 

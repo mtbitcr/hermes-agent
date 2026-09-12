@@ -727,6 +727,11 @@ from hermes_cli.model_setup_flows import (
     _model_flow_moa,
     _model_flow_ai_gateway,
 )
+# Fork compat (2026-09 sync): the fork plugins loader reads the built-in auxiliary
+# task registry from this module; upstream moved it to main_provider_setup. The
+# import-migration task retargets the loader; the pointer keeps it working until then.
+from hermes_cli.main_provider_setup import _AUX_TASKS  # noqa: F401
+
 logger = logging.getLogger(__name__)
 from hermes_cli.main_agent_cmds import (
     cmd_acp,

@@ -10376,7 +10376,7 @@ def _call_llm_impl(
         raise
 
 
-def extract_content_or_reasoning(response) -> str:
+def extract_content_or_reasoning(response, *, max_reasoning_chars: "int | None" = None) -> str:
     """Extract content from an LLM response, falling back to reasoning fields.
 
     Mirrors the main agent loop's behavior when a reasoning model (DeepSeek-R1,
@@ -10427,7 +10427,13 @@ def extract_content_or_reasoning(response) -> str:
                     reasoning_parts.append(summary.strip() if isinstance(summary, str) else str(summary))
 
     if reasoning_parts:
-        return "\n\n".join(reasoning_parts)
+        joined = "\n\n".join(reasoning_parts)
+        # Upstream contract (2026-09 sync): bound a reasoning FALLBACK so unbounded
+        # chain-of-thought can't become the compaction summary. Real content above
+        # is never truncated by this cap.
+        if isinstance(max_reasoning_chars, int) and max_reasoning_chars > 0:
+            return joined[:max_reasoning_chars]
+        return joined
 
     return ""
 
