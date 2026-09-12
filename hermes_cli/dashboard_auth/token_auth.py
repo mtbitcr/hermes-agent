@@ -67,8 +67,6 @@ from fastapi.responses import JSONResponse, Response
 from hermes_cli.dashboard_auth import list_token_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, AuditWriteError, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError, TokenPrincipal
-from hermes_cli.dashboard_auth.request_utils import (
-    client_ip as _client_ip, extract_bearer as extract_bearer_token, unreachable_response)
 
 _log = logging.getLogger(__name__)
 
@@ -209,7 +207,14 @@ def register_token_route(
     )
     key = (normalized_method, normalized_path)
     with _lock:
-        _token_routes.add(path)
+        existing = _token_routes.get(key)
+        if existing is not None and existing != policy:
+            raise ValueError(
+                f"token route {normalized_method} {normalized_path} is already "
+                f"registered with a different required scope"
+            )
+        _token_routes[key] = policy
+
 
 def _compile_token_route_template(path_template: str) -> "re.Pattern[str]":
     """Compile an exact-match, fully-anchored regex from a ``{name}`` template.
@@ -440,14 +445,18 @@ def authenticate_token(
         try:
             principal = provider.verify_token(token=token)
         except ProviderError as e:
-            _log.warning("dashboard-auth: token provider %r unreachable during verify: %s",
-                         provider.name, e)
+            _log.warning(
+                "dashboard-auth: token provider %r unreachable during verify: %s",
+                provider.name, e,
+            )
             if unreachable is None:
                 unreachable = provider.name
             continue
         except Exception as e:  # noqa: BLE001 — a buggy provider must not 500 the gate
-            _log.warning("dashboard-auth: token provider %r raised during verify: %s",
-                         provider.name, e)
+            _log.warning(
+                "dashboard-auth: token provider %r raised during verify: %s",
+                provider.name, e,
+            )
             continue
         if principal is not None:
             return principal, None
@@ -495,9 +504,31 @@ def _audit_machine_failure(
 
 
 async def token_auth_middleware(
-    request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-    """Pass-through for unregistered paths; for a token route, valid token -> attach principal +
-    flag, unreachable -> 503, else 401."""
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    """Outermost auth seam for token-authable routes.
+
+    No-op pass-through for any request whose exact method + path was not
+    registered via :func:`register_token_route`. For a registered route, token
+    auth is the only accepted scheme:
+
+      * valid token, has the route's required scope
+                     → attach principal + ``token_authenticated`` flag, pass through.
+      * valid token, missing that scope
+                     → 403 (generic; no scope contents disclosed, no fallback
+                       to another provider or to cookie/session auth).
+      * unreachable  → 503 (provider backing store down; not "bad credentials").
+      * otherwise    → 401 unauthenticated.
+
+    The policy is resolved BEFORE any authentication happens, and the token is
+    authenticated exactly once; the scope check runs immediately after a
+    provider recognises it.
+
+    Runs before the cookie/session gates (installed last in ``web_server.py``).
+    The cookie gates honour ``request.state.token_authenticated`` and skip
+    enforcement, so a token-authed request is never redirected to ``/login``.
+    """
     path = request.url.path
     bearer = extract_bearer_token(request)
     family = get_machine_token_family(bearer)

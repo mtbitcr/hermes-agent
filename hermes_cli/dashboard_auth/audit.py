@@ -1,7 +1,14 @@
-"""Audit log for dashboard-auth events: ``$HERMES_HOME/logs/dashboard-auth.log``, one JSON object
-per line. Token-like fields are stripped before serialisation so refresh tokens / JWTs never
-reach disk. Minimal import surface (no ``hermes_constants`` at import time) so early-loading
-middleware can import it."""
+"""Audit log for dashboard-auth events.
+
+Profile-aware location: ``$HERMES_HOME/logs/dashboard-auth.log``.
+Format: one JSON object per line. Token-like fields are stripped before
+serialisation to avoid leaking refresh tokens or JWTs to disk.
+
+This module deliberately keeps a minimal dependency surface — no imports
+from ``hermes_constants`` or other hermes_cli modules — so it can be
+imported safely from middleware code that loads early in the startup
+sequence.
+"""
 from __future__ import annotations
 
 import contextlib
@@ -38,11 +45,16 @@ _WINDOWS_LOCK_OFFSET = 0x7FFF_0000
 # these is silently dropped.
 _REDACTED_FIELDS: frozenset = frozenset({
     "access_token", "refresh_token", "code", "code_verifier",
-    "state", "ticket", "cookie", "Authorization", "authorization"})
+    "state", "ticket", "cookie", "Authorization", "authorization",
+})
 
 
 class AuditEvent(enum.Enum):
-    """Event types; values are the literal ``event`` field on the JSON line."""
+    """Event types written to dashboard-auth.log.
+
+    Values are the literal ``event`` field on the JSON line.
+    """
+
     LOGIN_START = "login_start"
     LOGIN_SUCCESS = "login_success"
     LOGIN_FAILURE = "login_failure"
@@ -114,8 +126,14 @@ class AuditRollbackUncertain(AuditWriteError):
 
 
 def _resolve_log_path() -> Path:
-    """Lazy leaf import: honours profile overrides + the native-Windows ``%LOCALAPPDATA%`` fallback."""
+    """``$HERMES_HOME/logs/dashboard-auth.log``.
+
+    Uses ``hermes_constants.get_hermes_home()`` (a leaf module — no import
+    cycle) so profile overrides and the native-Windows ``%LOCALAPPDATA%``
+    fallback are honored.
+    """
     from hermes_constants import get_hermes_home
+
     return get_hermes_home() / "logs" / "dashboard-auth.log"
 
 

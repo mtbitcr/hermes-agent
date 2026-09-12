@@ -22,14 +22,6 @@ from hermes_cli.dashboard_auth.token_auth import (
     transport_peer_ip,
 )
 
-from hermes_cli.dashboard_auth.audit import AuditEvent, AuditWriteError, audit_log
-from hermes_cli.dashboard_auth.token_auth import (
-    register_machine_token_family,
-    register_token_route,
-    register_token_route_template,
-    transport_peer_ip,
-)
-
 from hermes_cli.web_deps import late
 from hermes_cli.config import cfg_get
 from hermes_cli.web_server_cron import (
