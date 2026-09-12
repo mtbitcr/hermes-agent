@@ -115,6 +115,7 @@ tests/gateway/test_slash_config_writes_routed_profile.py
 tests/gateway/test_transcript_read_failure_100788.py
 tests/gateway/test_webhook_profile_egress.py
 tests/hermes_cli/test_anon_desktop_signin.py
+tests/hermes_cli/test_cmd_update.py
 tests/hermes_cli/test_config_guard_surfaces.py
 tests/hermes_cli/test_cron_dispatch_visibility.py
 tests/hermes_cli/test_cron_status_profile_isolation.py
@@ -156,7 +157,10 @@ tests/hermes_cli/test_spawn_gateway_restart_cooldown.py
 tests/hermes_cli/test_spawn_gateway_restart_reap.py
 tests/hermes_cli/test_ssh_ownership_endpoint.py
 tests/hermes_cli/test_stt_picker.py
+tests/hermes_cli/test_update_behind_count_recovery.py
+tests/hermes_cli/test_update_check.py
 tests/hermes_cli/test_update_receipt_endpoint.py
+tests/hermes_cli/test_update_yes_flag.py
 tests/hermes_cli/test_video_gen_picker.py
 tests/hermes_cli/test_web_oauth_dispatch.py
 tests/hermes_cli/test_web_plugins_catalog.py
