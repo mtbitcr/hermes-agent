@@ -4654,7 +4654,11 @@ def set_config_value(key: str, value: str, force: bool = False):
         user_config = _normalize_root_model_keys(user_config)
         key = "model.base_url"
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
-    _write_user_config(config_path, user_config)
+    # Fork: write through the shared route boundary — `config set model.default ...` is
+    # a route change like any other and must not bypass the lock, the policy check or
+    # the owner-work fence that the API and setup paths go through.
+    ensure_hermes_home()
+    _write_user_config_guarded(config_path, user_config)
 
     # Keep .env in sync: terminal_tool reads TERMINAL_ENV etc. directly from env vars.
     env_var = terminal_config_env_var_for_key(key)
