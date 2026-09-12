@@ -29,6 +29,10 @@ class RecordingAdapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+        # Fork sync note (2026-09-12): gateway.wake.admit_internal_event now
+        # requires a concrete admission receipt, not merely a handler that
+        # returns — a successful fake must set it like a real adapter does.
+        event._gateway_accepted = True
 
 
 class FailingWakeAdapter(RecordingAdapter):

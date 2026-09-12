@@ -51,6 +51,9 @@ _EXEMPT_DIRS = (
     ".venv",
     "venv",
     ".worktrees",
+    # Fork sync note (2026-09-12): uv package cache materialized inside the
+    # tree on the test contour; cached third-party sources are not Hermes code.
+    ".uv-cache",
 )
 
 # Call sites where a bare PATH lookup is the correct answer. Each entry is

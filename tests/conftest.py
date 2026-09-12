@@ -620,13 +620,16 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
     if request.node.get_closest_marker(_ALLOW_MACOS_KEYCHAIN_MARK):
         return None
 
+    # Fork sync note (2026-09-12): the keychain reader moved from
+    # agent.anthropic_adapter to agent.anthropic_credentials upstream;
+    # patching the old home left the real reader reachable.
     try:
-        import agent.anthropic_adapter as _anthropic_adapter
+        import agent.anthropic_credentials as _anthropic_credentials
     except Exception:
         return None
 
     monkeypatch.setattr(
-        _anthropic_adapter,
+        _anthropic_credentials,
         "_read_claude_code_credentials_from_keychain",
         lambda *_args, **_kwargs: None,
         raising=False,

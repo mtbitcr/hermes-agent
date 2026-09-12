@@ -1426,4 +1426,25 @@ from tools.terminal_tool_backends import (  # noqa: E402,F401
     _create_environment,
 )
 from tools.terminal_tool_config import _CONTAINER_BACKENDS  # noqa: E402,F401
-from tools.interrupt import _interrupt_event  # noqa: E402,F401  (fork env-blocklist tests patch it here)
+from tools import interrupt as _interrupt_mod  # noqa: E402
+
+
+class _LegacyInterruptEvent:
+    """Fork compat: the fork's thread-aware ``_interrupt_event`` proxy, mapped onto
+    the upstream interrupt API. The tool body never reads this attribute — fork
+    tests patch ``tools.terminal_tool._interrupt_event`` and expect it to exist."""
+
+    @staticmethod
+    def is_set() -> bool:
+        return _interrupt_mod.is_interrupted()
+
+    @staticmethod
+    def set() -> None:
+        _interrupt_mod.set_interrupt(True)
+
+    @staticmethod
+    def clear() -> None:
+        _interrupt_mod.clear_current_thread_interrupt()
+
+
+_interrupt_event = _LegacyInterruptEvent()

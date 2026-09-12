@@ -87,7 +87,16 @@ def _background_review_has_read(path: Path) -> bool:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    if resolved in _background_review_read_paths.get():
+        return True
+    # Fork sync note (2026-09-12): upstream's skills_tool records reads through
+    # tools.skill_manager_guards, a separate mark store; a read made there must
+    # authorize the write here too.
+    try:
+        from tools import skill_manager_guards as _guards
+        return _guards._background_review_has_read(path)
+    except Exception:
+        return False
 
 
 def _reset_background_review_read_marks() -> None:

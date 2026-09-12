@@ -132,7 +132,9 @@ def _capture_run(monkeypatch, module, **result_kwargs):
 
 
 def _assert_noninteractive(call: dict):
-    assert call.get("stdin") is subprocess.DEVNULL, call["argv"]
+    # Fork sync note (2026-09-12): upstream git_credentials feeds `credential fill`
+    # via input= (an implicit PIPE fed from memory) — noninteractive, but not DEVNULL.
+    assert call.get("stdin") is subprocess.DEVNULL or call.get("input") is not None, call["argv"]
     env = call.get("env")
     assert env is not None and env.get("GIT_TERMINAL_PROMPT") == "0", call["argv"]
 

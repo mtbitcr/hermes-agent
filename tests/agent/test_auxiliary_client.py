@@ -2541,12 +2541,15 @@ class TestAuxiliaryAuthRefreshRetry:
                 "refreshToken": "refresh-token",
                 "expiresAt": 0,
             }),
-            patch("agent.anthropic_adapter.refresh_anthropic_oauth_pure", return_value={
+            # Fork sync note (2026-09-12): _refresh_oauth_token moved to
+            # agent.anthropic_credentials and calls ITS module's helpers;
+            # patches must land there, not on the adapter facade.
+            patch("agent.anthropic_credentials.refresh_anthropic_oauth_pure", return_value={
                 "access_token": "fresh-token",
                 "refresh_token": "refresh-token-2",
                 "expires_at_ms": 9999999999999,
             }) as mock_refresh_oauth,
-            patch("agent.anthropic_adapter._write_claude_code_credentials") as mock_write,
+            patch("agent.anthropic_credentials._write_claude_code_credentials") as mock_write,
         ):
             from agent.auxiliary_client import _refresh_provider_credentials
 

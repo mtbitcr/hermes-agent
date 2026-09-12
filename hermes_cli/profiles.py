@@ -781,6 +781,10 @@ def profiles_to_serve(
                 continue  # default is the built-in entry already added above
             if not _PROFILE_ID_RE.match(name):
                 continue
+            # Fork sync note (2026-09-12): upstream serve-all filters tombstoned
+            # profiles — a deleted profile dir must not come back as a served home.
+            if named_profile_is_deleted(entry):
+                continue
             if allowed is not None and name not in allowed:
                 continue
             serve.append((name, entry))

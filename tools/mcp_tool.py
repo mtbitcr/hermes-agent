@@ -8189,3 +8189,14 @@ def _server_visible_in_scope(key, scope=None) -> bool:
     behavior), so every live connection is visible regardless of scope. Revisit with
     the decomposition-adoption card."""
     return True
+
+
+def _mcp_registry_scope():
+    """Upstream helper used by hermes_cli.mcp_discovery: the registry scope for MCP
+    registrations — a profile overlay key under an active multiplexer, else None.
+    Verbatim upstream logic against the fork registry (same public surface)."""
+    from agent.secret_scope import is_multiplex_active
+    if not is_multiplex_active():
+        return None
+    from tools.registry import registry
+    return registry.current_scope_key()
