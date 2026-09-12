@@ -221,6 +221,7 @@ tests/tools/test_delegate_timeout_cleanup.py
 tests/tools/test_denial_circuit_breaker.py
 tests/tools/test_desktop_tools_diet.py
 tests/tools/test_execute_helper_contract.py
+tests/tools/test_file_ops_single_roundtrip.py
 tests/tools/test_file_tools_plugin_container_cwd.py
 tests/tools/test_kanban_descendant_scope.py
 tests/tools/test_kanban_provenance.py

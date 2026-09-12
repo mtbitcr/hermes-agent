@@ -377,7 +377,9 @@ def _active_profile_line(agent: Any) -> str:
         f"{default_root}/cron/, {default_root}/memories/ — those belong to a "
         f"different session run from a different shell. Do NOT modify "
         f"another profile's skills/plugins/cron/memories unless the user "
-        f"explicitly directs you to."
+        f"explicitly directs you to. The cross-profile write guard will "
+        f"refuse such writes by default; pass cross_profile=True only "
+        f"after explicit direction."
     )
 
 

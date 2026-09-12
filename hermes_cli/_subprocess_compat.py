@@ -301,7 +301,8 @@ def _user_safe_directories(base_env: "Mapping[str, str]") -> list[str]:
             continue
         # -z terminates every value with NUL, so the trailing split field is always empty and is
         # not a config entry; interior empty fields are real reset markers and must survive.
-        records = proc.stdout.split("\0")
+        # Fork note: test fakes may omit stdout; treat as empty rather than raising.
+        records = (getattr(proc, "stdout", None) or "").split("\0")
         if records and records[-1] == "":
             records.pop()
         values.extend(records)
