@@ -412,7 +412,6 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     except (UnicodeDecodeError, OSError):
         return []
     findings = []
-    lines = content.split('\n')
     seen = set()  # (pattern_id, line_number) for deduplication
 
     # Regex matching strips every ZWNJ so it cannot split an attack keyword.

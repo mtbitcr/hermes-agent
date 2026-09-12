@@ -80,4 +80,7 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        # Fork: standard runners have 2-4 cores, not 32 — full concurrency starves the
+        # UI suites into 5s test timeouts. Two at a time keeps the wall clock sane
+        # without touching any test.
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2

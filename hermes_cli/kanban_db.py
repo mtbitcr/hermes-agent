@@ -13774,6 +13774,27 @@ class Event:
     created_at: int
     run_id: Optional[int] = None
 
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Event":
+        """Fork note (2026-09 sync): upstream's TUI session notifications build events
+        through this constructor on the facade; provided here so the dormant-adjacent
+        upstream callers work against the fork monolith."""
+        try:
+            run_id = row["run_id"]
+        except (IndexError, KeyError):
+            run_id = None
+        payload = row["payload"]
+        if isinstance(payload, (str, bytes)):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = None
+        return cls(
+            id=row["id"], task_id=row["task_id"], kind=row["kind"],
+            payload=payload, created_at=row["created_at"],
+            run_id=int(run_id) if run_id is not None else None,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Schema

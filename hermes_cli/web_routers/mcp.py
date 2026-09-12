@@ -15,6 +15,8 @@ from fastapi import APIRouter, HTTPException, Request  # noqa: F401
 from fastapi.responses import HTMLResponse  # noqa: F401
 
 from hermes_cli.dashboard_auth.audit import AuditEvent, AuditWriteError, audit_log
+
+_log = logging.getLogger(__name__)
 from hermes_cli.dashboard_auth.token_auth import (
     register_machine_token_family,
     register_token_route,

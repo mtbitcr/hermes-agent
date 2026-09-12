@@ -22,11 +22,14 @@ def _make_adapter(
     cfg = PlatformConfig(enabled=True, extra={"host": "127.0.0.1", "port": 8642, "key": "test-key"})
     adapter = APIServerAdapter(cfg)
 
+    # Fork sync note: upstream's GatewayConfig dropped the allowlist field; the
+    # adapter reads it via getattr, so the test pins it as a plain attribute.
+    _cfg = GatewayConfig(multiplex_profiles=multiplex)
+    if allowlist is not None:
+        _cfg.multiplex_profile_allowlist = allowlist
+
     class _Runner:
-        config = GatewayConfig(
-            multiplex_profiles=multiplex,
-            multiplex_profile_allowlist=allowlist,
-        )
+        config = _cfg
 
     adapter.gateway_runner = _Runner()
     return adapter
