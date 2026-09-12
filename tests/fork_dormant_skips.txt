@@ -221,11 +221,13 @@ tests/tools/test_delegate_timeout_cleanup.py
 tests/tools/test_denial_circuit_breaker.py
 tests/tools/test_desktop_tools_diet.py
 tests/tools/test_execute_helper_contract.py
+tests/tools/test_file_ops_env_not_ready.py
 tests/tools/test_file_ops_single_roundtrip.py
 tests/tools/test_file_tools_plugin_container_cwd.py
 tests/tools/test_kanban_descendant_scope.py
 tests/tools/test_kanban_provenance.py
 tests/tools/test_llm_content_none_guard.py
+tests/tools/test_local_setsid_descendant_sweep.py
 tests/tools/test_mcp_cimd.py
 tests/tools/test_mcp_death_supervisor.py
 tests/tools/test_mcp_device_flow.py
@@ -242,6 +244,7 @@ tests/tools/test_multiplex_turn_parity.py
 tests/tools/test_patch_v4a_gate.py
 tests/tools/test_plugin_guard.py
 tests/tools/test_read_file_schema_gating.py
+tests/tools/test_search_files_cpu_windows.py
 tests/tools/test_search_files_engine_selection.py
 tests/tools/test_skill_bundle_provenance.py
 tests/tools/test_skills_guard_agent_config.py
