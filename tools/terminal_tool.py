@@ -1421,7 +1421,9 @@ def __getattr__(name):  # PEP 562 — lazy so no import cycles
 # --- Fork compat (2026-09 sync): the fork file tools import the environment factory
 # and backend table from this module; upstream moved them to terminal_tool_backends.
 from tools.terminal_tool_backends import (  # noqa: E402,F401
+    _SUPPORTED_VERCEL_RUNTIMES,
     _check_vercel_sandbox_requirements,
     _create_environment,
 )
 from tools.terminal_tool_config import _CONTAINER_BACKENDS  # noqa: E402,F401
+from tools.interrupt import _interrupt_event  # noqa: E402,F401  (fork env-blocklist tests patch it here)

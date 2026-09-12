@@ -62,11 +62,13 @@ _ALLOWED: dict[tuple[str, str], str] = {
         "can only run what is on that subshell's PATH, which local.py populates "
         "with the managed dirs — so PATH is the correct question to ask here."
     ),
-    ("hermes_cli/update_cmd.py", "uv"): (
+    # Fork sync note (2026-09-12): upstream split update_cmd.py / main.py; the
+    # reviewed sites moved with the code, reasons unchanged.
+    ("hermes_cli/update_cmd_deps.py", "uv"): (
         "Termux fallback: a pkg-installed uv lands on PATH but not in the "
         "managed bin dir, and it is checked only after resolve_uv() misses."
     ),
-    ("hermes_cli/update_cmd.py", "npm"): (
+    ("hermes_cli/update_cmd_deps.py", "npm"): (
         "WSL diagnostic: deliberately inspects what PATH resolves so it can "
         "warn that the only reachable npm is the Windows one."
     ),
@@ -83,12 +85,21 @@ _ALLOWED: dict[tuple[str, str], str] = {
         "Fallback rung of _append_node_dir_for_service(), after the managed "
         "dirs from iter_hermes_node_dirs() are already appended."
     ),
-    ("hermes_cli/main.py", "node"): (
+    ("hermes_cli/main_tui_launch.py", "node"): (
         "_ensure_tui_node()'s idempotence gate: the question really is 'is "
         "node already discoverable on PATH', before bootstrapping one."
     ),
-    ("hermes_cli/main.py", "npm"): (
+    ("hermes_cli/main_tui_launch.py", "npm"): (
         "Same _ensure_tui_node() gate as node."
+    ),
+    ("hermes_cli/main_install_repair.py", "npm"): (
+        "WSL npm-path scan inside the install repair flow: probes each PATH "
+        "directory to skip a Windows npm, the same deliberate PATH question "
+        "as the update-flow WSL diagnostic."
+    ),
+    ("tools/browser_tool_install.py", "npx"): (
+        "agent-browser runs via `npx`, resolved against the extended browser "
+        "PATH that _merge_browser_path() already seeds with the managed dirs."
     ),
     ("tools/browser_tool.py", "npx"): (
         "agent-browser runs via `npx`, resolved against the extended browser "

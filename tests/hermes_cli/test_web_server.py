@@ -416,6 +416,11 @@ class TestWebServerEndpoints:
 
         legacy = sqlite3.connect(str(db_path))
         try:
+            # Fork sync note (2026-09-12): the upstream schema adds
+            # idx_sessions_effective_activity over last_activity_at; a store
+            # predating the column predates the index too, and SQLite refuses
+            # DROP COLUMN while an index references it.
+            legacy.execute("DROP INDEX IF EXISTS idx_sessions_effective_activity")
             legacy.execute(f"ALTER TABLE sessions DROP COLUMN {missing_column}")
             legacy.commit()
         finally:
@@ -462,6 +467,11 @@ class TestWebServerEndpoints:
 
         legacy = sqlite3.connect(str(db_path))
         try:
+            # Fork sync note (2026-09-12): the upstream schema adds
+            # idx_sessions_effective_activity over last_activity_at; a store
+            # predating the column predates the index too, and SQLite refuses
+            # DROP COLUMN while an index references it.
+            legacy.execute("DROP INDEX IF EXISTS idx_sessions_effective_activity")
             legacy.execute("ALTER TABLE sessions DROP COLUMN last_activity_at")
             legacy.commit()
         finally:

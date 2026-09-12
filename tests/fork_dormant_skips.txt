@@ -105,6 +105,7 @@ tests/gateway/test_kanban_multiplex_served_profile_parity.py
 tests/gateway/test_kanban_routed_transport.py
 tests/gateway/test_kanban_wake_acceptance.py
 tests/gateway/test_multiplex_mcp_discovery.py
+tests/gateway/test_multiplex_process_global_sinks.py
 tests/gateway/test_multiplex_process_memo_scope.py
 tests/gateway/test_multiplex_toolsets_profile_isolation.py
 tests/gateway/test_output_caps_removed.py
@@ -137,6 +138,7 @@ tests/hermes_cli/test_local_quickstart.py
 tests/hermes_cli/test_local_runtime_updates.py
 tests/hermes_cli/test_local_server_lifecycle.py
 tests/hermes_cli/test_mcp_catalog_env_boundary.py
+tests/hermes_cli/test_memory_setup_env_denylist.py
 tests/hermes_cli/test_nous_policy_surfaces.py
 tests/hermes_cli/test_plugin_call_mcp.py
 tests/hermes_cli/test_plugin_capabilities.py
@@ -196,6 +198,7 @@ tests/run_agent/test_authorization_gate.py
 tests/run_agent/test_run_agent.py
 tests/run_agent/test_sanitiser_escalation.py
 tests/run_agent/test_tool_executor_contextvar_propagation.py
+tests/security/test_gitspawn_config_injection.py
 tests/skills/test_openclaw_migration.py
 tests/test_browser_vault.py
 tests/test_compat_manifest_targets.py
@@ -250,7 +253,10 @@ tests/tools/test_plugin_guard.py
 tests/tools/test_read_file_schema_gating.py
 tests/tools/test_search_files_cpu_windows.py
 tests/tools/test_search_files_engine_selection.py
+tests/tools/test_search_giant_line_containment.py
+tests/tools/test_search_native_rg.py
 tests/tools/test_skill_bundle_provenance.py
+tests/tools/test_skill_create_dir.py
 tests/tools/test_skills_guard_agent_config.py
 tests/tools/test_strict_provider_selection.py
 tests/tools/test_terminal_scope_multiplex.py

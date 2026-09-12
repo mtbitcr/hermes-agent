@@ -714,6 +714,7 @@ _PLUGIN_COMPAT_LAZY = {
     # agent.anthropic_credentials upstream. The native import-migration task retargets the
     # caller; until then the pointer keeps the production preflight working.
     '_refresh_oauth_token': ('agent.anthropic_credentials', '_refresh_oauth_token'),
+    '_write_claude_code_credentials': ('agent.anthropic_credentials', '_write_claude_code_credentials'),
     'read_hermes_oauth_credentials': ('agent.anthropic_credentials', 'read_hermes_oauth_credentials'),
     'refresh_anthropic_oauth_pure': ('agent.anthropic_credentials', 'refresh_anthropic_oauth_pure'),
     'resolve_anthropic_token': ('agent.anthropic_credentials', 'resolve_anthropic_token'),
