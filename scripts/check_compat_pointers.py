@@ -41,6 +41,20 @@ FORK_CANONICAL_FACADES = frozenset({
     "tools.approval",                     # approvals module
     "tools.browser_tool",                 # browser tool
     "tools.mcp_tool",                     # MCP tool
+    # Fork-canonical modules the fork's own test suites reach through the
+    # same flagged paths (2026-09 sync, second tranche): definitions are
+    # real here, not pointers.
+    "hermes_cli.doctor",                  # doctor diagnostics
+    "hermes_cli.nous_subscription",       # subscription surface
+    "hermes_cli.tools_config",            # tools configuration
+    "toolsets",                           # toolset definitions
+    "tools.file_operations",              # file-operation backends
+    "tools.file_tools",                   # file tools
+    "tools.skill_manager_tool",           # skill manager
+    # The fork KEEPS the restored-def cache-entry helpers upstream schedules
+    # for deletion (has_cached_entry / clear_cache_entry) — weekly-sync
+    # watchlist item; they are live fork behavior, not pointers.
+    "tools.mcp_schema_cache",
 })
 
 
