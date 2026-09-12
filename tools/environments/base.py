@@ -637,3 +637,66 @@ def __getattr__(name):  # PEP 562 — lazy so no import cycles
     warn_once(__name__, name, *target)
     return getattr(importlib.import_module(target[0]), target[1])
 # ---- END PLUGIN-COMPAT ----
+
+
+# --- Fork compat (2026-09 sync): fork local env imports these ---
+def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
+    """Write *data* to proc.stdin on a daemon thread to avoid pipe-buffer deadlocks.
+
+    On Windows, text-mode stdin (``text=True`` / ``encoding="utf-8"``)
+    translates ``\\n`` → ``\\r\\n`` as the data flows through the pipe —
+    which corrupts every write_file / patch call because the bytes that
+    land on disk include injected carriage returns.  The file IS created,
+    but every subsequent byte-count / content compare against the
+    caller's ``\\n``-only string fails.
+
+    Workaround: write through ``proc.stdin.buffer`` (the underlying byte
+    buffer), encoding to UTF-8 ourselves.  That bypasses Python's
+    newline translation entirely on every platform.  No behaviour change
+    on POSIX — the byte sequence is identical to what text-mode would
+    produce there.
+
+    Encoding uses ``errors="surrogateescape"`` — the exact inverse of the
+    surrogateescape decode, so original bytes are restored.  For
+    surrogate-free strings it is byte-identical to strict UTF-8.
+    Surrogates outside the round-trip range U+DC80–U+DCFF raise and are
+    recorded on ``proc._hermes_stdin_errors`` while stdin is still closed
+    in ``finally`` so the child sees EOF instead of hanging;
+    ``_wait_for_process`` reads the recorded error and surfaces it as
+    ``stdin_error`` on the result.
+    """
+
+    errors: list[BaseException] = []
+    proc._hermes_stdin_errors = errors
+
+    def _write():
+        if proc.stdin is None:
+            errors.append(RuntimeError("process stdin unavailable"))
+            return
+        # Resolve the target BEFORE encoding: a failed encode must still
+        # reach the finally-close, or the child hangs on EOF forever.
+        target = getattr(proc.stdin, "buffer", proc.stdin)
+        try:
+            raw = data.encode("utf-8", "surrogateescape") if isinstance(data, str) else data
+            written = target.write(raw)
+            if written != len(raw):
+                # Buffered writers normally complete or raise; a short write
+                # is a real failure and must be surfaced, not swallowed.
+                raise RuntimeError(f"short stdin write: {written} of {len(raw)} bytes")
+        except (BrokenPipeError, OSError):
+            pass  # child closed stdin early — normal
+        except Exception as exc:
+            # Only reachable with surrogates outside the surrogateescape
+            # round-trip range (e.g. a literal U+D800). Record it so
+            # _wait_for_process can surface it instead of a silent false
+            # success.
+            errors.append(exc)
+        finally:
+            try:
+                target.close()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_write, daemon=True)
+    proc._hermes_stdin_thread = thread
+    thread.start()
