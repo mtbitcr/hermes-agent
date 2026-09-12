@@ -853,3 +853,52 @@ class LocalEnvironment(BaseEnvironment):
         for f in (self._snapshot_path, self._cwd_file, *stale):
             with contextlib.suppress(OSError):
                 os.unlink(f)
+
+
+# --- Fork (2026-09 sync): the fork code-execution env scrub imports this. Minimal
+# re-derivation of the fork helper (the fork original leaned on fork-only venv
+# validation plumbing): strip ONLY entries proven owned by THIS Hermes runtime —
+# the repo root and the running interpreter's site-packages — and preserve every
+# other entry byte-for-byte (ownership by provenance, never cross-version
+# heuristics; see the fork's #74817 follow-up).
+def _strip_hermes_owned_pythonpath(env: dict) -> None:
+    pp = env.get("PYTHONPATH")
+    if not pp:
+        return
+    import sysconfig
+
+    owned: set = set()
+    try:
+        owned.add(Path(__file__).resolve().parents[2])
+    except Exception:
+        pass
+    for key in ("purelib", "platlib"):
+        try:
+            owned.add(Path(sysconfig.get_paths()[key]).resolve())
+        except Exception:
+            continue
+    try:
+        import site
+
+        for sp in site.getsitepackages():
+            owned.add(Path(sp).resolve())
+    except Exception:
+        pass
+
+    kept = []
+    for entry in pp.split(os.pathsep):
+        if entry == "":
+            kept.append(entry)
+            continue
+        try:
+            resolved = Path(entry).resolve()
+        except Exception:
+            kept.append(entry)
+            continue
+        if resolved in owned:
+            continue
+        kept.append(entry)
+    if kept:
+        env["PYTHONPATH"] = os.pathsep.join(kept)
+    else:
+        env.pop("PYTHONPATH", None)

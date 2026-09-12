@@ -731,6 +731,7 @@ from hermes_cli.model_setup_flows import (
 # task registry from this module; upstream moved it to main_provider_setup. The
 # import-migration task retargets the loader; the pointer keeps it working until then.
 from hermes_cli.main_provider_setup import _AUX_TASKS  # noqa: F401
+from hermes_cli.main_tui_launch import _apply_tui_python_env  # noqa: F401  (fork web server imports it here)
 
 logger = logging.getLogger(__name__)
 from hermes_cli.main_agent_cmds import (
