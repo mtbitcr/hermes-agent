@@ -1416,3 +1416,11 @@ def __getattr__(name):  # PEP 562 — lazy so no import cycles
     warn_once(__name__, name, *target)
     return getattr(importlib.import_module(target[0]), target[1])
 # ---- END PLUGIN-COMPAT ----
+
+
+# --- Fork compat (2026-09 sync): the fork file tools import the environment factory
+# and backend table from this module; upstream moved them to terminal_tool_backends.
+from tools.terminal_tool_backends import (  # noqa: E402,F401
+    _CONTAINER_BACKENDS,
+    _create_environment,
+)

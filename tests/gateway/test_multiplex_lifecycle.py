@@ -30,12 +30,11 @@ def test_cron_profile_homes_follow_allowlist(tmp_path, monkeypatch):
 
     import gateway.run as gateway_run
 
-    homes = gateway_run._multiplex_profile_homes(
-        GatewayConfig(
-            multiplex_profiles=True,
-            multiplex_profile_allowlist=["worker"],
-        )
-    )
+    # Fork sync note: upstream's GatewayConfig dropped the allowlist field; the
+    # gateway reads it via getattr, so the test pins it as a plain attribute.
+    _cfg = GatewayConfig(multiplex_profiles=True)
+    _cfg.multiplex_profile_allowlist = ["worker"]
+    homes = gateway_run._multiplex_profile_homes(_cfg)
 
     assert [name for name, _home in homes] == ["default", "worker"]
 
