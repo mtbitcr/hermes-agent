@@ -1044,7 +1044,7 @@ class TestConnectionSecretFile:
 @pytest.fixture
 def refresh_spy(monkeypatch):
     """Replace the host refresh path and record how it was called."""
-    import agent.anthropic_credentials as adapter  # fork sync note: refresh helper moved out of anthropic_adapter
+    import agent.anthropic_adapter as adapter
 
     calls: list = []
 
@@ -1079,7 +1079,7 @@ class TestCredentialPreflight:
             records.append(_account_record(FRESH_OAUTH, _expires_in(8 * 3600)))
             return FRESH_OAUTH
 
-        import agent.anthropic_credentials as adapter  # fork sync note: refresh helper moved out of anthropic_adapter
+        import agent.anthropic_adapter as adapter
 
         monkeypatch.setattr(adapter, "_refresh_oauth_token", _refresh)
 
@@ -1165,7 +1165,7 @@ class TestCredentialPreflight:
             records.append(_account_record(FRESH_OAUTH, _expires_in(900)))
             return FRESH_OAUTH
 
-        import agent.anthropic_credentials as adapter  # fork sync note: refresh helper moved out of anthropic_adapter
+        import agent.anthropic_adapter as adapter
 
         monkeypatch.setattr(adapter, "_refresh_oauth_token", _refresh)
 
@@ -1193,7 +1193,7 @@ class TestCredentialPreflight:
             records.append(_account_record(WINNER_OAUTH, _expires_in(8 * 3600)))
             return FRESH_OAUTH
 
-        import agent.anthropic_credentials as adapter  # fork sync note: refresh helper moved out of anthropic_adapter
+        import agent.anthropic_adapter as adapter
 
         monkeypatch.setattr(adapter, "_refresh_oauth_token", _refresh)
 
@@ -1239,7 +1239,7 @@ class TestCredentialPreflight:
             )
             return FRESH_OAUTH
 
-        import agent.anthropic_credentials as adapter  # fork sync note: refresh helper moved out of anthropic_adapter
+        import agent.anthropic_adapter as adapter
 
         monkeypatch.setattr(adapter, "_refresh_oauth_token", _refresh)
 
@@ -1267,7 +1267,7 @@ class TestCredentialPreflight:
             records.append(_account_record(FRESH_OAUTH, _expires_in(8 * 3600)))
             return FRESH_OAUTH
 
-        import agent.anthropic_credentials as adapter  # fork sync note: refresh helper moved out of anthropic_adapter
+        import agent.anthropic_adapter as adapter
 
         monkeypatch.setattr(adapter, "_refresh_oauth_token", _refresh)
 

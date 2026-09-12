@@ -4558,6 +4558,18 @@ def _guard_section_overwrite(key: str, value: Any, user_config: Dict[str, Any], 
             pass
 
 
+def _touch_skin_file(key: str, value: Any) -> None:
+    """``display.skin`` set means "apply NOW": bump the skin file's mtime so the gateway watcher's
+    (name, mtime) signature moves even when the name is unchanged. Best-effort."""
+    if key == "display.skin" and isinstance(value, str) and value:
+        try:
+            skin_file = get_hermes_home() / "skins" / f"{value}.yaml"
+            if skin_file.exists():
+                skin_file.touch()
+        except Exception:
+            pass
+
+
 def _exit_invalid(msg: str) -> None:
     print(msg, file=sys.stderr)
     sys.exit(1)
