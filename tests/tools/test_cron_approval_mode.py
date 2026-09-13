@@ -100,6 +100,12 @@ class TestCronContextVarDetection:
         monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
         tokens = set_session_vars(platform="api_server", cron_session="")
         try:
+            # An API gateway turn has the owner's notification listener; a
+            # bare programmatic API call is intentionally unattended.
+            monkeypatch.setitem(
+                approval_module._gateway_notify_cbs,
+                approval_module.get_current_session_key(), lambda _: None,
+            )
             assert approval_module._is_cron_approval_context() is False
             assert approval_module._is_gateway_approval_context() is True
         finally:
@@ -474,4 +480,3 @@ class TestCronWithGatewayOrigin:
                 assert result.get("status") != "approval_required"
         finally:
             clear_session_vars(tokens)
-
