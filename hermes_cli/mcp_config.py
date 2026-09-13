@@ -1113,7 +1113,7 @@ def cmd_mcp_configure(args):
     # Same matching semantics as runtime registration (tools/mcp_tool.py):
     # exact names or fnmatch globs.
     try:
-        from tools.mcp_tool import matches_name_filter
+        from tools.mcp_tool_schema import matches_name_filter
     except ImportError:  # pragma: no cover — defensive fallback
         def matches_name_filter(tool_name, patterns):
             return tool_name in patterns

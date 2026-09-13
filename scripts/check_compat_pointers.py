@@ -26,7 +26,7 @@ MANIFEST = ROOT / "compat_manifest.json"
 SKIP_DIRS = {".git", "node_modules", "website", "skills", "optional-skills", "apps", "evals", "build", "MagicMock", ".worktrees", "__pycache__"}
 
 # Fork-canonical facades: these modules define their names in this fork (upstream decomposed
-# them), so manifest entries naming them are skipped. Covers the nine fork-canonical modules
+# them), so manifest entries naming them are skipped. Covers the retained fork-canonical modules
 # named by the migration policy plus agent.file_safety, whose three manifest entries are all
 # kind: "restored-def" with target "(deleted; BASE body restored)" — the fork restored the
 # real bodies, so there is no defining module to migrate to.
@@ -40,7 +40,6 @@ FORK_CANONICAL_FACADES = frozenset({
     "hermes_state",                       # state facade
     "tools.approval",                     # approvals module
     "tools.browser_tool",                 # browser tool
-    "tools.mcp_tool",                     # MCP tool
     # Fork-canonical modules the fork's own test suites reach through the
     # same flagged paths (2026-09 sync, second tranche): definitions are
     # real here, not pointers.

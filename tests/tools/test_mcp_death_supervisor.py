@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tools import mcp_death_supervisor, mcp_tool
-from tools import mcp_tool as _mcp_lifecycle  # Lifecycle remains in the retained fork module.
+from tools import mcp_tool_lifecycle as _mcp_lifecycle
 
 MCP_SDK_AVAILABLE = mcp_tool._ensure_mcp_sdk()
 
@@ -620,10 +620,10 @@ def _stdio_connection(child_pid, fake_supervisor):
         # First call is the pids_before baseline; the second reports our child
         # as the newly spawned server.
         patch(
-            "tools.mcp_tool._snapshot_child_pids",
+            "tools.mcp_tool_lifecycle._snapshot_child_pids",
             side_effect=[set(), {child_pid}],
         ),
-        patch("tools.mcp_tool._write_stderr_log_header"),
+        patch("tools.mcp_tool_config._write_stderr_log_header"),
         patch("tools.mcp_tool._get_mcp_stderr_log", return_value=None),
         patch(
             "tools.mcp_tool._spawn_death_supervisor",
@@ -730,9 +730,6 @@ def test_scoped_teardown_of_one_owner_keeps_the_other_owner_supervised(monkeypat
 
         _mcp_lifecycle._kill_orphaned_mcp_children(include_active=True, server_name="profile-a")
         a.wait(timeout=10)
-        # The reaper does not own the SDK's waitpid. Until that owner reaps
-        # the child, its zombie still exists; prune only after confirmed exit.
-        mcp_tool._update_death_supervisor("unregister", ())
 
         assert b.poll() is None, "scoped teardown of profile-a killed profile-b's server"
         assert f"unregister {pg_a}" in fake.lines()
