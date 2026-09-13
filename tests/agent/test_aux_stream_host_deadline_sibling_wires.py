@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -51,7 +51,7 @@ def _make_codex_adapter(event_iter):
     real_client = SimpleNamespace(
         base_url="https://chatgpt.com/backend-api/codex",
         responses=SimpleNamespace(create=lambda **_kwargs: event_iter),
-        close=lambda: None,
+        close=Mock(),
     )
     return aux._CodexCompletionsAdapter(real_client, "gpt-5.6-sol")
 
@@ -84,6 +84,7 @@ def test_codex_stream_stops_at_the_host_deadline_not_its_own_ceiling(protected):
     elapsed = time.monotonic() - start
     assert elapsed < 5.0, f"stream outlived the host deadline by {elapsed:.1f}s"
     assert yielded[0] < 100
+    adapter._client.close.assert_not_called()
 
 
 def test_codex_stream_without_host_deadline_keeps_its_ceiling():

@@ -1704,8 +1704,8 @@ class _CodexCompletionsAdapter:
             # Publish transport timeout only after the attempt-local decision is
             # fixed, so owner polling cannot observe completion in between.
             timed_out.set()
-            if not timeout_won:
-                # The request owner already hard-cancelled this attempt. The
+            if host_limited or not timeout_won:
+                # The owner deadline/cancellation affects only this attempt. The
                 # OpenAI client is process-shared, so closing/evicting it here
                 # would disrupt unrelated sessions. Wake only this attempt's
                 # event stream when responses.create() returned one in time;
@@ -1784,6 +1784,8 @@ class _CodexCompletionsAdapter:
 
             stream_kwargs = dict(resp_kwargs)
             stream_kwargs["stream"] = True
+            if host_limited:
+                stream_kwargs["timeout"] = max(0.001, deadline - time.monotonic())
 
             def _on_each_event(_event: Any) -> None:
                 # Re-check timeout/cancellation per event, matching the
@@ -1802,8 +1804,13 @@ class _CodexCompletionsAdapter:
             # now that it is safely attempt-owned; never touch the shared client.
             if (
                 timed_out.is_set()
-                and callable(protected_cancel_check)
-                and _captured_aux_cancel_requested(protected_cancel_check)
+                and (
+                    host_limited
+                    or (
+                        callable(protected_cancel_check)
+                        and _captured_aux_cancel_requested(protected_cancel_check)
+                    )
+                )
             ):
                 close_fn = getattr(event_stream, "close", None)
                 if callable(close_fn):

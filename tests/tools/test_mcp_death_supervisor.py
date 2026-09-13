@@ -730,6 +730,9 @@ def test_scoped_teardown_of_one_owner_keeps_the_other_owner_supervised(monkeypat
 
         _mcp_lifecycle._kill_orphaned_mcp_children(include_active=True, server_name="profile-a")
         a.wait(timeout=10)
+        # The reaper does not own the SDK's waitpid. Until that owner reaps
+        # the child, its zombie still exists; prune only after confirmed exit.
+        mcp_tool._update_death_supervisor("unregister", ())
 
         assert b.poll() is None, "scoped teardown of profile-a killed profile-b's server"
         assert f"unregister {pg_a}" in fake.lines()
