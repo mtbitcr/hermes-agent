@@ -147,7 +147,7 @@ def test_timed_out_no_agent_script_delivery_is_not_mislabeled_as_provider_failur
     """
     from cron.jobs import create_job
     import cron.scheduler as scheduler
-    from cron import scheduler_script as sched_script
+    from cron import scheduler as sched_script
 
     (hermes_env / "scripts" / "slow.py").write_text("import time; time.sleep(999)\n")
     job = create_job(
@@ -206,7 +206,7 @@ def test_agent_provider_timeout_delivery_keeps_fallback_guidance(hermes_env, mon
     """Provider timeout classification remains available to agent-backed jobs."""
     from cron.jobs import create_job
     import cron.scheduler as scheduler
-    from cron import scheduler_script as sched_script
+    from cron import scheduler as sched_script
 
     job = create_job(
         prompt="Summarize the overnight logs.",
@@ -247,7 +247,7 @@ def test_agent_provider_timeout_delivery_keeps_fallback_guidance(hermes_env, mon
 
 def test_run_job_script_path_traversal_still_blocked(hermes_env):
     """Security regression: shell-script support must NOT loosen containment."""
-    from cron.scheduler_script import _run_job_script
+    from cron.scheduler import _run_job_script
 
     # Absolute path outside the scripts dir should be rejected.
     ok, output = _run_job_script("/etc/passwd")
@@ -268,7 +268,7 @@ def test_run_job_script_nul_path_fails_cleanly(hermes_env):
     expanduser() ValueError and report a generic invalid-path message, so
     a bare "Blocked" assertion could not tell the fixed code from the
     unfixed code; on Windows the unfixed code crashes outright."""
-    from cron.scheduler_script import _run_job_script
+    from cron.scheduler import _run_job_script
 
     ok, output = _run_job_script("~user\x00bad.sh")
     assert ok is False
@@ -285,7 +285,7 @@ def test_run_job_script_nul_rejected_before_any_path_call(hermes_env, monkeypatc
     proves the rejection happens before any pathlib call on every
     platform, not just the ones where expanduser happens to raise."""
     import cron.scheduler as scheduler_module
-    from cron import scheduler_script as sched_script
+    from cron import scheduler as sched_script
 
     def boom(*_args, **_kwargs):
         raise AssertionError("Path must not be touched for a NUL-bearing script path")
@@ -304,7 +304,7 @@ def test_run_job_script_accepts_pathlike_script_path(hermes_env):
     scheduler at the guard itself. The guard coerces with str() first;
     a valid Path must still run the script end-to-end (regression for
     the #86832 review point)."""
-    from cron.scheduler_script import _run_job_script
+    from cron.scheduler import _run_job_script
 
     script = hermes_env / "scripts" / "probe.py"
     script.write_text('print("pathlike ok")\n', encoding="utf-8")

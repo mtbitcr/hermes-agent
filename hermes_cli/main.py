@@ -2868,7 +2868,7 @@ def _prepare_agent_startup(args) -> None:
     if _run_inline_mcp_discovery:
         try:  # synchronous for entrypoints without a later bounded startup path
             from hermes_cli.mcp_startup import get_mcp_server_filter
-            from tools.mcp_tool_discovery import discover_mcp_tools
+            from tools.mcp_tool import discover_mcp_tools
 
             _mcp_filter = get_mcp_server_filter()
             if _mcp_filter is None:

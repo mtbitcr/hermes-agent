@@ -1667,6 +1667,11 @@ class _CodexCompletionsAdapter:
         usage = None
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
         deadline = time.monotonic() + float(total_timeout) if total_timeout else None
+        host_deadline = _current_aux_stream_deadline()
+        host_limited = host_deadline is not None and (deadline is None or host_deadline < deadline)
+        if host_limited:
+            deadline = host_deadline
+            total_timeout = max(0.0, deadline - time.monotonic())
         timed_out = threading.Event()
         timeout_timer: Optional[threading.Timer] = None
         # A protected provider call may outlive its owning compression attempt:
@@ -1681,6 +1686,8 @@ class _CodexCompletionsAdapter:
         attempt_stream: List[Any] = []
 
         def _timeout_message() -> str:
+            if host_limited:
+                return "Codex auxiliary Responses stream exceeded the host hard ceiling"
             return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
 
         def _close_client_on_timeout() -> None:
@@ -2089,10 +2096,7 @@ class _AnthropicCompletionsAdapter:
             # watching liveness (gateway session hygiene) don't kill a
             # slow-but-generating summary model. No-op when no hook is
             # installed (None keeps the fast get_final_message path).
-            on_stream_event=(
-                (lambda _event: _notify_aux_progress())
-                if _aux_progress_active() else None
-            ),
+            on_stream_event=_anthropic_aux_stream_event_hook(),
         )
         _transport = get_transport("anthropic_messages")
         _nr = _transport.normalize_response(
@@ -11106,9 +11110,8 @@ async def _async_call_llm_impl(
 # decomposition added sibling modules (agent_runtime_helpers, conversation_compression,
 # review_idle_queue) that import a handful of small helpers from this module; the fork
 # resolver does not use them, but the siblings are live in the merged tree, so the names
-# are provided here verbatim from the pinned upstream snapshot. The published stream
-# deadline is not consulted by the fork resolver's provider daemon (fork behavior
-# unchanged); it exists so upstream callers keep working.
+# are provided here from the pinned upstream snapshot. Stream consumers also honour
+# the published deadline so the host's bounded work cannot leave a provider running.
 import contextlib as _fork_compat_contextlib
 
 _aux_stream_deadline = threading.local()
@@ -11130,8 +11133,8 @@ def _coerce_positive_timeout(raw: Any) -> Optional[float]:
 def aux_stream_deadline(deadline: Optional[float]):
     """Publish the host's absolute ``time.monotonic()`` deadline to the stream consumer.
 
-    ``None`` is a passthrough; re-entrant-safe. Upstream's compression path publishes the
-    host ceiling through this context manager; the fork resolver does not read it.
+    ``None`` is a passthrough; re-entrant-safe. The compression host publishes
+    the ceiling and each provider stream observes it.
     """
     previous = getattr(_aux_stream_deadline, "value", None)
     _aux_stream_deadline.value = deadline if isinstance(deadline, (int, float)) else previous
@@ -11144,6 +11147,22 @@ def aux_stream_deadline(deadline: Optional[float]):
 def _current_aux_stream_deadline() -> Optional[float]:
     """The published stream deadline, or None."""
     return getattr(_aux_stream_deadline, "value", None)
+
+
+def _anthropic_aux_stream_event_hook():
+    """Keep streamed progress observable without outliving its host or hard cancel."""
+    deadline = _current_aux_stream_deadline()
+    if not _aux_progress_active() and deadline is None and _capture_aux_cancel_check() is None:
+        return None
+
+    def on_event(_event):
+        if _aux_interrupt_cancel_requested():
+            raise AuxiliaryExplicitCancellation()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Anthropic auxiliary stream timed out at the host compression deadline")
+        _notify_aux_progress()
+
+    return on_event
 
 
 def _managed_local_netloc() -> str:

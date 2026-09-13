@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import os
 from pathlib import Path
@@ -88,9 +89,13 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         cwd=tmp_path,
     )
     output: queue.Queue[str] = queue.Queue()
+    stderr_tail: deque[str] = deque(maxlen=40)
     try:
         assert proc.stdin is not None
         assert proc.stdout is not None
+        assert proc.stderr is not None
+        # Drain both pipes: discovery diagnostics must not block the JSON reply.
+        threading.Thread(target=stderr_tail.extend, args=(proc.stderr,), daemon=True).start()
         stdout = proc.stdout
         threading.Thread(
             target=lambda: output.put(stdout.readline()),
@@ -101,7 +106,10 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         try:
             line = output.get(timeout=10)
         except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
+            pytest.fail(
+                "slash worker produced no /tools response within 10 seconds\n"
+                + "".join(stderr_tail)[-8000:]
+            )
         response = json.loads(line)
         assert response["ok"] is True
         assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
