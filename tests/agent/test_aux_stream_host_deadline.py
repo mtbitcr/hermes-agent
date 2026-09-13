@@ -28,12 +28,9 @@ that ``_run_protected_sync_provider_call`` spawns.
 
 from __future__ import annotations
 
-import ast
 import asyncio
-import inspect
 import threading
 import time
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +39,7 @@ from agent import auxiliary_client as aux
 from agent.conversation_compression import (
     DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS,
     CompressionCommitFence,
+    _run_summary_dispatch,
 )
 
 
@@ -273,35 +271,30 @@ def test_protected_provider_daemon_inherits_the_host_deadline():
 # ── The compression worker must actually install it ──────────────────────
 
 
-def _summary_dispatch_source() -> str:
-    from agent import conversation_compression
-
-    path = Path(inspect.getsourcefile(conversation_compression))
-    return path.read_text(encoding="utf-8")
-
-
 def test_compression_summary_dispatch_installs_the_fence_deadline():
-    """Source guard: the wiring is one line and trivially droppable.
+    """The real dispatch scopes the compressor's deadline and cancellation."""
+    fence = CompressionCommitFence()
+    fence.set_total_ceiling_seconds(60)
+    assert fence.deadline_monotonic is not None
+    cancel = threading.Event()
+    agent = SimpleNamespace(context_compressor=SimpleNamespace(), session_id="test")
+    messages = [{"role": "user", "content": "Summarize this conversation."}]
+    seen = {}
 
-    A behavioural test would have to drive the whole ``compress_context`` body
-    (durable lock, watermark, telemetry, commit). This asserts the seam itself:
-    the same ``with`` statement that installs the progress hook must also
-    install the stream deadline.
-    """
-    tree = ast.parse(_summary_dispatch_source())
-    wired = False
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.With):
-            continue
-        names = set()
-        for item in node.items:
-            call = item.context_expr
-            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
-                names.add(call.func.id)
-        if "aux_progress_hook" in names:
-            assert "aux_stream_deadline" in names, (
-                "the summary dispatch scope installs the progress hook but not "
-                "the host stream deadline — #99692 would regress"
-            )
-            wired = True
-    assert wired, "summary dispatch scope not found"
+    def compress(items):
+        seen["deadline"] = aux._current_aux_stream_deadline()
+        seen["progress"] = aux._aux_progress_active()
+        assert not aux._aux_interrupt_cancel_requested()
+        cancel.set()
+        seen["cancelled"] = aux._aux_interrupt_cancel_requested()
+        cancel.clear()
+        return items
+
+    assert _run_summary_dispatch(
+        agent, messages, compress, {}, commit_fence=fence,
+        attempt_generation=1, hard_cancel_event=cancel,
+    ) is messages
+    assert seen == {"deadline": fence.deadline_monotonic, "progress": True, "cancelled": True}
+    assert aux._current_aux_stream_deadline() is None
+    assert not aux._aux_progress_active()
+    assert not aux._aux_interrupt_cancel_requested()

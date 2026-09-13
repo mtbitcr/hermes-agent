@@ -16,7 +16,6 @@ tests/agent/test_aux_affordable_402_retry.py
 tests/agent/test_aux_progress_streaming.py
 tests/agent/test_aux_relay_progress_seam.py
 tests/agent/test_aux_session_endpoint_affinity.py
-tests/agent/test_aux_stream_host_deadline.py
 tests/agent/test_auxiliary_auto_never_guesses_provider.py
 tests/agent/test_auxiliary_client_nous_401_cache_key.py
 tests/agent/test_auxiliary_openrouter_max_tokens.py
