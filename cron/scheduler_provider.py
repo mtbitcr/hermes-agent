@@ -384,6 +384,8 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
+        default_profile=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -411,6 +413,8 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                profile_adapters=profile_adapters,
+                default_profile=default_profile,
             )
             return
 
@@ -482,6 +486,8 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        profile_adapters=None,
+        default_profile=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -534,13 +540,21 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in profile_homes:
+                        profile_name = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        # The launch profile owns adapters; another profile must
+                        # never inherit its bot when its own transport is absent.
+                        tick_adapters = (
+                            adapters
+                            if (profile_name or "default") == (default_profile or "default")
+                            else (profile_adapters or {}).get(profile_name) or {}
+                        )
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=tick_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
