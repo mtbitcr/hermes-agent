@@ -189,7 +189,7 @@ def _report_database_journal_modes(
     version_info: tuple[int, ...] | None = None,
 ) -> None:
     """List each database's journal mode; warn on WAL under a vulnerable SQLite."""
-    from hermes_state import _wal_reset_repair_hint, is_sqlite_wal_reset_vulnerable
+    from hermes_state_wal import _wal_reset_repair_hint, is_sqlite_wal_reset_vulnerable
 
     vulnerable = is_sqlite_wal_reset_vulnerable(version_info)
     home = hermes_home if hermes_home is not None else HERMES_HOME
@@ -1066,7 +1066,7 @@ def run_doctor(args):
     # SQLite across Python upgrades.
     try:
         import sqlite3
-        from hermes_state import is_sqlite_wal_reset_vulnerable, sqlite_source_id
+        from hermes_state_wal import is_sqlite_wal_reset_vulnerable, sqlite_source_id
 
         _sqlite_ver = sqlite3.sqlite_version
         _sqlite_src = sqlite_source_id()
@@ -1733,7 +1733,7 @@ def run_doctor(args):
             # through the triggers. `_db_opens_cleanly` now drives a rolled-back
             # write so this otherwise-silent corruption class is surfaced (and
             # repaired in place with --fix).
-            from hermes_state import _db_opens_cleanly, repair_state_db_schema
+            from hermes_state_repair import _db_opens_cleanly, repair_state_db_schema
 
             _write_reason = _db_opens_cleanly(state_db_path)
             if _write_reason is not None:
@@ -1822,7 +1822,7 @@ def run_doctor(args):
         # live DB held by the gateway; any failure degrades to one info
         # line rather than failing doctor.
         try:
-            from hermes_state import collect_state_db_stats, count_db_holders
+            from hermes_state_dbfile import collect_state_db_stats, count_db_holders
 
             _db_stats = collect_state_db_stats(state_db_path)
             _db_holders = count_db_holders(state_db_path)

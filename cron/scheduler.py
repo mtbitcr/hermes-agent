@@ -5668,7 +5668,7 @@ def run_job(
             # through and be delivered as a cron warning.
             _explainer_variants = []
             try:
-                from hermes_state import PERSISTENCE_ERROR_CAUSES as _causes
+                from hermes_state_errors import PERSISTENCE_ERROR_CAUSES as _causes
             except Exception:
                 _causes = ("locked", "disk", "unknown")
             for _cause in (None, *_causes):

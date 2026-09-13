@@ -37,7 +37,6 @@ FORK_CANONICAL_FACADES = frozenset({
     "hermes_cli.dashboard_auth.audit",    # dashboard audit module
     "hermes_cli.kanban_db",               # kanban kernel
     "hermes_cli.web_server",              # dashboard/web server
-    "hermes_state",                       # state facade
     "tools.approval",                     # approvals module
     "tools.browser_tool",                 # browser tool
     # Fork-canonical modules the fork's own test suites reach through the
