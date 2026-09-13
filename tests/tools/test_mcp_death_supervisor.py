@@ -20,7 +20,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tools import mcp_death_supervisor, mcp_tool
-from tools import mcp_tool_lifecycle as _mcp_lifecycle
+from tools import mcp_tool as _mcp_lifecycle  # Lifecycle remains in the retained fork module.
+
+MCP_SDK_AVAILABLE = mcp_tool._ensure_mcp_sdk()
 
 pytestmark = pytest.mark.skipif(
     os.name != "posix", reason="the supervisor is POSIX-only (process groups)"
@@ -618,10 +620,10 @@ def _stdio_connection(child_pid, fake_supervisor):
         # First call is the pids_before baseline; the second reports our child
         # as the newly spawned server.
         patch(
-            "tools.mcp_tool_lifecycle._snapshot_child_pids",
+            "tools.mcp_tool._snapshot_child_pids",
             side_effect=[set(), {child_pid}],
         ),
-        patch("tools.mcp_tool_config._write_stderr_log_header"),
+        patch("tools.mcp_tool._write_stderr_log_header"),
         patch("tools.mcp_tool._get_mcp_stderr_log", return_value=None),
         patch(
             "tools.mcp_tool._spawn_death_supervisor",
@@ -631,7 +633,7 @@ def _stdio_connection(child_pid, fake_supervisor):
         yield mcp_tool.MCPServerTask("supervisor-wiring")
 
 
-@pytest.mark.skipif(not mcp_tool._MCP_AVAILABLE, reason="MCP SDK not installed")
+@pytest.mark.skipif(not MCP_SDK_AVAILABLE, reason="MCP SDK not installed")
 def test_connecting_a_stdio_server_registers_its_real_process_group():
     fake = _FakeSupervisor()
     child = subprocess.Popen(_VICTIM, start_new_session=True)
@@ -648,7 +650,7 @@ def test_connecting_a_stdio_server_registers_its_real_process_group():
         child.wait(timeout=10)
 
 
-@pytest.mark.skipif(not mcp_tool._MCP_AVAILABLE, reason="MCP SDK not installed")
+@pytest.mark.skipif(not MCP_SDK_AVAILABLE, reason="MCP SDK not installed")
 def test_a_server_that_exited_is_released_on_teardown():
     fake = _FakeSupervisor()
     child = subprocess.Popen(_VICTIM, start_new_session=True)
@@ -677,7 +679,7 @@ def test_a_server_that_exited_is_released_on_teardown():
         _kill(child.pid)
 
 
-@pytest.mark.skipif(not mcp_tool._MCP_AVAILABLE, reason="MCP SDK not installed")
+@pytest.mark.skipif(not MCP_SDK_AVAILABLE, reason="MCP SDK not installed")
 def test_a_server_that_survived_teardown_stays_registered():
     # The case the whole module exists for: teardown did not manage to kill it.
     # Releasing it here would hand the orphan back to nobody.

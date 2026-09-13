@@ -237,7 +237,6 @@ tests/tools/test_local_temp_dir.py
 tests/tools/test_macos_protected_search.py
 tests/tools/test_managed_browserbase_and_modal.py
 tests/tools/test_mcp_cimd.py
-tests/tools/test_mcp_death_supervisor.py
 tests/tools/test_mcp_device_flow.py
 tests/tools/test_mcp_dynamic_discovery.py
 tests/tools/test_mcp_multiplex_connection_keys.py
