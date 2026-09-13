@@ -18,12 +18,12 @@ _AGENTMAIL_SKILL_SRC = (
 
 
 @pytest.fixture(autouse=True)
-def _clean_passthrough():
+def _clean_passthrough(monkeypatch):
     clear_env_passthrough()
-    _ep_mod._config_passthrough.clear()
+    # The cache is an optional frozenset, not a mutable set.
+    monkeypatch.setattr(_ep_mod, "_config_passthrough", None)
     yield
     clear_env_passthrough()
-    _ep_mod._config_passthrough.clear()
 
 
 def _create_skill(tmp_path, name, frontmatter_extra=""):
