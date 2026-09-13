@@ -113,7 +113,10 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
             )
         response = json.loads(line)
         assert response["ok"] is True
-        assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
+        diagnostics = ["".join(stderr_tail)[-4000:]]
+        for log in (profile_home / "logs").glob("*.log"):
+            diagnostics.append(f"{log.name}:\n{log.read_text(errors='replace')[-4000:]}")
+        assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"], "\n".join(diagnostics)[-12000:]
     finally:
         proc.terminate()
         try:

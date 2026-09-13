@@ -486,14 +486,13 @@ def _run_protected_sync_provider_call(
         raise AuxiliaryExplicitCancellation()
 
     progress_hook = getattr(_aux_progress, "hook", None)
-    host_deadline = _current_aux_stream_deadline()
     provider_context = contextvars.copy_context()
     done = threading.Event()
     outcome: dict[str, Any] = {}
 
     def _provider_worker() -> None:
         try:
-            with aux_progress_hook(progress_hook), aux_stream_deadline(host_deadline), aux_interrupt_protection(
+            with aux_progress_hook(progress_hook), aux_interrupt_protection(
                 cancel_check=cancel_check
             ):
                 outcome["result"] = callback(kwargs)
@@ -9306,7 +9305,7 @@ def _create_with_progress(
     original error is surfaced to the normal recovery chains instead.
     """
     _notify_aux_progress()  # request dispatched counts as progress
-    if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
+    if (not _aux_progress_active() and not force_stream and _current_aux_stream_deadline() is None) or _client_streams_internally(client):
         return client.chat.completions.create(**kwargs)
 
     total_ceiling = _aux_stream_total_ceiling(kwargs.get("timeout"))
@@ -9388,6 +9387,7 @@ class _ChatStreamAccumulator:
     def __init__(self, model: str = "", total_ceiling: Optional[float] = None):
         self._started = time.monotonic()
         self._total_ceiling = total_ceiling
+        self._host_deadline = _current_aux_stream_deadline()
         self.content_parts: List[str] = []
         self.reasoning_parts: List[str] = []
         self.tool_calls_acc: Dict[int, Dict[str, Any]] = {}
@@ -9398,6 +9398,8 @@ class _ChatStreamAccumulator:
 
     def feed(self, chunk: Any) -> None:
         _notify_aux_progress()
+        if self._host_deadline is not None and time.monotonic() >= self._host_deadline:
+            raise TimeoutError("Auxiliary stream timed out at the host compression deadline")
         if (
             self._total_ceiling is not None
             and (time.monotonic() - self._started) >= self._total_ceiling
@@ -11117,7 +11119,9 @@ async def _async_call_llm_impl(
 # the published deadline so the host's bounded work cannot leave a provider running.
 import contextlib as _fork_compat_contextlib
 
-_aux_stream_deadline = threading.local()
+_aux_stream_deadline: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "aux_stream_deadline", default=None,
+)
 
 _GEMINI_NATIVE_PROVIDER_NAMES = {"gemini", "google", "google-gemini", "google-ai-studio"}
 
@@ -11139,17 +11143,17 @@ def aux_stream_deadline(deadline: Optional[float]):
     ``None`` is a passthrough; re-entrant-safe. The compression host publishes
     the ceiling and each provider stream observes it.
     """
-    previous = getattr(_aux_stream_deadline, "value", None)
-    _aux_stream_deadline.value = deadline if isinstance(deadline, (int, float)) else previous
+    previous = _aux_stream_deadline.get()
+    token = _aux_stream_deadline.set(deadline if isinstance(deadline, (int, float)) else previous)
     try:
         yield
     finally:
-        _aux_stream_deadline.value = previous
+        _aux_stream_deadline.reset(token)
 
 
 def _current_aux_stream_deadline() -> Optional[float]:
     """The published stream deadline, or None."""
-    return getattr(_aux_stream_deadline, "value", None)
+    return _aux_stream_deadline.get()
 
 
 def _anthropic_aux_stream_event_hook():

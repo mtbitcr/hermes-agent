@@ -366,7 +366,9 @@ class TestFindExecFullPathRm:
 class TestSensitiveRedirectPattern:
     """Detect shell redirection writes to sensitive user-managed paths."""
 
-    def test_redirect_to_sensitive_target(self):
+    def test_redirect_to_sensitive_target(self, monkeypatch, tmp_path):
+        # The contour's HOME=/tmp is deliberately too broad for home-prefix folding.
+        monkeypatch.setenv("HOME", str(tmp_path / "owner-home"))
         authorized_keys = Path.home() / ".ssh" / "authorized_keys"
         for command in (
             "echo x > $HERMES_HOME/.env",

@@ -215,6 +215,18 @@ def test_deadline_scope_restores_the_previous_value():
     assert aux._current_aux_stream_deadline() is None
 
 
+def test_concurrent_async_deadline_scopes_are_independent():
+    async def observe(deadline):
+        with aux.aux_stream_deadline(deadline):
+            await asyncio.sleep(0)
+            assert aux._current_aux_stream_deadline() == deadline
+
+    async def run():
+        await asyncio.gather(observe(time.monotonic() - 1), observe(time.monotonic() + 600))
+
+    asyncio.run(run())
+
+
 def test_async_stream_mirror_honours_the_host_deadline():
     """The async consumer must not drift from the sync one."""
     stream = _AsyncStream(count=50)

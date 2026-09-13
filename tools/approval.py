@@ -4556,7 +4556,7 @@ def check_all_command_guards(command: str, env_type: str,
         if _is_cron_approval_context() or unattended:
             mode = _get_unattended_approval_mode() if unattended else _get_cron_approval_mode()
             reason = (
-                "this session runs on an unattended platform with no user present to approve it."
+                f"this session runs on an unattended platform ({_get_session_platform()}) with no user present to approve it."
                 if unattended else "cron jobs run without a user present to approve it."
             )
             setting = "unattended_mode" if unattended else "cron_mode"
