@@ -486,13 +486,14 @@ def _run_protected_sync_provider_call(
         raise AuxiliaryExplicitCancellation()
 
     progress_hook = getattr(_aux_progress, "hook", None)
+    host_deadline = _current_aux_stream_deadline()
     provider_context = contextvars.copy_context()
     done = threading.Event()
     outcome: dict[str, Any] = {}
 
     def _provider_worker() -> None:
         try:
-            with aux_progress_hook(progress_hook), aux_interrupt_protection(
+            with aux_progress_hook(progress_hook), aux_stream_deadline(host_deadline), aux_interrupt_protection(
                 cancel_check=cancel_check
             ):
                 outcome["result"] = callback(kwargs)
@@ -9214,8 +9215,10 @@ def _aux_stream_total_ceiling(effective_timeout: Optional[float]) -> float:
         timeout = float(effective_timeout) if effective_timeout is not None else 0.0
     except (TypeError, ValueError):
         timeout = 0.0
-    return max(_AUX_STREAM_CEILING_FLOOR_SECONDS,
-               _AUX_STREAM_CEILING_MULTIPLIER * timeout)
+    ceiling = max(_AUX_STREAM_CEILING_FLOOR_SECONDS,
+                  _AUX_STREAM_CEILING_MULTIPLIER * timeout)
+    deadline = _current_aux_stream_deadline()
+    return min(ceiling, max(0.0, deadline - time.monotonic())) if deadline is not None else ceiling
 
 
 def _client_streams_internally(client: Any) -> bool:

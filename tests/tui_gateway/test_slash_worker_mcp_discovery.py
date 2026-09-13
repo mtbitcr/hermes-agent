@@ -104,10 +104,11 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
         proc.stdin.flush()
         try:
-            line = output.get(timeout=10)
+            # Startup itself permits 15s of discovery before the CLI snapshot.
+            line = output.get(timeout=30)
         except queue.Empty:
             pytest.fail(
-                "slash worker produced no /tools response within 10 seconds\n"
+                "slash worker produced no /tools response within 30 seconds\n"
                 + "".join(stderr_tail)[-8000:]
             )
         response = json.loads(line)

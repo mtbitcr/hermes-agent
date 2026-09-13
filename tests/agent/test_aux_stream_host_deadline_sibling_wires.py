@@ -56,7 +56,8 @@ def _make_codex_adapter(event_iter):
     return aux._CodexCompletionsAdapter(real_client, "gpt-5.6-sol")
 
 
-def test_codex_stream_stops_at_the_host_deadline_not_its_own_ceiling():
+@pytest.mark.parametrize("protected", [False, True])
+def test_codex_stream_stops_at_the_host_deadline_not_its_own_ceiling(protected):
     """A live (re-arming) Codex stream must die at the host's deadline even
     though its own hard ceiling is >= 600s and every token re-arms the
     no-progress window."""
@@ -73,11 +74,12 @@ def test_codex_stream_stops_at_the_host_deadline_not_its_own_ceiling():
     with (
         patch("agent.codex_runtime._consume_codex_event_stream", _consume_codex),
         aux.aux_stream_deadline(time.monotonic() + 0.4),
+        aux.aux_interrupt_protection(cancel_check=(lambda: False) if protected else None),
         pytest.raises(TimeoutError, match="hard ceiling"),
     ):
-        adapter.create(
-            messages=[{"role": "user", "content": "summarize"}],
-            timeout=300,
+        aux._run_protected_sync_provider_call(
+            lambda request: adapter.create(**request),
+            {"messages": [{"role": "user", "content": "summarize"}], "timeout": 300},
         )
     elapsed = time.monotonic() - start
     assert elapsed < 5.0, f"stream outlived the host deadline by {elapsed:.1f}s"

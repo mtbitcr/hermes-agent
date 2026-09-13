@@ -11,12 +11,11 @@ import pytest
 
 import tools.approval as approval_module
 from tools import approval_context
-from tools import approval_smart
 from hermes_constants import get_hermes_home
 from tools.approval import approve_session, detect_dangerous_command, detect_hardline_command, is_approved, load_permanent, prompt_dangerous_approval
-from tools.approval_context import _get_approval_mode
-from tools.approval_context import _normalize_approval_mode
-from tools.approval_smart import _smart_approve
+from tools.approval import _get_approval_mode
+from tools.approval import _normalize_approval_mode
+from tools.approval import _smart_approve
 
 
 class TestApprovalModeParsing:
@@ -58,11 +57,11 @@ class TestSmartApproval:
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
         monkeypatch.setattr(
-            approval_context, "_get_approval_config",
+            approval_module, "_get_approval_config",
             lambda: {"mode": "smart"},
         )
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
-        monkeypatch.setattr(approval_smart, "_smart_approve", lambda *_: "approve")
+        monkeypatch.setattr(approval_module, "_smart_approve", lambda *_: "approve")
         monkeypatch.setattr(
             "tools.tirith_security.check_command_security",
             lambda _command: {"action": "allow", "findings": [], "summary": ""},
@@ -725,13 +724,25 @@ class TestWebhookApprovalExclusion:
     def test_all_unattended_platforms_return_false(self, monkeypatch):
         """Every unattended programmatic platform is excluded, not just webhook."""
         from tools.approval import _is_gateway_approval_context
-        from tools.approval_context import _UNATTENDED_APPROVAL_PLATFORMS
+        from tools.approval import _UNATTENDED_APPROVAL_PLATFORMS
 
         monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         for platform in _UNATTENDED_APPROVAL_PLATFORMS:
             monkeypatch.setenv("HERMES_SESSION_PLATFORM", platform)
             assert _is_gateway_approval_context() is False, platform
+
+    def test_api_session_with_owner_listener_keeps_gateway_approval(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "api_server")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        token = approval_context.set_current_session_key("api-owner-listener")
+        try:
+            monkeypatch.setitem(
+                approval_module._gateway_notify_cbs, "api-owner-listener", lambda _: None,
+            )
+            assert approval_module._is_gateway_approval_context() is True
+        finally:
+            approval_context.reset_current_session_key(token)
 
     def test_non_webhook_gateway_session_returns_true(self, monkeypatch):
         """Non-webhook gateway sessions (e.g. Telegram) are still gateway contexts."""
@@ -765,11 +776,9 @@ class TestWebhookApprovalExclusion:
     def _isolate(self, monkeypatch):
         """Neutralize host leakage: yolo frozen at import time + real config."""
         import tools.approval as approval_mod
-        from tools import approval_context
-        from tools import approval_context
 
         monkeypatch.setattr(approval_mod, "_YOLO_MODE_FROZEN", False)
-        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "smart")
 
     def test_webhook_dangerous_command_denies_by_default(self, monkeypatch):
         """Webhook sessions that trigger dangerous commands DENY instantly.
@@ -805,7 +814,7 @@ class TestWebhookApprovalExclusion:
         monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webhook")
         monkeypatch.setenv("HERMES_SESSION_KEY", "test-webhook-session")
         monkeypatch.setattr(
-            approval_context, "_get_unattended_approval_mode", lambda: "approve"
+            approval_module, "_get_unattended_approval_mode", lambda: "approve"
         )
 
         result = check_all_command_guards("sudo systemctl restart nginx", "local")
@@ -1327,8 +1336,6 @@ class TestApprovalTimeoutIsNotConsent:
     def setup_method(self):
         """Reset module state and force a tight approval timeout for fast tests."""
         from tools import approval as mod
-        from tools import approval_context
-        from tools import approval_context
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
         mod._session_approved.clear()
@@ -1363,7 +1370,7 @@ class TestApprovalTimeoutIsNotConsent:
     def _force_short_timeout(self, monkeypatch, seconds=0.05):
         from tools import approval as mod
         monkeypatch.setattr(
-            approval_context, "_get_approval_config",
+            approval_module, "_get_approval_config",
             lambda: {"mode": "manual", "timeout": seconds},
         )
 
@@ -1380,13 +1387,13 @@ class TestApprovalTimeoutIsNotConsent:
         mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
 
         hook_calls = []
-        original_fire = approval_context._fire_approval_hook
+        original_fire = approval_module._fire_approval_hook
 
         def _capture(event_name, **kwargs):
             hook_calls.append((event_name, kwargs))
             return original_fire(event_name, **kwargs)
 
-        monkeypatch.setattr(approval_context, "_fire_approval_hook", _capture)
+        monkeypatch.setattr(approval_module, "_fire_approval_hook", _capture)
 
         result = mod.check_all_command_guards("rm -rf .git", "local")
 
@@ -1458,13 +1465,13 @@ class TestApprovalTimeoutIsNotConsent:
         mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)
 
         hook_calls = []
-        original_fire = approval_context._fire_approval_hook
+        original_fire = approval_module._fire_approval_hook
 
         def _capture(event_name, **kwargs):
             hook_calls.append((event_name, kwargs))
             return original_fire(event_name, **kwargs)
 
-        monkeypatch.setattr(approval_context, "_fire_approval_hook", _capture)
+        monkeypatch.setattr(approval_module, "_fire_approval_hook", _capture)
 
         mod.check_all_command_guards("rm -rf .git", "local")
 
@@ -1485,7 +1492,7 @@ class TestApprovalTimeoutIsNotConsent:
         def _capture(event_name, **kwargs):
             hook_calls.append((event_name, kwargs))
 
-        monkeypatch.setattr(approval_context, "_fire_approval_hook", _capture)
+        monkeypatch.setattr(approval_module, "_fire_approval_hook", _capture)
 
         def _fail_notify(_data):
             raise RuntimeError("private gateway failure")
@@ -1631,7 +1638,7 @@ class TestConcurrentApprovalCoalescing:
 
     def test_identical_concurrent_approvals_send_one_prompt(self, monkeypatch):
         from tools import approval as mod
-        monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 30)
+        monkeypatch.setattr(approval_module, "_get_approval_timeout", lambda: 30)
 
         notified = []
         results, threads = self._spawn_waits(mod, notified, n=3)
@@ -1651,7 +1658,7 @@ class TestConcurrentApprovalCoalescing:
 
     def test_deny_propagates_to_followers(self, monkeypatch):
         from tools import approval as mod
-        monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 30)
+        monkeypatch.setattr(approval_module, "_get_approval_timeout", lambda: 30)
 
         notified = []
         results, threads = self._spawn_waits(mod, notified, n=2)
@@ -1667,7 +1674,7 @@ class TestConcurrentApprovalCoalescing:
 
     def test_once_makes_follower_reprompt(self, monkeypatch):
         from tools import approval as mod
-        monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 30)
+        monkeypatch.setattr(approval_module, "_get_approval_timeout", lambda: 30)
 
         notified = []
         results, threads = self._spawn_waits(mod, notified, n=2)
@@ -1688,7 +1695,7 @@ class TestConcurrentApprovalCoalescing:
 
     def test_different_commands_are_not_coalesced(self, monkeypatch):
         from tools import approval as mod
-        monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 30)
+        monkeypatch.setattr(approval_module, "_get_approval_timeout", lambda: 30)
         import threading
 
         notified = []
@@ -1869,7 +1876,7 @@ class TestApprovalPromptRedaction:
         with _patch("hermes_cli.config.load_config_readonly", return_value=cfg):
             with _patch("tools.approval._is_gateway_approval_context",
                         return_value=True):
-                with _patch("tools.approval_context._get_approval_mode",
+                with _patch("tools.approval._get_approval_mode",
                             return_value="manual"):
                     # No gateway notify callback registered -> pending fallback.
                     result = check_execute_code_guard(code, "local")
