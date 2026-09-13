@@ -20,9 +20,13 @@ selected via the `cron.provider` config key (empty = built-in).
 from __future__ import annotations
 
 import inspect
+import logging
 import threading
 from abc import ABC, abstractmethod
 from typing import Any
+
+logger = logging.getLogger(__name__)
+DEFAULT_MISFIRE_GRACE_MINUTES = 10
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail
 # with fd exhaustion (EMFILE/ENFILE, #87644).  Base is the tick interval

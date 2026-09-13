@@ -71,8 +71,6 @@ tests/cron/test_due_stale_cron_edit.py
 tests/cron/test_fire_forward_failure_stamp.py
 tests/cron/test_media_delivery_parity.py
 tests/cron/test_mirror_origin_fallback.py
-tests/cron/test_misfire_backstop_oneshot_grace.py
-tests/cron/test_misfire_catchup.py
 tests/cron/test_oneshot_grace_due_scan.py
 tests/cron/test_oneshot_guard_warning.py
 tests/cron/test_restart_safe_worker.py
