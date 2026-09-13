@@ -146,7 +146,6 @@ tests/hermes_cli/test_plugins.py
 tests/hermes_cli/test_plugins_cmd.py
 tests/hermes_cli/test_post_setup_gating.py
 tests/hermes_cli/test_profile_export_default_path.py
-tests/hermes_cli/test_serve_mcp_discovery_after_bind.py
 tests/hermes_cli/test_serve_parent_watchdog_live_macos.py
 tests/hermes_cli/test_serve_port_in_use.py
 tests/hermes_cli/test_session_message_page_owner.py

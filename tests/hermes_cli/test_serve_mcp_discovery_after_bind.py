@@ -12,7 +12,6 @@ import threading
 
 import hermes_cli.mcp_startup as mcp_startup
 import hermes_cli.web_server as web_server
-import hermes_cli.web_server_lifecycle as web_server_lifecycle
 from tests.hermes_cli.test_dashboard_auth_gate import _stub_uvicorn_run
 
 
@@ -22,7 +21,7 @@ def _reset_discovery_state(monkeypatch):
     monkeypatch.setattr(mcp_startup, "_mcp_discovery_deferred", None)
 
 
-def test_desktop_serve_arms_mcp_discovery_only_after_ready_sentinel(monkeypatch):
+def test_desktop_serve_arms_mcp_discovery_only_after_ready_sentinel(monkeypatch, capsys):
     _reset_discovery_state(monkeypatch)
     order: list[str] = []
     monkeypatch.setattr(
@@ -30,8 +29,14 @@ def test_desktop_serve_arms_mcp_discovery_only_after_ready_sentinel(monkeypatch)
         "start_background_mcp_discovery",
         lambda *, logger, thread_name: order.append("discovery:" + thread_name),
     )
-    monkeypatch.setattr(web_server, "_write_machine_sentinel_line", lambda line: order.append("sentinel"))
-    monkeypatch.setattr(web_server_lifecycle, "_write_machine_sentinel_line", lambda line: order.append("sentinel"))
+    defer = mcp_startup.defer_background_mcp_discovery
+
+    def after_ready(*, logger, thread_name, delay):
+        assert "HERMES_BACKEND_READY port=" in capsys.readouterr().out
+        order.append("sentinel")
+        defer(logger=logger, thread_name=thread_name, delay=60)
+
+    monkeypatch.setattr(mcp_startup, "defer_background_mcp_discovery", after_ready)
     _stub_uvicorn_run(monkeypatch)
 
     web_server.start_server(
@@ -51,7 +56,8 @@ def test_desktop_serve_arms_mcp_discovery_only_after_ready_sentinel(monkeypatch)
     order.clear()
     _reset_discovery_state(monkeypatch)
     web_server.start_server(host="127.0.0.1", port=0, open_browser=False, headless=True)
-    assert order == ["sentinel"] and mcp_startup._mcp_discovery_deferred is None
+    assert "HERMES_BACKEND_READY port=" in capsys.readouterr().out
+    assert order == [] and mcp_startup._mcp_discovery_deferred is None
 
 
 def test_deferred_discovery_fires_once_and_is_idempotent(monkeypatch):

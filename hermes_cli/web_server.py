@@ -18924,6 +18924,7 @@ def start_server(
     headless: bool = False,
     ssh_session_token: Optional[str] = None,
     ssh_owner_nonce: Optional[str] = None,
+    start_mcp_discovery_after_bind: bool = False,
 ):
     """Start the web UI server.
 
@@ -19167,6 +19168,18 @@ def start_server(
             else:
                 print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
+
+            if start_mcp_discovery_after_bind:
+                # Keep the native Desktop path: bind and announce readiness before
+                # the MCP SDK import competes with the initial UI handshake.
+                try:
+                    from hermes_cli.mcp_startup import defer_background_mcp_discovery
+
+                    defer_background_mcp_discovery(
+                        logger=_log, thread_name="dashboard-mcp-discovery", delay=1.0,
+                    )
+                except Exception:
+                    _log.debug("Deferred MCP discovery arm failed", exc_info=True)
 
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop
             # forcibly closes its WebSocket mid-write, asyncio logs a full
