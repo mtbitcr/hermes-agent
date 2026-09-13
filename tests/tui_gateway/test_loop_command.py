@@ -10,6 +10,7 @@ wakeups via ``_maybe_fire_tui_loop_tick``.
 from __future__ import annotations
 
 import importlib
+import sys
 import threading
 import time
 from pathlib import Path
@@ -33,16 +34,15 @@ def hermes_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def server(hermes_home):
-    with patch.dict(
-        "sys.modules",
-        {
-            "hermes_cli.env_loader": MagicMock(),
-            "hermes_cli.banner": MagicMock(),
-        },
-    ):
-        mod = importlib.import_module("tui_gateway.server")
+def server(hermes_home, monkeypatch):
+    # Restore only these stubs, not the entire module table while the TUI's
+    # background imports are still running (importlib teardown race).
+    monkeypatch.setitem(sys.modules, "hermes_cli.env_loader", MagicMock())
+    monkeypatch.setitem(sys.modules, "hermes_cli.banner", MagicMock())
+    mod = importlib.import_module("tui_gateway.server")
+    try:
         yield mod
+    finally:
         mod._sessions.clear()
         mod._pending.clear()
         mod._answers.clear()
