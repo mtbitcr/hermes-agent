@@ -6771,7 +6771,7 @@ def tick(
             if verbose:
                 logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
             try:
-                from tools.mcp_tool import _kill_orphaned_mcp_children
+                from tools.mcp_tool_lifecycle import _kill_orphaned_mcp_children
                 _kill_orphaned_mcp_children()
             except Exception as _e:
                 logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
@@ -7008,7 +7008,7 @@ def tick(
         # reaped.
         def _sweep_mcp_orphans() -> None:
             try:
-                from tools.mcp_tool import _kill_orphaned_mcp_children
+                from tools.mcp_tool_lifecycle import _kill_orphaned_mcp_children
                 _kill_orphaned_mcp_children()
             except Exception as _e:
                 logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)

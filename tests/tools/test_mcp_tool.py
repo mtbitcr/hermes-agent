@@ -739,7 +739,8 @@ class TestRunOnMCPLoopInterrupts:
 
         with patch.object(mcp_mod, "_mcp_loop", loop):
             with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_schedule):
-                return mcp_mod._run_on_mcp_loop(_unused_call(), timeout=1)
+                from tools.mcp_tool_loop import _run_on_mcp_loop
+                return _run_on_mcp_loop(_unused_call(), timeout=1)
 
     def test_interrupt_cancels_waiting_mcp_call(self):
         import tools.mcp_tool as mcp_mod
