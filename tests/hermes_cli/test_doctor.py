@@ -186,7 +186,9 @@ class TestHonchoDoctorConfigDetection:
 
 
 
-def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
+@pytest.mark.parametrize("in_container", [False, True])
+def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path, in_container):
+    monkeypatch.setattr("hermes_constants.is_container", lambda: in_container)
     monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
     monkeypatch.setenv("TERMINAL_VERCEL_RUNTIME", "python3.13")
     monkeypatch.setenv("TERMINAL_CONTAINER_DISK", "2048")
