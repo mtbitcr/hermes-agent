@@ -482,7 +482,7 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
         return False
     with _core._lock:
-        server_name = _core._mcp_tool_server_names.get(tool_name)
+        server_name = _core._mcp_tool_server_names.get(_server_key(tool_name))
         return bool(server_name and _server_key(server_name) in _core._parallel_safe_servers)
 
 

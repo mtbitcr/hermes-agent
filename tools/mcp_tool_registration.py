@@ -72,16 +72,16 @@ def _record_scope_trust(server_name: str, config: dict, scope: str) -> None:
             (config or {}).get("trust"))
 
 
-def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
-    """Remember the exact raw MCP server that registered *tool_name*."""
+def _track_mcp_tool_server(tool_name: str, server_name: str, scope: Optional[str] = None) -> None:
+    """Remember provenance in the same profile overlay as the registered tool."""
     with _core._lock:
-        _core._mcp_tool_server_names[tool_name] = server_name
+        _core._mcp_tool_server_names[_server_key(tool_name, scope, current=False)] = server_name
 
 
-def _forget_mcp_tool_server(tool_name: str) -> None:
-    """Forget MCP server provenance for a deregistered tool."""
+def _forget_mcp_tool_server(tool_name: str, scope: Optional[str] = None) -> None:
+    """Forget only the deregistered profile's tool provenance."""
     with _core._lock:
-        _core._mcp_tool_server_names.pop(tool_name, None)
+        _core._mcp_tool_server_names.pop(_server_key(tool_name, scope, current=False), None)
 
 
 def _server_key_for_task(server) -> object:
@@ -106,7 +106,7 @@ def _deregister_mcp_tool_all_scopes(server, tool_name: str) -> None:
             scopes = {_core._server_registry_scope(key)}
     for scope in scopes:
         registry.deregister(tool_name, scope=scope)
-    _forget_mcp_tool_server(tool_name)
+        _forget_mcp_tool_server(tool_name, scope)
     _restore_server_toolset_alias(key)
 
 
@@ -133,8 +133,12 @@ def _remove_server_scope(key, scope: str) -> None:
     from tools.registry import registry
 
     server_name = _key_name(key)
-    for tool_name in registry.get_tool_names_for_toolset(f"mcp-{server_name}"):
+    with _core._lock:
+        tool_names = [_key_name(tool_key) for tool_key, owner in _core._mcp_tool_server_names.items()
+                      if _key_scope(tool_key) == scope and owner == server_name]
+    for tool_name in tool_names:
         registry.deregister(tool_name, scope=scope)
+        _forget_mcp_tool_server(tool_name, scope)
     with _core._lock:
         scopes = set(_core._server_tool_scopes.get(key, ()))
         scopes.discard(scope)
@@ -143,6 +147,7 @@ def _remove_server_scope(key, scope: str) -> None:
         else:
             _core._server_tool_scopes.pop(key, None)
         _core._server_trust_levels.pop(_server_key(server_name, scope, current=False), None)
+        _core._parallel_safe_servers.discard(_server_key(server_name, scope, current=False))
     _restore_server_toolset_alias(key)
 
 
@@ -347,7 +352,7 @@ def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: C
             name=c.registry_name, toolset=toolset_name, schema=c.schema, handler=c.handler, check_fn=check_fn,
             is_async=False, description=c.schema.get("description") or "", scope=scope_value)
         if registry.get_toolset_for_tool(c.registry_name) == toolset_name:
-            _track_mcp_tool_server(c.registry_name, name)
+            _track_mcp_tool_server(c.registry_name, name, scope_value)
             if scope_value is not None:
                 with _core._lock:
                     _core._server_tool_scopes.setdefault(key, set()).add(scope_value)
@@ -411,19 +416,16 @@ def _server_enabled(config: dict) -> bool:
     return _parse_boolish(config.get("enabled", True), default=True)
 
 
-def _connection_identity(config: dict) -> tuple:
-    """What makes one live connection reusable for another profile: the route fingerprint PLUS
-    everything that authenticates it (``config_fingerprint`` deliberately excludes credentials so
-    the schema cache survives a token rotation). Two profiles pointing at the same URL with different
-    headers/env/auth/client certificates are two identities; borrowing across them would call tools
-    as the other user."""
-    from tools.mcp_schema_cache import config_fingerprint
+def _connection_identity(config: dict) -> str:
+    """Compare the complete connection configuration, not the credential-free schema-cache key.
 
-    def _frozen(value):
-        return json.dumps(value or {}, sort_keys=True, default=str)
-
-    return (config_fingerprint(config), _frozen(config.get("env")), _frozen(config.get("headers")),
-            _auth_type(config), _frozen(config.get("client_cert")), _frozen(config.get("client_key")))
+    Only trust and parallel admission are excluded: those belong to each consuming profile.
+    Unknown/new transport fields must prevent adoption when they differ, too.
+    """
+    identity = {key: value for key, value in config.items()
+                if key not in ("trust", "supports_parallel_tool_calls")}
+    identity["auth"] = _auth_type(config)
+    return json.dumps(identity, sort_keys=True, default=str)
 
 
 def _auth_type(config: dict) -> str:
@@ -431,15 +433,17 @@ def _auth_type(config: dict) -> str:
 
 
 def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False) -> bool:
-    """Whether *server* matches *config*, with OAuth connections never reusable across profiles.
+    """Match explicit configuration without borrowing profile-local credential authority.
 
-    OAuth credentials live in the owning profile's token storage rather than the static config,
-    so identical OAuth configs cannot prove that two profiles authenticate as the same account.
+    OAuth tokens, source-tagged stdio secrets and profile identity headers are resolved outside
+    the static config. Identical config cannot prove they match across profile homes.
     """
     if _connection_identity(getattr(server, "_config", {}) or {}) != _connection_identity(config):
         return False
-    # Identities match, so both sides carry the same normalised auth type.
-    return not (cross_profile and _auth_type(config) == "oauth")
+    identity_header = config.get("identity_header")
+    profile_header = (isinstance(identity_header, dict)
+                      and str(identity_header.get("value_from") or "").strip().lower() == "profile")
+    return not (cross_profile and (_auth_type(config) == "oauth" or "url" not in config or profile_header))
 
 
 def register_connected_into_current_scope(servers: dict) -> int:

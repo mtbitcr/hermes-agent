@@ -8,6 +8,7 @@ import time
 from typing import Dict, Optional
 from tools.mcp_tool_common import _core
 from tools import mcp_tool_loop as _loop
+from tools.mcp_tool_scope import _key_scope
 
 logger = logging.getLogger("tools.mcp_tool")
 
@@ -135,6 +136,8 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None):
     anything else is still connected."""
     with _core._lock:
         selected = [key for key in _core._servers if scope is None or _core._server_scope_keys.get(key) == scope]
+        adopted = [key for key, scopes in _core._server_tool_scopes.items()
+                   if scope is not None and scope in scopes and _key_scope(key) != scope]
         servers_snapshot = [_core._servers[key] for key in selected]
         selected_status = (
             set(_core._servers) | set(_core._server_scope_keys)
@@ -153,6 +156,13 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None):
                 for adopter in _core._server_tool_scopes.get(key, ()):
                     if adopter != scope:
                         _core._orphaned_adopters.setdefault(adopter, set()).add(_key_name(key))
+
+    # An adopter has no owned connection to shut down, but its overlay and call policy
+    # must still disappear. The owning profile's transport remains live.
+    if adopted:
+        from tools.mcp_tool_registration import _remove_server_scope
+        for key in adopted:
+            _remove_server_scope(key, scope)
 
     def clear_selected_status():
         _core._server_connecting.difference_update(selected_status)
@@ -196,6 +206,11 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None):
         if not servers_snapshot:
             clear_selected_status()
         _clear_connect_cooldowns(None if scope is None else selected_status)
+        _core._parallel_safe_servers.difference_update(
+            {key for key in _core._parallel_safe_servers if scope is None or _key_scope(key) == scope})
+        for key in list(_core._mcp_tool_server_names):
+            if scope is None or _key_scope(key) == scope:
+                _core._mcp_tool_server_names.pop(key, None)
     _loop._stop_mcp_loop(only_if_idle=scope is not None)
 
 

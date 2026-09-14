@@ -494,8 +494,8 @@ def _reset_server_error(server_name: str) -> None:
 # Servers opted into parallel tool calls, keyed by the consuming profile's own key (``foo-bar``/
 # ``foo_bar`` sanitize alike but must not share policy; neither do two profiles' same-named servers).
 _parallel_safe_servers: set = set()
-# registry tool name -> raw server name (the generated name is lossy; never re-parse it).
-_mcp_tool_server_names: Dict[str, str] = {}
+# Profile-scoped registry tool key -> raw server name (generated names are lossy).
+_mcp_tool_server_names: Dict[Any, str] = {}
 
 # Dedicated event loop in a background daemon thread; _lock guards the loop handles, _servers,
 # the status maps and the PID ledgers.
