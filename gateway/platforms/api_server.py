@@ -9502,6 +9502,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     response_env,
                     conversation_history_snapshot,
                     session_id_snapshot or session_id,
+                    final_response_text,
                 ):
                     raise RuntimeError("owner conversation reservation changed")
                 return
@@ -10295,6 +10296,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
+        stored = None
         stored_session_id = None
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(
@@ -10302,15 +10304,29 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
-            conversation_history = list(stored.get("conversation_history", []))
+            conversation_history = list(
+                stored.get("model_history", stored.get("conversation_history", []))
+                if is_owner_conversation else stored.get("conversation_history", [])
+            )
             stored_session_id = stored.get("session_id")
             # If no instructions provided, carry forward from previous
             if instructions is None:
                 instructions = stored.get("instructions")
 
+        # Freeze owner authority before the agent can rewrite its working context.
+        owner_history_before = None
+        if is_owner_conversation:
+            owner_history_before = copy.deepcopy(
+                stored.get("conversation_history") if stored is not None else conversation_history
+            )
+            if not isinstance(owner_history_before, list):
+                raise OwnerAuthorityBroken("owner conversation has no readable transcript")
+
         # Append new input messages to history (all but the last become history)
         for msg in input_messages[:-1]:
             conversation_history.append(msg)
+            if owner_history_before is not None:
+                owner_history_before.append(copy.deepcopy(msg))
 
         # Last input message is the user_message
         user_message: Any = input_messages[-1].get("content", "") if input_messages else ""
@@ -10357,6 +10373,7 @@ class APIServerAdapter(BasePlatformAdapter):
             terminal: dict,
             history_snapshot: List[Dict[str, Any]],
             effective_session_id: Optional[str],
+            owner_reply: Any,
             *,
             release_job: bool = False,
         ) -> bool:
@@ -10371,18 +10388,26 @@ class APIServerAdapter(BasePlatformAdapter):
             """
             nonlocal owner_response_idempotency
             reserved = owner_response_idempotency
+            owner_history = [
+                *owner_history_before,
+                {"role": "user", "content": copy.deepcopy(user_message)},
+                {"role": "assistant", "content": copy.deepcopy(owner_reply)},
+            ]
             published = self._response_store.publish_owner_turn(
                 profile=response_profile,
                 conversation=str(conversation),
                 response_id=response_id,
                 data={
                     "response": terminal,
-                    "conversation_history": history_snapshot,
+                    # Keep the established owner transcript readable by the
+                    # previous runtime too; only model context uses the new field.
+                    "conversation_history": owner_history,
+                    "model_history": history_snapshot,
                     "instructions": instructions,
                     "session_id": effective_session_id,
                 },
                 owner_proposal=_owner_history_has_actionable_final_proposal(
-                    history_snapshot
+                    owner_history
                 ),
                 reservation_id=conversation_reservation_id,
                 expected_previous_response_id=(
@@ -10612,7 +10637,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_q=_stream_q,
                     agent_task=agent_task,
                     agent_ref=agent_ref,
-                    conversation_history=conversation_history,
+                    conversation_history=(
+                        owner_history_before if is_owner_conversation else conversation_history
+                    ),
                     user_message=user_message,
                     instructions=instructions,
                     conversation=conversation,
@@ -10665,7 +10692,9 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             pending_store_data = {
                 "response": queued_response,
-                "conversation_history": list(conversation_history),
+                "conversation_history": (
+                    owner_history_before if is_owner_conversation else list(conversation_history)
+                ),
                 "instructions": instructions,
                 "session_id": session_id,
             }
@@ -10742,7 +10771,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # reached from the other side of the await.
                 try:
                     result, usage = await _compute_response()
-                    response_data, full_history, effective_session_id = (
+                    response_data, full_history, effective_session_id, owner_reply = (
                         self._finalize_response_result(
                             response_id=response_id,
                             created_at=created_at,
@@ -10761,7 +10790,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         # standard and streaming paths do — plus, on this path,
                         # the retirement of the recovery job the 202 reserved.
                         published = _publish_owner_turn(
-                            response_data, full_history, effective_session_id,
+                            response_data, full_history, effective_session_id, owner_reply,
                             release_job=True,
                         )
                     else:
@@ -10949,7 +10978,7 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _compute_finalized_response():
             result, usage = await _compute_response()
             created_at = int(time.time())
-            response_data, full_history, effective_session_id = (
+            response_data, full_history, effective_session_id, owner_reply = (
                 self._finalize_response_result(
                     response_id=response_id,
                     created_at=created_at,
@@ -10968,7 +10997,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     # turn's reservation release and the durable replay record
                     # an exact retry answers from.
                     if not _publish_owner_turn(
-                        response_data, full_history, effective_session_id,
+                        response_data, full_history, effective_session_id, owner_reply,
                     ):
                         raise _OwnerConversationReservationChanged
                     return response_data, effective_session_id
@@ -11777,10 +11806,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # This can happen because compression rewrote the transcript
             # (summary prefix replaces original history), OR because
             # agent_messages only carries the current turn without prior.
-            # The ``_compressed`` flag (set by _run_agent after compaction)
-            # distinguishes — skip the concatenation and use the compressed
-            # transcript directly.
-            if result.get("_compressed"):
+            # The real core always returns a full working transcript, including
+            # role-repaired histories. Legacy producers may return only a turn.
+            if result.get("_compressed") or result.get("_full_history"):
                 return list(agent_messages)
 
             full_history = prior
@@ -11804,8 +11832,8 @@ class APIServerAdapter(BasePlatformAdapter):
         content, and every tool-call field such as ``tool_calls``,
         ``tool_call_id``, ``name``, ``refusal`` or ``reasoning``. Only the
         durable bookkeeping the live transcript stamps onto its own copies is
-        ignored: the shared persistence-only fields plus ``_db_persisted``,
-        which exists only on the live cached copy.
+        ignored: the shared persistence-only fields, durable row ids and the
+        live cached copy's ``_db_persisted`` marker.
 
         Comparing whole dicts instead meant this turn's own user message never
         equalled the one the request described, because the agent had stamped
@@ -11823,7 +11851,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 key: value
                 for key, value in message.items()
                 if key not in PERSISTENCE_ONLY_MESSAGE_FIELDS
-                and key != "_db_persisted"
+                and key not in {"_db_persisted", "_row_id"}
             }
 
         return all(
@@ -11963,7 +11991,7 @@ class APIServerAdapter(BasePlatformAdapter):
         result: Dict[str, Any],
         usage: Dict[str, Any],
         background: bool,
-    ) -> tuple[Dict[str, Any], List[Dict[str, Any]], str]:
+    ) -> tuple[Dict[str, Any], List[Dict[str, Any]], str, Any]:
         """Build one completed Responses object and its durable transcript."""
         final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
         if not final_response:
@@ -12009,7 +12037,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if background:
             response_data["background"] = True
 
-        return response_data, full_history, effective_session_id
+        return response_data, full_history, effective_session_id, final_response
 
     # ------------------------------------------------------------------
     # Agent execution
@@ -12206,9 +12234,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._shutdown_interruptible_agents[id(agent)] = agent
                     result = agent.run_conversation(
                         user_message=user_message,
-                        conversation_history=conversation_history,
+                        conversation_history=copy.deepcopy(conversation_history),
                         task_id=effective_task_id,
                     )
+                    # The real agent returns its complete working transcript,
+                    # even when role repair rewrites its prefix without compression.
+                    result["_full_history"] = True
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

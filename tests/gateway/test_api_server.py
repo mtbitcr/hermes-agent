@@ -7675,6 +7675,78 @@ class TestPlatformEventCallbackEndpoint:
 # ---------------------------------------------------------------------------
 
 
+class TestOwnerDisplayHistory:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("delivery", ["standard", "background", "stream"])
+    async def test_provider_rewrites_do_not_replace_owner_words(self, adapter, delivery):
+        from agent.agent_runtime_helpers import repair_message_sequence
+
+        owner = "Verify this update without changing its code."
+        reply = json.dumps({"schema_version": 1, "kind": "question", "message": "Which check first?"})
+        conversation = "raphael-owner-" + uuid.uuid4().hex
+        model_histories = []
+
+        async def model(**kwargs):
+            # The real pre-request repair mutates dictionaries in its input.
+            # Neither that working context nor a later summary is owner speech.
+            for message in kwargs["conversation_history"]:
+                if message.get("role") == "user":
+                    message["content"] = "provider context " * 1_000
+            messages = [
+                {"role": "user", "content": "provider context " * 1_000},
+                {"role": "user", "content": kwargs["user_message"]},
+            ]
+            repair_message_sequence(None, messages)
+            if model_histories:
+                messages = [
+                    {"role": "system", "content": "Compressed model context."},
+                    {"role": "user", "content": kwargs["user_message"]},
+                ]
+            messages.append({"role": "assistant", "content": reply})
+            model_histories.append(json.loads(json.dumps(messages)))
+            return {
+                "messages": messages, "final_response": reply,
+                "_full_history": True, "_compressed": len(model_histories) > 1,
+            }, {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+
+        previous = None
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=model):
+                for turn in range(2):
+                    body = {
+                        "model": "hermes-agent", "input": owner, "store": True,
+                        "conversation": conversation,
+                        "expected_previous_response_id": previous,
+                    }
+                    if delivery != "standard":
+                        body[delivery] = True
+                    response = await cli.post(
+                        "/v1/responses", json=body,
+                        headers={"Idempotency-Key": uuid.uuid4().hex},
+                    )
+                    assert response.status in ({200, 202} if delivery == "background" else {200})
+                    if delivery == "stream":
+                        events = [json.loads(line[6:]) for line in (await response.text()).splitlines()
+                                  if line.startswith("data: {")]
+                        terminal = next(event["response"] for event in events
+                                        if event.get("type") == "response.completed")
+                    else:
+                        terminal = await response.json()
+                    if delivery == "background":
+                        async with asyncio.timeout(10):
+                            while terminal["status"] != "completed":
+                                await asyncio.sleep(0.01)
+                                polled = await cli.get("/v1/responses/" + terminal["id"])
+                                terminal = await polled.json()
+                    previous = terminal["id"]
+                    snapshot = adapter._response_store.owner_history_snapshot(conversation)
+                    assert snapshot["data"] == [{"owner": owner, "raphael": reply}] * (turn + 1)
+                    assert snapshot["incomplete"] is False
+                    assert snapshot["truncated"] is False
+                    stored = adapter._response_store.get(previous)
+                    assert stored["model_history"] == model_histories[-1]
+
+
 class TestGetResponse:
     @pytest.mark.asyncio
     async def test_get_stored_response(self, adapter):
@@ -7834,8 +7906,8 @@ class TestStoredTranscriptTurnStart:
 
     def test_a_first_turn_stores_the_owner_message_exactly_once(self):
         result = {"messages": [
-            self._stamped("user", "Plan the workshop.", at=100.0),
-            self._stamped("assistant", "Here is the plan.", at=101.0),
+            self._stamped("user", "Plan the workshop.", at=100.0, _row_id=1),
+            self._stamped("assistant", "Here is the plan.", at=101.0, _row_id=2),
         ]}
 
         stored = APIServerAdapter._build_response_conversation_history(
