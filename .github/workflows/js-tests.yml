@@ -81,6 +81,6 @@ jobs:
       # nothing.
       - name: Run all workspace checks
         # Fork: standard runners have 2-4 cores, not 32 — full concurrency starves the
-        # UI suites into 5s test timeouts. Two at a time keeps the wall clock sane
-        # without touching any test.
-        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2
+        # UI suites into 5s test timeouts even with two workspace checks. Each
+        # check already uses its own worker pool; keep the outer queue serial.
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 1
