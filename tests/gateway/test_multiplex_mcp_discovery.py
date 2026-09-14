@@ -126,7 +126,8 @@ async def test_reload_mcp_reports_a_shared_server_to_a_non_owner_profile(
         get_or_create_session=MagicMock(side_effect=RuntimeError("skip transcript")),
     )
 
-    live_server = SimpleNamespace(session=object(), _config={}, _tools=[], tool_timeout=30,
+    shared_config = {"url": "https://shared.example/mcp"}
+    live_server = SimpleNamespace(session=object(), _config=shared_config, _tools=[], tool_timeout=30,
                                   initialize_result=None, _registered_tool_names=[])
     monkeypatch.setattr(mcp_tool, "_servers", {"shared": live_server})
     monkeypatch.setattr(mcp_tool, "_server_scope_keys", {"shared": launch_scope})
@@ -138,7 +139,7 @@ async def test_reload_mcp_reports_a_shared_server_to_a_non_owner_profile(
 
     def fake_discover() -> list[str]:
         from tools import mcp_tool_registration as _mcp_registration
-        _mcp_registration.register_connected_into_current_scope({"shared": {}})
+        _mcp_registration.register_connected_into_current_scope({"shared": shared_config})
         return ["mcp__shared__tool"]
 
     monkeypatch.setattr(_mcp_lifecycle, "shutdown_mcp_servers", lambda **_kwargs: None)
@@ -212,13 +213,14 @@ def test_shared_server_tools_are_callable_and_removed_on_non_owner_reload(
         inputSchema={"type": "object", "properties": {}},
         annotations=None,
     )
+    shared_config = {"url": "https://shared.example/mcp"}
     server = SimpleNamespace(
         name="shared",
         session=object(),
         _tools=[tool],
         tool_timeout=30,
         _registered_tool_names=[],
-        _config={},
+        _config=shared_config,
         initialize_result=None,
     )
     owner_tool_name = "mcp__shared__echo"
@@ -249,7 +251,7 @@ def test_shared_server_tools_are_callable_and_removed_on_non_owner_reload(
     try:
         monkeypatch.setattr(mcp_tool, "_ensure_mcp_sdk", lambda: True)
         monkeypatch.setattr(_mcp_config, "_filter_suspicious_mcp_servers", lambda servers: servers)
-        assert _mcp_discovery.register_mcp_servers({"shared": {}})
+        assert _mcp_discovery.register_mcp_servers({"shared": shared_config})
         tool_names = registry.get_tool_names_for_toolset("mcp-shared")
         assert tool_names
         assert callable(registry.get_entry(tool_names[0]).handler)
