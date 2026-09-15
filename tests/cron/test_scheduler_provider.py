@@ -20,6 +20,7 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
     """Block until ``predicate()`` is truthy or ``timeout`` elapses.
@@ -589,25 +590,29 @@ class TestGuardJobCredentialExfil:
 # ── Multiplex profiles: cron per secondary profile (issue #69377) ─────────
 
 
-def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("primary_profile", [None, "primary"])
+def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch, primary_profile):
     """The multiplex cron scheduler calls tick() once per profile home,
     scoped via use_cron_store, so secondary-profile jobs actually fire
     instead of languishing in an unticked store."""
     from cron.scheduler_provider import InProcessCronScheduler
 
-    # Set up two profile directories.
+    # Cover the launch profile, its sibling and a profile without a transport.
     p1 = tmp_path / "default"
     p2 = tmp_path / "home-ops"
-    for d in (p1, p2):
+    p3 = tmp_path / "no-transport"
+    for d in (p1, p2, p3):
         (d / "cron").mkdir(parents=True)
 
-    profile_homes = [("default", p1), ("home-ops", p2)]
+    profile_homes = [(primary_profile, p1), ("home-ops", p2), ("no-transport", p3)]
+    primary_adapters = {"telegram": object()}
+    secondary_adapters = {"telegram": object()}
 
     # Count tick() calls — should be called once per profile per iteration.
-    tick_count: list[int] = []
+    tick_count: list[dict] = []
 
     def _tracking_tick(*args, **kwargs):
-        tick_count.append(1)
+        tick_count.append(kwargs["adapters"])
         return 0
 
     stop = threading.Event()
@@ -618,7 +623,12 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         t = threading.Thread(
             target=prov.start,
             args=(stop,),
-            kwargs={"interval": 0, "profile_homes": profile_homes},
+            kwargs={
+                "interval": 0, "profile_homes": profile_homes,
+                "adapters": primary_adapters,
+                "profile_adapters": {"home-ops": secondary_adapters},
+                "default_profile": primary_profile,
+            },
             daemon=True,
         )
         t.start()
@@ -635,8 +645,7 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
 
     assert not t.is_alive()
     # The ticker called tick() at least once per profile per iteration.
-    # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
+    # Every profile must be visited before the next tick cycle starts.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-
-
+    assert tick_count[:3] == [primary_adapters, secondary_adapters, {}]

@@ -333,6 +333,16 @@ def _prune_check_fn_caches(now: float) -> None:
         _check_fn_last_good.pop(next(iter(_check_fn_last_good)))
 
 
+# Fork compat (2026-09 sync): upstream marks some availability checks uncached.
+_NO_CACHE_CHECK_FNS: set = set()
+
+
+def no_cache_check_fn(fn: Callable) -> Callable:
+    """Mark a local, config-backed availability check as uncached."""
+    _NO_CACHE_CHECK_FNS.add(fn)
+    return fn
+
+
 def check_fn_cache_scope() -> Optional[str]:
     """Return the active profile key when availability is profile-scoped.
 
@@ -367,6 +377,11 @@ def _check_fn_cached(fn: Callable) -> bool:
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
     """
+    if fn in _NO_CACHE_CHECK_FNS:  # fork compat: upstream uncached checks
+        try:
+            return bool(fn())
+        except Exception:
+            return False
     now = time.monotonic()
     scope = check_fn_cache_scope()
     if scope == CHECK_FN_CACHE_BYPASS:
@@ -596,6 +611,23 @@ class ToolRegistry:
         """Return a snapshot of ``{alias: canonical_toolset}`` mappings."""
         with self._lock:
             return dict(self._toolset_aliases)
+
+    def _toolset_has_registrations(self, toolset: str) -> bool:
+        """Check global and scoped owners while holding the registry lock."""
+        return any(entry.toolset == toolset
+                   for entries in (self._tools, *self._scoped_tools.values())
+                   for entry in entries.values())
+
+    def reconcile_toolset_alias(self, alias: str, toolset: str) -> None:
+        """Keep an alias exactly while its toolset has a registered owner."""
+        with self._lock:
+            current = self._toolset_aliases.get(alias)
+            if self._toolset_has_registrations(toolset):
+                if current != toolset:
+                    self.register_toolset_alias(alias, toolset)
+            elif current == toolset:
+                del self._toolset_aliases[alias]
+                self._generation += 1
 
     def get_toolset_alias_target(self, alias: str) -> Optional[str]:
         """Return the canonical toolset name for an alias, or None."""
@@ -892,8 +924,14 @@ class ToolRegistry:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
 
-    def deregister(self, name: str) -> None:
+    def deregister(self, name: str, *, scope: Optional[str] = None,
+                   expected_toolset: Optional[str] = None) -> None:
         """Remove a tool from the registry.
+
+        Explicit scope selects a profile overlay for native MCP cleanup; plugin
+        callers remain confined to their own scope.
+        An expected toolset makes ownership checking and removal atomic, so
+        delayed cleanup cannot delete a replacement registered by another owner.
 
         Also cleans up the toolset check if no other tools remain in the
         same toolset.  Used by MCP dynamic tool discovery to nuke-and-repave
@@ -916,13 +954,16 @@ class ToolRegistry:
                 if caller_owner is not None
                 else None
             )
-            target = (
-                self._scoped_tools.get(caller_scope, {})
-                if caller_scope is not None
-                else self._tools
-            )
+            if caller_owner is not None and scope is not None and scope != caller_scope:
+                raise PermissionError(
+                    f"Plugin module {caller_mod!r} cannot deregister tools "
+                    "outside its own profile scope."
+                )
+            if scope is None:
+                scope = caller_scope
+            target = self._scoped_tools.get(scope, {}) if scope is not None else self._tools
             entry = target.get(name)
-            if entry is None and caller_scope is not None:
+            if entry is None and scope is not None and caller_owner is not None:
                 if name in self._tools:
                     raise PermissionError(
                         f"Scoped plugin module {caller_mod!r} cannot deregister "
@@ -962,15 +1003,14 @@ class ToolRegistry:
                         f"{name!r} (toolset {entry.toolset!r}) without operator "
                         f"opt-in (allow_tool_override)."
                     )
+            if expected_toolset is not None and entry.toolset != expected_toolset:
+                return
             del target[name]
-            if caller_scope is not None and not target:
-                self._scoped_tools.pop(caller_scope, None)
+            if scope is not None and not target:
+                self._scoped_tools.pop(scope, None)
             # Drop the toolset check and aliases if this was the last tool in
             # that toolset.
-            toolset_still_exists = any(
-                e.toolset == entry.toolset
-                for e in self._merged_tools(caller_scope).values()
-            )
+            toolset_still_exists = self._toolset_has_registrations(entry.toolset)
             if not toolset_still_exists:
                 self._toolset_checks.pop(entry.toolset, None)
                 self._toolset_aliases = {
@@ -1034,11 +1074,7 @@ class ToolRegistry:
                         self._toolset_checks.pop(toolset, None)
                     else:
                         self._toolset_checks[toolset] = check_fn
-                if not surviving and not any(
-                    entry.toolset == toolset
-                    for entries in self._scoped_tools.values()
-                    for entry in entries.values()
-                ):
+                if not self._toolset_has_registrations(toolset):
                     self._toolset_aliases = {
                         alias: target
                         for alias, target in self._toolset_aliases.items()

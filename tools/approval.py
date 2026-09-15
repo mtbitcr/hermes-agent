@@ -40,17 +40,12 @@ _YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
 # Gateway runs agent turns concurrently in executor threads, so reading a
 # process-global env var for session identity is racy. Keep env fallback for
 # legacy single-threaded callers, but prefer the context-local value when set.
-_approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "approval_session_key",
-    default="",
-)
-_approval_turn_id: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "approval_turn_id",
-    default="",
-)
-_approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "approval_tool_call_id",
-    default="",
+# New transport callers and the retained guard must share session identity.
+from tools.approval_context import (
+    _approval_session_key, _approval_turn_id, _approval_tool_call_id,
+    _approval_session_id, _hermes_interactive_ctx,
+    _UNATTENDED_APPROVAL_PLATFORMS, _is_unattended_platform_approval_context,
+    _get_unattended_approval_mode,
 )
 # Hermes session id (observability identity, distinct from the gateway
 # routing session_key above). Approval hooks forward it so observer
@@ -58,10 +53,6 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 # it they fall back to a synthetic "default" session whose scope never
 # closes, and close-time exporters never ship the marks (staging defect
 # 2026-08-10: approvals invisible on the audit board).
-_approval_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "approval_session_id",
-    default="",
-)
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -72,10 +63,6 @@ _approval_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 # thread/task-local, so each executor worker (or asyncio task) sees only its
 # own value. None = unset → fall back to the env var for legacy
 # single-threaded CLI callers that still export HERMES_INTERACTIVE.
-_hermes_interactive_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "hermes_interactive",
-    default=None,
-)
 
 
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
@@ -306,6 +293,9 @@ def _is_gateway_approval_context() -> bool:
     """
     if _is_cron_approval_context():
         return False
+    if _is_unattended_platform_approval_context():
+        # Preserve the live owner approval channel when this API session has one.
+        return bool(_gateway_notify_cbs.get(get_current_session_key()))
     if env_var_enabled("HERMES_GATEWAY_SESSION"):
         return True
     return bool(_get_session_platform())
@@ -2338,6 +2328,10 @@ def detect_dangerous_command(command: str) -> tuple:
     normalized = _normalize_command_for_detection(command)
     for description, _ in _execution_flag_findings(normalized):
         return (True, description, description)
+    from cron.lifecycle_guard import contains_gateway_lifecycle_command
+    if contains_gateway_lifecycle_command(command):
+        description = "stop/restart hermes gateway or launchd service (kills running agents)"
+        return (True, description, description)
     return (False, None, None)
 
 
@@ -2749,7 +2743,7 @@ def _release_permission_mode_dependents(session_key: str) -> None:
     immediately, even when no later computer-use call occurs.
     """
     try:
-        from tools.computer_use import release_computer_use_session
+        from tools.computer_use.tool import release_computer_use_session
 
         release_computer_use_session(session_key)
     except Exception:
@@ -4479,6 +4473,14 @@ def check_all_command_guards(command: str, env_type: str,
         # either here) — ignore it so single_query_mode actually takes effect.
         is_ask = False
 
+    unattended = (
+        not is_gateway and not _is_cron_approval_context()
+        and _is_unattended_platform_approval_context()
+    )
+    if unattended:
+        is_cli = False
+        is_ask = False
+
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
@@ -4550,9 +4552,16 @@ def check_all_command_guards(command: str, env_type: str,
                         }
                     # else: tirith_fail_open is True — allow as before
             # single_query_mode: approve — fall through to auto-approve below.
-        # Cron sessions: respect cron_mode config
-        if _is_cron_approval_context():
-            if _get_cron_approval_mode() == "deny":
+        # Reuse the no-human detection and scanner boundary for programmatic sessions.
+        if _is_cron_approval_context() or unattended:
+            mode = _get_unattended_approval_mode() if unattended else _get_cron_approval_mode()
+            reason = (
+                f"this session runs on an unattended platform ({_get_session_platform()}) with no user present to approve it."
+                if unattended else "cron jobs run without a user present to approve it."
+            )
+            setting = "unattended_mode" if unattended else "cron_mode"
+            where = "on unattended platforms" if unattended else "in cron jobs"
+            if mode == "deny":
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
                 if is_dangerous:
@@ -4560,10 +4569,10 @@ def check_all_command_guards(command: str, env_type: str,
                         "approved": False,
                         "message": (
                             f"BLOCKED: Command flagged as dangerous ({description}) "
-                            "but cron jobs run without a user present to approve it. "
+                            f"but {reason} "
                             "Find an alternative approach that avoids this command. "
-                            "To allow dangerous commands in cron jobs, set "
-                            "approvals.cron_mode: approve in config.yaml."
+                            f"To allow dangerous commands {where}, set "
+                            f"approvals.{setting}: approve in config.yaml."
                         ),
                     }
                 # Also run tirith check in cron-deny mode so content-level
@@ -4579,10 +4588,10 @@ def check_all_command_guards(command: str, env_type: str,
                             "approved": False,
                             "message": (
                                 f"BLOCKED: {_cron_desc} "
-                                "but cron jobs run without a user present to approve it. "
+                                f"but {reason} "
                                 "Find an alternative approach that avoids this command. "
-                                "To allow dangerous commands in cron jobs, set "
-                                "approvals.cron_mode: approve in config.yaml."
+                                f"To allow dangerous commands {where}, set "
+                                f"approvals.{setting}: approve in config.yaml."
                             ),
                         }
                 except ImportError:
@@ -4607,9 +4616,9 @@ def check_all_command_guards(command: str, env_type: str,
                                 "BLOCKED: the Tirith security scanner could not be "
                                 "imported and security.tirith_fail_open is false, "
                                 "so this command cannot be silently allowed — and "
-                                "cron jobs run without a user present to approve it. "
+                                f"{reason} "
                                 "Find an alternative approach, install tirith, or set "
-                                "approvals.cron_mode: approve in config.yaml."
+                                f"approvals.{setting}: approve in config.yaml."
                             ),
                         }
                     # else: tirith_fail_open is True — allow as before
@@ -5115,16 +5124,23 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
 
     # Cron: no user is present to approve arbitrary code.
-    if _is_cron_approval_context():
-        if _get_cron_approval_mode() == "deny":
+    unattended = (
+        not is_gateway and not _is_cron_approval_context()
+        and _is_unattended_platform_approval_context()
+    )
+    if _is_cron_approval_context() or unattended:
+        mode = _get_unattended_approval_mode() if unattended else _get_cron_approval_mode()
+        context = "This unattended platform runs" if unattended else "Cron jobs run"
+        setting = "unattended_mode" if unattended else "cron_mode"
+        if mode == "deny":
             return {
                 "approved": False,
                 "message": (
                     "BLOCKED: execute_code runs arbitrary local Python "
                     "(including subprocess calls that bypass shell-string "
-                    "approval checks). Cron jobs run without a user present "
+                    f"approval checks). {context} without a user present "
                     "to approve it. Use normal tools instead, or set "
-                    "approvals.cron_mode: approve only if this cron profile "
+                    f"approvals.{setting}: approve only if this context "
                     "is intentionally trusted."
                 ),
                 "pattern_key": pattern_key,

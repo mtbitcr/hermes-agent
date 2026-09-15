@@ -189,7 +189,7 @@ def _report_database_journal_modes(
     version_info: tuple[int, ...] | None = None,
 ) -> None:
     """List each database's journal mode; warn on WAL under a vulnerable SQLite."""
-    from hermes_state import _wal_reset_repair_hint, is_sqlite_wal_reset_vulnerable
+    from hermes_state_wal import _wal_reset_repair_hint, is_sqlite_wal_reset_vulnerable
 
     vulnerable = is_sqlite_wal_reset_vulnerable(version_info)
     home = hermes_home if hermes_home is not None else HERMES_HOME
@@ -686,7 +686,7 @@ def check_certificates(should_fix: bool = False, issues: "list | None" = None) -
     re-verifying.
     """
     try:
-        from agent.ssl_guard import verify_ca_bundle_with_fallback
+        from agent.ssl_guard import verify_ca_bundle as verify_ca_bundle_with_fallback
         from agent.errors import SSLConfigurationError
     except Exception as e:
         check_warn("SSL certificate check skipped", str(e))
@@ -1066,7 +1066,7 @@ def run_doctor(args):
     # SQLite across Python upgrades.
     try:
         import sqlite3
-        from hermes_state import is_sqlite_wal_reset_vulnerable, sqlite_source_id
+        from hermes_state_wal import is_sqlite_wal_reset_vulnerable, sqlite_source_id
 
         _sqlite_ver = sqlite3.sqlite_version
         _sqlite_src = sqlite_source_id()
@@ -1733,7 +1733,7 @@ def run_doctor(args):
             # through the triggers. `_db_opens_cleanly` now drives a rolled-back
             # write so this otherwise-silent corruption class is surfaced (and
             # repaired in place with --fix).
-            from hermes_state import _db_opens_cleanly, repair_state_db_schema
+            from hermes_state_repair import _db_opens_cleanly, repair_state_db_schema
 
             _write_reason = _db_opens_cleanly(state_db_path)
             if _write_reason is not None:
@@ -1822,7 +1822,7 @@ def run_doctor(args):
         # live DB held by the gateway; any failure degrades to one info
         # line rather than failing doctor.
         try:
-            from hermes_state import collect_state_db_stats, count_db_holders
+            from hermes_state_dbfile import collect_state_db_stats, count_db_holders
 
             _db_stats = collect_state_db_stats(state_db_path)
             _db_holders = count_db_holders(state_db_path)
@@ -1973,20 +1973,13 @@ def run_doctor(args):
     except Exception:
         running_in_container = False
 
-    if running_in_container:
-        # Inside our container the Docker terminal backend is not
-        # configured by default (Docker-in-Docker isn't set up); the
-        # local backend is the intended one. Skip the noisy "docker
-        # not found" warning. If the user has explicitly chosen
-        # TERMINAL_ENV=docker inside the container they likely mounted
-        # /var/run/docker.sock, so fall through to the normal check.
-        if terminal_env != "docker":
-            check_info(
-                "Running inside a container — using local terminal backend "
-                "(docker-in-docker is not configured by default)"
-            )
-            # Skip to next section; Docker isn't relevant here.
-            terminal_env = "local"
+    if running_in_container and terminal_env == "local":
+        # Container installs default to local, but explicitly selected remote
+        # backends still need their own diagnostics.
+        check_info(
+            "Running inside a container — using local terminal backend "
+            "(docker-in-docker is not configured by default)"
+        )
     if terminal_env == "docker":
         if _safe_which("docker"):
             # Check if docker daemon is running

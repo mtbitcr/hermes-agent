@@ -354,9 +354,9 @@ _TOOL_STUBS = {
     ),
     "search_files": (
         "search_files",
-        'pattern: str, target: str = "content", path: str = ".", file_glob: str = None, limit: int = 50, offset: int = 0, output_mode: str = "content", context: int = 0',
+        'pattern: str, target: str = "content", path: str = ".", file_glob: str = None, limit: int = 50, offset: int = 0, output_mode: str = "content", context: int = 0, order: str = None',
         '"""Search file contents (target="content") or find files by name (target="files"). Returns dict with "matches"."""',
-        '{"pattern": pattern, "target": target, "path": path, "file_glob": file_glob, "limit": limit, "offset": offset, "output_mode": output_mode, "context": context}',
+        '{"pattern": pattern, "target": target, "path": path, "file_glob": file_glob, "limit": limit, "offset": offset, "output_mode": output_mode, "context": context, "order": order}',
     ),
     "patch": (
         "patch",
@@ -366,9 +366,9 @@ _TOOL_STUBS = {
     ),
     "terminal": (
         "terminal",
-        "command: str, timeout: int = None, workdir: str = None",
+        "command: str, timeout: int = None, workdir: str = None, notify: bool = None",
         '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code"."""',
-        '{"command": command, "timeout": timeout, "workdir": workdir}',
+        '{"command": command, "timeout": timeout, "workdir": workdir, "notify": notify}',
     ),
 }
 
@@ -2212,3 +2212,17 @@ registry.register(
     emoji="🐍",
     max_result_size_chars=100_000,
 )
+
+
+# --- Fork compat (2026-09 sync): helpers upstream's code kernel imports ------------
+def _format_interrupted_output(stdout_text: str) -> str:
+    """Append an interruption marker without guessing who caused it."""
+    from tools.interrupt import get_interrupt_reason
+    reason = get_interrupt_reason()
+    marker = f"[execution interrupted — {reason}]" if reason else "[execution interrupted]"
+    return f"{stdout_text}\n{marker}" if stdout_text else marker
+
+
+def _error_result(error: str, *, tool_calls_made: int = 0, duration: float = 0) -> str:
+    return json.dumps({"status": "error", "error": error, "tool_calls_made": tool_calls_made,
+                       "duration_seconds": duration}, ensure_ascii=False)

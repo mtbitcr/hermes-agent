@@ -208,7 +208,7 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
             poll_seconds=_INIT_LOCK_POLL_SECONDS,
             required=True,
         ):
-            from hermes_state import apply_wal_with_fallback
+            from hermes_state_wal import apply_wal_with_fallback  # fork sync note: WAL helper moved to hermes_state_wal
 
             # A fresh database needs an exclusive lock while SQLite creates
             # its WAL sidecars. Keep WAL activation and schema setup in one

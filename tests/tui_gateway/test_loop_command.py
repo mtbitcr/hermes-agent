@@ -10,6 +10,7 @@ wakeups via ``_maybe_fire_tui_loop_tick``.
 from __future__ import annotations
 
 import importlib
+import sys
 import threading
 import time
 from pathlib import Path
@@ -25,24 +26,23 @@ def hermes_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    from hermes_cli import loops
+    from hermes_cli import goals
 
-    loops._DB_CACHE.clear()
+    goals._DB_CACHE.clear()
     yield home
-    loops._DB_CACHE.clear()
+    goals._DB_CACHE.clear()
 
 
 @pytest.fixture()
-def server(hermes_home):
-    with patch.dict(
-        "sys.modules",
-        {
-            "hermes_cli.env_loader": MagicMock(),
-            "hermes_cli.banner": MagicMock(),
-        },
-    ):
-        mod = importlib.import_module("tui_gateway.server")
+def server(hermes_home, monkeypatch):
+    # Restore only these stubs, not the entire module table while the TUI's
+    # background imports are still running (importlib teardown race).
+    monkeypatch.setitem(sys.modules, "hermes_cli.env_loader", MagicMock())
+    monkeypatch.setitem(sys.modules, "hermes_cli.banner", MagicMock())
+    mod = importlib.import_module("tui_gateway.server")
+    try:
         yield mod
+    finally:
         mod._sessions.clear()
         mod._pending.clear()
         mod._answers.clear()
@@ -195,7 +195,12 @@ def test_tui_tick_noop_when_not_due(server, session):
     sid, session_key, s = session
     from hermes_cli.loops import LoopManager
 
-    LoopManager(session_key).set("poll", interval_seconds=300)
+    mgr = LoopManager(session_key)
+    mgr.set("poll", interval_seconds=300)
+    # New loops are due immediately; push the wakeup out to model "not due".
+    from hermes_cli.loops import save_loop
+    mgr.state.next_due_at = time.time() + 300
+    save_loop(session_key, mgr.state)
 
     with patch.object(server, "_run_prompt_submit") as submit, \
          patch.object(server, "_emit"):

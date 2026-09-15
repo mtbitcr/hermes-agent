@@ -107,6 +107,20 @@ class TestResolveToolset:
 
 
 
+class TestProfileToolsetMemo:
+    def test_same_alias_resolves_only_current_profile_tools(self, monkeypatch):
+        reg = ToolRegistry()
+        monkeypatch.setattr("tools.registry.registry", reg)
+        for profile in ("alpha", "beta"):
+            name = "mcp__shared__" + profile
+            reg.register(name, "mcp-shared", _make_schema(name), _dummy_handler, scope=profile)
+        reg.register_toolset_alias("shared", "mcp-shared")
+
+        for profile in ("alpha", "beta", "alpha"):
+            monkeypatch.setattr(reg, "current_scope_key", lambda: profile)
+            assert resolve_toolset("shared") == ["mcp__shared__" + profile]
+
+
 class TestResolveMultipleToolsets:
     def test_combines_and_deduplicates(self):
         tools = resolve_multiple_toolsets(["web", "terminal"])
@@ -355,7 +369,7 @@ class TestResolveToolsetMemo:
             f"got {get_toolset_calls['n']} calls"
         )
         assert (
-            "hermes-cli", True, registry_id, generation
+            "hermes-cli", True, registry_id, generation, registry.current_scope_key()
         ) in toolsets_mod._resolve_toolset_memo
 
     def test_generation_bump_invalidates_memo(self, monkeypatch):

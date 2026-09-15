@@ -835,7 +835,7 @@ def _fast_model_from_catalog(provider_id: str) -> str:
     """
     try:
         from hermes_cli.auth import resolve_api_key_provider_credentials
-        from hermes_cli.models import fetch_models_with_pricing
+        from hermes_cli.models_pricing import fetch_models_with_pricing
         from providers import get_provider_profile
 
         # The provider's own credentials, because most ``/v1/models`` endpoints
@@ -1667,6 +1667,11 @@ class _CodexCompletionsAdapter:
         usage = None
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
         deadline = time.monotonic() + float(total_timeout) if total_timeout else None
+        host_deadline = _current_aux_stream_deadline()
+        host_limited = host_deadline is not None and (deadline is None or host_deadline < deadline)
+        if host_limited:
+            deadline = host_deadline
+            total_timeout = max(0.0, deadline - time.monotonic())
         timed_out = threading.Event()
         timeout_timer: Optional[threading.Timer] = None
         # A protected provider call may outlive its owning compression attempt:
@@ -1681,6 +1686,8 @@ class _CodexCompletionsAdapter:
         attempt_stream: List[Any] = []
 
         def _timeout_message() -> str:
+            if host_limited:
+                return "Codex auxiliary Responses stream exceeded the host hard ceiling"
             return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
 
         def _close_client_on_timeout() -> None:
@@ -1697,8 +1704,8 @@ class _CodexCompletionsAdapter:
             # Publish transport timeout only after the attempt-local decision is
             # fixed, so owner polling cannot observe completion in between.
             timed_out.set()
-            if not timeout_won:
-                # The request owner already hard-cancelled this attempt. The
+            if host_limited or not timeout_won:
+                # The owner deadline/cancellation affects only this attempt. The
                 # OpenAI client is process-shared, so closing/evicting it here
                 # would disrupt unrelated sessions. Wake only this attempt's
                 # event stream when responses.create() returned one in time;
@@ -1777,6 +1784,8 @@ class _CodexCompletionsAdapter:
 
             stream_kwargs = dict(resp_kwargs)
             stream_kwargs["stream"] = True
+            if host_limited:
+                stream_kwargs["timeout"] = max(0.001, deadline - time.monotonic())
 
             def _on_each_event(_event: Any) -> None:
                 # Re-check timeout/cancellation per event, matching the
@@ -1795,8 +1804,13 @@ class _CodexCompletionsAdapter:
             # now that it is safely attempt-owned; never touch the shared client.
             if (
                 timed_out.is_set()
-                and callable(protected_cancel_check)
-                and _captured_aux_cancel_requested(protected_cancel_check)
+                and (
+                    host_limited
+                    or (
+                        callable(protected_cancel_check)
+                        and _captured_aux_cancel_requested(protected_cancel_check)
+                    )
+                )
             ):
                 close_fn = getattr(event_stream, "close", None)
                 if callable(close_fn):
@@ -2089,10 +2103,7 @@ class _AnthropicCompletionsAdapter:
             # watching liveness (gateway session hygiene) don't kill a
             # slow-but-generating summary model. No-op when no hook is
             # installed (None keeps the fast get_final_message path).
-            on_stream_event=(
-                (lambda _event: _notify_aux_progress())
-                if _aux_progress_active() else None
-            ),
+            on_stream_event=_anthropic_aux_stream_event_hook(),
         )
         _transport = get_transport("anthropic_messages")
         _nr = _transport.normalize_response(
@@ -3855,7 +3866,8 @@ def _try_azure_foundry(
 
 def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
     try:
-        from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+        from agent.anthropic_adapter import build_anthropic_client
+        from agent.anthropic_credentials import resolve_anthropic_token
     except ImportError:
         return None, None
 
@@ -5145,7 +5157,7 @@ def _refresh_provider_credentials(provider: str) -> bool:
             _evict_cached_clients(normalized)
             return True
         if normalized == "anthropic":
-            from agent.anthropic_adapter import read_claude_code_credentials, _refresh_oauth_token, resolve_anthropic_token
+            from agent.anthropic_credentials import read_claude_code_credentials, _refresh_oauth_token, resolve_anthropic_token
 
             creds = read_claude_code_credentials()
             token = _refresh_oauth_token(creds) if isinstance(creds, dict) and creds.get("refreshToken") else None
@@ -9209,8 +9221,10 @@ def _aux_stream_total_ceiling(effective_timeout: Optional[float]) -> float:
         timeout = float(effective_timeout) if effective_timeout is not None else 0.0
     except (TypeError, ValueError):
         timeout = 0.0
-    return max(_AUX_STREAM_CEILING_FLOOR_SECONDS,
-               _AUX_STREAM_CEILING_MULTIPLIER * timeout)
+    ceiling = max(_AUX_STREAM_CEILING_FLOOR_SECONDS,
+                  _AUX_STREAM_CEILING_MULTIPLIER * timeout)
+    deadline = _current_aux_stream_deadline()
+    return min(ceiling, max(0.0, deadline - time.monotonic())) if deadline is not None else ceiling
 
 
 def _client_streams_internally(client: Any) -> bool:
@@ -9298,7 +9312,7 @@ def _create_with_progress(
     original error is surfaced to the normal recovery chains instead.
     """
     _notify_aux_progress()  # request dispatched counts as progress
-    if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
+    if (not _aux_progress_active() and not force_stream and _current_aux_stream_deadline() is None) or _client_streams_internally(client):
         return client.chat.completions.create(**kwargs)
 
     total_ceiling = _aux_stream_total_ceiling(kwargs.get("timeout"))
@@ -9380,6 +9394,7 @@ class _ChatStreamAccumulator:
     def __init__(self, model: str = "", total_ceiling: Optional[float] = None):
         self._started = time.monotonic()
         self._total_ceiling = total_ceiling
+        self._host_deadline = _current_aux_stream_deadline()
         self.content_parts: List[str] = []
         self.reasoning_parts: List[str] = []
         self.tool_calls_acc: Dict[int, Dict[str, Any]] = {}
@@ -9390,6 +9405,8 @@ class _ChatStreamAccumulator:
 
     def feed(self, chunk: Any) -> None:
         _notify_aux_progress()
+        if self._host_deadline is not None and time.monotonic() >= self._host_deadline:
+            raise TimeoutError("Auxiliary stream timed out at the host compression deadline")
         if (
             self._total_ceiling is not None
             and (time.monotonic() - self._started) >= self._total_ceiling
@@ -10376,7 +10393,7 @@ def _call_llm_impl(
         raise
 
 
-def extract_content_or_reasoning(response) -> str:
+def extract_content_or_reasoning(response, *, max_reasoning_chars: "int | None" = None) -> str:
     """Extract content from an LLM response, falling back to reasoning fields.
 
     Mirrors the main agent loop's behavior when a reasoning model (DeepSeek-R1,
@@ -10427,7 +10444,13 @@ def extract_content_or_reasoning(response) -> str:
                     reasoning_parts.append(summary.strip() if isinstance(summary, str) else str(summary))
 
     if reasoning_parts:
-        return "\n\n".join(reasoning_parts)
+        joined = "\n\n".join(reasoning_parts)
+        # Upstream contract (2026-09 sync): bound a reasoning FALLBACK so unbounded
+        # chain-of-thought can't become the compaction summary. Real content above
+        # is never truncated by this cap.
+        if isinstance(max_reasoning_chars, int) and max_reasoning_chars > 0:
+            return joined[:max_reasoning_chars]
+        return joined
 
     return ""
 
@@ -11092,3 +11115,97 @@ async def _async_call_llm_impl(
                 logger.debug("Auxiliary (async): cache eviction after connection error failed",
                              exc_info=True)
         raise
+
+
+# --- Fork compat appendix (2026-09-12 upstream sync) -------------------------------------
+# The resolver above is the fork-canonical auxiliary client. Upstream's September
+# decomposition added sibling modules (agent_runtime_helpers, conversation_compression,
+# review_idle_queue) that import a handful of small helpers from this module; the fork
+# resolver does not use them, but the siblings are live in the merged tree, so the names
+# are provided here from the pinned upstream snapshot. Stream consumers also honour
+# the published deadline so the host's bounded work cannot leave a provider running.
+import contextlib as _fork_compat_contextlib
+
+_aux_stream_deadline: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "aux_stream_deadline", default=None,
+)
+
+_GEMINI_NATIVE_PROVIDER_NAMES = {"gemini", "google", "google-gemini", "google-ai-studio"}
+
+_MANAGED_LOCAL_STATE_TTL_S = 15.0
+_managed_local_cache: "tuple[float, str]" = (0.0, "")
+
+
+def _coerce_positive_timeout(raw: Any) -> Optional[float]:
+    """Coerce a config ``timeout`` to a positive float, or None (rejects bools, which are ints)."""
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return float(raw)
+    return None
+
+
+@_fork_compat_contextlib.contextmanager
+def aux_stream_deadline(deadline: Optional[float]):
+    """Publish the host's absolute ``time.monotonic()`` deadline to the stream consumer.
+
+    ``None`` is a passthrough; re-entrant-safe. The compression host publishes
+    the ceiling and each provider stream observes it.
+    """
+    previous = _aux_stream_deadline.get()
+    token = _aux_stream_deadline.set(deadline if isinstance(deadline, (int, float)) else previous)
+    try:
+        yield
+    finally:
+        _aux_stream_deadline.reset(token)
+
+
+def _current_aux_stream_deadline() -> Optional[float]:
+    """The published stream deadline, or None."""
+    return _aux_stream_deadline.get()
+
+
+def _anthropic_aux_stream_event_hook():
+    """Keep streamed progress observable without outliving its host or hard cancel."""
+    deadline = _current_aux_stream_deadline()
+    if not _aux_progress_active() and deadline is None and _capture_aux_cancel_check() is None:
+        return None
+
+    def on_event(_event):
+        if _aux_interrupt_cancel_requested():
+            raise AuxiliaryExplicitCancellation()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Anthropic auxiliary stream timed out at the host compression deadline")
+        _notify_aux_progress()
+
+    return on_event
+
+
+def _managed_local_netloc() -> str:
+    """host:port of the managed local llama-server ("" when none), read with a short TTL from
+    the supervisor state file provider resolution also uses (exact match)."""
+    global _managed_local_cache
+    now = time.monotonic()
+    ts, cached = _managed_local_cache
+    if now - ts < _MANAGED_LOCAL_STATE_TTL_S:
+        return cached
+    try:
+        from hermes_cli.local_runtime.supervisor import state_path
+        raw = state_path().read_text(encoding="utf-8")
+        base = str((json.loads(raw) or {}).get("base_url", ""))
+        netloc = urlparse(base).netloc.lower()
+    except Exception:
+        netloc = ""
+    _managed_local_cache = (now, netloc)
+    return netloc
+
+
+def _is_managed_local_endpoint(base_url: Optional[str]) -> bool:
+    """True when *base_url* targets the llama-server this Hermes manages."""
+    if not base_url:
+        return False
+    managed = _managed_local_netloc()
+    if not managed:
+        return False
+    try:
+        return urlparse(str(base_url)).netloc.lower() == managed
+    except Exception:
+        return False

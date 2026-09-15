@@ -49,9 +49,9 @@ def _run_projects_workers(procs, queue, expected_messages):
 
 def _first_open_worker(db_path, barrier, lock, active, peak, queue):
     """Race a fresh Projects DB open and report the widest observed overlap."""
-    import hermes_state
+    import hermes_state_wal
 
-    real_apply = hermes_state.apply_wal_with_fallback
+    real_apply = hermes_state_wal.apply_wal_with_fallback
 
     def observed_apply(connection, **kwargs):
         with lock:
@@ -66,7 +66,7 @@ def _first_open_worker(db_path, barrier, lock, active, peak, queue):
             with lock:
                 active.value -= 1
 
-    hermes_state.apply_wal_with_fallback = observed_apply
+    hermes_state_wal.apply_wal_with_fallback = observed_apply
     connection = None
     try:
         barrier.wait(timeout=60)
@@ -81,6 +81,10 @@ def _first_open_worker(db_path, barrier, lock, active, peak, queue):
             connection.close()
 
 
+@pytest.mark.skipif(
+    __import__("hermes_state_wal").is_sqlite_wal_reset_vulnerable(),
+    reason="linked SQLite has the WAL-reset bug (fork sync note): connects choose journal_mode=DELETE up front, so the WAL attempt this test exercises never happens; production links a fixed SQLite",
+)
 def test_concurrent_first_open_serializes_wal_and_schema_across_processes(tmp_path):
     """First open is single-writer HOST-wide, not just inside one process.
 
