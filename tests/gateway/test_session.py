@@ -201,7 +201,7 @@ class TestBuildSessionContextPrompt:
 
             # Simulate a connected MCP server ("company-slack") that has
             # registered a real tool, via the actual tracking function used
-            # by the live registration path (tools/mcp_tool.py:_track_mcp_tool_server),
+            # by the live registration path (tools/mcp_tool_registration.py:_track_mcp_tool_server),
             # not a mock of the capability check.
             _mcp_registration._track_mcp_tool_server("mcp-company-slack_post_message", "company-slack")
             try:
@@ -210,7 +210,9 @@ class TestBuildSessionContextPrompt:
                     "registered tools must be detected as Slack capability"
                 )
             finally:
-                _mcp_registration._forget_mcp_tool_server("mcp-company-slack_post_message")
+                _mcp_registration._deregister_mcp_tool_scope(
+                    "company-slack", "mcp-company-slack_post_message", None,
+                )
 
 
     def test_shared_slack_prompt_warns_against_guessed_self_mentions(self):
@@ -1657,5 +1659,4 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
 
