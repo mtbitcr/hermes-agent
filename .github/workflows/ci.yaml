@@ -233,7 +233,8 @@ jobs:
   # the live comment poller can list failed jobs in the PR comment.
   # ─────────────────────────────────────────────────────────────────────
   all-checks-pass:
-    name: All required checks pass
+    # Manual validation must not satisfy the PR/push branch-protection context.
+    name: ${{ github.event_name == 'workflow_dispatch' && 'Manual validation checks pass' || 'All required checks pass' }}
     needs:
       - detect
       - tests
