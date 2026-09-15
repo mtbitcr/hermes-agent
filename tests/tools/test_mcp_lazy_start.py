@@ -265,7 +265,9 @@ class TestLazyFirstUseConnect:
         # Stale-cache reconciliation: the cached manifest advertised tool X,
         # but the live server only registers tool Y → X must be deregistered
         # after the first-use connect so the model stops seeing a phantom.
-        from tools.registry import registry
+        from tools.registry import ToolRegistry
+
+        registry = ToolRegistry()
 
         mcp._lazy_server_configs["playwright"] = {"command": "npx", "lazy": True}
         mcp._lazy_server_fingerprints["playwright"] = "stale-fp"
@@ -273,6 +275,8 @@ class TestLazyFirstUseConnect:
             "mcp_playwright_tool_x",
             "mcp_playwright_tool_y",
         ]
+        for name in mcp._lazy_server_tool_names["playwright"]:
+            registry.register(name, "mcp-playwright", {"name": name}, lambda **kwargs: None)
 
         connected = SimpleNamespace(
             session=MagicMock(),
@@ -287,10 +291,11 @@ class TestLazyFirstUseConnect:
 
         with patch.object(_mcp_loop, "_ensure_mcp_loop"), \
              patch.object(_mcp_loop, "_run_on_mcp_loop", side_effect=_fake_run), \
-             patch.object(registry, "deregister") as mock_dereg:
+             patch("tools.registry.registry", registry):
             assert _mcp_discovery._ensure_lazy_server_connected("playwright") is True
 
-        mock_dereg.assert_called_once_with("mcp_playwright_tool_x", scope=None)
+        assert registry.snapshot_registration("mcp_playwright_tool_x") is None
+        assert registry.snapshot_registration("mcp_playwright_tool_y") is not None
 
     def test_lazy_connect_failure_records_cooldown(self):
         mcp._lazy_server_configs["playwright"] = {"command": "npx", "lazy": True}
