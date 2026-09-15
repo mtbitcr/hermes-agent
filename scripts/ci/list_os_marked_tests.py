@@ -50,7 +50,19 @@ def find_marked_files(marker: str, root: Path) -> list[Path]:
             continue
         if pattern.search(text):
             hits.append(path)
-    return hits
+    # Fork (2026-09 sync): drop files whose subject implementation is dormant in this
+    # fork (tests/fork_dormant_skips.txt); explicit CI file lists bypass conftest
+    # collect_ignore, so the exclusion must happen at list time.
+    skips_file = root / "fork_dormant_skips.txt"
+    try:
+        skips = {
+            (root.parent / line.strip()).resolve()
+            for line in skips_file.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+    except OSError:
+        skips = set()
+    return [h for h in hits if h.resolve() not in skips]
 
 
 def main(argv: list[str]) -> int:

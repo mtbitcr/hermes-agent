@@ -5261,7 +5261,7 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
 
     def _produce():
         from tools.tts_streaming import SentenceChunker
-        from tools.tts_tool import _strip_markdown_for_tts
+        from tools.tts_text_normalize import _strip_markdown_for_tts
 
         chunker = SentenceChunker()
 
@@ -7001,13 +7001,13 @@ def get_recommended_default_model(provider: str = ""):
         try:
             from hermes_cli.models import (
                 get_curated_nous_model_ids,
-                get_pricing_for_provider,
                 check_nous_free_tier,
                 partition_nous_models_by_tier,
                 pick_silent_default_model,
                 union_with_portal_free_recommendations,
                 union_with_portal_paid_recommendations,
             )
+            from hermes_cli.models_pricing import get_pricing_for_provider
             from hermes_cli.auth import get_provider_auth_state
 
             model_ids = get_curated_nous_model_ids()
@@ -10274,7 +10274,7 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
     double-counts the token and shadows a real ANTHROPIC_API_KEY.
     """
     try:
-        from agent.anthropic_adapter import (
+        from agent.anthropic_credentials import (
             read_hermes_oauth_credentials,
             _get_hermes_oauth_file,
         )
@@ -10339,7 +10339,7 @@ def _claude_code_only_status() -> Dict[str, Any]:
     when they also have a separate Hermes-managed PKCE login.
     """
     try:
-        from agent.anthropic_adapter import read_claude_code_credentials
+        from agent.anthropic_credentials import read_claude_code_credentials
         creds = read_claude_code_credentials()
     except Exception:
         creds = None
@@ -13501,7 +13501,7 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
                         ]
                     flow.mark_approved()
                     if flow.reconnect_live:
-                        from tools.mcp_tool import reconnect_mcp_server
+                        from tools.mcp_tool_loop import reconnect_mcp_server
 
                         reconnect_mcp_server(flow.server_name)
                 except Exception:
@@ -18924,6 +18924,7 @@ def start_server(
     headless: bool = False,
     ssh_session_token: Optional[str] = None,
     ssh_owner_nonce: Optional[str] = None,
+    start_mcp_discovery_after_bind: bool = False,
 ):
     """Start the web UI server.
 
@@ -19167,6 +19168,18 @@ def start_server(
             else:
                 print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
+
+            if start_mcp_discovery_after_bind:
+                # Keep the native Desktop path: bind and announce readiness before
+                # the MCP SDK import competes with the initial UI handshake.
+                try:
+                    from hermes_cli.mcp_startup import defer_background_mcp_discovery
+
+                    defer_background_mcp_discovery(
+                        logger=_log, thread_name="dashboard-mcp-discovery", delay=1.0,
+                    )
+                except Exception:
+                    _log.debug("Deferred MCP discovery arm failed", exc_info=True)
 
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop
             # forcibly closes its WebSocket mid-write, asyncio logs a full

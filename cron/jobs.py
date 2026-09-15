@@ -3789,3 +3789,24 @@ def rewrite_skill_refs(
             "jobs_updated": len(rewrites),
             "jobs_scanned": len(jobs),
         }
+
+
+# --- Fork compat (2026-09 sync): upstream cron siblings import this ---
+def _is_named_profile_path(path: Path) -> bool:
+    """True if *path* is under ``<hermes_home>/profiles/<name>/`` (default/custom homes are not).
+    Checks the resolved path (symlinked parents) and the raw path (symlinked profile homes)."""
+    with contextlib.suppress(OSError, RuntimeError):
+        if "profiles" in path.resolve().parts:
+            return True
+    return "profiles" in path.parts
+
+
+def _ensure_cron_dir(cron_dir: Path) -> None:
+    """Create a cron directory without resurrecting a deleted profile home: a stale multiplex
+    scheduler may still hold a deleted profile's path, so named profiles use ``parents=False`` and
+    fail closed. Default/custom homes keep ``parents=True`` so first-run creation works."""
+    if _is_named_profile_path(cron_dir):
+        cron_dir.mkdir(exist_ok=True)
+        return
+    cron_dir.mkdir(parents=True, exist_ok=True)
+

@@ -87,7 +87,16 @@ def _background_review_has_read(path: Path) -> bool:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    if resolved in _background_review_read_paths.get():
+        return True
+    # Fork sync note (2026-09-12): upstream's skills_tool records reads through
+    # tools.skill_manager_guards, a separate mark store; a read made there must
+    # authorize the write here too.
+    try:
+        from tools import skill_manager_guards as _guards
+        return _guards._background_review_has_read(path)
+    except Exception:
+        return False
 
 
 def _reset_background_review_read_marks() -> None:
@@ -681,7 +690,10 @@ def _maybe_auto_propose_org_edit(name: str, skill_path: Path) -> Optional[str]:
                 f"saved locally and will not be overwritten by org updates. "
                 f"Run `hermes sync propose {name}` to share it back."
             )
-        result = ssc.propose_skill(name)
+        # Fork sync note (2026-09-12): propose_skill's defining module after
+        # the decomposition; the facade pointer is removed upstream on 2026-09-14.
+        from tools.skills_sync_client_org import propose_skill as _propose_skill
+        result = _propose_skill(name)
         if result.get("proposal_pending"):
             return (
                 f"Auto-proposed to your organisation as proposal "

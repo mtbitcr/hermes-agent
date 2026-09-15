@@ -1876,7 +1876,7 @@ class PluginContext:
 
         # Reuse the exact handler the tool registry uses for MCP tools —
         # same trust gate, circuit breaker, reconnect and rendering paths.
-        from tools.mcp_tool import _make_tool_handler
+        from tools.mcp_tool_handlers import _make_tool_handler
 
         handler = _make_tool_handler(server, tool, timeout)
         raw = handler(dict(arguments or {}))

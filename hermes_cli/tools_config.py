@@ -1160,7 +1160,7 @@ def install_cua_driver(
     if binary and not repair_existing:
         _state = None
         try:
-            from tools.computer_use.cua_backend import cua_driver_update_check
+            from tools.computer_use.cua_backend_driver import cua_driver_update_check
             _state = cua_driver_update_check()
         except Exception:
             _state = None
@@ -5576,7 +5576,7 @@ def _configure_mcp_tools_interactive(config: dict):
     print(color(f"  Connecting to {len(enabled_names)} server(s): {', '.join(enabled_names)}", Colors.DIM))
 
     try:
-        from tools.mcp_tool import probe_mcp_server_tools
+        from tools.mcp_tool_discovery import probe_mcp_server_tools
         server_tools = probe_mcp_server_tools()
     except Exception as exc:
         _print_error(f"Failed to probe MCP servers: {exc}")

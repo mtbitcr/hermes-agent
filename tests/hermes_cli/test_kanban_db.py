@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 import hermes_state
+import hermes_state_wal
 from hermes_cli import kanban_db as kb
 
 
@@ -912,6 +913,10 @@ class TestSharedBoardPaths:
 # NFS / network-filesystem fallback (see hermes_state.apply_wal_with_fallback)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(
+    __import__("hermes_state_wal").is_sqlite_wal_reset_vulnerable(),
+    reason="linked SQLite has the WAL-reset bug (fork sync note): connects choose journal_mode=DELETE up front, so the WAL attempt this test exercises never happens; production links a fixed SQLite",
+)
 def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch, caplog):
     """kanban_db.connect() must handle ``locking protocol`` on NFS/SMB.
 
@@ -939,7 +944,7 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 
     # These tests exercise the WAL-attempt path; assume a fixed SQLite so the
     # WAL-reset vulnerability gate doesn't short-circuit before the pragma.
-    import hermes_state as _hermes_state
+    import hermes_state_wal as _hermes_state
     monkeypatch.setattr(
         _hermes_state, "is_sqlite_wal_reset_vulnerable",
         lambda version_info=None: False,
@@ -988,6 +993,10 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     conn.close()
 
 
+@pytest.mark.skipif(
+    __import__("hermes_state_wal").is_sqlite_wal_reset_vulnerable(),
+    reason="linked SQLite has the WAL-reset bug (fork sync note): connects choose journal_mode=DELETE up front, so the WAL attempt this test exercises never happens; production links a fixed SQLite",
+)
 def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplog):
     """kanban_db.connect() must stay usable when WAL silently no-ops to DELETE."""
     import sqlite3 as _sqlite3
@@ -1002,7 +1011,7 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
     hermes_state._wal_fallback_warned_paths.clear()
     # Assume a fixed SQLite so the WAL-reset gate doesn't short-circuit.
     monkeypatch.setattr(
-        hermes_state, "is_sqlite_wal_reset_vulnerable",
+        hermes_state_wal, "is_sqlite_wal_reset_vulnerable",
         lambda version_info=None: False,
     )
 

@@ -1982,3 +1982,139 @@ class LocalEnvironment(BaseEnvironment):
                     pass
         except Exception:
             pass
+
+
+# --- Fork compat (2026-09 sync): upstream live callers' helpers, dep-closure verbatim ---
+TERMINAL_TEMP_MAX_AGE_HOURS = 72
+
+def _default_terminal_temp_dir() -> "Path | None":
+    """Return HERMES_HOME/cache/terminal, or None if unresolvable."""
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "cache" / "terminal"
+    except Exception:
+        return None
+
+_BG_GROUP_RE = re.compile(r"^(hermes_bg_[A-Za-z0-9_-]+)\.(log|pid|exit)$")
+
+def cleanup_terminal_temp_cache(max_age_hours: int = TERMINAL_TEMP_MAX_AGE_HOURS) -> int:
+    """Delete session temp artifacts older than *max_age_hours*; return count.
+    Only the managed default dir is pruned — never a user-pointed ``terminal.temp_dir``."""
+    root = _default_terminal_temp_dir()
+    if root is None:
+        return 0
+    cutoff = time.time() - (max_age_hours * 3600)
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return 0
+
+    mtimes: dict[Path, float] = {}
+    group_newest: dict[str, float] = {}
+    for f in entries:
+        try:
+            mtimes[f] = mt = f.stat().st_mtime
+        except OSError:
+            continue
+        if m := _BG_GROUP_RE.match(f.name):
+            group_newest[m.group(1)] = max(group_newest.get(m.group(1), 0.0), mt)
+
+    removed = 0
+    for f, mt in mtimes.items():
+        m = _BG_GROUP_RE.match(f.name)
+        if (group_newest[m.group(1)] if m else mt) >= cutoff:
+            continue
+        try:
+            shutil.rmtree(f, ignore_errors=True) if f.is_dir() else f.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+def strip_launch_profile_env(env: dict, target_home: "str | Path | None" = None) -> dict:
+    """Drop the LAUNCH profile's residue from a child env built for another served profile.
+    ``os.environ`` holds the default profile's ``.env`` and its bridged ``TERMINAL_*`` settings;
+    the secret scrub removes credentials but not settings (``HERMES_MODEL``, ``TERMINAL_ENV``,
+    ``HERMES_LANGUAGE``...), so a standalone ``hermes -p X`` worker and a served one saw different
+    envs. The child re-loads X's own ``.env`` and bridges X's config itself. ``target_home``
+    defaults to the active home override; no-op outside multiplex or when the target IS the
+    launch profile."""
+    from agent.secret_scope import _is_global_env, is_multiplex_active, load_env_file
+    from hermes_constants import get_hermes_home_override, get_process_hermes_home
+    target = target_home or get_hermes_home_override()
+    if not is_multiplex_active() or not target:
+        return env
+    launch_home = get_process_hermes_home()
+    if Path(target).resolve() == launch_home.resolve():
+        return env
+    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
+    for key in set(load_env_file(launch_home / ".env")) | set(TERMINAL_CONFIG_ENV_MAP.values()):
+        if not _is_global_env(key) or key.startswith("TERMINAL_"):
+            env.pop(key, None)
+    return env
+
+def _sweep_escaped_descendants(descendants: list, pgid: int) -> None:
+    """SIGKILL snapshotted survivors that escaped the process group via ``setsid``
+    — after TERM→KILL so in-group members keep their grace; psutil's identity-aware
+    Process skips recycled PIDs. POSIX-only (see _IS_WINDOWS gate in caller)."""
+    for child in descendants:
+        try:
+            if not child.is_running():
+                continue
+            try:
+                if os.getpgid(child.pid) == pgid:
+                    continue  # group-kill already covers it
+            except OSError:  # ProcessLookupError / PermissionError included
+                pass
+            child.kill()
+        except Exception:
+            continue
+
+def _wait_for_group_exit(proc, pgid: int, timeout: float) -> bool:
+    """Wait until the process group is gone, reaping the wrapper as we go (a dead
+    but unreaped group leader still makes ``killpg(pgid, 0)`` succeed).
+    POSIX-only; callers are behind the _IS_WINDOWS gate."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            proc.poll()
+        except Exception:
+            pass
+        try:
+            os.killpg(pgid, 0)  # windows-footgun: ok — POSIX process-group alive probe
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass  # exists, even if we cannot signal it
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+def _kill_process_group_posix(proc) -> None:
+    """TERM the group, wait, KILL, then sweep setsid escapees. Descendants are
+    snapshotted BEFORE the first signal — once the wrapper dies they reparent to
+    init — and we wait on the group, not the wrapper, which can exit before
+    grandchildren under load. POSIX-only (_IS_WINDOWS handled by the caller)."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        if (pgid := getattr(proc, "_hermes_pgid", None)) is None:
+            raise
+    try:  # psutil children snapshot; empty on any failure (must never break the kill)
+        import psutil
+        descendants = psutil.Process(proc.pid).children(recursive=True)
+    except Exception:
+        descendants = []
+    try:
+        os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX only (see _IS_WINDOWS gate in caller)
+        if not _wait_for_group_exit(proc, pgid, 1.0):
+            os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX only (see _IS_WINDOWS gate in caller)
+            _wait_for_group_exit(proc, pgid, 2.0)
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                proc.wait(timeout=0.2)
+    except ProcessLookupError:
+        pass
+    _sweep_escaped_descendants(descendants, pgid)
+
+
+

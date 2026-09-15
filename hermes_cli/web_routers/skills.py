@@ -123,7 +123,7 @@ async def list_skills_hub_sources(profile: Optional[str] = None):
     """
 
     def _run():
-        from tools.skills_hub import create_source_router
+        from tools.skills_hub_search import create_source_router
 
         with _config_profile_scope(profile):
             sources = create_source_router()
@@ -200,7 +200,7 @@ async def search_skills_hub(
         return {"results": [], "source_counts": {}, "timed_out": [], "installed": {}}
 
     def _run():
-        from tools.skills_hub import create_source_router, parallel_search_sources
+        from tools.skills_hub_search import create_source_router, parallel_search_sources
 
         with _config_profile_scope(profile):
             sources = create_source_router()
@@ -253,7 +253,7 @@ async def preview_skill_hub(identifier: str = "", profile: Optional[str] = None)
 
     def _run():
         from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
-        from tools.skills_hub import create_source_router
+        from tools.skills_hub_search import create_source_router
 
         with _config_profile_scope(profile):
             sources = create_source_router()
@@ -321,7 +321,8 @@ async def scan_skill_hub(identifier: str = "", profile: Optional[str] = None):
         import shutil as _shutil
 
         from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
-        from tools.skills_hub import create_source_router, quarantine_bundle
+        from tools.skills_hub_search import create_source_router
+        from tools.skills_hub_install import quarantine_bundle
         from tools.skills_guard import scan_skill, should_allow_install
 
         with _config_profile_scope(profile):

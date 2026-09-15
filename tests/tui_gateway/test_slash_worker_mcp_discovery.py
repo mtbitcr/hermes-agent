@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import os
 from pathlib import Path
@@ -88,9 +89,13 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         cwd=tmp_path,
     )
     output: queue.Queue[str] = queue.Queue()
+    stderr_tail: deque[str] = deque(maxlen=40)
     try:
         assert proc.stdin is not None
         assert proc.stdout is not None
+        assert proc.stderr is not None
+        # Drain both pipes: discovery diagnostics must not block the JSON reply.
+        threading.Thread(target=stderr_tail.extend, args=(proc.stderr,), daemon=True).start()
         stdout = proc.stdout
         threading.Thread(
             target=lambda: output.put(stdout.readline()),
@@ -99,12 +104,19 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
         proc.stdin.flush()
         try:
-            line = output.get(timeout=10)
+            # Startup itself permits 15s of discovery before the CLI snapshot.
+            line = output.get(timeout=30)
         except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
+            pytest.fail(
+                "slash worker produced no /tools response within 30 seconds\n"
+                + "".join(stderr_tail)[-8000:]
+            )
         response = json.loads(line)
         assert response["ok"] is True
-        assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
+        diagnostics = ["".join(stderr_tail)[-4000:]]
+        for log in (profile_home / "logs").glob("*.log"):
+            diagnostics.append(f"{log.name}:\n{log.read_text(errors='replace')[-4000:]}")
+        assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"], "\n".join(diagnostics)[-12000:]
     finally:
         proc.terminate()
         try:

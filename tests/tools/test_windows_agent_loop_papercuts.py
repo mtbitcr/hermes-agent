@@ -140,7 +140,9 @@ class TestSkillHashSymmetry:
 
     def test_disk_and_bundle_hashes_match(self, tmp_path):
         from tools.skills_guard import content_hash
-        from tools.skills_hub import SkillBundle, bundle_content_hash
+        # Fork sync note (2026-09-12): imports follow the decomposition's defining modules.
+        from tools.skills_hub_install import bundle_content_hash
+        from tools.skills_hub_models import SkillBundle
 
         skill = self._make_skill(tmp_path)
         disk = content_hash(skill)
@@ -157,7 +159,9 @@ class TestSkillHashSymmetry:
         assert bundle_content_hash(bundle) == disk
 
     def test_backslash_and_posix_keys_hash_identically(self):
-        from tools.skills_hub import SkillBundle, bundle_content_hash
+        # Fork sync note (2026-09-12): imports follow the decomposition's defining modules.
+        from tools.skills_hub_install import bundle_content_hash
+        from tools.skills_hub_models import SkillBundle
 
         posix = SkillBundle(
             name="s",
