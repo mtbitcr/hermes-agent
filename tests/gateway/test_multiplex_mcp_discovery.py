@@ -45,10 +45,13 @@ async def test_gateway_boot_discovers_mcp_under_every_profile_home(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lazy", [False, True])
 async def test_reload_mcp_only_touches_requesting_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lazy: bool
 ) -> None:
+    from agent.i18n import t
     from gateway.run import GatewayRunner
+    from gateway.session import _session_key_namespace
     from tools import mcp_tool
     from tools import mcp_tool_discovery as _mcp_discovery
     from tools import mcp_tool_lifecycle as _mcp_lifecycle
@@ -60,17 +63,34 @@ async def test_reload_mcp_only_touches_requesting_profile(
     runner = GatewayRunner.__new__(GatewayRunner)
     runner.config = GatewayConfig(multiplex_profiles=True)
     runner._resolve_profile_home_for_source = MagicMock(return_value=worker_home)
-    runner._agent_cache = {}
-    runner._agent_cache_lock = None
+    agent = SimpleNamespace(tools=[], valid_tool_names=set(), enabled_toolsets=["mcp-worker-srv"],
+                            disabled_toolsets=None)
+    sibling = SimpleNamespace(tools=[], valid_tool_names=set())
+    runner._agent_cache = {
+        _session_key_namespace("worker") + ":session": (agent, "sig"),
+        _session_key_namespace("default") + ":session": (sibling, "sig"),
+    }
+    runner._agent_cache_lock = threading.Lock()
     runner._async_session_store = SimpleNamespace(
         get_or_create_session=MagicMock(side_effect=RuntimeError("skip transcript")),
     )
 
-    monkeypatch.setattr(mcp_tool, "_servers", {"default-srv": object(), "worker-srv": object()})
+    monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
+    default_key = (hermes_home_key(tmp_path), "default-srv")
+    worker_key = (worker_scope, "worker-srv")
+    live = {default_key: object()}
+    if not lazy:
+        live[worker_key] = object()
+    monkeypatch.setattr(mcp_tool, "_servers", live)
+    monkeypatch.setattr(mcp_tool, "_lazy_server_configs", {worker_key: {"lazy": True}} if lazy else {})
     monkeypatch.setattr(
         mcp_tool, "_server_scope_keys",
-        {"default-srv": hermes_home_key(tmp_path), "worker-srv": worker_scope},
+        {default_key: hermes_home_key(tmp_path), worker_key: worker_scope},
     )
+    tool_name = "mcp__worker_srv__tool"
+    monkeypatch.setattr(mcp_tool, "_mcp_tool_server_names", {(worker_scope, tool_name): "worker-srv"})
+    fresh_defs = [{"type": "function", "function": {"name": tool_name}}]
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kw: fresh_defs)
     seen: list[tuple] = []
 
     def fake_shutdown(*, scope=None) -> None:
@@ -78,7 +98,7 @@ async def test_reload_mcp_only_touches_requesting_profile(
 
     def fake_discover() -> list[str]:
         seen.append(("discover", get_hermes_home()))
-        return []
+        return [tool_name, "mcp__default_srv__foreign"]
 
     monkeypatch.setattr(_mcp_lifecycle, "shutdown_mcp_servers", fake_shutdown)
     monkeypatch.setattr(_mcp_discovery, "discover_mcp_tools", fake_discover)
@@ -100,6 +120,12 @@ async def test_reload_mcp_only_touches_requesting_profile(
         ("discover", worker_home),
     ]
     assert "default-srv" not in result
+    assert t("gateway.reload_mcp.tools_available", tools=1, servers=1) in result
+    if not lazy:
+        assert "worker-srv" in result
+    assert agent.tools == fresh_defs
+    assert agent.valid_tool_names == {tool_name}
+    assert sibling.tools == []
 
 
 @pytest.mark.asyncio

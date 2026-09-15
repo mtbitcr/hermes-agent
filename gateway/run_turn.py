@@ -2289,17 +2289,18 @@ class GatewayTurnMixin:
         try:
             from tools.mcp_tool_lifecycle import shutdown_mcp_servers
             from tools.mcp_tool_discovery import discover_mcp_tools
-            from tools.mcp_tool import _servers, _lock, _server_visible_in_scope
+            from tools.mcp_tool import _servers, _lazy_server_configs, _lock, _server_visible_in_scope
+            from tools.mcp_tool_scope import _key_name, _server_key
             from tools.mcp_tool_agent import reprobe_tool_availability
             from tools.registry import registry
 
             reload_scope = registry.current_scope_key() if multiplex else None
 
-            def _scoped_server_names() -> set:
+            def _scoped_server_names(*, include_lazy: bool = False) -> set:
                 with _lock:
                     return {
-                        name for name in _servers
-                        if _server_visible_in_scope(name, reload_scope)
+                        _key_name(key) for key in set(_servers) | (set(_lazy_server_configs) if include_lazy else set())
+                        if _server_visible_in_scope(key, reload_scope)
                     }
 
             old_servers = _scoped_server_names()
@@ -2310,10 +2311,12 @@ class GatewayTurnMixin:
             new_tools = await self._run_in_executor_with_context(discover_mcp_tools)
 
             connected_servers = _scoped_server_names()
+            available_servers = _scoped_server_names(include_lazy=True)
             if reload_scope is not None:
                 from tools.mcp_tool import _mcp_tool_server_names
                 with _lock:
-                    new_tools = [n for n in new_tools if _mcp_tool_server_names.get(n) in connected_servers]
+                    new_tools = [n for n in new_tools
+                                 if _mcp_tool_server_names.get(_server_key(n, reload_scope)) in available_servers]
             # (label, i18n key, names); i18n lines list reconnected first, the injected note added first.
             changes = (
                 ("Reconnected", "gateway.reload_mcp.reconnected", connected_servers & old_servers),
@@ -2323,10 +2326,10 @@ class GatewayTurnMixin:
             lines = [t("gateway.reload_mcp.header")] + [
                 t(key, names=", ".join(sorted(names))) for _label, key, names in changes if names
             ]
-            if not connected_servers:
+            if not available_servers:
                 lines.append(t("gateway.reload_mcp.none_connected"))
             else:
-                lines.append(t("gateway.reload_mcp.tools_available", tools=len(new_tools), servers=len(connected_servers)))
+                lines.append(t("gateway.reload_mcp.tools_available", tools=len(new_tools), servers=len(available_servers)))
 
             self._mcp_reload_refresh_cached_agents(multiplex, event.source.profile)
 

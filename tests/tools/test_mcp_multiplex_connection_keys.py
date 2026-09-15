@@ -440,6 +440,107 @@ def test_registration_does_not_publish_an_alias_after_concurrent_teardown(two_pr
     assert registry.get_toolset_alias_target("x") is None
 
 
+def _cache_lazy(config):
+    from tools import mcp_tool_discovery as disc
+    from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
+
+    write_cache_entry("x", config_fingerprint(config), tools=[{
+        "name": "t", "description": "Write probe", "inputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": False},
+    }])
+    return disc.register_mcp_servers({"x": config})
+
+
+@pytest.mark.parametrize("initial_trust", ["full", "untrusted"])
+@pytest.mark.parametrize("replacement", ["unchanged", "removed", "disabled", "new-route"])
+@pytest.mark.parametrize("all_scopes", [False, True])
+def test_lazy_reload_revokes_old_state_and_applies_current_policy(
+    two_profiles, monkeypatch, initial_trust, replacement, all_scopes,
+):
+    import tools.mcp_tool as core
+    from tools import mcp_tool_discovery as disc, mcp_tool_lifecycle as lifecycle
+    from tools.registry import registry
+
+    scope = two_profiles("a")
+    key, name = (scope, "x"), "mcp__x__t"
+    cfg = {"url": "https://mcp.example/x", "lazy": True, "trust": initial_trust,
+           "supports_parallel_tool_calls": True}
+    assert _cache_lazy(cfg) == [name]
+    asked = []
+    monkeypatch.setattr("tools.approval.request_elicitation_consent",
+                        lambda *a, **kw: asked.append(a) or "deny")
+
+    lifecycle.shutdown_mcp_servers(scope=None if all_scopes else scope)
+    assert registry.snapshot_registration(name, scope=scope) is None
+    assert (scope, name) not in core._mcp_tool_server_names
+    for ledger in (core._lazy_server_configs, core._lazy_server_fingerprints,
+                   core._lazy_server_tool_names, core._server_trust_levels,
+                   core._tool_read_only_hints, core._server_scope_keys,
+                   core._server_tool_scopes, core._parallel_safe_servers):
+        assert key not in ledger
+
+    updated = dict(cfg, trust="untrusted")
+    if replacement in ("removed", "disabled"):
+        servers = {} if replacement == "removed" else {"x": dict(updated, enabled=False)}
+        assert disc.register_mcp_servers(servers) == []
+        assert registry.snapshot_registration(name, scope=scope) is None
+        assert key not in core._lazy_server_configs
+        return
+    if replacement == "new-route":
+        updated["url"] = "https://mcp.example/replacement"
+    assert _cache_lazy(updated) == [name]
+    for _ in range(2):
+        assert disc.register_mcp_servers({"x": updated}) == [name]
+        assert "NOT run" in registry.get_entry(name).handler({})
+    assert len(asked) == 2
+    assert core._lazy_server_configs[key] == updated
+    assert core._server_trust_levels[key] == "untrusted"
+    assert core._mcp_tool_server_names[(scope, name)] == "x"
+
+
+@pytest.mark.parametrize("order", [("a", "b"), ("b", "a")])
+def test_rediscovery_does_not_adopt_over_an_own_lazy_connection(two_profiles, order):
+    import tools.mcp_tool as core
+    from tools import mcp_tool_discovery as disc, mcp_tool_registration as reg
+    from tools.registry import registry
+
+    cfg = {"url": "https://mcp.example/x", "lazy": True, "trust": "untrusted"}
+    scopes = {}
+    for profile in order:
+        scopes[profile] = two_profiles(profile)
+        if profile == "a":
+            _register("x", cfg)
+        else:
+            reg._register_from_cache_sync("x", cfg, {"tools": [{"name": "t"}]})
+    two_profiles("b")
+    entry = registry.get_entry("mcp__x__t")
+    for _ in range(2):
+        assert disc.register_mcp_servers({"x": cfg}) == ["mcp__x__t"]
+        assert registry.get_entry("mcp__x__t") is entry
+        assert core._server_tool_scopes[(scopes["b"], "x")] == {scopes["b"]}
+        assert scopes["b"] not in core._server_tool_scopes[(scopes["a"], "x")]
+        assert core._server_trust_levels[(scopes["b"], "x")] == "untrusted"
+    assert disc.register_mcp_servers({}) == []
+    assert (scopes["b"], "x") not in core._lazy_server_configs
+    assert registry.get_entry("mcp__x__t") is None
+    assert registry.get_toolset_alias_target("x") == "mcp-x"  # A still owns its live registration.
+
+
+def test_lazy_shutdown_removes_entries_left_without_provenance(two_profiles):
+    import tools.mcp_tool as core
+    from tools import mcp_tool_lifecycle as lifecycle
+    from tools.registry import registry
+
+    scope = two_profiles("a")
+    _cache_lazy({"url": "https://mcp.example/x", "lazy": True, "trust": "untrusted"})
+    core._mcp_tool_server_names.clear()
+    core._server_trust_levels.clear()
+    lifecycle.shutdown_mcp_servers(scope=scope)
+    assert registry.get_entry("mcp__x__t") is None
+    assert (scope, "x") not in core._lazy_server_configs
+    assert registry.get_toolset_alias_target("x") is None
+
+
 @pytest.mark.live_system_guard_bypass
 def test_real_stdio_calls_use_each_profiles_external_secret(tmp_path, monkeypatch):
     """Identical config must not reuse a process launched with a sibling's scoped secret."""
@@ -498,6 +599,18 @@ asyncio.run(main())
                 assert tool_name in registered, (homes[name] / "logs/mcp-stderr.log").read_text()[-3000:]
                 result = registry.get_entry(tool_name).handler({})
                 assert f"scope-{name}-private-marker" in result, result
+        with profile("b"):
+            lazy_cfg = dict(cfg, lazy=True, trust="untrusted")
+            lifecycle.shutdown_mcp_servers(scope=hermes_home_key(homes["b"]))
+            assert tool_name in disc.register_mcp_servers({"scopeprobe": lazy_cfg})
+            asked = []
+            monkeypatch.setattr("tools.approval.request_elicitation_consent",
+                                lambda *a, **kw: asked.append(a) or "deny")
+            assert "NOT run" in registry.get_entry(tool_name).handler({})
+            assert len(asked) == 1
+            monkeypatch.setattr("tools.approval.request_elicitation_consent", lambda *a, **kw: "accept")
+            result = registry.get_entry(tool_name).handler({})
+            assert "scope-b-private-marker" in result, result
         with profile("b"):
             lifecycle.shutdown_mcp_servers(scope=hermes_home_key(homes["a"]))
             result = registry.get_entry(tool_name).handler({})

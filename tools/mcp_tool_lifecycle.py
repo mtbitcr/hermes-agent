@@ -136,10 +136,11 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None):
     anything else is still connected."""
     with _core._lock:
         selected = [key for key in _core._servers if scope is None or _core._server_scope_keys.get(key) == scope]
+        lazy = [key for key in _core._lazy_server_configs if scope is None or _key_scope(key) == scope]
         adopted = [key for key, scopes in _core._server_tool_scopes.items()
                    if scope is not None and scope in scopes and _key_scope(key) != scope]
         servers_snapshot = [_core._servers[key] for key in selected]
-        selected_status = (
+        selected_status = set(lazy) | (
             set(_core._servers) | set(_core._server_scope_keys)
             | set(_core._server_tool_scopes)
             | set(_core._server_connecting) | set(_core._server_connect_errors)
@@ -159,10 +160,14 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None):
 
     # An adopter has no owned connection to shut down, but its overlay and call policy
     # must still disappear. The owning profile's transport remains live.
-    if adopted:
+    if adopted or lazy:
         from tools.mcp_tool_registration import _remove_server_scope
         for key in adopted:
             _remove_server_scope(key, scope)
+        # Lazy registrations have no server Task to deregister them. Revoke them
+        # before the final provenance sweep, while their exact owners are known.
+        for key in lazy:
+            _remove_server_scope(key, _key_scope(key))
 
     def clear_selected_status():
         _core._server_connecting.difference_update(selected_status)

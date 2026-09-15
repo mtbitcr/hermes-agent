@@ -122,12 +122,14 @@ def _reconcile_server_toolset_alias(key) -> None:
     registry.reconcile_toolset_alias(server_name, f"mcp-{server_name}")
 
 
-def _remove_server_scope(key, scope: str) -> None:
-    """Remove one profile's MCP overlay for a shared live connection."""
+def _remove_server_scope(key, scope: Optional[str]) -> None:
+    """Revoke one profile's registrations and policy, including an owned lazy route."""
     server_name = _key_name(key)
     with _core._lock:
-        tool_names = [_key_name(tool_key) for tool_key, owner in _core._mcp_tool_server_names.items()
-                      if _key_scope(tool_key) == scope and owner == server_name]
+        tool_names = {_key_name(tool_key) for tool_key, owner in _core._mcp_tool_server_names.items()
+                      if _key_scope(tool_key) == scope and owner == server_name}
+        if _key_scope(key) == scope:
+            tool_names.update(_core._lazy_server_tool_names.get(key, ()))
     for tool_name in tool_names:
         _deregister_mcp_tool_scope(server_name, tool_name, scope)
     with _core._lock:
@@ -139,6 +141,11 @@ def _remove_server_scope(key, scope: str) -> None:
             _core._server_tool_scopes.pop(key, None)
         _core._server_trust_levels.pop(_server_key(server_name, scope, current=False), None)
         _core._parallel_safe_servers.discard(_server_key(server_name, scope, current=False))
+        if _key_scope(key) == scope and key in _core._lazy_server_configs:
+            _core._lazy_server_configs.pop(key, None)
+            _core._lazy_server_fingerprints.pop(key, None)
+            _core._lazy_server_tool_names.pop(key, None)
+            _core._tool_read_only_hints.pop(key, None)
     _reconcile_server_toolset_alias(key)
 
 
@@ -468,6 +475,11 @@ def _register_connected_into_current_scope(servers: dict) -> int:
             server = _core._servers.get(key)
             config = servers.get(_key_name(key))
             cross_profile = _key_scope(key) != scope
+            if not cross_profile and key in _core._lazy_server_configs:
+                if config is not None and _server_enabled(config) and _core._lazy_server_configs[key] == config:
+                    continue
+                stale.append(key)
+                continue
             if (config is None or not _server_enabled(config) or server is None
                     or getattr(server, "session", None) is None
                     or not _same_server_route(server, config, cross_profile=cross_profile)):
@@ -480,8 +492,9 @@ def _register_connected_into_current_scope(servers: dict) -> int:
         if not _server_enabled(config):
             continue
         with _core._lock:
-            if _server_key(name, scope, current=False) in _core._servers:
-                continue  # this profile has its own connection for the name
+            own_key = _server_key(name, scope, current=False)
+            if own_key in _core._servers or own_key in _core._lazy_server_configs:
+                continue  # an owned lazy route must not adopt a sibling's transport
             # Any other profile's live connection with the same route AND credentials is shareable.
             shared = [(key, live) for key, live in _core._servers.items()
                       if _key_name(key) == name and getattr(live, "session", None) is not None
