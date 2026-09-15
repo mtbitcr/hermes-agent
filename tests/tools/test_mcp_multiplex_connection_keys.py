@@ -323,6 +323,74 @@ def test_adopter_shutdown_clears_only_its_policy_and_provenance(two_profiles, mo
     assert disc.is_mcp_tool_parallel_safe("mcp__x__t") is False
 
 
+@pytest.mark.parametrize("partial_collision", [False, True])
+def test_owner_teardown_preserves_a_siblings_colliding_private_tool(two_profiles, partial_collision):
+    import tools.mcp_tool as core
+    from tools import mcp_tool_discovery as disc, mcp_tool_registration as reg
+    from tools.mcp_tool_scope import _server_key
+    from tools.registry import registry
+
+    shared = {"url": "https://mcp.example/shared"}
+    private = {"url": "https://mcp.example/private"}
+    scope_a = two_profiles("a")
+    owner = _server("foo-bar", shared)
+    if partial_collision:
+        owner._tools.append(_tool("other"))
+    disc._adopt_server("foo-bar", owner)
+    owner._registered_tool_names = reg._register_server_tools("foo-bar", owner, shared)
+
+    scope_b = two_profiles("b")
+    _register("foo_bar", private)
+    tool_name = "mcp__foo_bar__t"
+    private_entry = registry.snapshot_registration(tool_name, scope=scope_b)
+    assert private_entry.toolset == "mcp-foo_bar"
+    reg.register_connected_into_current_scope({"foo-bar": shared, "foo_bar": private})
+    assert registry.snapshot_registration(tool_name, scope=scope_b) is private_entry
+    if partial_collision:
+        assert registry.snapshot_registration("mcp__foo_bar__other", scope=scope_b) is not None
+
+    two_profiles("a")
+    core.MCPServerTask._deregister_tools(owner)
+    assert registry.snapshot_registration(tool_name, scope=scope_a) is None
+    assert registry.snapshot_registration(tool_name, scope=scope_b) is private_entry
+    assert registry.snapshot_registration("mcp__foo_bar__other", scope=scope_b) is None
+    assert registry.get_toolset_alias_target("foo-bar") is None
+    assert registry.get_toolset_alias_target("foo_bar") == "mcp-foo_bar"
+
+    two_profiles("b")
+    reg.register_connected_into_current_scope({"foo-bar": shared, "foo_bar": private})
+    assert registry.get_entry(tool_name) is private_entry
+    assert core._mcp_tool_server_names[_server_key(tool_name)] == "foo_bar"
+    if partial_collision:
+        assert registry.get_entry("mcp__foo_bar__other").toolset == "mcp-foo-bar"
+
+
+def test_teardown_cannot_remove_a_registration_replaced_before_atomic_deletion(two_profiles, monkeypatch):
+    import tools.mcp_tool as core
+    from tools import mcp_tool_registration as reg
+    from tools.registry import registry
+
+    scope = two_profiles("a")
+    owner = _register("shared", {"url": "https://mcp.example/shared"})
+    name = "mcp__shared__t"
+    original_deregister = registry.deregister
+    def replacement_handler(**kwargs):
+        return "replacement"
+
+    def replace_before_atomic_removal(tool_name, **kwargs):
+        registry.register(name, "mcp-private", {"name": name}, replacement_handler,
+                          scope=scope, override=True)
+        original_deregister(tool_name, **kwargs)
+
+    # Deterministically exercise a replacement after MCP selects the tool but
+    # before the registry deletion. The registry must check the current owner.
+    monkeypatch.setattr(registry, "deregister", replace_before_atomic_removal)
+    core.MCPServerTask._deregister_tools(owner)
+    assert registry.snapshot_registration(name, scope=scope).handler is replacement_handler
+    monkeypatch.setattr(registry, "deregister", original_deregister)
+    reg._track_mcp_tool_server(name, "private", scope)
+
+
 @pytest.mark.live_system_guard_bypass
 def test_real_stdio_calls_use_each_profiles_external_secret(tmp_path, monkeypatch):
     """Identical config must not reuse a process launched with a sibling's scoped secret."""

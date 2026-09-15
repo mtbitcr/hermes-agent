@@ -907,11 +907,14 @@ class ToolRegistry:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
 
-    def deregister(self, name: str, *, scope: Optional[str] = None) -> None:
+    def deregister(self, name: str, *, scope: Optional[str] = None,
+                   expected_toolset: Optional[str] = None) -> None:
         """Remove a tool from the registry.
 
         Explicit scope selects a profile overlay for native MCP cleanup; plugin
         callers remain confined to their own scope.
+        An expected toolset makes ownership checking and removal atomic, so
+        delayed cleanup cannot delete a replacement registered by another owner.
 
         Also cleans up the toolset check if no other tools remain in the
         same toolset.  Used by MCP dynamic tool discovery to nuke-and-repave
@@ -983,6 +986,8 @@ class ToolRegistry:
                         f"{name!r} (toolset {entry.toolset!r}) without operator "
                         f"opt-in (allow_tool_override)."
                     )
+            if expected_toolset is not None and entry.toolset != expected_toolset:
+                return
             del target[name]
             if scope is not None and not target:
                 self._scoped_tools.pop(scope, None)
