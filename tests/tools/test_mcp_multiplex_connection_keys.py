@@ -48,6 +48,7 @@ def two_profiles(tmp_path, monkeypatch):
     ledgers = ("_servers", "_server_scope_keys", "_server_tool_scopes", "_server_connecting",
                "_server_connect_errors", "_server_connect_retry_after", "_server_connect_failures",
                "_server_error_counts", "_server_breaker_opened_at", "_lazy_server_configs",
+               "_lazy_server_fingerprints", "_lazy_server_tool_names",
                "_mcp_tool_server_names", "_orphaned_adopters", "_parallel_safe_servers",
                "_server_trust_levels", "_tool_read_only_hints")
     saved = {n: type(getattr(core, n))(getattr(core, n)) for n in ledgers}
@@ -389,6 +390,54 @@ def test_teardown_cannot_remove_a_registration_replaced_before_atomic_deletion(t
     assert registry.snapshot_registration(name, scope=scope).handler is replacement_handler
     monkeypatch.setattr(registry, "deregister", original_deregister)
     reg._track_mcp_tool_server(name, "private", scope)
+    assert registry.get_toolset_alias_target("shared") is None
+
+
+def test_owner_teardown_preserves_a_siblings_lazy_toolset_alias(two_profiles):
+    import tools.mcp_tool as core
+    import toolsets
+    from tools import mcp_tool_registration as reg
+    from tools.delegate_tool_toolsets import _is_mcp_toolset_name
+    from tools.registry import registry
+
+    two_profiles("a")
+    owner = _register("x", {"url": "https://mcp.example/live"})
+    scope_b = two_profiles("b")
+    names = reg._register_from_cache_sync(
+        "x", {"url": "https://mcp.example/lazy", "lazy": True},
+        {"tools": [{"name": "t", "description": "d",
+                    "inputSchema": {"type": "object", "properties": {}}}]})
+    assert names == ["mcp__x__t"]
+    lazy_entry = registry.snapshot_registration(names[0], scope=scope_b)
+    assert (scope_b, "x") not in core._servers
+
+    two_profiles("a")
+    core.MCPServerTask._deregister_tools(owner)
+
+    two_profiles("b")
+    assert registry.snapshot_registration(names[0], scope=scope_b) is lazy_entry
+    assert core._lazy_server_tool_names[(scope_b, "x")] == names
+    assert registry.get_toolset_alias_target("x") == "mcp-x"
+    assert toolsets.validate_toolset("x")
+    assert toolsets.get_toolset("x")["tools"] == names
+    assert _is_mcp_toolset_name("x")
+
+
+def test_registration_does_not_publish_an_alias_after_concurrent_teardown(two_profiles, monkeypatch):
+    from tools import mcp_tool_registration as reg
+    from tools.registry import registry
+
+    scope = two_profiles("a")
+    track = reg._track_mcp_tool_server
+
+    def teardown_before_alias(tool_name, server_name, scope):
+        track(tool_name, server_name, scope)
+        registry.deregister(tool_name, scope=scope)
+
+    monkeypatch.setattr(reg, "_track_mcp_tool_server", teardown_before_alias)
+    _register("x", {"url": "https://mcp.example/x"})
+    assert registry.snapshot_registration("mcp__x__t", scope=scope) is None
+    assert registry.get_toolset_alias_target("x") is None
 
 
 @pytest.mark.live_system_guard_bypass

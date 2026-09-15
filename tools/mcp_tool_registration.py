@@ -111,26 +111,15 @@ def _deregister_mcp_tool_all_scopes(server, tool_name: str) -> None:
             scopes = {_core._server_registry_scope(key)}
     for scope in scopes:
         _deregister_mcp_tool_scope(_key_name(key), tool_name, scope)
-    _restore_server_toolset_alias(key)
+    _reconcile_server_toolset_alias(key)
 
 
-def _restore_server_toolset_alias(key) -> None:
-    """Keep the process-global alias while any profile still owns tools of a server with this
-    name — including another profile's same-named connection (the alias is per NAME; the
-    registry deregister dropped it after checking only one scope)."""
+def _reconcile_server_toolset_alias(key) -> None:
+    """Use actual registry ownership, including lazy and global registrations."""
     from tools.registry import registry
 
     server_name = _key_name(key)
-    with _core._lock:
-        owned = [(server, set(_core._server_tool_scopes.get(k, ())))
-                 for k, server in _core._servers.items() if _key_name(k) == server_name]
-    if any(
-        (entry := registry.snapshot_registration(tool_name, scope=scope)) is not None
-        and entry.toolset == f"mcp-{server_name}"
-        for server, scopes in owned for scope in scopes
-        for tool_name in getattr(server, "_registered_tool_names", ())
-    ):
-        registry.register_toolset_alias(server_name, f"mcp-{server_name}")
+    registry.reconcile_toolset_alias(server_name, f"mcp-{server_name}")
 
 
 def _remove_server_scope(key, scope: str) -> None:
@@ -150,7 +139,7 @@ def _remove_server_scope(key, scope: str) -> None:
             _core._server_tool_scopes.pop(key, None)
         _core._server_trust_levels.pop(_server_key(server_name, scope, current=False), None)
         _core._parallel_safe_servers.discard(_server_key(server_name, scope, current=False))
-    _restore_server_toolset_alias(key)
+    _reconcile_server_toolset_alias(key)
 
 
 def _select_utility_schemas(server_name: str, server: "MCPServerTask", config: dict) -> List[dict]:
@@ -363,7 +352,7 @@ def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: C
             logger.error("MCP server '%s': registration of %s as '%s' was rejected by the registry; "
                          "skipping provenance/count updates", name, c.origin, c.registry_name)
     if registered:
-        registry.register_toolset_alias(name, toolset_name)
+        registry.reconcile_toolset_alias(name, toolset_name)
     return registered
 
 

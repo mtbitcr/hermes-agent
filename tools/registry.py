@@ -612,6 +612,23 @@ class ToolRegistry:
         with self._lock:
             return dict(self._toolset_aliases)
 
+    def _toolset_has_registrations(self, toolset: str) -> bool:
+        """Check global and scoped owners while holding the registry lock."""
+        return any(entry.toolset == toolset
+                   for entries in (self._tools, *self._scoped_tools.values())
+                   for entry in entries.values())
+
+    def reconcile_toolset_alias(self, alias: str, toolset: str) -> None:
+        """Keep an alias exactly while its toolset has a registered owner."""
+        with self._lock:
+            current = self._toolset_aliases.get(alias)
+            if self._toolset_has_registrations(toolset):
+                if current != toolset:
+                    self.register_toolset_alias(alias, toolset)
+            elif current == toolset:
+                del self._toolset_aliases[alias]
+                self._generation += 1
+
     def get_toolset_alias_target(self, alias: str) -> Optional[str]:
         """Return the canonical toolset name for an alias, or None."""
         with self._lock:
@@ -993,10 +1010,7 @@ class ToolRegistry:
                 self._scoped_tools.pop(scope, None)
             # Drop the toolset check and aliases if this was the last tool in
             # that toolset.
-            toolset_still_exists = any(
-                e.toolset == entry.toolset
-                for e in self._merged_tools(scope).values()
-            )
+            toolset_still_exists = self._toolset_has_registrations(entry.toolset)
             if not toolset_still_exists:
                 self._toolset_checks.pop(entry.toolset, None)
                 self._toolset_aliases = {
