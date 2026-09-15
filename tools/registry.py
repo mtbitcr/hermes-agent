@@ -1074,11 +1074,7 @@ class ToolRegistry:
                         self._toolset_checks.pop(toolset, None)
                     else:
                         self._toolset_checks[toolset] = check_fn
-                if not surviving and not any(
-                    entry.toolset == toolset
-                    for entries in self._scoped_tools.values()
-                    for entry in entries.values()
-                ):
+                if not self._toolset_has_registrations(toolset):
                     self._toolset_aliases = {
                         alias: target
                         for alias, target in self._toolset_aliases.items()

@@ -388,6 +388,25 @@ class TestEmojiMetadata:
 
 
 class TestEntryLookup:
+    def test_scoped_restore_preserves_a_shadowed_global_alias(self):
+        reg = ToolRegistry()
+        name = "mcp__global__t"
+        reg.register(name, "mcp-global", _make_schema(name), _dummy_handler)
+        global_entry = reg.snapshot_registration(name)
+        reg.register(name, "mcp-private", _make_schema(name), _dummy_handler,
+                     scope="a", override=True)
+        previous = reg.snapshot_registration(name, scope="a")
+        assert previous.toolset == "mcp-private"
+        reg.register(name, "mcp-global", _make_schema(name), _dummy_handler,
+                     scope="a", override=True)
+        current = reg.snapshot_registration(name, scope="a")
+        reg.register_toolset_alias("global", "mcp-global")
+
+        assert reg.restore_registration(name, current, previous, scope="a")
+        assert reg.snapshot_registration(name, scope="a") is previous
+        assert reg.get_entry(name, scope="b") is global_entry
+        assert reg.get_toolset_alias_target("global") == "mcp-global"
+
     def test_get_entry_returns_registered_entry(self):
         reg = ToolRegistry()
         reg.register(
