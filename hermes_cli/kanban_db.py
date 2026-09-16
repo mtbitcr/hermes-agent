@@ -22471,7 +22471,7 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks "
+        "SELECT status, claim_lock, worker_pid, worker_start_time FROM tasks "
         "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
@@ -22481,8 +22481,18 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    # The operator asked for this release and gets it either way; what the
+    # recorded IDENTITY decides is what may be SIGNALLED. A pid the OS
+    # recycled is a stranger, and the reclaim must not kill it — the witness
+    # is threaded into the termination helper, which refuses in that case and
+    # still reports its usual keys.
+    identity: dict = {}
+    _worker_identity_presence(
+        row["worker_pid"], _row_worker_start_time(row), evidence=identity,
+    )
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        recorded_start_time=_row_worker_start_time(row),
     )
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
@@ -22511,6 +22521,9 @@ def reclaim_task(
             "retry_status": retry_status,
         }
         payload.update(termination)
+        # The evidence the signal decision was taken on, not just the verdict
+        # — the same keys the automatic stale-claim reclaim records.
+        payload.update(identity)
         _append_event(
             conn, task_id, "reclaimed",
             payload,
@@ -30565,6 +30578,10 @@ def verified_active_worker_rows(
         "r.worker_pid IS NOT NULL",
         "t.current_run_id = r.id",
         "t.worker_pid = r.worker_pid",
+        # The identity witness is half of the worker's identity, so the task
+        # and run sides must agree on it too, not only on the pid number.
+        # ``IS`` so two pre-migration NULLs still correlate.
+        "t.worker_start_time IS r.worker_start_time",
         "t.claim_lock = r.claim_lock",
         "t.claim_expires = r.claim_expires",
     ]
@@ -30574,7 +30591,8 @@ def verified_active_worker_rows(
         params.append(str(project_id))
     rows = conn.execute(
         "SELECT r.id AS run_id, r.profile, t.title AS task_title, "
-        "r.started_at, r.worker_pid, r.claim_lock, r.claim_expires, "
+        "r.started_at, r.worker_pid, r.worker_start_time, "
+        "r.claim_lock, r.claim_expires, "
         "r.last_heartbeat_at AS run_heartbeat, "
         "t.last_heartbeat_at AS task_heartbeat "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE "
@@ -30587,11 +30605,19 @@ def verified_active_worker_rows(
     for row in rows:
         claim_lock = str(row["claim_lock"] or "")
         claim_expires = row["claim_expires"]
+        # "That exact local PID is alive" is a statement about an IDENTITY,
+        # not a number: a pid the OS recycled to an unrelated process is
+        # provably NOT this worker, and reporting it as one would put a
+        # stranger's process behind a "Working now" badge. An owner whose
+        # identity can be neither confirmed nor refuted is treated exactly
+        # like a live one (unchanged from before the witness existed).
         if (
             not claim_lock.startswith(host_prefix)
             or claim_expires is None
             or int(claim_expires) < observed_at
-            or not _pid_alive(row["worker_pid"])
+            or _worker_identity_presence(
+                row["worker_pid"], _row_worker_start_time(row),
+            ) is HolderPresence.PROVABLY_ABSENT
         ):
             continue
         task_heartbeat = row["task_heartbeat"]
@@ -30620,8 +30646,22 @@ def _terminate_reclaimed_worker(
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    recorded_start_time: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    ``recorded_start_time`` is the identity witness stored beside ``pid``
+    by :func:`_set_worker_pid`. It is OPTIONAL and defaults to None, so a
+    caller that does not pass it behaves exactly as before. When it IS
+    passed and :func:`_worker_identity_presence` proves the number now
+    belongs to an unrelated process (alive, but a different start time
+    from the one recorded), NOTHING is signalled: the recorded owner is
+    already gone and the process wearing its pid is a stranger. The
+    returned dict keeps every key its callers and
+    :func:`_worker_survived_termination` read — ``terminated`` is True
+    because the owner really is gone — plus ``pid_reused`` and the
+    identity evidence, exactly as the stale-claim reclaim records it.
+    """
     import signal
 
     info: dict[str, Any] = {
@@ -30638,6 +30678,21 @@ def _terminate_reclaimed_worker(
     if not str(claim_lock).startswith(host_prefix):
         return info
     info["host_local"] = True
+
+    if recorded_start_time is not None:
+        identity: dict[str, Any] = {}
+        presence = _worker_identity_presence(
+            pid, recorded_start_time, evidence=identity,
+        )
+        if (
+            presence is HolderPresence.PROVABLY_ABSENT
+            and identity.get("observed_worker_start_time") is not None
+        ):
+            # PID REUSE. Signalling here would kill a stranger.
+            info["terminated"] = True
+            info["pid_reused"] = True
+            info.update(identity)
+            return info
 
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
@@ -31053,7 +31108,7 @@ def enforce_max_runtime(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.current_run_id, "
+        "SELECT t.id, t.worker_pid, t.worker_start_time, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -31077,17 +31132,36 @@ def enforce_max_runtime(
         tid = row["id"]
         run_id = row["current_run_id"]
 
+        # WHAT gets signalled is decided by the recorded IDENTITY, not by the
+        # pid number: the OS recycles numbers, so a pid whose recorded start
+        # time no longer matches the process wearing it belongs to a stranger,
+        # and this path SIGTERMs then SIGKILLs. The timeout bookkeeping below
+        # is unchanged — the attempt really did run past its limit and its
+        # owner really is gone — only the signal is withheld.
+        identity: dict = {}
+        presence = _worker_identity_presence(
+            row["worker_pid"], _row_worker_start_time(row), evidence=identity,
+        )
+        pid_reused = (
+            presence is HolderPresence.PROVABLY_ABSENT
+            and identity.get("observed_worker_start_time") is not None
+        )
+
         # The handover check runs BEFORE anything is recorded, through the
         # one shared helper the iteration-budget exit uses too.
         if run_id is not None and _complete_run_handover_before_timeout(
             conn, tid,
             handover_reason="budget_exhausted",
             run_id=int(run_id),
-            stop_worker=lambda: _request_worker_stop(pid, signal_fn),
+            stop_worker=(
+                (lambda: None) if pid_reused
+                else (lambda: _request_worker_stop(pid, signal_fn))
+            ),
             event_payload_extra={
                 "pid": pid,
                 "elapsed_seconds": int(elapsed),
                 "limit_seconds": int(row["max_runtime_seconds"]),
+                **identity,
             },
             metadata_extra={
                 "elapsed_seconds": int(elapsed),
@@ -31106,7 +31180,7 @@ def enforce_max_runtime(
         kill = signal_fn if signal_fn is not None else (
             os.kill if hasattr(os, "kill") else None
         )
-        if kill is not None:
+        if kill is not None and not pid_reused:
             try:
                 kill(pid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
@@ -31125,6 +31199,19 @@ def enforce_max_runtime(
                 except (ProcessLookupError, OSError):
                     pass
 
+        error_text = (
+            f"elapsed {int(elapsed)}s > "
+            f"limit {int(row['max_runtime_seconds'])}s"
+        )
+        if pid_reused:
+            # Saying nothing here would leave the history claiming we stopped
+            # a worker we deliberately did not signal.
+            error_text += (
+                f" — pid {pid} was recycled: the process holding it now "
+                f"started at {identity['observed_worker_start_time']}, not "
+                f"the {identity['worker_start_time']} recorded with the "
+                "claim, so it was not signalled"
+            )
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -31143,10 +31230,17 @@ def enforce_max_runtime(
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                if pid_reused:
+                    payload["pid_reused"] = True
+                    payload["termination_attempted"] = False
+                # The evidence the signal decision was taken on, not just the
+                # verdict: recorded pid, recorded start time, observed start
+                # time, classification.
+                payload.update(identity)
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
-                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                    error=error_text,
                     metadata=payload,
                 )
                 _append_event(
@@ -31162,7 +31256,7 @@ def enforce_max_runtime(
             with _after_durable_commit(f"enforce_max_runtime({tid})"):
                 _record_task_failure(
                     conn, tid,
-                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                    error=error_text,
                     outcome="timed_out",
                     release_claim=False,
                     end_run=False,
@@ -31170,6 +31264,7 @@ def enforce_max_runtime(
                         "pid": pid,
                         "sigkill": killed,
                         "retry_status": retry_status,
+                        **identity,
                     },
                     # The run this timeout was recorded against — the one
                     # ``_end_run`` just closed above, not a run inferred from
@@ -31224,7 +31319,8 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.worker_start_time, t.last_heartbeat_at, "
+        "       t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -31249,9 +31345,26 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
+        # One classification of the recorded identity per row, reused by the
+        # termination decision AND by the audit payload. The heartbeat
+        # backstop above is what makes this row a candidate and it stays the
+        # authority for RELEASING it (a worker making no observable progress
+        # is reclaimed whatever its identity says — the same rule the
+        # stale-claim reclaim applies); what the identity decides is what may
+        # be SIGNALLED. LIVE and INDETERMINATE are treated identically: both
+        # go through the ordinary terminate-then-defer-if-it-survived path.
+        # Only a pid the OS recycled — alive, but a different start time from
+        # the one recorded — is spared the signal, because the process
+        # wearing that number is a stranger.
+        identity: dict = {}
+        _worker_identity_presence(
+            pid, _row_worker_start_time(row), evidence=identity,
+        )
+
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
+            recorded_start_time=_row_worker_start_time(row),
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -31289,6 +31402,10 @@ def detect_stale_running(
                 "retry_status": retry_status,
             }
             payload.update(termination)
+            # The evidence the verdict was reached on, not just the verdict:
+            # recorded pid, recorded start time, observed start time,
+            # classification — the same keys the stale-claim reclaim records.
+            payload.update(identity)
 
             run_id = _end_run(
                 conn, tid,
@@ -31346,14 +31463,26 @@ def reconcile_orphaned_running(
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+        "SELECT id, claim_lock, claim_expires, worker_pid, worker_start_time "
+        "FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL) AND task_kind = 'work'"
     ).fetchall()
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _pid_alive(pid):
+        # The recorded IDENTITY decides whether there is an owner to protect,
+        # not the pid number: a pid the OS recycled is a stranger, and
+        # deferring to it holds the card in ``running`` forever. LIVE and
+        # INDETERMINATE are both "there may be a real worker here" and are
+        # deferred exactly as before; only a provably-absent owner is
+        # requeued. A row with NO pid has no owner to duplicate and keeps
+        # being requeued exactly as before.
+        identity: dict = {}
+        presence = _worker_identity_presence(
+            pid, _row_worker_start_time(row), evidence=identity,
+        )
+        if pid and presence is not HolderPresence.PROVABLY_ABSENT:
             # The recorded worker may still be doing real work — never
             # requeue beside a live process. Retry next tick.
             _log.debug(
@@ -31361,6 +31490,16 @@ def reconcile_orphaned_running(
                 "pid %s is alive on this host — deferring", tid, pid,
             )
             continue
+        if identity.get("observed_worker_start_time") is not None:
+            # The number is running; the process wearing it is not our
+            # worker. Saying "pid gone" here would be false.
+            _log.info(
+                "kanban reconcile: task %s recorded pid %s was recycled — the "
+                "process holding it now started at %s, not the %s recorded "
+                "with the claim; requeueing without disturbing it",
+                tid, pid, identity["observed_worker_start_time"],
+                identity["worker_start_time"],
+            )
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -31382,6 +31521,11 @@ def reconcile_orphaned_running(
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
             }
+            # The evidence the verdict was reached on, not a bare pid: the
+            # start time recorded with the claim, the one observed now, and
+            # the classification — so a requeue taken over a recycled pid is
+            # auditable from this one event.
+            payload.update(identity)
             run_id = _end_run(
                 conn, tid,
                 outcome="reclaimed", status="reclaimed",
