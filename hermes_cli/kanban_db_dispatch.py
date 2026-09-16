@@ -1135,9 +1135,17 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR). The review
-    lane skips the last two: they are the *inputs* to a review handoff. Stale /
-    dead claim locks are NOT a guard reason — the reclaim passes own those.
+    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
+    kernel-written review handback, ``changes_requested`` or
+    ``review_reopened``, landed AFTER that comment, proving the PR was already
+    reviewed and the task released for trusted rework; a handback OLDER than
+    the comment authorises nothing. ``created_at`` is whole-second resolution,
+    so a same-second handback/comment pair is ordered by deterministic
+    ORDINAL pairing between comment ids and ``commented`` event ids, never by
+    comment content, and fails CLOSED (still counts as active) when that
+    pairing can't be established). The review lane skips the last two: they
+    are the *inputs* to a review handoff. Stale / dead claim locks are NOT a
+    guard reason — the reclaim passes own those.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1204,13 +1212,87 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Exception: a kernel-written review handback (``changes_requested`` or
+    #    ``review_reopened``) landing AFTER the comment proves the PR was
+    #    already reviewed and the task released for trusted rework, not a
+    #    duplicate-work race. A handback OLDER than the comment authorises
+    #    nothing. Resolve the latest handback event once, not per comment.
+    #
+    #    ``created_at`` is whole-second resolution, so a handback and a
+    #    brand-new PR comment in the same tick can share a timestamp and
+    #    can't be ordered by it alone. Row id is the tiebreaker (same
+    #    rationale ``kanban_db._review_findings_history`` documents for event
+    #    ordering) — but ``task_comments.id`` and ``task_events.id`` are
+    #    independent sequences, so a comment id can't be compared to an event
+    #    id directly, and comment *content* (author/length/etc.) is never a
+    #    reliable identity: two distinct comments can be byte-for-byte
+    #    identical in those fields (same template, different PR number), so
+    #    matching on content risks pairing the wrong comment to the wrong
+    #    event. Instead we use deterministic ORDINAL pairing:
+    #    ``kanban_db.add_comment`` inserts the comment row and appends its
+    #    ``commented`` event in the same transaction, so *if every comment on
+    #    this task went through ``add_comment``* (i.e. the task's total
+    #    comment count equals its total ``commented`` event count), the i-th
+    #    comment by id and the i-th ``commented`` event by id are the same
+    #    insert — no content inspection needed. When the counts differ, at
+    #    least one comment came from one of ``kanban_db``'s inline
+    #    ``INSERT INTO task_comments`` sites that deliberately skip the
+    #    event, so the correspondence cannot be established for ANY comment
+    #    on the task — every same-second tie then fails CLOSED (still counts
+    #    as an active, unreviewed PR) rather than risk mis-ordering.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+    latest_handback = conn.execute(
+        "SELECT created_at, id FROM task_events "
+        "WHERE task_id = ? AND kind IN ('changes_requested', 'review_reopened') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    handback_at = int(latest_handback["created_at"]) if latest_handback else None
+    handback_id = int(latest_handback["id"]) if latest_handback else None
+    comments = conn.execute(
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+    ).fetchall()
+    # Only build the ordinal pairing when a handback exists AND at least one
+    # comment actually ties its second — that is the only ambiguous case.
+    pairing_available = False
+    pairing: dict = {}
+    if handback_at is not None and any(
+        int(c["created_at"]) == handback_at for c in comments
+    ):
+        comment_ids = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM task_comments WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        ]
+        commented_ids = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM task_events WHERE task_id = ? AND kind = 'commented' "
+                "ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        ]
+        if len(comment_ids) == len(commented_ids):
+            pairing_available = True
+            pairing = dict(zip(comment_ids, commented_ids))
+    for c in comments:
+        if not c["body"] or not _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            continue
+        if handback_at is None:
             return "active_pr"
+        c_at = int(c["created_at"])
+        if c_at < handback_at:
+            continue
+        if c_at > handback_at:
+            return "active_pr"
+        paired_event_id = pairing.get(c["id"]) if pairing_available else None
+        if paired_event_id is not None and paired_event_id < handback_id:
+            continue
+        return "active_pr"
 
     return None
 

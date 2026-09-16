@@ -17,6 +17,7 @@ import pytest
 import hermes_state
 import hermes_state_wal
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -547,6 +548,87 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+_GUARD_PR_COMMENT = (
+    "Candidate is up at https://github.com/example/repo/pull/123 - please review."
+)
+
+
+def _make_review_handback(conn, *, title: str, pr_comment: str = _GUARD_PR_COMMENT) -> str:
+    """Drive a real implement -> PR comment -> review -> changes_requested cycle.
+
+    Returns a task id left in a genuine, current review-handback state
+    (``ready``, ``current_run_id`` NULL, assignee restored to the
+    implementer) — built entirely from real lifecycle calls.
+    """
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    kb.add_comment(conn, tid, author="worker", body=pr_comment)
+    ok = kb.request_review(
+        conn, tid, summary="candidate ready", reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+    )
+    assert ok is True
+    review_claim = kb.claim_review_task(conn, tid)
+    assert review_claim is not None
+    ok, who = kb.request_changes(
+        conn, tid, reason="fix the guard boundary",
+        expected_run_id=review_claim.current_run_id,
+    )
+    assert ok is True, who
+    return tid
+
+
+def test_active_pr_guard_blocks_when_no_review_handback(kanban_home):
+    """No review round trip ever happened for this task — a fresh PR-URL
+    comment must still defer the respawn as duplicate-work evidence, in
+    both guard copies."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="already PRed, no review cycle", assignee="worker")
+        kb.add_comment(conn, tid, author="worker", body=_GUARD_PR_COMMENT)
+
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_review_handback_does_not_override_rate_limit_cooldown(kanban_home, monkeypatch):
+    """A handback must never punch through the rate-limit cooldown: priority
+    order (rate_limit_cooldown before active_pr) is unchanged by the
+    supersession rule."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    with kb.connect() as conn:
+        tid = _make_review_handback(conn, title="handback then rate limited")
+
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, "
+            "started_at, ended_at) VALUES (?, 'worker', 'rate_limited', "
+            "'rate_limited', ?, ?)",
+            # ended_at strictly after the review-handoff run so the
+            # "latest run" query deterministically picks this one.
+            (tid, now, now + 5),
+        )
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+
+def test_review_handback_does_not_override_auth_blocker(kanban_home):
+    """A handback must never punch through the auth/quota blocker: priority
+    order (blocker_auth before active_pr) is unchanged by the supersession
+    rule."""
+    with kb.connect() as conn:
+        tid = _make_review_handback(conn, title="handback then auth blocked")
+
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("401 unauthorized: invalid api key", tid),
+        )
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, tid) == "blocker_auth"
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
 
 
 
