@@ -144,10 +144,14 @@ def test_a_commit_the_kernel_did_not_create_stays_unverified_forever(
     foreign = git(workspace, "rev-parse", "HEAD")
 
     head = _materialize(setup)
-    _complete(setup)
 
-    # The range really does contain it; the kernel's list really does not.
+    # The range really does contain it. Asked while the work area still
+    # exists: completing the task deregisters and removes that directory,
+    # so afterwards this git question has nowhere to run.
     assert foreign in git(workspace, "rev-list", head, f"^{setup['base']}").split()
+
+    # The kernel's own list, read from durable state, really does not.
+    _complete(setup)
     reference = _reference(slug, task_id)
     assert head in reference["commits"]
     assert foreign not in reference["commits"]
