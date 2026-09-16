@@ -5034,8 +5034,17 @@ def _read_quiescence_predicate(
         )
     try:
         try:
+            # The identity witness is additive, so a store that predates the
+            # migration simply has no column to read: select it only when it
+            # is there and let ``_row_worker_start_time`` answer None
+            # otherwise (which classifies as INDETERMINATE, never absent).
+            task_cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+            witness = (
+                ", worker_start_time" if "worker_start_time" in task_cols else ""
+            )
             held_rows = conn.execute(
-                "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+                f"SELECT id, claim_lock, claim_expires, worker_pid{witness} "
+                "FROM tasks "
                 "WHERE status = 'running' AND claim_lock IS NOT NULL"
             ).fetchall()
         except sqlite3.Error as exc:
@@ -7465,16 +7474,194 @@ class AbsentHolderResolution:
     ended: "tuple[str, ...]" = ()
 
 
-def _probe_holder_presence(row, *, host_prefix: str, pid_probe) -> HolderProbe:
+def _probe_worker_start_time(pid: int) -> Optional[int]:
+    """This host's start-time fingerprint for ``pid``, or None when unknown.
+
+    A thin, lazy-importing wrapper over the ONE start-time probe this
+    codebase has — ``gateway.status.get_process_start_time`` (``/proc/<pid>/stat``
+    field 22 on Linux, psutil ``create_time`` in centiseconds elsewhere).
+    Imported inside the function exactly the way :func:`_pid_alive` imports
+    ``gateway.status._pid_exists``, so the kernel keeps no import-time
+    dependency on the gateway package. Never raises: a probe that could not
+    be performed answers None, which the classifier reads as INDETERMINATE.
+    """
+    try:
+        from gateway.status import get_process_start_time
+
+        value = get_process_start_time(int(pid))
+    except Exception:
+        return None
+    return None if value is None else int(value)
+
+
+def _row_worker_start_time(row) -> Optional[int]:
+    """The recorded identity witness on *row*, tolerating pre-migration rows."""
+    try:
+        keys = row.keys()
+    except AttributeError:
+        return None
+    if "worker_start_time" not in keys:
+        return None
+    value = row["worker_start_time"]
+    return None if value is None else int(value)
+
+
+def _worker_identity_presence(
+    pid,
+    recorded_start,
+    *,
+    pid_probe=None,
+    start_time_probe=None,
+    evidence: Optional[dict] = None,
+) -> HolderPresence:
+    """What the recorded ``(worker_pid, worker_start_time)`` pair PROVES.
+
+    A pid on its own is not an identity: the OS recycles pid numbers, so a
+    recycled pid belonging to an unrelated process reads as "the owner is
+    alive" to a bare liveness probe. The start time recorded beside the pid
+    by :func:`_set_worker_pid` is the fingerprint that turns the one pid
+    field into an identity, and this is the single place that reads the
+    pair. The verdicts are :class:`HolderPresence`'s existing three —
+    ``INDETERMINATE`` is not a shade of absent, it is treated exactly like
+    ``LIVE``:
+
+    ======================================  ==================
+    observation                             verdict
+    ======================================  ==================
+    no pid recorded                         INDETERMINATE
+    pid recorded, probe says gone           PROVABLY_ABSENT
+    pid alive, no recorded start time       INDETERMINATE
+    pid alive, current start time unknown   INDETERMINATE
+    pid alive, start times agree            LIVE
+    pid alive, start times disagree         PROVABLY_ABSENT
+    any probe raised                        INDETERMINATE
+    ======================================  ==================
+
+    Start times are compared as exact integers, which is correct precisely
+    because both sides come from the same host and the same probe. (The
+    float-tolerance helper ``gateway.status._start_times_agree`` is for a
+    different record shape and is deliberately not used here.)
+
+    ``pid_probe`` / ``start_time_probe`` are the injection points; they
+    default to :func:`_pid_alive` and :func:`_probe_worker_start_time`,
+    looked up at call time so monkeypatching the module attribute works.
+    ``evidence``, when given, is filled in with what was observed so the
+    caller's audit event can carry the proof rather than just the verdict.
+    """
+    def _record(presence: HolderPresence, reason: str, observed) -> HolderPresence:
+        if evidence is not None:
+            evidence.update({
+                "worker_pid": int(pid) if pid else None,
+                "worker_start_time": (
+                    int(recorded_start) if recorded_start is not None else None
+                ),
+                "observed_worker_start_time": observed,
+                "worker_presence": presence.value,
+                "worker_identity_reason": reason,
+            })
+        return presence
+
+    if not pid:
+        return _record(
+            HolderPresence.INDETERMINATE,
+            "the claim records no worker pid: absence cannot be proven",
+            None,
+        )
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return _record(
+            HolderPresence.INDETERMINATE,
+            f"the recorded worker pid {pid!r} is not a number",
+            None,
+        )
+
+    probe = pid_probe if pid_probe is not None else _pid_alive
+    try:
+        alive = probe(pid_int)
+    except Exception as exc:
+        return _record(
+            HolderPresence.INDETERMINATE,
+            f"the liveness probe for pid {pid_int} failed ({exc}): a query "
+            "that did not succeed proves nothing",
+            None,
+        )
+    if not alive:
+        return _record(
+            HolderPresence.PROVABLY_ABSENT,
+            f"pid {pid_int} is recorded on this host and a successful probe "
+            "found it absent",
+            None,
+        )
+
+    if recorded_start is None:
+        return _record(
+            HolderPresence.INDETERMINATE,
+            f"pid {pid_int} is alive but no start time was recorded with it: "
+            "the pid alone cannot prove the owner's identity",
+            None,
+        )
+    start_probe = (
+        start_time_probe if start_time_probe is not None else _probe_worker_start_time
+    )
+    try:
+        observed = start_probe(pid_int)
+    except Exception as exc:
+        return _record(
+            HolderPresence.INDETERMINATE,
+            f"the start-time probe for pid {pid_int} failed ({exc}): a query "
+            "that did not succeed proves nothing",
+            None,
+        )
+    if observed is None:
+        return _record(
+            HolderPresence.INDETERMINATE,
+            f"pid {pid_int} is alive but its current start time is "
+            "unreadable: identity can be neither confirmed nor refuted",
+            None,
+        )
+    try:
+        same = int(recorded_start) == int(observed)
+    except (TypeError, ValueError):
+        return _record(
+            HolderPresence.INDETERMINATE,
+            f"pid {pid_int} carries a malformed start time "
+            f"(recorded {recorded_start!r}, observed {observed!r})",
+            observed if isinstance(observed, int) else None,
+        )
+    if same:
+        return _record(
+            HolderPresence.LIVE,
+            f"pid {pid_int} is alive on this host and its start time matches "
+            f"the one recorded with the claim ({int(observed)})",
+            int(observed),
+        )
+    return _record(
+        HolderPresence.PROVABLY_ABSENT,
+        f"pid {pid_int} is alive but its start time is {int(observed)}, not "
+        f"the {int(recorded_start)} recorded with the claim: the pid was "
+        "recycled and this process is NOT the recorded owner",
+        int(observed),
+    )
+
+
+def _probe_holder_presence(
+    row, *, host_prefix: str, pid_probe, start_time_probe=None,
+) -> HolderProbe:
     """Is this reservation's holder PROVABLY absent? (QB-1d, AB-1 shape.)
 
     A positive standard, in three parts, every one of which must hold:
     the claim records a ``worker_pid``; the recorded holder is on THIS
     host (a PID recorded on another host is a PID this system cannot
-    interrogate); and a liveness probe that SUCCEEDED says the process is
-    gone. Anything else — no PID, a foreign host, a probe that raised —
-    is indeterminate, and an indeterminate holder is treated as live.
-    Fail-closed, in the direction that protects work.
+    interrogate); and the recorded IDENTITY — the pid together with the
+    start time bound beside it — is provably gone. Anything else — no PID,
+    a foreign host, a probe that raised, a pid whose identity cannot be
+    established — is indeterminate, and an indeterminate holder is treated
+    as live. Fail-closed, in the direction that protects work.
+
+    A recycled pid is the case the start time exists for: without it, an
+    unrelated process that inherited the number reads as the holder being
+    alive, and the reservation is held forever by a stranger.
     """
     task_id = row["id"]
     claim_lock = row["claim_lock"]
@@ -7493,25 +7680,16 @@ def _probe_holder_presence(row, *, host_prefix: str, pid_probe) -> HolderProbe:
             "system cannot interrogate: its recorded expiry is what resolves it",
             worker_pid=int(pid), claim_lock=claim_lock,
         )
-    try:
-        alive = pid_probe(int(pid))
-    except Exception as exc:
-        return HolderProbe(
-            task_id, HolderPresence.INDETERMINATE,
-            f"the liveness probe for pid {int(pid)} failed ({exc}): a query "
-            "that did not succeed proves nothing",
-            worker_pid=int(pid), claim_lock=claim_lock,
-        )
-    if alive:
-        return HolderProbe(
-            task_id, HolderPresence.LIVE,
-            f"pid {int(pid)} is alive on this host",
-            worker_pid=int(pid), claim_lock=claim_lock,
-        )
+    evidence: dict = {}
+    presence = _worker_identity_presence(
+        pid,
+        _row_worker_start_time(row),
+        pid_probe=pid_probe,
+        start_time_probe=start_time_probe,
+        evidence=evidence,
+    )
     return HolderProbe(
-        task_id, HolderPresence.PROVABLY_ABSENT,
-        f"pid {int(pid)} is recorded on this host and a successful probe "
-        "found it absent",
+        task_id, presence, evidence["worker_identity_reason"],
         worker_pid=int(pid), claim_lock=claim_lock,
     )
 
@@ -13862,6 +14040,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- exceeds DEFAULT_FAILURE_LIMIT consecutive non-successes.
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     worker_pid           INTEGER,
+    -- Identity witness for ``worker_pid``: the OS start-time fingerprint of
+    -- the process that pid named when it was bound. PIDs are recycled, so a
+    -- bare number is not an identity; the pair is. Written ONLY by
+    -- ``_set_worker_pid``, in the same statement group as ``worker_pid``, so
+    -- a pid and its witness commit together or not at all. NULL means "we
+    -- could not tell" (pre-migration row, or a probe that came back empty),
+    -- which classifies as INDETERMINATE — never as absent.
+    worker_start_time    INTEGER,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -14028,6 +14214,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    -- Per-run copy of the identity witness described on ``tasks``.
+    worker_start_time   INTEGER,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -15619,6 +15807,13 @@ def _migrate_add_optional_columns(
             )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
+    # The identity witness for ``worker_pid``. Additive and nullable: rows
+    # bound before this migration keep a NULL witness, which the classifier
+    # reads as INDETERMINATE (cannot prove identity), never as absent.
+    if "worker_start_time" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "worker_start_time", "worker_start_time INTEGER"
+        )
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
             conn, "tasks", "last_failure_error", "last_failure_error TEXT"
@@ -15861,6 +16056,23 @@ def _migrate_add_optional_columns(
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+
+    # task_runs carries the same pid/identity-witness pair the task row does,
+    # one per attempt. Table-existence guarded like ``task_comments`` below,
+    # for callers migrating a minimal legacy schema. Runs BEFORE
+    # ``_rebuild_drifted_tables`` and is idempotent either way: a rebuilt
+    # table is recreated from the canonical DDL, which already has the column.
+    runs_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if runs_table_exists:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if "worker_pid" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "worker_pid", "worker_pid INTEGER")
+        if "worker_start_time" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_start_time", "worker_start_time INTEGER"
+            )
 
     # Durable operation identity for idempotent comment replay (see
     # add_comment()'s operation_key parameter). Partial unique index: NULL
@@ -16237,7 +16449,8 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_start_time INTEGER,"
+        " max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -21996,13 +22209,26 @@ def release_stale_claims(
 ) -> int:
     """Reset any ``running`` task whose claim has expired.
 
-    A stale-by-TTL claim whose host-local worker PID is still alive is
+    A stale-by-TTL claim whose host-local worker is PROVABLY LIVE is
     *extended* (with a ``claim_extended`` event) instead of being
     reclaimed. Reclaiming a live worker mid-flight produces the spawn-
     then-immediately-reclaim loop seen on slow models that spend longer
     than ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM
     call (#23025): no tool calls means no ``kanban_heartbeat``, even
     though the subprocess is healthy.
+
+    "Provably live" is the recorded IDENTITY, not the pid number:
+    :func:`_worker_identity_presence` compares the pid's current start time
+    with the one ``_set_worker_pid`` bound beside it. Only a ``LIVE``
+    verdict extends. A ``PROVABLY_ABSENT`` verdict — including a pid the OS
+    recycled to an unrelated process, which a bare liveness probe would
+    have called alive forever — is reclaimed through the ordinary reclaim
+    path below, and the ``reclaimed`` event carries the evidence. An
+    ``INDETERMINATE`` verdict proves nothing either way, so it neither
+    extends nor reclaims: the claim is HELD through the existing
+    :func:`_defer_reclaim_for_live_worker`, which is how "unknown is
+    treated exactly like live" stays true without ever calling an
+    unknown owner absent.
 
     Backstop (#29747 gap 3): if the worker's PID is still alive but its
     ``last_heartbeat_at`` is stale by more than
@@ -22023,8 +22249,8 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "SELECT id, claim_lock, worker_pid, worker_start_time, claim_expires, "
+        "       last_heartbeat_at, assignee "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ? AND task_kind = 'work'",
@@ -22042,10 +22268,21 @@ def release_stale_claims(
             hb is not None
             and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
+        # One classification of the recorded identity per row, reused by
+        # every arm below AND by the audit payload, so the verdict the
+        # decision was taken on is the verdict the event records.
+        identity: dict = {}
+        presence = (
+            _worker_identity_presence(
+                row["worker_pid"], _row_worker_start_time(row), evidence=identity,
+            )
+            if host_local
+            else None
+        )
         if (
             host_local
             and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
+            and presence is HolderPresence.LIVE
             and not heartbeat_stale
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
@@ -22066,27 +22303,73 @@ def release_stale_claims(
                         "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
                         (new_expires, run_id),
                     )
+                extended_payload = {
+                    "reason": "pid_alive",
+                    "worker_pid": int(row["worker_pid"]),
+                    "claim_lock": row["claim_lock"],
+                    "claim_expires_was": int(row["claim_expires"]),
+                    "claim_expires_now": new_expires,
+                    "last_heartbeat_at": (
+                        int(row["last_heartbeat_at"])
+                        if row["last_heartbeat_at"] is not None
+                        else None
+                    ),
+                }
+                extended_payload.update(identity)
                 _append_event(
-                    conn, row["id"], "claim_extended",
-                    {
-                        "reason": "pid_alive",
-                        "worker_pid": int(row["worker_pid"]),
-                        "claim_lock": row["claim_lock"],
-                        "claim_expires_was": int(row["claim_expires"]),
-                        "claim_expires_now": new_expires,
-                        "last_heartbeat_at": (
-                            int(row["last_heartbeat_at"])
-                            if row["last_heartbeat_at"] is not None
-                            else None
-                        ),
-                    },
+                    conn, row["id"], "claim_extended", extended_payload,
                     run_id=run_id,
                 )
             continue
 
-        termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
-        )
+        # Unknown is treated exactly like live: an identity that can be
+        # neither confirmed nor refuted is HELD, not released and not
+        # signalled — but only when there is an owner to protect. A claim
+        # that records NO pid has no worker to duplicate and nothing to
+        # signal, so its expiry stays the authority that recovers it, which
+        # is how a claim whose worker never spawned gets back to the board
+        # instead of being held forever. The heartbeat backstop overrides
+        # this arm either way: a worker making no observable progress for an
+        # hour is reclaimed whatever its identity says (pre-existing rule,
+        # unchanged).
+        if (
+            presence is HolderPresence.INDETERMINATE
+            and row["worker_pid"]
+            and not heartbeat_stale
+        ):
+            held = {
+                "prev_pid": int(row["worker_pid"]),
+                "host_local": True,
+                "termination_attempted": False,
+                "terminated": False,
+                "sigkill": False,
+            }
+            held.update(identity)
+            _defer_reclaim_for_live_worker(
+                conn, row["id"], row["claim_lock"], now, held,
+                reason="ttl_expired_worker_identity_indeterminate",
+            )
+            continue
+
+        if presence is HolderPresence.PROVABLY_ABSENT and identity.get(
+            "observed_worker_start_time"
+        ) is not None:
+            # PID REUSE: the number is alive, but it belongs to an unrelated
+            # process now. Signalling it would kill a stranger, so this
+            # reclaim skips termination entirely and records why. The
+            # recorded owner is gone, which is what ``terminated`` states.
+            termination = {
+                "prev_pid": int(row["worker_pid"]),
+                "host_local": host_local,
+                "termination_attempted": False,
+                "terminated": True,
+                "sigkill": False,
+                "pid_reused": True,
+            }
+        else:
+            termination = _terminate_reclaimed_worker(
+                row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
@@ -22134,6 +22417,13 @@ def release_stale_claims(
                 "retry_status": retry_status,
             }
             payload.update(termination)
+            # The evidence the verdict was reached on, not just the verdict:
+            # the pid, the start time recorded with the claim, the start time
+            # observed now, and the classification. A release caused by an
+            # identity that no longer matches is auditable from this one
+            # event — and it is emitted by the SAME reclaim path as every
+            # other stale release, never a new one.
+            payload.update(identity)
             _append_event(
                 conn, row["id"], "reclaimed",
                 payload,
@@ -31214,6 +31504,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``_default_spawn`` always runs the worker on the same host as the
     dispatcher (the whole design is single-host).
 
+    Liveness is judged on the recorded IDENTITY via
+    :func:`_worker_identity_presence` — the pid together with the start
+    time ``_set_worker_pid`` bound beside it — so a pid the OS recycled to
+    an unrelated process is swept instead of being mistaken for a live
+    worker, and an owner whose identity cannot be established is left
+    strictly alone (INDETERMINATE is treated exactly like LIVE).
+
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
@@ -31248,7 +31545,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_start_time, claim_lock, started_at, "
+            "       assignee "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL "
             "AND task_kind = 'work'"
@@ -31267,7 +31565,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
                     continue
-            if _pid_alive(row["worker_pid"]):
+            # The recorded IDENTITY decides, not the pid number: only a
+            # provably-absent owner is swept. A live owner and an owner whose
+            # identity cannot be established are both left alone, and a pid
+            # the OS recycled to an unrelated process is provably absent —
+            # a bare liveness probe would have called it a live worker.
+            identity: dict = {}
+            presence = _worker_identity_presence(
+                row["worker_pid"], _row_worker_start_time(row), evidence=identity,
+            )
+            if presence is not HolderPresence.PROVABLY_ABSENT:
                 continue
 
             pid = int(row["worker_pid"])
@@ -31326,6 +31633,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error_text = f"pid {pid} exited with code {code}"
                 elif kind == "signaled":
                     error_text = f"pid {pid} killed by signal {code}"
+                elif identity.get("observed_worker_start_time") is not None:
+                    # The number is running; the process wearing it is not
+                    # our worker. Saying "not alive" here would be false.
+                    error_text = (
+                        f"pid {pid} was recycled: the process holding it now "
+                        f"started at {identity['observed_worker_start_time']}, "
+                        f"not the {identity['worker_start_time']} recorded "
+                        "with the claim"
+                    )
                 else:
                     error_text = f"pid {pid} not alive"
                 event_kind = "crashed"
@@ -31336,6 +31652,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
+            # Same evidence rule as the stale-claim reclaim: the event says
+            # what was observed, not only what was concluded.
+            event_payload.update(identity)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -31793,23 +32112,38 @@ def _record_spawn_failure(
 def _set_worker_pid(
     conn: sqlite3.Connection, task_id: str, pid: int, *, max_turns: Optional[int] = None,
 ) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
+    """Record the spawned child's pid + its identity witness, emit ``spawned``.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
+
+    This is the ONE writer of the pid on this side of the kernel, and it is
+    therefore also the one writer of ``worker_start_time``: the start-time
+    fingerprint of the process that pid names, read here and written in the
+    SAME statement group, inside the same ``write_txn``. A pid and its
+    witness commit together or not at all — a half-bound row would be a pid
+    with no identity, which is the state this column exists to abolish. A
+    probe that cannot answer writes NULL, which classifies as
+    INDETERMINATE (unknown), never as absent.
     """
+    start_time = _probe_worker_start_time(int(pid))
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+            "UPDATE tasks SET worker_pid = ?, worker_start_time = ? WHERE id = ?",
+            (int(pid), start_time, task_id),
         )
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+                "UPDATE task_runs SET worker_pid = ?, worker_start_time = ? "
+                "WHERE id = ?",
+                (int(pid), start_time, run_id),
             )
+        # The ``spawned`` payload keeps its established shape: the witness
+        # lives in the column the classifier reads, and the events that
+        # carry it as evidence are the reclaim ones, where it is the reason
+        # for a decision rather than a restatement of the row.
         payload: dict[str, Any] = {"pid": int(pid)}
         if max_turns:
             payload["max_turns"] = int(max_turns)
