@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -37,12 +38,16 @@ from hermes_cli.sqlite_util import (
     cross_process_init_lock,
 )
 from tests.hermes_cli._kanban_fence_support import (
+    archive_records,
     begin_removal,
     close_fence,
     create_fenced_board,
+    marker_row,
     permanent_confirmation,
+    read_only,
     ready_task,
     register_row,
+    row_count,
     start_removal,
     task_row,
 )
@@ -901,3 +906,230 @@ def test_a_brand_new_board_is_still_created_while_a_removal_is_in_flight(
     _control_board_still_works("born-alongside")
     _control_board_still_works("control")
     assert all(entry["slug"] != "doomed-neighbour" for entry in kb.list_boards())
+
+
+# ---------------------------------------------------------------------------
+# Losing the register does not un-remove a board
+#
+# The register row and the register file are ONE loss domain. §1.3 keeps the
+# ever-existed marker and the removal archive in a different one
+# (``board_removal_archive.db``, ledgered "retained: the resurrection guard
+# outlives the board") precisely so a removed name survives losing its row or
+# the whole register. Admission used to read "no entry" / "no register file"
+# as "this name is new", so deleting either was enough to let ``init_db``
+# recreate a removed board's store and take writes again.
+#
+# Every removal below is a REAL ``remove_board_fenced``; the only thing these
+# tests arrange by hand is the LOSS, which is the fault under test.
+# ---------------------------------------------------------------------------
+
+def _lose_register_row(slug: str) -> None:
+    """Lose ONE board's Gate A row, and nothing else.
+
+    Written with a plain connection, not through ``kanban_db``: this is
+    state no shipped path produces — it is the loss the second store
+    exists to survive. The row is asserted present first and absent
+    afterwards, or "losing" it would prove nothing.
+    """
+    path = kb.register_db_path()
+    assert path.exists(), f"no register store at {path}"
+    assert register_row(slug) is not None, f"{slug} has no register row to lose"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("DELETE FROM board_register WHERE board_name = ?", (slug,))
+        conn.commit()
+    finally:
+        conn.close()
+    assert register_row(slug) is None, f"{slug}'s register row is still there"
+
+
+def _lose_register_store(*slugs: str) -> None:
+    """Lose the WHOLE register file — sidecars included.
+
+    The filename comes from :func:`kanban_db.register_db_path` rather than
+    being spelled out here, so the test cannot "delete" a path production
+    does not use.
+    """
+    path = kb.register_db_path()
+    assert path.exists(), f"no register store at {path}"
+    for slug in slugs:
+        assert register_row(slug) is not None, (
+            f"{slug} has no register row, so losing the register proves nothing"
+        )
+    for member in (
+        path,
+        path.with_name(path.name + "-wal"),
+        path.with_name(path.name + "-shm"),
+    ):
+        if member.exists():
+            member.unlink()
+    assert not path.exists(), f"the register store is still there at {path}"
+    for slug in slugs:
+        assert register_row(slug) is None, f"{slug} still has a register row"
+
+
+def _assert_the_guard_outlived_the_register(slug: str) -> None:
+    """The independent stores still hold the name, read off their own file."""
+    assert marker_row(slug) is True, (
+        f"{slug}'s ever-existed marker is gone, so this test is not about "
+        "losing the register any more"
+    )
+    assert archive_records(slug) >= 1, (
+        f"{slug} has no removal-archive records, so this test is not about "
+        "losing the register any more"
+    )
+
+
+def _creation_is_refused(slug: str) -> None:
+    """Both explicit creation routes refuse, and leave nothing behind."""
+    with pytest.raises(kb.BoardFenceClosedError) as auto_init:
+        kb.init_db(board=slug)
+    assert auto_init.value.refusal.rule is kb.FenceRefusalRule.GA_2
+    assert auto_init.value.refusal.outcome is kb.FenceOutcome.REFUSED_CLOSED
+    _assert_left_nothing_behind(slug, what="the refused auto-init")
+
+    with pytest.raises(kb.BoardFenceClosedError) as created:
+        kb.create_board(slug)
+    assert created.value.refusal.rule is kb.FenceRefusalRule.GA_2
+    _assert_left_nothing_behind(slug, what="the refused create_board")
+
+    # And an ordinary open still has nothing to open.
+    with pytest.raises(kb.BoardFenceClosedError) as opened:
+        kb.connect(board=slug)
+    assert opened.value.refusal.rule is kb.FenceRefusalRule.GA_4
+    assert all(entry["slug"] != slug for entry in kb.list_boards())
+
+
+def _remove_after_real_work(slug: str) -> None:
+    """Create, fence, do real work on, and really remove *slug*."""
+    create_fenced_board(slug)
+    conn = kb.connect(board=slug)
+    try:
+        ready_task(conn, title="work that was removed")
+    finally:
+        conn.close()
+    assert kb.remove_board_fenced(slug, mode="reversible").success
+    assert not kb.kanban_db_path(board=slug).exists()
+    assert not kb.board_dir(slug).exists()
+
+
+def test_a_lost_register_row_does_not_un_remove_the_board(fence_home):
+    """The row is gone; the marker and the archive still say the name existed."""
+    _remove_after_real_work("doomed")
+    create_fenced_board("control")
+    _assert_the_guard_outlived_the_register("doomed")
+
+    _lose_register_row("doomed")
+    _assert_the_guard_outlived_the_register("doomed")
+
+    _creation_is_refused("doomed")
+
+    # The control board's own row — and therefore its authority — is
+    # untouched by this loss, so it must remain FULLY usable: open and
+    # write, not merely open.
+    assert register_row("control") is not None
+    _control_board_still_works("control")
+    assert kb.init_db(board="control").exists()
+
+
+def test_a_lost_register_file_does_not_un_remove_the_board(fence_home):
+    """The whole register is gone; the second loss domain still refuses.
+
+    The control board's authority is gone too, so this does NOT assert a
+    healthy write for it. What it does assert is that global register loss
+    costs no DATA and is never answered by letting an unknown authority
+    through: the control board's store and its task are still there, and
+    what happens next is either a fail-closed refusal or a write whose
+    authority has actually been recovered.
+    """
+    _remove_after_real_work("doomed")
+    create_fenced_board("control")
+    control_db = kb.kanban_db_path(board="control")
+    conn = kb.connect(board="control")
+    try:
+        control_task = ready_task(conn, title="control work from before the loss")
+    finally:
+        conn.close()
+    control_tasks_before = row_count(control_db, "tasks")
+
+    _lose_register_store("doomed", "control")
+    _assert_the_guard_outlived_the_register("doomed")
+
+    _creation_is_refused("doomed")
+
+    # The control board lost no data: its directory, its store and the task
+    # it already held are all still there, read without kanban_db.
+    assert kb.board_dir("control").is_dir()
+    assert control_db.exists()
+    assert row_count(control_db, "tasks") == control_tasks_before
+    assert task_row(control_db, control_task) is not None
+    with read_only(control_db) as ro:
+        titles = {r["title"] for r in ro.execute("SELECT title FROM tasks")}
+    assert "control work from before the loss" in titles
+
+    # Whatever the code does next must be one of the two supported answers.
+    outcome = _open_and_write("control")
+    assert outcome in ("refused", "wrote"), outcome
+    if outcome == "wrote":
+        assert register_row("control") is not None, (
+            "a write that succeeded while the authority is still missing is a "
+            "silent resurrection of an unknown authority, not a recovery"
+        )
+    # Either way, nothing was resurrected and nothing was lost.
+    assert marker_row("doomed") is True
+    assert not kb.kanban_db_path(board="doomed").exists()
+    assert row_count(control_db, "tasks") >= control_tasks_before
+
+
+def test_a_never_used_name_is_still_creatable_after_the_register_is_lost(
+    fence_home,
+):
+    """Fail-closed must not swallow the bootstrap case.
+
+    A name neither store has ever heard of is demonstrably new, and the
+    creation path has to stay open for it — otherwise "a removed name can
+    never be recreated" would be satisfied by "no board can ever be
+    created once the register is gone", which is the same fence failing
+    the other way.
+    """
+    _remove_after_real_work("doomed")
+    create_fenced_board("control")
+    _lose_register_store("doomed", "control")
+
+    assert marker_row("never-seen") is False
+    assert archive_records("never-seen") == 0
+
+    meta = kb.create_board("never-seen")
+    assert meta["slug"] == "never-seen"
+    fresh_db = kb.kanban_db_path(board="never-seen")
+    assert fresh_db.exists(), "a demonstrably new name was refused a store"
+    # A real, initialized store — not an empty file the refusal left behind.
+    with read_only(fresh_db) as ro:
+        tables = {
+            r[0]
+            for r in ro.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    assert "tasks" in tables
+
+    # The removed name is still refused in the very same state.
+    _creation_is_refused("doomed")
+
+
+def _open_and_write(slug: str) -> str:
+    """Try to open *slug* and write through it; classify what happened.
+
+    ``"wrote"`` — the write went through. ``"refused"`` — the fence
+    refused, at the open or at the write chokepoint. Anything else is
+    neither of the two supported answers and is re-raised.
+    """
+    try:
+        conn = kb.connect(board=slug)
+    except kb.BoardFenceClosedError:
+        return "refused"
+    try:
+        ready_task(conn, title=f"write after the loss ({slug})")
+    except kb.BoardFenceClosedError:
+        return "refused"
+    finally:
+        conn.close()
+    return "wrote"

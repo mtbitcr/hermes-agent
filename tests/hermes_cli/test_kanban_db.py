@@ -974,7 +974,14 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 
     with _patch("hermes_cli.kanban_db.sqlite3.connect", side_effect=wal_blocking_connect):
         with caplog.at_level("ERROR", logger="hermes_state"):
-            conn = kb.connect()
+            # create=True is the documented "bring a store into being"
+            # route, and the only one there is: an ordinary connect() never
+            # creates, so it refuses this deliberately-missing store (GA-4)
+            # before the injected WAL behaviour can run. The store is still
+            # genuinely fresh — nothing has touched this path before the
+            # injection is installed — so the first WAL attempt on a
+            # brand-new file is exactly what this exercises.
+            conn = kb.connect(create=True)
 
     # One fallback error, naming kanban.db
     errors = [
@@ -1034,7 +1041,10 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
         side_effect=wal_silent_noop_connect,
     ):
         with caplog.at_level("ERROR", logger="hermes_state"):
-            conn = kb.connect()
+            # Same reason as the locking-protocol test above: creating is
+            # the explicit route, and the store is still brought into being
+            # under the injection rather than pre-initialized.
+            conn = kb.connect(create=True)
 
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
     t = kb.create_task(conn, title="post-silent-fallback task")

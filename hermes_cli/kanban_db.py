@@ -2857,6 +2857,13 @@ def ever_existed_marker_set(
     try:
         if register_conn is not None:
             return _legacy(register_conn)
+        if not register_db_path().exists():
+            # There is no register store, so there is no legacy column to
+            # consult — and opening one would CREATE the register as a side
+            # effect of a read, which the creation path (which asks this on
+            # a brand-new home) must not do. The independent marker store
+            # above already gave the definite answer.
+            return False
         with register_connect() as c:
             return _legacy(c)
     except sqlite3.Error:
@@ -2941,6 +2948,12 @@ def has_removal_archive_record(
     try:
         if conn is not None:
             return _check(conn)
+        if not register_db_path().exists():
+            # No register store to hold the legacy table, and opening one
+            # would create it as a side effect of a read — see
+            # :func:`ever_existed_marker_set` for why that matters on the
+            # creation path. The independent archive above already answered.
+            return False
         with register_connect() as c:
             return _check(c)
     except sqlite3.Error:
@@ -14995,30 +15008,141 @@ def _assert_creation_admitted(path: Path, board: Optional[str]) -> None:
 
     WHICH board is being admitted is :func:`_creation_admission_slug`'s
     answer, and that answer comes from the target PATH first — see there.
+
+    **An ABSENT register answer is indeterminate, never "this name is
+    new".** The register row and the register file itself are a single loss
+    domain, and a removed name has to outlive losing either of them — which
+    is exactly why §1.3 keeps the ever-existed marker and the removal
+    archive in a DIFFERENT file (:func:`archive_db_path`), ledgered as
+    "retained: the resurrection guard outlives the board". Reading "no
+    entry" as "never used" threw that second domain away: deleting one
+    ``board_register`` row, or the register file, was enough to let
+    ``init_db`` recreate a removed board's store and take writes again.
+    So a missing entry falls through to the two INDEPENDENT stores, and
+    only a name both of them answer a definite "no" for may be created.
+
+    Callers must hold this board's register lock — see
+    :func:`_creation_admission_lock`, which both call sites go through, so
+    the answer cannot go stale between the decision and the side effects it
+    admits.
     """
     if _in_fence_protocol():
         return
     slug = _creation_admission_slug(path, board)
-    # No register store means no board has ever been registered, so nothing
-    # can have been removed. Reading through get_register_entry() would
-    # create the register as a side effect of every fresh board creation.
-    if not slug or not register_db_path().exists():
+    if not slug:
         return
-    entry = get_register_entry(slug)
-    if entry is None or entry.lifecycle is BoardLifecycle.LIVE:
-        return
-    raise BoardFenceClosedError(
-        FenceRefusal(
-            outcome=FenceOutcome.REFUSED_CLOSED,
-            rule=FenceRefusalRule.GA_2,
-            board=slug,
-            message=(
-                f"board is {entry.lifecycle.value}: refusing to create its "
-                "store again"
-            ),
-            register_epoch=entry.epoch,
+    # Reading through get_register_entry() would create the register as a
+    # side effect of every fresh board creation, so an absent register file
+    # is not opened here — it is simply one more authority that cannot
+    # answer, and the independent stores below are asked instead.
+    entry = get_register_entry(slug) if register_db_path().exists() else None
+    if entry is not None:
+        if entry.lifecycle is BoardLifecycle.LIVE:
+            # An armed, live board: creation is idempotent (mkdir -p).
+            return
+        raise BoardFenceClosedError(
+            FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.GA_2,
+                board=slug,
+                message=(
+                    f"board is {entry.lifecycle.value}: refusing to create its "
+                    "store again"
+                ),
+                register_epoch=entry.epoch,
+            )
         )
-    )
+
+    # No register answer for this name. Consult the independent stores
+    # before treating that as "new" — both are tri-state, and per their
+    # contracts None means the LOOKUP failed, never "no records".
+    marker = ever_existed_marker_set(slug)
+    if marker is None:
+        raise BoardFenceClosedError(
+            FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.INDETERMINATE,
+                board=slug,
+                message=(
+                    f"no register entry for {slug!r} and the ever-existed "
+                    f"marker store ({archive_db_path()}) could not be read: "
+                    "refusing to create its store from an indeterminate "
+                    "answer. Restore or repair that store, then retry."
+                ),
+            )
+        )
+    if marker:
+        raise BoardFenceClosedError(
+            FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.GA_2,
+                board=slug,
+                message=(
+                    f"the name {slug!r} has existed (ever-existed marker set) "
+                    "and its register entry is missing: refusing to create its "
+                    "store again. The marker outlives the register on purpose; "
+                    "if this board's register entry was lost, repair the "
+                    "register rather than recreating the board, or choose a "
+                    "different slug."
+                ),
+            )
+        )
+    archived_record = has_removal_archive_record(slug)
+    if archived_record is None:
+        raise BoardFenceClosedError(
+            FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.GA_6b,
+                board=slug,
+                message=(
+                    f"no register entry for {slug!r} and the removal archive "
+                    f"({archive_db_path()}) could not be read: refusing to "
+                    "create its store from an indeterminate answer. Restore "
+                    "or repair that store, then retry."
+                ),
+            )
+        )
+    if archived_record:
+        raise BoardFenceClosedError(
+            FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.GA_6a,
+                board=slug,
+                message=(
+                    f"no register entry for {slug!r}, but the removal archive "
+                    "holds receipt/audit records for that name: refusing to "
+                    "create its store again. Repair the register from the "
+                    "archive, or choose a different slug."
+                ),
+            )
+        )
+    # Both independent stores answered a definite no: a demonstrably
+    # never-used name. This is the first-run bootstrap path too — a fresh
+    # home has no register, no marker and no archive record for any name.
+
+
+@contextlib.contextmanager
+def _creation_admission_lock(path: Path, board: Optional[str]):
+    """Hold the authority that decides a creation, for the whole decision.
+
+    The SAME per-board register lock every Gate A transition takes — no
+    second lock system, and nothing new to acquire: the removal machinery
+    is exempt (it IS the authority), and a path that names no board has no
+    authority to serialize against.
+
+    ``reentrant=True`` is what lets both admission call sites share it:
+    :func:`_admitted_store_creation` holds it across the decision AND the
+    directory creation, and the re-validation inside
+    :func:`_open_initialized_store` — reached from ``init_db`` through
+    ``connect(create=True)`` — re-enters the very same lock instead of
+    deciding unserialized.
+    """
+    slug = _creation_admission_slug(path, board)
+    if slug is None or _in_fence_protocol():
+        yield None
+        return
+    with board_register_lock(slug, reentrant=True):
+        yield slug
 
 
 def _creation_admission_slug(path: Path, board: Optional[str]) -> Optional[str]:
@@ -15096,15 +15220,10 @@ def _admitted_store_creation(path: Path, board: Optional[str]):
     # The removal machinery already holds this lock for the board it is
     # removing, and is exempt from admission for the same reason it is
     # exempt at the write chokepoint: it is the authority, not a client.
-    if slug is None or _in_fence_protocol():
-        lock_scope = contextlib.nullcontext()
-    else:
-        # reentrant: create_board opens this window and then re-enters it
-        # through init_db -> connect(create=True), and a holder may itself
-        # drive register transitions from inside.
-        lock_scope = board_register_lock(slug, reentrant=True)
-
-    with lock_scope:
+    # Taken re-entrantly: create_board opens this window and then re-enters
+    # it through init_db -> connect(create=True), and a holder may itself
+    # drive register transitions from inside.
+    with _creation_admission_lock(path, board):
         _assert_creation_admitted(path, board)
         board_directory = path.parent
         # Only a board's OWN directory is ever ours to take back down. The
@@ -15258,7 +15377,14 @@ def _open_initialized_store(
             # landed in between must not be overtaken by a ``create=True``
             # decided ahead of it. (The lock itself has already refused the
             # case where the removal took the whole directory.)
-            _assert_creation_admitted(path, board)
+            #
+            # Under the SAME register lock the admitted window holds, not a
+            # second one: the ordinary route here is already inside that
+            # window, where this is a free re-entry, and the one route that
+            # is not — a store that vanished after the window saw it — is
+            # exactly the case that must not decide unserialized.
+            with _creation_admission_lock(path, board):
+                _assert_creation_admitted(path, board)
         # Read-only file/sidecar preflight (port of kilocode#12508) —
         # repair-or-refuse before the header/integrity probes so a stray
         # read-only kanban.db fails with an actionable message instead of
