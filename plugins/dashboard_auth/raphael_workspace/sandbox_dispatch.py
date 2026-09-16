@@ -89,6 +89,7 @@ bodies are never logged or returned — they can carry protected data.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -273,6 +274,11 @@ class _Sdk:
     credential: Any
     credential_binding: Any
     connection_config: Any
+    #: Fleet read surface: the metadata filter model and the manager that
+    #: lists with it. Reading what the kernel owns goes through these, never
+    #: through a local receipt file.
+    sandbox_filter: Any
+    manager: Any
 
 
 def _load_sdk() -> _Sdk:
@@ -284,8 +290,10 @@ def _load_sdk() -> _Sdk:
             CredentialProxyConfig,
             NetworkPolicy,
             NetworkRule,
+            SandboxFilter,
             SandboxImageSpec,
         )
+        from opensandbox.sync.manager import SandboxManagerSync
         from opensandbox.sync.sandbox import SandboxSync
     except ImportError as exc:
         raise SandboxDispatchError(
@@ -303,7 +311,126 @@ def _load_sdk() -> _Sdk:
         credential=Credential,
         credential_binding=CredentialBinding,
         connection_config=ConnectionConfigSync,
+        sandbox_filter=SandboxFilter,
+        manager=SandboxManagerSync,
     )
+
+
+# ---------------------------------------------------------------------------
+# Creation-time provenance for the machines this module creates
+# ---------------------------------------------------------------------------
+
+#: The resource kind every intent and verification is recorded under.
+KERNEL_SANDBOX_KIND = "raphael_build_sandbox"
+#: Stamped into create metadata so an independent reader can ask the control
+#: plane what this kernel owns with no local state. ``hermes_intent`` is the
+#: identity the kernel MINTS before the machine exists, which is what makes a
+#: machine created during a crash recognisable afterwards.
+KERNEL_OWNER = "hermes-kanban-kernel"
+KERNEL_OWNER_KEY = "hermes_owner"
+KERNEL_INTENT_KEY = "hermes_intent"
+_LIST_PAGE_SIZE = 100
+#: Only stops a control plane that never stops advertising a next page.
+_LIST_PAGE_LIMIT = 100
+
+
+def _kernel_metadata(
+    ctx: _WorkerContext, *, generation: int, project: str, intent_id: str
+) -> dict:
+    """The create stamp: every identity, as strings (the SDK types it so)."""
+    return {
+        "hermes_task": ctx.task_id,
+        "hermes_run": str(ctx.run_id),
+        "hermes_profile": ctx.profile,
+        "hermes_board": ctx.board or "default",
+        "hermes_project": project,
+        "hermes_generation": str(generation),
+        KERNEL_OWNER_KEY: KERNEL_OWNER,
+        KERNEL_INTENT_KEY: intent_id,
+    }
+
+
+def list_kernel_owned_sandboxes(
+    *, metadata: Optional[dict] = None, states: Optional[list] = None,
+    sdk: Optional[_Sdk] = None, connection: Optional[_Connection] = None,
+) -> list:
+    """Enumerate what the kernel owns THROUGH the SDK. Strictly read-only.
+
+    Filters by metadata and pages to the end of the result set. It never
+    creates, patches, kills or renews, and reads no local receipt, so an
+    independent reader with no board and no receipt file gets the same
+    answer as the host that created the machines.
+    """
+    sdk = sdk or _load_sdk()
+    manager = sdk.manager.create(
+        _connection_config(sdk, connection or _resolve_connection())
+    )
+    selector = {KERNEL_OWNER_KEY: KERNEL_OWNER, **(metadata or {})}
+    infos: list = []
+    try:
+        for page in range(1, _LIST_PAGE_LIMIT + 1):
+            paged = manager.list_sandbox_infos(sdk.sandbox_filter(
+                states=states, metadata=selector,
+                page_size=_LIST_PAGE_SIZE, page=page,
+            ))
+            batch = list(getattr(paged, "sandbox_infos", None) or [])
+            infos.extend(batch)
+            if not batch or not getattr(
+                getattr(paged, "pagination", None), "has_next_page", False
+            ):
+                break
+    except Exception as exc:
+        raise SandboxDispatchError(
+            "the remote build service could not be asked what this host owns, "
+            "so nothing is reported and nothing was changed.",
+            code="enumeration_failed",
+        ) from exc
+    finally:
+        with contextlib.suppress(Exception):
+            manager.close()
+    return infos
+
+
+def recover_creation_intents(*, board: Optional[str] = None, **kwargs: Any) -> dict:
+    """Resolve every intent whose machine was never confirmed, BOTH ways.
+
+    An intent still at ``intended`` is a crash between writing the intent
+    and recording the created machine. A machine carrying that intent
+    identity means the resource outlived the crash (orphan, attributable
+    and recoverable); no such machine means it never came into being.
+    Either outcome is RECORDED — nothing is deleted, nothing stays pending.
+    """
+    kb = _kanban()
+    pending = kb.kernel_resource_intents(
+        kind=KERNEL_SANDBOX_KIND, board_name=board,
+        state=kb.KERNEL_INTENT_INTENDED,
+    )
+    if not pending:
+        return {"orphan_resources": [], "never_created": []}
+    observed = {}
+    for info in list_kernel_owned_sandboxes(**kwargs):
+        identity = dict(getattr(info, "metadata", None) or {}).get(KERNEL_INTENT_KEY)
+        if identity:
+            observed[identity] = str(info.id)
+    resolved: dict = {"orphan_resources": [], "never_created": []}
+    for row in pending:
+        found = observed.get(row["record_id"])
+        kb.settle_kernel_resource_intent(
+            row["record_id"],
+            state=(kb.KERNEL_INTENT_ORPHAN_RESOURCE if found
+                   else kb.KERNEL_INTENT_NEVER_CREATED),
+            resolution=(
+                "a machine carrying this intent identity was found through the "
+                "SDK, so the resource outlived the crash" if found else
+                "no machine carries this intent identity, so the crash fell "
+                "between writing the intent and creating the machine"
+            ),
+            subject_id=found,
+        )
+        entry = {"intent_id": row["record_id"]}
+        key = "orphan_resources" if found else "never_created"
+        resolved[key].append({**entry, "sandbox_id": found} if found else entry)
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -1787,6 +1914,25 @@ def _provision(
         )
         archive, source_digest = _package_source(source, staging)
 
+        # The creation intent is durable BEFORE the machine exists, outside
+        # this board's own store, and it mints the identity the machine is
+        # stamped with — the only way a machine created during a crash can
+        # be recognised afterwards. Fails closed: no intent, no machine.
+        project = str(getattr(_resolve_task(ctx), "project_id", "") or "")
+        kb = _kanban()
+        try:
+            intent_id = kb.record_kernel_creation(
+                family=kb.KERNEL_FAMILY_RESOURCE, kind=KERNEL_SANDBOX_KIND,
+                board=ctx.board, task_id=ctx.task_id, run_id=ctx.run_id,
+                project_id=project or None, generation=generation,
+            )
+        except Exception as exc:
+            raise SandboxDispatchError(
+                "this run's build-machine creation intent could not be "
+                "recorded outside the board, so no machine was started.",
+                code="intent_unavailable",
+            ) from exc
+
         config = _connection_config(sdk, connection)
         network_policy = sdk.network_policy(
             default_action="deny",
@@ -1802,11 +1948,10 @@ def _provision(
                 ready_timeout=timedelta(seconds=SANDBOX_READY_TIMEOUT_SECONDS),
                 resource=dict(SANDBOX_RESOURCES),
                 env=_sandbox_env(secret) if secret is not None else {},
-                metadata={
-                    "hermes_task": ctx.task_id,
-                    "hermes_run": str(ctx.run_id),
-                    "hermes_profile": ctx.profile,
-                },
+                metadata=_kernel_metadata(
+                    ctx, generation=generation, project=project,
+                    intent_id=intent_id,
+                ),
                 network_policy=network_policy,
                 credential_proxy=(sdk.credential_proxy(enabled=True) if secret is not None else None),
                 connection_config=config,
@@ -1817,6 +1962,12 @@ def _provision(
                 "operator to check the connection and retry.",
                 code="create_failed",
             ) from exc
+
+        # The observed concrete id, recorded against the intent that named
+        # this machine before it existed.
+        kb.settle_kernel_resource_intent(
+            intent_id, state=kb.KERNEL_INTENT_CREATED, subject_id=str(sandbox.id),
+        )
 
         created = _advance_reservation(
             ctx,

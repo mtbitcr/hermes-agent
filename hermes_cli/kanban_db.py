@@ -2289,7 +2289,36 @@ CREATE TABLE IF NOT EXISTS board_removal_phase (
     updated_at              INTEGER NOT NULL
 );
 
+-- CREATION-TIME provenance for what the KERNEL creates. It lives here —
+-- OUTSIDE every board — so a board removal cannot destroy the record of
+-- what its kernel made, and a reader with no local receipt can still read
+-- it. One row per created thing, written AS the kernel creates it
+-- (commits) or BEFORE the thing exists (resources: the kernel mints
+-- ``record_id`` and stamps it into the creation request, then fills in the
+-- observed ``subject_id``). A crash between the two is settled by
+-- RECORDING the outcome in ``state``/``resolution``, never by deleting.
+-- Nothing reconstructs a row afterwards, and a thing with no row here is
+-- never claimed as kernel-created.
+CREATE TABLE IF NOT EXISTS kernel_creation_provenance (
+    record_id               TEXT PRIMARY KEY,
+    family                  TEXT NOT NULL,
+    kind                    TEXT NOT NULL,
+    subject_id              TEXT,
+    board_name              TEXT,
+    task_id                 TEXT,
+    run_id                  INTEGER,
+    project_id              TEXT,
+    generation              INTEGER,
+    reference               TEXT,
+    state                   TEXT NOT NULL,
+    resolution              TEXT,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_register_lifecycle ON board_register(lifecycle);
+CREATE INDEX IF NOT EXISTS idx_kernel_provenance_subject
+    ON kernel_creation_provenance(subject_id);
 CREATE INDEX IF NOT EXISTS idx_archive_board ON board_removal_archive(board_name);
 CREATE INDEX IF NOT EXISTS idx_removal_phase_phase ON board_removal_phase(phase);
 """
@@ -2426,6 +2455,187 @@ def register_connect() -> sqlite3.Connection:
         yield conn
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Creation-time provenance ledger (see ``kernel_creation_provenance`` above)
+# ---------------------------------------------------------------------------
+
+#: Named on every receipt whose commit list is covered by ledger rows.
+KERNEL_COMMIT_PROVENANCE_SOURCE = "creation-time-commit-provenance-ledger"
+
+KERNEL_FAMILY_COMMIT = "commit"
+KERNEL_FAMILY_RESOURCE = "resource"
+#: ``state``: a resource is INTENDED before it exists and CREATED once its
+#: id is observed; the last two settle a crash between those, either way.
+KERNEL_INTENT_INTENDED = "intended"
+KERNEL_INTENT_CREATED = "created"
+KERNEL_INTENT_ORPHAN_RESOURCE = "orphan_resource"
+KERNEL_INTENT_NEVER_CREATED = "never_created"
+
+_KERNEL_INSERT = (
+    "INSERT OR IGNORE INTO kernel_creation_provenance (record_id, family, "
+    "kind, subject_id, board_name, task_id, run_id, project_id, generation, "
+    "reference, state, created_at, updated_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def kernel_provenance_rows(**filters: Any) -> list:
+    """Rows matching these column equalities. READ-ONLY; writes nothing.
+
+    Reads the register read-only, so an absent, unreadable or older store
+    reads as "no rows" — which callers turn into UNVERIFIED, never a pass.
+    """
+    columns = {name: value for name, value in filters.items() if value is not None}
+    path = register_db_path()
+    if not path.exists():
+        return []
+    where = " AND ".join(f"{name} = ?" for name in columns)
+    sql = "SELECT * FROM kernel_creation_provenance"
+    sql += f"{' WHERE ' + where if where else ''} ORDER BY created_at, record_id"
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except (sqlite3.Error, OSError, ValueError):
+        return []
+    try:
+        conn.row_factory = sqlite3.Row
+        params = tuple(str(value) for value in columns.values())
+        return [dict(row) for row in conn.execute(sql, params)]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def _kernel_ledger_write(sql: str, params: tuple) -> int:
+    with register_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(sql, params)
+            conn.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
+    return cur.rowcount
+
+
+def record_kernel_creation(
+    *, family: str, kind: str, subject_id: Any = None, board: Any = None,
+    task_id: Any = None, run_id: Any = None, project_id: Any = None,
+    generation: Any = None, reference: Any = None,
+) -> str:
+    """Write ONE creation-time row and return its record id.
+
+    A COMMIT is recorded the moment it exists, with its exact id as the
+    subject. A RESOURCE is recorded BEFORE it exists, with no subject yet
+    and a record id MINTED here for the kernel to stamp into the creation
+    request — a remote id cannot serve, because it does not exist yet,
+    which is exactly the window this row covers.
+    """
+    subject = None if subject_id is None else str(subject_id).strip()
+    if family == KERNEL_FAMILY_COMMIT:
+        if not re.fullmatch(r"[0-9a-fA-F]{7,64}", subject or ""):
+            raise ValueError("a creation-time commit record needs an exact commit id")
+        board = _normalize_board_slug(board) or DEFAULT_BOARD
+        record_id, state = f"{family}:{board}:{subject}", KERNEL_INTENT_CREATED
+    else:
+        record_id, state = f"kri-{secrets.token_hex(16)}", KERNEL_INTENT_INTENDED
+    now = int(time.time())
+    _kernel_ledger_write(_KERNEL_INSERT, (
+        record_id, str(family), str(kind), subject,
+        None if board is None else (_normalize_board_slug(board) or str(board)),
+        None if task_id is None else str(task_id),
+        None if run_id is None else int(run_id),
+        None if project_id is None else str(project_id),
+        None if generation is None else int(generation),
+        None if reference is None else str(reference),
+        state, now, now,
+    ))
+    return record_id
+
+
+def kernel_commit_records(board: Any = None, **filters: Any) -> list:
+    """The creation-time rows for commits, by identity. Read-only."""
+    return kernel_provenance_rows(
+        family=KERNEL_FAMILY_COMMIT, **filters,
+        board_name=None if board is None else (
+            _normalize_board_slug(board) or str(board)
+        ),
+    )
+
+
+def kernel_resource_intents(**filters: Any) -> list:
+    """The creation-intent rows matching this identity. Read-only."""
+    return kernel_provenance_rows(family=KERNEL_FAMILY_RESOURCE, **filters)
+
+
+def settle_kernel_resource_intent(
+    record_id: str, *, state: str, subject_id: Any = None, resolution: Any = None
+) -> bool:
+    """Record what became of a pending intent. Never deletes it.
+
+    ``CREATED`` carries the OBSERVED id of the resource that now exists.
+    The other two are the crash directions: the resource outlived the crash
+    (orphan, with the observed id) or it never came into being.
+    """
+    if state not in (KERNEL_INTENT_CREATED, KERNEL_INTENT_ORPHAN_RESOURCE,
+                     KERNEL_INTENT_NEVER_CREATED):
+        raise ValueError(f"{state!r} is not an outcome of a creation intent")
+    if state != KERNEL_INTENT_NEVER_CREATED and not str(subject_id or "").strip():
+        raise ValueError("a resource that exists must be recorded by its exact id")
+    return _kernel_ledger_write(
+        "UPDATE kernel_creation_provenance SET state = ?, resolution = ?, "
+        "subject_id = COALESCE(?, subject_id), updated_at = ? "
+        "WHERE record_id = ? AND state = ?",
+        (state, None if resolution is None else str(resolution),
+         None if subject_id is None else str(subject_id), int(time.time()),
+         str(record_id), KERNEL_INTENT_INTENDED),
+    ) == 1
+
+
+@dataclass(frozen=True)
+class ProvenanceVerification:
+    """A read-only verdict about ONE subject's creation-time record.
+
+    Neither a boolean nor authority: an unrecorded subject is UNVERIFIED
+    for good — verifying writes nothing, so observation cannot upgrade it —
+    and no verdict authorizes destroying anything. Truth testing raises
+    rather than letting ``if verify(x):`` read as permission.
+    """
+
+    subject: str
+    verdict: str
+    detail: str
+    record: Optional[dict] = None
+
+    def __bool__(self) -> bool:
+        raise TypeError(
+            "a provenance verification is not a boolean and never authorizes "
+            "destruction; read .verdict"
+        )
+
+    @property
+    def authorizes_destruction(self) -> bool:
+        return False
+
+
+def verify_kernel_creation(subject_id: Any, **filters: Any) -> ProvenanceVerification:
+    """The READ-ONLY verification entry point: is there a creation record?"""
+    subject = str(subject_id or "").strip()
+    rows = kernel_provenance_rows(subject_id=subject, **filters)
+    if rows:
+        return ProvenanceVerification(
+            subject, RECEIPT_VERDICT_PASS,
+            f"{subject!r} was recorded at creation time by the kernel",
+            dict(rows[0]),
+        )
+    return ProvenanceVerification(
+        subject, RECEIPT_VERDICT_UNVERIFIED,
+        f"no creation-time record covers {subject!r}, so the kernel does not "
+        "claim it; this verdict is permanent and authorizes nothing",
+    )
 
 
 REGISTER_LOCK_TIMEOUT_SECONDS = 5.0
@@ -8313,28 +8523,30 @@ BOARD_CREATED_COMMIT_RULE = (
 _RUN_EXECUTION_RECEIPT_KEY = "execution_receipt"
 
 # WHERE the commit list comes from, named on every receipt and in every
-# prospective statement. There is exactly one derivation and it is this
-# one: the run receipts each advance persisted at completion time.
-#
-# There is deliberately NO creation-time commit provenance ledger in this
-# milestone (owner decision, deferred). That absence is the reason
-# completeness cannot be claimed, so the source and the honest completeness
-# marking are written down together, here, and referenced everywhere else.
-COMMIT_LIST_SOURCE = "recorded-run-receipts"
+# prospective statement. Two durable derivations, both named: the run
+# receipts each advance persisted at completion time, and the creation-time
+# ledger the kernel writes AS it makes a commit. The ledger covers only
+# what the KERNEL created, so completeness is earned per reference, from
+# rows, rather than claimed here.
+COMMIT_LIST_SOURCE = f"recorded-run-receipts+{KERNEL_COMMIT_PROVENANCE_SOURCE}"
 COMMIT_LIST_SOURCE_STATEMENT = (
     "this commit list is derived from the RECORDED RUN RECEIPTS — the "
     f"task_runs.metadata.{_RUN_EXECUTION_RECEIPT_KEY} rows each advance "
-    "persisted when it completed — and from the per-task git receipt "
-    "columns. It is NOT derived from a creation-time commit provenance "
-    "ledger: this milestone builds no such ledger."
+    "persisted when it completed — from the per-task git receipt columns, "
+    "and from the creation-time commit provenance ledger. It is NEVER "
+    "derived from a base..head range."
 )
 COMMIT_LIST_COMPLETENESS_UNVERIFIED = (
-    "no creation-time commit provenance ledger exists, so a recorded run "
+    "no creation-time ledger row covers this reference, so a recorded run "
     "receipt names the HEAD its advance produced but not every commit that "
     "advance created. Where one advance produced SEVERAL commits, only its "
     "head is on this list. Completeness is therefore UNVERIFIED — it is not "
     "claimed as a complete enumeration, and the absence of an entry is not "
     "evidence that no commit exists."
+)
+COMMIT_LIST_COMPLETENESS_COVERED = (
+    "every commit on this list carries a creation-time ledger row the "
+    "kernel wrote as it created that commit, so this IS the enumeration"
 )
 COMMIT_LIST_COMPLETENESS_NO_RECEIPT = (
     "this reference records a real head commit but no run receipt names an "
@@ -8344,27 +8556,74 @@ COMMIT_LIST_COMPLETENESS_NO_RECEIPT = (
 
 
 def commit_list_completeness(ref: dict) -> dict:
-    """The honest completeness marking for ONE reference's commit list.
+    """The completeness marking for ONE reference's commit list, EARNED.
 
-    Always :data:`RECEIPT_VERDICT_UNVERIFIED` while the creation-time
-    provenance ledger is absent — which it is, by owner decision, for this
-    milestone. The verdict is stated rather than omitted, and the reasons
-    name the specific things about THIS reference that cannot be
-    established, so a reader is never left to infer completeness from
-    silence or from a bare PASS that only meant "nothing was found".
+    :data:`RECEIPT_VERDICT_PASS` only where every commit on the list — and
+    the recorded head — carries a creation-time ledger row, the only thing
+    that establishes the kernel created it. Anything else is
+    :data:`RECEIPT_VERDICT_UNVERIFIED` naming the exact commits not
+    covered, so completeness is never inferred from silence or from a bare
+    PASS that only meant "nothing was found".
     """
     advances = ref.get("advances") or []
-    head = ref.get("head_commit")
-    reasons = [COMMIT_LIST_COMPLETENESS_UNVERIFIED]
-    if head and not advances:
-        reasons.append(COMMIT_LIST_COMPLETENESS_NO_RECEIPT)
+    head = str(ref.get("head_commit") or "").strip()
+    recorded = {
+        str(row.get("subject_id"))
+        for row in (ref.get("kernel_commit_records") or [])
+        if row.get("subject_id")
+    }
+    listed = [
+        str(commit) for commit in
+        (ref.get("board_created_commits") or ref.get("commits") or [])
+    ]
+    uncovered = list(dict.fromkeys(
+        commit for commit in listed + [head] if commit and commit not in recorded
+    ))
+    covered = bool(recorded) and not uncovered
+    if covered:
+        reasons = [COMMIT_LIST_COMPLETENESS_COVERED]
+    elif recorded:
+        reasons = [f"no creation-time row covers {', '.join(uncovered)}"]
+    else:
+        reasons = [COMMIT_LIST_COMPLETENESS_UNVERIFIED]
+        if head and not advances:
+            reasons.append(COMMIT_LIST_COMPLETENESS_NO_RECEIPT)
     return {
-        "verdict": RECEIPT_VERDICT_UNVERIFIED,
-        "source": COMMIT_LIST_SOURCE,
-        "creation_time_provenance_ledger": "absent",
+        "verdict": RECEIPT_VERDICT_PASS if covered else RECEIPT_VERDICT_UNVERIFIED,
+        "source": KERNEL_COMMIT_PROVENANCE_SOURCE if covered else COMMIT_LIST_SOURCE,
+        "creation_time_provenance_ledger": (
+            "present" if covered else "partial" if recorded else "absent"
+        ),
+        "uncovered_commits": uncovered,
         "reasons": reasons,
         "advance_count": len(advances),
         "head_recorded": bool(head),
+    }
+
+
+def _commit_list_completeness_summary(references: list) -> dict:
+    """Section-level completeness: the conjunction of the per-reference
+    verdicts, each earned from creation-time rows — never asserted here."""
+    per_reference = [
+        {"task": ref.get("task"), "reference": ref.get("reference"),
+         "completeness": commit_list_completeness(ref)}
+        for ref in references
+    ]
+    states = {
+        entry["completeness"]["creation_time_provenance_ledger"]
+        for entry in per_reference
+    }
+    covered = bool(per_reference) and states == {"present"}
+    return {
+        "verdict": RECEIPT_VERDICT_PASS if covered else RECEIPT_VERDICT_UNVERIFIED,
+        "creation_time_provenance_ledger": (
+            "present" if covered else "absent" if states <= {"absent"} else "partial"
+        ),
+        "reason": (
+            COMMIT_LIST_COMPLETENESS_COVERED if covered
+            else COMMIT_LIST_COMPLETENESS_UNVERIFIED
+        ),
+        "per_reference": per_reference,
     }
 
 
@@ -8432,14 +8691,15 @@ def _task_advance_ledger(
 
 
 def _board_created_commits(
-    *, base_commit: Any, head_commit: Any, advances: list
+    *, base_commit: Any, head_commit: Any, advances: list, ledger: Any = (),
 ) -> "tuple[list, list, list]":
     """Apply :data:`BOARD_CREATED_COMMIT_RULE`. The only implementation.
 
     Returns ``(created, absorbed, provenance)``: the exact ordered list of
     commit identities this board created, the heads absorbed from another
     subject's work (disclosed, never claimed), and one provenance entry per
-    created commit naming the durable receipt it came from.
+    created commit naming the durable record it came from: the creation-
+    time ledger row where one exists, the recorded receipt otherwise.
     """
     base = str(base_commit).strip() if base_commit else None
     absorbed: list = []
@@ -8479,6 +8739,17 @@ def _board_created_commits(
             **detail,
         })
 
+    # Creation-time rows first: a commit the kernel recorded as it made it
+    # is provenanced by that row, carrying the identity that produced it,
+    # not by a receipt written afterwards.
+    for row in ledger or ():
+        _consider(row.get("subject_id"), KERNEL_COMMIT_PROVENANCE_SOURCE, {
+            "rule": "recorded-by-the-kernel-when-it-created-the-commit",
+            "run": row.get("run_id"), "reference": row.get("reference"),
+            "recorded_at": row.get("created_at"), "task": row.get("task_id"),
+            "board": row.get("board_name"), "project": row.get("project_id"),
+            "generation": row.get("generation"), "commit_kind": row.get("kind"),
+        })
     for advance in advances:
         _consider(
             advance.get("head_commit"), "advance-head-receipt",
@@ -8495,7 +8766,7 @@ def _board_created_commits(
     return created, absorbed, provenance
 
 
-def _board_work_scope(conn: sqlite3.Connection) -> dict:
+def _board_work_scope(conn: sqlite3.Connection, board: Any = None) -> dict:
     """This board's durable record of the work areas it created elsewhere.
 
     Read from the board's own task rows — the only durable place it
@@ -8552,10 +8823,13 @@ def _board_work_scope(conn: sqlite3.Connection) -> dict:
         base_commit = task.get("base_commit")
         head_commit = task.get("head_commit")
         advances, advance_source = _task_advance_ledger(conn, task_id)
+        # The creation-time rows for THIS task, read from outside the board.
+        kernel_rows = kernel_commit_records(board, task_id=task_id)
         created, absorbed, provenance = _board_created_commits(
             base_commit=base_commit, head_commit=head_commit, advances=advances,
+            ledger=kernel_rows,
         )
-        if reference or created or absorbed or base_commit or head_commit:
+        if reference or created or absorbed or base_commit or head_commit or kernel_rows:
             references.append({
                 "task": task_id,
                 "title": title,
@@ -8576,6 +8850,7 @@ def _board_work_scope(conn: sqlite3.Connection) -> dict:
                 "commit_provenance": provenance,
                 "commit_rule": BOARD_CREATED_COMMIT_RULE,
                 "advances_read_from": advance_source,
+                "kernel_commit_records": kernel_rows,
             })
         work_area = task.get("workspace_path")
         if task.get("workspace_kind") != "worktree":
@@ -8629,7 +8904,7 @@ def _carried_outside_resource_ledger(slug: str, conn: sqlite3.Connection) -> lis
     each of them. Recorded before anything is destroyed, so authority is
     never destroyed before the resource it governs is released.
     """
-    work = _board_work_scope(conn)
+    work = _board_work_scope(conn, slug)
     ledger = []
     for scope in CARRIED_LEDGER_SCOPE:
         entry = {
@@ -11034,32 +11309,25 @@ def _build_receipt_verification(
         evidence={"rule": BOARD_CREATED_COMMIT_RULE, "unnamed": unnamed},
     ))
 
-    # The commit list's SOURCE is a named fact on the receipt, and its
-    # COMPLETENESS is not something this build can verify: the creation-time
-    # commit provenance ledger that would establish it is deferred and
-    # absent. Marked UNVERIFIED here rather than claimed, dropped, or
-    # allowed to read as a pass.
+    # The commit list's SOURCE is a named fact on the receipt; its
+    # COMPLETENESS is earned per reference from creation-time ledger rows,
+    # so one reference with an uncovered commit holds this check at
+    # UNVERIFIED instead of letting it read as a pass.
+    summary = _commit_list_completeness_summary(references)
     checks.append(_receipt_check(
         "commit-list-completeness",
         "the commit list's source is named, and its completeness is only "
         "claimed where durable state can establish it",
-        verdict=RECEIPT_VERDICT_UNVERIFIED,
+        verdict=summary["verdict"],
         observed=(
             f"the commit list for {len(references)} reference(s) is derived "
-            f"from {COMMIT_LIST_SOURCE}; {COMMIT_LIST_COMPLETENESS_UNVERIFIED}"
+            f"from {COMMIT_LIST_SOURCE}; creation-time ledger coverage: "
+            f"{summary['creation_time_provenance_ledger']}"
         ),
         evidence={
             "commit_list_source": COMMIT_LIST_SOURCE,
             "commit_list_source_statement": COMMIT_LIST_SOURCE_STATEMENT,
-            "creation_time_provenance_ledger": "absent",
-            "per_reference": [
-                {
-                    "task": ref.get("task"),
-                    "reference": ref.get("reference"),
-                    "completeness": commit_list_completeness(ref),
-                }
-                for ref in references
-            ],
+            **summary,
         },
     ))
 
@@ -11319,11 +11587,7 @@ def _build_version_control_receipt(payload: dict) -> dict:
         "source": vc_entry.get("read_from", "outside_resource_ledger"),
         "commit_list_source": COMMIT_LIST_SOURCE,
         "commit_list_source_statement": COMMIT_LIST_SOURCE_STATEMENT,
-        "commit_list_completeness": {
-            "verdict": RECEIPT_VERDICT_UNVERIFIED,
-            "creation_time_provenance_ledger": "absent",
-            "reason": COMMIT_LIST_COMPLETENESS_UNVERIFIED,
-        },
+        "commit_list_completeness": _commit_list_completeness_summary(references),
     }
 
 
@@ -11341,6 +11605,7 @@ def _build_reference_receipt(ref: dict) -> dict:
     base = ref.get("base_commit")
     absorbed = ref.get("absorbed_heads") or []
     advances = ref.get("advances") or []
+    completeness = commit_list_completeness(ref)
     return {
         "repository": ref.get("container") or RECEIPT_VERDICT_UNVERIFIED,
         "reference": ref.get("reference") or RECEIPT_VERDICT_UNVERIFIED,
@@ -11370,7 +11635,7 @@ def _build_reference_receipt(ref: dict) -> dict:
             or "this board's durable task rows' recorded git receipts"
         ),
         # WHERE this list came from, as a named field, so a reader never
-        # has to assume it came from a creation-time provenance ledger.
+        # has to assume which of the two durable sources covered it.
         "commit_list_source": {
             "source": COMMIT_LIST_SOURCE,
             "statement": COMMIT_LIST_SOURCE_STATEMENT,
@@ -11378,11 +11643,13 @@ def _build_reference_receipt(ref: dict) -> dict:
                 ref.get("advances_read_from")
                 or "this board's durable task rows' recorded git receipts"
             ),
-            "creation_time_provenance_ledger": "absent",
+            "creation_time_provenance_ledger": completeness[
+                "creation_time_provenance_ledger"],
+            "creation_time_records": ref.get("kernel_commit_records") or [],
         },
-        # …and how complete that makes it. Never a verified claim while the
-        # ledger is absent, and never silence.
-        "commit_list_completeness": commit_list_completeness(ref),
+        # …and how complete that makes it. Claimed only where every commit
+        # carries a creation-time row, and never silence.
+        "commit_list_completeness": completeness,
     }
 
 
@@ -28675,6 +28942,26 @@ def _rollback_worktree_materialization(
         ) from exc
 
 
+def _record_kernel_created_commit(task: Any, workspace: Path, *, kind: str) -> str:
+    """Record the commit the kernel JUST created, with its full identity.
+
+    Resolves the exact new id and writes it to the creation-time ledger in
+    the step that created it. A failure here is fatal on purpose: the
+    caller's rollback abandons the commit, so no commit survives whose
+    provenance nothing recorded.
+    """
+    head = str(_git_output(workspace, "rev-parse", "--verify", "HEAD")).strip()
+    board = get_current_board()
+    entry = get_register_entry(board)
+    record_kernel_creation(
+        family=KERNEL_FAMILY_COMMIT, kind=kind, subject_id=head, board=board,
+        task_id=task.id, run_id=task.current_run_id, project_id=task.project_id,
+        generation=None if entry is None else entry.epoch,
+        reference=task.branch_name,
+    )
+    return head
+
+
 def _materialize_remote_worktree_handoff(
     conn: sqlite3.Connection,
     task_id: str,
@@ -28838,6 +29125,9 @@ def _materialize_remote_worktree_handoff(
                     _git_mutation(
                         workspace, "merge", "--no-ff", "--no-edit", parent_head
                     )
+                    _record_kernel_created_commit(
+                        task, workspace, kind="parent-head-integration-merge",
+                    )
                     merged_any = True
                 merged_parent_heads.append(
                     {"task_id": str(row["id"]), "head_commit": parent_head}
@@ -28910,10 +29200,21 @@ def _materialize_remote_worktree_handoff(
                     f"Hermes-Patch-SHA256: {patch_sha256}"
                 )
                 _git_mutation(workspace, "commit", "--no-gpg-sign", "-m", message)
+                _record_kernel_created_commit(
+                    task, workspace, kind="materialized-remote-handoff",
+                )
 
         materialized_head = str(
             _git_output(workspace, "rev-parse", "--verify", "HEAD")
         ).strip()
+        # The courier-free native path: HEAD advanced by a route the two
+        # calls above do not cover, so the new head is recorded rather than
+        # left unattributed. The insert ignores a commit already recorded,
+        # so the more specific kind above wins and no row is rewritten.
+        if materialized_head != original_head:
+            _record_kernel_created_commit(
+                task, workspace, kind="native-materialization-head",
+            )
         if (
             materialized_head == original_head
             and not patch_already_materialized
