@@ -47,6 +47,17 @@ def _repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _board(tmp_path: Path):
+    """Create this test's board store, then open it.
+
+    ``kb.connect()`` only ever opens an existing store — creating one is
+    ``init_db``'s job — so a test that wants a scratch board asks for it.
+    """
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    return kb.connect(db_path)
+
+
 def _project_task(conn, *, title: str, owned_paths):
     task_id = kb.create_task(
         conn,
@@ -84,7 +95,7 @@ def test_owned_path_contract_is_literal_canonical_and_bounded(tmp_path):
         with pytest.raises(ValueError):
             kb.normalize_owned_paths(invalid)
 
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         with pytest.raises(ValueError, match="requires a mutating owned_paths"):
             kb.create_task(
@@ -113,7 +124,7 @@ def test_owned_path_contract_is_literal_canonical_and_bounded(tmp_path):
 
 
 def test_claim_allows_only_disjoint_or_read_only_project_work(tmp_path):
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         first = _project_task(conn, title="first", owned_paths=["src/a"])
         disjoint = _project_task(conn, title="disjoint", owned_paths=["src/b"])
@@ -170,7 +181,7 @@ def test_claim_allows_only_disjoint_or_read_only_project_work(tmp_path):
 
 
 def test_dispatch_reports_scope_deferral_without_dropping_task(tmp_path, monkeypatch):
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         first = _project_task(conn, title="running", owned_paths=["src/a"])
         overlap = _project_task(conn, title="waiting", owned_paths=["src/a/file.py"])
@@ -193,7 +204,7 @@ def test_dispatch_reports_scope_deferral_without_dropping_task(tmp_path, monkeyp
 def test_duplicate_projects_on_same_repo_still_contend(tmp_path):
     repo = tmp_path / "shared-repo"
     other_repo = tmp_path / "other-repo"
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         first = _project_task(conn, title="first project", owned_paths=["src/shared"])
         duplicate = _project_task(
@@ -262,7 +273,7 @@ def _attach_patch(conn, task_id: str, root: Path, path: str, content: str) -> in
 
 def test_cross_profile_child_inherits_project_repo_without_sharing_worktree(tmp_path):
     repo = _repo(tmp_path)
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         parent_id = kb.create_task(
             conn,
@@ -310,7 +321,7 @@ def test_kernel_materializes_current_run_patch_inside_owned_scope(
     repo = _repo(tmp_path)
     attachment_root = tmp_path / "attachments"
     monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(attachment_root))
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(
             conn,
@@ -379,7 +390,7 @@ def test_kernel_rejects_out_of_scope_patch_and_restores_worktree(
     repo = _repo(tmp_path)
     attachment_root = tmp_path / "attachments"
     monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(attachment_root))
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(
             conn,
@@ -428,7 +439,7 @@ def test_kernel_merges_exact_parent_heads_before_integration_patch(
     repo = _repo(tmp_path)
     attachment_root = tmp_path / "attachments"
     monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(attachment_root))
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
 
     def create_scoped(title, branch, owned_paths, parents=(), *, integrates=False):
         task_id = kb.create_task(
@@ -552,7 +563,7 @@ def test_cli_claim_records_worktree_base_before_control_returns(tmp_path, monkey
 
 def test_completion_derives_exact_clean_in_scope_git_receipt(tmp_path):
     repo = _repo(tmp_path)
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(
             conn,
@@ -602,7 +613,7 @@ def test_completion_derives_exact_clean_in_scope_git_receipt(tmp_path):
 
 def test_completion_rejects_noop_for_mutating_scope_without_closing_task(tmp_path):
     repo = _repo(tmp_path)
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(
             conn,
@@ -630,7 +641,7 @@ def test_completion_rejects_noop_for_mutating_scope_without_closing_task(tmp_pat
 
 def test_integrator_must_contain_every_exact_same_project_parent_head(tmp_path):
     repo = _repo(tmp_path)
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
 
     def create_scoped(
         title, branch, owned_paths, parents=(), *, integrates_parent_heads=False
@@ -715,7 +726,7 @@ def test_integrator_rejects_mutating_parent_without_git_receipt(
     tmp_path, parent_owned_paths
 ):
     repo = _repo(tmp_path)
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         parent = kb.create_task(
             conn,
@@ -758,7 +769,7 @@ def test_integrator_rejects_mutating_parent_without_git_receipt(
 
 def test_integrator_rechecks_parent_head_at_completion(tmp_path):
     repo = _repo(tmp_path)
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         parent = kb.create_task(
             conn,
@@ -831,7 +842,7 @@ def test_integrator_rechecks_parent_head_at_completion(tmp_path):
 
 def test_completion_rejects_dirty_worktree_without_closing_task(tmp_path):
     repo = _repo(tmp_path)
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(
             conn,
@@ -858,7 +869,7 @@ def test_completion_rejects_dirty_worktree_without_closing_task(tmp_path):
 
 def test_completion_rejects_committed_out_of_scope_change_without_closing_task(tmp_path):
     repo = _repo(tmp_path)
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(
             conn,
@@ -886,7 +897,7 @@ def test_completion_rejects_committed_out_of_scope_change_without_closing_task(t
 
 def test_large_receipt_keeps_bounded_path_evidence(tmp_path, monkeypatch):
     repo = _repo(tmp_path)
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         monkeypatch.setattr(kb, "_MAX_RECEIPT_CHANGED_PATHS", 1)
         task_id = kb.create_task(

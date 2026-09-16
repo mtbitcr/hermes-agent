@@ -93,6 +93,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import (
+    InitLockDirectoryAbsent,
     InitLockUnavailable,
     add_column_if_missing as _add_column_if_missing,
     cross_process_init_lock as _shared_cross_process_init_lock,
@@ -1313,21 +1314,28 @@ def create_board(
     Returns the resulting metadata. Raises :class:`ValueError` for a
     malformed slug; returns the existing metadata (not an error) if the
     board already exists — matching ``mkdir -p`` semantics.
+
+    A board the register has removed is refused (GA-2) BEFORE the first
+    side effect. This used to write ``board.json`` first and let ``init_db``
+    refuse afterwards, which left a discoverable directory + metadata ghost
+    for a name that was supposed to stay removed: a refusal that arrives
+    after the side effect is too late.
     """
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
-    meta = write_board_metadata(
-        normed,
-        name=name,
-        description=description,
-        icon=icon,
-        color=color,
-        default_workdir=default_workdir,
-        project_id=project_id,
-    )
-    # Touch the DB so list_boards() sees it immediately.
-    init_db(board=normed)
+    with _admitted_store_creation(kanban_db_path(board=normed), normed):
+        meta = write_board_metadata(
+            normed,
+            name=name,
+            description=description,
+            icon=icon,
+            color=color,
+            default_workdir=default_workdir,
+            project_id=project_id,
+        )
+        # Touch the DB so list_boards() sees it immediately.
+        init_db(board=normed)
     return meta
 
 
@@ -1400,9 +1408,9 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if get_current_board() == normed:
         clear_current_board()
 
-    # A concurrent connect(board=normed) after the rename/delete recreates
-    # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
-    # dropped first so the schema init pass re-runs on that fresh file.
+    # connect() no longer recreates a store it finds missing, but this slug
+    # can legitimately be created again later; the cache entry must not
+    # survive the rename/delete or that fresh file would skip schema init.
     _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
 
     if archive:
@@ -14220,7 +14228,27 @@ def _cross_process_init_lock(path: Path):
     additive migrations), so the worst case of two processes racing first-init
     is redundant work, not corruption. A bounded "proceed anyway" beats an
     unbounded hang that silently stops the board.
+
+    **The lock never creates the store's directory.** ``<path>.init.lock`` is
+    a sibling of the database, so ACQUIRING it used to ``mkdir`` a board
+    directory a removal had just taken away and leave a lock file sitting
+    inside it — the removed board's directory back from the dead, brought
+    there by the lock rather than by any admitted creation. The containing
+    directory is therefore a PRECONDITION here
+    (``require_existing_directory=True``), not something the shared helper
+    materialises. Making it is the admitted creation window's job
+    (:func:`_admitted_store_creation`), which does it under this board's
+    register lock and only once the register has said this board may have a
+    store at all.
+
+    Asking the helper is the whole point: a ``path.parent.exists()`` test
+    here followed by a helper that could still ``mkdir`` is a check/use race,
+    and a removal landing in that gap was recreating the board directory.
+    The refusal now comes from the ``ENOENT`` the OPEN returned, so there is
+    no instant at which a removal can land and still be overtaken — and it
+    is reported as the same GA-4 refusal an absent store gets anywhere else.
     """
+
     def _warn(lock_path, timeout_seconds):
         _log.warning(
             "kanban init lock for %s not acquired within %.0fs — proceeding "
@@ -14230,12 +14258,22 @@ def _cross_process_init_lock(path: Path):
             lock_path, timeout_seconds,
         )
 
-    with _shared_cross_process_init_lock(
-        path,
-        timeout_seconds=_INIT_LOCK_TIMEOUT_SECONDS,
-        poll_seconds=_INIT_LOCK_POLL_SECONDS,
-        on_timeout=_warn,
-    ):
+    with contextlib.ExitStack() as stack:
+        try:
+            # enter_context so ONLY the acquire is translated: an
+            # InitLockDirectoryAbsent raised by the body would mean something
+            # else entirely and must not be reported as this board's refusal.
+            stack.enter_context(
+                _shared_cross_process_init_lock(
+                    path,
+                    timeout_seconds=_INIT_LOCK_TIMEOUT_SECONDS,
+                    poll_seconds=_INIT_LOCK_POLL_SECONDS,
+                    on_timeout=_warn,
+                    require_existing_directory=True,
+                )
+            )
+        except InitLockDirectoryAbsent as exc:
+            raise BoardFenceClosedError(_absent_board_store_refusal(path)) from exc
         yield
 
 
@@ -14906,20 +14944,217 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+def _absent_board_store_refusal(path: Path) -> FenceRefusal:
+    """GA-4's refusal: there is no store here and an open never makes one."""
+    slug = board_slug_for_db_path(path)
+    return FenceRefusal(
+        outcome=FenceOutcome.REFUSED_CLOSED,
+        rule=FenceRefusalRule.GA_4,
+        board=slug or str(path),
+        message=(
+            f"no kanban store at {path}: opening a board never creates one. "
+            "A removed board stays removed; create a genuinely new board with "
+            "`hermes kanban boards create <slug>`."
+        ),
+    )
+
+
+def _open_board_store(path: Path, *, create: bool) -> sqlite3.Connection:
+    """The one place :func:`connect` turns a path into a connection.
+
+    An ordinary open goes through :func:`_sqlite_connect_no_create`, whose
+    ``mode=rw`` URI makes SQLite itself refuse a missing file. That is what
+    closes the resurrection window: a removal that lands after we looked at
+    the path loses the race inside SQLite rather than being handed a fresh
+    empty database to hand back as "the board".
+    """
+    if create:
+        return _sqlite_connect(path)
+    try:
+        return _sqlite_connect_no_create(
+            path, timeout_seconds=_resolve_busy_timeout_ms() / 1000.0
+        )
+    except sqlite3.OperationalError as exc:
+        if path.exists():
+            # A real open failure (locked, permissions, bad file) — not the
+            # no-creation guarantee talking.
+            raise
+        raise BoardFenceClosedError(_absent_board_store_refusal(path)) from exc
+
+
+def _assert_creation_admitted(path: Path, board: Optional[str]) -> None:
+    """GA-2: a board under removal refuses to have its store created.
+
+    Opening an EXISTING store mid-removal stays admitted (GA-1) — already
+    accepted work has to be able to finish, and the write chokepoint is what
+    decides whether it may still mutate. Bringing the store back into
+    existence is the one thing no ordinary caller may do, so this fires only
+    when there is nothing there to open. The removal machinery itself runs
+    inside the fence protocol scope and is exempt, exactly as it is at the
+    write chokepoint.
+
+    WHICH board is being admitted is :func:`_creation_admission_slug`'s
+    answer, and that answer comes from the target PATH first — see there.
+    """
+    if _in_fence_protocol():
+        return
+    slug = _creation_admission_slug(path, board)
+    # No register store means no board has ever been registered, so nothing
+    # can have been removed. Reading through get_register_entry() would
+    # create the register as a side effect of every fresh board creation.
+    if not slug or not register_db_path().exists():
+        return
+    entry = get_register_entry(slug)
+    if entry is None or entry.lifecycle is BoardLifecycle.LIVE:
+        return
+    raise BoardFenceClosedError(
+        FenceRefusal(
+            outcome=FenceOutcome.REFUSED_CLOSED,
+            rule=FenceRefusalRule.GA_2,
+            board=slug,
+            message=(
+                f"board is {entry.lifecycle.value}: refusing to create its "
+                "store again"
+            ),
+            register_epoch=entry.epoch,
+        )
+    )
+
+
+def _creation_admission_slug(path: Path, board: Optional[str]) -> Optional[str]:
+    """Which board's authority governs creating a store at *path*, if any.
+
+    **The resolved target path outranks the ``board`` argument.** A creation
+    brings a store into existence at a PATH; the argument is only a name the
+    caller supplied, and the two can disagree — an explicit ``db_path=``, or
+    a pinned ``HERMES_KANBAN_DB`` (which :func:`kanban_db_path` already
+    honours ABOVE ``board``). Asking the argument first let a live name
+    authorize a creation at a REMOVED board's path and resurrect its store.
+    The connection, not the argument, is the authority on which board is
+    being touched — the same precedence
+    ``tools.kanban_tools._board_of_connection`` already states for reads.
+
+    The argument is the FALLBACK, for a path that carries no board identity
+    of its own: a staging DB in a temp dir, a legacy or foreign
+    ``HERMES_KANBAN_DB`` outside the boards tree. ``None`` — neither the
+    path nor the argument names a board — means no register entry to admit
+    or refuse against and no register lock to serialize on.
+    """
+    try:
+        return board_slug_for_db_path(path) or _normalize_board_slug(board)
+    except ValueError:
+        return None
+
+
+@contextlib.contextmanager
+def _admitted_store_creation(path: Path, board: Optional[str]):
+    """The one window in which a board store may be brought into existence.
+
+    Every defect this closes had the same shape: **admission was decided
+    from a stale observation, and side effects happened before or outside
+    the window it admitted.** ``create=True`` was read as authority over a
+    board that had since been removed, and the board directory, its
+    ``board.json`` and its init-lock file could all appear at a path the
+    caller was about to be refused.
+
+    So this window owns all three of those:
+
+    * Admission is asserted HERE, before the first side effect — not
+      inherited from a ``path.exists()`` snapshot some earlier caller took.
+      :func:`create_board` opens the window before it writes ``board.json``;
+      :func:`connect` opens it before it makes the directory.
+    * **Both halves run under this board's register lock**, the SAME
+      per-board lock at :func:`board_register_lock` that every Gate A
+      transition — every removal — has to take to move this board's
+      lifecycle. "The register says LIVE" and "the directory now exists" are
+      therefore one indivisible step: a removal cannot slip between them,
+      it waits behind them. The acquire is bounded (it raises
+      :class:`InitLockUnavailable` at the deadline rather than blocking), so
+      a creation that cannot be serialized fails closed instead of hanging,
+      and a removal is delayed by at most one creation — which is the
+      correct price for the boundary, not a regression.
+    * Whatever the window loses, it leaves nothing behind. Ownership of the
+      board directory is claimed from the OS by a ``mkdir`` WITHOUT
+      ``exist_ok`` while the lock is held: only the call that actually
+      created the directory may take it back down. A bare ``exists()``
+      snapshot cannot say that — two concurrent creations of the same
+      brand-new board both see "it wasn't there", and the loser would
+      ``rmtree`` a directory the winner is legitimately filling.
+
+    A store that is ALREADY there is not creation and takes no lock: GA-1
+    keeps an existing store openable mid-removal, so there is no admission
+    decision to serialize and nothing to bring into existence. If it is
+    taken away underneath us anyway, :func:`_cross_process_init_lock` and
+    :func:`_open_board_store` both refuse from the kernel's answer rather
+    than from anything read here.
+    """
+    if path.exists():
+        yield
+        return
+
+    slug = _creation_admission_slug(path, board)
+    # The removal machinery already holds this lock for the board it is
+    # removing, and is exempt from admission for the same reason it is
+    # exempt at the write chokepoint: it is the authority, not a client.
+    if slug is None or _in_fence_protocol():
+        lock_scope = contextlib.nullcontext()
+    else:
+        # reentrant: create_board opens this window and then re-enters it
+        # through init_db -> connect(create=True), and a holder may itself
+        # drive register transitions from inside.
+        lock_scope = board_register_lock(slug, reentrant=True)
+
+    with lock_scope:
+        _assert_creation_admitted(path, board)
+        board_directory = path.parent
+        # Only a board's OWN directory is ever ours to take back down. The
+        # default board's store lives at ``<home>/kanban.db``, so its parent
+        # is the kanban home itself — shared with everything else Hermes
+        # keeps there — and an explicit ``db_path`` can point anywhere.
+        claimable = slug is not None and board_directory == board_dir(slug)
+        created_here = False
+        if claimable:
+            try:
+                board_directory.mkdir(parents=True)
+                created_here = True
+            except FileExistsError:
+                # Something already published this board's directory. It is
+                # not this window's to delete, whatever happens next.
+                pass
+        else:
+            board_directory.mkdir(parents=True, exist_ok=True)
+        try:
+            yield
+        except BoardFenceClosedError:
+            if created_here:
+                # Proven under the lock we still hold: this call created the
+                # directory, and no other creation can have entered it since.
+                # Everything in there is residue of a creation that was
+                # refused — the directory, the metadata, the init-lock file.
+                shutil.rmtree(board_directory, ignore_errors=True)
+            raise
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    create: bool = False,
 ) -> sqlite3.Connection:
-    """Open (and initialize if needed) the kanban DB.
+    """Open an EXISTING kanban DB; ``create=True`` brings one into being.
 
     WAL mode is enabled on every connection; it's a no-op after the first
     time but keeps the code robust if the DB file is ever re-created.
 
-    The first connection to a given path auto-runs :func:`init_db` so
-    fresh installs and test harnesses that construct `connect()`
-    directly don't have to remember a separate init step. Subsequent
-    connections skip the schema check via a module-level path cache.
+    **Opening is not creating.** Every ordinary caller gets the default,
+    ``create=False``: the board directory is never made, the SQLite file is
+    never made, and a board whose storage a removal took away can never be
+    resurrected by someone merely looking at it — the open is refused with
+    :class:`BoardFenceClosedError` (GA-4) instead. Only the explicit
+    creation path (:func:`init_db`, and :func:`create_board` through it)
+    passes ``create=True``. Schema creation and the additive migrations
+    still run on the first open of an EXISTING store, so a legacy board
+    keeps being upgraded in place.
 
     Path resolution:
 
@@ -14933,8 +15168,38 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not create:
+        if not path.exists():
+            # Refuse HERE, before the cross-process init lock: that lock's
+            # file is a sibling of the DB, so acquiring it would re-create
+            # the board directory a removal just took away.
+            raise BoardFenceClosedError(_absent_board_store_refusal(path))
+        return _open_initialized_store(
+            path, board=board, db_path=db_path, create=False,
+        )
+    # Creating runs entirely inside the admitted window: the directory, the
+    # store and the init-lock file are all side effects of a creation, and
+    # none of them may happen before the register has admitted one.
+    with _admitted_store_creation(path, board):
+        return _open_initialized_store(
+            path, board=board, db_path=db_path, create=True,
+        )
 
+
+def _open_initialized_store(
+    path: Path,
+    *,
+    board: Optional[str],
+    db_path: Optional[Path],
+    create: bool,
+) -> sqlite3.Connection:
+    """Open *path*, running the first-open init once per process per path.
+
+    Split out of :func:`connect` so the creating case can run the WHOLE of
+    this inside :func:`_admitted_store_creation`'s window. Admission has to
+    cover every step that could bring a store into existence — the init
+    lock's own file included — not merely the decision that preceded them.
+    """
     # Fast path: once THIS process has initialized this path, the expensive
     # first-open work (header validation, integrity probe, schema + additive
     # migrations) is already done and cached in _INITIALIZED_PATHS. Acquiring
@@ -14947,7 +15212,7 @@ def connect(
     # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
     resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
-        conn = _sqlite_connect(path)
+        conn = _open_board_store(path, create=create)
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
@@ -14969,13 +15234,14 @@ def connect(
             raise
         if schema_present:
             return conn
-        # The cache says "initialized", the file says otherwise: it was deleted
-        # or replaced under a live process, and the open above silently
-        # recreated an empty DB. Left alone, every query on this path fails
-        # with "no such table: tasks" for the rest of the process's life and
-        # the board just renders empty (#83445). Drop the stale cache entry and
-        # fall through to the full init path, which re-runs the header and
-        # integrity probes and the schema script under the cross-process lock.
+        # The cache says "initialized", the file says otherwise: it was
+        # replaced under a live process by one carrying no schema. (A DELETED
+        # file no longer reaches here at all — the open above refuses it.)
+        # Left alone, every query on this path fails with "no such table:
+        # tasks" for the rest of the process's life and the board just renders
+        # empty (#83445). Drop the stale cache entry and fall through to the
+        # full init path, which re-runs the header and integrity probes and
+        # the schema script on that existing file under the cross-process lock.
         conn.close()
         with _INIT_LOCK:
             _INITIALIZED_PATHS.discard(resolved)
@@ -14986,6 +15252,13 @@ def connect(
         )
 
     with _cross_process_init_lock(path):
+        if create and not path.exists():
+            # Re-validate AT THE MOMENT OF CREATION. The admission that got
+            # us here was read before this lock was taken; a removal that
+            # landed in between must not be overtaken by a ``create=True``
+            # decided ahead of it. (The lock itself has already refused the
+            # case where the removal took the whole directory.)
+            _assert_creation_admitted(path, board)
         # Read-only file/sidecar preflight (port of kilocode#12508) —
         # repair-or-refuse before the header/integrity probes so a stray
         # read-only kanban.db fails with an actionable message instead of
@@ -15000,7 +15273,7 @@ def connect(
         # via _INITIALIZED_PATHS so it only runs once per process per path.
         _guard_existing_db_is_healthy(path)
         resolved = str(path.resolve())
-        conn = _sqlite_connect(path)
+        conn = _open_board_store(path, create=create)
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
@@ -15080,6 +15353,7 @@ def connect_closing(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    create: bool = False,
 ):
     """Open a kanban DB connection and guarantee it is closed on exit.
 
@@ -15100,7 +15374,7 @@ def connect_closing(
     intentionally manage the connection lifetime (tests, long-lived
     callers) continue to work.
     """
-    conn = connect(db_path=db_path, board=board)
+    conn = connect(db_path=db_path, board=board, create=create)
     try:
         yield conn
     finally:
@@ -15124,12 +15398,17 @@ def init_db(
     may have drifted — tests that write legacy event kinds directly,
     external tools that upgrade an old DB file — can call this to
     force re-migration.
+
+    This is the explicit creation entry point: it is the one route that
+    passes ``create=True`` to :func:`connect`, so "make a board store" is
+    something a caller has to ASK for rather than something any open does.
+    A board the register says is being (or has been) removed refuses even
+    here — GA-2 — so an auto-init on a removed board cannot resurrect it.
     """
     if db_path is not None:
         path = db_path
     else:
         path = kanban_db_path(board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
     # schema + migration pass unconditionally.
@@ -15137,7 +15416,7 @@ def init_db(
         _INITIALIZED_PATHS.discard(resolved)
     # Carry the board through: the migration reads this board's published
     # owner metadata to recover receipt ownership on a pre-upgrade board.
-    with contextlib.closing(connect(path, board=board)):
+    with contextlib.closing(connect(path, board=board, create=True)):
         pass
     return path
 

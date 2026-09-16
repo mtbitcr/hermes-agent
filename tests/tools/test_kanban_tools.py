@@ -2033,7 +2033,8 @@ def test_create_governance_follows_the_pinned_database_not_the_board_argument(wo
     _govern_current_board(kb)
     _stub_admitted_route(monkeypatch)
     kb.write_board_metadata("plain", name="Plain")
-    kb.connect(board="plain").close()
+    # Explicitly, because opening a board no longer creates its store.
+    kb.init_db(board="plain")
     default_db = kb.kanban_db_path(board="default")
     plain_db = kb.kanban_db_path(board="plain")
 

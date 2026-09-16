@@ -613,6 +613,12 @@ def stage_legacy_db(tmp_path: Path, slug: str) -> Path:
     the assertions can actually read back rather than infer from a size.
     """
     staging = Path(tmp_path) / f"legacy-{slug}.db"
+    # ``connect`` opens; it does not create. The staging file is a scratch
+    # path in a temp dir — not a board path, with no register entry — so the
+    # sanctioned explicit creation route is what brings it into being, and
+    # doing it here weakens nothing: the no-resurrection contract is about
+    # board paths, and this file only becomes one after the move below.
+    kb.init_db(db_path=staging)
     with contextlib.closing(kb.connect(db_path=staging)) as conn:
         kb.create_task(conn, title=LEGACY_SENTINEL_TITLE, assignee="worker")
     kb._INITIALIZED_PATHS.discard(str(staging.resolve()))
