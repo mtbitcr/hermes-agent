@@ -24,8 +24,16 @@ termination helper they all reach:
   for any caller that does not pass the witness
 
 Plus the two-module consistency check: ``kanban_db_dispatch`` ships its own
-copies of three of these sweeps, and whatever ``kanban_db`` decides the
-dispatch copy must decide identically.
+copies of these sweeps, and whatever ``kanban_db`` decides the dispatch copy
+must decide identically — for the sweeps actually exercised here.  The crash
+sweep (``detect_crashed_workers``) is explicitly EXCLUDED: the dispatch copy
+cannot run it at all because ``_json_dict``, the fifth missing kernel helper,
+is deliberately left unshimmed.  It does not fail cleanly either — it commits
+the release and THEN raises while accounting the failure, so the task returns
+to ``ready`` with its failure uncounted and the breaker never trips.  That
+exclusion, and that consequence, are pinned by
+``test_the_dispatch_crash_sweep_cannot_run_even_with_the_four_shims`` rather
+than left implicit.
 
 How the state is built, honestly (same as the round-one suites, and the
 same shared helpers): a REAL child process is started and its REAL start
@@ -41,7 +49,9 @@ resulting row is the shipped code's.
 
 from __future__ import annotations
 
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -489,17 +499,30 @@ def test_the_termination_helper_signals_a_matching_identity(board):
 
 @pytest.fixture
 def dispatch_shims(monkeypatch):
-    """Supply four kernel helpers ``kanban_db_dispatch`` calls that DO NOT EXIST.
+    """Supply four of the FIVE kernel helpers ``kanban_db_dispatch`` calls that DO NOT EXIST.
 
-    This is not part of the identity repair and it is not hiding anything:
     ``kanban_db_dispatch`` reaches ``_kb._host_prefix``, ``_kb._row_get``,
-    ``_kb._opt_int`` and ``_kb._insert_comment``, and ``hermes_cli.kanban_db``
-    defines none of them — in this tree OR in the round-one tree these tests
-    are diffed against. Every dispatch-side sweep therefore raises
-    ``AttributeError`` before it reaches any decision at all. That is a
-    PRE-EXISTING defect, reported as an open finding rather than repaired
-    here (repairing it would turn a dead module live, which is far outside a
-    bounded identity fix).
+    ``_kb._opt_int``, ``_kb._insert_comment`` and ``_kb._json_dict``, and
+    ``hermes_cli.kanban_db`` defines none of them — in this tree OR in the
+    round-one tree these tests are diffed against.  This fixture shims only
+    the first four.  The fifth, ``_kb._json_dict``, is reached from
+    ``_protocol_violation_streak`` via ``_account_crashes`` from
+    ``detect_crashed_workers`` — the CRASH SWEEP — and is deliberately left
+    unshimmed so the gap is executable rather than papered over.
+    ``test_the_dispatch_crash_sweep_cannot_run_even_with_the_four_shims``
+    pins that gap.
+
+    Consequently, the dispatch-consistency tests below establish agreement
+    ONLY for the sweeps they actually exercise: the runtime-cap sweep, the
+    stale-claim sweep, the orphan-reconcile sweep and the termination
+    helper.  The crash sweep is NOT covered — the dispatch copy raises
+    ``AttributeError`` on DEFAULT settings (no optional staleness sweep
+    needed), not only when an optional feature is enabled, and it raises
+    AFTER its reclaim txn has committed, so the failure is never counted.
+
+    That is a PRE-EXISTING defect, reported as an open finding rather than
+    repaired here (repairing it would turn a dead module live, which is far
+    outside a bounded identity fix).
 
     The shims are the obvious one-line bodies, orthogonal to worker identity,
     and exist only so the dispatch copies can RUN — so "both modules reach
@@ -620,3 +643,72 @@ def test_the_dispatch_termination_helper_agrees_with_the_origin(
     assert info["sigkill"] is False
     assert info["pid_reused"] is True
     assert kbd._worker_survived_termination(info) is False
+
+
+def test_the_dispatch_crash_sweep_cannot_run_even_with_the_four_shims(
+    board, conn, dispatch_shims,
+):
+    """Pin a KNOWN DEFECT: the dispatch crash sweep cannot run.
+
+    The dispatch copy of ``detect_crashed_workers`` reaches
+    ``_protocol_violation_streak`` which calls ``_kb._json_dict``, the fifth
+    missing helper that ``dispatch_shims`` deliberately does not supply.
+    This test builds the real protocol-violation shape — a worker that exits
+    cleanly (rc=0) while its task is still ``running`` — and proves:
+
+    * the KERNEL copy classifies the case, returns the task id and COUNTS
+      the failure;
+    * the DISPATCH copy raises ``AttributeError`` naming ``_json_dict`` —
+      but only AFTER committing the release, so the task is handed back to
+      ``ready`` with ``consecutive_failures`` still 0.  Repeated forever,
+      that is an unbounded respawn loop: the breaker that is supposed to
+      park a task after a bounded number of clean-exit protocol violations
+      can never trip through this module.
+
+    This test passes BECAUSE the dispatch copy is broken.  It is EXPECTED TO
+    FAIL, loudly and deliberately, when the separate dead-module card
+    repairs ``kanban_db_dispatch``.  At that point this test should be
+    converted into a real agreement assertion (like the three consistency
+    tests above it).
+    """
+
+    def _violation_task():
+        """Create a task whose worker exits cleanly while it is still running."""
+        task_id = ready_task(conn)
+        assert kb.claim_task(conn, task_id) is not None
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        pid = child.pid
+        child.returncode = 0
+        kb._set_worker_pid(conn, task_id, pid)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            kbd.reap_worker_zombies()
+            classification, _rc = kbd._classify_worker_exit(pid)
+            if classification != "unknown":
+                break
+            time.sleep(0.05)
+        assert kbd._classify_worker_exit(pid) == ("clean_exit", 0)
+        return task_id
+
+    # First task — consumed by the kernel copy.
+    task1 = _violation_task()
+    reclaimed = kb.detect_crashed_workers(conn)
+    assert task1 in reclaimed
+
+    # Second task — the dispatch copy never reaches the decision.
+    task2 = _violation_task()
+    with pytest.raises(AttributeError, match="_json_dict"):
+        kbd.detect_crashed_workers(conn)
+
+    # It does NOT fail cleanly. The reclaim txn has already COMMITTED by the
+    # time the accounting raises, so the task is released back to ``ready``
+    # while its failure is never counted: ``consecutive_failures`` stays 0.
+    # The kernel, on the same input, counts the failure.
+    released = conn.execute(
+        "SELECT status, consecutive_failures FROM tasks WHERE id = ?", (task2,)
+    ).fetchone()
+    assert released["status"] == "ready"
+    assert released["consecutive_failures"] == 0
+    assert conn.execute(
+        "SELECT consecutive_failures FROM tasks WHERE id = ?", (task1,)
+    ).fetchone()["consecutive_failures"] == 1
