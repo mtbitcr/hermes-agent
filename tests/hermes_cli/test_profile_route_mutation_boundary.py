@@ -404,6 +404,10 @@ def test_fence_pins_owner_work_before_a_real_route_change(monkeypatch):
     profile = "default"
     _scoped_save(profile, _ADMITTED)
     model_policy.enroll_profile(profile)
+    # Explicit bootstrap: this is the first touch of the default board, so
+    # the store must be created before the ordinary (non-creating) opens
+    # below can succeed.
+    kanban_db.init_db()
     with kanban_db.connect() as conn:
         # Classified but not yet locked — the state a pre-lock owner commit
         # leaves behind, and the only one the policy can mint authority for.
