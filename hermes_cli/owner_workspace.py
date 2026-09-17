@@ -6764,8 +6764,13 @@ def _dispatch_removal_drive(board_slug, project_id, operation_key):
     The same thread under a running event loop or not. The drive used to go
     to ``loop.run_in_executor(None, ...)`` when one was running — the loop's
     DEFAULT executor, the bounded pool the API server hands every blocking
-    agent run to for that run's whole length. An accepted removal then
-    WAITED behind those runs instead of driving.
+    agent run to for that run's whole length — so an accepted removal
+    could wait behind those runs instead of driving. That coupling was a
+    real defect in its own right and is fixed here; it was NOT the cause of
+    the previously reported stall, which was a §6.7 sweep refusal (see
+    test_removal_resume_stalls_on_indeterminate_sweep_then_recovers in
+    tests/gateway/test_api_server_removal_resume_on_start.py) unrelated to
+    this thread pool.
     """
     import threading
 
@@ -6945,6 +6950,7 @@ def _removal_confirm_permanent(
         if not fenced.success:
             projects_db.update_removal_operation(
                 pconn, project.id, op_key,
+                retained_copy_id=None,
                 last_error=_REMOVAL_SAFE_ERRORS["driver_failed"],
             )
             result = {

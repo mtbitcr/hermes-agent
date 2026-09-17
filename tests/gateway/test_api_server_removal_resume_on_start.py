@@ -150,9 +150,14 @@ def _setup_real_board_operation(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_removal_drive_is_not_queued_behind_the_server_run_pool(monkeypatch):
-    """The startup resume must drive a removal to completion while every
+    """A removal drive must not wait behind the server's blocking-run pool:
+    the startup resume must drive a removal to completion while every
     thread of the loop's default executor is held by blocking run work, and
-    a drive that REFUSES must say so on the operation."""
+    a drive that REFUSES must say so on the operation. This guards the
+    executor-coupling fix on its own merits; it is not a reproduction of
+    the previously reported stall, whose actual cause (a sweep refusal) is
+    covered by test_removal_resume_stalls_on_indeterminate_sweep_then_recovers
+    below."""
     import concurrent.futures
     import threading
 
@@ -192,3 +197,94 @@ async def test_removal_drive_is_not_queued_behind_the_server_run_pool(monkeypatc
     # rather than re-stamped from a partial kernel record.
     assert refused["last_error"] == ow._REMOVAL_SAFE_ERRORS["driver_failed"]
     assert refused["phase"] == "carried"
+
+
+def test_removal_resume_stalls_on_indeterminate_sweep_then_recovers(monkeypatch):
+    """The previously reported stall was NOT the server's run-pool: a drive
+    that is never dispatched leaves the kernel phase at 'intent' with no
+    gate/quiesce/carry stamps and the board directory still present — the
+    opposite of what was observed. The real mechanism is a sweep record
+    class (§6.7) that reads INDETERMINATE (e.g. a locked store):
+    advance_removal_to_swept correctly REFUSES rather than treat a failed
+    read as proof of absence, so the kernel phase legitimately holds at
+    'applied' with those stamps set and the board directory already gone.
+    Restart resume must retry the sweep — re-refusing while the condition
+    persists, and completing to 'done' once it clears."""
+    pid, slug, key = _setup_real_board_operation(monkeypatch)
+
+    original_sweep_record_class = kanban_db._sweep_record_class
+    state = {"indeterminate": True, "sweep_attempts": 0}
+
+    def _flaky_sweep_record_class(rec_key, board_slug, *, reversible, record):
+        if rec_key == "subscriptions":
+            state["sweep_attempts"] += 1
+            if state["indeterminate"]:
+                return {
+                    "result": kanban_db.SWEEP_RESULT_INDETERMINATE,
+                    "key": f"locked:{board_slug}",
+                    "reason": "simulated: database is locked",
+                }
+        return original_sweep_record_class(
+            rec_key, board_slug, reversible=reversible, record=record,
+        )
+
+    monkeypatch.setattr(kanban_db, "_sweep_record_class", _flaky_sweep_record_class)
+
+    def _wait_until(predicate, timeout=20.0, interval=0.02):
+        deadline = time.monotonic() + timeout
+        while True:
+            if predicate():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(interval)
+
+    def _owner_op():
+        with projects_db.connect_closing() as c:
+            return projects_db.get_removal_operation(c, pid, key)
+
+    # (a) The drive rolls all the way forward to Applied, then the sweep
+    # refuses: the owner operation records the refusal.
+    ow.resume_removal_operations()
+    assert _wait_until(lambda: state["sweep_attempts"] >= 1), \
+        "the sweep was never attempted"
+    assert _wait_until(
+        lambda: (_owner_op() or {})["last_error"]
+        == ow._REMOVAL_SAFE_ERRORS["driver_failed"]
+    ), "the owner operation never recorded the sweep refusal"
+
+    phase_rec = kanban_db.get_removal_phase_record(slug)
+    op = _owner_op()
+    assert phase_rec.phase == kanban_db.RemovalPhase.APPLIED, phase_rec.phase
+    assert phase_rec.gate_closed_at is not None
+    assert phase_rec.quiesce_completed_at is not None
+    assert phase_rec.carry_completed_at is not None
+    assert phase_rec.outcome is None
+    assert not kanban_db.board_dir(slug).exists()
+    assert op["last_error"] == ow._REMOVAL_SAFE_ERRORS["driver_failed"]
+
+    # (b) Resume while the indeterminate condition is STILL present must
+    # not falsely advance the phase.
+    attempts_before = state["sweep_attempts"]
+    ow.resume_removal_operations()
+    assert _wait_until(lambda: state["sweep_attempts"] > attempts_before), \
+        "the resumed drive never re-attempted the sweep"
+    time.sleep(0.2)  # let the durable write following this attempt land
+    phase_rec = kanban_db.get_removal_phase_record(slug)
+    op = _owner_op()
+    assert phase_rec.phase == kanban_db.RemovalPhase.APPLIED, phase_rec.phase
+    assert op["last_error"] == ow._REMOVAL_SAFE_ERRORS["driver_failed"]
+
+    # (c) Once the condition clears, resume completes to Done.
+    state["indeterminate"] = False
+    ow.resume_removal_operations()
+    assert _wait_until(
+        lambda: kanban_db.get_removal_phase_record(slug).phase
+        == kanban_db.RemovalPhase.DONE
+    ), "the removal never completed once the sweep could be read"
+    phase_rec = kanban_db.get_removal_phase_record(slug)
+    op = _owner_op()
+    assert phase_rec.outcome == "archived", phase_rec.outcome
+    assert op["applied_at"] is not None
+    assert op["completed_at"] is not None
+    assert op["last_error"] is None

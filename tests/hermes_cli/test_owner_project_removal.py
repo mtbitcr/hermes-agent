@@ -881,3 +881,37 @@ class TestFinding6PermanentContinuesFromArchived:
         assert not kanban_db.reversible_retained_path(
             s, served["retained_copy_id"],
         ).exists()
+
+    def test_a_refused_permanent_withdraws_the_restore_it_can_no_longer_honour(
+        self, monkeypatch,
+    ):
+        """continue_archived_removal_as_permanent reinstalls and discards
+        the retained copy before remove_board_fenced ever runs; a refusal
+        there must not leave the owner offered a Restore that no longer
+        has anything to restore."""
+        pid, s = _real_board(monkeypatch)
+        _start_and_join(pid, "f6rs")
+        with projects_db.connect_closing() as c:
+            served = _project_removal_state(c, pid, s)
+        assert served["phase"] == "done" and served["restorable"] is True
+        retained_copy_id = served["retained_copy_id"]
+        assert retained_copy_id
+        monkeypatch.setattr(
+            kanban_db, "remove_board_fenced",
+            lambda *a, **kw: kanban_db.FencedRemovalResult(
+                False, "refused for the test",
+            ),
+        )
+        confirmed = _call(
+            pid, f"f6rc{_n[0]}", "confirm_permanent",
+            consequences_digest=served["consequences_digest"],
+        )
+        assert confirmed["ok"] is False
+        with projects_db.connect_closing() as c:
+            after = _project_removal_state(c, pid, s)
+        assert after["restorable"] is False
+        assert after["retained_copy_id"] is None
+        assert not kanban_db.reversible_retained_path(s, retained_copy_id).exists()
+        assert kanban_db.get_register_entry(s).lifecycle is (
+            kanban_db.BoardLifecycle.LIVE
+        )
