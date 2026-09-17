@@ -2725,7 +2725,7 @@ def list_kanban_projects(request: Request):
     """
     _workspace_response = _workspace_maybe_respond(
         request,
-        require_board=True,
+        require_board=False,
         builder=lambda: _workspace_projects_response(
             include_removal_state=_workspace_applied_capability(request)
             == owner_workspace.OWNER_PROJECT_REMOVAL_STATE_CAPABILITY
@@ -3484,11 +3484,39 @@ def _workspace_audit_deny(
     )
 
 
-def _workspace_require_no_query(request: Request) -> None:
-    """Routes 1-2 (``/projects``, ``/boards``): no query string admitted at all."""
-    if request.query_params.multi_items():
+def _workspace_require_no_query(
+    request: Request, *, allowed_capability: Optional[str] = None
+) -> None:
+    """Routes 1-2 (``/projects``, ``/boards``): no query string by default.
+
+    When *allowed_capability* is set, exactly one ``?capabilities=<value>``
+    parameter is admitted (same fail-closed rules as the board validator).
+    The board is never required or granted on these routes.
+    """
+    items = request.query_params.multi_items()
+    if allowed_capability is None:
+        if items:
+            _workspace_audit_deny(request, reason="unexpected_query", status=400)
+            raise HTTPException(status_code=400, detail="Bad Request")
+        return
+    if not items:
+        request.state.workspace_applied_capability = None
+        return
+    values: dict[str, str] = {}
+    invalid = False
+    for key, value in items:
+        if key in values:
+            invalid = True
+            break
+        values[key] = value
+    if (
+        invalid
+        or set(values) != {"capabilities"}
+        or values.get("capabilities") != allowed_capability
+    ):
         _workspace_audit_deny(request, reason="unexpected_query", status=400)
         raise HTTPException(status_code=400, detail="Bad Request")
+    request.state.workspace_applied_capability = allowed_capability
 
 
 def _workspace_applied_capability(request: Request) -> Optional[str]:
@@ -3598,7 +3626,9 @@ def _workspace_maybe_respond(
             request, allowed_capability=allowed_capability
         )
     else:
-        _workspace_require_no_query(request)
+        _workspace_require_no_query(
+            request, allowed_capability=allowed_capability
+        )
     try:
         scope_active = _workspace_scope_is_active()
     except (KeyError, OSError, TypeError, ValueError, sqlite3.Error):

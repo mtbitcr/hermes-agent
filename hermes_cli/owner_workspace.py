@@ -6646,24 +6646,70 @@ def _removal_drive_and_record(project_id, board_slug, operation_key):
         pconn.close()
 
 
+_removal_background_tasks: set = set()
+_removal_background_threads: set = set()
+
+
+def _removal_thread_cleanup():
+    for t in list(_removal_background_threads):
+        t.join(timeout=30)
+
+
+import atexit as _atexit
+_atexit.register(_removal_thread_cleanup)
+
+
 def _dispatch_removal_drive(board_slug, project_id, operation_key):
     """Hand the drive to a background mechanism and return immediately."""
     import asyncio
     try:
         loop = asyncio.get_running_loop()
-        loop.run_in_executor(
-            None, _removal_drive_and_record, project_id, board_slug, operation_key,
-        )
-        return
     except RuntimeError:
-        pass
+        loop = None
+    if loop is not None and loop.is_running():
+        async def _run():
+            await loop.run_in_executor(
+                None, _removal_drive_and_record, project_id, board_slug, operation_key,
+            )
+        task = loop.create_task(_run())
+        _removal_background_tasks.add(task)
+        task.add_done_callback(_removal_background_tasks.discard)
+        return
     import threading
-    t = threading.Thread(
-        target=_removal_drive_and_record,
-        args=(project_id, board_slug, operation_key),
-        daemon=True,
-    )
+
+    def _wrapped():
+        try:
+            _removal_drive_and_record(project_id, board_slug, operation_key)
+        finally:
+            _removal_background_threads.discard(t)
+
+    t = threading.Thread(target=_wrapped, daemon=False)
+    _removal_background_threads.add(t)
     t.start()
+
+
+def resume_removal_operations():
+    """Re-dispatch drives for non-terminal removal operations.
+
+    Called at process startup to resume operations that were interrupted.
+    Must NOT be called from a status read path.
+    """
+    try:
+        pconn = projects_db.connect()
+    except Exception:
+        return
+    try:
+        rows = projects_db.list_resumable_removal_operations(pconn)
+    except Exception:
+        pconn.close()
+        return
+    pconn.close()
+    for row in rows:
+        board_slug = row["board_slug"]
+        project_id = row["project_id"]
+        operation_key = row["idempotency_key"]
+        if board_slug:
+            _dispatch_removal_drive(board_slug, project_id, operation_key)
 
 
 def _removal_start(pconn, ctx, project, idempotency_key, operation, digest, existing_op):

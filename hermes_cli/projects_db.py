@@ -1044,3 +1044,15 @@ def list_removal_operations_for_project(
         "WHERE project_id = ? ORDER BY created_at DESC",
         (project_id,),
     ).fetchall()
+
+
+def list_resumable_removal_operations(conn: sqlite3.Connection) -> list:
+    """Non-terminal removal operations across all projects."""
+    terminal = ("done", "cancelled", "failed", "restored")
+    placeholders = ",".join("?" for _ in terminal)
+    return conn.execute(
+        "SELECT * FROM project_removal_operations "
+        f"WHERE phase NOT IN ({placeholders}) "
+        "ORDER BY created_at ASC",
+        terminal,
+    ).fetchall()

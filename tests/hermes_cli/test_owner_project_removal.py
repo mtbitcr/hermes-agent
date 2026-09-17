@@ -479,24 +479,32 @@ class TestT2AsyncDrive:
 # ── T3: Major 3 — dashboard /projects removal_state gating ──
 
 class TestT3DashboardRemovalStateGating:
-    def test_not_asked_key_absent(self):
-        with projects_db.connect_closing() as c:
-            projects_db.record_removal_operation(
-                c, project_id="t3a", idempotency_key="t3ak",
-                action="start", phase="accepted", mode="reversible")
-        from hermes_cli.owner_workspace import _project_removal_state
-        result = ow._project_removal_state.__wrapped__(
-            None, "t3a", None,
-        ) if hasattr(ow._project_removal_state, '__wrapped__') else None
-        proj = {"id": "t3a", "slug": "t3", "name": "T"}
+    def test_not_asked_key_absent(self, monkeypatch):
+        """Builder without include_removal_state must NOT include the key."""
+        from plugins.kanban.dashboard import plugin_api as papi
+        pid, s = _setup(monkeypatch)
+        _mk_op(pid, s, "t3ak2", "accepted", consequences_digest="cd")
+        monkeypatch.setattr(
+            papi, "_workspace_scope_snapshot",
+            lambda: (MagicMock(id=pid, slug=s, name="T", board_slug=s), None),
+        )
+        result = papi._workspace_projects_response(include_removal_state=False)
+        assert result is not None
+        proj = result["projects"][0]
         assert "removal_state" not in proj
 
-    def test_asked_no_removal_key_null(self):
-        proj = {"id": "xxx", "slug": "xxx", "name": "X"}
-        with projects_db.connect_closing() as c:
-            st = _project_removal_state(c, "nonexistent_project_t3", None)
-        assert st is None
-        proj["removal_state"] = st
+    def test_asked_includes_key(self, monkeypatch):
+        """Builder with include_removal_state=True must include the key."""
+        from plugins.kanban.dashboard import plugin_api as papi
+        pid, s = _setup(monkeypatch)
+        monkeypatch.setattr(
+            papi, "_workspace_scope_snapshot",
+            lambda: (MagicMock(id=pid, slug=s, name="T", board_slug=s), None),
+        )
+        result = papi._workspace_projects_response(include_removal_state=True)
+        assert result is not None
+        proj = result["projects"][0]
+        assert "removal_state" in proj
         assert proj["removal_state"] is None
 
     def test_asked_with_removal_returns_state(self, monkeypatch):
@@ -506,6 +514,63 @@ class TestT3DashboardRemovalStateGating:
             st = _project_removal_state(c, pid, s)
         assert st is not None
         assert st["phase"] == "fenced"
+
+    def test_route_no_query_no_removal_state_key(self, monkeypatch, tmp_path):
+        """GET /projects with no query string must omit removal_state."""
+        from pathlib import Path
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.dashboard_auth import clear_providers, register_provider
+        from hermes_cli.dashboard_auth import token_auth
+        from plugins.dashboard_auth.raphael_workspace import (
+            BOARD, PROJECT, WorkspaceReadTokenProvider, token_store,
+        )
+        from plugins.kanban.dashboard import plugin_api as papi
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        kb._INITIALIZED_PATHS.clear()
+
+        repo = tmp_path / "workspace-repo"
+        repo.mkdir()
+        with projects_db.connect_closing() as conn:
+            project_id = projects_db.create_project(
+                conn, name="Raphael Workspace", primary_path=str(repo))
+        kb.create_board(BOARD, name="Raphael Workspace", project_id=project_id)
+        kb.init_db(board=BOARD)
+
+        token_dir = home / "workspace-token"
+        token_dir.mkdir(mode=0o700)
+        token_path = token_dir / "bearer"
+        token_store.issue(out_path=token_path)
+        bearer = token_path.read_text(encoding="utf-8").strip()
+
+        clear_providers()
+        token_auth.clear_token_routes()
+        register_provider(WorkspaceReadTokenProvider())
+        papi._register_workspace_machine_routes()
+
+        app = FastAPI()
+        app.include_router(papi.router, prefix="/api/plugins/kanban")
+
+        @app.middleware("http")
+        async def machine_auth(request, call_next):
+            return await token_auth.token_auth_middleware(request, call_next)
+
+        with TestClient(app) as client:
+            headers = {"Authorization": f"Bearer {bearer}",
+                       "X-Forwarded-For": "203.0.113.10"}
+            resp = client.get("/api/plugins/kanban/projects", headers=headers)
+            assert resp.status_code == 200, f"expected 200 got {resp.status_code}"
+            proj = resp.json()["projects"][0]
+            assert "removal_state" not in proj
+
+        clear_providers()
+        token_auth.clear_token_routes()
+        kb._INITIALIZED_PATHS.clear()
 
 
 # ── T4: Major 4 — confirm_permanent releases retained copy ──
@@ -588,3 +653,102 @@ class TestT5DigestStableAcrossModeFlip:
         with projects_db.connect_closing() as c:
             op_after = projects_db.get_removal_operation(c, pid, start_ik)
         assert op_after["consequences_digest"] == digest_before
+
+
+# ── T6: Blocking 2 — resume and background seam ──
+
+_REAL_DISPATCH = ow._dispatch_removal_drive
+
+
+class TestT6ResumeAndBackgroundSeam:
+    def test_resume_drives_interrupted_operation(self, monkeypatch):
+        """Reviewer reproduction: a real start whose drive is abandoned
+        mid-phase is resumed, after a simulated process restart, strictly
+        from the durable phase record -- reaching a terminal phase with no
+        new owner request."""
+        pid, s = _setup(monkeypatch)
+        _mock_intent_success(monkeypatch, s)
+
+        # -- process 1: a real start whose background drive never completes.
+        monkeypatch.setattr(ow, "_dispatch_removal_drive", lambda *a, **kw: None)
+        start_ik = "t6s%d" % _n[0]
+        r = _call(pid, start_ik, "start")
+        assert r["ok"]
+
+        # The drive reached an intermediate phase and then died there.
+        with projects_db.connect_closing() as c:
+            projects_db.update_removal_operation(c, pid, start_ik, phase="carried")
+            mid = projects_db.get_removal_operation(c, pid, start_ik)
+        assert mid["phase"] == "carried"
+
+        # -- process 2 (restart): only the resume entry point runs. No owner call.
+        driven = []
+
+        def _fake_drive(board, *a, **kw):
+            driven.append(board)
+            return None
+
+        phase_rec = MagicMock()
+        phase_rec.phase = MagicMock()
+        phase_rec.phase.value = "done"
+        phase_rec.mode = kanban_db.RemovalMode.REVERSIBLE
+        phase_rec.removal_id = "rm_test"
+        monkeypatch.setattr(kanban_db, "drive_removal", _fake_drive)
+        monkeypatch.setattr(kanban_db, "get_removal_phase_record",
+                            lambda *a, **kw: phase_rec)
+        # the production dispatch seam, restored for the restart half
+        monkeypatch.setattr(ow, "_dispatch_removal_drive", _REAL_DISPATCH)
+
+        ow.resume_removal_operations()
+        for t in list(ow._removal_background_threads):
+            t.join(timeout=20)
+
+        # The resumed drive ran against the board named by the durable record ...
+        assert driven == [s]
+        # ... and the durable operation advanced to terminal on its own.
+        with projects_db.connect_closing() as c:
+            op = projects_db.get_removal_operation(c, pid, start_ik)
+        assert op["phase"] == "done"
+
+    def test_resume_skips_terminal_operations(self, monkeypatch):
+        """Operations at terminal phases must NOT be re-dispatched."""
+        pid, s = _setup(monkeypatch)
+        for phase in ("done", "cancelled", "failed", "restored"):
+            _mk_op(pid, s, f"t6t_{phase}_{_n[0]}", phase)
+
+        dispatched = []
+        monkeypatch.setattr(ow, "_dispatch_removal_drive",
+                            lambda bs, pid_, ok: dispatched.append(pid_))
+        ow.resume_removal_operations()
+        assert pid not in dispatched
+
+    def test_status_read_does_not_resume(self, monkeypatch):
+        """Reading removal_state must never dispatch a drive."""
+        pid, s = _setup(monkeypatch)
+        _mk_op(pid, s, "t6nr", "fenced")
+        drive_calls = []
+        monkeypatch.setattr(kanban_db, "drive_removal",
+                            lambda *a, **kw: drive_calls.append(1))
+        with projects_db.connect_closing() as c:
+            _project_removal_state(c, pid, s)
+        assert len(drive_calls) == 0
+
+    def test_drive_uses_tracked_background(self, monkeypatch):
+        """The dispatch mechanism must track tasks/threads, not fire-and-forget."""
+        pid, s = _setup(monkeypatch)
+        _mk_op(pid, s, "t6bg", "accepted")
+        monkeypatch.setattr(kanban_db, "drive_removal", lambda *a, **kw: None)
+        phase_rec = MagicMock()
+        phase_rec.phase = MagicMock()
+        phase_rec.phase.value = "done"
+        phase_rec.mode = kanban_db.RemovalMode.REVERSIBLE
+        phase_rec.removal_id = "rm_test"
+        monkeypatch.setattr(kanban_db, "get_removal_phase_record",
+                            lambda *a, **kw: phase_rec)
+        ow._dispatch_removal_drive(s, pid, "t6bg")
+        for t in list(ow._removal_background_threads):
+            t.join(timeout=10)
+        with projects_db.connect_closing() as c:
+            op = projects_db.get_removal_operation(c, pid, "t6bg")
+        assert op is not None
+        assert op["phase"] == "done"
