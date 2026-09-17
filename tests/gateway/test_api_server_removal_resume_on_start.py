@@ -83,7 +83,7 @@ async def test_api_server_startup_resumes_removal_operations(monkeypatch):
     driven = []
     def _fake_drive(board, *a, **kw):
         driven.append(board)
-        return None
+        return kanban_db.FencedRemovalResult(True, "removal complete")
 
     monkeypatch.setattr(kanban_db, "drive_removal", _fake_drive)
     monkeypatch.setattr(kanban_db, "get_removal_phase_record",
@@ -134,3 +134,61 @@ async def test_api_server_startup_resumes_removal_operations(monkeypatch):
 
     finally:
         await adapter.disconnect()
+
+
+def _setup_real_board_operation(monkeypatch):
+    """The same setup, on a real fenced board with a real recorded intent."""
+    from tests.hermes_cli._kanban_fence_support import create_fenced_board
+
+    pid, slug, key = _setup_board_and_operation(monkeypatch)
+    create_fenced_board(slug)
+    assert kanban_db.record_removal_intent(
+        slug, mode=kanban_db.RemovalMode.REVERSIBLE, removal_id="rm_test",
+    ).success
+    return pid, slug, key
+
+
+@pytest.mark.asyncio
+async def test_removal_drive_is_not_queued_behind_the_server_run_pool(monkeypatch):
+    """The startup resume must drive a removal to completion while every
+    thread of the loop's default executor is held by blocking run work, and
+    a drive that REFUSES must say so on the operation."""
+    import concurrent.futures
+    import threading
+
+    pid, slug, key = _setup_real_board_operation(monkeypatch)
+    # No recorded removal at all: the driver REFUSES BY RETURN VALUE there.
+    refused_pid, _, refused_key = _setup_board_and_operation(monkeypatch)
+
+    loop = asyncio.get_running_loop()
+    release = threading.Event()
+    busy = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    loop.set_default_executor(busy)
+    # The server's blocking-run pool, fully occupied as it is mid-run.
+    held = [loop.run_in_executor(busy, release.wait) for _ in range(2)]
+    try:
+        ow.resume_removal_operations()          # the startup entry point
+        # Owner-facing durable state only, while the pool is still saturated.
+        deadline = time.monotonic() + 30
+        while True:
+            with projects_db.connect_closing() as c:
+                completed = projects_db.get_removal_operation(c, pid, key)
+                refused = projects_db.get_removal_operation(
+                    c, refused_pid, refused_key)
+            if completed["phase"] == "done" and refused["last_error"]:
+                break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.1)
+    finally:
+        release.set()
+        await asyncio.gather(*held, return_exceptions=True)
+        busy.shutdown(wait=True)
+    assert completed["phase"] == "done", completed["phase"]
+    assert completed["retained_copy_id"] is not None
+    assert completed["receipt_id"] == key
+    assert completed["last_error"] is None
+    # The refusal is recorded, and the phase is left on its durable value
+    # rather than re-stamped from a partial kernel record.
+    assert refused["last_error"] == ow._REMOVAL_SAFE_ERRORS["driver_failed"]
+    assert refused["phase"] == "carried"

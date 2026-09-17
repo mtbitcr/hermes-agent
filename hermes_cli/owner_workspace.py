@@ -2002,6 +2002,19 @@ _REMOVAL_PHASE_OWNER_MAP: dict[str, str] = {
     "done": "done",
 }
 
+# Kernel removal mode -> the fixed owner contract vocabulary. The kernel's
+# own word stays 'reversible'; this presentation mapping is applied once,
+# at the owner boundary, by _project_removal_state.
+_REMOVAL_MODE_OWNER_MAP = {"reversible": "recoverable", "permanent": "permanent"}
+
+
+def _owner_removal_mode(mode: Any) -> str:
+    """Map a kernel removal mode onto the owner contract's two words.
+
+    An unreadable mode presents as 'permanent': never promise recoverable.
+    """
+    return _REMOVAL_MODE_OWNER_MAP.get(str(mode or "").strip().lower(), "permanent")
+
 # Owner-safe last_error sentences (fixed set, no internals leak).
 _REMOVAL_SAFE_ERRORS: dict[str, str] = {
     "driver_failed": "The removal could not advance to the next phase.",
@@ -3117,6 +3130,28 @@ def owner_project_planning_context(
     }
 
 
+def _deleted_project_snapshot(
+    project: dict, project_id: str, project_slug: str,
+    board_slug: str, removal_state: dict,
+) -> dict:
+    """The Deleted presentation of a Project whose board has been removed."""
+    name = owner_project_name(project["name"])
+    return {
+        "project": {"id": project_id, "slug": project_slug, "name": name,
+                    "description": project["description"], "board": board_slug,
+                    "archived": False},
+        "board": {"slug": board_slug, "name": name, "project_id": project_id,
+                  "counts": dict.fromkeys((*_OWNER_PROJECT_COLUMNS, "archived"), 0),
+                  "total": 0},
+        "columns": [{"name": s, "tasks": []} for s in _OWNER_PROJECT_COLUMNS],
+        "workers": [], "attachments": [], "runs": [],
+        "steward": _deleted_project_steward(project["name"], 7, removal_state),
+        "removal_state": removal_state,
+        "truncated": dict.fromkeys(
+            ("tasks", "workers", "attachments", "runs"), False),
+    }
+
+
 def read_project_snapshot(
     ctx: OwnerContext,
     project_slug: str,
@@ -3152,6 +3187,13 @@ def read_project_snapshot(
 
     project_id = str(project["project_id"])
     board_slug = str(project["board"])
+    removal_state = _completed_removal_state(project_id)
+    if removal_state is not None and not kanban_db.board_exists(board_slug):
+        # The board is gone because the owner removed it: Deleted, and its
+        # Restore control, are built from the record and retained-copy facts.
+        return _deleted_project_snapshot(
+            project, project_id, project_slug, board_slug, removal_state,
+        )
     try:
         _assert_board_ownership(board_slug, project_id)
         metadata = kanban_db.read_board_metadata(board_slug)
@@ -4140,6 +4182,44 @@ def _open_read_only_sqlite(path, *, label: str) -> sqlite3.Connection:
         ) from exc
 
 
+def _completed_removal_state(project_id: str) -> Optional[dict]:
+    """The removal_state of a COMPLETED removal of this Project, or None."""
+    try:
+        with projects_db.connect_closing() as conn:
+            state = _project_removal_state(conn, project_id, None)
+    except (OSError, sqlite3.Error):
+        return None
+    if state is not None and state["phase"] == "done":
+        return state
+    return None
+
+
+def _deleted_project_steward(
+    project_name: Any, lookback_days: int, removal_state: dict,
+) -> dict:
+    """The steward projection of a Project whose board has been removed."""
+    return {
+        "schema_version": 2,
+        "project": {"name": owner_project_name(project_name)},
+        "generated_at": _owner_timestamp(_now()),
+        "lookback_days": lookback_days,
+        "execution": {
+            "state": "deleted",
+            "summary": (
+                "This Project was deleted. Its retained copy can be restored."
+                if removal_state["restorable"] else "This Project was deleted."),
+            "paused": False},
+        "counts": dict.fromkeys(
+            ("open", "completed_in_window", "needs_attention", "awaiting_review"), 0),
+        "progress": [], "needs_attention": [], "decisions_needed": [],
+        "active_work": [], "stale_candidates": [],
+        "truncated": dict.fromkeys(
+            ("progress", "needs_attention", "decisions_needed", "active_work",
+             "stale_candidates"), False),
+        "removal_state": removal_state,
+    }
+
+
 def project_steward_snapshot(
     *, project_id: str, lookback_days: int = 7
 ) -> dict:
@@ -4197,6 +4277,11 @@ def project_steward_snapshot(
 
     board_slug = str(project["board_slug"])
     if not kanban_db.board_exists(board_slug):
+        removal_state = _completed_removal_state(project_id)
+        if removal_state is not None:
+            return _deleted_project_steward(
+                project["name"], lookback_days, removal_state,
+            )
         raise OwnerWorkspaceError(
             "snapshot_unavailable", "the Project board is unavailable"
         )
@@ -6509,7 +6594,7 @@ def _project_removal_state(
         )
     return {
         "phase": phase,
-        "mode": mode,
+        "mode": _owner_removal_mode(mode),
         "accepted_at": op["accepted_at"],
         "applied_at": op["applied_at"],
         "completed_at": op["completed_at"],
@@ -6616,12 +6701,22 @@ def _removal_drive_and_record(project_id, board_slug, operation_key):
     pconn = projects_db.connect()
     try:
         try:
-            kanban_db.drive_removal(board_slug)
+            drive = kanban_db.drive_removal(board_slug)
         except Exception:
             projects_db.update_removal_operation(
                 pconn, project_id, operation_key, phase="failed",
                 last_error=_REMOVAL_SAFE_ERRORS["driver_failed"],
                 completed_at=int(time.time()),
+            )
+            return
+        if not drive.success:
+            # drive_removal REFUSES by return value, not by raising. A
+            # discarded refusal leaves the owner looking at a phase the
+            # removal merely passed through, with nothing saying it stopped.
+            # Record it; the phase stays durable, so this stays resumable.
+            projects_db.update_removal_operation(
+                pconn, project_id, operation_key,
+                last_error=_REMOVAL_SAFE_ERRORS["driver_failed"],
             )
             return
 
@@ -6632,8 +6727,12 @@ def _removal_drive_and_record(project_id, board_slug, operation_key):
                 owner_phase = _REMOVAL_PHASE_OWNER_MAP.get(
                     phase_record.phase.value, phase_record.phase.value,
                 )
-                updates: dict = {"phase": owner_phase}
-                if owner_phase == "applied":
+                updates: dict = {"phase": owner_phase, "last_error": None}
+                if owner_phase in ("applied", "swept", "done") and (
+                    not op["applied_at"]
+                ):
+                    # A drive that runs straight to 'done' passes Applied
+                    # without ever being observed there.
                     updates["applied_at"] = int(time.time())
                 if phase_record.phase.value == "done":
                     updates["completed_at"] = int(time.time())
@@ -6660,21 +6759,14 @@ atexit.register(_removal_thread_cleanup)
 
 
 def _dispatch_removal_drive(board_slug, project_id, operation_key):
-    """Hand the drive to a background mechanism and return immediately."""
-    import asyncio
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop is not None and loop.is_running():
-        async def _run():
-            await loop.run_in_executor(
-                None, _removal_drive_and_record, project_id, board_slug, operation_key,
-            )
-        task = loop.create_task(_run())
-        _removal_background_tasks.add(task)
-        task.add_done_callback(_removal_background_tasks.discard)
-        return
+    """Hand the drive to its own tracked thread and return immediately.
+
+    The same thread under a running event loop or not. The drive used to go
+    to ``loop.run_in_executor(None, ...)`` when one was running — the loop's
+    DEFAULT executor, the bounded pool the API server hands every blocking
+    agent run to for that run's whole length. An accepted removal then
+    WAITED behind those runs instead of driving.
+    """
     import threading
 
     def _wrapped():
@@ -6809,6 +6901,19 @@ def _removal_confirm_permanent(
 
     op_key = existing_op["idempotency_key"]
     try:
+        # The contract offers confirm_permanent on a COMPLETED recoverable
+        # operation too, and the kernel can only run a permanent removal
+        # over a live board. Continue from the archived state FIRST, so the
+        # permanence statement below is the one the removal will run under.
+        # A refusal here is turned into the standard owner-safe refusal by
+        # this block's own except handler.
+        continued = kanban_db.continue_archived_removal_as_permanent(
+            project.board_slug,
+        )
+        if not continued.success:
+            raise OwnerWorkspaceError(
+                "removal_refused", _REMOVAL_SAFE_ERRORS["driver_failed"],
+            )
         disclosure = kanban_db.permanent_removal_disclosure(project.board_slug)
         confirmation_result = kanban_db.confirm_permanent_removal(
             project.board_slug,

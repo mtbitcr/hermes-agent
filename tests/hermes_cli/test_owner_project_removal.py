@@ -54,6 +54,11 @@ def _setup(mp):
         pc.close()
     return pid, s
 
+def _drove_ok(*a, **kw):
+    """What the real driver returns when it reaches Done."""
+    return kanban_db.FencedRemovalResult(True, "removal complete")
+
+
 def _mk_op(pid, s, ik, phase, **kw):
     with projects_db.connect_closing() as c:
         projects_db.record_removal_operation(
@@ -453,7 +458,7 @@ class TestT2AsyncDrive:
         phase_rec.phase.value = "done"
         phase_rec.mode = kanban_db.RemovalMode.REVERSIBLE
         phase_rec.removal_id = "rm_test"
-        monkeypatch.setattr(kanban_db, "drive_removal", lambda *a, **kw: None)
+        monkeypatch.setattr(kanban_db, "drive_removal", _drove_ok)
         monkeypatch.setattr(kanban_db, "get_removal_phase_record",
                             lambda *a, **kw: phase_rec)
         ow._removal_drive_and_record(pid, s, op_key)
@@ -686,7 +691,7 @@ class TestT6ResumeAndBackgroundSeam:
 
         def _fake_drive(board, *a, **kw):
             driven.append(board)
-            return None
+            return _drove_ok(board)
 
         phase_rec = MagicMock()
         phase_rec.phase = MagicMock()
@@ -737,7 +742,7 @@ class TestT6ResumeAndBackgroundSeam:
         """The dispatch mechanism must track tasks/threads, not fire-and-forget."""
         pid, s = _setup(monkeypatch)
         _mk_op(pid, s, "t6bg", "accepted")
-        monkeypatch.setattr(kanban_db, "drive_removal", lambda *a, **kw: None)
+        monkeypatch.setattr(kanban_db, "drive_removal", _drove_ok)
         phase_rec = MagicMock()
         phase_rec.phase = MagicMock()
         phase_rec.phase.value = "done"
@@ -752,3 +757,127 @@ class TestT6ResumeAndBackgroundSeam:
             op = projects_db.get_removal_operation(c, pid, "t6bg")
         assert op is not None
         assert op["phase"] == "done"
+
+
+def _real_board(monkeypatch):
+    """A Project whose board really exists and is really fenced."""
+    from tests.hermes_cli._kanban_fence_support import create_fenced_board
+    pid, s = _setup(monkeypatch)
+    create_fenced_board(s)
+    return pid, s
+
+
+def _start_and_join(pid, tag):
+    """The shipped owner start, driven to a standstill on its own thread."""
+    assert _call(pid, f"{tag}{_n[0]}", "start")["ok"]
+    for t in list(ow._removal_background_threads):
+        t.join(timeout=60)
+
+
+class TestFinding1OwnerModeVocabulary:
+    def test_owner_surface_says_recoverable_then_permanent(self, monkeypatch):
+        """Owner-facing mode is 'recoverable' or 'permanent'; the kernel's
+        own word stays 'reversible' underneath."""
+        pid, s = _setup(monkeypatch)
+        _mock_intent_success(monkeypatch, s)
+        monkeypatch.setattr(ow, "_dispatch_removal_drive", lambda *a, **kw: None)
+        started = _call(pid, f"f1s{_n[0]}", "start")
+        assert started["removal_state"]["mode"] == "recoverable"
+        with projects_db.connect_closing() as c:
+            assert _project_removal_state(c, pid, s)["mode"] == "recoverable"
+            assert projects_db.get_active_removal_operation(c, pid)["mode"] == (
+                "reversible"
+            )
+        _mock_permanent_path(monkeypatch, s)
+        confirmed = _call(
+            pid, f"f1c{_n[0]}", "confirm_permanent",
+            consequences_digest=started["removal_state"]["consequences_digest"],
+        )
+        assert confirmed["removal_state"]["mode"] == "permanent"
+        with projects_db.connect_closing() as c:
+            assert _project_removal_state(c, pid, s)["mode"] == "permanent"
+
+
+class TestMinorAppliedAtStamped:
+    def test_completed_removal_reports_when_content_was_applied(self, monkeypatch):
+        """A real drive passes Applied on its way to Done; the owner is
+        still owed the instant content was applied."""
+        pid, s = _real_board(monkeypatch)
+        _start_and_join(pid, "mas")
+        with projects_db.connect_closing() as c:
+            st = _project_removal_state(c, pid, s)
+        assert st["phase"] == "done"
+        assert st["completed_at"] is not None
+        assert st["applied_at"] is not None
+        assert st["applied_at"] <= st["completed_at"]
+
+
+class TestFinding4DeletedSnapshotPresentation:
+    def test_completed_removal_presents_deleted_with_restore(self, monkeypatch):
+        """The board is gone by design: the snapshot comes from the
+        projects-list record and the retained-copy facts."""
+        pid, s = _real_board(monkeypatch)
+        _start_and_join(pid, "f4s")
+        assert not kanban_db.board_exists(s)
+        snapshot = ow.read_project_snapshot(_ctx(), s)
+        assert snapshot["project"]["slug"] == s
+        assert snapshot["steward"]["execution"]["state"] == "deleted"
+        assert snapshot["removal_state"]["restorable"] is True
+        assert snapshot["removal_state"]["mode"] == "recoverable"
+        assert ow.project_steward_snapshot(project_id=pid)["execution"]["state"] == (
+            "deleted"
+        )
+
+
+class TestFinding5RestoreClearsArchivedMarker:
+    def test_restored_project_is_visible_and_paused(self, monkeypatch):
+        """The archived marker rides inside the retained copy; a restore
+        that leaves it there hides the Project forever."""
+        from tests.hermes_cli._kanban_fence_support import ready_task
+
+        pid, s = _real_board(monkeypatch)
+        conn = kanban_db.connect(board=s)
+        try:
+            task_id = ready_task(conn, title="work")
+            conn.execute(
+                "UPDATE tasks SET project_id = ? WHERE id = ?", (pid, task_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        _start_and_join(pid, "f5s")
+        assert _call(pid, f"f5r{_n[0]}", "restore")["ok"]
+        metadata = kanban_db.read_board_metadata(s)
+        assert metadata["archived"] is False
+        assert kanban_db.RETAINED_ARCHIVED_MARKER_KEY not in metadata
+        snapshot = ow.read_project_snapshot(_ctx(), s)
+        assert snapshot["project"]["slug"] == s
+        assert snapshot["steward"]["execution"]["state"] == "paused"
+        assert snapshot["steward"]["execution"]["paused"] is True
+
+
+class TestFinding6PermanentContinuesFromArchived:
+    def test_confirm_permanent_after_a_completed_recoverable_removal(
+        self, monkeypatch,
+    ):
+        """The contract offers confirm_permanent on a completed recoverable
+        operation with the served digest; the kernel must agree too."""
+        pid, s = _real_board(monkeypatch)
+        _start_and_join(pid, "f6s")
+        with projects_db.connect_closing() as c:
+            served = _project_removal_state(c, pid, s)
+        assert served["phase"] == "done" and served["restorable"] is True
+        confirmed = _call(
+            pid, f"f6c{_n[0]}", "confirm_permanent",
+            consequences_digest=served["consequences_digest"],
+        )
+        assert confirmed["ok"], confirmed
+        assert confirmed["removal_state"]["mode"] == "permanent"
+        assert confirmed["removal_state"]["restorable"] is False
+        # The kernel agrees: hard-removed, no retained copy left.
+        assert kanban_db.get_register_entry(s).lifecycle is (
+            kanban_db.BoardLifecycle.HARD_REMOVED
+        )
+        assert not kanban_db.reversible_retained_path(
+            s, served["retained_copy_id"],
+        ).exists()

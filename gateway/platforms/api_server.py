@@ -13783,6 +13783,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 "archived": archived,
                 "execution_paused": execution_paused,
             }
+        elif operation == "owner_project_removal":
+            # A removal is ACCEPTED synchronously and driven to its terminal
+            # phase off the request path, so acceptance IS this run's
+            # committed outcome; waiting for 'done' reports an accepted
+            # removal as an uncommitted change.
+            action = value.get("action")
+            state = value.get("removal_state")
+            phase = state.get("phase") if isinstance(state, dict) else None
+            if (
+                action not in {"start", "confirm_permanent", "cancel", "restore"}
+                or not isinstance(phase, str)
+                or re.fullmatch(r"[a-z][a-z_]{0,31}", phase) is None
+            ):
+                return None
+            receipt = {
+                "ok": True,
+                "action": action,
+                "project_slug": project_slug,
+                "phase": phase,
+            }
         else:
             return None
         return json.dumps(receipt, sort_keys=True, separators=(",", ":"))

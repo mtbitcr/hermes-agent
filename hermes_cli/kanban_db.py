@@ -12491,6 +12491,30 @@ def mark_retained_copy_archived(
     return meta
 
 
+def clear_restored_archived_marker(slug: str) -> dict:
+    """Clear §7.3's archived marker on a board restored from its copy.
+
+    ``archived: True`` and :data:`RETAINED_ARCHIVED_MARKER_KEY` live in the
+    RETAINED copy's own ``board.json`` and install verbatim with it, so a
+    restored board reads as archived and every owner projection keeps
+    hiding it. §9.4 restores a board PAUSED, not archived.
+    """
+    path = board_metadata_path(slug)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    raw.pop(RETAINED_ARCHIVED_MARKER_KEY, None)
+    raw["archived"] = False
+    raw["dispatch_paused_by_owner"] = True
+    _atomic_write_text(
+        path, json.dumps(raw, indent=2, ensure_ascii=False) + "\n"
+    )
+    return raw
+
+
 def list_archived_boards() -> list:
     """Enumerate the boards a reversible removal RETAINED (§7.3).
 
@@ -13504,6 +13528,11 @@ def restore_retained_board(
         )
     record = get_removal_phase_record(slug) or record
 
+    # The installed set is what §7.3 archived, marker included; clearing it
+    # is part of restoring, and follows the in-place re-validation above so
+    # nothing is checked against a file this step rewrote.
+    clear_restored_archived_marker(slug)
+
     paused_ok, paused_reason, paused_detail = _restore_pause_store(
         slug, epoch=epoch
     )
@@ -13689,6 +13718,62 @@ def resume_restored_board(board: str) -> RestoreResult:
         True, f"board {slug!r} resumed: it is live and usable at epoch {epoch}",
         state=RESTORE_STATE_RESUMED, epoch=epoch,
         record=get_removal_phase_record(slug) or record, entry=entry,
+    )
+
+
+def continue_archived_removal_as_permanent(board: str) -> RestoreResult:
+    """Bring an ARCHIVED board back live so a permanent removal can run.
+
+    §6.1 tells an operator whose permanent request lost to a reversible one
+    to re-issue it once the reversible removal completes — but every phase
+    after Intent reads the board's OWN store, which a completed reversible
+    removal left only in the retained copy. So the permanent path continues
+    from archived the only way it can: the copy is reinstalled through the
+    shipped validated restore, its gate is opened at the restored epoch,
+    and the copy is discarded, leaving exactly ONE of the board to destroy.
+    A board that is not archived this way is left untouched.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RestoreResult(False, "invalid board name")
+    record = get_removal_p�ase_record(slug)
+    entry = get_register_entry(slug)
+    if (
+        record is None
+        or entry is None
+        or record.mode != RemovalMode.REVERSIBLE
+        or record.phase != RemovalPhase.DONE
+        or entry.lifecycle is not BoardLifecycle.ARCHIVED
+    ):
+        return RestoreResult(
+            True,
+            f"{slug!r} is not archived under a completed reversible removal: "
+            "there is nothing to continue from",
+            record=record, entry=entry, already_done=True,
+        )
+    retained = reversible_retained_path(slug, record.removal_id)
+    restored = restore_retained_board(slug, removal_id=record.removal_id)
+    if not restored.success:
+        return restored
+    resumed = resume_restored_board(slug)
+    if not resumed.success:
+        return resumed
+    message = (
+        f"board {slug!r} is live again from its retained copy, which has been "
+        "discarded: a permanent removal continues from here"
+    )
+    ok = True
+    if retained.exists():
+        try:
+            shutil.rmtree(retained)
+        except OSError as exc:
+            ok, message = False, (
+                "the board is live again but its retained copy could not be "
+                f"discarded, so a permanent removal would leave one: {exc}"
+            )
+    return RestoreResult(
+        ok, message, state=RESTORE_STATE_RESUMED, epoch=resumed.epoch,
+        record=get_removal_phase_record(slug), entry=get_register_entry(slug),
     )
 
 
