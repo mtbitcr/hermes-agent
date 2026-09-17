@@ -13379,7 +13379,11 @@ def restore_retained_board(
     live = board_dir(slug)
 
     # A restore that has not begun may not overwrite anything live, and
-    # may only act on a board the removal really finished.
+    # may only act on a board the removal really finished. Either refusal
+    # is still a restore that WAS attempted, so it is journalled as a
+    # failed restore item before it returns: the owner-facing status read
+    # derives its state from this journal alone, and silence there would
+    # report "no restore was ever attempted".
     if validated is None:
         if entry.lifecycle is not BoardLifecycle.ARCHIVED:
             message = (
@@ -13387,16 +13391,33 @@ def restore_retained_board(
                 "not archived: there is no retained copy of a board that was "
                 "not reversibly removed"
             )
-            return RestoreResult(False, message, record=record, entry=entry)
+            _restore_journal(
+                slug, record, RESTORE_JOURNAL_VALIDATED, ok=False,
+                reason=message,
+                detail={
+                    "retained": str(retained),
+                    "lifecycle": entry.lifecycle.value,
+                },
+            )
+            _record_phase_refusal(slug, record, REMOVAL_REFUSAL_RESTORE, message)
+            return RestoreResult(
+                False, message, state=RESTORE_STATE_REFUSED,
+                record=get_removal_phase_record(slug) or record, entry=entry,
+            )
         if live.exists() or kanban_db_path(board=slug).exists():
             message = (
                 f"{slug!r} already has live storage at {live}: a restore "
                 "never writes over a board that is present"
             )
+            _restore_journal(
+                slug, record, RESTORE_JOURNAL_VALIDATED, ok=False,
+                reason=message,
+                detail={"retained": str(retained), "live": str(live)},
+            )
             _record_phase_refusal(slug, record, REMOVAL_REFUSAL_RESTORE, message)
             return RestoreResult(
                 False, message, state=RESTORE_STATE_REFUSED,
-                record=record, entry=entry,
+                record=get_removal_phase_record(slug) or record, entry=entry,
             )
 
     # ── 1. Validate the complete retained set, before any live write ────
