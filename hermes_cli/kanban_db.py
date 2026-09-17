@@ -12391,10 +12391,18 @@ def apply_reversible_mode_content(
             "mode-specific content belongs to Applied", record=record,
         )
 
+    payload = record.carried()
+    if payload is None:
+        return ReversibleModeContentResult(
+            False,
+            "§7.3: nothing was carried, so there is no ledger to act on",
+            record=record,
+        )
+
     retained = reversible_retained_path(slug, removal_id)
     live = board_dir(slug)
     c13 = next(
-        (e for e in (record.carried() or {}).get("outside_resource_ledger") or []
+        (e for e in payload.get("outside_resource_ledger") or []
          if e.get("member") == "work-area-registration"), {},
     )
     destroyed: list = []

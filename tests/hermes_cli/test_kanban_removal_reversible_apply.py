@@ -323,3 +323,62 @@ def test_the_archive_says_so_itself_and_is_listed_before_any_success(
         assert [e for e in json.loads(cli("boards archived --json"))
                 if e["slug"] == slug] == [entry]
         assert slug in cli("boards archived")
+
+
+@pytest.mark.parametrize("corrupt_payload", [
+    pytest.param("{not valid json", id="invalid-json"),
+    pytest.param("[1, 2, 3]", id="json-array"),
+    pytest.param('"just a string"', id="json-string"),
+    pytest.param(None, id="absent"),
+    pytest.param("", id="empty"),
+])
+def test_an_unreadable_carry_refuses_instead_of_acting_on_an_empty_ledger(
+    fence_home, tmp_path, corrupt_payload
+):
+    """§7.3: a carry that cannot be READ is refused — never an empty ledger.
+
+    ``(record.carried() or {}).get(...)`` used to turn every unreadable
+    shape (bad JSON, a non-object, absent, empty) into ``{}``, so neither
+    the work-area loop nor the unresolved-block branch in
+    ``_apply_carried_work_areas`` ever ran, and the apply went on to
+    delete the live board while the work area, its directory and its
+    worktree registration were all left live.
+    """
+    slug = "rev-unreadable-carry"
+    setup = _with_work_area(slug, tmp_path / "repo")
+    intent = start_removal(slug, mode="reversible")
+    assert intent.success, intent.message
+    for step in (kb.advance_removal_to_fenced, kb.advance_removal_to_quiesced,
+                 kb.advance_removal_to_carried, kb.advance_removal_to_released,
+                 kb.advance_removal_to_applied):
+        result = step(slug, removal_id=intent.removal_id)
+        assert result.success, f"{step.__name__}: {result.message}"
+    removal_id = intent.removal_id
+
+    # The carry step already ran and recorded a valid payload; corrupt the
+    # REAL durable column a re-read of the record goes through, after the
+    # fact, exactly as an on-disk corruption would.
+    with kb.register_connect() as conn:
+        conn.execute(
+            "UPDATE board_removal_phase SET carried_payload = ? "
+            "WHERE board_name = ?", (corrupt_payload, slug),
+        )
+
+    result = kb.drive_removal(slug, resumed=True)
+
+    assert result.success is False, result.message
+    assert kb.board_dir(slug).exists()
+    assert kb.kanban_db_path(board=slug).exists()
+    content = setup["work_area"] / f"{setup['task']}.txt"
+    assert content.exists(), "the work area's content did not survive"
+    assert setup["work_area"].exists(), "the work area directory did not survive"
+    assert setup["registration"].exists(), "the registration did not survive"
+    listing = git(setup["repo"], "worktree", "list", "--porcelain").splitlines()
+    worktrees = [ln.split(" ", 1)[1] for ln in listing if ln.startswith("worktree ")]
+    assert str(setup["work_area"]) in worktrees, listing
+    row = _row(slug)
+    assert row["phase"] != "done"
+    assert row["outcome"] != "archived"
+    record = kb.get_removal_phase_record(slug)
+    assert record.removal_id == removal_id
+    assert kb.applied_mode_content_is_outstanding(record)
