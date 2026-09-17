@@ -15590,6 +15590,15 @@ class APIServerAdapter(BasePlatformAdapter):
             # starts serving.
             self._recover_orphaned_owner_jobs()
 
+            # Queued owner removal work IS resumable from durable state (unlike
+            # the orphaned owner jobs just terminalised above), so a restart
+            # re-dispatches its drive rather than abandoning it mid-phase.
+            try:
+                from hermes_cli.owner_workspace import resume_removal_operations
+                resume_removal_operations()
+            except Exception:
+                logger.exception("[api_server] removal operation resume failed")
+
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

@@ -69,6 +69,7 @@ Security contract enforced HERE (not at the tool layer):
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import contextvars
 import hashlib
@@ -6655,8 +6656,7 @@ def _removal_thread_cleanup():
         t.join(timeout=30)
 
 
-import atexit as _atexit
-_atexit.register(_removal_thread_cleanup)
+atexit.register(_removal_thread_cleanup)
 
 
 def _dispatch_removal_drive(board_slug, project_id, operation_key):
@@ -6683,7 +6683,11 @@ def _dispatch_removal_drive(board_slug, project_id, operation_key):
         finally:
             _removal_background_threads.discard(t)
 
-    t = threading.Thread(target=_wrapped, daemon=False)
+    # daemon=True prevents blocking interpreter shutdown indefinitely (CPython
+    # joins non-daemon threads in threading._shutdown BEFORE atexit handlers
+    # run); the already-registered atexit join gives in-flight drives a bounded
+    # 30s grace period without wedging process exit.
+    t = threading.Thread(target=_wrapped, daemon=True)
     _removal_background_threads.add(t)
     t.start()
 
