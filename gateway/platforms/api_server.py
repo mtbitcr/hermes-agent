@@ -15599,6 +15599,16 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 logger.exception("[api_server] removal operation resume failed")
 
+            # Run the additive schema migration (e.g. worker_start_time column) on
+            # every registered board before any owner read can arrive.  Boards opened
+            # read-only by the owner snapshot path raise sqlite3.OperationalError when
+            # the column is absent; a single write-path kernel open here migrates them.
+            try:
+                from hermes_cli.kanban_db import migrate_registered_boards
+                migrate_registered_boards()
+            except Exception:
+                logger.exception("[api_server] migrate_registered_boards failed")
+
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

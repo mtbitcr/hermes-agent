@@ -37217,3 +37217,36 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+def migrate_registered_boards() -> list[str]:
+    """Run the additive schema migration for every registered board, once.
+
+    Called at gateway startup so owner-read surfaces (e.g. ``verified_active_worker_rows``,
+    ``read_project_snapshot``) never encounter a board that still lacks columns added
+    by ``_migrate_add_optional_columns`` (such as ``worker_start_time``).  The migration
+    is the existing write-path kernel open: ``connect_closing(board=slug, create=False)``
+    triggers ``_open_initialized_store``, which runs ``CREATE TABLE IF NOT EXISTS`` and
+    ``_migrate_add_optional_columns`` exactly once per process per path, then caches
+    the result in ``_INITIALIZED_PATHS`` so subsequent opens are free.
+
+    Boards that cannot be opened (absent store, ``BoardFenceClosedError``, or any
+    other exception) are logged at WARNING and skipped — a single bad board must
+    never block startup.  Returns the list of slugs successfully opened.
+    """
+    migrated: list[str] = []
+    for meta in list_boards():
+        slug = meta.get("slug")
+        if not slug:
+            continue
+        try:
+            with connect_closing(board=slug, create=False):
+                pass
+        except Exception as exc:
+            _log.warning(
+                "migrate_registered_boards: skipping board %r — open failed: %s",
+                slug, exc,
+            )
+            continue
+        migrated.append(slug)
+    return migrated
