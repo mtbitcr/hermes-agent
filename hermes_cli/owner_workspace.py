@@ -6488,6 +6488,10 @@ def _project_removal_state(
         phase == "done" and mode == "reversible"
         and op["retained_copy_id"] is not None
     )
+    try:
+        accepted_mode = op["accepted_mode"] or mode
+    except (IndexError, KeyError):
+        accepted_mode = mode
     consequences = None
     if cancelable or op["retained_copy_id"] is not None:
         try:
@@ -6500,7 +6504,7 @@ def _project_removal_state(
         epoch_val = op["epoch"] if op["epoch"] is not None else 0
         consequences = _removal_consequences_document(
             pname, op["board_slug"] or "", epoch_val,
-            retained=(mode == "reversible"),
+            retained=(accepted_mode == "reversible"),
         )
     return {
         "phase": phase,
@@ -6583,9 +6587,7 @@ def project_removal(
                 "the Project changed after it was shown; refresh before trying again",
             )
 
-        existing_op = projects_db.get_removal_operation(
-            pconn, project_id, idempotency_key,
-        )
+        active_op = projects_db.get_active_removal_operation(pconn, project_id)
 
         action_handlers = {
             "start": _removal_start,
@@ -6595,14 +6597,73 @@ def project_removal(
         if action == "confirm_permanent":
             return _removal_confirm_permanent(
                 pconn, ctx, project, idempotency_key, operation, digest,
-                existing_op, consequences_digest,
+                active_op, consequences_digest,
             )
         handler = action_handlers[action]
         return handler(
-            pconn, ctx, project, idempotency_key, operation, digest, existing_op,
+            pconn, ctx, project, idempotency_key, operation, digest, active_op,
         )
     finally:
         pconn.close()
+
+
+def _removal_drive_and_record(project_id, board_slug, operation_key):
+    """Drive the removal and record phase advancement.
+
+    Runs off the request path with its own connection.
+    """
+    pconn = projects_db.connect()
+    try:
+        try:
+            kanban_db.drive_removal(board_slug)
+        except Exception:
+            projects_db.update_removal_operation(
+                pconn, project_id, operation_key, phase="failed",
+                last_error=_REMOVAL_SAFE_ERRORS["driver_failed"],
+                completed_at=int(time.time()),
+            )
+            return
+
+        op = projects_db.get_removal_operation(pconn, project_id, operation_key)
+        if op and op["phase"] != "failed":
+            phase_record = kanban_db.get_removal_phase_record(board_slug)
+            if phase_record:
+                owner_phase = _REMOVAL_PHASE_OWNER_MAP.get(
+                    phase_record.phase.value, phase_record.phase.value,
+                )
+                updates: dict = {"phase": owner_phase}
+                if owner_phase == "applied":
+                    updates["applied_at"] = int(time.time())
+                if phase_record.phase.value == "done":
+                    updates["completed_at"] = int(time.time())
+                    updates["receipt_id"] = operation_key
+                    if phase_record.mode == kanban_db.RemovalMode.REVERSIBLE:
+                        updates["retained_copy_id"] = phase_record.removal_id
+                projects_db.update_removal_operation(
+                    pconn, project_id, operation_key, **updates,
+                )
+    finally:
+        pconn.close()
+
+
+def _dispatch_removal_drive(board_slug, project_id, operation_key):
+    """Hand the drive to a background mechanism and return immediately."""
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(
+            None, _removal_drive_and_record, project_id, board_slug, operation_key,
+        )
+        return
+    except RuntimeError:
+        pass
+    import threading
+    t = threading.Thread(
+        target=_removal_drive_and_record,
+        args=(project_id, board_slug, operation_key),
+        daemon=True,
+    )
+    t.start()
 
 
 def _removal_start(pconn, ctx, project, idempotency_key, operation, digest, existing_op):
@@ -6658,38 +6719,13 @@ def _removal_start(pconn, ctx, project, idempotency_key, operation, digest, exis
     projects_db.record_removal_operation(
         pconn, project_id=project.id, idempotency_key=idempotency_key,
         action="start", phase="accepted", mode=mode.value,
+        accepted_mode=mode.value,
         board_slug=project.board_slug, removal_id=intent.removal_id,
         consequences_digest=consequences["digest"],
         epoch=intent_epoch,
     )
 
-    try:
-        kanban_db.drive_removal(project.board_slug)
-    except Exception:
-        projects_db.update_removal_operation(
-            pconn, project.id, idempotency_key, phase="failed",
-            last_error=_REMOVAL_SAFE_ERRORS["driver_failed"],
-            completed_at=int(time.time()),
-        )
-
-    op = projects_db.get_removal_operation(pconn, project.id, idempotency_key)
-    if op and op["phase"] != "failed":
-        phase_record = kanban_db.get_removal_phase_record(project.board_slug)
-        if phase_record:
-            owner_phase = _REMOVAL_PHASE_OWNER_MAP.get(
-                phase_record.phase.value, phase_record.phase.value,
-            )
-            updates: dict = {"phase": owner_phase}
-            if owner_phase == "applied":
-                updates["applied_at"] = int(time.time())
-            if phase_record.phase.value == "done":
-                updates["completed_at"] = int(time.time())
-                updates["receipt_id"] = idempotency_key
-                if phase_record.mode == kanban_db.RemovalMode.REVERSIBLE:
-                    updates["retained_copy_id"] = phase_record.removal_id
-            projects_db.update_removal_operation(
-                pconn, project.id, idempotency_key, **updates,
-            )
+    _dispatch_removal_drive(project.board_slug, project.id, idempotency_key)
 
     removal_st = _project_removal_state(pconn, project.id, project.board_slug)
     result = {
@@ -6721,9 +6757,71 @@ def _removal_confirm_permanent(
     if state == "terminal":
         return json.loads(row["result_json"])
 
-    projects_db.update_removal_operation(
-        pconn, project.id, existing_op["idempotency_key"], mode="permanent",
-    )
+    op_key = existing_op["idempotency_key"]
+    try:
+        disclosure = kanban_db.permanent_removal_disclosure(project.board_slug)
+        confirmation_result = kanban_db.confirm_permanent_removal(
+            project.board_slug,
+            response=disclosure.required_response,
+            confirmed_by="owner_project_removal",
+            shown_digest=disclosure.statement_digest,
+            disclosure=disclosure,
+        )
+        if not confirmation_result.confirmed:
+            projects_db.update_removal_operation(
+                pconn, project.id, op_key,
+                last_error=_REMOVAL_SAFE_ERRORS["cancel_refused"],
+            )
+            result = {
+                "ok": False, "action": "confirm_permanent",
+                "project_slug": project.slug,
+                "reason": _REMOVAL_SAFE_ERRORS["cancel_refused"],
+            }
+            _finalize_receipt(
+                pconn, ctx, idempotency_key, token, status="committed",
+                result=result,
+            )
+            return result
+        fenced = kanban_db.remove_board_fenced(
+            project.board_slug,
+            mode=kanban_db.RemovalMode.PERMANENT,
+            permanent_confirmation=confirmation_result.confirmation,
+        )
+        if not fenced.success:
+            projects_db.update_removal_operation(
+                pconn, project.id, op_key,
+                last_error=_REMOVAL_SAFE_ERRORS["driver_failed"],
+            )
+            result = {
+                "ok": False, "action": "confirm_permanent",
+                "project_slug": project.slug,
+                "reason": _REMOVAL_SAFE_ERRORS["driver_failed"],
+            }
+            _finalize_receipt(
+                pconn, ctx, idempotency_key, token, status="committed",
+                result=result,
+            )
+            return result
+        projects_db.update_removal_operation(
+            pconn, project.id, op_key, mode="permanent",
+            retained_copy_id=None,
+        )
+    except Exception:
+        projects_db.update_removal_operation(
+            pconn, project.id, op_key,
+            last_error=_REMOVAL_SAFE_ERRORS["driver_failed"],
+        )
+        result = {
+            "ok": False, "action": "confirm_permanent",
+            "project_slug": project.slug,
+            "reason": _REMOVAL_SAFE_ERRORS["driver_failed"],
+        }
+        _finalize_receipt(
+            pconn, ctx, idempotency_key, token, status="committed",
+            result=result,
+        )
+        return result
+
     removal_st = _project_removal_state(pconn, project.id, project.board_slug)
     result = {
         "ok": True, "action": "confirm_permanent", "project_slug": project.slug,

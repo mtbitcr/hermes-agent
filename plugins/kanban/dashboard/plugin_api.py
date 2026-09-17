@@ -2725,10 +2725,14 @@ def list_kanban_projects(request: Request):
     """
     _workspace_response = _workspace_maybe_respond(
         request,
-        require_board=False,
-        builder=_workspace_projects_response,
+        require_board=True,
+        builder=lambda: _workspace_projects_response(
+            include_removal_state=_workspace_applied_capability(request)
+            == owner_workspace.OWNER_PROJECT_REMOVAL_STATE_CAPABILITY
+        ),
         object_kind="project",
         object_id=WORKSPACE_PROJECT,
+        allowed_capability=owner_workspace.OWNER_PROJECT_REMOVAL_STATE_CAPABILITY,
     )
     if _workspace_response is not None:
         return _workspace_response
@@ -3833,7 +3837,9 @@ def _workspace_task_event_state(
     }
 
 
-def _workspace_projects_response() -> Optional[dict]:
+def _workspace_projects_response(
+    *, include_removal_state: bool = False,
+) -> Optional[dict]:
     snapshot = _workspace_scope_snapshot()
     if snapshot is None:
         return None
@@ -3843,16 +3849,16 @@ def _workspace_projects_response() -> Optional[dict]:
         "slug": project.slug,
         "name": owner_workspace.owner_project_name(project.name),
     }
-    try:
-        from hermes_cli import projects_db as pdb
-        with pdb.connect_closing() as pconn:
-            removal_st = owner_workspace._project_removal_state(
-                pconn, project.id, project.board_slug,
-            )
-        if removal_st is not None:
+    if include_removal_state:
+        try:
+            from hermes_cli import projects_db as pdb
+            with pdb.connect_closing() as pconn:
+                removal_st = owner_workspace._project_removal_state(
+                    pconn, project.id, project.board_slug,
+                )
             projection["removal_state"] = removal_st
-    except Exception:
-        pass
+        except (OSError, ValueError, KeyError, sqlite3.Error):
+            projection["removal_state"] = None
     return {"projects": [projection]}
 
 

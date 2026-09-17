@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS project_removal_operations (
     action           TEXT NOT NULL,
     phase            TEXT NOT NULL,
     mode             TEXT,
+    accepted_mode    TEXT,
     board_slug       TEXT,
     removal_id       TEXT,
     retained_copy_id TEXT,
@@ -291,6 +292,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "epoch" not in rem_cols:
             _add_column_if_missing(
                 conn, "project_removal_operations", "epoch", "epoch INTEGER",
+            )
+        if "accepted_mode" not in rem_cols:
+            _add_column_if_missing(
+                conn, "project_removal_operations", "accepted_mode",
+                "accepted_mode TEXT",
             )
 
 
@@ -927,6 +933,7 @@ def record_removal_operation(
     action: str,
     phase: str = "accepted",
     mode: Optional[str] = None,
+    accepted_mode: Optional[str] = None,
     board_slug: Optional[str] = None,
     removal_id: Optional[str] = None,
     retained_copy_id: Optional[str] = None,
@@ -936,17 +943,19 @@ def record_removal_operation(
 ) -> bool:
     """Insert a new removal operation record. Returns True if inserted."""
     now = _now()
+    if accepted_mode is None:
+        accepted_mode = mode
     try:
         with write_txn(conn):
             conn.execute(
                 "INSERT INTO project_removal_operations "
-                "(project_id, idempotency_key, action, phase, mode, board_slug, "
-                "removal_id, retained_copy_id, receipt_id, consequences_digest, "
-                "epoch, accepted_at, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (project_id, idempotency_key, action, phase, mode, board_slug,
-                 removal_id, retained_copy_id, receipt_id, consequences_digest,
-                 epoch, now, now, now),
+                "(project_id, idempotency_key, action, phase, mode, accepted_mode, "
+                "board_slug, removal_id, retained_copy_id, receipt_id, "
+                "consequences_digest, epoch, accepted_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (project_id, idempotency_key, action, phase, mode, accepted_mode,
+                 board_slug, removal_id, retained_copy_id, receipt_id,
+                 consequences_digest, epoch, now, now, now),
             )
         return True
     except sqlite3.IntegrityError:
@@ -997,6 +1006,32 @@ def update_removal_operation(
             params,
         )
     return cur.rowcount > 0
+
+
+def get_active_removal_operation(
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> Optional[sqlite3.Row]:
+    """Return the newest operation a later action can still act on.
+
+    Actionable means: non-terminal (still in progress), OR terminal-done
+    with a retained copy (so ``restore`` is still reachable).  Terminal
+    rows that are cancelled/failed/restored, or done-with-no-retained-copy,
+    resolve to None.
+    """
+    row = conn.execute(
+        "SELECT * FROM project_removal_operations "
+        "WHERE project_id = ? ORDER BY created_at DESC LIMIT 1",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    terminal_no_action = {"cancelled", "failed", "restored"}
+    if row["phase"] in terminal_no_action:
+        return None
+    if row["phase"] == "done" and not row["retained_copy_id"]:
+        return None
+    return row
 
 
 def list_removal_operations_for_project(
