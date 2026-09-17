@@ -12784,10 +12784,18 @@ def apply_reversible_mode_content(
                          "board listing, so nothing an operator can read says "
                          "this board survives anywhere", {"marker": archived})
             else:
+                # §9.4 needs the retained set's sizes and digests to be
+                # RECORDED, or a later restore has nothing to validate
+                # the set against. Captured here, after the archived
+                # marker, so it describes the copy as finally left.
+                manifest, manifest_reason = retained_set_manifest(retained)
                 _journal(APPLY_JOURNAL_RETAINED_ARCHIVED, retained, True,
                          "the retained copy's own metadata records it archived "
                          "by this removal, and the board appears in the "
-                         "archived listing", listed)
+                         "archived listing",
+                         {**listed, "manifest": manifest,
+                          "manifest_unreadable":
+                              None if manifest else manifest_reason})
     except ApplyJournalUnwritable as unwritable:
         # A journal write that did not commit stops the sequence HERE.
         failures.append({
@@ -12831,6 +12839,835 @@ def apply_reversible_mode_content(
         f"{retained}, archived in its own metadata, {len(destroyed)} "
         f"destroyed, {len(deregistered)} deregistered",
         retained_path=str(retained), record=apply_result.record,
+    )
+
+
+# ---------------------------------------------------------------------------
+# §9.4 — Restore of a retained copy: validated, paused under a new epoch
+# ---------------------------------------------------------------------------
+#
+# Restore is §7.3 run backwards, and it deliberately adds NO state machine
+# of its own: the removal stays at Done and every step of the restore is
+# one item on that same removal's durable apply journal (§7.2/§7.3's
+# receipt seam). A restart therefore reads what has already happened from
+# exactly where a re-drive of the removal would, which is what makes
+# "complete or refuse the SAME restore, never start a second one" a
+# property of durable state rather than of a lock.
+
+#: The retained set's recorded sizes and digests, captured as §7.3 leaves
+#: the copy — after the archived marker is written, so the manifest
+#: describes the set as it was finally left — and journalled with it.
+RETAINED_MANIFEST_VERSION = 1
+
+RESTORE_JOURNAL_VALIDATED = "restore-set-validated"
+RESTORE_JOURNAL_INSTALLED = "restore-store-installed"
+RESTORE_JOURNAL_REATTACHED = "restore-reattachment-recorded"
+RESTORE_JOURNAL_COMPLETED = "restore-completed"
+RESTORE_JOURNAL_RESUMED = "restore-resumed"
+
+#: Every journal action a restore writes, in the order it writes them.
+RESTORE_JOURNAL_ACTIONS: "tuple[str, ...]" = (
+    RESTORE_JOURNAL_VALIDATED,
+    RESTORE_JOURNAL_INSTALLED,
+    RESTORE_JOURNAL_REATTACHED,
+    RESTORE_JOURNAL_COMPLETED,
+    RESTORE_JOURNAL_RESUMED,
+)
+
+# The owner-facing states the status read reports. There is no fifth:
+# silence is reported as no restore, never as a half-success.
+RESTORE_STATE_RESTORING = "restoring"
+RESTORE_STATE_RESTORED = "restored"
+RESTORE_STATE_RESUMED = "resumed"
+RESTORE_STATE_REFUSED = "refused"
+
+REMOVAL_REFUSAL_RESTORE = "refused-restore"
+
+
+@dataclass
+class RestoreResult:
+    """Result of :func:`restore_retained_board` / :func:`resume_restored_board`."""
+    success: bool
+    message: str
+    state: Optional[str] = None
+    epoch: Optional[int] = None
+    record: Optional[RemovalPhaseRecord] = None
+    entry: Optional[RegisterEntry] = None
+    already_done: bool = False
+    reattachment: Optional[dict] = None
+    detail: Optional[dict] = None
+
+
+def retained_set_manifest(retained: Path) -> "tuple[Optional[dict], str]":
+    """Every file of the retained set, with its size and content digest.
+
+    Returns ``(None, reason)`` when the set cannot be read: a manifest
+    that could not be derived is never recorded as an empty one, because a
+    restore validating against an empty manifest would validate nothing.
+    """
+    files: list = []
+    try:
+        if not retained.is_dir():
+            return None, f"{retained} is not a retained copy"
+        for source in sorted(retained.rglob("*")):
+            if source.is_symlink() or not source.is_file():
+                continue
+            files.append({
+                "path": str(source.relative_to(retained)),
+                "size": source.stat().st_size,
+                "sha256": _file_digest(source),
+            })
+    except OSError as exc:
+        return None, f"the retained set at {retained} cannot be read: {exc}"
+    if not files:
+        return None, f"{retained} holds no readable file to record"
+    return {
+        "version": RETAINED_MANIFEST_VERSION,
+        "retained": str(retained),
+        "files": files,
+        "count": len(files),
+    }, f"{len(files)} retained file(s) recorded with size and digest"
+
+
+def validate_retained_set(
+    retained: Path, manifest: Optional[dict]
+) -> "tuple[bool, str, dict]":
+    """Check the retained set FILE BY FILE against its recorded manifest.
+
+    The complete set — board database, files and metadata — is compared
+    against the sizes and digests recorded when §7.3 left the copy. A
+    missing file, a changed size, a changed digest, or a file the manifest
+    does not name all refuse, each with a plain reason. Nothing live is
+    touched here: this function only reads.
+    """
+    detail: dict = {"retained": str(retained)}
+    if not isinstance(manifest, dict) or not isinstance(
+        manifest.get("files"), list
+    ):
+        return False, (
+            "no recorded sizes and digests exist for this retained set, so "
+            "it cannot be validated: a set nothing can be checked against "
+            "is never restored"
+        ), detail
+    recorded = {
+        str(item.get("path")): item
+        for item in manifest["files"] if isinstance(item, dict)
+    }
+    detail["recorded"] = len(recorded)
+    try:
+        if not retained.is_dir():
+            return False, f"the retained copy {retained} is not there", detail
+        present = {
+            str(path.relative_to(retained))
+            for path in retained.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        checked = 0
+        for relative, item in sorted(recorded.items()):
+            target = retained / relative
+            if not target.is_file():
+                return False, (
+                    f"INCOMPLETE: {relative} is recorded in the retained set "
+                    f"and is not present at {retained}"
+                ), detail
+            size = target.stat().st_size
+            if size != item.get("size"):
+                return False, (
+                    f"TAMPERED: {relative} is {size} byte(s) where the "
+                    f"retained set records {item.get('size')}"
+                ), detail
+            if _file_digest(target) != item.get("sha256"):
+                return False, (
+                    f"TAMPERED: the content of {relative} is not what the "
+                    "retained set recorded for it"
+                ), detail
+            checked += 1
+        extra = sorted(present - set(recorded))
+        if extra:
+            return False, (
+                f"TAMPERED: {len(extra)} file(s) the retained set does not "
+                f"record are present in it (first: {extra[0]})"
+            ), detail
+    except OSError as exc:
+        return False, f"the retained set cannot be read: {exc}", detail
+    detail["files_validated"] = checked
+    return True, (
+        f"the retained set at {retained} is complete: {checked} file(s) "
+        "match the recorded sizes and digests, and nothing else is present"
+    ), detail
+
+
+def _restore_journal_item(
+    record: RemovalPhaseRecord, action: str
+) -> Optional[dict]:
+    """The first item durably recording *action* as done, or ``None``."""
+    for item in record.journal()["items"]:
+        if item.get("action") == action and item.get("ok"):
+            return item
+    return None
+
+
+def _restore_last_item(record: RemovalPhaseRecord) -> Optional[dict]:
+    """The last journal item belonging to a restore, successful or not."""
+    last = None
+    for item in record.journal()["items"]:
+        if item.get("step") in RESTORE_JOURNAL_ACTIONS or (
+            item.get("action") in RESTORE_JOURNAL_ACTIONS
+        ):
+            last = item
+    return last
+
+
+def restore_status(record: Optional[RemovalPhaseRecord]) -> Optional[dict]:
+    """What the owner is owed: restoring, restored, resumed, or refused.
+
+    Read from the SAME durable journal the restore writes, so the status
+    is the recorded facts and not a second account of them. ``None`` means
+    no restore was ever attempted — never a half-success.
+    """
+    if record is None:
+        return None
+    validated = _restore_journal_item(record, RESTORE_JOURNAL_VALIDATED)
+    completed = _restore_journal_item(record, RESTORE_JOURNAL_COMPLETED)
+    resumed = _restore_journal_item(record, RESTORE_JOURNAL_RESUMED)
+    last = _restore_last_item(record)
+    if resumed is not None:
+        state, reason = RESTORE_STATE_RESUMED, resumed.get("reason")
+    elif completed is not None:
+        state, reason = RESTORE_STATE_RESTORED, completed.get("reason")
+    elif last is not None and not last.get("ok"):
+        state, reason = RESTORE_STATE_REFUSED, last.get("reason")
+    elif last is not None:
+        state, reason = RESTORE_STATE_RESTORING, last.get("reason")
+    else:
+        return None
+    epoch = None
+    if validated is not None:
+        epoch = (validated.get("detail") or {}).get("epoch")
+    return {
+        "state": state,
+        "reason": reason,
+        "epoch": epoch,
+        "removal_id": record.removal_id,
+        "retained_path": str(
+            reversible_retained_path(record.board_name, record.removal_id)
+        ),
+        "paused": state in (RESTORE_STATE_RESTORING, RESTORE_STATE_RESTORED),
+    }
+
+
+def _restore_journal(
+    slug: str, record: RemovalPhaseRecord, action: str, *,
+    ok: bool, reason: str, detail: dict,
+) -> bool:
+    """Append ONE restore item to the removal's own durable journal.
+
+    The removal's phase is NOT moved: a restore is recorded against the
+    finished removal it reverses, through the seam that already exists.
+    """
+    last = _restore_last_item(record)
+    if (
+        last is not None and not ok and not last.get("ok")
+        and last.get("step") == action and last.get("reason") == reason
+    ):
+        return True  # the identical refusal is already durable
+    return journal_apply_item(
+        slug, removal_id=record.removal_id, phase=record.phase,
+        item={
+            "action": action if ok else APPLY_JOURNAL_FAILURE,
+            "step": action, "identity": str(detail.get("retained") or slug),
+            "ok": bool(ok), "reason": reason, "detail": detail,
+        },
+    )
+
+
+def _restore_install_store(retained: Path, live: Path) -> None:
+    """Put the validated retained set back where the live board belongs.
+
+    Every file is rewritten from the retained original, so a half-written
+    one from an interrupted restore cannot survive as "already installed";
+    the install is then re-validated against the same recorded manifest
+    before anything is journalled.
+    """
+    live.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(retained, live, dirs_exist_ok=True)
+
+
+def _restore_pause_store(slug: str, *, epoch: int) -> "tuple[bool, str, dict]":
+    """Freeze the restored store at the NEW epoch and void what came before.
+
+    One write transaction on the restored board's own store: the in-board
+    gate is committed FROZEN with the new epoch as its mirror, and every
+    reservation recorded before the removal is returned to the pool with
+    its claim cleared. After this, a handle, claim or lease minted before
+    the removal can satisfy no compare-and-set on this board — the claim
+    it names is gone, and the gate refuses every mutation until an
+    explicit resume opens it.
+    """
+    detail: dict = {"epoch": epoch, "voided": []}
+    try:
+        with _fence_protocol_scope():
+            conn = connect(board=slug)
+            try:
+                with write_txn(conn):
+                    _ensure_in_board_fence_schema(conn)
+                    if not commit_gate_state(conn, InBoardGate.FROZEN, epoch):
+                        return False, (
+                            "the restored store's in-board gate could not be "
+                            "frozen at the new epoch"
+                        ), detail
+                    held = [
+                        row["id"] for row in conn.execute(
+                            "SELECT id FROM tasks WHERE status = 'running' "
+                            "AND claim_lock IS NOT NULL"
+                        )
+                    ]
+                    conn.execute(
+                        "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL, "
+                        "current_run_id = NULL "
+                        "WHERE status = 'running' AND claim_lock IS NOT NULL"
+                    )
+                    for task_id in held:
+                        _append_event(
+                            conn, task_id, "restore_reservation_voided",
+                            {"epoch": epoch, "board": slug},
+                        )
+                    detail["voided"] = held
+            finally:
+                conn.close()
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
+        return False, (
+            f"the restored store could not be paused at the new epoch: {exc}"
+        ), detail
+    reading = _read_gate_instant(slug)
+    if not (
+        reading.status is DurableReadStatus.OK
+        and reading.gate is InBoardGate.FROZEN
+        and reading.epoch_mirror == epoch
+    ):
+        return False, (
+            f"the restored store does not read back frozen at epoch {epoch}: "
+            f"{reading.reason}"
+        ), detail
+    return True, (
+        f"the restored store is frozen at epoch {epoch} and "
+        f"{len(detail['voided'])} reservation(s) recorded before the removal "
+        "were voided"
+    ), detail
+
+
+def build_restore_reattachment(slug: str, *, epoch: int) -> dict:
+    """What the restored board may be reattached to — and what it may not.
+
+    STRICTLY READ-ONLY, and deliberately so: shared version-control state
+    is never rewound by a restore. No branch, commit or work-area
+    registration is created, moved, deleted or rewritten here. Each thing
+    the restored board records is attributed against the creation-time
+    provenance ledger (which lives outside every board, so the removal
+    could not destroy it) plus the shared container's own registration
+    metadata. Anything that cannot be attributed is reported
+    :data:`RECEIPT_VERDICT_UNVERIFIED` with its reason and is NOT acted
+    on.
+    """
+    report = {
+        "version": 1, "board": slug, "epoch": epoch,
+        "source": KERNEL_COMMIT_PROVENANCE_SOURCE,
+        "attributed": [], "unverified": [],
+        # A restore writes no shared version-control state at all. This
+        # stays empty by construction, and says so on the receipt.
+        "acted_on": [],
+        "shared_state_rule": (
+            "branches, commits and work-area registrations are left exactly "
+            "as they are; a restore reattaches by record only"
+        ),
+    }
+    db_path = kanban_db_path(board=slug)
+    if not db_path.exists():
+        report["unverified"].append({
+            "member": "board-store", "identity": str(db_path),
+            "verdict": RECEIPT_VERDICT_UNVERIFIED,
+            "reason": "the restored store is not readable, so nothing this "
+                      "board recorded can be attributed",
+        })
+        return report
+    try:
+        conn = _sqlite_connect_no_create(db_path)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        report["unverified"].append({
+            "member": "board-store", "identity": str(db_path),
+            "verdict": RECEIPT_VERDICT_UNVERIFIED,
+            "reason": f"the restored store cannot be opened: {exc}",
+        })
+        return report
+    try:
+        work = _board_work_scope(conn, slug)
+    except sqlite3.Error as exc:
+        report["unverified"].append({
+            "member": "board-store", "identity": str(db_path),
+            "verdict": RECEIPT_VERDICT_UNVERIFIED,
+            "reason": f"the restored store cannot be read: {exc}",
+        })
+        return report
+    finally:
+        conn.close()
+
+    for reference in work["references"]:
+        ledgered = {
+            str(row.get("subject_id"))
+            for row in reference.get("kernel_commit_records") or []
+            if row.get("subject_id")
+        }
+        for commit in reference.get("board_created_commits") or []:
+            item = {
+                "member": "version-control-reference",
+                "task": reference.get("task"),
+                "reference": reference.get("reference"),
+                "container": reference.get("container"),
+                "commit": commit,
+            }
+            if commit in ledgered:
+                report["attributed"].append({
+                    **item, "verdict": RECEIPT_VERDICT_PASS,
+                    "reason": "the creation-time provenance ledger records "
+                              "this board as its creator",
+                })
+            else:
+                report["unverified"].append({
+                    **item, "verdict": RECEIPT_VERDICT_UNVERIFIED,
+                    "reason": "the creation-time provenance ledger has no "
+                              "row naming this board as its creator, so it "
+                              "is not reattached and is left untouched",
+                })
+
+    for registration in work["registrations"]:
+        ownership = verify_work_area_ownership(registration)
+        item = {
+            "member": "work-area-registration",
+            "task": registration.get("task"),
+            "work_area": registration.get("work_area"),
+            "container": registration.get("container"),
+            "registration": registration.get("registration"),
+        }
+        if ownership.owned is True:
+            report["attributed"].append({
+                **item, "verdict": RECEIPT_VERDICT_PASS,
+                "reason": ownership.reason,
+            })
+        else:
+            report["unverified"].append({
+                **item, "verdict": RECEIPT_VERDICT_UNVERIFIED,
+                "reason": ownership.reason,
+            })
+    for unresolved in work["unresolved"]:
+        report["unverified"].append({
+            "member": "work-area-registration",
+            "task": unresolved.get("task"),
+            "work_area": unresolved.get("work_area"),
+            "verdict": RECEIPT_VERDICT_UNVERIFIED,
+            "reason": unresolved.get("reason"),
+        })
+    report["attributed_count"] = len(report["attributed"])
+    report["unverified_count"] = len(report["unverified"])
+    return report
+
+
+def _restore_register_entry(
+    slug: str, entry: RegisterEntry, *, epoch: int
+) -> "tuple[bool, str, Optional[RegisterEntry]]":
+    """Record the restored board LIVE at the new epoch. Idempotent."""
+    if entry.lifecycle is BoardLifecycle.LIVE and entry.epoch == epoch:
+        return True, "the register already records the restored epoch", entry
+    lineage = list(entry.epoch_lineage or [])
+    if not lineage or lineage[-1] != epoch:
+        lineage.append(epoch)
+    restored = RegisterEntry(
+        board_name=slug, lifecycle=BoardLifecycle.LIVE, epoch=epoch,
+        epoch_before=int(entry.epoch), gate_move=GateMove.SETTLED,
+        removal_mode=None,
+        scope_declaration_version=entry.scope_declaration_version,
+        epoch_lineage=lineage, created_at=entry.created_at,
+    )
+    try:
+        with board_register_lock(slug, reentrant=True):
+            with register_connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _write_register_entry(conn, restored)
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
+        return False, f"the register could not record the restore: {exc}", None
+    return True, f"the register records {slug!r} live at epoch {epoch}", restored
+
+
+def restore_retained_board(
+    board: str, *, removal_id: Optional[str] = None
+) -> RestoreResult:
+    """§9.4: restore a reversible removal's retained copy, PAUSED.
+
+    In order, and never out of it:
+
+    1. the complete retained set — board database, files and metadata — is
+       validated file by file against the sizes and digests recorded when
+       §7.3 left it. An incomplete or tampered set is REFUSED with a plain
+       reason and NOTHING LIVE IS TOUCHED;
+    2. only then is the set installed and re-validated in place, the store
+       frozen at a NEW epoch, every pre-removal reservation voided, and
+       the register moved live at that same new epoch. The board is
+       therefore restored PAUSED: usable only after
+       :func:`resume_restored_board`;
+    3. the restored board is reattached only to what the creation-time
+       provenance ledger records as its own; shared version-control state
+       is never rewound, and anything unattributable is reported
+       UNVERIFIED without being acted on;
+    4. every step is one item on the removal's OWN apply journal, so a
+       restart completes or refuses the SAME restore — the new epoch is
+       recorded before it is used — and never starts a second one.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RestoreResult(False, "invalid board name")
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return RestoreResult(
+            False, f"no removal is recorded for {slug!r}: there is no "
+            "retained copy to restore",
+        )
+    if removal_id is not None and removal_id != record.removal_id:
+        return RestoreResult(
+            False,
+            f"removal_id {removal_id!r} does not match the recorded removal "
+            f"{record.removal_id!r}", record=record,
+        )
+    if record.mode != RemovalMode.REVERSIBLE:
+        return RestoreResult(
+            False,
+            f"this removal is {record.mode.value}: only a reversible removal "
+            "retains a copy, and a permanent one can never be restored",
+            record=record,
+        )
+    if record.phase != RemovalPhase.DONE:
+        return RestoreResult(
+            False,
+            f"the removal is at {record.phase.value}, not done: a retained "
+            "copy exists to be restored only after the removal completed "
+            "(cancel the removal instead)",
+            record=record,
+        )
+    entry = get_register_entry(slug)
+    if entry is None:
+        return RestoreResult(
+            False, "register entry missing: the board's authority cannot be "
+            "read, so nothing may be restored", record=record,
+        )
+
+    completed = _restore_journal_item(record, RESTORE_JOURNAL_COMPLETED)
+    validated = _restore_journal_item(record, RESTORE_JOURNAL_VALIDATED)
+    if completed is not None:
+        status = restore_status(record)
+        return RestoreResult(
+            True, f"already restored (idempotent no-op): {completed['reason']}",
+            state=(status or {}).get("state"),
+            epoch=(completed.get("detail") or {}).get("epoch"),
+            record=record, entry=entry, already_done=True,
+        )
+
+    retained = reversible_retained_path(slug, record.removal_id)
+    live = board_dir(slug)
+
+    # A restore that has not begun may not overwrite anything live, and
+    # may only act on a board the removal really finished.
+    if validated is None:
+        if entry.lifecycle is not BoardLifecycle.ARCHIVED:
+            message = (
+                f"the register records {slug!r} as {entry.lifecycle.value}, "
+                "not archived: there is no retained copy of a board that was "
+                "not reversibly removed"
+            )
+            return RestoreResult(False, message, record=record, entry=entry)
+        if live.exists() or kanban_db_path(board=slug).exists():
+            message = (
+                f"{slug!r} already has live storage at {live}: a restore "
+                "never writes over a board that is present"
+            )
+            _record_phase_refusal(slug, record, REMOVAL_REFUSAL_RESTORE, message)
+            return RestoreResult(
+                False, message, state=RESTORE_STATE_REFUSED,
+                record=record, entry=entry,
+            )
+
+    # ── 1. Validate the complete retained set, before any live write ────
+    manifest, manifest_reason = _recorded_retained_manifest(record)
+    ok, reason, detail = validate_retained_set(retained, manifest)
+    if not ok:
+        message = f"restore refused: {reason}"
+        if manifest is None:
+            message = f"restore refused: {manifest_reason}"
+        _restore_journal(
+            slug, record, RESTORE_JOURNAL_VALIDATED, ok=False,
+            reason=message, detail={**detail, "retained": str(retained)},
+        )
+        _record_phase_refusal(slug, record, REMOVAL_REFUSAL_RESTORE, message)
+        return RestoreResult(
+            False, message, state=RESTORE_STATE_REFUSED,
+            record=get_removal_phase_record(slug) or record, entry=entry,
+            detail=detail,
+        )
+
+    # The new epoch is decided ONCE and recorded BEFORE it is used, so a
+    # restart finishes this restore rather than minting a second one.
+    if validated is not None:
+        epoch = int((validated.get("detail") or {}).get("epoch"))
+    else:
+        epoch = int(entry.epoch) + 1
+        if not _restore_journal(
+            slug, record, RESTORE_JOURNAL_VALIDATED, ok=True, reason=reason,
+            detail={
+                **detail, "retained": str(retained), "epoch": epoch,
+                "epoch_before": int(entry.epoch),
+            },
+        ):
+            return RestoreResult(
+                False,
+                "the validated retained set could not be recorded durably, "
+                "so the restore did not begin and nothing live was touched",
+                record=record, entry=entry,
+            )
+        record = get_removal_phase_record(slug) or record
+
+    # ── 2. Install the validated set, then re-validate it in place ──────
+    try:
+        _restore_install_store(retained, live)
+    except OSError as exc:
+        message = f"restore refused: the retained set could not be installed: {exc}"
+        _restore_journal(
+            slug, record, RESTORE_JOURNAL_INSTALLED, ok=False,
+            reason=message, detail={"retained": str(retained), "live": str(live)},
+        )
+        return RestoreResult(
+            False, message, state=RESTORE_STATE_REFUSED,
+            record=get_removal_phase_record(slug) or record, entry=entry,
+        )
+    installed_ok, installed_reason, installed_detail = validate_retained_set(
+        live, manifest
+    )
+    if not installed_ok:
+        message = (
+            f"restore refused: what was installed is not the retained set: "
+            f"{installed_reason}"
+        )
+        _restore_journal(
+            slug, record, RESTORE_JOURNAL_INSTALLED, ok=False,
+            reason=message, detail={"retained": str(retained), "live": str(live)},
+        )
+        return RestoreResult(
+            False, message, state=RESTORE_STATE_REFUSED,
+            record=get_removal_phase_record(slug) or record, entry=entry,
+        )
+    if not _restore_journal(
+        slug, record, RESTORE_JOURNAL_INSTALLED, ok=True,
+        reason=installed_reason,
+        detail={
+            **installed_detail, "retained": str(retained), "live": str(live),
+            "epoch": epoch,
+        },
+    ):
+        return RestoreResult(
+            False,
+            "the installed set could not be recorded durably: the restore "
+            "stops here and a re-drive resumes from the durable journal",
+            record=get_removal_phase_record(slug) or record, entry=entry,
+        )
+    record = get_removal_phase_record(slug) or record
+
+    paused_ok, paused_reason, paused_detail = _restore_pause_store(
+        slug, epoch=epoch
+    )
+    if not paused_ok:
+        message = f"restore refused: {paused_reason}"
+        _restore_journal(
+            slug, record, RESTORE_JOURNAL_COMPLETED, ok=False,
+            reason=message, detail=paused_detail,
+        )
+        return RestoreResult(
+            False, message, state=RESTORE_STATE_REFUSED,
+            record=get_removal_phase_record(slug) or record, entry=entry,
+        )
+
+    register_ok, register_reason, restored_entry = _restore_register_entry(
+        slug, entry, epoch=epoch
+    )
+    if not register_ok:
+        message = f"restore refused: {register_reason}"
+        _restore_journal(
+            slug, record, RESTORE_JOURNAL_COMPLETED, ok=False,
+            reason=message, detail={"epoch": epoch},
+        )
+        return RestoreResult(
+            False, message, state=RESTORE_STATE_REFUSED,
+            record=get_removal_phase_record(slug) or record, entry=entry,
+        )
+
+    # ── 3. Reattach by record only; never rewind shared git state ───────
+    reattachment = build_restore_reattachment(slug, epoch=epoch)
+    _restore_journal(
+        slug, record, RESTORE_JOURNAL_REATTACHED, ok=True,
+        reason=(
+            f"{reattachment['attributed_count']} item(s) attributed to this "
+            f"board by the creation-time provenance ledger and "
+            f"{reattachment['unverified_count']} reported UNVERIFIED without "
+            "being acted on; no shared version-control state was written"
+        ),
+        detail=reattachment,
+    )
+    record = get_removal_phase_record(slug) or record
+
+    # ── 4. The restore is complete, and the board is PAUSED ─────────────
+    if not _restore_journal(
+        slug, record, RESTORE_JOURNAL_COMPLETED, ok=True,
+        reason=(
+            f"{slug!r} is restored from its retained copy and PAUSED at "
+            f"epoch {epoch}: {paused_reason}; it becomes usable only on an "
+            "explicit resume"
+        ),
+        detail={"epoch": epoch, "retained": str(retained), **paused_detail},
+    ):
+        return RestoreResult(
+            False,
+            "the completed restore could not be recorded durably, so it is "
+            "NOT reported complete; a re-drive finishes the same restore",
+            record=get_removal_phase_record(slug) or record,
+            entry=restored_entry,
+        )
+    record = get_removal_phase_record(slug) or record
+    return RestoreResult(
+        True,
+        f"board {slug!r} restored from its retained copy and paused at epoch "
+        f"{epoch}: resume it explicitly to make it usable",
+        state=RESTORE_STATE_RESTORED, epoch=epoch, record=record,
+        entry=restored_entry, reattachment=reattachment,
+    )
+
+
+def _recorded_retained_manifest(
+    record: RemovalPhaseRecord,
+) -> "tuple[Optional[dict], str]":
+    """The sizes and digests §7.3 recorded for this removal's retained set."""
+    item = _restore_journal_item(record, APPLY_JOURNAL_RETAINED_ARCHIVED)
+    if item is None:
+        return None, (
+            "this removal's journal records no archived retained copy, so "
+            "there is no recorded set to validate one against"
+        )
+    detail = item.get("detail")
+    manifest = detail.get("manifest") if isinstance(detail, dict) else None
+    if not isinstance(manifest, dict):
+        reason = (
+            (detail or {}).get("manifest_unreadable")
+            if isinstance(detail, dict) else None
+        )
+        return None, (
+            reason or
+            "this removal recorded no sizes and digests for its retained "
+            "set, so the set cannot be validated and is not restored"
+        )
+    return manifest, "the retained set's recorded sizes and digests"
+
+
+def resume_restored_board(board: str) -> RestoreResult:
+    """§9.4: the explicit resume that makes a restored board usable.
+
+    Accepted only for a board this build durably recorded as restored, and
+    only at the epoch the restore recorded: the gate is opened at that
+    exact epoch, so nothing minted before the removal can act on the board
+    even after the resume. Idempotent.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RestoreResult(False, "invalid board name")
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return RestoreResult(
+            False, f"no removal is recorded for {slug!r}: nothing to resume",
+        )
+    completed = _restore_journal_item(record, RESTORE_JOURNAL_COMPLETED)
+    if completed is None:
+        return RestoreResult(
+            False,
+            f"{slug!r} is not recorded as restored, so there is no paused "
+            "restore to resume",
+            state=(restore_status(record) or {}).get("state"), record=record,
+        )
+    epoch = int((completed.get("detail") or {}).get("epoch"))
+    entry = get_register_entry(slug)
+    if entry is None or entry.lifecycle is not BoardLifecycle.LIVE or (
+        entry.epoch != epoch
+    ):
+        return RestoreResult(
+            False,
+            "the register no longer records this board live at the epoch the "
+            f"restore recorded ({epoch}): refusing to resume it",
+            state=RESTORE_STATE_REFUSED, epoch=epoch, record=record, entry=entry,
+        )
+    resumed = _restore_journal_item(record, RESTORE_JOURNAL_RESUMED)
+    reading = _read_gate_instant(slug)
+    already_open = (
+        reading.status is DurableReadStatus.OK
+        and reading.gate is InBoardGate.OPEN
+        and reading.epoch_mirror == epoch
+    )
+    if resumed is not None and already_open:
+        return RestoreResult(
+            True, "already resumed (idempotent no-op)",
+            state=RESTORE_STATE_RESUMED, epoch=epoch, record=record,
+            entry=entry, already_done=True,
+        )
+    committed = False
+    try:
+        with _fence_protocol_scope():
+            conn = connect(board=slug)
+            try:
+                with write_txn(conn):
+                    committed = commit_gate_state(conn, InBoardGate.OPEN, epoch)
+            finally:
+                conn.close()
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
+        committed = False
+        _log.warning(
+            "kanban restore: resume of %s raised %s: %s",
+            slug, type(exc).__name__, exc,
+        )
+    reading = _read_gate_instant(slug)
+    if not (
+        committed
+        and reading.status is DurableReadStatus.OK
+        and reading.gate is InBoardGate.OPEN
+        and reading.epoch_mirror == epoch
+    ):
+        message = (
+            f"board {slug!r} is not yet usable: the in-board gate could not "
+            f"be opened at epoch {epoch}"
+        )
+        _restore_journal(
+            slug, record, RESTORE_JOURNAL_RESUMED, ok=False,
+            reason=message, detail={"epoch": epoch},
+        )
+        return RestoreResult(
+            False, message, state=RESTORE_STATE_REFUSED, epoch=epoch,
+            record=get_removal_phase_record(slug) or record, entry=entry,
+        )
+    _restore_journal(
+        slug, record, RESTORE_JOURNAL_RESUMED, ok=True,
+        reason=f"board {slug!r} resumed and usable at epoch {epoch}",
+        detail={"epoch": epoch},
+    )
+    return RestoreResult(
+        True, f"board {slug!r} resumed: it is live and usable at epoch {epoch}",
+        state=RESTORE_STATE_RESUMED, epoch=epoch,
+        record=get_removal_phase_record(slug) or record, entry=entry,
     )
 
 
