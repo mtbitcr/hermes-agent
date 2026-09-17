@@ -68,8 +68,10 @@ def test_deadline_abandonment_with_live_owner(fence_home):
         expect_phase=kb.RemovalPhase.FENCED,
         quiescence_deadline=int(time.time()) - 10,
     )
+    # §9.2 ships through this path now: at the deadline the reversible
+    # advance abandons rather than refusing with "later work".
     q = kb.advance_removal_to_quiesced(slug, removal_id=removal_id)
-    assert not q.success
+    assert q.success, q.message
     assert q.action == kb.QuiescenceDeadlineAction.ABANDON
 
     r = kb.abandon_or_cancel_removal(slug, removal_id=removal_id, reason="deadline")
@@ -264,8 +266,8 @@ def test_gate_reopen_failure_is_not_success(fence_home, monkeypatch):
 
 
 def test_no_partial_state_across_restore(fence_home):
-    """Register+outcome consistent after success; resume refuses forward
-    when gate step failed but register is live."""
+    """Register+outcome consistent after success; and when the gate step
+    failed, resume prescribes the reopen rather than reporting complete."""
     slug_ok = "nps-ok"
     rid = _fenced_board(slug_ok)
     r = kb.abandon_or_cancel_removal(slug_ok, removal_id=rid, reason="deadline")
@@ -286,4 +288,91 @@ def test_no_partial_state_across_restore(fence_home):
         kb.commit_gate_state = original
 
     assert kb.get_register_entry(slug_int).lifecycle == kb.BoardLifecycle.LIVE
-    assert kb.resume_removal(slug_int).action == kb.RemovalRecoveryAction.NO_ACTION_COMPLETE
+    assert kb.resume_removal(slug_int).action == (
+        kb.RemovalRecoveryAction.ROLL_FORWARD_REOPEN_AFTER_ABANDON
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. The restart path repairs a board the abandonment left unusable
+# ---------------------------------------------------------------------------
+
+def test_restart_repairs_board_after_failed_gate_reopen(fence_home, monkeypatch):
+    """A gate reopen that does not take effect is repaired by the
+    PRODUCTION loop, and the board is provably usable afterwards."""
+    slug = "reopen-restart"
+    removal_id = _fenced_board(slug)
+
+    # The gate commit does not take effect; nothing else changes.
+    original_commit = kb.commit_gate_state
+    monkeypatch.setattr(kb, "commit_gate_state", lambda *a, **k: False)
+    r = kb.abandon_or_cancel_removal(slug, removal_id=removal_id, reason="deadline")
+    assert not r.success
+    rec = kb.get_removal_phase_record(slug)
+    assert json.loads(rec.refusal_outcome)["outcome"] == "gate-reopen-failed"
+    assert gate_row(kb.kanban_db_path(board=slug))[0] != "open"
+
+    # While the gate is closed the board is NOT complete, whatever the
+    # outcome and the register say.
+    assert kb.resume_removal(slug).action == (
+        kb.RemovalRecoveryAction.ROLL_FORWARD_REOPEN_AFTER_ABANDON
+    )
+
+    monkeypatch.setattr(kb, "commit_gate_state", original_commit)
+    driven = kb.drive_removal(slug)
+    assert driven.success, driven.message
+    assert driven.action == kb.REMOVAL_OUTCOME_ABANDONED
+
+    entry = kb.get_register_entry(slug)
+    assert gate_row(kb.kanban_db_path(board=slug)) == ("open", entry.epoch)
+    assert kb.resume_removal(slug).action == kb.RemovalRecoveryAction.NO_ACTION_COMPLETE
+
+    conn = kb.connect(board=slug)
+    try:
+        assert kb.create_task(conn, title="after the restart", assignee="w")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 6. The deadline reaches abandonment through the shipped loop
+# ---------------------------------------------------------------------------
+
+def test_drive_removal_abandons_at_deadline_with_live_owner(fence_home):
+    """``drive_removal`` — not the abandon API — carries a reversible
+    removal past its deadline, leaving the live owner's claim untouched."""
+    slug = "drive-abandon"
+    removal_id, task_id = _held_board(slug)
+    kb._record_phase_fields(
+        slug, removal_id=removal_id,
+        expect_phase=kb.RemovalPhase.FENCED,
+        quiescence_deadline=int(time.time()) - 10,
+    )
+
+    driven = kb.drive_removal(slug)
+    assert driven.success, driven.message
+    assert driven.action == kb.REMOVAL_OUTCOME_ABANDONED
+
+    rec = kb.get_removal_phase_record(slug)
+    assert rec.outcome == kb.REMOVAL_OUTCOME_ABANDONED
+    entry = kb.get_register_entry(slug)
+    assert entry.lifecycle == kb.BoardLifecycle.LIVE
+    assert gate_row(kb.kanban_db_path(board=slug)) == ("open", entry.epoch)
+
+    # The live owner's claim was never treated as absent.
+    row = task_row(kb.kanban_db_path(board=slug), task_id)
+    assert row["status"] == "running" and row["claim_lock"] is not None
+
+    conn = kb.connect(board=slug)
+    try:
+        assert kb.create_task(conn, title="after abandonment", assignee="w")
+    finally:
+        conn.close()
+
+    # Idempotent: same end state, no duplicate journal entry.
+    items = len(rec.journal()["items"])
+    again = kb.drive_removal(slug)
+    assert again.success and again.action == kb.REMOVAL_OUTCOME_ABANDONED
+    assert len(kb.get_removal_phase_record(slug).journal()["items"]) == items
+    assert kb.get_register_entry(slug).lifecycle == kb.BoardLifecycle.LIVE
+    assert task_row(kb.kanban_db_path(board=slug), task_id)["claim_lock"] is not None

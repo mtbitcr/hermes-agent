@@ -378,6 +378,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_removal_phase.add_argument("slug")
     b_removal_phase.add_argument("--json", action="store_true")
 
+    b_cancel_removal = boards_sub.add_parser(
+        "cancel-removal",
+        help="Cancel a reversible board removal and restore the board to live",
+        description=(
+            "Cancels the recorded removal of a board (design revision 5, "
+            "§9.2) and restores it to live. Accepted strictly before "
+            "Applied; at or past Applied, and for a permanent removal, it "
+            "is refused with a recorded reason."
+        ),
+    )
+    b_cancel_removal.add_argument("slug")
+    b_cancel_removal.add_argument("--json", action="store_true")
+
     b_set_wd = boards_sub.add_parser(
         "set-default-workdir",
         help="Set the default workspace path for tasks on a board",
@@ -1459,6 +1472,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_backfill_fence(args)
     if sub == "removal-phase":
         return _cmd_boards_removal_phase(args)
+    if sub == "cancel-removal":
+        return _cmd_boards_cancel_removal(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1714,6 +1729,57 @@ def _cmd_boards_removal_phase(args: argparse.Namespace) -> int:
         for item in operator_items:
             print(f"  operator item: {item.get('identity')} — {item.get('detail')}")
     return 0
+
+
+def _cmd_boards_cancel_removal(args: argparse.Namespace) -> int:
+    """``hermes kanban boards cancel-removal <slug>`` (§9.2).
+
+    Cancels by the EXACT recorded removal_id, never a different removal.
+    """
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards cancel-removal: {exc}", file=sys.stderr)
+        return 2
+    if not normed:
+        print("kanban boards cancel-removal: slug is required", file=sys.stderr)
+        return 2
+
+    as_json = getattr(args, "json", False)
+    record = kb.get_removal_phase_record(normed)
+    if record is None:
+        message = "no removal is recorded for this board: nothing to cancel"
+        if as_json:
+            print(json.dumps({"board": normed, "ok": False, "message": message}))
+        else:
+            print(f"{normed}: {message}", file=sys.stderr)
+        return 1
+
+    result = kb.abandon_or_cancel_removal(
+        normed, removal_id=record.removal_id, reason="cancel"
+    )
+    updated = result.record or record
+    if as_json:
+        print(json.dumps({
+            "board": normed,
+            "removal_id": record.removal_id,
+            "ok": result.success,
+            "message": result.message,
+            "phase": updated.phase.value,
+            "outcome": updated.outcome,
+        }, indent=2, ensure_ascii=False))
+    elif result.success:
+        print(
+            f"{normed}: removal {record.removal_id} cancelled — the board is "
+            "live again and can be used"
+        )
+    else:
+        print(
+            f"{normed}: removal {record.removal_id} was NOT cancelled — "
+            f"{result.message}",
+            file=sys.stderr,
+        )
+    return 0 if result.success else 1
 
 
 def _read_confirmation_line() -> Optional[str]:

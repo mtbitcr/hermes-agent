@@ -1747,6 +1747,19 @@ def _removal_drive_actions() -> dict:
                     slug, removal_id=rec.removal_id
                 )
             ),
+            # Re-enters the SAME recorded intent: the discard is already
+            # journalled and the register/outcome already restored, so this
+            # only re-attempts and re-verifies the gate reopen.
+            RemovalRecoveryAction.ROLL_FORWARD_REOPEN_AFTER_ABANDON: (
+                lambda slug, rec: abandon_or_cancel_removal(
+                    slug, removal_id=rec.removal_id,
+                    reason=(
+                        "deadline"
+                        if rec.outcome == REMOVAL_OUTCOME_ABANDONED
+                        else "cancel"
+                    ),
+                )
+            ),
         })
     return _REMOVAL_DRIVE_ACTIONS
 
@@ -7661,9 +7674,10 @@ class QuiescenceDeadlineAction(str, Enum):
     """QB-3's shared decision point: what the deadline implies (§6.3).
 
     Deciding is shared between both modes; ACTING on ``FORCE_END_HELD``
-    (permanent) or ``ABANDON`` (reversible) is mode-specific later work
-    (§7.2, §9.2) — this enum and :func:`quiescence_deadline_action` only
-    return the decision.
+    (permanent) is mode-specific later work (§7.2), while ``ABANDON``
+    (reversible) is acted on by :func:`advance_removal_to_quiesced`
+    through §9.2's :func:`abandon_or_cancel_removal`. This enum and
+    :func:`quiescence_deadline_action` only return the decision.
     """
     ADVANCE = "advance"
     WAIT = "wait"
@@ -8177,9 +8191,10 @@ def advance_removal_to_quiesced(
 
     If the predicate fails and the recorded deadline has not arrived,
     refuses with a distinct still-quiescing reason and leaves the phase
-    where it is. At or after the deadline, reports the shared decision
-    (:func:`quiescence_deadline_action`) without acting on it — force-
-    ending and abandonment are mode-specific later work (§7.2, §9.2).
+    where it is. At or after the deadline it takes the shared decision
+    (:func:`quiescence_deadline_action`): in reversible mode it abandons
+    through §9.2's :func:`abandon_or_cancel_removal`; force-ending in
+    permanent mode is still mode-specific later work (§7.2).
 
     A record already AT Quiesced is not taken at its word: the durable
     completion fact and TQ-2 itself are re-read, and a no-op success is
@@ -8261,6 +8276,19 @@ def advance_removal_to_quiesced(
         return QuiescedAdvanceResult(
             False, message, record=record, action=action, held=held,
             outcome=RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE,
+            resolution=resolution,
+        )
+    if action is QuiescenceDeadlineAction.ABANDON:
+        # §9.2, reversible mode: the deadline's answer is abandonment, and
+        # this is the shipped path to it. It writes the outcome through the
+        # phase-record seam and records its own refusal, so neither is
+        # written again here.
+        abandoned = abandon_or_cancel_removal(
+            slug, removal_id=record.removal_id, reason="deadline"
+        )
+        return QuiescedAdvanceResult(
+            abandoned.success, abandoned.message,
+            record=abandoned.record or record, action=action, held=held,
             resolution=resolution,
         )
     message = (
@@ -13718,6 +13746,9 @@ class RemovalRecoveryAction(str, Enum):
     # terminal claim is incomplete, so the removal rolls forward by
     # writing it rather than reporting a success it cannot account for.
     ROLL_FORWARD_TERMINAL_RECEIPT = "write-terminal-receipt"
+    # §9.2: the outcome is recorded but the board is not usable — the
+    # abandonment's own gate reopen is re-entered until it takes effect.
+    ROLL_FORWARD_REOPEN_AFTER_ABANDON = "reopen-gate-after-abandon"
     NO_ACTION_COMPLETE = "no-action-complete"
     NO_ACTION_BEYOND_FENCED = "no-action-beyond-fenced"
 
@@ -13779,19 +13810,31 @@ def resume_removal(board: str) -> RemovalResumeDecision:
 
     entry = get_register_entry(slug)
 
-    # §9.2: an abandoned or cancelled removal is finished — the board is
-    # live again and no forward work is prescribed.
+    # §9.2: an abandoned or cancelled removal is finished only when the
+    # board is USABLE again. The outcome commits BEFORE the gate reopen,
+    # so a reopen that did not take effect leaves the outcome and the
+    # register saying live over a closed gate: the gate is read here, and
+    # a board that is not usable rolls the reopen forward.
     if record.outcome in (REMOVAL_OUTCOME_ABANDONED, REMOVAL_OUTCOME_CANCELLED):
+        gate = _read_gate_instant(slug)
+        if (
+            entry is not None
+            and entry.lifecycle is BoardLifecycle.LIVE
+            and gate.status is DurableReadStatus.OK
+            and gate.gate is InBoardGate.OPEN
+            and gate.epoch_mirror == entry.epoch
+        ):
+            return RemovalResumeDecision(
+                RemovalRecoveryPoint.P12, RemovalRecoveryAction.NO_ACTION_COMPLETE,
+                f"removal was {record.outcome}: the board is live, no action needed",
+                record=record, entry=entry,
+            )
         return RemovalResumeDecision(
-            RemovalRecoveryPoint.P12, RemovalRecoveryAction.NO_ACTION_COMPLETE,
-            f"removal was {record.outcome}: the board is live, no action needed",
-            record=record, entry=entry,
-        )
-
-    if entry is not None and entry.lifecycle == BoardLifecycle.LIVE:
-        return RemovalResumeDecision(
-            RemovalRecoveryPoint.P12, RemovalRecoveryAction.NO_ACTION_COMPLETE,
-            "register is live: not rolling a removal forward",
+            RemovalRecoveryPoint.P12,
+            RemovalRecoveryAction.ROLL_FORWARD_REOPEN_AFTER_ABANDON,
+            f"removal was {record.outcome} but the board is not usable yet: "
+            "the in-board gate is not open at the register's epoch — roll "
+            "forward by re-entering the recorded abandonment",
             record=record, entry=entry,
         )
 
