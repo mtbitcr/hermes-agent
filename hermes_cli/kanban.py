@@ -276,6 +276,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_list.add_argument("--all", action="store_true",
                         help="Include archived boards too")
 
+    b_archived = boards_sub.add_parser(
+        "archived",
+        help="List boards retained by a reversible removal (read-only)",
+        description=(
+            "A reversible removal keeps a verified copy of the board OUTSIDE "
+            "boards/, where `boards list` cannot see it. This is the explicit "
+            "listing of those archives: the board slug, the removal that "
+            "archived it, where the copy is, and the archived marker in the "
+            "copy's own metadata. Read-only."
+        ),
+    )
+    b_archived.add_argument("--json", action="store_true")
+
     b_create = boards_sub.add_parser(
         "create", aliases=["new"],
         help="Create a new board",
@@ -1428,6 +1441,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     sub = getattr(args, "boards_action", None) or "list"
     if sub in {"list", "ls"}:
         return _cmd_boards_list(args)
+    if sub == "archived":
+        return _cmd_boards_archived(args)
     if sub in {"create", "new"}:
         return _cmd_boards_create(args)
     if sub in {"rm", "remove", "delete"}:
@@ -1495,6 +1510,30 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     print(f"Current board: {current}")
     if len(boards) > 1:
         print("Switch boards with `hermes kanban boards switch <slug>`.")
+    return 0
+
+
+def _cmd_boards_archived(args: argparse.Namespace) -> int:
+    """``hermes kanban boards archived`` — the retained copies, read-only.
+
+    Read from each retained copy's own metadata, so an archived board is
+    findable without the removal record (a different store, and a
+    different loss domain).
+    """
+    entries = kb.list_archived_boards()
+    if getattr(args, "json", False):
+        print(json.dumps(entries, indent=2, ensure_ascii=False))
+        return 0
+    if not entries:
+        print("(no archived boards — a reversible removal creates one)")
+        return 0
+    print(f"{'SLUG':24s}  {'REMOVAL':28s}  PATH")
+    for entry in entries:
+        print(
+            f"{entry['slug']:24s}  {entry['removal_id'] or '(unmarked)':28s}  "
+            f"{entry['retained_path']}"
+            + ("" if entry["archived"] else "  [marker missing]")
+        )
     return 0
 
 

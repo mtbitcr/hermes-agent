@@ -43,6 +43,10 @@ CRASH_POINTS: "dict[str, tuple[str, str]]" = {
     "apply-after-work-area": ("_destroy_work_area_content", "after"),
     "apply-after-deregister": ("_deregister_work_area", "after"),
     "apply-before-record": ("record_applied_mode_content", "before"),
+    # Inside the REVERSIBLE apply: the retained copy is written to disk
+    # and the verification that alone authorises the live deletion has
+    # not run yet.
+    "apply-mid-retained-copy": ("_complete_retained_copy", "after"),
     "after-apply-content": ("apply_permanent_mode_content", "after"),
     # The last two boundaries, including the window between the terminal
     # transition and the terminal receipt.

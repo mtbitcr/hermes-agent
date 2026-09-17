@@ -391,6 +391,59 @@ def list_kernel_owned_sandboxes(
     return infos
 
 
+#: The create-metadata key the kernel stamps the owning board into. A
+#: removal's owner tag is this plus :data:`KERNEL_OWNER_KEY`.
+KERNEL_BOARD_KEY = "hermes_board"
+
+
+def list_removal_owned_sandboxes(
+    *, board: Optional[str], removal_id: str, states: Optional[list] = None,
+    sdk: Optional[_Sdk] = None, connection: Optional[_Connection] = None,
+) -> dict:
+    """What a removal owns remotely, read THROUGH the SDK. Strictly read-only.
+
+    The owner tag :func:`_kernel_metadata` stamps at CREATE time is what
+    makes a machine attributable with no local state, so a removal's
+    inventory is that tag narrowed to the board being removed: an
+    independent reader — another host, after the board's store is gone,
+    with no receipt file — asks the same question and gets the same
+    answer. ``removal_id`` is carried as attribution rather than added to
+    the selector: it is minted long after the machines are, so filtering
+    on it would report nothing for every machine the board already had.
+
+    This is :func:`list_kernel_owned_sandboxes` with that selector, so it
+    inherits the same paging and close-the-manager behaviour, and it
+    creates, patches, kills and renews nothing.
+    """
+    if not str(removal_id or "").strip():
+        raise ValueError(
+            "a removal inventory needs the removal it is for: an inventory "
+            "with nothing to attribute it to is not a removal's inventory"
+        )
+    selector = {
+        KERNEL_OWNER_KEY: KERNEL_OWNER, KERNEL_BOARD_KEY: board or "default",
+    }
+    resources = []
+    for info in list_kernel_owned_sandboxes(
+        metadata=selector, states=states, sdk=sdk, connection=connection,
+    ):
+        metadata = dict(getattr(info, "metadata", None) or {})
+        resources.append({
+            "sandbox_id": str(info.id),
+            "kind": KERNEL_SANDBOX_KIND,
+            "intent_id": metadata.get(KERNEL_INTENT_KEY),
+            "task_id": metadata.get("hermes_task"),
+            "run_id": metadata.get("hermes_run"),
+            "state": getattr(getattr(info, "status", None), "state", None),
+            "metadata": metadata,
+        })
+    return {
+        "board": selector[KERNEL_BOARD_KEY], "removal_id": removal_id,
+        "owner": KERNEL_OWNER, "selector": selector, "read_only": True,
+        "resources": resources,
+    }
+
+
 def recover_creation_intents(*, board: Optional[str] = None, **kwargs: Any) -> dict:
     """Resolve every intent whose machine was never confirmed, BOTH ways.
 

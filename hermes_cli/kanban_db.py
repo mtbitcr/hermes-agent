@@ -10662,6 +10662,9 @@ APPLY_JOURNAL_WORK_AREA_DESTROYED = "work-area-destroyed"
 APPLY_JOURNAL_DEREGISTERED = "registration-deregistered"
 APPLY_JOURNAL_RETENTION_RECORDED = "retention-recorded"
 APPLY_JOURNAL_RETAINED_COPY = "retained-copy-completed"
+#: §7.3's last step: the retained copy's OWN metadata records it archived by
+#: this removal, and the board is findable in the archived listing.
+APPLY_JOURNAL_RETAINED_ARCHIVED = "retained-copy-archived"
 APPLY_JOURNAL_FAILURE = "blocked"
 
 # The journal actions a SUCCESSFUL apply step is recorded under. Completion
@@ -10810,6 +10813,83 @@ def _deregister_work_area(registration: dict) -> "tuple[bool, str, dict]":
         return False, f"cannot deregister {reg_path}: {exc}", detail
 
     return True, "registration deregistered by exact recorded identity", detail
+
+
+def _apply_carried_work_areas(
+    c13_entry: dict, *, destroyed, blocked, journal, deregistered: list
+) -> None:
+    """Every carried C13 work area: ownership first, content then registration.
+
+    Shared VERBATIM by §7.2 and §7.3 — a work area an archived board owns
+    is no less live than one a hard-removed board owns, so both modes run
+    this rather than two implementations that can drift. Ownership is
+    verified against the container's OWN registration metadata before
+    anything is touched, the CONTENT goes FIRST and the registration LAST
+    (a crash between them must not orphan content whose owner is no longer
+    identifiable), and each item is journalled as it happens through the
+    caller's own recorders. Ownership that is not positively established,
+    and an ``unresolved`` registration, block with everything left intact.
+    """
+    for registration in c13_entry.get("registrations") or []:
+        work_area = registration.get("work_area")
+        ownership = verify_work_area_ownership(registration)
+        if ownership.owned is not True:
+            blocked(
+                "work-area", "C13", work_area,
+                APPLY_JOURNAL_WORK_AREA_DESTROYED,
+                f"work-area ownership is not established, so nothing was "
+                f"touched: {ownership.reason}", ownership.evidence,
+                ownership=(
+                    "indeterminate" if ownership.owned is None else "denied"
+                ),
+            )
+            continue
+        ok, reason, detail = _destroy_work_area_content(registration, ownership)
+        if not ok:
+            blocked(
+                "work-area", "C13", work_area,
+                APPLY_JOURNAL_WORK_AREA_DESTROYED, reason, detail,
+            )
+            continue
+        # Journals the destruction and RAISES if it does not commit: the
+        # blocking check that has to sit between the content going and the
+        # only durable thing that identifies its owner going.
+        destroyed(
+            "work-area", "C13", work_area,
+            APPLY_JOURNAL_WORK_AREA_DESTROYED, reason, detail,
+        )
+        ok, reason, detail = _deregister_work_area(registration)
+        if not ok:
+            blocked(
+                "work-area-registration", "C13",
+                registration.get("registration"),
+                APPLY_JOURNAL_DEREGISTERED, reason, detail,
+            )
+            continue
+        deregistered.append({
+            "member": "work-area-registration",
+            "category": "C13",
+            "identity": registration.get("registration"),
+            "deregistered": True,
+            "reason": reason,
+            "detail": detail,
+            "reference_kept": registration.get("reference"),
+            "work_area_destroyed": work_area,
+            "ownership": ownership.reason,
+        })
+        journal(
+            APPLY_JOURNAL_DEREGISTERED, registration.get("registration"),
+            True, reason, detail,
+        )
+
+    for unresolved in c13_entry.get("unresolved") or []:
+        if isinstance(unresolved, dict):
+            blocked(
+                "work-area", "C13", unresolved.get("work_area"),
+                APPLY_JOURNAL_WORK_AREA_DESTROYED,
+                f"unresolved C13 registration: {unresolved.get('reason')}",
+                dict(unresolved), ownership="unresolved",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -11905,79 +11985,13 @@ def apply_permanent_mode_content(
                 APPLY_JOURNAL_RESOURCE_DESTROYED, reason, detail,
             )
 
-        # Step 4: each C13 work area is an OWNED MEMBER — verify ownership,
-        # destroy the CONTENT first, and deregister LAST, journalling each
-        # item as it happens so a crash can never orphan content.
-        for registration in c13_entry.get("registrations") or []:
-            ownership = verify_work_area_ownership(registration)
-            if ownership.owned is not True:
-                _blocked(
-                    "work-area", "C13", registration.get("work_area"),
-                    APPLY_JOURNAL_WORK_AREA_DESTROYED,
-                    f"work-area ownership is not established, so nothing was "
-                    f"touched: {ownership.reason}",
-                    ownership.evidence,
-                    ownership=(
-                        "indeterminate" if ownership.owned is None else "denied"
-                    ),
-                )
-                continue
-            ok, reason, detail = _destroy_work_area_content(registration, ownership)
-            if not ok:
-                _blocked(
-                    "work-area", "C13", registration.get("work_area"),
-                    APPLY_JOURNAL_WORK_AREA_DESTROYED, reason, detail,
-                )
-                continue
-            # This journals the destruction and RAISES if it does not
-            # commit — which is the blocking check that has to sit between
-            # the destruction and the deregistration, because the
-            # registration is the only durable thing that identifies the
-            # content's owner and it is deliberately the last to go.
-            _destroyed(
-                "work-area", "C13", registration.get("work_area"),
-                APPLY_JOURNAL_WORK_AREA_DESTROYED, reason, detail,
-            )
-            # Only now, with the content gone and that fact durably
-            # journalled, does the metadata that identified its owner go.
-            ok, reason, detail = _deregister_work_area(registration)
-            if not ok:
-                _blocked(
-                    "work-area-registration", "C13",
-                    registration.get("registration"),
-                    APPLY_JOURNAL_DEREGISTERED, reason, detail,
-                )
-                continue
-            deregistered.append({
-                "member": "work-area-registration",
-                "category": "C13",
-                "identity": registration.get("registration"),
-                "deregistered": True,
-                "reason": reason,
-                "detail": detail,
-                "reference_kept": registration.get("reference"),
-                "work_area_destroyed": registration.get("work_area"),
-                "ownership": ownership.reason,
-            })
-            _journal(
-                APPLY_JOURNAL_DEREGISTERED, registration.get("registration"),
-                True, reason, detail,
-            )
-
-        # Step 4b (IN-3): a work area this board recorded creating whose shared
-        # container durable state cannot establish has no exact identity to act
-        # on. It is a recorded BLOCKING failure — reaching Done over it would
-        # claim content was destroyed that was never even located.
-        for unresolved in c13_entry.get("unresolved") or []:
-            if not isinstance(unresolved, dict):
-                continue
-            _blocked(
-                "work-area", "C13", unresolved.get("work_area"),
-                APPLY_JOURNAL_WORK_AREA_DESTROYED,
-                f"unresolved C13 registration: {unresolved.get('reason')}",
-                dict(unresolved),
-                ownership="unresolved",
-            )
+        # Steps 4 and 4b: each C13 work area is an OWNED MEMBER — ownership
+        # verified first, CONTENT destroyed first, registration LAST, and an
+        # unresolved registration blocking. §7.3 runs this same function.
+        _apply_carried_work_areas(
+            c13_entry, destroyed=_destroyed, blocked=_blocked,
+            journal=_journal, deregistered=deregistered,
+        )
 
         # Step 5: Write retention records for OUT resources (C6, C7)
         for resource in ledger:
@@ -12161,6 +12175,171 @@ def reversible_retained_path(slug: str, removal_id: str) -> Path:
     return kanban_home() / "retained" / f"{slug}-{removal_id}"
 
 
+#: The key §7.3 records its archived marker under, in the RETAINED copy's
+#: own ``board.json`` — the only metadata that speaks for that directory.
+RETAINED_ARCHIVED_MARKER_KEY = "removal_archived"
+
+
+def _retained_board_metadata(retained: Path) -> dict:
+    """A retained copy's OWN ``board.json``, or ``{}`` when unreadable."""
+    try:
+        raw = json.loads((retained / "board.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def mark_retained_copy_archived(
+    retained: "str | Path", *, slug: str, removal_id: str
+) -> dict:
+    """Record ARCHIVED, and which removal did it, in the copy's own metadata.
+
+    Written through ``board.json``'s usual atomic writer, and idempotent:
+    the derived path means a re-drive rewrites the same marker.
+    """
+    retained = Path(retained)
+    meta = _retained_board_metadata(retained)
+    meta["slug"] = slug
+    meta["archived"] = True
+    meta[RETAINED_ARCHIVED_MARKER_KEY] = {
+        "removal_id": removal_id,
+        "mode": RemovalMode.REVERSIBLE.value,
+        "retained_path": str(retained),
+        "archived_at": int(time.time()),
+    }
+    _atomic_write_text(
+        retained / "board.json", json.dumps(meta, indent=2, ensure_ascii=False)
+    )
+    return meta
+
+
+def list_archived_boards() -> list:
+    """Enumerate the boards a reversible removal RETAINED (§7.3).
+
+    A retained copy lives outside ``boards/`` so nothing mistakes it for a
+    live board, which is exactly why this explicit listing has to exist:
+    without it an archived board is findable only through the removal
+    record, a different store in a different loss domain. Read from the
+    retained root and each copy's OWN metadata, so what is listed is what
+    is on disk. A copy that is missing or unmarked is still listed, with
+    ``archived`` false — an incomplete archive is a fact a reader needs.
+    """
+    root = kanban_home() / "retained"
+    entries: list = []
+    try:
+        children = sorted(root.iterdir()) if root.is_dir() else []
+    except OSError:
+        return entries
+    for child in children:
+        if not child.is_dir():
+            continue
+        meta = _retained_board_metadata(child)
+        marker = meta.get(RETAINED_ARCHIVED_MARKER_KEY)
+        marker = marker if isinstance(marker, dict) else {}
+        entries.append({
+            "slug": meta.get("slug") or child.name,
+            "removal_id": marker.get("removal_id"),
+            "retained_path": str(child),
+            "store": str(_retained_store_path(child)),
+            "archived": bool(meta.get("archived") and marker.get("removal_id")),
+            "archived_marker": marker,
+        })
+    return entries
+
+
+def archived_board_listing_entry(slug: str, removal_id: str) -> Optional[dict]:
+    """This removal's entry in the archived listing, or ``None`` (§7.3)."""
+    for entry in list_archived_boards():
+        if entry["archived"] and (entry["slug"], entry["removal_id"]) == (
+            slug, removal_id
+        ):
+            return entry
+    return None
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _complete_retained_copy(live: Path, retained: Path) -> None:
+    """Copy every live file into the ONE derived retained path."""
+    retained.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(live, retained, dirs_exist_ok=True)
+
+
+def _retained_copy_step(
+    live: Path, retained: Path, *, journalled: bool
+) -> "tuple[bool, str, dict]":
+    """Complete the ONE derived retained copy and VERIFY it — or refuse.
+
+    ``dirs_exist_ok`` is the point of the copy: the retained path derives
+    from the removal id in the durable record, so a restart addresses the
+    SAME copy and completes it instead of making a second, and every file
+    is rewritten from the live original so a half-written one cannot
+    survive as "already copied".
+
+    Verification is a real comparison, not a presence check: every file of
+    the live tree — store, board files, ``board.json`` — must be in the
+    retained tree with the same size and content digest, and the retained
+    store must open and read. It is the ONLY thing that authorises the
+    live deletion, so a PARTIAL directory can never pass for an archive.
+    Once the live tree is gone nothing is left to compare against, so that
+    case is accepted only when the journal already records THIS copy
+    verified; a partial copy that can no longer be completed is refused.
+    """
+    detail = {"retained": str(retained), "source": str(live)}
+    compared = 0
+
+    def _no(reason: str):
+        return False, reason, detail
+
+    try:
+        if live.exists():
+            _complete_retained_copy(live, retained)
+        elif not journalled:
+            return _no(
+                f"{live} is gone and no durable journal entry records a "
+                f"verified retained copy at {retained}: what is there is a "
+                "PARTIAL copy that can no longer be completed against the "
+                "board it came from, and is never accepted as an archive"
+            )
+        if not retained.is_dir():
+            return _no(f"{retained} is not a retained copy")
+        for source in sorted(live.rglob("*")) if live.exists() else []:
+            if source.is_symlink() or not source.is_file():
+                continue
+            relative = source.relative_to(live)
+            target = retained / relative
+            if not target.is_file():
+                return _no(f"INCOMPLETE: {relative} is live and not in {retained}")
+            if target.stat().st_size != source.stat().st_size or (
+                _file_digest(target) != _file_digest(source)
+            ):
+                return _no(f"the retained {relative} is not the live file")
+            compared += 1
+        detail["files_compared"] = compared
+        if live.exists() and not compared:
+            return _no(f"{live} holds no readable file to verify a copy against")
+    except OSError as exc:
+        return _no(f"§7.3 could not complete the retained copy: {exc}")
+    store = _retained_store_path(retained)
+    try:
+        with contextlib.closing(_sqlite_connect_no_create(store)) as conn:
+            inventory = _pre_application_inventory(conn)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return _no(f"the retained store {store} cannot be opened and read: {exc}")
+    detail["retained_tasks"] = inventory["count"]
+    return True, (
+        f"the retained copy at {retained} is complete: {compared} live "
+        f"file(s) compared byte-for-byte, and its store opens with "
+        f"{inventory['count']} task identity/identities"
+    ), detail
+
+
 def apply_reversible_mode_content(
     board: str,
     *,
@@ -12170,11 +12349,20 @@ def apply_reversible_mode_content(
 
     The reversible peer of :func:`apply_permanent_mode_content`, and the
     reason the common driver has no mode-specific branch of its own to
-    get wrong. Journalled item by item, idempotent under re-drive (the
-    retained copy has one derived identity, so a restart completes the
-    same copy instead of making a second), and recorded through the same
-    seam — which verifies the retained copy is really readable and the
-    live store really gone before anything is marked applied.
+    get wrong. In order: complete the ONE derived retained copy and VERIFY
+    it against the live board (a PARTIAL directory is completed against
+    the recorded intent, or the removal is REFUSED — never accepted); only
+    then remove the live directory and store; process the carried C13
+    work-area ledger through :func:`_apply_carried_work_areas`, permanent
+    mode's own path; and record the archived marker in the RETAINED copy's
+    own ``board.json``, requiring the board to appear in the explicit
+    archived listing (:func:`list_archived_boards`).
+
+    Each step is journalled as it happens, idempotent by exact identity,
+    and a journal write that does not commit BLOCKS where it stands. Any
+    blocking failure means no success, which is what stops Done: the seam
+    (:func:`record_applied_mode_content`) is reached only when every step
+    is durably done.
     """
     slug = _normalize_board_slug(board)
     if not slug:
@@ -12205,61 +12393,133 @@ def apply_reversible_mode_content(
 
     retained = reversible_retained_path(slug, removal_id)
     live = board_dir(slug)
+    c13 = next(
+        (e for e in (record.carried() or {}).get("outside_resource_ledger") or []
+         if e.get("member") == "work-area-registration"), {},
+    )
+    destroyed: list = []
+    deregistered: list = []
     failures: list = []
+    archived: Optional[dict] = None
+    # Idempotence, read from the DURABLE journal: a re-drive appends no
+    # second entry for a step already recorded done.
+    journalled: dict = {
+        action: set(journalled_apply_identities(record, action=action))
+        for action in (*APPLY_JOURNAL_SUCCESS_ACTIONS,
+                       APPLY_JOURNAL_RETAINED_COPY,
+                       APPLY_JOURNAL_RETAINED_ARCHIVED)
+    }
+    refused: set = {
+        (item.get("step"), item.get("identity"), item.get("reason"))
+        for item in record.journal()["items"] if not item.get("ok")
+    }
+
+    def _journal(action, identity, ok, reason, extra) -> None:
+        """One durable journal item, or BLOCK the whole sequence."""
+        key = None if identity is None else str(identity)
+        if (key in journalled.get(action, frozenset()) if ok
+                else (action, key, reason) in refused):
+            return
+        if not journal_apply_item(
+            slug, removal_id=removal_id, phase=RemovalPhase.APPLIED,
+            item={"action": action if ok else APPLY_JOURNAL_FAILURE,
+                  "step": action, "identity": key, "ok": bool(ok),
+                  "reason": reason, "detail": extra},
+        ):
+            raise ApplyJournalUnwritable(action, key, reason)
+        (journalled.setdefault(action, set()).add(key) if ok
+         else refused.add((action, key, reason)))
+
+    def _destroyed(member, category, identity, action, reason, detail) -> None:
+        destroyed.append({"member": member, "category": category,
+                          "identity": identity, "destroyed": True,
+                          "reason": reason, "detail": detail})
+        _journal(action, identity, True, reason, detail)
+
+    def _blocked(member, category, identity, action, reason, detail, **extra) -> None:
+        failures.append({"member": member, "category": category,
+                         "identity": identity, "destroyed": False,
+                         "reason": reason, "detail": detail, **extra})
+        _journal(action, identity, False, reason, detail)
+
     try:
-        retained.parent.mkdir(parents=True, exist_ok=True)
-        if live.exists() and not retained.exists():
-            shutil.copytree(live, retained)
-        journal_apply_item(
-            slug, removal_id=removal_id, phase=RemovalPhase.APPLIED,
-            item={
-                "action": APPLY_JOURNAL_RETAINED_COPY,
-                "step": APPLY_JOURNAL_RETAINED_COPY,
-                "identity": str(retained),
-                "ok": True,
-                "reason": "the retained copy is complete outside the board",
-                "detail": {"source": str(live)},
-            },
+        # Step 1: the ONE derived copy, completed and VERIFIED. Nothing
+        # live is touched unless this passes.
+        ok, reason, detail = _retained_copy_step(
+            live, retained,
+            journalled=str(retained) in journalled[APPLY_JOURNAL_RETAINED_COPY],
         )
-        if live.exists():
-            shutil.rmtree(live)
-        db_path = kanban_db_path(board=slug)
-        if db_path.exists():
-            # The default board's store lives outside board_dir.
-            db_path.unlink()
-        journal_apply_item(
-            slug, removal_id=removal_id, phase=RemovalPhase.APPLIED,
-            item={
-                "action": APPLY_JOURNAL_STORAGE_DESTROYED,
-                "step": APPLY_JOURNAL_STORAGE_DESTROYED,
-                "identity": str(live),
-                "ok": True,
-                "reason": "the live copy was removed after the retained copy "
-                          "was complete",
-                "detail": {"retained": str(retained)},
-            },
-        )
-    except OSError as exc:
+        if not ok:
+            _blocked("retained-copy", "C1", str(retained),
+                     APPLY_JOURNAL_RETAINED_COPY, reason, detail)
+        else:
+            _journal(APPLY_JOURNAL_RETAINED_COPY, retained, True, reason, detail)
+            # Step 2: only now may the live board and its store go.
+            try:
+                if live.exists():
+                    shutil.rmtree(live)
+                db_path = kanban_db_path(board=slug)
+                if db_path.exists():
+                    db_path.unlink()  # the default store lives outside board_dir
+            except OSError as exc:
+                ok, reason = False, f"§7.3 could not remove the live copy: {exc}"
+            else:
+                reason = ("the live copy was removed after the retained copy "
+                          "verified complete")
+            (_destroyed if ok else _blocked)(
+                "board-storage", "C1", str(live),
+                APPLY_JOURNAL_STORAGE_DESTROYED, reason, {"retained": str(retained)},
+            )
+        if ok:
+            # Step 3: the carried C13 ledger, through permanent mode's own
+            # path — an archived board's work areas are as live as a
+            # hard-removed board's.
+            _apply_carried_work_areas(
+                c13, destroyed=_destroyed, blocked=_blocked,
+                journal=_journal, deregistered=deregistered,
+            )
+            # Step 4: the archived marker in the retained copy's OWN
+            # metadata, and the board's presence in the explicit archived
+            # listing. Both are durable before success is reported, and
+            # that success is what lets Done record a terminal fact.
+            try:
+                archived = mark_retained_copy_archived(
+                    retained, slug=slug, removal_id=removal_id)
+                listed = archived_board_listing_entry(slug, removal_id)
+            except OSError as exc:
+                listed, reason = None, (
+                    f"§7.3 could not record the archived marker in the "
+                    f"retained copy's own metadata: {exc}")
+            if listed is None:
+                _blocked("archived-listing", "C1", str(retained),
+                         APPLY_JOURNAL_RETAINED_ARCHIVED,
+                         reason if archived is None else
+                         "the retained copy does not appear in the archived "
+                         "board listing, so nothing an operator can read says "
+                         "this board survives anywhere", {"marker": archived})
+            else:
+                _journal(APPLY_JOURNAL_RETAINED_ARCHIVED, retained, True,
+                         "the retained copy's own metadata records it archived "
+                         "by this removal, and the board appears in the "
+                         "archived listing", listed)
+    except ApplyJournalUnwritable as unwritable:
+        # A journal write that did not commit stops the sequence HERE.
         failures.append({
-            "member": "board-storage",
-            "category": "C1",
-            "identity": str(live),
-            "reason": f"§7.3 could not complete the retained copy: {exc}",
+            "member": "apply-journal", "category": "C1",
+            "identity": unwritable.identity, "destroyed": False,
+            "reason": str(unwritable),
+            "detail": {"action": unwritable.action,
+                       "step_reason": unwritable.step_reason},
         })
-        journal_apply_item(
-            slug, removal_id=removal_id, phase=RemovalPhase.APPLIED,
-            item={
-                "action": APPLY_JOURNAL_FAILURE,
-                "step": APPLY_JOURNAL_RETAINED_COPY,
-                "identity": str(retained),
-                "ok": False,
-                "reason": str(exc),
-                "detail": {"source": str(live)},
-            },
-        )
+
+    if failures:
         return ReversibleModeContentResult(
-            False, failures[0]["reason"], retained_path=str(retained),
-            failures=failures, record=get_removal_phase_record(slug) or record,
+            False,
+            f"§7.3: {len(failures)} step(s) could not be completed — this "
+            "BLOCKS Done; what was already done is durable in the journal "
+            "and a re-drive resumes from it",
+            retained_path=str(retained), failures=failures,
+            record=get_removal_phase_record(slug) or record,
         )
 
     apply_result = record_applied_mode_content(
@@ -12280,7 +12540,10 @@ def apply_reversible_mode_content(
             retained_path=str(retained), record=apply_result.record,
         )
     return ReversibleModeContentResult(
-        True, f"§7.3 reversible mode content applied: retained at {retained}",
+        True,
+        f"§7.3 reversible mode content applied: verified retained copy at "
+        f"{retained}, archived in its own metadata, {len(destroyed)} "
+        f"destroyed, {len(deregistered)} deregistered",
         retained_path=str(retained), record=apply_result.record,
     )
 

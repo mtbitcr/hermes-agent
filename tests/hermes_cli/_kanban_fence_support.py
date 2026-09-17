@@ -266,9 +266,16 @@ def apply_mode_specific_content(slug: str, removal_id: str):
     board = kb.board_dir(slug)
     retained = None
     if record.mode is kb.RemovalMode.REVERSIBLE:
-        retained = kb.kanban_home() / "retained" / f"{slug}-{removal_id}"
+        retained = kb.reversible_retained_path(slug, removal_id)
         retained.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(board, retained)
+        shutil.copytree(board, retained, dirs_exist_ok=True)
+        # §7.3 also marks the retained copy archived in its own metadata,
+        # so the board is findable in the archived listing. A helper that
+        # stopped short of that would leave every Done test resting on a
+        # copy nothing can find.
+        kb.mark_retained_copy_archived(
+            retained, slug=slug, removal_id=removal_id,
+        )
     if board.exists():
         shutil.rmtree(board)
     db_path = kb.kanban_db_path(board=slug)
