@@ -2,12 +2,16 @@
 from __future__ import annotations
 from unittest.mock import MagicMock
 
+import asyncio
 import json
 import time
 import pytest
-from hermes_cli import kanban_db, owner_workspace as ow, projects_db
-from gateway.platforms.api_server import APIServerAdapter
-from gateway.config import PlatformConfig
+
+pytest.importorskip("aiohttp")
+
+from hermes_cli import kanban_db, owner_workspace as ow, projects_db  # noqa: E402
+from gateway.platforms.api_server import APIServerAdapter  # noqa: E402
+from gateway.config import PlatformConfig  # noqa: E402
 
 
 _n = [0]
@@ -109,6 +113,15 @@ async def test_api_server_startup_resumes_removal_operations(monkeypatch):
         # Join background threads (removal drives run in threads)
         for t in list(ow._removal_background_threads):
             t.join(timeout=20)
+
+        # connect() runs under a running event loop, so _dispatch_removal_drive
+        # takes the asyncio branch and registers the drive in
+        # ow._removal_background_tasks rather than as a thread; await those
+        # tasks too or the assertions below race a still-running drive.
+        await asyncio.wait_for(
+            asyncio.gather(*ow._removal_background_tasks, return_exceptions=True),
+            timeout=30,
+        )
 
         # Assert: the drive was dispatched
         assert driven == [slug], f"Expected drive for {slug}, got {driven}"
