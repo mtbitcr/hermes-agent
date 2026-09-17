@@ -13736,7 +13736,7 @@ def continue_archived_removal_as_permanent(board: str) -> RestoreResult:
     slug = _normalize_board_slug(board)
     if not slug:
         return RestoreResult(False, "invalid board name")
-    record = get_removal_p„ase_record(slug)
+    record = get_removal_phase_record(slug)
     entry = get_register_entry(slug)
     if (
         record is None
