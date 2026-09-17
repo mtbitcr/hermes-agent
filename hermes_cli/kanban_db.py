@@ -1610,11 +1610,34 @@ def remove_board_fenced(
             not permanent_confirmation.confirmed
             or permanent_confirmation.statement_digest != expected
         ):
+            _refuse_intent(
+                normed, RemovalIntentOutcome.REFUSED_UNCONFIRMED,
+                "the offered confirmation is not bound to the permanence "
+                "statement in force for this board",
+            )
             return FencedRemovalResult(
                 False,
                 "the offered confirmation is not bound to the permanence "
                 "statement in force for this board: refusing to treat it as "
                 "a confirmation of this removal",
+                slug=normed, mode=mode.value,
+                refusal_reason="unbound-confirmation",
+            )
+        if (
+            permanent_confirmation.board is not None
+            and permanent_confirmation.board != normed
+        ):
+            _refuse_intent(
+                normed, RemovalIntentOutcome.REFUSED_UNCONFIRMED,
+                f"the confirmation is bound to board "
+                f"{permanent_confirmation.board!r}, not {normed!r}",
+            )
+            return FencedRemovalResult(
+                False,
+                f"the confirmation is bound to board "
+                f"{permanent_confirmation.board!r}, not {normed!r}: a "
+                "confirmation minted for one board cannot be replayed "
+                "against another",
                 slug=normed, mode=mode.value,
                 refusal_reason="unbound-confirmation",
             )
@@ -1770,9 +1793,14 @@ def drive_removal(
             "message": decision.message,
         })
         if decision.action is RemovalRecoveryAction.NO_ACTION_COMPLETE:
-            action = (
-                "deleted" if record.mode == RemovalMode.PERMANENT else "archived"
-            )
+            if record.outcome in (
+                REMOVAL_OUTCOME_ABANDONED, REMOVAL_OUTCOME_CANCELLED,
+            ):
+                action = record.outcome
+            elif record.mode == RemovalMode.PERMANENT:
+                action = "deleted"
+            else:
+                action = "archived"
             return FencedRemovalResult(
                 True,
                 f"board {slug!r} {action} via fenced removal",
@@ -5731,11 +5759,18 @@ class PermanentRemovalConfirmation:
     ``statement_digest`` pins WHICH statement was shown; a confirmation
     whose digest does not match the statement in force is not a
     confirmation of this removal and is refused.
+
+    ``board`` is the board the confirmation was minted for. When present,
+    the confirmation is bound to that exact board and cannot be replayed
+    against a different one. When ``None`` (the default), the confirmation
+    is unbound and checked only against the statement digest — keeping
+    existing callers that pass no board working.
     """
     confirmed: bool
     statement_digest: str
     confirmed_by: Optional[str] = None
     confirmed_at: Optional[int] = None
+    board: Optional[str] = None
 
 
 # The words an operator must echo, verbatim, to confirm a permanent
@@ -5928,6 +5963,7 @@ def confirm_permanent_removal(
             statement_digest=active.statement_digest,
             confirmed_by=confirmed_by,
             confirmed_at=int(time.time()),
+            board=active.board_name,
         ),
         message="the operator echoed the statement-bound confirmation line",
     )
@@ -6186,6 +6222,18 @@ def _record_removal_intent_locked(
                 "the confirmation does not match the permanence statement in "
                 "force for this board: refusing to treat it as a confirmation "
                 "of this removal",
+                entry=entry,
+            )
+        if (
+            permanent_confirmation.board is not None
+            and permanent_confirmation.board != slug
+        ):
+            return _refuse_intent(
+                slug, RemovalIntentOutcome.REFUSED_UNCONFIRMED,
+                f"the confirmation is bound to board "
+                f"{permanent_confirmation.board!r}, not {slug!r}: a "
+                "confirmation minted for one board cannot be replayed "
+                "against another",
                 entry=entry,
             )
         confirmed_at = permanent_confirmation.confirmed_at or int(time.time())
@@ -8226,6 +8274,207 @@ def advance_removal_to_quiesced(
         False, message, record=record, action=action, held=held,
         outcome=RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE,
         resolution=resolution,
+    )
+
+
+# ---------------------------------------------------------------------------
+# §9.2 — Deadline abandonment and cancel-before-Applied
+# ---------------------------------------------------------------------------
+
+REMOVAL_OUTCOME_ABANDONED = "abandoned"
+REMOVAL_OUTCOME_CANCELLED = "cancelled"
+
+
+@dataclass
+class RemovalAbandonResult:
+    """Result of :func:`abandon_or_cancel_removal`."""
+    success: bool
+    message: str
+    record: Optional[RemovalPhaseRecord] = None
+    entry: Optional[RegisterEntry] = None
+    already_done: bool = False
+
+
+def abandon_or_cancel_removal(
+    board: str,
+    *,
+    removal_id: str,
+    reason: str = "cancel",
+) -> RemovalAbandonResult:
+    """Abandon (deadline) or cancel (operator) a removal back to live (§9.2).
+
+    Accepted strictly BEFORE Applied: both deadline abandonment and
+    operator cancel share one implementation and produce the same valid
+    live end state. At or after Applied the removal has already acted on
+    content and the only safe direction is forward — the cancel is
+    REFUSED with a plain-language reason, durably recorded, and the
+    removal recovers forward on restart.
+
+    Permanent mode is always refused: a permanent removal is a deliberate,
+    confirmed decision and cannot be abandoned.
+
+    Idempotent: if the outcome is already recorded and the board is already
+    live, this returns success without writing a duplicate journal entry.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RemovalAbandonResult(False, "invalid board name")
+
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return RemovalAbandonResult(False, f"no removal phase record for {slug!r}")
+    if record.removal_id != removal_id:
+        return RemovalAbandonResult(
+            False,
+            f"removal_id {removal_id!r} does not match the recorded "
+            f"removal {record.removal_id!r}",
+            record=record,
+        )
+
+    outcome_value = (
+        REMOVAL_OUTCOME_ABANDONED if reason == "deadline" else REMOVAL_OUTCOME_CANCELLED
+    )
+
+    # Idempotent: already abandoned or cancelled?
+    if record.outcome in (REMOVAL_OUTCOME_ABANDONED, REMOVAL_OUTCOME_CANCELLED):
+        entry = get_register_entry(slug)
+        if entry is not None and entry.lifecycle == BoardLifecycle.LIVE:
+            gate = _read_gate_instant(slug)
+            if (
+                gate.status is DurableReadStatus.OK
+                and gate.gate is InBoardGate.OPEN
+                and gate.epoch_mirror == entry.epoch
+            ):
+                return RemovalAbandonResult(
+                    True,
+                    f"already {record.outcome} (idempotent no-op)",
+                    record=record, entry=entry, already_done=True,
+                )
+
+    # Permanent mode is never abandoned or cancelled.
+    if record.mode == RemovalMode.PERMANENT:
+        message = (
+            "a permanent removal cannot be abandoned or cancelled: it is a "
+            "deliberate, confirmed decision and must complete forward"
+        )
+        _record_phase_refusal(slug, record, "refused-abandon-permanent", message)
+        return RemovalAbandonResult(False, message, record=record)
+
+    # At or after Applied, refuse: content has been acted on.
+    applied_ordinal = removal_phase_ordinal(RemovalPhase.APPLIED)
+    current_ordinal = removal_phase_ordinal(record.phase)
+    if current_ordinal >= applied_ordinal:
+        message = (
+            f"the removal is at {record.phase.value}, which is at or past "
+            "Applied: content has already been acted on and the removal "
+            "can only be completed forward, not reversed"
+        )
+        _record_phase_refusal(slug, record, "refused-cancel-past-applied", message)
+        return RemovalAbandonResult(False, message, record=record)
+
+    return _abandon_removal_locked(slug, record, outcome_value)
+
+
+def _abandon_removal_locked(
+    slug: str, record: RemovalPhaseRecord, outcome: str
+) -> RemovalAbandonResult:
+    """Shared body for deadline abandonment and cancel (§9.2)."""
+    entry = get_register_entry(slug)
+    if entry is None:
+        return RemovalAbandonResult(
+            False, "register entry missing", record=record,
+        )
+
+    retained = reversible_retained_path(slug, record.removal_id)
+    already_journalled = (
+        str(retained)
+        in journalled_apply_identities(record, action=APPLY_JOURNAL_RETAINED_DISCARDED)
+    )
+    if retained.exists() and not already_journalled:
+        shutil.rmtree(retained, ignore_errors=True)
+        journal_apply_item(
+            slug, removal_id=record.removal_id, phase=record.phase,
+            item={
+                "action": APPLY_JOURNAL_RETAINED_DISCARDED,
+                "identity": str(retained),
+                "ok": True,
+                "reason": f"partial retained copy discarded during {outcome}",
+            },
+        )
+
+    already_restored = (
+        entry.lifecycle == BoardLifecycle.LIVE
+        and record.outcome in (REMOVAL_OUTCOME_ABANDONED, REMOVAL_OUTCOME_CANCELLED)
+    )
+    if not already_restored:
+        restored_entry = RegisterEntry(
+            board_name=slug, lifecycle=BoardLifecycle.LIVE,
+            epoch=entry.epoch, epoch_before=entry.epoch_before,
+            gate_move=GateMove.SETTLED, removal_mode=None,
+            scope_declaration_version=entry.scope_declaration_version,
+            epoch_lineage=entry.epoch_lineage, created_at=entry.created_at,
+        )
+        now = int(time.time())
+        with board_register_lock(slug, reentrant=True):
+            with register_connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _write_register_entry(conn, restored_entry)
+                    conn.execute(
+                        "UPDATE board_removal_phase "
+                        "SET outcome = ?, updated_at = ? "
+                        "WHERE board_name = ? AND removal_id = ? "
+                        "AND phase = ?",
+                        (outcome, now, slug, record.removal_id,
+                         record.phase.value),
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+        entry = restored_entry
+
+    gate_committed = False
+    try:
+        with _fence_protocol_scope():
+            conn = connect(board=slug)
+            try:
+                with write_txn(conn):
+                    gate_committed = commit_gate_state(
+                        conn, InBoardGate.OPEN, entry.epoch,
+                    )
+            finally:
+                conn.close()
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
+        _log.warning(
+            "kanban removal: gate reopen for %s raised %s: %s",
+            slug, type(exc).__name__, exc,
+        )
+
+    reading = _read_gate_instant(slug)
+    if not (
+        gate_committed
+        and reading.status is DurableReadStatus.OK
+        and reading.gate is InBoardGate.OPEN
+        and reading.epoch_mirror == entry.epoch
+    ):
+        updated_record = get_removal_phase_record(slug)
+        message = (
+            f"board {slug!r} is not yet usable: the in-board gate "
+            f"could not be reopened"
+        )
+        _record_phase_refusal(
+            slug, updated_record or record,
+            "gate-reopen-failed", message,
+        )
+        return RemovalAbandonResult(
+            False, message, record=updated_record, entry=entry,
+        )
+
+    updated_record = get_removal_phase_record(slug)
+    return RemovalAbandonResult(
+        True, f"removal {outcome}: board {slug!r} restored to live",
+        record=updated_record, entry=get_register_entry(slug),
     )
 
 
@@ -10665,6 +10914,7 @@ APPLY_JOURNAL_RETAINED_COPY = "retained-copy-completed"
 #: §7.3's last step: the retained copy's OWN metadata records it archived by
 #: this removal, and the board is findable in the archived listing.
 APPLY_JOURNAL_RETAINED_ARCHIVED = "retained-copy-archived"
+APPLY_JOURNAL_RETAINED_DISCARDED = "retained-copy-discarded"
 APPLY_JOURNAL_FAILURE = "blocked"
 
 # The journal actions a SUCCESSFUL apply step is recorded under. Completion
@@ -13528,6 +13778,22 @@ def resume_removal(board: str) -> RemovalResumeDecision:
         )
 
     entry = get_register_entry(slug)
+
+    # §9.2: an abandoned or cancelled removal is finished — the board is
+    # live again and no forward work is prescribed.
+    if record.outcome in (REMOVAL_OUTCOME_ABANDONED, REMOVAL_OUTCOME_CANCELLED):
+        return RemovalResumeDecision(
+            RemovalRecoveryPoint.P12, RemovalRecoveryAction.NO_ACTION_COMPLETE,
+            f"removal was {record.outcome}: the board is live, no action needed",
+            record=record, entry=entry,
+        )
+
+    if entry is not None and entry.lifecycle == BoardLifecycle.LIVE:
+        return RemovalResumeDecision(
+            RemovalRecoveryPoint.P12, RemovalRecoveryAction.NO_ACTION_COMPLETE,
+            "register is live: not rolling a removal forward",
+            record=record, entry=entry,
+        )
 
     if record.phase == RemovalPhase.INTENT:
         gate = _read_gate_instant(slug)

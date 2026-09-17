@@ -1653,6 +1653,12 @@ def _cmd_boards_removal_phase(args: argparse.Namespace) -> int:
 
     operator_items = kb.removal_operator_items(record)
     mode_content = kb.applied_mode_content_marker(record)
+    refusal_outcome = None
+    if record.refusal_outcome:
+        try:
+            refusal_outcome = json.loads(record.refusal_outcome)
+        except (TypeError, ValueError):
+            refusal_outcome = record.refusal_outcome
     payload = {
         "board": normed,
         "removal_id": record.removal_id,
@@ -1662,6 +1668,7 @@ def _cmd_boards_removal_phase(args: argparse.Namespace) -> int:
         "quiescence_deadline": record.quiescence_deadline,
         "deadline_basis": record.deadline_basis,
         "outcome": record.outcome,
+        "refusal_outcome": refusal_outcome,
         "gate_closed_at": record.gate_closed_at,
         "scope_declaration_version": record.scope_declaration_version,
         "permanent_confirmed_at": record.permanent_confirmed_at,
@@ -1683,6 +1690,15 @@ def _cmd_boards_removal_phase(args: argparse.Namespace) -> int:
             print(f"  deadline: {record.quiescence_deadline} ({record.deadline_basis})")
         if record.outcome is not None:
             print(f"  outcome: {record.outcome}")
+        if refusal_outcome is not None:
+            ro = refusal_outcome
+            if isinstance(ro, dict):
+                print(
+                    f"  refusal: {ro.get('outcome', 'unknown')} — "
+                    f"{ro.get('message', '')}"
+                )
+            else:
+                print(f"  refusal: {ro}")
         if kb.applied_mode_content_is_outstanding(record):
             print(
                 f"  applied mode content: OUTSTANDING "
