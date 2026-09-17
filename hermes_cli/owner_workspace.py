@@ -1985,7 +1985,32 @@ def _set_project_dispatch_state(
 
 
 OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY = "lifecycle_revision"
+OWNER_PROJECT_REMOVAL_STATE_CAPABILITY = "removal_state"
 _OWNER_PROJECT_LIFECYCLE_ACTIONS = ("archive", "restore", "pause", "resume")
+_OWNER_PROJECT_REMOVAL_ACTIONS = ("start", "confirm_permanent", "cancel", "restore")
+
+# Driver phase -> owner-facing phase mapping (one explicit table).
+_REMOVAL_PHASE_OWNER_MAP: dict[str, str] = {
+    "intent": "accepted",
+    "fenced": "fenced",
+    "quiesced": "quiesced",
+    "carried": "carried",
+    "released": "released",
+    "applied": "applied",
+    "swept": "swept",
+    "done": "done",
+}
+
+# Owner-safe last_error sentences (fixed set, no internals leak).
+_REMOVAL_SAFE_ERRORS: dict[str, str] = {
+    "driver_failed": "The removal could not advance to the next phase.",
+    "cancel_refused": "The removal has already acted on content and can only be completed, not undone.",
+    "restore_no_copy": "No complete retained copy is available for restoration.",
+    "digest_mismatch": "The consequences digest does not match the current state.",
+    "internal": "An unexpected condition prevented the operation from completing.",
+    "start_refused": "The removal could not be started.",
+    "restore_failed": "The retained copy could not be restored.",
+}
 
 
 def _project_lifecycle_revision(
@@ -2032,6 +2057,7 @@ def _project_lifecycle_revision(
 
 def list_committed_projects(
     ctx: OwnerContext, *, lifecycle_revision: bool = False,
+    removal_state: bool = False,
 ) -> list[dict]:
     """Read-only projection of projects proven by committed owner receipts.
 
@@ -2136,12 +2162,12 @@ def list_committed_projects(
                 "has_repository": bool(row["primary_path"]),
             }
             if lifecycle_revision:
-                # Opt-in keeps the legacy closed projection stable during a
-                # rolling deploy. The durable marker never disappears when a
-                # timed-out receipt is retried, so this generation cannot move
-                # backwards while another owner decision is pending.
                 projection["lifecycle_revision"] = _project_lifecycle_revision(
                     conn, ctx, project_id,
+                )
+            if removal_state:
+                projection["removal_state"] = _project_removal_state(
+                    conn, project_id, row["board_slug"],
                 )
             projects.append(projection)
         return projects
@@ -6400,3 +6426,397 @@ def retry_task(
             kconn.close()
     finally:
         pconn.close()
+
+
+# ---------------------------------------------------------------------------
+# owner_project_removal
+# ---------------------------------------------------------------------------
+
+
+def _removal_consequences_document(
+    project_name: str, board_slug: str, epoch: int, retained: bool,
+) -> dict:
+    """Build the owner-safe consequences document (contract §8)."""
+    lines = [
+        f"Removal of project “{project_name}”.",
+        f"Board epoch: {epoch}.",
+    ]
+    if retained:
+        lines.append("A retained copy of the board will be preserved.")
+    else:
+        lines.append("No retained copy will be created. This is permanent.")
+    lines.extend([
+        "What is deleted: board data, task content, and worker state.",
+        "What stays: Git refs and history, shared transcripts, and receipts.",
+        "Restoration reattaches only what the provenance ledger records as "
+        "the project’s own; anything unattributable is reported unverified "
+        "and is not acted on.",
+    ])
+    text = "\n".join(lines)
+    structured = {"project_name": project_name, "epoch": epoch, "retained": retained}
+    digest = _digest(structured)
+    return {"text": text, "digest": digest}
+
+
+def _project_removal_state(
+    conn: sqlite3.Connection, project_id: str, board_slug: Optional[str],
+) -> Optional[dict]:
+    """Build the removal_state capability payload for one project."""
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'project_removal_operations'"
+        )
+    }
+    if "project_removal_operations" not in tables:
+        return None
+    ops = conn.execute(
+        "SELECT * FROM project_removal_operations "
+        "WHERE project_id = ? ORDER BY created_at DESC LIMIT 1",
+        (project_id,),
+    ).fetchall()
+    if not ops:
+        return None
+    op = ops[0]
+    phase = op["phase"]
+    mode = op["mode"]
+    applied_phases = {"applied", "swept", "done"}
+    terminal_phases = {"done", "cancelled", "failed", "restored"}
+    cancelable = phase not in applied_phases and phase not in terminal_phases
+    restorable = (
+        phase == "done" and mode == "reversible"
+        and op["retained_copy_id"] is not None
+    )
+    consequences = None
+    if cancelable or op["retained_copy_id"] is not None:
+        try:
+            project_row = conn.execute(
+                "SELECT name FROM projects WHERE id = ?", (project_id,),
+            ).fetchone()
+            pname = owner_project_name(project_row["name"]) if project_row else "Unknown"
+        except Exception:
+            pname = "Unknown"
+        epoch_val = op["epoch"] if op["epoch"] is not None else 0
+        consequences = _removal_consequences_document(
+            pname, op["board_slug"] or "", epoch_val,
+            retained=(mode == "reversible"),
+        )
+    return {
+        "phase": phase,
+        "mode": mode,
+        "accepted_at": op["accepted_at"],
+        "applied_at": op["applied_at"],
+        "completed_at": op["completed_at"],
+        "cancelable": cancelable,
+        "restorable": restorable,
+        "retained_copy_id": op["retained_copy_id"],
+        "receipt_id": op["receipt_id"],
+        "consequences_digest": op["consequences_digest"],
+        "last_error": op["last_error"],
+        "consequences": consequences,
+    }
+
+
+def project_removal(
+    ctx: OwnerContext,
+    *,
+    idempotency_key: str,
+    project_id: str,
+    expected_revision: Any,
+    action: str,
+    consequences_digest: Optional[str] = None,
+) -> dict:
+    """Apply one receipt-backed Project removal operation."""
+    idempotency_key = _bounded_text(idempotency_key, "idempotency_key", limit=200)
+    project_id = _bounded_text(project_id, "project_id", limit=100)
+    if type(expected_revision) is not int or expected_revision < 0:
+        raise OwnerWorkspaceError(
+            "invalid_argument", "expected_revision must be a non-negative integer",
+        )
+    action = str(action or "").strip().lower() or "start"
+    if action not in _OWNER_PROJECT_REMOVAL_ACTIONS:
+        raise OwnerWorkspaceError(
+            "invalid_argument",
+            "action must be 'start', 'confirm_permanent', 'cancel', or 'restore'",
+        )
+    if action == "confirm_permanent" and not consequences_digest:
+        raise OwnerWorkspaceError(
+            "invalid_argument",
+            "consequences_digest is required for confirm_permanent",
+        )
+
+    operation = "owner_project_removal"
+    payload = {
+        "idempotency_key": idempotency_key,
+        "project_id": project_id,
+        "expected_revision": expected_revision,
+        "action": action,
+    }
+    if action == "confirm_permanent":
+        payload["consequences_digest"] = consequences_digest
+    _require_owner_run_authority(
+        ctx, operation=operation, idempotency_key=idempotency_key, payload=payload,
+    )
+    digest = _digest(payload)
+
+    pconn = projects_db.connect()
+    try:
+        _ensure_schema(pconn)
+        replay = _terminal_replay(pconn, ctx, idempotency_key, operation, digest)
+        if replay is not None:
+            return replay
+        if not _receipt_owns_project(pconn, ctx, project_id):
+            raise OwnerWorkspaceError(
+                "project_not_owned",
+                "the Project is not owned by this owner-workspace profile",
+            )
+        project = projects_db.get_project(pconn, project_id)
+        if project is None or not project.board_slug:
+            raise OwnerWorkspaceError(
+                "project_not_found", "the Project is unavailable",
+            )
+        _assert_board_ownership(project.board_slug, project_id)
+        if _project_lifecycle_revision(pconn, ctx, project_id) != expected_revision:
+            raise OwnerWorkspaceError(
+                "stale_revision",
+                "the Project changed after it was shown; refresh before trying again",
+            )
+
+        existing_op = projects_db.get_removal_operation(
+            pconn, project_id, idempotency_key,
+        )
+
+        action_handlers = {
+            "start": _removal_start,
+            "cancel": _removal_cancel,
+            "restore": _removal_restore,
+        }
+        if action == "confirm_permanent":
+            return _removal_confirm_permanent(
+                pconn, ctx, project, idempotency_key, operation, digest,
+                existing_op, consequences_digest,
+            )
+        handler = action_handlers[action]
+        return handler(
+            pconn, ctx, project, idempotency_key, operation, digest, existing_op,
+        )
+    finally:
+        pconn.close()
+
+
+def _removal_start(pconn, ctx, project, idempotency_key, operation, digest, existing_op):
+    if existing_op is not None:
+        state = _project_removal_state(pconn, project.id, project.board_slug)
+        return {
+            "ok": True, "action": "start", "project_slug": project.slug,
+            "removal_state": state, "joined": True,
+        }
+
+    state, row, token = _acquire_or_replay(
+        pconn, ctx, idempotency_key, operation, digest,
+    )
+    if state == "terminal":
+        return json.loads(row["result_json"])
+
+    _update_progress(
+        pconn, ctx, idempotency_key, token,
+        project_id=project.id, board_slug=project.board_slug,
+    )
+
+    approval = _confirm(
+        ctx, operation=operation, digest=digest,
+        description=f"Remove Project {owner_project_name(project.name)!r}",
+    )
+    if not approval.get("approved"):
+        result = {
+            "ok": False, "error": "confirmation_denied",
+            "reason": approval.get("reason"),
+        }
+        _finalize_receipt(
+            pconn, ctx, idempotency_key, token, status="denied", result=result,
+        )
+        return result
+
+    mode = kanban_db.RemovalMode.REVERSIBLE
+    intent = kanban_db.record_removal_intent(project.board_slug, mode=mode)
+    if not intent.success:
+        result = {
+            "ok": False, "error": "removal_refused",
+            "reason": _REMOVAL_SAFE_ERRORS["start_refused"],
+        }
+        _finalize_receipt(
+            pconn, ctx, idempotency_key, token, status="committed", result=result,
+        )
+        return result
+
+    intent_epoch = intent.record.epoch if intent.record else 0
+    consequences = _removal_consequences_document(
+        owner_project_name(project.name), project.board_slug,
+        intent_epoch, retained=(mode == kanban_db.RemovalMode.REVERSIBLE),
+    )
+    projects_db.record_removal_operation(
+        pconn, project_id=project.id, idempotency_key=idempotency_key,
+        action="start", phase="accepted", mode=mode.value,
+        board_slug=project.board_slug, removal_id=intent.removal_id,
+        consequences_digest=consequences["digest"],
+        epoch=intent_epoch,
+    )
+
+    try:
+        kanban_db.drive_removal(project.board_slug)
+    except Exception:
+        projects_db.update_removal_operation(
+            pconn, project.id, idempotency_key, phase="failed",
+            last_error=_REMOVAL_SAFE_ERRORS["driver_failed"],
+            completed_at=int(time.time()),
+        )
+
+    op = projects_db.get_removal_operation(pconn, project.id, idempotency_key)
+    if op and op["phase"] != "failed":
+        phase_record = kanban_db.get_removal_phase_record(project.board_slug)
+        if phase_record:
+            owner_phase = _REMOVAL_PHASE_OWNER_MAP.get(
+                phase_record.phase.value, phase_record.phase.value,
+            )
+            updates: dict = {"phase": owner_phase}
+            if owner_phase == "applied":
+                updates["applied_at"] = int(time.time())
+            if phase_record.phase.value == "done":
+                updates["completed_at"] = int(time.time())
+                updates["receipt_id"] = idempotency_key
+                if phase_record.mode == kanban_db.RemovalMode.REVERSIBLE:
+                    updates["retained_copy_id"] = phase_record.removal_id
+            projects_db.update_removal_operation(
+                pconn, project.id, idempotency_key, **updates,
+            )
+
+    removal_st = _project_removal_state(pconn, project.id, project.board_slug)
+    result = {
+        "ok": True, "action": "start", "project_slug": project.slug,
+        "removal_state": removal_st,
+    }
+    _finalize_receipt(
+        pconn, ctx, idempotency_key, token, status="committed", result=result,
+    )
+    return result
+
+
+def _removal_confirm_permanent(
+    pconn, ctx, project, idempotency_key, operation, digest,
+    existing_op, consequences_digest,
+):
+    if existing_op is None:
+        raise OwnerWorkspaceError(
+            "invalid_argument", "no removal in progress to confirm",
+        )
+    expected = existing_op["consequences_digest"]
+    if not expected or consequences_digest != expected:
+        raise OwnerWorkspaceError(
+            "digest_mismatch", _REMOVAL_SAFE_ERRORS["digest_mismatch"],
+        )
+    state, row, token = _acquire_or_replay(
+        pconn, ctx, idempotency_key, operation, digest,
+    )
+    if state == "terminal":
+        return json.loads(row["result_json"])
+
+    projects_db.update_removal_operation(
+        pconn, project.id, existing_op["idempotency_key"], mode="permanent",
+    )
+    removal_st = _project_removal_state(pconn, project.id, project.board_slug)
+    result = {
+        "ok": True, "action": "confirm_permanent", "project_slug": project.slug,
+        "removal_state": removal_st,
+    }
+    _finalize_receipt(
+        pconn, ctx, idempotency_key, token, status="committed", result=result,
+    )
+    return result
+
+
+def _removal_cancel(pconn, ctx, project, idempotency_key, operation, digest, existing_op):
+    if existing_op is None:
+        raise OwnerWorkspaceError("invalid_argument", "no removal in progress to cancel")
+    applied_or_later = {"applied", "swept", "done"}
+    if existing_op["phase"] in applied_or_later:
+        raise OwnerWorkspaceError(
+            "cancel_refused", _REMOVAL_SAFE_ERRORS["cancel_refused"],
+        )
+    state, row, token = _acquire_or_replay(
+        pconn, ctx, idempotency_key, operation, digest,
+    )
+    if state == "terminal":
+        return json.loads(row["result_json"])
+
+    if existing_op["removal_id"]:
+        kanban_db.abandon_or_cancel_removal(
+            project.board_slug, removal_id=existing_op["removal_id"], reason="cancel",
+        )
+    projects_db.update_removal_operation(
+        pconn, project.id, existing_op["idempotency_key"],
+        phase="cancelled", completed_at=int(time.time()),
+    )
+    removal_st = _project_removal_state(pconn, project.id, project.board_slug)
+    result = {
+        "ok": True, "action": "cancel", "project_slug": project.slug,
+        "removal_state": removal_st,
+    }
+    _finalize_receipt(
+        pconn, ctx, idempotency_key, token, status="committed", result=result,
+    )
+    return result
+
+
+def _removal_restore(pconn, ctx, project, idempotency_key, operation, digest, existing_op):
+    if existing_op is None:
+        raise OwnerWorkspaceError("invalid_argument", "no removal to restore")
+    if existing_op["mode"] != "reversible":
+        raise OwnerWorkspaceError(
+            "restore_no_copy", _REMOVAL_SAFE_ERRORS["restore_no_copy"],
+        )
+    if existing_op["phase"] != "done":
+        raise OwnerWorkspaceError(
+            "restore_no_copy", _REMOVAL_SAFE_ERRORS["restore_no_copy"],
+        )
+    if not existing_op["retained_copy_id"]:
+        raise OwnerWorkspaceError(
+            "restore_no_copy", _REMOVAL_SAFE_ERRORS["restore_no_copy"],
+        )
+    retained = kanban_db.reversible_retained_path(
+        project.board_slug, existing_op["removal_id"],
+    )
+    manifest, _manifest_reason = kanban_db.retained_set_manifest(retained)
+    valid, _valid_reason, _valid_detail = kanban_db.validate_retained_set(
+        retained, manifest,
+    )
+    if not valid:
+        raise OwnerWorkspaceError(
+            "restore_no_copy", _REMOVAL_SAFE_ERRORS["restore_no_copy"],
+        )
+    state, row, token = _acquire_or_replay(
+        pconn, ctx, idempotency_key, operation, digest,
+    )
+    if state == "terminal":
+        return json.loads(row["result_json"])
+
+    restore_result = kanban_db.restore_retained_board(
+        project.board_slug, removal_id=existing_op["removal_id"],
+    )
+    if not restore_result.success:
+        raise OwnerWorkspaceError(
+            "restore_failed", _REMOVAL_SAFE_ERRORS["restore_failed"],
+        )
+    projects_db.update_removal_operation(
+        pconn, project.id, existing_op["idempotency_key"],
+        phase="restored", completed_at=int(time.time()),
+    )
+    removal_st = _project_removal_state(pconn, project.id, project.board_slug)
+    result = {
+        "ok": True, "action": "restore", "project_slug": project.slug,
+        "removal_state": removal_st,
+    }
+    _finalize_receipt(
+        pconn, ctx, idempotency_key, token, status="committed", result=result,
+    )
+    return result
