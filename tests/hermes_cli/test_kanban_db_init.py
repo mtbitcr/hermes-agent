@@ -5,6 +5,8 @@ import sqlite3
 import threading
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 
 
@@ -158,17 +160,24 @@ def _tables(path: Path) -> set[str]:
         conn.close()
 
 
-def test_connect_reinitializes_schema_when_db_file_vanished(tmp_path, monkeypatch):
-    """#83445: the schema cache is process-local, but the schema is on disk.
+def test_connect_refuses_when_db_file_vanished(tmp_path, monkeypatch):
+    """#83445's vanished-file half, answered by refusing instead of recreating.
 
-    A long-lived process (gateway, dispatcher, dashboard API) that already
-    initialized a path keeps taking the ``_INITIALIZED_PATHS`` fast path after
-    the file is deleted underneath it. SQLite recreates an empty DB on the next
-    open, so every query then fails with ``no such table: tasks`` and the board
-    renders empty until that process itself is restarted.
+    This test used to assert that the cached fast path RECREATED the deleted
+    store and re-ran the schema on it. That is the resurrect-on-open defect:
+    the very same fast path is what a removal races, and "the file is gone"
+    is indistinguishable from "a removal just took it away". So the deleted
+    file is now a refusal (GA-4) and nothing is written back to the path.
+
+    #83445's actual complaint — a board that renders empty forever with no
+    signal — is still answered, and answered better: the caller gets a loud
+    error instead of a silently empty board. The self-heal it asked for
+    survives for the shape that is genuinely a damaged store rather than an
+    absent one; see the replaced-by-empty-file test below.
     """
     db_path = _default_board_db(tmp_path, monkeypatch)
 
+    kb.init_db(db_path=db_path)
     with kb.connect_closing(db_path) as conn:
         conn.execute(
             "INSERT INTO tasks (id, title, status, created_at) VALUES ('t-1', 'T', 'ready', 1000)"
@@ -181,9 +190,11 @@ def test_connect_reinitializes_schema_when_db_file_vanished(tmp_path, monkeypatc
     for suffix in ("", "-wal", "-shm"):
         db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
 
-    with kb.connect_closing(db_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
-    assert "tasks" in _tables(db_path)
+    with pytest.raises(kb.BoardFenceClosedError) as excinfo:
+        with kb.connect_closing(db_path):
+            pass
+    assert excinfo.value.refusal.rule is kb.FenceRefusalRule.GA_4
+    assert not db_path.exists()
 
 
 def test_connect_reinitializes_schema_when_db_replaced_by_empty_file(tmp_path, monkeypatch):
@@ -191,6 +202,7 @@ def test_connect_reinitializes_schema_when_db_replaced_by_empty_file(tmp_path, m
     header and the integrity probes, but carries no schema at all."""
     db_path = _default_board_db(tmp_path, monkeypatch)
 
+    kb.init_db(db_path=db_path)
     with kb.connect_closing(db_path):
         pass
 
@@ -213,6 +225,7 @@ def test_healthy_fast_path_stays_lock_free(tmp_path, monkeypatch):
     the schema is actually gone."""
     db_path = _default_board_db(tmp_path, monkeypatch)
 
+    kb.init_db(db_path=db_path)
     with kb.connect_closing(db_path):
         pass
 
@@ -231,7 +244,10 @@ def test_healthy_fast_path_stays_lock_free(tmp_path, monkeypatch):
         pass
     assert locks == []
 
+    # "The schema is actually gone" is now the schemaless-file shape: a
+    # DELETED file is refused outright and never reaches the init path.
     db_path.unlink()
+    sqlite3.connect(str(db_path)).close()
     with kb.connect_closing(db_path):
         pass
     assert len(locks) == 1

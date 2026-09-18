@@ -9,8 +9,18 @@ from hermes_cli.kanban_swarm import (
 )
 
 
+def _board(tmp_path):
+    """Create this test's board store, then open it.
+
+    ``kb.connect()`` only opens an existing store — creating one is
+    ``init_db``'s job — so a test that wants a scratch board asks for it.
+    """
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    return kb.connect(db_path)
+
 def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         created = create_swarm(
             conn,
@@ -52,6 +62,7 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ):
     db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
     writer = kb.connect(db_path)
     reader = kb.connect(db_path)
     original_create = kb.create_task
@@ -137,7 +148,7 @@ def test_plain_write_txn_nesting_raises_and_allow_nested_composes(tmp_path):
     and an outer rollback discards the inner work without any post-commit
     side effects having fired (the workspace directory survives).
     """
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         workspace = tmp_path / "scratch-ws"
         workspace.mkdir()
@@ -178,7 +189,7 @@ def test_plain_write_txn_nesting_raises_and_allow_nested_composes(tmp_path):
 
 
 def test_swarm_blackboard_merges_structured_updates(tmp_path):
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         created = create_swarm(
             conn,
@@ -212,7 +223,7 @@ def test_swarm_blackboard_merges_structured_updates(tmp_path):
 
 
 def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         created = create_swarm(
             conn,

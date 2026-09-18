@@ -56,6 +56,15 @@ _PERMANENT_ONLY = {
     "after-terminal-transition",
 }
 
+# The mirror of the above: crash points inside the REVERSIBLE apply, which
+# a permanent removal never reaches.
+_REVERSIBLE_ONLY = {"apply-mid-retained-copy"}
+
+# §9.4's restore install step belongs to the RESTORE, not to either
+# removal: a removal of either mode never reaches it, so a child told to
+# crash there would run to completion instead of dying.
+_RESTORE_ONLY = {"restore-after-install"}
+
 # The crash points INSIDE the durable prepare-then-apply receipt protocol,
 # mapped to the durable state each one is expected to leave behind: the
 # register lifecycle, and the status of the receipt row.
@@ -169,7 +178,9 @@ def _assert_permanent_removal_is_complete(setup: dict) -> dict:
     return receipt
 
 
-@pytest.mark.parametrize("crash", sorted(CRASH_POINTS))
+@pytest.mark.parametrize(
+    "crash", sorted(set(CRASH_POINTS) - _REVERSIBLE_ONLY - _RESTORE_ONLY)
+)
 def test_permanent_removal_survives_a_sigkill_at_every_point(
     board_with_work, crash
 ):
@@ -220,7 +231,7 @@ def test_permanent_removal_survives_a_sigkill_at_every_point(
 
 
 @pytest.mark.parametrize(
-    "crash", sorted(set(CRASH_POINTS) - _PERMANENT_ONLY)
+    "crash", sorted(set(CRASH_POINTS) - _PERMANENT_ONLY - _RESTORE_ONLY)
 )
 def test_reversible_removal_survives_a_sigkill_at_every_point(
     board_with_work, crash

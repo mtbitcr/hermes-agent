@@ -22,6 +22,8 @@ from hermes_cli import kanban_diagnostics as kd
 
 @pytest.fixture
 def conn(tmp_path: Path):
+    # connect() only opens an existing store; creating one is init_db's job.
+    kb.init_db(db_path=tmp_path / "kanban.db")
     db = kb.connect(tmp_path / "kanban.db")
     try:
         yield db

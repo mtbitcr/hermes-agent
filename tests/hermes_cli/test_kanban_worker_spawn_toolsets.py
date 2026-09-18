@@ -273,6 +273,8 @@ def test_set_worker_pid_records_max_turns_in_spawned_event(monkeypatch, tmp_path
     from hermes_cli import kanban_db as kb
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    # connect() opens; init_db() is what creates the store.
+    kb.init_db()
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="budgeted")

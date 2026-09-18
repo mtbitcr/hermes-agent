@@ -26,6 +26,12 @@ def isolated_kanban_home(monkeypatch):
     for mod in list(sys.modules.keys()):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
+    # These tests call the `dispatch` handler directly rather than through
+    # kanban_command, so nothing else runs the CLI's auto-init. connect()
+    # only opens — the board has to be created for real first.
+    from hermes_cli import kanban_db
+
+    kanban_db.init_db()
     yield test_home
 
 

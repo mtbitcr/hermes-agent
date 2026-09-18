@@ -287,8 +287,17 @@ def _terminate_reclaimed_worker(
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    recorded_start_time: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    ``recorded_start_time`` is the identity witness ``_set_worker_pid``
+    stored beside ``pid``; OPTIONAL, defaulting to None so a caller that
+    omits it behaves exactly as before. When it proves the number now
+    belongs to an unrelated process (alive, different start time),
+    nothing is signalled — same verdict, same recorded keys, as
+    ``_kb._terminate_reclaimed_worker``.
+    """
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
         "host_local": False,
@@ -301,6 +310,21 @@ def _terminate_reclaimed_worker(
     if not str(claim_lock).startswith(_kb._host_prefix()):
         return info
     info["host_local"] = True
+
+    if recorded_start_time is not None:
+        identity: dict[str, Any] = {}
+        presence = _kb._worker_identity_presence(
+            pid, recorded_start_time, evidence=identity,
+        )
+        if (
+            presence is _kb.HolderPresence.PROVABLY_ABSENT
+            and identity.get("observed_worker_start_time") is not None
+        ):
+            # PID REUSE. Signalling here would kill a stranger.
+            info["terminated"] = True
+            info["pid_reused"] = True
+            info.update(identity)
+            return info
 
     kill = _kill_fn(signal_fn)
     if kill is None:
@@ -427,7 +451,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.worker_start_time, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -449,11 +473,23 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
 
         pid = int(row["worker_pid"])
         tid = row["id"]
+        # WHAT gets signalled is decided by the recorded IDENTITY, not by the
+        # pid number: a pid the OS recycled belongs to a stranger and this
+        # path SIGTERMs then SIGKILLs. The timeout bookkeeping is unchanged —
+        # only the signal is withheld. Same rule as ``_kb.enforce_max_runtime``.
+        identity: dict = {}
+        presence = _kb._worker_identity_presence(
+            row["worker_pid"], _kb._row_worker_start_time(row), evidence=identity,
+        )
+        pid_reused = (
+            presence is _kb.HolderPresence.PROVABLY_ABSENT
+            and identity.get("observed_worker_start_time") is not None
+        )
         # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
         # shutdown install their own SIGTERM handler.
         killed = False
         kill = _kill_fn(signal_fn)
-        if kill is not None:
+        if kill is not None and not pid_reused:
             with contextlib.suppress(ProcessLookupError, OSError):
                 kill(pid, signal.SIGTERM)
             # Short polling wait — no time.sleep on the write txn.
@@ -462,6 +498,15 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
+        if pid_reused:
+            # Saying nothing would leave the history claiming we stopped a
+            # worker we deliberately did not signal.
+            error += (
+                f" — pid {pid} was recycled: the process holding it now "
+                f"started at {identity['observed_worker_start_time']}, not "
+                f"the {identity['worker_start_time']} recorded with the "
+                "claim, so it was not signalled"
+            )
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -480,6 +525,12 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                if pid_reused:
+                    payload["pid_reused"] = True
+                    payload["termination_attempted"] = False
+                # The evidence the signal decision was taken on, not just the
+                # verdict.
+                payload.update(identity)
                 run_id = _kb._end_run(
                     conn, tid, outcome="timed_out", status="timed_out",
                     error=error, metadata=payload,
@@ -496,7 +547,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
+                event_payload_extra={
+                    "pid": pid, "sigkill": killed, "retry_status": retry_status,
+                    **identity,
+                },
             )
     return timed_out
 
@@ -529,7 +583,8 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.worker_start_time, t.last_heartbeat_at, "
+        "       t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -552,7 +607,20 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
-        termination = _kb._terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn)
+        # One classification of the recorded identity per row, reused by the
+        # termination decision AND by the audit payload. The heartbeat
+        # backstop stays the authority for RELEASING the claim; the identity
+        # decides only what may be SIGNALLED, and LIVE and INDETERMINATE are
+        # treated identically. Same rule as ``_kb.detect_stale_running``.
+        identity: dict = {}
+        _kb._worker_identity_presence(
+            pid, _kb._row_worker_start_time(row), evidence=identity,
+        )
+
+        termination = _kb._terminate_reclaimed_worker(
+            pid, lock, signal_fn=signal_fn,
+            recorded_start_time=_kb._row_worker_start_time(row),
+        )
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -585,6 +653,8 @@ def detect_stale_running(
                 "retry_status": retry_status,
             }
             payload.update(termination)
+            # The evidence the verdict was reached on, not just the verdict.
+            payload.update(identity)
 
             run_id = _kb._end_run(
                 conn, tid,
@@ -615,20 +685,38 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+        "SELECT id, claim_lock, claim_expires, worker_pid, worker_start_time "
+        "FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _kb._pid_alive(pid):
+        # The recorded IDENTITY decides whether there is an owner to protect,
+        # not the pid number. LIVE and INDETERMINATE defer exactly as before;
+        # only a provably-absent owner (including a recycled pid) is
+        # requeued. Same rule as ``_kb.reconcile_orphaned_running``.
+        identity: dict = {}
+        presence = _kb._worker_identity_presence(
+            pid, _kb._row_worker_start_time(row), evidence=identity,
+        )
+        if pid and presence is not _kb.HolderPresence.PROVABLY_ABSENT:
             # Never requeue beside a live process. Retry next tick.
             _kb._log.debug(
                 "kanban reconcile: task %s has broken claim bookkeeping but "
                 "pid %s is alive on this host — deferring", tid, pid,
             )
             continue
+        if identity.get("observed_worker_start_time") is not None:
+            # The number is running; the process wearing it is not our worker.
+            _kb._log.info(
+                "kanban reconcile: task %s recorded pid %s was recycled — the "
+                "process holding it now started at %s, not the %s recorded "
+                "with the claim; requeueing without disturbing it",
+                tid, pid, identity["observed_worker_start_time"],
+                identity["worker_start_time"],
+            )
         with _kb.write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -647,6 +735,8 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
             }
+            # The evidence the verdict was reached on, not a bare pid.
+            payload.update(identity)
             run_id = _kb._end_run(
                 conn, tid,
                 outcome="reclaimed", status="reclaimed",
@@ -750,8 +840,18 @@ class _DeadWorker:
         return "rate_limited" if self.rate_limited else "crashed"
 
 
-def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
-    """Map a dead worker's reaped exit status to its reclaim bookkeeping."""
+def _classify_dead_worker(
+    pid: int, claimer: Optional[str], identity: Optional[dict] = None,
+) -> _DeadWorker:
+    """Map a dead worker's reaped exit status to its reclaim bookkeeping.
+
+    ``identity`` is the evidence ``_kb._worker_identity_presence`` produced
+    for this row; when it shows the pid was RECYCLED (alive, but a different
+    start time from the one recorded), the number is running and "not alive"
+    would be a false statement, so the error text and the event payload say
+    what was actually observed.
+    """
+    identity = identity or {}
     kind, code = _classify_worker_exit(pid)
     if kind == "clean_exit":
         # rc=0 while still ``running``: usually the work succeeded and only the
@@ -779,12 +879,19 @@ def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
         error_text = f"pid {pid} killed by signal {code}"
+    elif identity.get("observed_worker_start_time") is not None:
+        error_text = (
+            f"pid {pid} was recycled: the process holding it now started at "
+            f"{identity['observed_worker_start_time']}, not the "
+            f"{identity.get('worker_start_time')} recorded with the claim"
+        )
     else:
         error_text = f"pid {pid} not alive"
     event_payload = {"pid": pid, "claimer": claimer}
     if code is not None and kind != "unknown":
         event_payload["exit_kind"] = kind
         event_payload["exit_code"] = code
+    event_payload.update(identity)
     return _DeadWorker(kind, code, error_text, "crashed", event_payload)
 
 
@@ -803,11 +910,20 @@ class _CrashSweep:
 
 
 def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
-    """Release every host-local ``running`` task whose worker PID is dead."""
+    """Release every host-local ``running`` task whose recorded OWNER is gone.
+
+    "Gone" is the identity verdict, not the pid number: the sweep delegates
+    to ``_kb._worker_identity_presence`` — the same classifier the removal
+    fence and the stale-claim reclaim use — so a pid the OS recycled to an
+    unrelated process is released instead of being mistaken for a live
+    worker, and an owner whose identity cannot be established is left alone
+    (INDETERMINATE is treated exactly like LIVE).
+    """
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_start_time, claim_lock, started_at, "
+            "       assignee "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -821,11 +937,17 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             started_at = _kb._row_get(row, "started_at")
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
-            if _kb._pid_alive(row["worker_pid"]):
+            identity: dict = {}
+            presence = _kb._worker_identity_presence(
+                row["worker_pid"],
+                _kb._row_worker_start_time(row),
+                evidence=identity,
+            )
+            if presence is not _kb.HolderPresence.PROVABLY_ABSENT:
                 continue
 
             pid = int(row["worker_pid"])
-            dead = _classify_dead_worker(pid, row["claim_lock"])
+            dead = _classify_dead_worker(pid, row["claim_lock"], identity)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1098,12 +1220,31 @@ def _record_task_failure(
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event carrying it."""
+    """Record the spawned child's pid + its identity witness; emit ``spawned``.
+
+    The peer of ``kanban_db._set_worker_pid`` and behaviourally identical to
+    it: a pid number is not an identity (the OS recycles pids), so the start
+    time of the process that pid names is read here and written in the SAME
+    statement group, inside the same ``write_txn``. Pid and witness commit
+    together or not at all. A probe that cannot answer writes NULL, which
+    ``_kb._worker_identity_presence`` reads as INDETERMINATE — unknown,
+    never absent.
+    """
+    start_time = _kb._probe_worker_start_time(int(pid))
     with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, worker_start_time = ? WHERE id = ?",
+            (int(pid), start_time, task_id),
+        )
         run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
-            conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_start_time = ? "
+                "WHERE id = ?",
+                (int(pid), start_time, run_id),
+            )
+        # Same payload shape as its peer: the witness is a column, not an
+        # event field (see ``kanban_db._set_worker_pid``).
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 

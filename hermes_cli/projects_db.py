@@ -100,6 +100,29 @@ CREATE TABLE IF NOT EXISTS discovered_repos (
     label         TEXT,
     last_seen     INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS project_removal_operations (
+    project_id       TEXT NOT NULL,
+    idempotency_key  TEXT NOT NULL,
+    action           TEXT NOT NULL,
+    phase            TEXT NOT NULL,
+    mode             TEXT,
+    accepted_mode    TEXT,
+    board_slug       TEXT,
+    removal_id       TEXT,
+    retained_copy_id TEXT,
+    receipt_id       TEXT,
+    consequences_digest TEXT,
+    epoch            INTEGER,
+    last_error       TEXT,
+    result_json      TEXT,
+    accepted_at      INTEGER,
+    applied_at       INTEGER,
+    completed_at     INTEGER,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    PRIMARY KEY (project_id, idempotency_key)
+);
 """
 
 
@@ -256,6 +279,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     for col in _OPTIONAL_PROJECT_COLUMNS:
         if col not in cols:
             _add_column_if_missing(conn, "projects", col, f"{col} TEXT")
+    tables = {
+        row["name"] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if "project_removal_operations" in tables:
+        rem_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(project_removal_operations)")
+        }
+        if "epoch" not in rem_cols:
+            _add_column_if_missing(
+                conn, "project_removal_operations", "epoch", "epoch INTEGER",
+            )
+        if "accepted_mode" not in rem_cols:
+            _add_column_if_missing(
+                conn, "project_removal_operations", "accepted_mode",
+                "accepted_mode TEXT",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -876,3 +918,141 @@ def branch_name_for(project: Project, task_id: str, *, title: str = "") -> str:
         if tslug:
             base = f"{base}-{tslug}"
     return base
+
+
+# ---------------------------------------------------------------------------
+# Project removal operation records
+# ---------------------------------------------------------------------------
+
+
+def record_removal_operation(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    idempotency_key: str,
+    action: str,
+    phase: str = "accepted",
+    mode: Optional[str] = None,
+    accepted_mode: Optional[str] = None,
+    board_slug: Optional[str] = None,
+    removal_id: Optional[str] = None,
+    retained_copy_id: Optional[str] = None,
+    receipt_id: Optional[str] = None,
+    consequences_digest: Optional[str] = None,
+    epoch: Optional[int] = None,
+) -> bool:
+    """Insert a new removal operation record. Returns True if inserted."""
+    now = _now()
+    if accepted_mode is None:
+        accepted_mode = mode
+    try:
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO project_removal_operations "
+                "(project_id, idempotency_key, action, phase, mode, accepted_mode, "
+                "board_slug, removal_id, retained_copy_id, receipt_id, "
+                "consequences_digest, epoch, accepted_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (project_id, idempotency_key, action, phase, mode, accepted_mode,
+                 board_slug, removal_id, retained_copy_id, receipt_id,
+                 consequences_digest, epoch, now, now, now),
+            )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def get_removal_operation(
+    conn: sqlite3.Connection,
+    project_id: str,
+    idempotency_key: str,
+) -> Optional[sqlite3.Row]:
+    """Look up one removal operation by (project_id, idempotency_key)."""
+    return conn.execute(
+        "SELECT * FROM project_removal_operations "
+        "WHERE project_id = ? AND idempotency_key = ?",
+        (project_id, idempotency_key),
+    ).fetchone()
+
+
+def update_removal_operation(
+    conn: sqlite3.Connection,
+    project_id: str,
+    idempotency_key: str,
+    **fields,
+) -> bool:
+    """Update named columns on an existing removal operation record."""
+    allowed = {
+        "phase", "mode", "board_slug", "removal_id", "retained_copy_id",
+        "receipt_id", "consequences_digest", "epoch", "last_error",
+        "result_json", "accepted_at", "applied_at", "completed_at", "action",
+    }
+    sets = []
+    params = []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        sets.append(f"{k} = ?")
+        params.append(v)
+    if not sets:
+        return False
+    sets.append("updated_at = ?")
+    params.append(_now())
+    params.extend([project_id, idempotency_key])
+    with write_txn(conn):
+        cur = conn.execute(
+            f"UPDATE project_removal_operations SET {', '.join(sets)} "
+            "WHERE project_id = ? AND idempotency_key = ?",
+            params,
+        )
+    return cur.rowcount > 0
+
+
+def get_active_removal_operation(
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> Optional[sqlite3.Row]:
+    """Return the newest operation a later action can still act on.
+
+    Actionable means: non-terminal (still in progress), OR terminal-done
+    with a retained copy (so ``restore`` is still reachable).  Terminal
+    rows that are cancelled/failed/restored, or done-with-no-retained-copy,
+    resolve to None.
+    """
+    row = conn.execute(
+        "SELECT * FROM project_removal_operations "
+        "WHERE project_id = ? ORDER BY created_at DESC LIMIT 1",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    terminal_no_action = {"cancelled", "failed", "restored"}
+    if row["phase"] in terminal_no_action:
+        return None
+    if row["phase"] == "done" and not row["retained_copy_id"]:
+        return None
+    return row
+
+
+def list_removal_operations_for_project(
+    conn: sqlite3.Connection,
+    project_id: str,
+) -> list:
+    """All removal operations for one project, newest first."""
+    return conn.execute(
+        "SELECT * FROM project_removal_operations "
+        "WHERE project_id = ? ORDER BY created_at DESC",
+        (project_id,),
+    ).fetchall()
+
+
+def list_resumable_removal_operations(conn: sqlite3.Connection) -> list:
+    """Non-terminal removal operations across all projects."""
+    terminal = ("done", "cancelled", "failed", "restored")
+    placeholders = ",".join("?" for _ in terminal)
+    return conn.execute(
+        "SELECT * FROM project_removal_operations "
+        f"WHERE phase NOT IN ({placeholders}) "
+        "ORDER BY created_at ASC",
+        terminal,
+    ).fetchall()

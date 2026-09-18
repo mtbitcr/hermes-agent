@@ -93,6 +93,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import (
+    InitLockDirectoryAbsent,
     InitLockUnavailable,
     add_column_if_missing as _add_column_if_missing,
     cross_process_init_lock as _shared_cross_process_init_lock,
@@ -1313,21 +1314,28 @@ def create_board(
     Returns the resulting metadata. Raises :class:`ValueError` for a
     malformed slug; returns the existing metadata (not an error) if the
     board already exists — matching ``mkdir -p`` semantics.
+
+    A board the register has removed is refused (GA-2) BEFORE the first
+    side effect. This used to write ``board.json`` first and let ``init_db``
+    refuse afterwards, which left a discoverable directory + metadata ghost
+    for a name that was supposed to stay removed: a refusal that arrives
+    after the side effect is too late.
     """
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
-    meta = write_board_metadata(
-        normed,
-        name=name,
-        description=description,
-        icon=icon,
-        color=color,
-        default_workdir=default_workdir,
-        project_id=project_id,
-    )
-    # Touch the DB so list_boards() sees it immediately.
-    init_db(board=normed)
+    with _admitted_store_creation(kanban_db_path(board=normed), normed):
+        meta = write_board_metadata(
+            normed,
+            name=name,
+            description=description,
+            icon=icon,
+            color=color,
+            default_workdir=default_workdir,
+            project_id=project_id,
+        )
+        # Touch the DB so list_boards() sees it immediately.
+        init_db(board=normed)
     return meta
 
 
@@ -1400,9 +1408,9 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if get_current_board() == normed:
         clear_current_board()
 
-    # A concurrent connect(board=normed) after the rename/delete recreates
-    # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
-    # dropped first so the schema init pass re-runs on that fresh file.
+    # connect() no longer recreates a store it finds missing, but this slug
+    # can legitimately be created again later; the cache entry must not
+    # survive the rename/delete or that fresh file would skip schema init.
     _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
 
     if archive:
@@ -1602,11 +1610,34 @@ def remove_board_fenced(
             not permanent_confirmation.confirmed
             or permanent_confirmation.statement_digest != expected
         ):
+            _refuse_intent(
+                normed, RemovalIntentOutcome.REFUSED_UNCONFIRMED,
+                "the offered confirmation is not bound to the permanence "
+                "statement in force for this board",
+            )
             return FencedRemovalResult(
                 False,
                 "the offered confirmation is not bound to the permanence "
                 "statement in force for this board: refusing to treat it as "
                 "a confirmation of this removal",
+                slug=normed, mode=mode.value,
+                refusal_reason="unbound-confirmation",
+            )
+        if (
+            permanent_confirmation.board is not None
+            and permanent_confirmation.board != normed
+        ):
+            _refuse_intent(
+                normed, RemovalIntentOutcome.REFUSED_UNCONFIRMED,
+                f"the confirmation is bound to board "
+                f"{permanent_confirmation.board!r}, not {normed!r}",
+            )
+            return FencedRemovalResult(
+                False,
+                f"the confirmation is bound to board "
+                f"{permanent_confirmation.board!r}, not {normed!r}: a "
+                "confirmation minted for one board cannot be replayed "
+                "against another",
                 slug=normed, mode=mode.value,
                 refusal_reason="unbound-confirmation",
             )
@@ -1716,6 +1747,19 @@ def _removal_drive_actions() -> dict:
                     slug, removal_id=rec.removal_id
                 )
             ),
+            # Re-enters the SAME recorded intent: the discard is already
+            # journalled and the register/outcome already restored, so this
+            # only re-attempts and re-verifies the gate reopen.
+            RemovalRecoveryAction.ROLL_FORWARD_REOPEN_AFTER_ABANDON: (
+                lambda slug, rec: abandon_or_cancel_removal(
+                    slug, removal_id=rec.removal_id,
+                    reason=(
+                        "deadline"
+                        if rec.outcome == REMOVAL_OUTCOME_ABANDONED
+                        else "cancel"
+                    ),
+                )
+            ),
         })
     return _REMOVAL_DRIVE_ACTIONS
 
@@ -1762,9 +1806,14 @@ def drive_removal(
             "message": decision.message,
         })
         if decision.action is RemovalRecoveryAction.NO_ACTION_COMPLETE:
-            action = (
-                "deleted" if record.mode == RemovalMode.PERMANENT else "archived"
-            )
+            if record.outcome in (
+                REMOVAL_OUTCOME_ABANDONED, REMOVAL_OUTCOME_CANCELLED,
+            ):
+                action = record.outcome
+            elif record.mode == RemovalMode.PERMANENT:
+                action = "deleted"
+            else:
+                action = "archived"
             return FencedRemovalResult(
                 True,
                 f"board {slug!r} {action} via fenced removal",
@@ -2281,7 +2330,36 @@ CREATE TABLE IF NOT EXISTS board_removal_phase (
     updated_at              INTEGER NOT NULL
 );
 
+-- CREATION-TIME provenance for what the KERNEL creates. It lives here —
+-- OUTSIDE every board — so a board removal cannot destroy the record of
+-- what its kernel made, and a reader with no local receipt can still read
+-- it. One row per created thing, written AS the kernel creates it
+-- (commits) or BEFORE the thing exists (resources: the kernel mints
+-- ``record_id`` and stamps it into the creation request, then fills in the
+-- observed ``subject_id``). A crash between the two is settled by
+-- RECORDING the outcome in ``state``/``resolution``, never by deleting.
+-- Nothing reconstructs a row afterwards, and a thing with no row here is
+-- never claimed as kernel-created.
+CREATE TABLE IF NOT EXISTS kernel_creation_provenance (
+    record_id               TEXT PRIMARY KEY,
+    family                  TEXT NOT NULL,
+    kind                    TEXT NOT NULL,
+    subject_id              TEXT,
+    board_name              TEXT,
+    task_id                 TEXT,
+    run_id                  INTEGER,
+    project_id              TEXT,
+    generation              INTEGER,
+    reference               TEXT,
+    state                   TEXT NOT NULL,
+    resolution              TEXT,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_register_lifecycle ON board_register(lifecycle);
+CREATE INDEX IF NOT EXISTS idx_kernel_provenance_subject
+    ON kernel_creation_provenance(subject_id);
 CREATE INDEX IF NOT EXISTS idx_archive_board ON board_removal_archive(board_name);
 CREATE INDEX IF NOT EXISTS idx_removal_phase_phase ON board_removal_phase(phase);
 """
@@ -2418,6 +2496,187 @@ def register_connect() -> sqlite3.Connection:
         yield conn
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Creation-time provenance ledger (see ``kernel_creation_provenance`` above)
+# ---------------------------------------------------------------------------
+
+#: Named on every receipt whose commit list is covered by ledger rows.
+KERNEL_COMMIT_PROVENANCE_SOURCE = "creation-time-commit-provenance-ledger"
+
+KERNEL_FAMILY_COMMIT = "commit"
+KERNEL_FAMILY_RESOURCE = "resource"
+#: ``state``: a resource is INTENDED before it exists and CREATED once its
+#: id is observed; the last two settle a crash between those, either way.
+KERNEL_INTENT_INTENDED = "intended"
+KERNEL_INTENT_CREATED = "created"
+KERNEL_INTENT_ORPHAN_RESOURCE = "orphan_resource"
+KERNEL_INTENT_NEVER_CREATED = "never_created"
+
+_KERNEL_INSERT = (
+    "INSERT OR IGNORE INTO kernel_creation_provenance (record_id, family, "
+    "kind, subject_id, board_name, task_id, run_id, project_id, generation, "
+    "reference, state, created_at, updated_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def kernel_provenance_rows(**filters: Any) -> list:
+    """Rows matching these column equalities. READ-ONLY; writes nothing.
+
+    Reads the register read-only, so an absent, unreadable or older store
+    reads as "no rows" — which callers turn into UNVERIFIED, never a pass.
+    """
+    columns = {name: value for name, value in filters.items() if value is not None}
+    path = register_db_path()
+    if not path.exists():
+        return []
+    where = " AND ".join(f"{name} = ?" for name in columns)
+    sql = "SELECT * FROM kernel_creation_provenance"
+    sql += f"{' WHERE ' + where if where else ''} ORDER BY created_at, record_id"
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except (sqlite3.Error, OSError, ValueError):
+        return []
+    try:
+        conn.row_factory = sqlite3.Row
+        params = tuple(str(value) for value in columns.values())
+        return [dict(row) for row in conn.execute(sql, params)]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def _kernel_ledger_write(sql: str, params: tuple) -> int:
+    with register_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(sql, params)
+            conn.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
+    return cur.rowcount
+
+
+def record_kernel_creation(
+    *, family: str, kind: str, subject_id: Any = None, board: Any = None,
+    task_id: Any = None, run_id: Any = None, project_id: Any = None,
+    generation: Any = None, reference: Any = None,
+) -> str:
+    """Write ONE creation-time row and return its record id.
+
+    A COMMIT is recorded the moment it exists, with its exact id as the
+    subject. A RESOURCE is recorded BEFORE it exists, with no subject yet
+    and a record id MINTED here for the kernel to stamp into the creation
+    request — a remote id cannot serve, because it does not exist yet,
+    which is exactly the window this row covers.
+    """
+    subject = None if subject_id is None else str(subject_id).strip()
+    if family == KERNEL_FAMILY_COMMIT:
+        if not re.fullmatch(r"[0-9a-fA-F]{7,64}", subject or ""):
+            raise ValueError("a creation-time commit record needs an exact commit id")
+        board = _normalize_board_slug(board) or DEFAULT_BOARD
+        record_id, state = f"{family}:{board}:{subject}", KERNEL_INTENT_CREATED
+    else:
+        record_id, state = f"kri-{secrets.token_hex(16)}", KERNEL_INTENT_INTENDED
+    now = int(time.time())
+    _kernel_ledger_write(_KERNEL_INSERT, (
+        record_id, str(family), str(kind), subject,
+        None if board is None else (_normalize_board_slug(board) or str(board)),
+        None if task_id is None else str(task_id),
+        None if run_id is None else int(run_id),
+        None if project_id is None else str(project_id),
+        None if generation is None else int(generation),
+        None if reference is None else str(reference),
+        state, now, now,
+    ))
+    return record_id
+
+
+def kernel_commit_records(board: Any = None, **filters: Any) -> list:
+    """The creation-time rows for commits, by identity. Read-only."""
+    return kernel_provenance_rows(
+        family=KERNEL_FAMILY_COMMIT, **filters,
+        board_name=None if board is None else (
+            _normalize_board_slug(board) or str(board)
+        ),
+    )
+
+
+def kernel_resource_intents(**filters: Any) -> list:
+    """The creation-intent rows matching this identity. Read-only."""
+    return kernel_provenance_rows(family=KERNEL_FAMILY_RESOURCE, **filters)
+
+
+def settle_kernel_resource_intent(
+    record_id: str, *, state: str, subject_id: Any = None, resolution: Any = None
+) -> bool:
+    """Record what became of a pending intent. Never deletes it.
+
+    ``CREATED`` carries the OBSERVED id of the resource that now exists.
+    The other two are the crash directions: the resource outlived the crash
+    (orphan, with the observed id) or it never came into being.
+    """
+    if state not in (KERNEL_INTENT_CREATED, KERNEL_INTENT_ORPHAN_RESOURCE,
+                     KERNEL_INTENT_NEVER_CREATED):
+        raise ValueError(f"{state!r} is not an outcome of a creation intent")
+    if state != KERNEL_INTENT_NEVER_CREATED and not str(subject_id or "").strip():
+        raise ValueError("a resource that exists must be recorded by its exact id")
+    return _kernel_ledger_write(
+        "UPDATE kernel_creation_provenance SET state = ?, resolution = ?, "
+        "subject_id = COALESCE(?, subject_id), updated_at = ? "
+        "WHERE record_id = ? AND state = ?",
+        (state, None if resolution is None else str(resolution),
+         None if subject_id is None else str(subject_id), int(time.time()),
+         str(record_id), KERNEL_INTENT_INTENDED),
+    ) == 1
+
+
+@dataclass(frozen=True)
+class ProvenanceVerification:
+    """A read-only verdict about ONE subject's creation-time record.
+
+    Neither a boolean nor authority: an unrecorded subject is UNVERIFIED
+    for good — verifying writes nothing, so observation cannot upgrade it —
+    and no verdict authorizes destroying anything. Truth testing raises
+    rather than letting ``if verify(x):`` read as permission.
+    """
+
+    subject: str
+    verdict: str
+    detail: str
+    record: Optional[dict] = None
+
+    def __bool__(self) -> bool:
+        raise TypeError(
+            "a provenance verification is not a boolean and never authorizes "
+            "destruction; read .verdict"
+        )
+
+    @property
+    def authorizes_destruction(self) -> bool:
+        return False
+
+
+def verify_kernel_creation(subject_id: Any, **filters: Any) -> ProvenanceVerification:
+    """The READ-ONLY verification entry point: is there a creation record?"""
+    subject = str(subject_id or "").strip()
+    rows = kernel_provenance_rows(subject_id=subject, **filters)
+    if rows:
+        return ProvenanceVerification(
+            subject, RECEIPT_VERDICT_PASS,
+            f"{subject!r} was recorded at creation time by the kernel",
+            dict(rows[0]),
+        )
+    return ProvenanceVerification(
+        subject, RECEIPT_VERDICT_UNVERIFIED,
+        f"no creation-time record covers {subject!r}, so the kernel does not "
+        "claim it; this verdict is permanent and authorizes nothing",
+    )
 
 
 REGISTER_LOCK_TIMEOUT_SECONDS = 5.0
@@ -2849,6 +3108,13 @@ def ever_existed_marker_set(
     try:
         if register_conn is not None:
             return _legacy(register_conn)
+        if not register_db_path().exists():
+            # There is no register store, so there is no legacy column to
+            # consult — and opening one would CREATE the register as a side
+            # effect of a read, which the creation path (which asks this on
+            # a brand-new home) must not do. The independent marker store
+            # above already gave the definite answer.
+            return False
         with register_connect() as c:
             return _legacy(c)
     except sqlite3.Error:
@@ -2933,6 +3199,12 @@ def has_removal_archive_record(
     try:
         if conn is not None:
             return _check(conn)
+        if not register_db_path().exists():
+            # No register store to hold the legacy table, and opening one
+            # would create it as a side effect of a read — see
+            # :func:`ever_existed_marker_set` for why that matters on the
+            # creation path. The independent archive above already answered.
+            return False
         with register_connect() as c:
             return _check(c)
     except sqlite3.Error:
@@ -5013,8 +5285,17 @@ def _read_quiescence_predicate(
         )
     try:
         try:
+            # The identity witness is additive, so a store that predates the
+            # migration simply has no column to read: select it only when it
+            # is there and let ``_row_worker_start_time`` answer None
+            # otherwise (which classifies as INDETERMINATE, never absent).
+            task_cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+            witness = (
+                ", worker_start_time" if "worker_start_time" in task_cols else ""
+            )
             held_rows = conn.execute(
-                "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+                f"SELECT id, claim_lock, claim_expires, worker_pid{witness} "
+                "FROM tasks "
                 "WHERE status = 'running' AND claim_lock IS NOT NULL"
             ).fetchall()
         except sqlite3.Error as exc:
@@ -5491,11 +5772,18 @@ class PermanentRemovalConfirmation:
     ``statement_digest`` pins WHICH statement was shown; a confirmation
     whose digest does not match the statement in force is not a
     confirmation of this removal and is refused.
+
+    ``board`` is the board the confirmation was minted for. When present,
+    the confirmation is bound to that exact board and cannot be replayed
+    against a different one. When ``None`` (the default), the confirmation
+    is unbound and checked only against the statement digest — keeping
+    existing callers that pass no board working.
     """
     confirmed: bool
     statement_digest: str
     confirmed_by: Optional[str] = None
     confirmed_at: Optional[int] = None
+    board: Optional[str] = None
 
 
 # The words an operator must echo, verbatim, to confirm a permanent
@@ -5688,6 +5976,7 @@ def confirm_permanent_removal(
             statement_digest=active.statement_digest,
             confirmed_by=confirmed_by,
             confirmed_at=int(time.time()),
+            board=active.board_name,
         ),
         message="the operator echoed the statement-bound confirmation line",
     )
@@ -5946,6 +6235,18 @@ def _record_removal_intent_locked(
                 "the confirmation does not match the permanence statement in "
                 "force for this board: refusing to treat it as a confirmation "
                 "of this removal",
+                entry=entry,
+            )
+        if (
+            permanent_confirmation.board is not None
+            and permanent_confirmation.board != slug
+        ):
+            return _refuse_intent(
+                slug, RemovalIntentOutcome.REFUSED_UNCONFIRMED,
+                f"the confirmation is bound to board "
+                f"{permanent_confirmation.board!r}, not {slug!r}: a "
+                "confirmation minted for one board cannot be replayed "
+                "against another",
                 entry=entry,
             )
         confirmed_at = permanent_confirmation.confirmed_at or int(time.time())
@@ -7373,9 +7674,10 @@ class QuiescenceDeadlineAction(str, Enum):
     """QB-3's shared decision point: what the deadline implies (§6.3).
 
     Deciding is shared between both modes; ACTING on ``FORCE_END_HELD``
-    (permanent) or ``ABANDON`` (reversible) is mode-specific later work
-    (§7.2, §9.2) — this enum and :func:`quiescence_deadline_action` only
-    return the decision.
+    (permanent) is mode-specific later work (§7.2), while ``ABANDON``
+    (reversible) is acted on by :func:`advance_removal_to_quiesced`
+    through §9.2's :func:`abandon_or_cancel_removal`. This enum and
+    :func:`quiescence_deadline_action` only return the decision.
     """
     ADVANCE = "advance"
     WAIT = "wait"
@@ -7444,16 +7746,194 @@ class AbsentHolderResolution:
     ended: "tuple[str, ...]" = ()
 
 
-def _probe_holder_presence(row, *, host_prefix: str, pid_probe) -> HolderProbe:
+def _probe_worker_start_time(pid: int) -> Optional[int]:
+    """This host's start-time fingerprint for ``pid``, or None when unknown.
+
+    A thin, lazy-importing wrapper over the ONE start-time probe this
+    codebase has — ``gateway.status.get_process_start_time`` (``/proc/<pid>/stat``
+    field 22 on Linux, psutil ``create_time`` in centiseconds elsewhere).
+    Imported inside the function exactly the way :func:`_pid_alive` imports
+    ``gateway.status._pid_exists``, so the kernel keeps no import-time
+    dependency on the gateway package. Never raises: a probe that could not
+    be performed answers None, which the classifier reads as INDETERMINATE.
+    """
+    try:
+        from gateway.status import get_process_start_time
+
+        value = get_process_start_time(int(pid))
+    except Exception:
+        return None
+    return None if value is None else int(value)
+
+
+def _row_worker_start_time(row) -> Optional[int]:
+    """The recorded identity witness on *row*, tolerating pre-migration rows."""
+    try:
+        keys = row.keys()
+    except AttributeError:
+        return None
+    if "worker_start_time" not in keys:
+        return None
+    value = row["worker_start_time"]
+    return None if value is None else int(value)
+
+
+def _worker_identity_presence(
+    pid,
+    recorded_start,
+    *,
+    pid_probe=None,
+    start_time_probe=None,
+    evidence: Optional[dict] = None,
+) -> HolderPresence:
+    """What the recorded ``(worker_pid, worker_start_time)`` pair PROVES.
+
+    A pid on its own is not an identity: the OS recycles pid numbers, so a
+    recycled pid belonging to an unrelated process reads as "the owner is
+    alive" to a bare liveness probe. The start time recorded beside the pid
+    by :func:`_set_worker_pid` is the fingerprint that turns the one pid
+    field into an identity, and this is the single place that reads the
+    pair. The verdicts are :class:`HolderPresence`'s existing three —
+    ``INDETERMINATE`` is not a shade of absent, it is treated exactly like
+    ``LIVE``:
+
+    ======================================  ==================
+    observation                             verdict
+    ======================================  ==================
+    no pid recorded                         INDETERMINATE
+    pid recorded, probe says gone           PROVABLY_ABSENT
+    pid alive, no recorded start time       INDETERMINATE
+    pid alive, current start time unknown   INDETERMINATE
+    pid alive, start times agree            LIVE
+    pid alive, start times disagree         PROVABLY_ABSENT
+    any probe raised                        INDETERMINATE
+    ======================================  ==================
+
+    Start times are compared as exact integers, which is correct precisely
+    because both sides come from the same host and the same probe. (The
+    float-tolerance helper ``gateway.status._start_times_agree`` is for a
+    different record shape and is deliberately not used here.)
+
+    ``pid_probe`` / ``start_time_probe`` are the injection points; they
+    default to :func:`_pid_alive` and :func:`_probe_worker_start_time`,
+    looked up at call time so monkeypatching the module attribute works.
+    ``evidence``, when given, is filled in with what was observed so the
+    caller's audit event can carry the proof rather than just the verdict.
+    """
+    def _record(presence: HolderPresence, reason: str, observed) -> HolderPresence:
+        if evidence is not None:
+            evidence.update({
+                "worker_pid": int(pid) if pid else None,
+                "worker_start_time": (
+                    int(recorded_start) if recorded_start is not None else None
+                ),
+                "observed_worker_start_time": observed,
+                "worker_presence": presence.value,
+                "worker_identity_reason": reason,
+            })
+        return presence
+
+    if not pid:
+        return _record(
+            HolderPresence.INDETERMINATE,
+            "the claim records no worker pid: absence cannot be proven",
+            None,
+        )
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return _record(
+            HolderPresence.INDETERMINATE,
+            f"the recorded worker pid {pid!r} is not a number",
+            None,
+        )
+
+    probe = pid_probe if pid_probe is not None else _pid_alive
+    try:
+        alive = probe(pid_int)
+    except Exception as exc:
+        return _record(
+            HolderPresence.INDETERMINATE,
+            f"the liveness probe for pid {pid_int} failed ({exc}): a query "
+            "that did not succeed proves nothing",
+            None,
+        )
+    if not alive:
+        return _record(
+            HolderPresence.PROVABLY_ABSENT,
+            f"pid {pid_int} is recorded on this host and a successful probe "
+            "found it absent",
+            None,
+        )
+
+    if recorded_start is None:
+        return _record(
+            HolderPresence.INDETERMINATE,
+            f"pid {pid_int} is alive but no start time was recorded with it: "
+            "the pid alone cannot prove the owner's identity",
+            None,
+        )
+    start_probe = (
+        start_time_probe if start_time_probe is not None else _probe_worker_start_time
+    )
+    try:
+        observed = start_probe(pid_int)
+    except Exception as exc:
+        return _record(
+            HolderPresence.INDETERMINATE,
+            f"the start-time probe for pid {pid_int} failed ({exc}): a query "
+            "that did not succeed proves nothing",
+            None,
+        )
+    if observed is None:
+        return _record(
+            HolderPresence.INDETERMINATE,
+            f"pid {pid_int} is alive but its current start time is "
+            "unreadable: identity can be neither confirmed nor refuted",
+            None,
+        )
+    try:
+        same = int(recorded_start) == int(observed)
+    except (TypeError, ValueError):
+        return _record(
+            HolderPresence.INDETERMINATE,
+            f"pid {pid_int} carries a malformed start time "
+            f"(recorded {recorded_start!r}, observed {observed!r})",
+            observed if isinstance(observed, int) else None,
+        )
+    if same:
+        return _record(
+            HolderPresence.LIVE,
+            f"pid {pid_int} is alive on this host and its start time matches "
+            f"the one recorded with the claim ({int(observed)})",
+            int(observed),
+        )
+    return _record(
+        HolderPresence.PROVABLY_ABSENT,
+        f"pid {pid_int} is alive but its start time is {int(observed)}, not "
+        f"the {int(recorded_start)} recorded with the claim: the pid was "
+        "recycled and this process is NOT the recorded owner",
+        int(observed),
+    )
+
+
+def _probe_holder_presence(
+    row, *, host_prefix: str, pid_probe, start_time_probe=None,
+) -> HolderProbe:
     """Is this reservation's holder PROVABLY absent? (QB-1d, AB-1 shape.)
 
     A positive standard, in three parts, every one of which must hold:
     the claim records a ``worker_pid``; the recorded holder is on THIS
     host (a PID recorded on another host is a PID this system cannot
-    interrogate); and a liveness probe that SUCCEEDED says the process is
-    gone. Anything else — no PID, a foreign host, a probe that raised —
-    is indeterminate, and an indeterminate holder is treated as live.
-    Fail-closed, in the direction that protects work.
+    interrogate); and the recorded IDENTITY — the pid together with the
+    start time bound beside it — is provably gone. Anything else — no PID,
+    a foreign host, a probe that raised, a pid whose identity cannot be
+    established — is indeterminate, and an indeterminate holder is treated
+    as live. Fail-closed, in the direction that protects work.
+
+    A recycled pid is the case the start time exists for: without it, an
+    unrelated process that inherited the number reads as the holder being
+    alive, and the reservation is held forever by a stranger.
     """
     task_id = row["id"]
     claim_lock = row["claim_lock"]
@@ -7472,25 +7952,16 @@ def _probe_holder_presence(row, *, host_prefix: str, pid_probe) -> HolderProbe:
             "system cannot interrogate: its recorded expiry is what resolves it",
             worker_pid=int(pid), claim_lock=claim_lock,
         )
-    try:
-        alive = pid_probe(int(pid))
-    except Exception as exc:
-        return HolderProbe(
-            task_id, HolderPresence.INDETERMINATE,
-            f"the liveness probe for pid {int(pid)} failed ({exc}): a query "
-            "that did not succeed proves nothing",
-            worker_pid=int(pid), claim_lock=claim_lock,
-        )
-    if alive:
-        return HolderProbe(
-            task_id, HolderPresence.LIVE,
-            f"pid {int(pid)} is alive on this host",
-            worker_pid=int(pid), claim_lock=claim_lock,
-        )
+    evidence: dict = {}
+    presence = _worker_identity_presence(
+        pid,
+        _row_worker_start_time(row),
+        pid_probe=pid_probe,
+        start_time_probe=start_time_probe,
+        evidence=evidence,
+    )
     return HolderProbe(
-        task_id, HolderPresence.PROVABLY_ABSENT,
-        f"pid {int(pid)} is recorded on this host and a successful probe "
-        "found it absent",
+        task_id, presence, evidence["worker_identity_reason"],
         worker_pid=int(pid), claim_lock=claim_lock,
     )
 
@@ -7720,9 +8191,10 @@ def advance_removal_to_quiesced(
 
     If the predicate fails and the recorded deadline has not arrived,
     refuses with a distinct still-quiescing reason and leaves the phase
-    where it is. At or after the deadline, reports the shared decision
-    (:func:`quiescence_deadline_action`) without acting on it — force-
-    ending and abandonment are mode-specific later work (§7.2, §9.2).
+    where it is. At or after the deadline it takes the shared decision
+    (:func:`quiescence_deadline_action`): in reversible mode it abandons
+    through §9.2's :func:`abandon_or_cancel_removal`; force-ending in
+    permanent mode is still mode-specific later work (§7.2).
 
     A record already AT Quiesced is not taken at its word: the durable
     completion fact and TQ-2 itself are re-read, and a no-op success is
@@ -7806,6 +8278,19 @@ def advance_removal_to_quiesced(
             outcome=RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE,
             resolution=resolution,
         )
+    if action is QuiescenceDeadlineAction.ABANDON:
+        # §9.2, reversible mode: the deadline's answer is abandonment, and
+        # this is the shipped path to it. It writes the outcome through the
+        # phase-record seam and records its own refusal, so neither is
+        # written again here.
+        abandoned = abandon_or_cancel_removal(
+            slug, removal_id=record.removal_id, reason="deadline"
+        )
+        return QuiescedAdvanceResult(
+            abandoned.success, abandoned.message,
+            record=abandoned.record or record, action=action, held=held,
+            resolution=resolution,
+        )
     message = (
         f"quiescence deadline reached: {action.value} is required "
         "(mode-specific, later work)"
@@ -7817,6 +8302,207 @@ def advance_removal_to_quiesced(
         False, message, record=record, action=action, held=held,
         outcome=RemovalAdvanceOutcome.REFUSED_REENTER_QUIESCENCE,
         resolution=resolution,
+    )
+
+
+# ---------------------------------------------------------------------------
+# §9.2 — Deadline abandonment and cancel-before-Applied
+# ---------------------------------------------------------------------------
+
+REMOVAL_OUTCOME_ABANDONED = "abandoned"
+REMOVAL_OUTCOME_CANCELLED = "cancelled"
+
+
+@dataclass
+class RemovalAbandonResult:
+    """Result of :func:`abandon_or_cancel_removal`."""
+    success: bool
+    message: str
+    record: Optional[RemovalPhaseRecord] = None
+    entry: Optional[RegisterEntry] = None
+    already_done: bool = False
+
+
+def abandon_or_cancel_removal(
+    board: str,
+    *,
+    removal_id: str,
+    reason: str = "cancel",
+) -> RemovalAbandonResult:
+    """Abandon (deadline) or cancel (operator) a removal back to live (§9.2).
+
+    Accepted strictly BEFORE Applied: both deadline abandonment and
+    operator cancel share one implementation and produce the same valid
+    live end state. At or after Applied the removal has already acted on
+    content and the only safe direction is forward — the cancel is
+    REFUSED with a plain-language reason, durably recorded, and the
+    removal recovers forward on restart.
+
+    Permanent mode is always refused: a permanent removal is a deliberate,
+    confirmed decision and cannot be abandoned.
+
+    Idempotent: if the outcome is already recorded and the board is already
+    live, this returns success without writing a duplicate journal entry.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RemovalAbandonResult(False, "invalid board name")
+
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return RemovalAbandonResult(False, f"no removal phase record for {slug!r}")
+    if record.removal_id != removal_id:
+        return RemovalAbandonResult(
+            False,
+            f"removal_id {removal_id!r} does not match the recorded "
+            f"removal {record.removal_id!r}",
+            record=record,
+        )
+
+    outcome_value = (
+        REMOVAL_OUTCOME_ABANDONED if reason == "deadline" else REMOVAL_OUTCOME_CANCELLED
+    )
+
+    # Idempotent: already abandoned or cancelled?
+    if record.outcome in (REMOVAL_OUTCOME_ABANDONED, REMOVAL_OUTCOME_CANCELLED):
+        entry = get_register_entry(slug)
+        if entry is not None and entry.lifecycle == BoardLifecycle.LIVE:
+            gate = _read_gate_instant(slug)
+            if (
+                gate.status is DurableReadStatus.OK
+                and gate.gate is InBoardGate.OPEN
+                and gate.epoch_mirror == entry.epoch
+            ):
+                return RemovalAbandonResult(
+                    True,
+                    f"already {record.outcome} (idempotent no-op)",
+                    record=record, entry=entry, already_done=True,
+                )
+
+    # Permanent mode is never abandoned or cancelled.
+    if record.mode == RemovalMode.PERMANENT:
+        message = (
+            "a permanent removal cannot be abandoned or cancelled: it is a "
+            "deliberate, confirmed decision and must complete forward"
+        )
+        _record_phase_refusal(slug, record, "refused-abandon-permanent", message)
+        return RemovalAbandonResult(False, message, record=record)
+
+    # At or after Applied, refuse: content has been acted on.
+    applied_ordinal = removal_phase_ordinal(RemovalPhase.APPLIED)
+    current_ordinal = removal_phase_ordinal(record.phase)
+    if current_ordinal >= applied_ordinal:
+        message = (
+            f"the removal is at {record.phase.value}, which is at or past "
+            "Applied: content has already been acted on and the removal "
+            "can only be completed forward, not reversed"
+        )
+        _record_phase_refusal(slug, record, "refused-cancel-past-applied", message)
+        return RemovalAbandonResult(False, message, record=record)
+
+    return _abandon_removal_locked(slug, record, outcome_value)
+
+
+def _abandon_removal_locked(
+    slug: str, record: RemovalPhaseRecord, outcome: str
+) -> RemovalAbandonResult:
+    """Shared body for deadline abandonment and cancel (§9.2)."""
+    entry = get_register_entry(slug)
+    if entry is None:
+        return RemovalAbandonResult(
+            False, "register entry missing", record=record,
+        )
+
+    retained = reversible_retained_path(slug, record.removal_id)
+    already_journalled = (
+        str(retained)
+        in journalled_apply_identities(record, action=APPLY_JOURNAL_RETAINED_DISCARDED)
+    )
+    if retained.exists() and not already_journalled:
+        shutil.rmtree(retained, ignore_errors=True)
+        journal_apply_item(
+            slug, removal_id=record.removal_id, phase=record.phase,
+            item={
+                "action": APPLY_JOURNAL_RETAINED_DISCARDED,
+                "identity": str(retained),
+                "ok": True,
+                "reason": f"partial retained copy discarded during {outcome}",
+            },
+        )
+
+    already_restored = (
+        entry.lifecycle == BoardLifecycle.LIVE
+        and record.outcome in (REMOVAL_OUTCOME_ABANDONED, REMOVAL_OUTCOME_CANCELLED)
+    )
+    if not already_restored:
+        restored_entry = RegisterEntry(
+            board_name=slug, lifecycle=BoardLifecycle.LIVE,
+            epoch=entry.epoch, epoch_before=entry.epoch_before,
+            gate_move=GateMove.SETTLED, removal_mode=None,
+            scope_declaration_version=entry.scope_declaration_version,
+            epoch_lineage=entry.epoch_lineage, created_at=entry.created_at,
+        )
+        now = int(time.time())
+        with board_register_lock(slug, reentrant=True):
+            with register_connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _write_register_entry(conn, restored_entry)
+                    conn.execute(
+                        "UPDATE board_removal_phase "
+                        "SET outcome = ?, updated_at = ? "
+                        "WHERE board_name = ? AND removal_id = ? "
+                        "AND phase = ?",
+                        (outcome, now, slug, record.removal_id,
+                         record.phase.value),
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+        entry = restored_entry
+
+    gate_committed = False
+    try:
+        with _fence_protocol_scope():
+            conn = connect(board=slug)
+            try:
+                with write_txn(conn):
+                    gate_committed = commit_gate_state(
+                        conn, InBoardGate.OPEN, entry.epoch,
+                    )
+            finally:
+                conn.close()
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
+        _log.warning(
+            "kanban removal: gate reopen for %s raised %s: %s",
+            slug, type(exc).__name__, exc,
+        )
+
+    reading = _read_gate_instant(slug)
+    if not (
+        gate_committed
+        and reading.status is DurableReadStatus.OK
+        and reading.gate is InBoardGate.OPEN
+        and reading.epoch_mirror == entry.epoch
+    ):
+        updated_record = get_removal_phase_record(slug)
+        message = (
+            f"board {slug!r} is not yet usable: the in-board gate "
+            f"could not be reopened"
+        )
+        _record_phase_refusal(
+            slug, updated_record or record,
+            "gate-reopen-failed", message,
+        )
+        return RemovalAbandonResult(
+            False, message, record=updated_record, entry=entry,
+        )
+
+    updated_record = get_removal_phase_record(slug)
+    return RemovalAbandonResult(
+        True, f"removal {outcome}: board {slug!r} restored to live",
+        record=updated_record, entry=get_register_entry(slug),
     )
 
 
@@ -8114,28 +8800,30 @@ BOARD_CREATED_COMMIT_RULE = (
 _RUN_EXECUTION_RECEIPT_KEY = "execution_receipt"
 
 # WHERE the commit list comes from, named on every receipt and in every
-# prospective statement. There is exactly one derivation and it is this
-# one: the run receipts each advance persisted at completion time.
-#
-# There is deliberately NO creation-time commit provenance ledger in this
-# milestone (owner decision, deferred). That absence is the reason
-# completeness cannot be claimed, so the source and the honest completeness
-# marking are written down together, here, and referenced everywhere else.
-COMMIT_LIST_SOURCE = "recorded-run-receipts"
+# prospective statement. Two durable derivations, both named: the run
+# receipts each advance persisted at completion time, and the creation-time
+# ledger the kernel writes AS it makes a commit. The ledger covers only
+# what the KERNEL created, so completeness is earned per reference, from
+# rows, rather than claimed here.
+COMMIT_LIST_SOURCE = f"recorded-run-receipts+{KERNEL_COMMIT_PROVENANCE_SOURCE}"
 COMMIT_LIST_SOURCE_STATEMENT = (
     "this commit list is derived from the RECORDED RUN RECEIPTS — the "
     f"task_runs.metadata.{_RUN_EXECUTION_RECEIPT_KEY} rows each advance "
-    "persisted when it completed — and from the per-task git receipt "
-    "columns. It is NOT derived from a creation-time commit provenance "
-    "ledger: this milestone builds no such ledger."
+    "persisted when it completed — from the per-task git receipt columns, "
+    "and from the creation-time commit provenance ledger. It is NEVER "
+    "derived from a base..head range."
 )
 COMMIT_LIST_COMPLETENESS_UNVERIFIED = (
-    "no creation-time commit provenance ledger exists, so a recorded run "
+    "no creation-time ledger row covers this reference, so a recorded run "
     "receipt names the HEAD its advance produced but not every commit that "
     "advance created. Where one advance produced SEVERAL commits, only its "
     "head is on this list. Completeness is therefore UNVERIFIED — it is not "
     "claimed as a complete enumeration, and the absence of an entry is not "
     "evidence that no commit exists."
+)
+COMMIT_LIST_COMPLETENESS_COVERED = (
+    "every commit on this list carries a creation-time ledger row the "
+    "kernel wrote as it created that commit, so this IS the enumeration"
 )
 COMMIT_LIST_COMPLETENESS_NO_RECEIPT = (
     "this reference records a real head commit but no run receipt names an "
@@ -8145,27 +8833,74 @@ COMMIT_LIST_COMPLETENESS_NO_RECEIPT = (
 
 
 def commit_list_completeness(ref: dict) -> dict:
-    """The honest completeness marking for ONE reference's commit list.
+    """The completeness marking for ONE reference's commit list, EARNED.
 
-    Always :data:`RECEIPT_VERDICT_UNVERIFIED` while the creation-time
-    provenance ledger is absent — which it is, by owner decision, for this
-    milestone. The verdict is stated rather than omitted, and the reasons
-    name the specific things about THIS reference that cannot be
-    established, so a reader is never left to infer completeness from
-    silence or from a bare PASS that only meant "nothing was found".
+    :data:`RECEIPT_VERDICT_PASS` only where every commit on the list — and
+    the recorded head — carries a creation-time ledger row, the only thing
+    that establishes the kernel created it. Anything else is
+    :data:`RECEIPT_VERDICT_UNVERIFIED` naming the exact commits not
+    covered, so completeness is never inferred from silence or from a bare
+    PASS that only meant "nothing was found".
     """
     advances = ref.get("advances") or []
-    head = ref.get("head_commit")
-    reasons = [COMMIT_LIST_COMPLETENESS_UNVERIFIED]
-    if head and not advances:
-        reasons.append(COMMIT_LIST_COMPLETENESS_NO_RECEIPT)
+    head = str(ref.get("head_commit") or "").strip()
+    recorded = {
+        str(row.get("subject_id"))
+        for row in (ref.get("kernel_commit_records") or [])
+        if row.get("subject_id")
+    }
+    listed = [
+        str(commit) for commit in
+        (ref.get("board_created_commits") or ref.get("commits") or [])
+    ]
+    uncovered = list(dict.fromkeys(
+        commit for commit in listed + [head] if commit and commit not in recorded
+    ))
+    covered = bool(recorded) and not uncovered
+    if covered:
+        reasons = [COMMIT_LIST_COMPLETENESS_COVERED]
+    elif recorded:
+        reasons = [f"no creation-time row covers {', '.join(uncovered)}"]
+    else:
+        reasons = [COMMIT_LIST_COMPLETENESS_UNVERIFIED]
+        if head and not advances:
+            reasons.append(COMMIT_LIST_COMPLETENESS_NO_RECEIPT)
     return {
-        "verdict": RECEIPT_VERDICT_UNVERIFIED,
-        "source": COMMIT_LIST_SOURCE,
-        "creation_time_provenance_ledger": "absent",
+        "verdict": RECEIPT_VERDICT_PASS if covered else RECEIPT_VERDICT_UNVERIFIED,
+        "source": KERNEL_COMMIT_PROVENANCE_SOURCE if covered else COMMIT_LIST_SOURCE,
+        "creation_time_provenance_ledger": (
+            "present" if covered else "partial" if recorded else "absent"
+        ),
+        "uncovered_commits": uncovered,
         "reasons": reasons,
         "advance_count": len(advances),
         "head_recorded": bool(head),
+    }
+
+
+def _commit_list_completeness_summary(references: list) -> dict:
+    """Section-level completeness: the conjunction of the per-reference
+    verdicts, each earned from creation-time rows — never asserted here."""
+    per_reference = [
+        {"task": ref.get("task"), "reference": ref.get("reference"),
+         "completeness": commit_list_completeness(ref)}
+        for ref in references
+    ]
+    states = {
+        entry["completeness"]["creation_time_provenance_ledger"]
+        for entry in per_reference
+    }
+    covered = bool(per_reference) and states == {"present"}
+    return {
+        "verdict": RECEIPT_VERDICT_PASS if covered else RECEIPT_VERDICT_UNVERIFIED,
+        "creation_time_provenance_ledger": (
+            "present" if covered else "absent" if states <= {"absent"} else "partial"
+        ),
+        "reason": (
+            COMMIT_LIST_COMPLETENESS_COVERED if covered
+            else COMMIT_LIST_COMPLETENESS_UNVERIFIED
+        ),
+        "per_reference": per_reference,
     }
 
 
@@ -8233,14 +8968,15 @@ def _task_advance_ledger(
 
 
 def _board_created_commits(
-    *, base_commit: Any, head_commit: Any, advances: list
+    *, base_commit: Any, head_commit: Any, advances: list, ledger: Any = (),
 ) -> "tuple[list, list, list]":
     """Apply :data:`BOARD_CREATED_COMMIT_RULE`. The only implementation.
 
     Returns ``(created, absorbed, provenance)``: the exact ordered list of
     commit identities this board created, the heads absorbed from another
     subject's work (disclosed, never claimed), and one provenance entry per
-    created commit naming the durable receipt it came from.
+    created commit naming the durable record it came from: the creation-
+    time ledger row where one exists, the recorded receipt otherwise.
     """
     base = str(base_commit).strip() if base_commit else None
     absorbed: list = []
@@ -8280,6 +9016,17 @@ def _board_created_commits(
             **detail,
         })
 
+    # Creation-time rows first: a commit the kernel recorded as it made it
+    # is provenanced by that row, carrying the identity that produced it,
+    # not by a receipt written afterwards.
+    for row in ledger or ():
+        _consider(row.get("subject_id"), KERNEL_COMMIT_PROVENANCE_SOURCE, {
+            "rule": "recorded-by-the-kernel-when-it-created-the-commit",
+            "run": row.get("run_id"), "reference": row.get("reference"),
+            "recorded_at": row.get("created_at"), "task": row.get("task_id"),
+            "board": row.get("board_name"), "project": row.get("project_id"),
+            "generation": row.get("generation"), "commit_kind": row.get("kind"),
+        })
     for advance in advances:
         _consider(
             advance.get("head_commit"), "advance-head-receipt",
@@ -8296,7 +9043,7 @@ def _board_created_commits(
     return created, absorbed, provenance
 
 
-def _board_work_scope(conn: sqlite3.Connection) -> dict:
+def _board_work_scope(conn: sqlite3.Connection, board: Any = None) -> dict:
     """This board's durable record of the work areas it created elsewhere.
 
     Read from the board's own task rows — the only durable place it
@@ -8353,10 +9100,13 @@ def _board_work_scope(conn: sqlite3.Connection) -> dict:
         base_commit = task.get("base_commit")
         head_commit = task.get("head_commit")
         advances, advance_source = _task_advance_ledger(conn, task_id)
+        # The creation-time rows for THIS task, read from outside the board.
+        kernel_rows = kernel_commit_records(board, task_id=task_id)
         created, absorbed, provenance = _board_created_commits(
             base_commit=base_commit, head_commit=head_commit, advances=advances,
+            ledger=kernel_rows,
         )
-        if reference or created or absorbed or base_commit or head_commit:
+        if reference or created or absorbed or base_commit or head_commit or kernel_rows:
             references.append({
                 "task": task_id,
                 "title": title,
@@ -8377,6 +9127,7 @@ def _board_work_scope(conn: sqlite3.Connection) -> dict:
                 "commit_provenance": provenance,
                 "commit_rule": BOARD_CREATED_COMMIT_RULE,
                 "advances_read_from": advance_source,
+                "kernel_commit_records": kernel_rows,
             })
         work_area = task.get("workspace_path")
         if task.get("workspace_kind") != "worktree":
@@ -8430,7 +9181,7 @@ def _carried_outside_resource_ledger(slug: str, conn: sqlite3.Connection) -> lis
     each of them. Recorded before anything is destroyed, so authority is
     never destroyed before the resource it governs is released.
     """
-    work = _board_work_scope(conn)
+    work = _board_work_scope(conn, slug)
     ledger = []
     for scope in CARRIED_LEDGER_SCOPE:
         entry = {
@@ -10188,6 +10939,10 @@ APPLY_JOURNAL_WORK_AREA_DESTROYED = "work-area-destroyed"
 APPLY_JOURNAL_DEREGISTERED = "registration-deregistered"
 APPLY_JOURNAL_RETENTION_RECORDED = "retention-recorded"
 APPLY_JOURNAL_RETAINED_COPY = "retained-copy-completed"
+#: §7.3's last step: the retained copy's OWN metadata records it archived by
+#: this removal, and the board is findable in the archived listing.
+APPLY_JOURNAL_RETAINED_ARCHIVED = "retained-copy-archived"
+APPLY_JOURNAL_RETAINED_DISCARDED = "retained-copy-discarded"
 APPLY_JOURNAL_FAILURE = "blocked"
 
 # The journal actions a SUCCESSFUL apply step is recorded under. Completion
@@ -10336,6 +11091,83 @@ def _deregister_work_area(registration: dict) -> "tuple[bool, str, dict]":
         return False, f"cannot deregister {reg_path}: {exc}", detail
 
     return True, "registration deregistered by exact recorded identity", detail
+
+
+def _apply_carried_work_areas(
+    c13_entry: dict, *, destroyed, blocked, journal, deregistered: list
+) -> None:
+    """Every carried C13 work area: ownership first, content then registration.
+
+    Shared VERBATIM by §7.2 and §7.3 — a work area an archived board owns
+    is no less live than one a hard-removed board owns, so both modes run
+    this rather than two implementations that can drift. Ownership is
+    verified against the container's OWN registration metadata before
+    anything is touched, the CONTENT goes FIRST and the registration LAST
+    (a crash between them must not orphan content whose owner is no longer
+    identifiable), and each item is journalled as it happens through the
+    caller's own recorders. Ownership that is not positively established,
+    and an ``unresolved`` registration, block with everything left intact.
+    """
+    for registration in c13_entry.get("registrations") or []:
+        work_area = registration.get("work_area")
+        ownership = verify_work_area_ownership(registration)
+        if ownership.owned is not True:
+            blocked(
+                "work-area", "C13", work_area,
+                APPLY_JOURNAL_WORK_AREA_DESTROYED,
+                f"work-area ownership is not established, so nothing was "
+                f"touched: {ownership.reason}", ownership.evidence,
+                ownership=(
+                    "indeterminate" if ownership.owned is None else "denied"
+                ),
+            )
+            continue
+        ok, reason, detail = _destroy_work_area_content(registration, ownership)
+        if not ok:
+            blocked(
+                "work-area", "C13", work_area,
+                APPLY_JOURNAL_WORK_AREA_DESTROYED, reason, detail,
+            )
+            continue
+        # Journals the destruction and RAISES if it does not commit: the
+        # blocking check that has to sit between the content going and the
+        # only durable thing that identifies its owner going.
+        destroyed(
+            "work-area", "C13", work_area,
+            APPLY_JOURNAL_WORK_AREA_DESTROYED, reason, detail,
+        )
+        ok, reason, detail = _deregister_work_area(registration)
+        if not ok:
+            blocked(
+                "work-area-registration", "C13",
+                registration.get("registration"),
+                APPLY_JOURNAL_DEREGISTERED, reason, detail,
+            )
+            continue
+        deregistered.append({
+            "member": "work-area-registration",
+            "category": "C13",
+            "identity": registration.get("registration"),
+            "deregistered": True,
+            "reason": reason,
+            "detail": detail,
+            "reference_kept": registration.get("reference"),
+            "work_area_destroyed": work_area,
+            "ownership": ownership.reason,
+        })
+        journal(
+            APPLY_JOURNAL_DEREGISTERED, registration.get("registration"),
+            True, reason, detail,
+        )
+
+    for unresolved in c13_entry.get("unresolved") or []:
+        if isinstance(unresolved, dict):
+            blocked(
+                "work-area", "C13", unresolved.get("work_area"),
+                APPLY_JOURNAL_WORK_AREA_DESTROYED,
+                f"unresolved C13 registration: {unresolved.get('reason')}",
+                dict(unresolved), ownership="unresolved",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -10835,32 +11667,25 @@ def _build_receipt_verification(
         evidence={"rule": BOARD_CREATED_COMMIT_RULE, "unnamed": unnamed},
     ))
 
-    # The commit list's SOURCE is a named fact on the receipt, and its
-    # COMPLETENESS is not something this build can verify: the creation-time
-    # commit provenance ledger that would establish it is deferred and
-    # absent. Marked UNVERIFIED here rather than claimed, dropped, or
-    # allowed to read as a pass.
+    # The commit list's SOURCE is a named fact on the receipt; its
+    # COMPLETENESS is earned per reference from creation-time ledger rows,
+    # so one reference with an uncovered commit holds this check at
+    # UNVERIFIED instead of letting it read as a pass.
+    summary = _commit_list_completeness_summary(references)
     checks.append(_receipt_check(
         "commit-list-completeness",
         "the commit list's source is named, and its completeness is only "
         "claimed where durable state can establish it",
-        verdict=RECEIPT_VERDICT_UNVERIFIED,
+        verdict=summary["verdict"],
         observed=(
             f"the commit list for {len(references)} reference(s) is derived "
-            f"from {COMMIT_LIST_SOURCE}; {COMMIT_LIST_COMPLETENESS_UNVERIFIED}"
+            f"from {COMMIT_LIST_SOURCE}; creation-time ledger coverage: "
+            f"{summary['creation_time_provenance_ledger']}"
         ),
         evidence={
             "commit_list_source": COMMIT_LIST_SOURCE,
             "commit_list_source_statement": COMMIT_LIST_SOURCE_STATEMENT,
-            "creation_time_provenance_ledger": "absent",
-            "per_reference": [
-                {
-                    "task": ref.get("task"),
-                    "reference": ref.get("reference"),
-                    "completeness": commit_list_completeness(ref),
-                }
-                for ref in references
-            ],
+            **summary,
         },
     ))
 
@@ -11120,11 +11945,7 @@ def _build_version_control_receipt(payload: dict) -> dict:
         "source": vc_entry.get("read_from", "outside_resource_ledger"),
         "commit_list_source": COMMIT_LIST_SOURCE,
         "commit_list_source_statement": COMMIT_LIST_SOURCE_STATEMENT,
-        "commit_list_completeness": {
-            "verdict": RECEIPT_VERDICT_UNVERIFIED,
-            "creation_time_provenance_ledger": "absent",
-            "reason": COMMIT_LIST_COMPLETENESS_UNVERIFIED,
-        },
+        "commit_list_completeness": _commit_list_completeness_summary(references),
     }
 
 
@@ -11142,6 +11963,7 @@ def _build_reference_receipt(ref: dict) -> dict:
     base = ref.get("base_commit")
     absorbed = ref.get("absorbed_heads") or []
     advances = ref.get("advances") or []
+    completeness = commit_list_completeness(ref)
     return {
         "repository": ref.get("container") or RECEIPT_VERDICT_UNVERIFIED,
         "reference": ref.get("reference") or RECEIPT_VERDICT_UNVERIFIED,
@@ -11171,7 +11993,7 @@ def _build_reference_receipt(ref: dict) -> dict:
             or "this board's durable task rows' recorded git receipts"
         ),
         # WHERE this list came from, as a named field, so a reader never
-        # has to assume it came from a creation-time provenance ledger.
+        # has to assume which of the two durable sources covered it.
         "commit_list_source": {
             "source": COMMIT_LIST_SOURCE,
             "statement": COMMIT_LIST_SOURCE_STATEMENT,
@@ -11179,11 +12001,13 @@ def _build_reference_receipt(ref: dict) -> dict:
                 ref.get("advances_read_from")
                 or "this board's durable task rows' recorded git receipts"
             ),
-            "creation_time_provenance_ledger": "absent",
+            "creation_time_provenance_ledger": completeness[
+                "creation_time_provenance_ledger"],
+            "creation_time_records": ref.get("kernel_commit_records") or [],
         },
-        # …and how complete that makes it. Never a verified claim while the
-        # ledger is absent, and never silence.
-        "commit_list_completeness": commit_list_completeness(ref),
+        # …and how complete that makes it. Claimed only where every commit
+        # carries a creation-time row, and never silence.
+        "commit_list_completeness": completeness,
     }
 
 
@@ -11439,79 +12263,13 @@ def apply_permanent_mode_content(
                 APPLY_JOURNAL_RESOURCE_DESTROYED, reason, detail,
             )
 
-        # Step 4: each C13 work area is an OWNED MEMBER — verify ownership,
-        # destroy the CONTENT first, and deregister LAST, journalling each
-        # item as it happens so a crash can never orphan content.
-        for registration in c13_entry.get("registrations") or []:
-            ownership = verify_work_area_ownership(registration)
-            if ownership.owned is not True:
-                _blocked(
-                    "work-area", "C13", registration.get("work_area"),
-                    APPLY_JOURNAL_WORK_AREA_DESTROYED,
-                    f"work-area ownership is not established, so nothing was "
-                    f"touched: {ownership.reason}",
-                    ownership.evidence,
-                    ownership=(
-                        "indeterminate" if ownership.owned is None else "denied"
-                    ),
-                )
-                continue
-            ok, reason, detail = _destroy_work_area_content(registration, ownership)
-            if not ok:
-                _blocked(
-                    "work-area", "C13", registration.get("work_area"),
-                    APPLY_JOURNAL_WORK_AREA_DESTROYED, reason, detail,
-                )
-                continue
-            # This journals the destruction and RAISES if it does not
-            # commit — which is the blocking check that has to sit between
-            # the destruction and the deregistration, because the
-            # registration is the only durable thing that identifies the
-            # content's owner and it is deliberately the last to go.
-            _destroyed(
-                "work-area", "C13", registration.get("work_area"),
-                APPLY_JOURNAL_WORK_AREA_DESTROYED, reason, detail,
-            )
-            # Only now, with the content gone and that fact durably
-            # journalled, does the metadata that identified its owner go.
-            ok, reason, detail = _deregister_work_area(registration)
-            if not ok:
-                _blocked(
-                    "work-area-registration", "C13",
-                    registration.get("registration"),
-                    APPLY_JOURNAL_DEREGISTERED, reason, detail,
-                )
-                continue
-            deregistered.append({
-                "member": "work-area-registration",
-                "category": "C13",
-                "identity": registration.get("registration"),
-                "deregistered": True,
-                "reason": reason,
-                "detail": detail,
-                "reference_kept": registration.get("reference"),
-                "work_area_destroyed": registration.get("work_area"),
-                "ownership": ownership.reason,
-            })
-            _journal(
-                APPLY_JOURNAL_DEREGISTERED, registration.get("registration"),
-                True, reason, detail,
-            )
-
-        # Step 4b (IN-3): a work area this board recorded creating whose shared
-        # container durable state cannot establish has no exact identity to act
-        # on. It is a recorded BLOCKING failure — reaching Done over it would
-        # claim content was destroyed that was never even located.
-        for unresolved in c13_entry.get("unresolved") or []:
-            if not isinstance(unresolved, dict):
-                continue
-            _blocked(
-                "work-area", "C13", unresolved.get("work_area"),
-                APPLY_JOURNAL_WORK_AREA_DESTROYED,
-                f"unresolved C13 registration: {unresolved.get('reason')}",
-                dict(unresolved),
-                ownership="unresolved",
-            )
+        # Steps 4 and 4b: each C13 work area is an OWNED MEMBER — ownership
+        # verified first, CONTENT destroyed first, registration LAST, and an
+        # unresolved registration blocking. §7.3 runs this same function.
+        _apply_carried_work_areas(
+            c13_entry, destroyed=_destroyed, blocked=_blocked,
+            journal=_journal, deregistered=deregistered,
+        )
 
         # Step 5: Write retention records for OUT resources (C6, C7)
         for resource in ledger:
@@ -11695,6 +12453,195 @@ def reversible_retained_path(slug: str, removal_id: str) -> Path:
     return kanban_home() / "retained" / f"{slug}-{removal_id}"
 
 
+#: The key §7.3 records its archived marker under, in the RETAINED copy's
+#: own ``board.json`` — the only metadata that speaks for that directory.
+RETAINED_ARCHIVED_MARKER_KEY = "removal_archived"
+
+
+def _retained_board_metadata(retained: Path) -> dict:
+    """A retained copy's OWN ``board.json``, or ``{}`` when unreadable."""
+    try:
+        raw = json.loads((retained / "board.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def mark_retained_copy_archived(
+    retained: "str | Path", *, slug: str, removal_id: str
+) -> dict:
+    """Record ARCHIVED, and which removal did it, in the copy's own metadata.
+
+    Written through ``board.json``'s usual atomic writer, and idempotent:
+    the derived path means a re-drive rewrites the same marker.
+    """
+    retained = Path(retained)
+    meta = _retained_board_metadata(retained)
+    meta["slug"] = slug
+    meta["archived"] = True
+    meta[RETAINED_ARCHIVED_MARKER_KEY] = {
+        "removal_id": removal_id,
+        "mode": RemovalMode.REVERSIBLE.value,
+        "retained_path": str(retained),
+        "archived_at": int(time.time()),
+    }
+    _atomic_write_text(
+        retained / "board.json", json.dumps(meta, indent=2, ensure_ascii=False)
+    )
+    return meta
+
+
+def clear_restored_archived_marker(slug: str) -> dict:
+    """Clear §7.3's archived marker on a board restored from its copy.
+
+    ``archived: True`` and :data:`RETAINED_ARCHIVED_MARKER_KEY` live in the
+    RETAINED copy's own ``board.json`` and install verbatim with it, so a
+    restored board reads as archived and every owner projection keeps
+    hiding it. §9.4 restores a board PAUSED, not archived.
+    """
+    path = board_metadata_path(slug)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    raw.pop(RETAINED_ARCHIVED_MARKER_KEY, None)
+    raw["archived"] = False
+    raw["dispatch_paused_by_owner"] = True
+    _atomic_write_text(
+        path, json.dumps(raw, indent=2, ensure_ascii=False) + "\n"
+    )
+    return raw
+
+
+def list_archived_boards() -> list:
+    """Enumerate the boards a reversible removal RETAINED (§7.3).
+
+    A retained copy lives outside ``boards/`` so nothing mistakes it for a
+    live board, which is exactly why this explicit listing has to exist:
+    without it an archived board is findable only through the removal
+    record, a different store in a different loss domain. Read from the
+    retained root and each copy's OWN metadata, so what is listed is what
+    is on disk. A copy that is missing or unmarked is still listed, with
+    ``archived`` false — an incomplete archive is a fact a reader needs.
+    """
+    root = kanban_home() / "retained"
+    entries: list = []
+    try:
+        children = sorted(root.iterdir()) if root.is_dir() else []
+    except OSError:
+        return entries
+    for child in children:
+        if not child.is_dir():
+            continue
+        meta = _retained_board_metadata(child)
+        marker = meta.get(RETAINED_ARCHIVED_MARKER_KEY)
+        marker = marker if isinstance(marker, dict) else {}
+        entries.append({
+            "slug": meta.get("slug") or child.name,
+            "removal_id": marker.get("removal_id"),
+            "retained_path": str(child),
+            "store": str(_retained_store_path(child)),
+            "archived": bool(meta.get("archived") and marker.get("removal_id")),
+            "archived_marker": marker,
+        })
+    return entries
+
+
+def archived_board_listing_entry(slug: str, removal_id: str) -> Optional[dict]:
+    """This removal's entry in the archived listing, or ``None`` (§7.3)."""
+    for entry in list_archived_boards():
+        if entry["archived"] and (entry["slug"], entry["removal_id"]) == (
+            slug, removal_id
+        ):
+            return entry
+    return None
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _complete_retained_copy(live: Path, retained: Path) -> None:
+    """Copy every live file into the ONE derived retained path."""
+    retained.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(live, retained, dirs_exist_ok=True)
+
+
+def _retained_copy_step(
+    live: Path, retained: Path, *, journalled: bool
+) -> "tuple[bool, str, dict]":
+    """Complete the ONE derived retained copy and VERIFY it — or refuse.
+
+    ``dirs_exist_ok`` is the point of the copy: the retained path derives
+    from the removal id in the durable record, so a restart addresses the
+    SAME copy and completes it instead of making a second, and every file
+    is rewritten from the live original so a half-written one cannot
+    survive as "already copied".
+
+    Verification is a real comparison, not a presence check: every file of
+    the live tree — store, board files, ``board.json`` — must be in the
+    retained tree with the same size and content digest, and the retained
+    store must open and read. It is the ONLY thing that authorises the
+    live deletion, so a PARTIAL directory can never pass for an archive.
+    Once the live tree is gone nothing is left to compare against, so that
+    case is accepted only when the journal already records THIS copy
+    verified; a partial copy that can no longer be completed is refused.
+    """
+    detail = {"retained": str(retained), "source": str(live)}
+    compared = 0
+
+    def _no(reason: str):
+        return False, reason, detail
+
+    try:
+        if live.exists():
+            _complete_retained_copy(live, retained)
+        elif not journalled:
+            return _no(
+                f"{live} is gone and no durable journal entry records a "
+                f"verified retained copy at {retained}: what is there is a "
+                "PARTIAL copy that can no longer be completed against the "
+                "board it came from, and is never accepted as an archive"
+            )
+        if not retained.is_dir():
+            return _no(f"{retained} is not a retained copy")
+        for source in sorted(live.rglob("*")) if live.exists() else []:
+            if source.is_symlink() or not source.is_file():
+                continue
+            relative = source.relative_to(live)
+            target = retained / relative
+            if not target.is_file():
+                return _no(f"INCOMPLETE: {relative} is live and not in {retained}")
+            if target.stat().st_size != source.stat().st_size or (
+                _file_digest(target) != _file_digest(source)
+            ):
+                return _no(f"the retained {relative} is not the live file")
+            compared += 1
+        detail["files_compared"] = compared
+        if live.exists() and not compared:
+            return _no(f"{live} holds no readable file to verify a copy against")
+    except OSError as exc:
+        return _no(f"§7.3 could not complete the retained copy: {exc}")
+    store = _retained_store_path(retained)
+    try:
+        with contextlib.closing(_sqlite_connect_no_create(store)) as conn:
+            inventory = _pre_application_inventory(conn)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return _no(f"the retained store {store} cannot be opened and read: {exc}")
+    detail["retained_tasks"] = inventory["count"]
+    return True, (
+        f"the retained copy at {retained} is complete: {compared} live "
+        f"file(s) compared byte-for-byte, and its store opens with "
+        f"{inventory['count']} task identity/identities"
+    ), detail
+
+
 def apply_reversible_mode_content(
     board: str,
     *,
@@ -11704,11 +12651,20 @@ def apply_reversible_mode_content(
 
     The reversible peer of :func:`apply_permanent_mode_content`, and the
     reason the common driver has no mode-specific branch of its own to
-    get wrong. Journalled item by item, idempotent under re-drive (the
-    retained copy has one derived identity, so a restart completes the
-    same copy instead of making a second), and recorded through the same
-    seam — which verifies the retained copy is really readable and the
-    live store really gone before anything is marked applied.
+    get wrong. In order: complete the ONE derived retained copy and VERIFY
+    it against the live board (a PARTIAL directory is completed against
+    the recorded intent, or the removal is REFUSED — never accepted); only
+    then remove the live directory and store; process the carried C13
+    work-area ledger through :func:`_apply_carried_work_areas`, permanent
+    mode's own path; and record the archived marker in the RETAINED copy's
+    own ``board.json``, requiring the board to appear in the explicit
+    archived listing (:func:`list_archived_boards`).
+
+    Each step is journalled as it happens, idempotent by exact identity,
+    and a journal write that does not commit BLOCKS where it stands. Any
+    blocking failure means no success, which is what stops Done: the seam
+    (:func:`record_applied_mode_content`) is reached only when every step
+    is durably done.
     """
     slug = _normalize_board_slug(board)
     if not slug:
@@ -11737,63 +12693,151 @@ def apply_reversible_mode_content(
             "mode-specific content belongs to Applied", record=record,
         )
 
+    payload = record.carried()
+    if payload is None:
+        return ReversibleModeContentResult(
+            False,
+            "§7.3: nothing was carried, so there is no ledger to act on",
+            record=record,
+        )
+
     retained = reversible_retained_path(slug, removal_id)
     live = board_dir(slug)
+    c13 = next(
+        (e for e in payload.get("outside_resource_ledger") or []
+         if e.get("member") == "work-area-registration"), {},
+    )
+    destroyed: list = []
+    deregistered: list = []
     failures: list = []
+    archived: Optional[dict] = None
+    # Idempotence, read from the DURABLE journal: a re-drive appends no
+    # second entry for a step already recorded done.
+    journalled: dict = {
+        action: set(journalled_apply_identities(record, action=action))
+        for action in (*APPLY_JOURNAL_SUCCESS_ACTIONS,
+                       APPLY_JOURNAL_RETAINED_COPY,
+                       APPLY_JOURNAL_RETAINED_ARCHIVED)
+    }
+    refused: set = {
+        (item.get("step"), item.get("identity"), item.get("reason"))
+        for item in record.journal()["items"] if not item.get("ok")
+    }
+
+    def _journal(action, identity, ok, reason, extra) -> None:
+        """One durable journal item, or BLOCK the whole sequence."""
+        key = None if identity is None else str(identity)
+        if (key in journalled.get(action, frozenset()) if ok
+                else (action, key, reason) in refused):
+            return
+        if not journal_apply_item(
+            slug, removal_id=removal_id, phase=RemovalPhase.APPLIED,
+            item={"action": action if ok else APPLY_JOURNAL_FAILURE,
+                  "step": action, "identity": key, "ok": bool(ok),
+                  "reason": reason, "detail": extra},
+        ):
+            raise ApplyJournalUnwritable(action, key, reason)
+        (journalled.setdefault(action, set()).add(key) if ok
+         else refused.add((action, key, reason)))
+
+    def _destroyed(member, category, identity, action, reason, detail) -> None:
+        destroyed.append({"member": member, "category": category,
+                          "identity": identity, "destroyed": True,
+                          "reason": reason, "detail": detail})
+        _journal(action, identity, True, reason, detail)
+
+    def _blocked(member, category, identity, action, reason, detail, **extra) -> None:
+        failures.append({"member": member, "category": category,
+                         "identity": identity, "destroyed": False,
+                         "reason": reason, "detail": detail, **extra})
+        _journal(action, identity, False, reason, detail)
+
     try:
-        retained.parent.mkdir(parents=True, exist_ok=True)
-        if live.exists() and not retained.exists():
-            shutil.copytree(live, retained)
-        journal_apply_item(
-            slug, removal_id=removal_id, phase=RemovalPhase.APPLIED,
-            item={
-                "action": APPLY_JOURNAL_RETAINED_COPY,
-                "step": APPLY_JOURNAL_RETAINED_COPY,
-                "identity": str(retained),
-                "ok": True,
-                "reason": "the retained copy is complete outside the board",
-                "detail": {"source": str(live)},
-            },
+        # Step 1: the ONE derived copy, completed and VERIFIED. Nothing
+        # live is touched unless this passes.
+        ok, reason, detail = _retained_copy_step(
+            live, retained,
+            journalled=str(retained) in journalled[APPLY_JOURNAL_RETAINED_COPY],
         )
-        if live.exists():
-            shutil.rmtree(live)
-        db_path = kanban_db_path(board=slug)
-        if db_path.exists():
-            # The default board's store lives outside board_dir.
-            db_path.unlink()
-        journal_apply_item(
-            slug, removal_id=removal_id, phase=RemovalPhase.APPLIED,
-            item={
-                "action": APPLY_JOURNAL_STORAGE_DESTROYED,
-                "step": APPLY_JOURNAL_STORAGE_DESTROYED,
-                "identity": str(live),
-                "ok": True,
-                "reason": "the live copy was removed after the retained copy "
-                          "was complete",
-                "detail": {"retained": str(retained)},
-            },
-        )
-    except OSError as exc:
+        if not ok:
+            _blocked("retained-copy", "C1", str(retained),
+                     APPLY_JOURNAL_RETAINED_COPY, reason, detail)
+        else:
+            _journal(APPLY_JOURNAL_RETAINED_COPY, retained, True, reason, detail)
+            # Step 2: only now may the live board and its store go.
+            try:
+                if live.exists():
+                    shutil.rmtree(live)
+                db_path = kanban_db_path(board=slug)
+                if db_path.exists():
+                    db_path.unlink()  # the default store lives outside board_dir
+            except OSError as exc:
+                ok, reason = False, f"§7.3 could not remove the live copy: {exc}"
+            else:
+                reason = ("the live copy was removed after the retained copy "
+                          "verified complete")
+            (_destroyed if ok else _blocked)(
+                "board-storage", "C1", str(live),
+                APPLY_JOURNAL_STORAGE_DESTROYED, reason, {"retained": str(retained)},
+            )
+        if ok:
+            # Step 3: the carried C13 ledger, through permanent mode's own
+            # path — an archived board's work areas are as live as a
+            # hard-removed board's.
+            _apply_carried_work_areas(
+                c13, destroyed=_destroyed, blocked=_blocked,
+                journal=_journal, deregistered=deregistered,
+            )
+            # Step 4: the archived marker in the retained copy's OWN
+            # metadata, and the board's presence in the explicit archived
+            # listing. Both are durable before success is reported, and
+            # that success is what lets Done record a terminal fact.
+            try:
+                archived = mark_retained_copy_archived(
+                    retained, slug=slug, removal_id=removal_id)
+                listed = archived_board_listing_entry(slug, removal_id)
+            except OSError as exc:
+                listed, reason = None, (
+                    f"§7.3 could not record the archived marker in the "
+                    f"retained copy's own metadata: {exc}")
+            if listed is None:
+                _blocked("archived-listing", "C1", str(retained),
+                         APPLY_JOURNAL_RETAINED_ARCHIVED,
+                         reason if archived is None else
+                         "the retained copy does not appear in the archived "
+                         "board listing, so nothing an operator can read says "
+                         "this board survives anywhere", {"marker": archived})
+            else:
+                # §9.4 needs the retained set's sizes and digests to be
+                # RECORDED, or a later restore has nothing to validate
+                # the set against. Captured here, after the archived
+                # marker, so it describes the copy as finally left.
+                manifest, manifest_reason = retained_set_manifest(retained)
+                _journal(APPLY_JOURNAL_RETAINED_ARCHIVED, retained, True,
+                         "the retained copy's own metadata records it archived "
+                         "by this removal, and the board appears in the "
+                         "archived listing",
+                         {**listed, "manifest": manifest,
+                          "manifest_unreadable":
+                              None if manifest else manifest_reason})
+    except ApplyJournalUnwritable as unwritable:
+        # A journal write that did not commit stops the sequence HERE.
         failures.append({
-            "member": "board-storage",
-            "category": "C1",
-            "identity": str(live),
-            "reason": f"§7.3 could not complete the retained copy: {exc}",
+            "member": "apply-journal", "category": "C1",
+            "identity": unwritable.identity, "destroyed": False,
+            "reason": str(unwritable),
+            "detail": {"action": unwritable.action,
+                       "step_reason": unwritable.step_reason},
         })
-        journal_apply_item(
-            slug, removal_id=removal_id, phase=RemovalPhase.APPLIED,
-            item={
-                "action": APPLY_JOURNAL_FAILURE,
-                "step": APPLY_JOURNAL_RETAINED_COPY,
-                "identity": str(retained),
-                "ok": False,
-                "reason": str(exc),
-                "detail": {"source": str(live)},
-            },
-        )
+
+    if failures:
         return ReversibleModeContentResult(
-            False, failures[0]["reason"], retained_path=str(retained),
-            failures=failures, record=get_removal_phase_record(slug) or record,
+            False,
+            f"§7.3: {len(failures)} step(s) could not be completed — this "
+            "BLOCKS Done; what was already done is durable in the journal "
+            "and a re-drive resumes from it",
+            retained_path=str(retained), failures=failures,
+            record=get_removal_phase_record(slug) or record,
         )
 
     apply_result = record_applied_mode_content(
@@ -11814,8 +12858,922 @@ def apply_reversible_mode_content(
             retained_path=str(retained), record=apply_result.record,
         )
     return ReversibleModeContentResult(
-        True, f"§7.3 reversible mode content applied: retained at {retained}",
+        True,
+        f"§7.3 reversible mode content applied: verified retained copy at "
+        f"{retained}, archived in its own metadata, {len(destroyed)} "
+        f"destroyed, {len(deregistered)} deregistered",
         retained_path=str(retained), record=apply_result.record,
+    )
+
+
+# ---------------------------------------------------------------------------
+# §9.4 — Restore of a retained copy: validated, paused under a new epoch
+# ---------------------------------------------------------------------------
+#
+# Restore is §7.3 run backwards, and it deliberately adds NO state machine
+# of its own: the removal stays at Done and every step of the restore is
+# one item on that same removal's durable apply journal (§7.2/§7.3's
+# receipt seam). A restart therefore reads what has already happened from
+# exactly where a re-drive of the removal would, which is what makes
+# "complete or refuse the SAME restore, never start a second one" a
+# property of durable state rather than of a lock.
+
+#: The retained set's recorded sizes and digests, captured as §7.3 leaves
+#: the copy — after the archived marker is written, so the manifest
+#: describes the set as it was finally left — and journalled with it.
+RETAINED_MANIFEST_VERSION = 1
+
+RESTORE_JOURNAL_VALIDATED = "restore-set-validated"
+RESTORE_JOURNAL_INSTALLED = "restore-store-installed"
+RESTORE_JOURNAL_REATTACHED = "restore-reattachment-recorded"
+RESTORE_JOURNAL_COMPLETED = "restore-completed"
+RESTORE_JOURNAL_RESUMED = "restore-resumed"
+
+#: Every journal action a restore writes, in the order it writes them.
+RESTORE_JOURNAL_ACTIONS: "tuple[str, ...]" = (
+    RESTORE_JOURNAL_VALIDATED,
+    RESTORE_JOURNAL_INSTALLED,
+    RESTORE_JOURNAL_REATTACHED,
+    RESTORE_JOURNAL_COMPLETED,
+    RESTORE_JOURNAL_RESUMED,
+)
+
+# The owner-facing states the status read reports. There is no fifth:
+# silence is reported as no restore, never as a half-success.
+RESTORE_STATE_RESTORING = "restoring"
+RESTORE_STATE_RESTORED = "restored"
+RESTORE_STATE_RESUMED = "resumed"
+RESTORE_STATE_REFUSED = "refused"
+
+REMOVAL_REFUSAL_RESTORE = "refused-restore"
+
+
+@dataclass
+class RestoreResult:
+    """Result of :func:`restore_retained_board` / :func:`resume_restored_board`."""
+    success: bool
+    message: str
+    state: Optional[str] = None
+    epoch: Optional[int] = None
+    record: Optional[RemovalPhaseRecord] = None
+    entry: Optional[RegisterEntry] = None
+    already_done: bool = False
+    reattachment: Optional[dict] = None
+    detail: Optional[dict] = None
+
+
+def retained_set_manifest(retained: Path) -> "tuple[Optional[dict], str]":
+    """Every file of the retained set, with its size and content digest.
+
+    Returns ``(None, reason)`` when the set cannot be read: a manifest
+    that could not be derived is never recorded as an empty one, because a
+    restore validating against an empty manifest would validate nothing.
+    """
+    files: list = []
+    try:
+        if not retained.is_dir():
+            return None, f"{retained} is not a retained copy"
+        for source in sorted(retained.rglob("*")):
+            if source.is_symlink() or not source.is_file():
+                continue
+            files.append({
+                "path": str(source.relative_to(retained)),
+                "size": source.stat().st_size,
+                "sha256": _file_digest(source),
+            })
+    except OSError as exc:
+        return None, f"the retained set at {retained} cannot be read: {exc}"
+    if not files:
+        return None, f"{retained} holds no readable file to record"
+    return {
+        "version": RETAINED_MANIFEST_VERSION,
+        "retained": str(retained),
+        "files": files,
+        "count": len(files),
+    }, f"{len(files)} retained file(s) recorded with size and digest"
+
+
+def validate_retained_set(
+    retained: Path, manifest: Optional[dict]
+) -> "tuple[bool, str, dict]":
+    """Check the retained set FILE BY FILE against its recorded manifest.
+
+    The complete set — board database, files and metadata — is compared
+    against the sizes and digests recorded when §7.3 left the copy. A
+    missing file, a changed size, a changed digest, or a file the manifest
+    does not name all refuse, each with a plain reason. Nothing live is
+    touched here: this function only reads.
+    """
+    detail: dict = {"retained": str(retained)}
+    if not isinstance(manifest, dict) or not isinstance(
+        manifest.get("files"), list
+    ):
+        return False, (
+            "no recorded sizes and digests exist for this retained set, so "
+            "it cannot be validated: a set nothing can be checked against "
+            "is never restored"
+        ), detail
+    recorded = {
+        str(item.get("path")): item
+        for item in manifest["files"] if isinstance(item, dict)
+    }
+    detail["recorded"] = len(recorded)
+    try:
+        if not retained.is_dir():
+            return False, f"the retained copy {retained} is not there", detail
+        present = {
+            str(path.relative_to(retained))
+            for path in retained.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        checked = 0
+        for relative, item in sorted(recorded.items()):
+            target = retained / relative
+            if not target.is_file():
+                return False, (
+                    f"INCOMPLETE: {relative} is recorded in the retained set "
+                    f"and is not present at {retained}"
+                ), detail
+            size = target.stat().st_size
+            if size != item.get("size"):
+                return False, (
+                    f"TAMPERED: {relative} is {size} byte(s) where the "
+                    f"retained set records {item.get('size')}"
+                ), detail
+            if _file_digest(target) != item.get("sha256"):
+                return False, (
+                    f"TAMPERED: the content of {relative} is not what the "
+                    "retained set recorded for it"
+                ), detail
+            checked += 1
+        extra = sorted(present - set(recorded))
+        if extra:
+            return False, (
+                f"TAMPERED: {len(extra)} file(s) the retained set does not "
+                f"record are present in it (first: {extra[0]})"
+            ), detail
+    except OSError as exc:
+        return False, f"the retained set cannot be read: {exc}", detail
+    detail["files_validated"] = checked
+    return True, (
+        f"the retained set at {retained} is complete: {checked} file(s) "
+        "match the recorded sizes and digests, and nothing else is present"
+    ), detail
+
+
+def _restore_journal_item(
+    record: RemovalPhaseRecord, action: str
+) -> Optional[dict]:
+    """The first item durably recording *action* as done, or ``None``."""
+    for item in record.journal()["items"]:
+        if item.get("action") == action and item.get("ok"):
+            return item
+    return None
+
+
+def _restore_last_item(record: RemovalPhaseRecord) -> Optional[dict]:
+    """The last journal item belonging to a restore, successful or not."""
+    last = None
+    for item in record.journal()["items"]:
+        if item.get("step") in RESTORE_JOURNAL_ACTIONS or (
+            item.get("action") in RESTORE_JOURNAL_ACTIONS
+        ):
+            last = item
+    return last
+
+
+def restore_status(record: Optional[RemovalPhaseRecord]) -> Optional[dict]:
+    """What the owner is owed: restoring, restored, resumed, or refused.
+
+    Read from the SAME durable journal the restore writes, so the status
+    is the recorded facts and not a second account of them. ``None`` means
+    no restore was ever attempted — never a half-success.
+    """
+    if record is None:
+        return None
+    validated = _restore_journal_item(record, RESTORE_JOURNAL_VALIDATED)
+    completed = _restore_journal_item(record, RESTORE_JOURNAL_COMPLETED)
+    resumed = _restore_journal_item(record, RESTORE_JOURNAL_RESUMED)
+    last = _restore_last_item(record)
+    if resumed is not None:
+        state, reason = RESTORE_STATE_RESUMED, resumed.get("reason")
+    elif completed is not None:
+        state, reason = RESTORE_STATE_RESTORED, completed.get("reason")
+    elif last is not None and not last.get("ok"):
+        state, reason = RESTORE_STATE_REFUSED, last.get("reason")
+    elif last is not None:
+        state, reason = RESTORE_STATE_RESTORING, last.get("reason")
+    else:
+        return None
+    epoch = None
+    if validated is not None:
+        epoch = (validated.get("detail") or {}).get("epoch")
+    return {
+        "state": state,
+        "reason": reason,
+        "epoch": epoch,
+        "removal_id": record.removal_id,
+        "retained_path": str(
+            reversible_retained_path(record.board_name, record.removal_id)
+        ),
+        "paused": state in (RESTORE_STATE_RESTORING, RESTORE_STATE_RESTORED),
+    }
+
+
+def _restore_journal(
+    slug: str, record: RemovalPhaseRecord, action: str, *,
+    ok: bool, reason: str, detail: dict,
+) -> bool:
+    """Append ONE restore item to the removal's own durable journal.
+
+    The removal's phase is NOT moved: a restore is recorded against the
+    finished removal it reverses, through the seam that already exists.
+    """
+    last = _restore_last_item(record)
+    if (
+        last is not None and not ok and not last.get("ok")
+        and last.get("step") == action and last.get("reason") == reason
+    ):
+        return True  # the identical refusal is already durable
+    return journal_apply_item(
+        slug, removal_id=record.removal_id, phase=record.phase,
+        item={
+            "action": action if ok else APPLY_JOURNAL_FAILURE,
+            "step": action, "identity": str(detail.get("retained") or slug),
+            "ok": bool(ok), "reason": reason, "detail": detail,
+        },
+    )
+
+
+def _restore_install_store(retained: Path, live: Path) -> None:
+    """Put the validated retained set back where the live board belongs.
+
+    Every file is rewritten from the retained original, so a half-written
+    one from an interrupted restore cannot survive as "already installed";
+    the install is then re-validated against the same recorded manifest
+    before anything is journalled.
+    """
+    live.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(retained, live, dirs_exist_ok=True)
+
+
+def _restore_pause_store(slug: str, *, epoch: int) -> "tuple[bool, str, dict]":
+    """Freeze the restored store at the NEW epoch and void what came before.
+
+    One write transaction on the restored board's own store: the in-board
+    gate is committed FROZEN with the new epoch as its mirror, and every
+    reservation recorded before the removal is returned to the pool with
+    its claim cleared. After this, a handle, claim or lease minted before
+    the removal can satisfy no compare-and-set on this board — the claim
+    it names is gone, and the gate refuses every mutation until an
+    explicit resume opens it.
+    """
+    detail: dict = {"epoch": epoch, "voided": []}
+    try:
+        with _fence_protocol_scope():
+            conn = connect(board=slug)
+            try:
+                with write_txn(conn):
+                    _ensure_in_board_fence_schema(conn)
+                    if not commit_gate_state(conn, InBoardGate.FROZEN, epoch):
+                        return False, (
+                            "the restored store's in-board gate could not be "
+                            "frozen at the new epoch"
+                        ), detail
+                    held = [
+                        row["id"] for row in conn.execute(
+                            "SELECT id FROM tasks WHERE status = 'running' "
+                            "AND claim_lock IS NOT NULL"
+                        )
+                    ]
+                    conn.execute(
+                        "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL, "
+                        "current_run_id = NULL "
+                        "WHERE status = 'running' AND claim_lock IS NOT NULL"
+                    )
+                    for task_id in held:
+                        _append_event(
+                            conn, task_id, "restore_reservation_voided",
+                            {"epoch": epoch, "board": slug},
+                        )
+                    detail["voided"] = held
+            finally:
+                conn.close()
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
+        return False, (
+            f"the restored store could not be paused at the new epoch: {exc}"
+        ), detail
+    reading = _read_gate_instant(slug)
+    if not (
+        reading.status is DurableReadStatus.OK
+        and reading.gate is InBoardGate.FROZEN
+        and reading.epoch_mirror == epoch
+    ):
+        return False, (
+            f"the restored store does not read back frozen at epoch {epoch}: "
+            f"{reading.reason}"
+        ), detail
+    return True, (
+        f"the restored store is frozen at epoch {epoch} and "
+        f"{len(detail['voided'])} reservation(s) recorded before the removal "
+        "were voided"
+    ), detail
+
+
+def build_restore_reattachment(slug: str, *, epoch: int) -> dict:
+    """What the restored board may be reattached to — and what it may not.
+
+    STRICTLY READ-ONLY, and deliberately so: shared version-control state
+    is never rewound by a restore. No branch, commit or work-area
+    registration is created, moved, deleted or rewritten here. Each thing
+    the restored board records is attributed against the creation-time
+    provenance ledger (which lives outside every board, so the removal
+    could not destroy it) plus the shared container's own registration
+    metadata. Anything that cannot be attributed is reported
+    :data:`RECEIPT_VERDICT_UNVERIFIED` with its reason and is NOT acted
+    on.
+    """
+    report = {
+        "version": 1, "board": slug, "epoch": epoch,
+        "source": KERNEL_COMMIT_PROVENANCE_SOURCE,
+        "attributed": [], "unverified": [],
+        # A restore writes no shared version-control state at all. This
+        # stays empty by construction, and says so on the receipt.
+        "acted_on": [],
+        "shared_state_rule": (
+            "branches, commits and work-area registrations are left exactly "
+            "as they are; a restore reattaches by record only"
+        ),
+    }
+    db_path = kanban_db_path(board=slug)
+    if not db_path.exists():
+        report["unverified"].append({
+            "member": "board-store", "identity": str(db_path),
+            "verdict": RECEIPT_VERDICT_UNVERIFIED,
+            "reason": "the restored store is not readable, so nothing this "
+                      "board recorded can be attributed",
+        })
+        return report
+    try:
+        conn = _sqlite_connect_no_create(db_path)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        report["unverified"].append({
+            "member": "board-store", "identity": str(db_path),
+            "verdict": RECEIPT_VERDICT_UNVERIFIED,
+            "reason": f"the restored store cannot be opened: {exc}",
+        })
+        return report
+    try:
+        work = _board_work_scope(conn, slug)
+    except sqlite3.Error as exc:
+        report["unverified"].append({
+            "member": "board-store", "identity": str(db_path),
+            "verdict": RECEIPT_VERDICT_UNVERIFIED,
+            "reason": f"the restored store cannot be read: {exc}",
+        })
+        return report
+    finally:
+        conn.close()
+
+    for reference in work["references"]:
+        ledgered = {
+            str(row.get("subject_id"))
+            for row in reference.get("kernel_commit_records") or []
+            if row.get("subject_id")
+        }
+        for commit in reference.get("board_created_commits") or []:
+            item = {
+                "member": "version-control-reference",
+                "task": reference.get("task"),
+                "reference": reference.get("reference"),
+                "container": reference.get("container"),
+                "commit": commit,
+            }
+            if commit in ledgered:
+                report["attributed"].append({
+                    **item, "verdict": RECEIPT_VERDICT_PASS,
+                    "reason": "the creation-time provenance ledger records "
+                              "this board as its creator",
+                })
+            else:
+                report["unverified"].append({
+                    **item, "verdict": RECEIPT_VERDICT_UNVERIFIED,
+                    "reason": "the creation-time provenance ledger has no "
+                              "row naming this board as its creator, so it "
+                              "is not reattached and is left untouched",
+                })
+
+    for registration in work["registrations"]:
+        ownership = verify_work_area_ownership(registration)
+        item = {
+            "member": "work-area-registration",
+            "task": registration.get("task"),
+            "work_area": registration.get("work_area"),
+            "container": registration.get("container"),
+            "registration": registration.get("registration"),
+        }
+        if ownership.owned is True:
+            report["attributed"].append({
+                **item, "verdict": RECEIPT_VERDICT_PASS,
+                "reason": ownership.reason,
+            })
+        else:
+            report["unverified"].append({
+                **item, "verdict": RECEIPT_VERDICT_UNVERIFIED,
+                "reason": ownership.reason,
+            })
+    for unresolved in work["unresolved"]:
+        report["unverified"].append({
+            "member": "work-area-registration",
+            "task": unresolved.get("task"),
+            "work_area": unresolved.get("work_area"),
+            "verdict": RECEIPT_VERDICT_UNVERIFIED,
+            "reason": unresolved.get("reason"),
+        })
+    report["attributed_count"] = len(report["attributed"])
+    report["unverified_count"] = len(report["unverified"])
+    return report
+
+
+def _restore_register_entry(
+    slug: str, entry: RegisterEntry, *, epoch: int
+) -> "tuple[bool, str, Optional[RegisterEntry]]":
+    """Record the restored board LIVE at the new epoch. Idempotent."""
+    if entry.lifecycle is BoardLifecycle.LIVE and entry.epoch == epoch:
+        return True, "the register already records the restored epoch", entry
+    lineage = list(entry.epoch_lineage or [])
+    if not lineage or lineage[-1] != epoch:
+        lineage.append(epoch)
+    restored = RegisterEntry(
+        board_name=slug, lifecycle=BoardLifecycle.LIVE, epoch=epoch,
+        epoch_before=int(entry.epoch), gate_move=GateMove.SETTLED,
+        removal_mode=None,
+        scope_declaration_version=entry.scope_declaration_version,
+        epoch_lineage=lineage, created_at=entry.created_at,
+    )
+    try:
+        with board_register_lock(slug, reentrant=True):
+            with register_connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _write_register_entry(conn, restored)
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
+        return False, f"the register could not record the restore: {exc}", None
+    return True, f"the register records {slug!r} live at epoch {epoch}", restored
+
+
+def restore_retained_board(
+    board: str, *, removal_id: Optional[str] = None
+) -> RestoreResult:
+    """§9.4: restore a reversible removal's retained copy, PAUSED.
+
+    In order, and never out of it:
+
+    1. the complete retained set — board database, files and metadata — is
+       validated file by file against the sizes and digests recorded when
+       §7.3 left it. An incomplete or tampered set is REFUSED with a plain
+       reason and NOTHING LIVE IS TOUCHED;
+    2. only then is the set installed and re-validated in place, the store
+       frozen at a NEW epoch, every pre-removal reservation voided, and
+       the register moved live at that same new epoch. The board is
+       therefore restored PAUSED: usable only after
+       :func:`resume_restored_board`;
+    3. the restored board is reattached only to what the creation-time
+       provenance ledger records as its own; shared version-control state
+       is never rewound, and anything unattributable is reported
+       UNVERIFIED without being acted on;
+    4. every step is one item on the removal's OWN apply journal, so a
+       restart completes or refuses the SAME restore — the new epoch is
+       recorded before it is used — and never starts a second one.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RestoreResult(False, "invalid board name")
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return RestoreResult(
+            False, f"no removal is recorded for {slug!r}: there is no "
+            "retained copy to restore",
+        )
+    if removal_id is not None and removal_id != record.removal_id:
+        return RestoreResult(
+            False,
+            f"removal_id {removal_id!r} does not match the recorded removal "
+            f"{record.removal_id!r}", record=record,
+        )
+    if record.mode != RemovalMode.REVERSIBLE:
+        return RestoreResult(
+            False,
+            f"this removal is {record.mode.value}: only a reversible removal "
+            "retains a copy, and a permanent one can never be restored",
+            record=record,
+        )
+    if record.phase != RemovalPhase.DONE:
+        return RestoreResult(
+            False,
+            f"the removal is at {record.phase.value}, not done: a retained "
+            "copy exists to be restored only after the removal completed "
+            "(cancel the removal instead)",
+            record=record,
+        )
+    entry = get_register_entry(slug)
+    if entry is None:
+        return RestoreResult(
+            False, "register entry missing: the board's authority cannot be "
+            "read, so nothing may be restored", record=record,
+        )
+
+    completed = _restore_journal_item(record, RESTORE_JOURNAL_COMPLETED)
+    validated = _restore_journal_item(record, RESTORE_JOURNAL_VALIDATED)
+    if completed is not None:
+        status = restore_status(record)
+        return RestoreResult(
+            True, f"already restored (idempotent no-op): {completed['reason']}",
+            state=(status or {}).get("state"),
+            epoch=(completed.get("detail") or {}).get("epoch"),
+            record=record, entry=entry, already_done=True,
+        )
+
+    retained = reversible_retained_path(slug, record.removal_id)
+    live = board_dir(slug)
+
+    # A restore that has not begun may not overwrite anything live, and
+    # may only act on a board the removal really finished. Either refusal
+    # is still a restore that WAS attempted, so it is journalled as a
+    # failed restore item before it returns: the owner-facing status read
+    # derives its state from this journal alone, and silence there would
+    # report "no restore was ever attempted".
+    if validated is None:
+        if entry.lifecycle is not BoardLifecycle.ARCHIVED:
+            message = (
+                f"the register records {slug!r} as {entry.lifecycle.value}, "
+                "not archived: there is no retained copy of a board that was "
+                "not reversibly removed"
+            )
+            _restore_journal(
+                slug, record, RESTORE_JOURNAL_VALIDATED, ok=False,
+                reason=message,
+                detail={
+                    "retained": str(retained),
+                    "lifecycle": entry.lifecycle.value,
+                },
+            )
+            _record_phase_refusal(slug, record, REMOVAL_REFUSAL_RESTORE, message)
+            return RestoreResult(
+                False, message, state=RESTORE_STATE_REFUSED,
+                record=get_removal_phase_record(slug) or record, entry=entry,
+            )
+        if live.exists() or kanban_db_path(board=slug).exists():
+            message = (
+                f"{slug!r} already has live storage at {live}: a restore "
+                "never writes over a board that is present"
+            )
+            _restore_journal(
+                slug, record, RESTORE_JOURNAL_VALIDATED, ok=False,
+                reason=message,
+                detail={"retained": str(retained), "live": str(live)},
+            )
+            _record_phase_refusal(slug, record, REMOVAL_REFUSAL_RESTORE, message)
+            return RestoreResult(
+                False, message, state=RESTORE_STATE_REFUSED,
+                record=get_removal_phase_record(slug) or record, entry=entry,
+            )
+
+    # ── 1. Validate the complete retained set, before any live write ────
+    manifest, manifest_reason = _recorded_retained_manifest(record)
+    ok, reason, detail = validate_retained_set(retained, manifest)
+    if not ok:
+        message = f"restore refused: {reason}"
+        if manifest is None:
+            message = f"restore refused: {manifest_reason}"
+        _restore_journal(
+            slug, record, RESTORE_JOURNAL_VALIDATED, ok=False,
+            reason=message, detail={**detail, "retained": str(retained)},
+        )
+        _record_phase_refusal(slug, record, REMOVAL_REFUSAL_RESTORE, message)
+        return RestoreResult(
+            False, message, state=RESTORE_STATE_REFUSED,
+            record=get_removal_phase_record(slug) or record, entry=entry,
+            detail=detail,
+        )
+
+    # The new epoch is decided ONCE and recorded BEFORE it is used, so a
+    # restart finishes this restore rather than minting a second one.
+    if validated is not None:
+        epoch = int((validated.get("detail") or {}).get("epoch"))
+    else:
+        epoch = int(entry.epoch) + 1
+        if not _restore_journal(
+            slug, record, RESTORE_JOURNAL_VALIDATED, ok=True, reason=reason,
+            detail={
+                **detail, "retained": str(retained), "epoch": epoch,
+                "epoch_before": int(entry.epoch),
+            },
+        ):
+            return RestoreResult(
+                False,
+                "the validated retained set could not be recorded durably, "
+                "so the restore did not begin and nothing live was touched",
+                record=record, entry=entry,
+            )
+        record = get_removal_phase_record(slug) or record
+
+    # ── 2. Install the validated set, then re-validate it in place ──────
+    try:
+        _restore_install_store(retained, live)
+    except OSError as exc:
+        message = f"restore refused: the retained set could not be installed: {exc}"
+        _restore_journal(
+            slug, record, RESTORE_JOURNAL_INSTALLED, ok=False,
+            reason=message, detail={"retained": str(retained), "live": str(live)},
+        )
+        return RestoreResult(
+            False, message, state=RESTORE_STATE_REFUSED,
+            record=get_removal_phase_record(slug) or record, entry=entry,
+        )
+    installed_ok, installed_reason, installed_detail = validate_retained_set(
+        live, manifest
+    )
+    if not installed_ok:
+        message = (
+            f"restore refused: what was installed is not the retained set: "
+            f"{installed_reason}"
+        )
+        _restore_journal(
+            slug, record, RESTORE_JOURNAL_INSTALLED, ok=False,
+            reason=message, detail={"retained": str(retained), "live": str(live)},
+        )
+        return RestoreResult(
+            False, message, state=RESTORE_STATE_REFUSED,
+            record=get_removal_phase_record(slug) or record, entry=entry,
+        )
+    if not _restore_journal(
+        slug, record, RESTORE_JOURNAL_INSTALLED, ok=True,
+        reason=installed_reason,
+        detail={
+            **installed_detail, "retained": str(retained), "live": str(live),
+            "epoch": epoch,
+        },
+    ):
+        return RestoreResult(
+            False,
+            "the installed set could not be recorded durably: the restore "
+            "stops here and a re-drive resumes from the durable journal",
+            record=get_removal_phase_record(slug) or record, entry=entry,
+        )
+    record = get_removal_phase_record(slug) or record
+
+    # The installed set is what §7.3 archived, marker included; clearing it
+    # is part of restoring, and follows the in-place re-validation above so
+    # nothing is checked against a file this step rewrote.
+    clear_restored_archived_marker(slug)
+
+    paused_ok, paused_reason, paused_detail = _restore_pause_store(
+        slug, epoch=epoch
+    )
+    if not paused_ok:
+        message = f"restore refused: {paused_reason}"
+        _restore_journal(
+            slug, record, RESTORE_JOURNAL_COMPLETED, ok=False,
+            reason=message, detail=paused_detail,
+        )
+        return RestoreResult(
+            False, message, state=RESTORE_STATE_REFUSED,
+            record=get_removal_phase_record(slug) or record, entry=entry,
+        )
+
+    register_ok, register_reason, restored_entry = _restore_register_entry(
+        slug, entry, epoch=epoch
+    )
+    if not register_ok:
+        message = f"restore refused: {register_reason}"
+        _restore_journal(
+            slug, record, RESTORE_JOURNAL_COMPLETED, ok=False,
+            reason=message, detail={"epoch": epoch},
+        )
+        return RestoreResult(
+            False, message, state=RESTORE_STATE_REFUSED,
+            record=get_removal_phase_record(slug) or record, entry=entry,
+        )
+
+    # ── 3. Reattach by record only; never rewind shared git state ───────
+    reattachment = build_restore_reattachment(slug, epoch=epoch)
+    _restore_journal(
+        slug, record, RESTORE_JOURNAL_REATTACHED, ok=True,
+        reason=(
+            f"{reattachment['attributed_count']} item(s) attributed to this "
+            f"board by the creation-time provenance ledger and "
+            f"{reattachment['unverified_count']} reported UNVERIFIED without "
+            "being acted on; no shared version-control state was written"
+        ),
+        detail=reattachment,
+    )
+    record = get_removal_phase_record(slug) or record
+
+    # ── 4. The restore is complete, and the board is PAUSED ─────────────
+    if not _restore_journal(
+        slug, record, RESTORE_JOURNAL_COMPLETED, ok=True,
+        reason=(
+            f"{slug!r} is restored from its retained copy and PAUSED at "
+            f"epoch {epoch}: {paused_reason}; it becomes usable only on an "
+            "explicit resume"
+        ),
+        detail={"epoch": epoch, "retained": str(retained), **paused_detail},
+    ):
+        return RestoreResult(
+            False,
+            "the completed restore could not be recorded durably, so it is "
+            "NOT reported complete; a re-drive finishes the same restore",
+            record=get_removal_phase_record(slug) or record,
+            entry=restored_entry,
+        )
+    record = get_removal_phase_record(slug) or record
+    return RestoreResult(
+        True,
+        f"board {slug!r} restored from its retained copy and paused at epoch "
+        f"{epoch}: resume it explicitly to make it usable",
+        state=RESTORE_STATE_RESTORED, epoch=epoch, record=record,
+        entry=restored_entry, reattachment=reattachment,
+    )
+
+
+def _recorded_retained_manifest(
+    record: RemovalPhaseRecord,
+) -> "tuple[Optional[dict], str]":
+    """The sizes and digests §7.3 recorded for this removal's retained set."""
+    item = _restore_journal_item(record, APPLY_JOURNAL_RETAINED_ARCHIVED)
+    if item is None:
+        return None, (
+            "this removal's journal records no archived retained copy, so "
+            "there is no recorded set to validate one against"
+        )
+    detail = item.get("detail")
+    manifest = detail.get("manifest") if isinstance(detail, dict) else None
+    if not isinstance(manifest, dict):
+        reason = (
+            (detail or {}).get("manifest_unreadable")
+            if isinstance(detail, dict) else None
+        )
+        return None, (
+            reason or
+            "this removal recorded no sizes and digests for its retained "
+            "set, so the set cannot be validated and is not restored"
+        )
+    return manifest, "the retained set's recorded sizes and digests"
+
+
+def resume_restored_board(board: str) -> RestoreResult:
+    """§9.4: the explicit resume that makes a restored board usable.
+
+    Accepted only for a board this build durably recorded as restored, and
+    only at the epoch the restore recorded: the gate is opened at that
+    exact epoch, so nothing minted before the removal can act on the board
+    even after the resume. Idempotent.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RestoreResult(False, "invalid board name")
+    record = get_removal_phase_record(slug)
+    if record is None:
+        return RestoreResult(
+            False, f"no removal is recorded for {slug!r}: nothing to resume",
+        )
+    completed = _restore_journal_item(record, RESTORE_JOURNAL_COMPLETED)
+    if completed is None:
+        return RestoreResult(
+            False,
+            f"{slug!r} is not recorded as restored, so there is no paused "
+            "restore to resume",
+            state=(restore_status(record) or {}).get("state"), record=record,
+        )
+    epoch = int((completed.get("detail") or {}).get("epoch"))
+    entry = get_register_entry(slug)
+    if entry is None or entry.lifecycle is not BoardLifecycle.LIVE or (
+        entry.epoch != epoch
+    ):
+        return RestoreResult(
+            False,
+            "the register no longer records this board live at the epoch the "
+            f"restore recorded ({epoch}): refusing to resume it",
+            state=RESTORE_STATE_REFUSED, epoch=epoch, record=record, entry=entry,
+        )
+    resumed = _restore_journal_item(record, RESTORE_JOURNAL_RESUMED)
+    reading = _read_gate_instant(slug)
+    already_open = (
+        reading.status is DurableReadStatus.OK
+        and reading.gate is InBoardGate.OPEN
+        and reading.epoch_mirror == epoch
+    )
+    if resumed is not None and already_open:
+        return RestoreResult(
+            True, "already resumed (idempotent no-op)",
+            state=RESTORE_STATE_RESUMED, epoch=epoch, record=record,
+            entry=entry, already_done=True,
+        )
+    committed = False
+    try:
+        with _fence_protocol_scope():
+            conn = connect(board=slug)
+            try:
+                with write_txn(conn):
+                    committed = commit_gate_state(conn, InBoardGate.OPEN, epoch)
+            finally:
+                conn.close()
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
+        committed = False
+        _log.warning(
+            "kanban restore: resume of %s raised %s: %s",
+            slug, type(exc).__name__, exc,
+        )
+    reading = _read_gate_instant(slug)
+    if not (
+        committed
+        and reading.status is DurableReadStatus.OK
+        and reading.gate is InBoardGate.OPEN
+        and reading.epoch_mirror == epoch
+    ):
+        message = (
+            f"board {slug!r} is not yet usable: the in-board gate could not "
+            f"be opened at epoch {epoch}"
+        )
+        _restore_journal(
+            slug, record, RESTORE_JOURNAL_RESUMED, ok=False,
+            reason=message, detail={"epoch": epoch},
+        )
+        return RestoreResult(
+            False, message, state=RESTORE_STATE_REFUSED, epoch=epoch,
+            record=get_removal_phase_record(slug) or record, entry=entry,
+        )
+    _restore_journal(
+        slug, record, RESTORE_JOURNAL_RESUMED, ok=True,
+        reason=f"board {slug!r} resumed and usable at epoch {epoch}",
+        detail={"epoch": epoch},
+    )
+    return RestoreResult(
+        True, f"board {slug!r} resumed: it is live and usable at epoch {epoch}",
+        state=RESTORE_STATE_RESUMED, epoch=epoch,
+        record=get_removal_phase_record(slug) or record, entry=entry,
+    )
+
+
+def continue_archived_removal_as_permanent(board: str) -> RestoreResult:
+    """Bring an ARCHIVED board back live so a permanent removal can run.
+
+    §6.1 tells an operator whose permanent request lost to a reversible one
+    to re-issue it once the reversible removal completes — but every phase
+    after Intent reads the board's OWN store, which a completed reversible
+    removal left only in the retained copy. So the permanent path continues
+    from archived the only way it can: the copy is reinstalled through the
+    shipped validated restore, its gate is opened at the restored epoch,
+    and the copy is discarded, leaving exactly ONE of the board to destroy.
+    A board that is not archived this way is left untouched.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug:
+        return RestoreResult(False, "invalid board name")
+    record = get_removal_phase_record(slug)
+    entry = get_register_entry(slug)
+    if (
+        record is None
+        or entry is None
+        or record.mode != RemovalMode.REVERSIBLE
+        or record.phase != RemovalPhase.DONE
+        or entry.lifecycle is not BoardLifecycle.ARCHIVED
+    ):
+        return RestoreResult(
+            True,
+            f"{slug!r} is not archived under a completed reversible removal: "
+            "there is nothing to continue from",
+            record=record, entry=entry, already_done=True,
+        )
+    retained = reversible_retained_path(slug, record.removal_id)
+    restored = restore_retained_board(slug, removal_id=record.removal_id)
+    if not restored.success:
+        return restored
+    resumed = resume_restored_board(slug)
+    if not resumed.success:
+        return resumed
+    message = (
+        f"board {slug!r} is live again from its retained copy, which has been "
+        "discarded: a permanent removal continues from here"
+    )
+    ok = True
+    if retained.exists():
+        try:
+            shutil.rmtree(retained)
+        except OSError as exc:
+            ok, message = False, (
+                "the board is live again but its retained copy could not be "
+                f"discarded, so a permanent removal would leave one: {exc}"
+            )
+    return RestoreResult(
+        ok, message, state=RESTORE_STATE_RESUMED, epoch=resumed.epoch,
+        record=get_removal_phase_record(slug), entry=get_register_entry(slug),
     )
 
 
@@ -12731,6 +14689,9 @@ class RemovalRecoveryAction(str, Enum):
     # terminal claim is incomplete, so the removal rolls forward by
     # writing it rather than reporting a success it cannot account for.
     ROLL_FORWARD_TERMINAL_RECEIPT = "write-terminal-receipt"
+    # §9.2: the outcome is recorded but the board is not usable — the
+    # abandonment's own gate reopen is re-entered until it takes effect.
+    ROLL_FORWARD_REOPEN_AFTER_ABANDON = "reopen-gate-after-abandon"
     NO_ACTION_COMPLETE = "no-action-complete"
     NO_ACTION_BEYOND_FENCED = "no-action-beyond-fenced"
 
@@ -12791,6 +14752,34 @@ def resume_removal(board: str) -> RemovalResumeDecision:
         )
 
     entry = get_register_entry(slug)
+
+    # §9.2: an abandoned or cancelled removal is finished only when the
+    # board is USABLE again. The outcome commits BEFORE the gate reopen,
+    # so a reopen that did not take effect leaves the outcome and the
+    # register saying live over a closed gate: the gate is read here, and
+    # a board that is not usable rolls the reopen forward.
+    if record.outcome in (REMOVAL_OUTCOME_ABANDONED, REMOVAL_OUTCOME_CANCELLED):
+        gate = _read_gate_instant(slug)
+        if (
+            entry is not None
+            and entry.lifecycle is BoardLifecycle.LIVE
+            and gate.status is DurableReadStatus.OK
+            and gate.gate is InBoardGate.OPEN
+            and gate.epoch_mirror == entry.epoch
+        ):
+            return RemovalResumeDecision(
+                RemovalRecoveryPoint.P12, RemovalRecoveryAction.NO_ACTION_COMPLETE,
+                f"removal was {record.outcome}: the board is live, no action needed",
+                record=record, entry=entry,
+            )
+        return RemovalResumeDecision(
+            RemovalRecoveryPoint.P12,
+            RemovalRecoveryAction.ROLL_FORWARD_REOPEN_AFTER_ABANDON,
+            f"removal was {record.outcome} but the board is not usable yet: "
+            "the in-board gate is not open at the register's epoch — roll "
+            "forward by re-entering the recorded abandonment",
+            record=record, entry=entry,
+        )
 
     if record.phase == RemovalPhase.INTENT:
         gate = _read_gate_instant(slug)
@@ -13841,6 +15830,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- exceeds DEFAULT_FAILURE_LIMIT consecutive non-successes.
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     worker_pid           INTEGER,
+    -- Identity witness for ``worker_pid``: the OS start-time fingerprint of
+    -- the process that pid named when it was bound. PIDs are recycled, so a
+    -- bare number is not an identity; the pair is. Written ONLY by
+    -- ``_set_worker_pid``, in the same statement group as ``worker_pid``, so
+    -- a pid and its witness commit together or not at all. NULL means "we
+    -- could not tell" (pre-migration row, or a probe that came back empty),
+    -- which classifies as INDETERMINATE — never as absent.
+    worker_start_time    INTEGER,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -14007,6 +16004,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    -- Per-run copy of the identity witness described on ``tasks``.
+    worker_start_time   INTEGER,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -14220,7 +16219,27 @@ def _cross_process_init_lock(path: Path):
     additive migrations), so the worst case of two processes racing first-init
     is redundant work, not corruption. A bounded "proceed anyway" beats an
     unbounded hang that silently stops the board.
+
+    **The lock never creates the store's directory.** ``<path>.init.lock`` is
+    a sibling of the database, so ACQUIRING it used to ``mkdir`` a board
+    directory a removal had just taken away and leave a lock file sitting
+    inside it — the removed board's directory back from the dead, brought
+    there by the lock rather than by any admitted creation. The containing
+    directory is therefore a PRECONDITION here
+    (``require_existing_directory=True``), not something the shared helper
+    materialises. Making it is the admitted creation window's job
+    (:func:`_admitted_store_creation`), which does it under this board's
+    register lock and only once the register has said this board may have a
+    store at all.
+
+    Asking the helper is the whole point: a ``path.parent.exists()`` test
+    here followed by a helper that could still ``mkdir`` is a check/use race,
+    and a removal landing in that gap was recreating the board directory.
+    The refusal now comes from the ``ENOENT`` the OPEN returned, so there is
+    no instant at which a removal can land and still be overtaken — and it
+    is reported as the same GA-4 refusal an absent store gets anywhere else.
     """
+
     def _warn(lock_path, timeout_seconds):
         _log.warning(
             "kanban init lock for %s not acquired within %.0fs — proceeding "
@@ -14230,12 +16249,22 @@ def _cross_process_init_lock(path: Path):
             lock_path, timeout_seconds,
         )
 
-    with _shared_cross_process_init_lock(
-        path,
-        timeout_seconds=_INIT_LOCK_TIMEOUT_SECONDS,
-        poll_seconds=_INIT_LOCK_POLL_SECONDS,
-        on_timeout=_warn,
-    ):
+    with contextlib.ExitStack() as stack:
+        try:
+            # enter_context so ONLY the acquire is translated: an
+            # InitLockDirectoryAbsent raised by the body would mean something
+            # else entirely and must not be reported as this board's refusal.
+            stack.enter_context(
+                _shared_cross_process_init_lock(
+                    path,
+                    timeout_seconds=_INIT_LOCK_TIMEOUT_SECONDS,
+                    poll_seconds=_INIT_LOCK_POLL_SECONDS,
+                    on_timeout=_warn,
+                    require_existing_directory=True,
+                )
+            )
+        except InitLockDirectoryAbsent as exc:
+            raise BoardFenceClosedError(_absent_board_store_refusal(path)) from exc
         yield
 
 
@@ -14906,20 +16935,323 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+def _absent_board_store_refusal(path: Path) -> FenceRefusal:
+    """GA-4's refusal: there is no store here and an open never makes one."""
+    slug = board_slug_for_db_path(path)
+    return FenceRefusal(
+        outcome=FenceOutcome.REFUSED_CLOSED,
+        rule=FenceRefusalRule.GA_4,
+        board=slug or str(path),
+        message=(
+            f"no kanban store at {path}: opening a board never creates one. "
+            "A removed board stays removed; create a genuinely new board with "
+            "`hermes kanban boards create <slug>`."
+        ),
+    )
+
+
+def _open_board_store(path: Path, *, create: bool) -> sqlite3.Connection:
+    """The one place :func:`connect` turns a path into a connection.
+
+    An ordinary open goes through :func:`_sqlite_connect_no_create`, whose
+    ``mode=rw`` URI makes SQLite itself refuse a missing file. That is what
+    closes the resurrection window: a removal that lands after we looked at
+    the path loses the race inside SQLite rather than being handed a fresh
+    empty database to hand back as "the board".
+    """
+    if create:
+        return _sqlite_connect(path)
+    try:
+        return _sqlite_connect_no_create(
+            path, timeout_seconds=_resolve_busy_timeout_ms() / 1000.0
+        )
+    except sqlite3.OperationalError as exc:
+        if path.exists():
+            # A real open failure (locked, permissions, bad file) — not the
+            # no-creation guarantee talking.
+            raise
+        raise BoardFenceClosedError(_absent_board_store_refusal(path)) from exc
+
+
+def _assert_creation_admitted(path: Path, board: Optional[str]) -> None:
+    """GA-2: a board under removal refuses to have its store created.
+
+    Opening an EXISTING store mid-removal stays admitted (GA-1) — already
+    accepted work has to be able to finish, and the write chokepoint is what
+    decides whether it may still mutate. Bringing the store back into
+    existence is the one thing no ordinary caller may do, so this fires only
+    when there is nothing there to open. The removal machinery itself runs
+    inside the fence protocol scope and is exempt, exactly as it is at the
+    write chokepoint.
+
+    WHICH board is being admitted is :func:`_creation_admission_slug`'s
+    answer, and that answer comes from the target PATH first — see there.
+
+    **An ABSENT register answer is indeterminate, never "this name is
+    new".** The register row and the register file itself are a single loss
+    domain, and a removed name has to outlive losing either of them — which
+    is exactly why §1.3 keeps the ever-existed marker and the removal
+    archive in a DIFFERENT file (:func:`archive_db_path`), ledgered as
+    "retained: the resurrection guard outlives the board". Reading "no
+    entry" as "never used" threw that second domain away: deleting one
+    ``board_register`` row, or the register file, was enough to let
+    ``init_db`` recreate a removed board's store and take writes again.
+    So a missing entry falls through to the two INDEPENDENT stores, and
+    only a name both of them answer a definite "no" for may be created.
+
+    Callers must hold this board's register lock — see
+    :func:`_creation_admission_lock`, which both call sites go through, so
+    the answer cannot go stale between the decision and the side effects it
+    admits.
+    """
+    if _in_fence_protocol():
+        return
+    slug = _creation_admission_slug(path, board)
+    if not slug:
+        return
+    # Reading through get_register_entry() would create the register as a
+    # side effect of every fresh board creation, so an absent register file
+    # is not opened here — it is simply one more authority that cannot
+    # answer, and the independent stores below are asked instead.
+    entry = get_register_entry(slug) if register_db_path().exists() else None
+    if entry is not None:
+        if entry.lifecycle is BoardLifecycle.LIVE:
+            # An armed, live board: creation is idempotent (mkdir -p).
+            return
+        raise BoardFenceClosedError(
+            FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.GA_2,
+                board=slug,
+                message=(
+                    f"board is {entry.lifecycle.value}: refusing to create its "
+                    "store again"
+                ),
+                register_epoch=entry.epoch,
+            )
+        )
+
+    # No register answer for this name. Consult the independent stores
+    # before treating that as "new" — both are tri-state, and per their
+    # contracts None means the LOOKUP failed, never "no records".
+    marker = ever_existed_marker_set(slug)
+    if marker is None:
+        raise BoardFenceClosedError(
+            FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.INDETERMINATE,
+                board=slug,
+                message=(
+                    f"no register entry for {slug!r} and the ever-existed "
+                    f"marker store ({archive_db_path()}) could not be read: "
+                    "refusing to create its store from an indeterminate "
+                    "answer. Restore or repair that store, then retry."
+                ),
+            )
+        )
+    if marker:
+        raise BoardFenceClosedError(
+            FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.GA_2,
+                board=slug,
+                message=(
+                    f"the name {slug!r} has existed (ever-existed marker set) "
+                    "and its register entry is missing: refusing to create its "
+                    "store again. The marker outlives the register on purpose; "
+                    "if this board's register entry was lost, repair the "
+                    "register rather than recreating the board, or choose a "
+                    "different slug."
+                ),
+            )
+        )
+    archived_record = has_removal_archive_record(slug)
+    if archived_record is None:
+        raise BoardFenceClosedError(
+            FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.GA_6b,
+                board=slug,
+                message=(
+                    f"no register entry for {slug!r} and the removal archive "
+                    f"({archive_db_path()}) could not be read: refusing to "
+                    "create its store from an indeterminate answer. Restore "
+                    "or repair that store, then retry."
+                ),
+            )
+        )
+    if archived_record:
+        raise BoardFenceClosedError(
+            FenceRefusal(
+                outcome=FenceOutcome.REFUSED_CLOSED,
+                rule=FenceRefusalRule.GA_6a,
+                board=slug,
+                message=(
+                    f"no register entry for {slug!r}, but the removal archive "
+                    "holds receipt/audit records for that name: refusing to "
+                    "create its store again. Repair the register from the "
+                    "archive, or choose a different slug."
+                ),
+            )
+        )
+    # Both independent stores answered a definite no: a demonstrably
+    # never-used name. This is the first-run bootstrap path too — a fresh
+    # home has no register, no marker and no archive record for any name.
+
+
+@contextlib.contextmanager
+def _creation_admission_lock(path: Path, board: Optional[str]):
+    """Hold the authority that decides a creation, for the whole decision.
+
+    The SAME per-board register lock every Gate A transition takes — no
+    second lock system, and nothing new to acquire: the removal machinery
+    is exempt (it IS the authority), and a path that names no board has no
+    authority to serialize against.
+
+    ``reentrant=True`` is what lets both admission call sites share it:
+    :func:`_admitted_store_creation` holds it across the decision AND the
+    directory creation, and the re-validation inside
+    :func:`_open_initialized_store` — reached from ``init_db`` through
+    ``connect(create=True)`` — re-enters the very same lock instead of
+    deciding unserialized.
+    """
+    slug = _creation_admission_slug(path, board)
+    if slug is None or _in_fence_protocol():
+        yield None
+        return
+    with board_register_lock(slug, reentrant=True):
+        yield slug
+
+
+def _creation_admission_slug(path: Path, board: Optional[str]) -> Optional[str]:
+    """Which board's authority governs creating a store at *path*, if any.
+
+    **The resolved target path outranks the ``board`` argument.** A creation
+    brings a store into existence at a PATH; the argument is only a name the
+    caller supplied, and the two can disagree — an explicit ``db_path=``, or
+    a pinned ``HERMES_KANBAN_DB`` (which :func:`kanban_db_path` already
+    honours ABOVE ``board``). Asking the argument first let a live name
+    authorize a creation at a REMOVED board's path and resurrect its store.
+    The connection, not the argument, is the authority on which board is
+    being touched — the same precedence
+    ``tools.kanban_tools._board_of_connection`` already states for reads.
+
+    The argument is the FALLBACK, for a path that carries no board identity
+    of its own: a staging DB in a temp dir, a legacy or foreign
+    ``HERMES_KANBAN_DB`` outside the boards tree. ``None`` — neither the
+    path nor the argument names a board — means no register entry to admit
+    or refuse against and no register lock to serialize on.
+    """
+    try:
+        return board_slug_for_db_path(path) or _normalize_board_slug(board)
+    except ValueError:
+        return None
+
+
+@contextlib.contextmanager
+def _admitted_store_creation(path: Path, board: Optional[str]):
+    """The one window in which a board store may be brought into existence.
+
+    Every defect this closes had the same shape: **admission was decided
+    from a stale observation, and side effects happened before or outside
+    the window it admitted.** ``create=True`` was read as authority over a
+    board that had since been removed, and the board directory, its
+    ``board.json`` and its init-lock file could all appear at a path the
+    caller was about to be refused.
+
+    So this window owns all three of those:
+
+    * Admission is asserted HERE, before the first side effect — not
+      inherited from a ``path.exists()`` snapshot some earlier caller took.
+      :func:`create_board` opens the window before it writes ``board.json``;
+      :func:`connect` opens it before it makes the directory.
+    * **Both halves run under this board's register lock**, the SAME
+      per-board lock at :func:`board_register_lock` that every Gate A
+      transition — every removal — has to take to move this board's
+      lifecycle. "The register says LIVE" and "the directory now exists" are
+      therefore one indivisible step: a removal cannot slip between them,
+      it waits behind them. The acquire is bounded (it raises
+      :class:`InitLockUnavailable` at the deadline rather than blocking), so
+      a creation that cannot be serialized fails closed instead of hanging,
+      and a removal is delayed by at most one creation — which is the
+      correct price for the boundary, not a regression.
+    * Whatever the window loses, it leaves nothing behind. Ownership of the
+      board directory is claimed from the OS by a ``mkdir`` WITHOUT
+      ``exist_ok`` while the lock is held: only the call that actually
+      created the directory may take it back down. A bare ``exists()``
+      snapshot cannot say that — two concurrent creations of the same
+      brand-new board both see "it wasn't there", and the loser would
+      ``rmtree`` a directory the winner is legitimately filling.
+
+    A store that is ALREADY there is not creation and takes no lock: GA-1
+    keeps an existing store openable mid-removal, so there is no admission
+    decision to serialize and nothing to bring into existence. If it is
+    taken away underneath us anyway, :func:`_cross_process_init_lock` and
+    :func:`_open_board_store` both refuse from the kernel's answer rather
+    than from anything read here.
+    """
+    if path.exists():
+        yield
+        return
+
+    slug = _creation_admission_slug(path, board)
+    # The removal machinery already holds this lock for the board it is
+    # removing, and is exempt from admission for the same reason it is
+    # exempt at the write chokepoint: it is the authority, not a client.
+    # Taken re-entrantly: create_board opens this window and then re-enters
+    # it through init_db -> connect(create=True), and a holder may itself
+    # drive register transitions from inside.
+    with _creation_admission_lock(path, board):
+        _assert_creation_admitted(path, board)
+        board_directory = path.parent
+        # Only a board's OWN directory is ever ours to take back down. The
+        # default board's store lives at ``<home>/kanban.db``, so its parent
+        # is the kanban home itself — shared with everything else Hermes
+        # keeps there — and an explicit ``db_path`` can point anywhere.
+        claimable = slug is not None and board_directory == board_dir(slug)
+        created_here = False
+        if claimable:
+            try:
+                board_directory.mkdir(parents=True)
+                created_here = True
+            except FileExistsError:
+                # Something already published this board's directory. It is
+                # not this window's to delete, whatever happens next.
+                pass
+        else:
+            board_directory.mkdir(parents=True, exist_ok=True)
+        try:
+            yield
+        except BoardFenceClosedError:
+            if created_here:
+                # Proven under the lock we still hold: this call created the
+                # directory, and no other creation can have entered it since.
+                # Everything in there is residue of a creation that was
+                # refused — the directory, the metadata, the init-lock file.
+                shutil.rmtree(board_directory, ignore_errors=True)
+            raise
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    create: bool = False,
 ) -> sqlite3.Connection:
-    """Open (and initialize if needed) the kanban DB.
+    """Open an EXISTING kanban DB; ``create=True`` brings one into being.
 
     WAL mode is enabled on every connection; it's a no-op after the first
     time but keeps the code robust if the DB file is ever re-created.
 
-    The first connection to a given path auto-runs :func:`init_db` so
-    fresh installs and test harnesses that construct `connect()`
-    directly don't have to remember a separate init step. Subsequent
-    connections skip the schema check via a module-level path cache.
+    **Opening is not creating.** Every ordinary caller gets the default,
+    ``create=False``: the board directory is never made, the SQLite file is
+    never made, and a board whose storage a removal took away can never be
+    resurrected by someone merely looking at it — the open is refused with
+    :class:`BoardFenceClosedError` (GA-4) instead. Only the explicit
+    creation path (:func:`init_db`, and :func:`create_board` through it)
+    passes ``create=True``. Schema creation and the additive migrations
+    still run on the first open of an EXISTING store, so a legacy board
+    keeps being upgraded in place.
 
     Path resolution:
 
@@ -14933,8 +17265,38 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not create:
+        if not path.exists():
+            # Refuse HERE, before the cross-process init lock: that lock's
+            # file is a sibling of the DB, so acquiring it would re-create
+            # the board directory a removal just took away.
+            raise BoardFenceClosedError(_absent_board_store_refusal(path))
+        return _open_initialized_store(
+            path, board=board, db_path=db_path, create=False,
+        )
+    # Creating runs entirely inside the admitted window: the directory, the
+    # store and the init-lock file are all side effects of a creation, and
+    # none of them may happen before the register has admitted one.
+    with _admitted_store_creation(path, board):
+        return _open_initialized_store(
+            path, board=board, db_path=db_path, create=True,
+        )
 
+
+def _open_initialized_store(
+    path: Path,
+    *,
+    board: Optional[str],
+    db_path: Optional[Path],
+    create: bool,
+) -> sqlite3.Connection:
+    """Open *path*, running the first-open init once per process per path.
+
+    Split out of :func:`connect` so the creating case can run the WHOLE of
+    this inside :func:`_admitted_store_creation`'s window. Admission has to
+    cover every step that could bring a store into existence — the init
+    lock's own file included — not merely the decision that preceded them.
+    """
     # Fast path: once THIS process has initialized this path, the expensive
     # first-open work (header validation, integrity probe, schema + additive
     # migrations) is already done and cached in _INITIALIZED_PATHS. Acquiring
@@ -14947,7 +17309,7 @@ def connect(
     # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
     resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
-        conn = _sqlite_connect(path)
+        conn = _open_board_store(path, create=create)
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
@@ -14969,13 +17331,14 @@ def connect(
             raise
         if schema_present:
             return conn
-        # The cache says "initialized", the file says otherwise: it was deleted
-        # or replaced under a live process, and the open above silently
-        # recreated an empty DB. Left alone, every query on this path fails
-        # with "no such table: tasks" for the rest of the process's life and
-        # the board just renders empty (#83445). Drop the stale cache entry and
-        # fall through to the full init path, which re-runs the header and
-        # integrity probes and the schema script under the cross-process lock.
+        # The cache says "initialized", the file says otherwise: it was
+        # replaced under a live process by one carrying no schema. (A DELETED
+        # file no longer reaches here at all — the open above refuses it.)
+        # Left alone, every query on this path fails with "no such table:
+        # tasks" for the rest of the process's life and the board just renders
+        # empty (#83445). Drop the stale cache entry and fall through to the
+        # full init path, which re-runs the header and integrity probes and
+        # the schema script on that existing file under the cross-process lock.
         conn.close()
         with _INIT_LOCK:
             _INITIALIZED_PATHS.discard(resolved)
@@ -14986,6 +17349,20 @@ def connect(
         )
 
     with _cross_process_init_lock(path):
+        if create and not path.exists():
+            # Re-validate AT THE MOMENT OF CREATION. The admission that got
+            # us here was read before this lock was taken; a removal that
+            # landed in between must not be overtaken by a ``create=True``
+            # decided ahead of it. (The lock itself has already refused the
+            # case where the removal took the whole directory.)
+            #
+            # Under the SAME register lock the admitted window holds, not a
+            # second one: the ordinary route here is already inside that
+            # window, where this is a free re-entry, and the one route that
+            # is not — a store that vanished after the window saw it — is
+            # exactly the case that must not decide unserialized.
+            with _creation_admission_lock(path, board):
+                _assert_creation_admitted(path, board)
         # Read-only file/sidecar preflight (port of kilocode#12508) —
         # repair-or-refuse before the header/integrity probes so a stray
         # read-only kanban.db fails with an actionable message instead of
@@ -15000,7 +17377,7 @@ def connect(
         # via _INITIALIZED_PATHS so it only runs once per process per path.
         _guard_existing_db_is_healthy(path)
         resolved = str(path.resolve())
-        conn = _sqlite_connect(path)
+        conn = _open_board_store(path, create=create)
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
@@ -15080,6 +17457,7 @@ def connect_closing(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    create: bool = False,
 ):
     """Open a kanban DB connection and guarantee it is closed on exit.
 
@@ -15100,7 +17478,7 @@ def connect_closing(
     intentionally manage the connection lifetime (tests, long-lived
     callers) continue to work.
     """
-    conn = connect(db_path=db_path, board=board)
+    conn = connect(db_path=db_path, board=board, create=create)
     try:
         yield conn
     finally:
@@ -15124,12 +17502,17 @@ def init_db(
     may have drifted — tests that write legacy event kinds directly,
     external tools that upgrade an old DB file — can call this to
     force re-migration.
+
+    This is the explicit creation entry point: it is the one route that
+    passes ``create=True`` to :func:`connect`, so "make a board store" is
+    something a caller has to ASK for rather than something any open does.
+    A board the register says is being (or has been) removed refuses even
+    here — GA-2 — so an auto-init on a removed board cannot resurrect it.
     """
     if db_path is not None:
         path = db_path
     else:
         path = kanban_db_path(board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
     # schema + migration pass unconditionally.
@@ -15137,7 +17520,7 @@ def init_db(
         _INITIALIZED_PATHS.discard(resolved)
     # Carry the board through: the migration reads this board's published
     # owner metadata to recover receipt ownership on a pre-upgrade board.
-    with contextlib.closing(connect(path, board=board)):
+    with contextlib.closing(connect(path, board=board, create=True)):
         pass
     return path
 
@@ -15214,6 +17597,13 @@ def _migrate_add_optional_columns(
             )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
+    # The identity witness for ``worker_pid``. Additive and nullable: rows
+    # bound before this migration keep a NULL witness, which the classifier
+    # reads as INDETERMINATE (cannot prove identity), never as absent.
+    if "worker_start_time" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "worker_start_time", "worker_start_time INTEGER"
+        )
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
             conn, "tasks", "last_failure_error", "last_failure_error TEXT"
@@ -15456,6 +17846,23 @@ def _migrate_add_optional_columns(
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+
+    # task_runs carries the same pid/identity-witness pair the task row does,
+    # one per attempt. Table-existence guarded like ``task_comments`` below,
+    # for callers migrating a minimal legacy schema. Runs BEFORE
+    # ``_rebuild_drifted_tables`` and is idempotent either way: a rebuilt
+    # table is recreated from the canonical DDL, which already has the column.
+    runs_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if runs_table_exists:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if "worker_pid" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "worker_pid", "worker_pid INTEGER")
+        if "worker_start_time" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_start_time", "worker_start_time INTEGER"
+            )
 
     # Durable operation identity for idempotent comment replay (see
     # add_comment()'s operation_key parameter). Partial unique index: NULL
@@ -15832,7 +18239,8 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_start_time INTEGER,"
+        " max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -21591,13 +23999,26 @@ def release_stale_claims(
 ) -> int:
     """Reset any ``running`` task whose claim has expired.
 
-    A stale-by-TTL claim whose host-local worker PID is still alive is
+    A stale-by-TTL claim whose host-local worker is PROVABLY LIVE is
     *extended* (with a ``claim_extended`` event) instead of being
     reclaimed. Reclaiming a live worker mid-flight produces the spawn-
     then-immediately-reclaim loop seen on slow models that spend longer
     than ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM
     call (#23025): no tool calls means no ``kanban_heartbeat``, even
     though the subprocess is healthy.
+
+    "Provably live" is the recorded IDENTITY, not the pid number:
+    :func:`_worker_identity_presence` compares the pid's current start time
+    with the one ``_set_worker_pid`` bound beside it. Only a ``LIVE``
+    verdict extends. A ``PROVABLY_ABSENT`` verdict — including a pid the OS
+    recycled to an unrelated process, which a bare liveness probe would
+    have called alive forever — is reclaimed through the ordinary reclaim
+    path below, and the ``reclaimed`` event carries the evidence. An
+    ``INDETERMINATE`` verdict proves nothing either way, so it neither
+    extends nor reclaims: the claim is HELD through the existing
+    :func:`_defer_reclaim_for_live_worker`, which is how "unknown is
+    treated exactly like live" stays true without ever calling an
+    unknown owner absent.
 
     Backstop (#29747 gap 3): if the worker's PID is still alive but its
     ``last_heartbeat_at`` is stale by more than
@@ -21618,8 +24039,8 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "SELECT id, claim_lock, worker_pid, worker_start_time, claim_expires, "
+        "       last_heartbeat_at, assignee "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ? AND task_kind = 'work'",
@@ -21637,10 +24058,21 @@ def release_stale_claims(
             hb is not None
             and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
+        # One classification of the recorded identity per row, reused by
+        # every arm below AND by the audit payload, so the verdict the
+        # decision was taken on is the verdict the event records.
+        identity: dict = {}
+        presence = (
+            _worker_identity_presence(
+                row["worker_pid"], _row_worker_start_time(row), evidence=identity,
+            )
+            if host_local
+            else None
+        )
         if (
             host_local
             and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
+            and presence is HolderPresence.LIVE
             and not heartbeat_stale
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
@@ -21661,27 +24093,73 @@ def release_stale_claims(
                         "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
                         (new_expires, run_id),
                     )
+                extended_payload = {
+                    "reason": "pid_alive",
+                    "worker_pid": int(row["worker_pid"]),
+                    "claim_lock": row["claim_lock"],
+                    "claim_expires_was": int(row["claim_expires"]),
+                    "claim_expires_now": new_expires,
+                    "last_heartbeat_at": (
+                        int(row["last_heartbeat_at"])
+                        if row["last_heartbeat_at"] is not None
+                        else None
+                    ),
+                }
+                extended_payload.update(identity)
                 _append_event(
-                    conn, row["id"], "claim_extended",
-                    {
-                        "reason": "pid_alive",
-                        "worker_pid": int(row["worker_pid"]),
-                        "claim_lock": row["claim_lock"],
-                        "claim_expires_was": int(row["claim_expires"]),
-                        "claim_expires_now": new_expires,
-                        "last_heartbeat_at": (
-                            int(row["last_heartbeat_at"])
-                            if row["last_heartbeat_at"] is not None
-                            else None
-                        ),
-                    },
+                    conn, row["id"], "claim_extended", extended_payload,
                     run_id=run_id,
                 )
             continue
 
-        termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
-        )
+        # Unknown is treated exactly like live: an identity that can be
+        # neither confirmed nor refuted is HELD, not released and not
+        # signalled — but only when there is an owner to protect. A claim
+        # that records NO pid has no worker to duplicate and nothing to
+        # signal, so its expiry stays the authority that recovers it, which
+        # is how a claim whose worker never spawned gets back to the board
+        # instead of being held forever. The heartbeat backstop overrides
+        # this arm either way: a worker making no observable progress for an
+        # hour is reclaimed whatever its identity says (pre-existing rule,
+        # unchanged).
+        if (
+            presence is HolderPresence.INDETERMINATE
+            and row["worker_pid"]
+            and not heartbeat_stale
+        ):
+            held = {
+                "prev_pid": int(row["worker_pid"]),
+                "host_local": True,
+                "termination_attempted": False,
+                "terminated": False,
+                "sigkill": False,
+            }
+            held.update(identity)
+            _defer_reclaim_for_live_worker(
+                conn, row["id"], row["claim_lock"], now, held,
+                reason="ttl_expired_worker_identity_indeterminate",
+            )
+            continue
+
+        if presence is HolderPresence.PROVABLY_ABSENT and identity.get(
+            "observed_worker_start_time"
+        ) is not None:
+            # PID REUSE: the number is alive, but it belongs to an unrelated
+            # process now. Signalling it would kill a stranger, so this
+            # reclaim skips termination entirely and records why. The
+            # recorded owner is gone, which is what ``terminated`` states.
+            termination = {
+                "prev_pid": int(row["worker_pid"]),
+                "host_local": host_local,
+                "termination_attempted": False,
+                "terminated": True,
+                "sigkill": False,
+                "pid_reused": True,
+            }
+        else:
+            termination = _terminate_reclaimed_worker(
+                row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
@@ -21729,6 +24207,13 @@ def release_stale_claims(
                 "retry_status": retry_status,
             }
             payload.update(termination)
+            # The evidence the verdict was reached on, not just the verdict:
+            # the pid, the start time recorded with the claim, the start time
+            # observed now, and the classification. A release caused by an
+            # identity that no longer matches is auditable from this one
+            # event — and it is emitted by the SAME reclaim path as every
+            # other stale release, never a new one.
+            payload.update(identity)
             _append_event(
                 conn, row["id"], "reclaimed",
                 payload,
@@ -21776,7 +24261,7 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks "
+        "SELECT status, claim_lock, worker_pid, worker_start_time FROM tasks "
         "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
@@ -21786,8 +24271,18 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    # The operator asked for this release and gets it either way; what the
+    # recorded IDENTITY decides is what may be SIGNALLED. A pid the OS
+    # recycled is a stranger, and the reclaim must not kill it — the witness
+    # is threaded into the termination helper, which refuses in that case and
+    # still reports its usual keys.
+    identity: dict = {}
+    _worker_identity_presence(
+        row["worker_pid"], _row_worker_start_time(row), evidence=identity,
+    )
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        recorded_start_time=_row_worker_start_time(row),
     )
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
@@ -21816,6 +24311,9 @@ def reclaim_task(
             "retry_status": retry_status,
         }
         payload.update(termination)
+        # The evidence the signal decision was taken on, not just the verdict
+        # — the same keys the automatic stale-claim reclaim records.
+        payload.update(identity)
         _append_event(
             conn, task_id, "reclaimed",
             payload,
@@ -27967,6 +30465,26 @@ def _rollback_worktree_materialization(
         ) from exc
 
 
+def _record_kernel_created_commit(task: Any, workspace: Path, *, kind: str) -> str:
+    """Record the commit the kernel JUST created, with its full identity.
+
+    Resolves the exact new id and writes it to the creation-time ledger in
+    the step that created it. A failure here is fatal on purpose: the
+    caller's rollback abandons the commit, so no commit survives whose
+    provenance nothing recorded.
+    """
+    head = str(_git_output(workspace, "rev-parse", "--verify", "HEAD")).strip()
+    board = get_current_board()
+    entry = get_register_entry(board)
+    record_kernel_creation(
+        family=KERNEL_FAMILY_COMMIT, kind=kind, subject_id=head, board=board,
+        task_id=task.id, run_id=task.current_run_id, project_id=task.project_id,
+        generation=None if entry is None else entry.epoch,
+        reference=task.branch_name,
+    )
+    return head
+
+
 def _materialize_remote_worktree_handoff(
     conn: sqlite3.Connection,
     task_id: str,
@@ -28130,6 +30648,9 @@ def _materialize_remote_worktree_handoff(
                     _git_mutation(
                         workspace, "merge", "--no-ff", "--no-edit", parent_head
                     )
+                    _record_kernel_created_commit(
+                        task, workspace, kind="parent-head-integration-merge",
+                    )
                     merged_any = True
                 merged_parent_heads.append(
                     {"task_id": str(row["id"]), "head_commit": parent_head}
@@ -28202,10 +30723,21 @@ def _materialize_remote_worktree_handoff(
                     f"Hermes-Patch-SHA256: {patch_sha256}"
                 )
                 _git_mutation(workspace, "commit", "--no-gpg-sign", "-m", message)
+                _record_kernel_created_commit(
+                    task, workspace, kind="materialized-remote-handoff",
+                )
 
         materialized_head = str(
             _git_output(workspace, "rev-parse", "--verify", "HEAD")
         ).strip()
+        # The courier-free native path: HEAD advanced by a route the two
+        # calls above do not cover, so the new head is recorded rather than
+        # left unattributed. The insert ignores a commit already recorded,
+        # so the more specific kind above wins and no row is rewritten.
+        if materialized_head != original_head:
+            _record_kernel_created_commit(
+                task, workspace, kind="native-materialization-head",
+            )
         if (
             materialized_head == original_head
             and not patch_already_materialized
@@ -29870,6 +32402,10 @@ def verified_active_worker_rows(
         "r.worker_pid IS NOT NULL",
         "t.current_run_id = r.id",
         "t.worker_pid = r.worker_pid",
+        # The identity witness is half of the worker's identity, so the task
+        # and run sides must agree on it too, not only on the pid number.
+        # ``IS`` so two pre-migration NULLs still correlate.
+        "t.worker_start_time IS r.worker_start_time",
         "t.claim_lock = r.claim_lock",
         "t.claim_expires = r.claim_expires",
     ]
@@ -29879,7 +32415,8 @@ def verified_active_worker_rows(
         params.append(str(project_id))
     rows = conn.execute(
         "SELECT r.id AS run_id, r.profile, t.title AS task_title, "
-        "r.started_at, r.worker_pid, r.claim_lock, r.claim_expires, "
+        "r.started_at, r.worker_pid, r.worker_start_time, "
+        "r.claim_lock, r.claim_expires, "
         "r.last_heartbeat_at AS run_heartbeat, "
         "t.last_heartbeat_at AS task_heartbeat "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE "
@@ -29892,11 +32429,19 @@ def verified_active_worker_rows(
     for row in rows:
         claim_lock = str(row["claim_lock"] or "")
         claim_expires = row["claim_expires"]
+        # "That exact local PID is alive" is a statement about an IDENTITY,
+        # not a number: a pid the OS recycled to an unrelated process is
+        # provably NOT this worker, and reporting it as one would put a
+        # stranger's process behind a "Working now" badge. An owner whose
+        # identity can be neither confirmed nor refuted is treated exactly
+        # like a live one (unchanged from before the witness existed).
         if (
             not claim_lock.startswith(host_prefix)
             or claim_expires is None
             or int(claim_expires) < observed_at
-            or not _pid_alive(row["worker_pid"])
+            or _worker_identity_presence(
+                row["worker_pid"], _row_worker_start_time(row),
+            ) is HolderPresence.PROVABLY_ABSENT
         ):
             continue
         task_heartbeat = row["task_heartbeat"]
@@ -29925,8 +32470,22 @@ def _terminate_reclaimed_worker(
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    recorded_start_time: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    ``recorded_start_time`` is the identity witness stored beside ``pid``
+    by :func:`_set_worker_pid`. It is OPTIONAL and defaults to None, so a
+    caller that does not pass it behaves exactly as before. When it IS
+    passed and :func:`_worker_identity_presence` proves the number now
+    belongs to an unrelated process (alive, but a different start time
+    from the one recorded), NOTHING is signalled: the recorded owner is
+    already gone and the process wearing its pid is a stranger. The
+    returned dict keeps every key its callers and
+    :func:`_worker_survived_termination` read — ``terminated`` is True
+    because the owner really is gone — plus ``pid_reused`` and the
+    identity evidence, exactly as the stale-claim reclaim records it.
+    """
     import signal
 
     info: dict[str, Any] = {
@@ -29943,6 +32502,21 @@ def _terminate_reclaimed_worker(
     if not str(claim_lock).startswith(host_prefix):
         return info
     info["host_local"] = True
+
+    if recorded_start_time is not None:
+        identity: dict[str, Any] = {}
+        presence = _worker_identity_presence(
+            pid, recorded_start_time, evidence=identity,
+        )
+        if (
+            presence is HolderPresence.PROVABLY_ABSENT
+            and identity.get("observed_worker_start_time") is not None
+        ):
+            # PID REUSE. Signalling here would kill a stranger.
+            info["terminated"] = True
+            info["pid_reused"] = True
+            info.update(identity)
+            return info
 
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
@@ -30358,7 +32932,7 @@ def enforce_max_runtime(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.current_run_id, "
+        "SELECT t.id, t.worker_pid, t.worker_start_time, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -30382,17 +32956,36 @@ def enforce_max_runtime(
         tid = row["id"]
         run_id = row["current_run_id"]
 
+        # WHAT gets signalled is decided by the recorded IDENTITY, not by the
+        # pid number: the OS recycles numbers, so a pid whose recorded start
+        # time no longer matches the process wearing it belongs to a stranger,
+        # and this path SIGTERMs then SIGKILLs. The timeout bookkeeping below
+        # is unchanged — the attempt really did run past its limit and its
+        # owner really is gone — only the signal is withheld.
+        identity: dict = {}
+        presence = _worker_identity_presence(
+            row["worker_pid"], _row_worker_start_time(row), evidence=identity,
+        )
+        pid_reused = (
+            presence is HolderPresence.PROVABLY_ABSENT
+            and identity.get("observed_worker_start_time") is not None
+        )
+
         # The handover check runs BEFORE anything is recorded, through the
         # one shared helper the iteration-budget exit uses too.
         if run_id is not None and _complete_run_handover_before_timeout(
             conn, tid,
             handover_reason="budget_exhausted",
             run_id=int(run_id),
-            stop_worker=lambda: _request_worker_stop(pid, signal_fn),
+            stop_worker=(
+                (lambda: None) if pid_reused
+                else (lambda: _request_worker_stop(pid, signal_fn))
+            ),
             event_payload_extra={
                 "pid": pid,
                 "elapsed_seconds": int(elapsed),
                 "limit_seconds": int(row["max_runtime_seconds"]),
+                **identity,
             },
             metadata_extra={
                 "elapsed_seconds": int(elapsed),
@@ -30411,7 +33004,7 @@ def enforce_max_runtime(
         kill = signal_fn if signal_fn is not None else (
             os.kill if hasattr(os, "kill") else None
         )
-        if kill is not None:
+        if kill is not None and not pid_reused:
             try:
                 kill(pid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
@@ -30430,6 +33023,19 @@ def enforce_max_runtime(
                 except (ProcessLookupError, OSError):
                     pass
 
+        error_text = (
+            f"elapsed {int(elapsed)}s > "
+            f"limit {int(row['max_runtime_seconds'])}s"
+        )
+        if pid_reused:
+            # Saying nothing here would leave the history claiming we stopped
+            # a worker we deliberately did not signal.
+            error_text += (
+                f" — pid {pid} was recycled: the process holding it now "
+                f"started at {identity['observed_worker_start_time']}, not "
+                f"the {identity['worker_start_time']} recorded with the "
+                "claim, so it was not signalled"
+            )
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -30448,10 +33054,17 @@ def enforce_max_runtime(
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                if pid_reused:
+                    payload["pid_reused"] = True
+                    payload["termination_attempted"] = False
+                # The evidence the signal decision was taken on, not just the
+                # verdict: recorded pid, recorded start time, observed start
+                # time, classification.
+                payload.update(identity)
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
-                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                    error=error_text,
                     metadata=payload,
                 )
                 _append_event(
@@ -30467,7 +33080,7 @@ def enforce_max_runtime(
             with _after_durable_commit(f"enforce_max_runtime({tid})"):
                 _record_task_failure(
                     conn, tid,
-                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                    error=error_text,
                     outcome="timed_out",
                     release_claim=False,
                     end_run=False,
@@ -30475,6 +33088,7 @@ def enforce_max_runtime(
                         "pid": pid,
                         "sigkill": killed,
                         "retry_status": retry_status,
+                        **identity,
                     },
                     # The run this timeout was recorded against — the one
                     # ``_end_run`` just closed above, not a run inferred from
@@ -30529,7 +33143,8 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.worker_start_time, t.last_heartbeat_at, "
+        "       t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -30554,9 +33169,26 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
+        # One classification of the recorded identity per row, reused by the
+        # termination decision AND by the audit payload. The heartbeat
+        # backstop above is what makes this row a candidate and it stays the
+        # authority for RELEASING it (a worker making no observable progress
+        # is reclaimed whatever its identity says — the same rule the
+        # stale-claim reclaim applies); what the identity decides is what may
+        # be SIGNALLED. LIVE and INDETERMINATE are treated identically: both
+        # go through the ordinary terminate-then-defer-if-it-survived path.
+        # Only a pid the OS recycled — alive, but a different start time from
+        # the one recorded — is spared the signal, because the process
+        # wearing that number is a stranger.
+        identity: dict = {}
+        _worker_identity_presence(
+            pid, _row_worker_start_time(row), evidence=identity,
+        )
+
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
+            recorded_start_time=_row_worker_start_time(row),
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -30594,6 +33226,10 @@ def detect_stale_running(
                 "retry_status": retry_status,
             }
             payload.update(termination)
+            # The evidence the verdict was reached on, not just the verdict:
+            # recorded pid, recorded start time, observed start time,
+            # classification — the same keys the stale-claim reclaim records.
+            payload.update(identity)
 
             run_id = _end_run(
                 conn, tid,
@@ -30651,14 +33287,26 @@ def reconcile_orphaned_running(
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+        "SELECT id, claim_lock, claim_expires, worker_pid, worker_start_time "
+        "FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL) AND task_kind = 'work'"
     ).fetchall()
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _pid_alive(pid):
+        # The recorded IDENTITY decides whether there is an owner to protect,
+        # not the pid number: a pid the OS recycled is a stranger, and
+        # deferring to it holds the card in ``running`` forever. LIVE and
+        # INDETERMINATE are both "there may be a real worker here" and are
+        # deferred exactly as before; only a provably-absent owner is
+        # requeued. A row with NO pid has no owner to duplicate and keeps
+        # being requeued exactly as before.
+        identity: dict = {}
+        presence = _worker_identity_presence(
+            pid, _row_worker_start_time(row), evidence=identity,
+        )
+        if pid and presence is not HolderPresence.PROVABLY_ABSENT:
             # The recorded worker may still be doing real work — never
             # requeue beside a live process. Retry next tick.
             _log.debug(
@@ -30666,6 +33314,16 @@ def reconcile_orphaned_running(
                 "pid %s is alive on this host — deferring", tid, pid,
             )
             continue
+        if identity.get("observed_worker_start_time") is not None:
+            # The number is running; the process wearing it is not our
+            # worker. Saying "pid gone" here would be false.
+            _log.info(
+                "kanban reconcile: task %s recorded pid %s was recycled — the "
+                "process holding it now started at %s, not the %s recorded "
+                "with the claim; requeueing without disturbing it",
+                tid, pid, identity["observed_worker_start_time"],
+                identity["worker_start_time"],
+            )
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -30687,6 +33345,11 @@ def reconcile_orphaned_running(
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
             }
+            # The evidence the verdict was reached on, not a bare pid: the
+            # start time recorded with the claim, the one observed now, and
+            # the classification — so a requeue taken over a recycled pid is
+            # auditable from this one event.
+            payload.update(identity)
             run_id = _end_run(
                 conn, tid,
                 outcome="reclaimed", status="reclaimed",
@@ -30809,6 +33472,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``_default_spawn`` always runs the worker on the same host as the
     dispatcher (the whole design is single-host).
 
+    Liveness is judged on the recorded IDENTITY via
+    :func:`_worker_identity_presence` — the pid together with the start
+    time ``_set_worker_pid`` bound beside it — so a pid the OS recycled to
+    an unrelated process is swept instead of being mistaken for a live
+    worker, and an owner whose identity cannot be established is left
+    strictly alone (INDETERMINATE is treated exactly like LIVE).
+
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
@@ -30843,7 +33513,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_start_time, claim_lock, started_at, "
+            "       assignee "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL "
             "AND task_kind = 'work'"
@@ -30862,7 +33533,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
                     continue
-            if _pid_alive(row["worker_pid"]):
+            # The recorded IDENTITY decides, not the pid number: only a
+            # provably-absent owner is swept. A live owner and an owner whose
+            # identity cannot be established are both left alone, and a pid
+            # the OS recycled to an unrelated process is provably absent —
+            # a bare liveness probe would have called it a live worker.
+            identity: dict = {}
+            presence = _worker_identity_presence(
+                row["worker_pid"], _row_worker_start_time(row), evidence=identity,
+            )
+            if presence is not HolderPresence.PROVABLY_ABSENT:
                 continue
 
             pid = int(row["worker_pid"])
@@ -30921,6 +33601,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error_text = f"pid {pid} exited with code {code}"
                 elif kind == "signaled":
                     error_text = f"pid {pid} killed by signal {code}"
+                elif identity.get("observed_worker_start_time") is not None:
+                    # The number is running; the process wearing it is not
+                    # our worker. Saying "not alive" here would be false.
+                    error_text = (
+                        f"pid {pid} was recycled: the process holding it now "
+                        f"started at {identity['observed_worker_start_time']}, "
+                        f"not the {identity['worker_start_time']} recorded "
+                        "with the claim"
+                    )
                 else:
                     error_text = f"pid {pid} not alive"
                 event_kind = "crashed"
@@ -30931,6 +33620,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
+            # Same evidence rule as the stale-claim reclaim: the event says
+            # what was observed, not only what was concluded.
+            event_payload.update(identity)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -31388,23 +34080,38 @@ def _record_spawn_failure(
 def _set_worker_pid(
     conn: sqlite3.Connection, task_id: str, pid: int, *, max_turns: Optional[int] = None,
 ) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
+    """Record the spawned child's pid + its identity witness, emit ``spawned``.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
+
+    This is the ONE writer of the pid on this side of the kernel, and it is
+    therefore also the one writer of ``worker_start_time``: the start-time
+    fingerprint of the process that pid names, read here and written in the
+    SAME statement group, inside the same ``write_txn``. A pid and its
+    witness commit together or not at all — a half-bound row would be a pid
+    with no identity, which is the state this column exists to abolish. A
+    probe that cannot answer writes NULL, which classifies as
+    INDETERMINATE (unknown), never as absent.
     """
+    start_time = _probe_worker_start_time(int(pid))
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+            "UPDATE tasks SET worker_pid = ?, worker_start_time = ? WHERE id = ?",
+            (int(pid), start_time, task_id),
         )
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+                "UPDATE task_runs SET worker_pid = ?, worker_start_time = ? "
+                "WHERE id = ?",
+                (int(pid), start_time, run_id),
             )
+        # The ``spawned`` payload keeps its established shape: the witness
+        # lives in the column the classifier reads, and the events that
+        # carry it as evidence are the reclaim ones, where it is the reason
+        # for a decision rather than a restatement of the row.
         payload: dict[str, Any] = {"pid": int(pid)}
         if max_turns:
             payload["max_turns"] = int(max_turns)
@@ -34595,3 +37302,36 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+def migrate_registered_boards() -> list[str]:
+    """Run the additive schema migration for every registered board, once.
+
+    Called at gateway startup so owner-read surfaces (e.g. ``verified_active_worker_rows``,
+    ``read_project_snapshot``) never encounter a board that still lacks columns added
+    by ``_migrate_add_optional_columns`` (such as ``worker_start_time``).  The migration
+    is the existing write-path kernel open: ``connect_closing(board=slug, create=False)``
+    triggers ``_open_initialized_store``, which runs ``CREATE TABLE IF NOT EXISTS`` and
+    ``_migrate_add_optional_columns`` exactly once per process per path, then caches
+    the result in ``_INITIALIZED_PATHS`` so subsequent opens are free.
+
+    Boards that cannot be opened (absent store, ``BoardFenceClosedError``, or any
+    other exception) are logged at WARNING and skipped — a single bad board must
+    never block startup.  Returns the list of slugs successfully opened.
+    """
+    migrated: list[str] = []
+    for meta in list_boards():
+        slug = meta.get("slug")
+        if not slug:
+            continue
+        try:
+            with connect_closing(board=slug, create=False):
+                pass
+        except Exception as exc:
+            _log.warning(
+                "migrate_registered_boards: skipping board %r — open failed: %s",
+                slug, exc,
+            )
+            continue
+        migrated.append(slug)
+    return migrated

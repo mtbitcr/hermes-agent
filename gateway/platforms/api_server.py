@@ -442,6 +442,36 @@ def _resolve_owner_lifecycle_run_authority(value: Any) -> "dict[str, Any] | None
     }
 
 
+def _resolve_owner_removal_run_authority(value: Any) -> "dict[str, Any] | None":
+    """Validate the closed transport shape for one Project removal run."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "operation", "idempotency_key", "payload",
+    }:
+        raise ValueError("invalid owner removal authority")
+    operation = value.get("operation")
+    idempotency_key = value.get("idempotency_key")
+    payload = value.get("payload")
+    if (
+        operation != "owner_project_removal"
+        or not isinstance(idempotency_key, str)
+        or re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", idempotency_key) is None
+        or not isinstance(payload, dict)
+        or payload.get("idempotency_key") != idempotency_key
+    ):
+        raise ValueError("invalid owner removal authority")
+    required_keys = {"idempotency_key", "project_id", "expected_revision", "action"}
+    allowed_keys = required_keys | {"consequences_digest"}
+    if not required_keys <= set(payload) or not set(payload) <= allowed_keys:
+        raise ValueError("invalid owner removal authority")
+    return {
+        "operation": operation,
+        "idempotency_key": idempotency_key,
+        "payload": payload,
+    }
+
+
 def _resolve_owner_retry_run_authority(value: Any) -> "dict[str, Any] | None":
     """Validate the closed transport shape for one owner retry run."""
     if value is None:
@@ -478,6 +508,7 @@ def _resolve_owner_retry_run_authority(value: Any) -> "dict[str, Any] | None":
 # An absent handler is refused (see ``_run_sync``), never substituted.
 _OWNER_NATIVE_RUN_HANDLERS = {
     "owner_task_retry": "_handle_task_retry",
+    "owner_project_removal": "_handle_project_removal",
 }
 
 
@@ -12696,6 +12727,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             from hermes_cli.owner_workspace import (
                 OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY,
+                OWNER_PROJECT_REMOVAL_STATE_CAPABILITY,
                 list_committed_projects,
                 resolve_owner_context,
             )
@@ -12704,6 +12736,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 resolve_owner_context(),
                 lifecycle_revision=_owner_workspace_capability_requested(
                     request, OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY,
+                ),
+                removal_state=_owner_workspace_capability_requested(
+                    request, OWNER_PROJECT_REMOVAL_STATE_CAPABILITY,
                 ),
             )
         except Exception:
@@ -13297,6 +13332,61 @@ class APIServerAdapter(BasePlatformAdapter):
             ).hexdigest(),
         }
 
+    def _validated_owner_removal_authority(
+        self,
+        authority: "dict[str, Any]",
+        context: "dict[str, Any]",
+        profile: str,
+    ) -> "dict[str, Any]":
+        """Bind one removal run to exact receipt-backed Project state."""
+        if (
+            context.get("profile") != profile
+            or context.get("mode") != "existing"
+            or not isinstance(context.get("project_slug"), str)
+        ):
+            raise ValueError("owner removal context mismatch")
+        payload = authority["payload"]
+        project_id = payload.get("project_id")
+        expected_revision = payload.get("expected_revision")
+        action = payload.get("action")
+        if (
+            not isinstance(project_id, str)
+            or not project_id
+            or isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+            or action not in {"start", "confirm_permanent", "cancel", "restore"}
+        ):
+            raise ValueError("owner removal payload is invalid")
+
+        from hermes_cli.owner_workspace import (
+            list_committed_projects,
+            resolve_owner_context,
+        )
+
+        projects = list_committed_projects(
+            resolve_owner_context(), lifecycle_revision=True,
+        )
+        matches = [
+            project for project in projects
+            if project.get("slug") == context["project_slug"]
+            and project.get("project_id") == project_id
+            and project.get("lifecycle_revision") == expected_revision
+        ]
+        if len(matches) != 1:
+            raise ValueError("owner removal Project state is stale")
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        return {
+            "operation": "owner_project_removal",
+            "payload": copy.deepcopy(payload),
+            "idempotency_key": authority["idempotency_key"],
+            "payload_digest": hashlib.sha256(
+                canonical.encode("utf-8")
+            ).hexdigest(),
+        }
+
     def _validated_owner_retry_authority(
         self,
         authority: "dict[str, Any]",
@@ -13693,6 +13783,30 @@ class APIServerAdapter(BasePlatformAdapter):
                 "archived": archived,
                 "execution_paused": execution_paused,
             }
+        elif operation == "owner_project_removal":
+            # A removal is ACCEPTED synchronously and driven to its terminal
+            # phase off the request path, so acceptance IS this run's
+            # committed outcome; waiting for 'done' reports an accepted
+            # removal as an uncommitted change. The owner Workspace's strict
+            # parser requires the full removal_state object (phase, mode,
+            # cancelable, restorable, consequences digest, retained-copy and
+            # receipt handles, last_error), not a flattened phase string, so
+            # that object is what gets committed to the receipt.
+            action = value.get("action")
+            state = value.get("removal_state")
+            phase = state.get("phase") if isinstance(state, dict) else None
+            if (
+                action not in {"start", "confirm_permanent", "cancel", "restore"}
+                or not isinstance(phase, str)
+                or re.fullmatch(r"[a-z][a-z_]{0,31}", phase) is None
+            ):
+                return None
+            receipt = {
+                "ok": True,
+                "action": action,
+                "project_slug": project_slug,
+                "removal_state": state,
+            }
         else:
             return None
         return json.dumps(receipt, sort_keys=True, separators=(",", ":"))
@@ -13721,6 +13835,9 @@ class APIServerAdapter(BasePlatformAdapter):
             owner_lifecycle_authority = _resolve_owner_lifecycle_run_authority(
                 body.get("owner_lifecycle_authority")
             )
+            owner_removal_authority = _resolve_owner_removal_run_authority(
+                body.get("owner_removal_authority")
+            )
             owner_retry_authority = _resolve_owner_retry_run_authority(
                 body.get("owner_retry_authority")
             )
@@ -13731,6 +13848,7 @@ class APIServerAdapter(BasePlatformAdapter):
         owner_authorities = (
             owner_proposal_authority,
             owner_lifecycle_authority,
+            owner_removal_authority,
             owner_retry_authority,
         )
         if sum(authority is not None for authority in owner_authorities) > 1:
@@ -13879,11 +13997,37 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=409,
                 )
+        if owner_removal_authority is not None:
+            # A completed removal command changes the state its authority
+            # was bound to. An exact transport retry must therefore resolve
+            # from the persisted terminal receipt before fresh-state
+            # validation.
+            replayed = self._replayed_native_owner_run(
+                request=request,
+                body=body,
+                authority=owner_removal_authority,
+                profile=request_owner_profile,
+                gateway_session_key=gateway_session_key,
+            )
+            if replayed is not None:
+                return replayed
+            try:
+                owner_removal_authority = (
+                    self._validated_owner_removal_authority(
+                        owner_removal_authority,
+                        owner_workspace_context,
+                        request_owner_profile,
+                    )
+                )
+            except ValueError:
+                return web.json_response(
+                    _openai_error(
+                        "Owner removal state does not authorize this run",
+                        code="owner_removal_authority_conflict",
+                    ),
+                    status=409,
+                )
         if owner_retry_authority is not None:
-            # A committed retry moves the stopped work the authority was bound
-            # to out of the state that made it retryable, so an exact
-            # transport retry resolves from the persisted terminal receipt
-            # before fresh-state validation, exactly like a lifecycle command.
             replayed = self._replayed_native_owner_run(
                 request=request,
                 body=body,
@@ -13911,6 +14055,7 @@ class APIServerAdapter(BasePlatformAdapter):
         owner_mutation_authority = (
             owner_proposal_authority
             or owner_lifecycle_authority
+            or owner_removal_authority
             or owner_retry_authority
         )
 
@@ -14516,7 +14661,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "owner_project_plan_commit",
                         "owner_task_move",
                         "owner_task_comment", "owner_project_lifecycle",
-                        "owner_task_retry",
+                        "owner_task_retry", "owner_project_removal",
                     }:
                         pending_approval["operation"] = operation
                     self._set_run_status(
@@ -15471,6 +15616,25 @@ class APIServerAdapter(BasePlatformAdapter):
             # process cannot resume, so it is made terminal before this one
             # starts serving.
             self._recover_orphaned_owner_jobs()
+
+            # Queued owner removal work IS resumable from durable state (unlike
+            # the orphaned owner jobs just terminalised above), so a restart
+            # re-dispatches its drive rather than abandoning it mid-phase.
+            try:
+                from hermes_cli.owner_workspace import resume_removal_operations
+                resume_removal_operations()
+            except Exception:
+                logger.exception("[api_server] removal operation resume failed")
+
+            # Run the additive schema migration (e.g. worker_start_time column) on
+            # every registered board before any owner read can arrive.  Boards opened
+            # read-only by the owner snapshot path raise sqlite3.OperationalError when
+            # the column is absent; a single write-path kernel open here migrates them.
+            try:
+                from hermes_cli.kanban_db import migrate_registered_boards
+                migrate_registered_boards()
+            except Exception:
+                logger.exception("[api_server] migrate_registered_boards failed")
 
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())

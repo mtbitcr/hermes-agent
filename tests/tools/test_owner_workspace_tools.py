@@ -33,7 +33,7 @@ TOOL_NAMES = (
     "owner_workspace_bootstrap", "owner_task_graph_commit",
     "owner_project_plan_commit",
     "owner_task_move", "owner_task_comment",
-    "owner_project_lifecycle",
+    "owner_project_lifecycle", "owner_project_removal",
 )
 
 
@@ -57,7 +57,7 @@ class TestToolSurface:
 
     def test_no_other_toolset_exposes_owner_tools(self):
         for name, ts in TOOLSETS.items():
-            if name in {"owner_workspace", "owner_task_graph_commit", "owner_project_plan_commit", "owner_project_lifecycle"}:
+            if name in {"owner_workspace", "owner_task_graph_commit", "owner_project_plan_commit", "owner_project_lifecycle", "owner_project_removal"}:
                 continue
             assert not set(ts.get("tools") or []) & set(TOOL_NAMES)
         assert TOOLSETS["owner_task_graph_commit"]["tools"] == [
@@ -69,11 +69,14 @@ class TestToolSurface:
         assert TOOLSETS["owner_project_lifecycle"]["tools"] == [
             "owner_project_lifecycle"
         ]
+        assert TOOLSETS["owner_project_removal"]["tools"] == [
+            "owner_project_removal"
+        ]
 
     def test_owner_workspace_toolsets_are_kernel_gated(self):
         assert {
             "owner_workspace", "owner_task_graph_commit", "owner_project_plan_commit",
-            "owner_project_lifecycle",
+            "owner_project_lifecycle", "owner_project_removal",
         } <= get_kernel_gated_toolsets()
 
     def test_resolve_toolset_returns_exactly_these_tools(self):
@@ -118,6 +121,7 @@ _ALLOWED_PARAM_NAMES = {
     "request_title", "specification", "current_milestone",
     "owner_visible_result", "root_assignee", "tasks", "later_milestones",
     "trigger", "summary", "changes", "action", "reason",
+    "consequences_digest",
 }
 
 

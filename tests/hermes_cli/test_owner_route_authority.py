@@ -46,6 +46,16 @@ _NAMED_ROLE_ROUTE = {
 }
 
 
+def _bootstrap_default_board() -> None:
+    """Explicitly bring the default board's store into being.
+
+    ``connect()`` never creates one (that is the whole point of the fence
+    under test here), so any test whose own setup is the board's first
+    touch has to ask for it through the admitted creation entry point.
+    """
+    kanban_db.init_db()
+
+
 def _write_profile_route(profile: str, config: dict) -> None:
     directory = get_profile_dir(profile)
     directory.mkdir(parents=True, exist_ok=True)
@@ -147,6 +157,7 @@ def test_the_dispatcher_never_sees_the_anchor(bootstrapped):
 
 
 def test_a_control_task_cannot_be_created_with_a_route():
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         with pytest.raises(ValueError, match="control task cannot carry"):
             kanban_db.create_task(
@@ -346,6 +357,7 @@ def _seed_receipt(operation: str, result, *, project_id) -> None:
 def test_a_fully_specified_but_unlocked_task_is_not_skipped(monkeypatch):
     """Naming all three route fields is not the same as being approved."""
     _write_profile_route(_OWNER_PROFILE, _OWNER_ROUTE)
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = kanban_db.create_task(
             conn,
@@ -371,6 +383,7 @@ def test_a_fully_specified_but_unlocked_task_is_not_skipped(monkeypatch):
 def test_an_unpinnable_receipt_owned_task_is_paused_not_left_runnable(monkeypatch):
     """A route the policy cannot admit is paused with a reapproval requirement."""
     _write_profile_route(_OWNER_PROFILE, _OWNER_ROUTE)
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         # No execution tier at all: the policy can mint no authority for it.
         legacy_id = kanban_db.create_task(
@@ -412,6 +425,7 @@ def test_an_unpinnable_receipt_owned_task_is_paused_not_left_runnable(monkeypatc
 
 def test_an_ordinary_non_receipt_task_is_never_fenced(monkeypatch):
     _write_profile_route(_OWNER_PROFILE, _OWNER_ROUTE)
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         manual_id = kanban_db.create_task(
             conn, title="manual card", assignee=_OWNER_PROFILE,
@@ -433,6 +447,7 @@ def test_an_ordinary_non_receipt_task_is_never_fenced(monkeypatch):
 def _exposed_owner_task(monkeypatch, **columns) -> str:
     """One unlocked receipt-owned task the fence is told to cover."""
     _write_profile_route(_OWNER_PROFILE, _OWNER_ROUTE)
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = kanban_db.create_task(
             conn,
@@ -537,6 +552,9 @@ def test_every_board_lock_is_taken_in_one_deterministic_order(monkeypatch):
     boards = ["zzz-second-board", "aaa-first-board"]
     owned: dict[str, set[str]] = {}
     for board in boards:
+        # Each of these named boards is genuinely new: bootstrap its store
+        # explicitly before creating work on it.
+        kanban_db.init_db(board=board)
         with kanban_db.connect(board=board) as conn:
             owned[board] = {kanban_db.create_task(
                 conn,
@@ -572,6 +590,9 @@ def test_two_concurrent_fences_over_the_same_boards_both_complete():
     owned: dict[str, set[str]] = {board: set() for board in boards}
     expected: dict[str, set[str]] = {role: set() for role in roles}
     for board in boards:
+        # Each of these named boards is genuinely new: bootstrap its store
+        # explicitly before creating work on it.
+        kanban_db.init_db(board=board)
         with kanban_db.connect(board=board) as conn:
             for role in roles:
                 task_id = kanban_db.create_task(
@@ -697,6 +718,7 @@ def _locked_task(conn, *, assignee: str = "raphael-builder") -> str:
 
 
 def test_reassigning_a_locked_task_is_refused():
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = _locked_task(conn)
         before = kanban_db.get_task(conn, task_id)
@@ -709,6 +731,7 @@ def test_reassigning_a_locked_task_is_refused():
 
 
 def test_unassigning_a_locked_task_is_refused_so_no_stale_lock_survives():
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = _locked_task(conn)
         with pytest.raises(RuntimeError, match="would strand the lock"):
@@ -719,6 +742,7 @@ def test_unassigning_a_locked_task_is_refused_so_no_stale_lock_survives():
 
 
 def test_only_an_exact_owner_approved_replacement_route_can_move_a_locked_task():
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = _locked_task(conn)
         # The verifier's one admitted lane — independent of the Claude family
@@ -772,6 +796,7 @@ def test_only_an_exact_owner_approved_replacement_route_can_move_a_locked_task()
 
 def test_internal_review_and_rework_do_not_silently_repin_a_locked_task():
     """Review/rework must be separately approved work, never a silent re-pin."""
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = _locked_task(conn)
         with kanban_db.write_txn(conn):
@@ -806,6 +831,7 @@ def test_request_changes_cannot_silently_repin_a_locked_task():
     verifier_route = model_policy.task_assignment_for(
         "raphael-verifier", "openai-codex", "deep"
     )
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         # An ordinary unlocked card, so the historical review handoff really
         # runs and leaves the implementer provenance request_changes reads
@@ -864,6 +890,7 @@ def test_request_changes_cannot_silently_repin_a_locked_task():
 
 
 def test_the_dispatcher_default_assignee_cannot_adopt_a_locked_task():
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = _locked_task(conn)
         with kanban_db.write_txn(conn):
@@ -902,6 +929,7 @@ def _migrated_owner_task(conn, *, status: str = "scheduled") -> str:
 
 @pytest.mark.parametrize("status", ["scheduled", "todo"])
 def test_migrated_owner_work_refuses_every_reassignment_surface(status):
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = _migrated_owner_task(conn, status=status)
         before = kanban_db.get_task(conn, task_id)
@@ -935,6 +963,7 @@ def test_migrated_owner_work_cannot_be_rerouted_then_promoted_into_a_run():
     mint an "exact admitted lock" for a route nobody approved. With the reroute
     refused, the row has nothing to mint from and stays out of the work pool.
     """
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = _migrated_owner_task(conn, status="todo")
         with pytest.raises(RuntimeError):
@@ -950,6 +979,7 @@ def test_migrated_owner_work_cannot_be_rerouted_then_promoted_into_a_run():
 
 
 def test_migrated_owner_work_refuses_a_triage_specify_role_change():
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = _migrated_owner_task(conn, status="triage")
         with pytest.raises(RuntimeError, match="approved again"):
@@ -961,6 +991,7 @@ def test_migrated_owner_work_refuses_a_triage_specify_role_change():
 
 
 def test_one_exact_reapproved_route_moves_migrated_owner_work_atomically():
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = _migrated_owner_task(conn)
         approved = model_policy.task_assignment_for(
@@ -999,6 +1030,7 @@ def test_one_exact_reapproved_route_moves_migrated_owner_work_atomically():
 
 def test_an_ordinary_manual_task_keeps_every_route_mutation():
     """Nothing here narrows a card no owner receipt owns."""
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = kanban_db.create_task(
             conn, title="manual card", assignee="engineer",
@@ -1013,6 +1045,7 @@ def test_an_ordinary_manual_task_keeps_every_route_mutation():
 
 
 def test_an_unlocked_task_keeps_its_ordinary_reassignment_behaviour():
+    _bootstrap_default_board()
     with kanban_db.connect() as conn:
         task_id = kanban_db.create_task(
             conn, title="manual card", assignee="engineer",
@@ -1627,8 +1660,10 @@ def pre_upgrade_board():
     that survives from before ``task_kind='control'`` existed.
     """
     path = kanban_db.kanban_db_path(board=_LEGACY_BOARD)
-    with contextlib.closing(kanban_db.connect(board=_LEGACY_BOARD)):
-        pass
+    # Explicit initial bootstrap of this board's store — everything after
+    # this line is deliberately reshaping it back into the pre-upgrade
+    # schema, which is the whole point of this fixture.
+    kanban_db.init_db(board=_LEGACY_BOARD)
     kanban_db.write_board_metadata(
         _LEGACY_BOARD, project_id=_LEGACY_PROJECT, dispatch_enabled=True,
     )
@@ -1997,6 +2032,9 @@ def test_a_well_formed_authority_field_is_still_verified(pre_upgrade_board):
 def test_a_board_with_no_metadata_file_still_dispatches(all_assignees_spawnable):
     """Absent is not unreadable: a board that publishes no owner is verified."""
     board = "no-metadata-board"
+    # Explicit store bootstrap only — deliberately no board metadata write,
+    # which is the whole premise this test exists to cover.
+    kanban_db.init_db(board=board)
     with contextlib.closing(kanban_db.connect(board=board)) as conn:
         task_id = kanban_db.create_task(
             conn, title="plain card", assignee=_LEGACY_ROLE, board=board,

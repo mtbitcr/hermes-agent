@@ -14,6 +14,8 @@ unsubscribe) and ``_format_kanban_event_text``.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from tui_gateway.server import (
     _collect_kanban_notifications,
@@ -21,6 +23,20 @@ from tui_gateway.server import (
 )
 
 SESSION_KEY = "tui-session-key-1"
+
+
+@pytest.fixture(autouse=True)
+def _bootstrap_board():
+    """Create the board explicitly; opening one no longer creates it.
+
+    Each test gets an empty ``HERMES_HOME``, and ``kb.connect()`` used to
+    bring the default board's store into existence on first use. It no
+    longer does — creating is now something a caller has to ask for, so
+    that a removed board cannot be resurrected by anything that merely
+    looks at it. The poller under test is a READER, so the store it reads
+    has to be brought into being here rather than by the read.
+    """
+    kb.init_db()
 
 
 def _session(key: str = SESSION_KEY) -> dict:

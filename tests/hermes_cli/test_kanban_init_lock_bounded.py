@@ -33,6 +33,11 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     db_path = kb.kanban_db_path(board="default")
+    # connect() opens an existing store and never creates one, so the board
+    # is created here. The cache entry is then dropped so each test's subject
+    # is still "a path this process has not initialized yet" — the state that
+    # decides whether the cross-process init lock is taken at all.
+    kb.init_db(board="default")
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     return home
 

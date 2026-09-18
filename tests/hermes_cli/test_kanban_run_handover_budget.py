@@ -26,6 +26,17 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+def _board(tmp_path: Path):
+    """Create this test's board store, then open it.
+
+    ``kb.connect()`` only opens an existing store — creating one is
+    ``init_db``'s job — so a test that wants a scratch board asks for it.
+    """
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    return kb.connect(db_path)
+
+
 def _git(cwd: Path, *args: str) -> str:
     result = subprocess.run(
         [
@@ -147,7 +158,7 @@ def test_budget_expiry_with_patch_and_report_completes_with_artifacts(
     repo = _repo(tmp_path)
     attachment_root = tmp_path / "attachments"
     monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(attachment_root))
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(
             conn, title="handover on budget", assignee="worker",
@@ -231,7 +242,7 @@ def test_budget_expiry_without_full_handover_still_times_out(
     repo = _repo(tmp_path)
     attachment_root = tmp_path / "attachments"
     monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(attachment_root))
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(
             conn, title="no full handover", assignee="worker",
@@ -279,7 +290,7 @@ def test_run_handover_failure_falls_back_to_timeout(tmp_path, monkeypatch):
     repo = _repo(tmp_path)
     attachment_root = tmp_path / "attachments"
     monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(attachment_root))
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(
             conn, title="bad handover patch", assignee="worker",
@@ -346,7 +357,7 @@ def test_current_run_report_under_a_collision_suffixed_name_is_found(
     monkeypatch.setenv(
         "HERMES_KANBAN_ATTACHMENTS_ROOT", str(tmp_path / "attachments"),
     )
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(
             conn, title="collision-suffixed report", assignee="worker",
@@ -430,7 +441,7 @@ def test_same_second_prior_run_artifacts_are_not_selected_for_a_new_run(
     monkeypatch.setenv(
         "HERMES_KANBAN_ATTACHMENTS_ROOT", str(tmp_path / "attachments"),
     )
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(
             conn, title="prior run artifacts", assignee="worker",
@@ -1298,7 +1309,7 @@ def test_rollback_leaves_a_head_that_moved_after_its_own_check_alone(
     worktree before answering.
     """
     repo = _repo(tmp_path)
-    with contextlib.closing(kb.connect(tmp_path / "kanban.db")) as conn:
+    with contextlib.closing(_board(tmp_path)) as conn:
         task_id = kb.create_task(
             conn, title="rollback window", assignee="worker",
             workspace_kind="worktree", workspace_path=str(repo),
@@ -1356,7 +1367,7 @@ def test_bound_completion_still_records_a_genuine_scope_rejection(
     monkeypatch.setenv(
         "HERMES_KANBAN_ATTACHMENTS_ROOT", str(tmp_path / "attachments"),
     )
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(
             conn, title="genuinely out of scope", assignee="worker",
@@ -1489,7 +1500,7 @@ def test_bound_budget_exit_still_records_a_genuine_handover_failure(
 def test_gave_up_breaker_preserves_and_records_attachments(tmp_path, monkeypatch):
     attachment_root = tmp_path / "attachments"
     monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(attachment_root))
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         task_id = kb.create_task(conn, title="flaky worker", assignee="worker")
         claimed = kb.claim_task(conn, task_id)
@@ -1550,7 +1561,7 @@ def test_enforce_max_runtime_is_the_bounded_mutation_not_the_helper(
 
     monkeypatch.setattr(kb, "_mutation_deadline", _spy_mutation_deadline)
 
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = _board(tmp_path)
     try:
         result = kb._run_handover_artifacts(conn, "no-such-task", None)
         assert result is None

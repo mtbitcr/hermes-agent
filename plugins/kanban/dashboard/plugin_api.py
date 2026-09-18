@@ -2726,9 +2726,13 @@ def list_kanban_projects(request: Request):
     _workspace_response = _workspace_maybe_respond(
         request,
         require_board=False,
-        builder=_workspace_projects_response,
+        builder=lambda: _workspace_projects_response(
+            include_removal_state=_workspace_applied_capability(request)
+            == owner_workspace.OWNER_PROJECT_REMOVAL_STATE_CAPABILITY
+        ),
         object_kind="project",
         object_id=WORKSPACE_PROJECT,
+        allowed_capability=owner_workspace.OWNER_PROJECT_REMOVAL_STATE_CAPABILITY,
     )
     if _workspace_response is not None:
         return _workspace_response
@@ -3480,11 +3484,39 @@ def _workspace_audit_deny(
     )
 
 
-def _workspace_require_no_query(request: Request) -> None:
-    """Routes 1-2 (``/projects``, ``/boards``): no query string admitted at all."""
-    if request.query_params.multi_items():
+def _workspace_require_no_query(
+    request: Request, *, allowed_capability: Optional[str] = None
+) -> None:
+    """Routes 1-2 (``/projects``, ``/boards``): no query string by default.
+
+    When *allowed_capability* is set, exactly one ``?capabilities=<value>``
+    parameter is admitted (same fail-closed rules as the board validator).
+    The board is never required or granted on these routes.
+    """
+    items = request.query_params.multi_items()
+    if allowed_capability is None:
+        if items:
+            _workspace_audit_deny(request, reason="unexpected_query", status=400)
+            raise HTTPException(status_code=400, detail="Bad Request")
+        return
+    if not items:
+        request.state.workspace_applied_capability = None
+        return
+    values: dict[str, str] = {}
+    invalid = False
+    for key, value in items:
+        if key in values:
+            invalid = True
+            break
+        values[key] = value
+    if (
+        invalid
+        or set(values) != {"capabilities"}
+        or values.get("capabilities") != allowed_capability
+    ):
         _workspace_audit_deny(request, reason="unexpected_query", status=400)
         raise HTTPException(status_code=400, detail="Bad Request")
+    request.state.workspace_applied_capability = allowed_capability
 
 
 def _workspace_applied_capability(request: Request) -> Optional[str]:
@@ -3594,7 +3626,9 @@ def _workspace_maybe_respond(
             request, allowed_capability=allowed_capability
         )
     else:
-        _workspace_require_no_query(request)
+        _workspace_require_no_query(
+            request, allowed_capability=allowed_capability
+        )
     try:
         scope_active = _workspace_scope_is_active()
     except (KeyError, OSError, TypeError, ValueError, sqlite3.Error):
@@ -3833,24 +3867,29 @@ def _workspace_task_event_state(
     }
 
 
-def _workspace_projects_response() -> Optional[dict]:
+def _workspace_projects_response(
+    *, include_removal_state: bool = False,
+) -> Optional[dict]:
     snapshot = _workspace_scope_snapshot()
     if snapshot is None:
         return None
     project, _ = snapshot
-    # This builder only ever serves the machine-authenticated owner reader
-    # (the interactive dashboard falls through to its own handler), so the
-    # name is projected unconditionally — unlike the board/worker titles,
-    # which stay raw for the browser and are gated on the owner capability.
-    return {
-        "projects": [
-            {
-                "id": project.id,
-                "slug": project.slug,
-                "name": owner_workspace.owner_project_name(project.name),
-            }
-        ]
+    projection = {
+        "id": project.id,
+        "slug": project.slug,
+        "name": owner_workspace.owner_project_name(project.name),
     }
+    if include_removal_state:
+        try:
+            from hermes_cli import projects_db as pdb
+            with pdb.connect_closing() as pconn:
+                removal_st = owner_workspace._project_removal_state(
+                    pconn, project.id, project.board_slug,
+                )
+            projection["removal_state"] = removal_st
+        except (OSError, ValueError, KeyError, sqlite3.Error):
+            projection["removal_state"] = None
+    return {"projects": [projection]}
 
 
 def _workspace_profiles_response() -> dict:

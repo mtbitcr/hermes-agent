@@ -192,6 +192,27 @@ def _handle_project_lifecycle(args: dict, **kw) -> str:
         return tool_error("owner_project_lifecycle: internal error")
 
 
+def _handle_project_removal(args: dict, **kw) -> str:
+    try:
+        ctx = resolve_owner_context()
+        result = _kernel.project_removal(
+            ctx,
+            idempotency_key=args.get("idempotency_key"),
+            project_id=args.get("project_id"),
+            expected_revision=args.get("expected_revision"),
+            action=args.get("action"),
+            consequences_digest=args.get("consequences_digest"),
+        )
+        return _ok(result)
+    except OwnerWorkspaceError as e:
+        return _refused("owner_project_removal", e)
+    except ValueError as e:
+        return tool_error(f"owner_project_removal: {e}")
+    except Exception:
+        logger.exception("owner_project_removal failed")
+        return tool_error("owner_project_removal: internal error")
+
+
 def _handle_task_move(args: dict, **kw) -> str:
     try:
         ctx = resolve_owner_context()
@@ -723,6 +744,29 @@ registry.register(
         },
     },
     handler=lambda args, **kw: _handle_project_lifecycle(args, **kw),
+)
+
+
+registry.register(
+    name="owner_project_removal",
+    toolset="owner_workspace",
+    schema={
+        "name": "owner_project_removal",
+        "description": "Remove one owner-workspace Project. Idempotent.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "idempotency_key": {"type": "string"},
+                "project_id": {"type": "string"},
+                "expected_revision": {"type": "integer", "minimum": 0},
+                "action": {"type": "string", "enum": ["start", "confirm_permanent", "cancel", "restore"]},
+                "consequences_digest": {"type": "string"},
+            },
+            "required": ["idempotency_key", "project_id", "expected_revision", "action"],
+        },
+    },
+    handler=lambda args, **kw: _handle_project_removal(args, **kw),
 )
 
 
