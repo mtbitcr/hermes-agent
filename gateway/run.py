@@ -4589,6 +4589,15 @@ def _housekeeping_deferred_fts_retry() -> None:
                     getattr(_sdb, "db_path", "state.db"))
 
 
+def _housekeeping_removal_resume() -> None:
+    """Re-drive non-terminal board removals. An accepted removal that met
+    in-flight work is refused once ("still quiescing") and records that on the
+    owner's operation; without this tick nothing drives it again until the
+    next process start, so the owner would wait for a restart."""
+    from hermes_cli.owner_workspace import resume_removal_operations
+    resume_removal_operations()
+
+
 def _housekeeping_memory_trim() -> None:
     """Messaging-gateway counterpart to the TUI idle reaper; config-gated and rate-limited inside."""
     from hermes_cli.mem_trim import trim_memory
@@ -4644,6 +4653,7 @@ def _start_gateway_housekeeping(
         (60, "Org sync pull tick", _housekeeping_org_skill_sync),
         (60, "Auto-archive tick", _housekeeping_auto_archive),
         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
+        (1, "Removal resume tick", _housekeeping_removal_resume),
         (1, "gateway housekeeping memory trim", _housekeeping_memory_trim)]
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
