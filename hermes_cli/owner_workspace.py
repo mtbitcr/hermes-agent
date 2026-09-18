@@ -6885,6 +6885,28 @@ def _removal_start(pconn, ctx, project, idempotency_key, operation, digest, exis
     return result
 
 
+def _withdraw_retained_copy_if_discarded(board_slug, removal_id):
+    """Withdraw the retained-copy handle when the copy is gone from disk.
+
+    Returns a dict of updates to apply: clears retained_copy_id only when
+    the copy has been discarded. If the copy is still present (e.g., a
+    pre-discard refusal), keeps the handle so the Restore offer remains valid.
+    Probe errors default to keeping the handle (fail safe toward not
+    destroying a real Restore offer).
+    """
+    retained_path = kanban_db.reversible_retained_path(board_slug, removal_id)
+    try:
+        copy_exists = retained_path.exists()
+    except OSError:
+        # Cannot prove the copy is gone; keep the handle (fail safe).
+        return {}
+    if copy_exists:
+        # Copy still present: keep the handle, the Restore is honourable.
+        return {}
+    # Copy is gone: withdraw the handle.
+    return {"retained_copy_id": None}
+
+
 def _removal_confirm_permanent(
     pconn, ctx, project, idempotency_key, operation, digest,
     existing_op, consequences_digest,
@@ -6928,9 +6950,13 @@ def _removal_confirm_permanent(
             disclosure=disclosure,
         )
         if not confirmation_result.confirmed:
+            retained_updates = _withdraw_retained_copy_if_discarded(
+                project.board_slug, existing_op["removal_id"],
+            )
             projects_db.update_removal_operation(
                 pconn, project.id, op_key,
                 last_error=_REMOVAL_SAFE_ERRORS["cancel_refused"],
+                **retained_updates,
             )
             result = {
                 "ok": False, "action": "confirm_permanent",
@@ -6948,10 +6974,13 @@ def _removal_confirm_permanent(
             permanent_confirmation=confirmation_result.confirmation,
         )
         if not fenced.success:
+            retained_updates = _withdraw_retained_copy_if_discarded(
+                project.board_slug, existing_op["removal_id"],
+            )
             projects_db.update_removal_operation(
                 pconn, project.id, op_key,
-                retained_copy_id=None,
                 last_error=_REMOVAL_SAFE_ERRORS["driver_failed"],
+                **retained_updates,
             )
             result = {
                 "ok": False, "action": "confirm_permanent",
@@ -6968,9 +6997,13 @@ def _removal_confirm_permanent(
             retained_copy_id=None,
         )
     except Exception:
+        retained_updates = _withdraw_retained_copy_if_discarded(
+            project.board_slug, existing_op["removal_id"],
+        )
         projects_db.update_removal_operation(
             pconn, project.id, op_key,
             last_error=_REMOVAL_SAFE_ERRORS["driver_failed"],
+            **retained_updates,
         )
         result = {
             "ok": False, "action": "confirm_permanent",

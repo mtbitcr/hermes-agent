@@ -915,3 +915,96 @@ class TestFinding6PermanentContinuesFromArchived:
         assert kanban_db.get_register_entry(s).lifecycle is (
             kanban_db.BoardLifecycle.LIVE
         )
+
+    def test_confirmation_refused_withdraws_retained_copy_when_discarded(
+        self, monkeypatch,
+    ):
+        """When confirm_permanent_removal refuses confirmation, the retained
+        copy has already been discarded by continue_archived_removal_as_permanent;
+        the handle must be withdrawn to avoid a false Restore offer."""
+        pid, s = _real_board(monkeypatch)
+        _start_and_join(pid, "f6conf")
+        with projects_db.connect_closing() as c:
+            served = _project_removal_state(c, pid, s)
+        assert served["phase"] == "done" and served["restorable"] is True
+        retained_copy_id = served["retained_copy_id"]
+        assert retained_copy_id
+        # Force confirmation refusal after continue_archived has already discarded.
+        conf_result = MagicMock()
+        conf_result.confirmed = False
+        monkeypatch.setattr(
+            kanban_db, "confirm_permanent_removal", lambda *a, **kw: conf_result,
+        )
+        confirmed = _call(
+            pid, f"f6confr{_n[0]}", "confirm_permanent",
+            consequences_digest=served["consequences_digest"],
+        )
+        assert confirmed["ok"] is False
+        with projects_db.connect_closing() as c:
+            after = _project_removal_state(c, pid, s)
+        # Handle withdrawn because the copy is gone.
+        assert after["restorable"] is False
+        assert after["retained_copy_id"] is None
+        assert not kanban_db.reversible_retained_path(s, retained_copy_id).exists()
+
+    def test_exception_after_discard_withdraws_retained_copy(self, monkeypatch):
+        """If an exception is raised AFTER continue_archived_removal_as_permanent
+        has discarded the retained copy, the generic exception handler must
+        withdraw the handle."""
+        pid, s = _real_board(monkeypatch)
+        _start_and_join(pid, "f6exc")
+        with projects_db.connect_closing() as c:
+            served = _project_removal_state(c, pid, s)
+        assert served["phase"] == "done" and served["restorable"] is True
+        retained_copy_id = served["retained_copy_id"]
+        assert retained_copy_id
+        # Let continue_archived succeed (discarding the copy), then raise.
+        orig_confirm = kanban_db.confirm_permanent_removal
+        def _raise_after_continue(*a, **kw):
+            raise RuntimeError("forced exception after discard")
+        monkeypatch.setattr(
+            kanban_db, "confirm_permanent_removal", _raise_after_continue,
+        )
+        confirmed = _call(
+            pid, f"f6excr{_n[0]}", "confirm_permanent",
+            consequences_digest=served["consequences_digest"],
+        )
+        assert confirmed["ok"] is False
+        with projects_db.connect_closing() as c:
+            after = _project_removal_state(c, pid, s)
+        # Handle withdrawn because the copy is gone.
+        assert after["restorable"] is False
+        assert after["retained_copy_id"] is None
+        assert not kanban_db.reversible_retained_path(s, retained_copy_id).exists()
+
+    def test_pre_discard_refusal_keeps_restorable_offer(self, monkeypatch):
+        """If continue_archived_removal_as_permanent refuses WITHOUT discarding
+        the retained copy, the exception handler must KEEP the handle and the
+        Restore offer — this is a pre-discard refusal."""
+        pid, s = _real_board(monkeypatch)
+        _start_and_join(pid, "f6pre")
+        with projects_db.connect_closing() as c:
+            served = _project_removal_state(c, pid, s)
+        assert served["phase"] == "done" and served["restorable"] is True
+        retained_copy_id = served["retained_copy_id"]
+        assert retained_copy_id
+        retained_path = kanban_db.reversible_retained_path(s, retained_copy_id)
+        assert retained_path.exists()
+        # Force continue_archived to fail WITHOUT discarding the copy.
+        monkeypatch.setattr(
+            kanban_db, "continue_archived_removal_as_permanent",
+            lambda *a, **kw: kanban_db.RestoreResult(
+                False, "pre-discard refusal for test",
+            ),
+        )
+        confirmed = _call(
+            pid, f"f6prer{_n[0]}", "confirm_permanent",
+            consequences_digest=served["consequences_digest"],
+        )
+        assert confirmed["ok"] is False
+        with projects_db.connect_closing() as c:
+            after = _project_removal_state(c, pid, s)
+        # Handle KEPT because the copy is still present.
+        assert after["restorable"] is True
+        assert after["retained_copy_id"] == retained_copy_id
+        assert retained_path.exists()
