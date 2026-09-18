@@ -2024,6 +2024,7 @@ _REMOVAL_SAFE_ERRORS: dict[str, str] = {
     "internal": "An unexpected condition prevented the operation from completing.",
     "start_refused": "The removal could not be started.",
     "restore_failed": "The retained copy could not be restored.",
+    "permanent_not_confirmed": "The permanent deletion was not confirmed; nothing was made permanent.",
 }
 
 
@@ -6926,6 +6927,24 @@ def _removal_confirm_permanent(
     if state == "terminal":
         return json.loads(row["result_json"])
 
+    approval = _confirm(
+        ctx, operation=operation, digest=digest,
+        description=(
+            f"Permanently delete Project {owner_project_name(project.name)!r}: "
+            "this makes the removal irreversible and the retained copy will "
+            "not be kept"
+        ),
+    )
+    if not approval.get("approved"):
+        result = {
+            "ok": False, "error": "confirmation_denied",
+            "reason": approval.get("reason"),
+        }
+        _finalize_receipt(
+            pconn, ctx, idempotency_key, token, status="denied", result=result,
+        )
+        return result
+
     op_key = existing_op["idempotency_key"]
     try:
         # The contract offers confirm_permanent on a COMPLETED recoverable
@@ -6955,13 +6974,13 @@ def _removal_confirm_permanent(
             )
             projects_db.update_removal_operation(
                 pconn, project.id, op_key,
-                last_error=_REMOVAL_SAFE_ERRORS["cancel_refused"],
+                last_error=_REMOVAL_SAFE_ERRORS["permanent_not_confirmed"],
                 **retained_updates,
             )
             result = {
                 "ok": False, "action": "confirm_permanent",
                 "project_slug": project.slug,
-                "reason": _REMOVAL_SAFE_ERRORS["cancel_refused"],
+                "reason": _REMOVAL_SAFE_ERRORS["permanent_not_confirmed"],
             }
             _finalize_receipt(
                 pconn, ctx, idempotency_key, token, status="committed",

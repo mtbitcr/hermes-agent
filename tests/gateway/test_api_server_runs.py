@@ -2083,6 +2083,58 @@ class TestOwnerRetryMutationReceipt:
         }
 
 
+class TestOwnerRemovalMutationReceipt:
+    """The minimal receipt projection for a Project removal."""
+
+    def test_a_genuine_success_keeps_the_removal_state_object_intact(self, adapter):
+        result = {
+            "ok": True, "action": "start", "project_slug": "workshop-pilot",
+            "removal_state": {
+                "phase": "accepted", "mode": "recoverable",
+                "cancelable": True, "restorable": False,
+                "consequences_digest": "abc123", "last_error": None,
+            },
+        }
+        receipt = json.loads(adapter._owner_mutation_receipt(
+            "owner_project_removal", result,
+        ))
+        assert receipt["ok"] is True
+        assert receipt["action"] == "start"
+        assert receipt["project_slug"] == "workshop-pilot"
+        assert receipt["removal_state"]["phase"] == "accepted"
+        assert receipt["removal_state"]["mode"] == "recoverable"
+        assert receipt["removal_state"]["cancelable"] is True
+        assert receipt["removal_state"]["restorable"] is False
+
+    def test_an_unknown_action_projects_nothing(self, adapter):
+        result = {
+            "ok": True, "action": "delete_forever",
+            "project_slug": "workshop-pilot",
+            "removal_state": {"phase": "accepted"},
+        }
+        assert adapter._owner_mutation_receipt(
+            "owner_project_removal", result,
+        ) is None
+
+    @pytest.mark.parametrize("removal_state", [
+        None,
+        "accepted",
+        {},
+        {"phase": 1},
+        {"phase": "Accepted!"},
+    ])
+    def test_a_missing_or_invalid_removal_state_projects_nothing(
+        self, adapter, removal_state,
+    ):
+        result = {
+            "ok": True, "action": "start", "project_slug": "workshop-pilot",
+            "removal_state": removal_state,
+        }
+        assert adapter._owner_mutation_receipt(
+            "owner_project_removal", result,
+        ) is None
+
+
 # ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id} — poll run status
 # ---------------------------------------------------------------------------
@@ -3257,7 +3309,9 @@ class TestOwnerRemovalRunBoundary:
         assert started.status == 202
         assert status["status"] == "completed", status.get("error")
         assert status["owner_mutation_committed"] is True
-        assert json.loads(status["output"]) == {
-            "ok": True, "action": "start",
-            "project_slug": created["project_slug"], "phase": "accepted"}
+        output = json.loads(status["output"])
+        assert output["ok"] is True
+        assert output["action"] == "start"
+        assert output["project_slug"] == created["project_slug"]
+        assert output["removal_state"]["phase"] == "accepted"
         mock_create.assert_not_called()

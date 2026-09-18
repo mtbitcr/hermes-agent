@@ -405,6 +405,72 @@ class TestT1RealStartThenAction:
                    consequences_digest=served_digest)
         assert rc["ok"] and rc["action"] == "confirm_permanent"
 
+    def test_confirm_permanent_denied_leaves_phase_and_mode_unchanged(
+        self, monkeypatch,
+    ):
+        pid, s = _setup(monkeypatch)
+        _mock_intent_success(monkeypatch, s)
+        monkeypatch.setattr(ow, "_dispatch_removal_drive", lambda *a, **kw: None)
+        start_ik = f"t1pd_s{_n[0]}"
+        r = _call(pid, start_ik, "start")
+        assert r["ok"]
+        served_digest = r["removal_state"]["consequences_digest"]
+
+        continue_mock = MagicMock()
+        disclosure_mock = MagicMock()
+        confirm_mock = MagicMock()
+        fence_mock = MagicMock()
+        update_mock = MagicMock()
+        monkeypatch.setattr(
+            kanban_db, "continue_archived_removal_as_permanent", continue_mock)
+        monkeypatch.setattr(
+            kanban_db, "permanent_removal_disclosure", disclosure_mock)
+        monkeypatch.setattr(kanban_db, "confirm_permanent_removal", confirm_mock)
+        monkeypatch.setattr(kanban_db, "remove_board_fenced", fence_mock)
+        monkeypatch.setattr(projects_db, "update_removal_operation", update_mock)
+        monkeypatch.setattr(
+            "tools.approval.request_exact_operation_approval",
+            lambda *a, **kw: {"approved": False, "reason": "owner declined"},
+        )
+
+        confirm_ik = f"t1pd_c{_n[0]}"
+        rc = _call(
+            pid, confirm_ik, "confirm_permanent", consequences_digest=served_digest,
+        )
+
+        assert rc["ok"] is False
+        assert rc["error"] == "confirmation_denied"
+        assert rc["reason"] == "owner declined"
+        continue_mock.assert_not_called()
+        disclosure_mock.assert_not_called()
+        confirm_mock.assert_not_called()
+        fence_mock.assert_not_called()
+        update_mock.assert_not_called()
+
+        with projects_db.connect_closing() as c:
+            st = _project_removal_state(c, pid, s)
+        assert st["phase"] == "accepted"
+        assert st["mode"] == "recoverable"
+
+    def test_confirm_permanent_approved_continues_as_before(self, monkeypatch):
+        pid, s = _setup(monkeypatch)
+        _mock_intent_success(monkeypatch, s)
+        monkeypatch.setattr(ow, "_dispatch_removal_drive", lambda *a, **kw: None)
+        start_ik = f"t1pa_s{_n[0]}"
+        r = _call(pid, start_ik, "start")
+        assert r["ok"]
+        served_digest = r["removal_state"]["consequences_digest"]
+
+        _mock_permanent_path(monkeypatch, s)
+        confirm_ik = f"t1pa_c{_n[0]}"
+        rc = _call(
+            pid, confirm_ik, "confirm_permanent", consequences_digest=served_digest,
+        )
+
+        assert rc["ok"] is True
+        assert rc["action"] == "confirm_permanent"
+        assert rc["removal_state"]["mode"] == "permanent"
+
     def test_start_key_replay_safe(self, monkeypatch):
         pid, s = _setup(monkeypatch)
         _mock_intent_success(monkeypatch, s)

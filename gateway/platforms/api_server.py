@@ -13787,7 +13787,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # A removal is ACCEPTED synchronously and driven to its terminal
             # phase off the request path, so acceptance IS this run's
             # committed outcome; waiting for 'done' reports an accepted
-            # removal as an uncommitted change.
+            # removal as an uncommitted change. The owner Workspace's strict
+            # parser requires the full removal_state object (phase, mode,
+            # cancelable, restorable, consequences digest, retained-copy and
+            # receipt handles, last_error), not a flattened phase string, so
+            # that object is what gets committed to the receipt.
             action = value.get("action")
             state = value.get("removal_state")
             phase = state.get("phase") if isinstance(state, dict) else None
@@ -13801,7 +13805,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "ok": True,
                 "action": action,
                 "project_slug": project_slug,
-                "phase": phase,
+                "removal_state": state,
             }
         else:
             return None
@@ -13994,6 +13998,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=409,
                 )
         if owner_removal_authority is not None:
+            # A completed removal command changes the state its authority
+            # was bound to. An exact transport retry must therefore resolve
+            # from the persisted terminal receipt before fresh-state
+            # validation.
             replayed = self._replayed_native_owner_run(
                 request=request,
                 body=body,
@@ -14003,7 +14011,6 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if replayed is not None:
                 return replayed
-        if owner_removal_authority is not None:
             try:
                 owner_removal_authority = (
                     self._validated_owner_removal_authority(
