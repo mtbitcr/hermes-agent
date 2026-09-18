@@ -2063,7 +2063,7 @@ def _project_lifecycle_revision(
         "WHERE actor = ? AND profile = ? "
         "AND (project_id = ? OR (project_id IS NULL AND request_digest IN ("
         f"{legacy_digest_placeholders}))) "
-        "AND operation = 'owner_project_lifecycle' "
+        "AND operation IN ('owner_project_lifecycle', 'owner_project_removal') "
         f"{generation_filter}",
         (ctx.actor, ctx.profile, project_id, *legacy_digests),
     ).fetchall()
@@ -6927,6 +6927,11 @@ def _removal_confirm_permanent(
     if state == "terminal":
         return json.loads(row["result_json"])
 
+    _update_progress(
+        pconn, ctx, idempotency_key, token,
+        project_id=project.id, board_slug=project.board_slug,
+    )
+
     approval = _confirm(
         ctx, operation=operation, digest=digest,
         description=(
@@ -7060,6 +7065,11 @@ def _removal_cancel(pconn, ctx, project, idempotency_key, operation, digest, exi
     if state == "terminal":
         return json.loads(row["result_json"])
 
+    _update_progress(
+        pconn, ctx, idempotency_key, token,
+        project_id=project.id, board_slug=project.board_slug,
+    )
+
     if existing_op["removal_id"]:
         kanban_db.abandon_or_cancel_removal(
             project.board_slug, removal_id=existing_op["removal_id"], reason="cancel",
@@ -7110,6 +7120,11 @@ def _removal_restore(pconn, ctx, project, idempotency_key, operation, digest, ex
     )
     if state == "terminal":
         return json.loads(row["result_json"])
+
+    _update_progress(
+        pconn, ctx, idempotency_key, token,
+        project_id=project.id, board_slug=project.board_slug,
+    )
 
     restore_result = kanban_db.restore_retained_board(
         project.board_slug, removal_id=existing_op["removal_id"],

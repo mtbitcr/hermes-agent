@@ -66,7 +66,13 @@ def _mk_op(pid, s, ik, phase, **kw):
             action="start", phase=phase, mode="reversible",
             board_slug=s, removal_id="rm", **kw)
 
-def _call(pid, ik, action, rev=0, **kw):
+def _call(pid, ik, action, rev=None, **kw):
+    # The optimistic revision now advances with every completed removal action,
+    # so a test that chains actions reads the served revision the way the owner
+    # Workspace does instead of assuming zero.
+    if rev is None:
+        with projects_db.connect_closing() as c:
+            rev = ow._project_lifecycle_revision(c, _ctx(), pid)
     p = {"idempotency_key":ik,"project_id":pid,"expected_revision":rev,"action":action}
     if "consequences_digest" in kw:
         p["consequences_digest"] = kw["consequences_digest"]
@@ -476,9 +482,13 @@ class TestT1RealStartThenAction:
         _mock_intent_success(monkeypatch, s)
         monkeypatch.setattr(ow, "_dispatch_removal_drive", lambda *a, **kw: None)
         start_ik = f"t1rs{_n[0]}"
-        r1 = _call(pid, start_ik, "start")
+        # An exact retry re-sends the same request, revision included; only
+        # the served revision before the first call is the right one for both.
+        with projects_db.connect_closing() as c:
+            rev0 = ow._project_lifecycle_revision(c, _ctx(), pid)
+        r1 = _call(pid, start_ik, "start", rev=rev0)
         assert r1["ok"]
-        r2 = _call(pid, start_ik, "start")
+        r2 = _call(pid, start_ik, "start", rev=rev0)
         assert r2["ok"]
 
     def test_fresh_start_key_joins_existing(self, monkeypatch):
@@ -1074,3 +1084,42 @@ class TestFinding6PermanentContinuesFromArchived:
         assert after["restorable"] is True
         assert after["retained_copy_id"] == retained_copy_id
         assert retained_path.exists()
+
+
+# The optimistic revision counts removal receipts like lifecycle receipts: a
+# completed removal action advances it by one, so the owner Workspace's fence
+# (completion accepted only at the expected revision plus one) holds, and an
+# authority bound to the pre-removal revision is stale afterwards.
+class TestRevisionFence:
+    def test_start_advances_the_revision_by_one(self, monkeypatch):
+        pid, s = _setup(monkeypatch)
+        _mock_intent_success(monkeypatch, s)
+        monkeypatch.setattr(ow, "_dispatch_removal_drive", lambda *a, **kw: None)
+        with projects_db.connect_closing() as c:
+            before = ow._project_lifecycle_revision(c, _ctx(), pid)
+        assert _call(pid, f"rf_s{_n[0]}", "start", rev=before)["ok"]
+        with projects_db.connect_closing() as c:
+            assert ow._project_lifecycle_revision(c, _ctx(), pid) == before + 1
+
+    def test_pre_removal_revision_is_stale_after_the_start(self, monkeypatch):
+        pid, s = _setup(monkeypatch)
+        _mock_intent_success(monkeypatch, s)
+        monkeypatch.setattr(ow, "_dispatch_removal_drive", lambda *a, **kw: None)
+        with projects_db.connect_closing() as c:
+            before = ow._project_lifecycle_revision(c, _ctx(), pid)
+        assert _call(pid, f"rf_a{_n[0]}", "start", rev=before)["ok"]
+        with pytest.raises(OwnerWorkspaceError) as e:
+            _call(pid, f"rf_b{_n[0]}", "cancel", rev=before)
+        assert e.value.code == "stale_revision"
+
+    def test_cancel_after_start_advances_again(self, monkeypatch):
+        pid, s = _setup(monkeypatch)
+        _mock_intent_success(monkeypatch, s)
+        monkeypatch.setattr(ow, "_dispatch_removal_drive", lambda *a, **kw: None)
+        with projects_db.connect_closing() as c:
+            before = ow._project_lifecycle_revision(c, _ctx(), pid)
+        assert _call(pid, f"rf_c{_n[0]}", "start")["ok"]
+        r = _call(pid, f"rf_d{_n[0]}", "cancel")
+        assert r["ok"] and r["removal_state"]["phase"] == "cancelled"
+        with projects_db.connect_closing() as c:
+            assert ow._project_lifecycle_revision(c, _ctx(), pid) == before + 2
