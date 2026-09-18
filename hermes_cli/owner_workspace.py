@@ -70,6 +70,7 @@ Security contract enforced HERE (not at the tool layer):
 from __future__ import annotations
 
 import atexit
+import threading
 import contextlib
 import contextvars
 import hashlib
@@ -6749,6 +6750,12 @@ def _removal_drive_and_record(project_id, board_slug, operation_key):
 
 _removal_background_tasks: set = set()
 _removal_background_threads: set = set()
+# Operations whose drive is running right now, keyed (project_id, operation
+# key): the startup resume and the housekeeping resume tick may both find
+# the same non-terminal operation, and a second drive would only queue
+# behind the first on the board's register lock.
+_removal_drives_in_flight: set = set()
+_removal_drives_lock = threading.Lock()
 
 
 def _removal_thread_cleanup():
@@ -6773,13 +6780,19 @@ def _dispatch_removal_drive(board_slug, project_id, operation_key):
     tests/gateway/test_api_server_removal_resume_on_start.py) unrelated to
     this thread pool.
     """
-    import threading
+    key = (project_id, operation_key)
+    with _removal_drives_lock:
+        if key in _removal_drives_in_flight:
+            return
+        _removal_drives_in_flight.add(key)
 
     def _wrapped():
         try:
             _removal_drive_and_record(project_id, board_slug, operation_key)
         finally:
             _removal_background_threads.discard(t)
+            with _removal_drives_lock:
+                _removal_drives_in_flight.discard(key)
 
     # daemon=True prevents blocking interpreter shutdown indefinitely (CPython
     # joins non-daemon threads in threading._shutdown BEFORE atexit handlers
@@ -6793,7 +6806,12 @@ def _dispatch_removal_drive(board_slug, project_id, operation_key):
 def resume_removal_operations():
     """Re-dispatch drives for non-terminal removal operations.
 
-    Called at process startup to resume operations that were interrupted.
+    Called at process startup to resume operations that were interrupted,
+    and by the gateway housekeeping tick: a drive refused while the board
+    is still quiescing (a reservation held by in-flight work) records the
+    refusal and returns, so the operation must be driven again once the
+    reservation ends or its recorded deadline passes. A drive already
+    running for an operation is never doubled (see _dispatch_removal_drive).
     Must NOT be called from a status read path.
     """
     try:

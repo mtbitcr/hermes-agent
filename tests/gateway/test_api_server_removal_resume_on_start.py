@@ -288,3 +288,39 @@ def test_removal_resume_stalls_on_indeterminate_sweep_then_recovers(monkeypatch)
     assert op["applied_at"] is not None
     assert op["completed_at"] is not None
     assert op["last_error"] is None
+
+
+def test_resume_never_overlaps_a_drive_in_flight_for_one_operation(monkeypatch):
+    """The housekeeping resume tick may find an operation whose drive is still
+    running; it must not start a second drive for it, and once that drive
+    ends the next tick drives it again."""
+    import threading
+
+    pid, _, key = _setup_board_and_operation(monkeypatch)
+    started = []
+    release = threading.Event()
+
+    def blocking_drive(project_id, board_slug, operation_key):
+        started.append((project_id, operation_key))
+        release.wait(5)
+
+    monkeypatch.setattr(ow, "_removal_drive_and_record", blocking_drive)
+    try:
+        ow.resume_removal_operations()
+        ow.resume_removal_operations()
+        deadline = time.monotonic() + 2
+        while not started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.2)
+        assert started.count((pid, key)) == 1
+    finally:
+        release.set()
+    for thread in list(ow._removal_background_threads):
+        thread.join(5)
+    ow.resume_removal_operations()
+    deadline = time.monotonic() + 2
+    while started.count((pid, key)) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.count((pid, key)) == 2
+    for thread in list(ow._removal_background_threads):
+        thread.join(5)
