@@ -2149,6 +2149,7 @@ class TestRunStatus:
             "owner_task_graph_commit",
             "owner_project_plan_commit",
             "owner_task_retry",
+            "owner_project_removal",
         ],
     )
     async def test_status_exposes_redacted_approval_then_clears_it(self, adapter, operation):

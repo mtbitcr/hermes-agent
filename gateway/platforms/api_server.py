@@ -14661,7 +14661,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "owner_project_plan_commit",
                         "owner_task_move",
                         "owner_task_comment", "owner_project_lifecycle",
-                        "owner_task_retry",
+                        "owner_task_retry", "owner_project_removal",
                     }:
                         pending_approval["operation"] = operation
                     self._set_run_status(
