@@ -7,6 +7,7 @@ writes refuse with the structured refusal. Reads keep working throughout.
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -27,8 +28,10 @@ from tests.hermes_cli._kanban_fence_support import (
     make_legacy_board,
     marker_row,
     ready_task,
+    register_lineage,
     register_row,
     row_count,
+    start_removal,
 )
 
 
@@ -204,3 +207,241 @@ def test_the_register_and_the_marker_live_in_different_files(fence_home):
 
     assert marker_row("two-stores") is True
     assert kb.ever_existed_marker_set("two-stores") is True
+
+
+# ---------------------------------------------------------------------------
+# A board is born registered
+#
+# The backfill above is the operator's migration for boards that PREDATE the
+# fence. A board created today is not one of those: ``create_board`` publishes
+# its register authority inside the same admitted-creation window that brings
+# its directory and store into existence. A board that had to be backfilled by
+# hand before anything could be done to it was a board born unregistered —
+# every later operation that needs authority refused until an operator
+# intervened, with a removal refusing outright ("no register entry ... cannot
+# determine removability").
+# ---------------------------------------------------------------------------
+
+def _assert_left_nothing_behind(slug: str, *, what: str) -> None:
+    """No directory, no store, no metadata, no init lock for *slug*.
+
+    A refusal that still publishes something at the board's path has not
+    refused: the directory alone makes the name discoverable to
+    ``list_boards`` again.
+    """
+    db_path = kb.kanban_db_path(board=slug)
+    init_lock = db_path.with_name(db_path.name + ".init.lock")
+    assert not db_path.exists(), f"{what} left a store: {db_path}"
+    assert not kb.board_metadata_path(slug).exists(), f"{what} left board.json"
+    assert not init_lock.exists(), f"{what} left an init lock: {init_lock}"
+    assert not kb.board_dir(slug).exists(), f"{what} left the board directory"
+    assert all(entry["slug"] != slug for entry in kb.list_boards())
+
+
+def _assert_born_registered(slug: str) -> None:
+    """Every durable fact the backfill writes, written at creation instead.
+
+    Read off the three stores directly — the register, the archive and the
+    board's own gate — never through the module that wrote them.
+    """
+    assert register_row(slug) == {
+        "lifecycle": "live",
+        "epoch": 1,
+        "epoch_before": None,
+        "gate_move": "settled",
+    }
+    assert register_lineage(slug) == [1]
+    assert marker_row(slug) is True
+    assert archive_records(slug) == 1
+    # The registration is DISCHARGED, not left in flight.
+    assert intent_rows(slug) == 0
+    assert gate_row(kb.kanban_db_path(board=slug)) == ("open", 1)
+
+
+def test_a_created_board_carries_its_register_authority_immediately(fence_home):
+    """Creation publishes the entry, the marker + receipt and the mirror."""
+    kb.create_board("born-fenced")
+
+    _assert_born_registered("born-fenced")
+
+
+def test_a_creation_that_lost_the_registration_race_gets_the_board(
+    fence_home, monkeypatch,
+):
+    """Two creations of one new slug: the loser's backfill runs after the
+    winner registered the board, so it refuses on the marker; the board
+    exists, is live and writable, and the loser must get it back the way
+    ``mkdir -p`` would, not a refusal."""
+    real = kb.backfill_register_entry
+
+    def winner_registers_first(slug):
+        won = real(slug)
+        assert won.success, won.message
+        return kb.BackfillResult(
+            False, "GA-5: ever-existed marker is set, backfill not permitted",
+        )
+
+    monkeypatch.setattr(kb, "backfill_register_entry", winner_registers_first)
+
+    meta = kb.create_board("raced")
+
+    assert isinstance(meta, dict)
+    _assert_born_registered("raced")
+
+
+def test_a_created_board_can_start_a_reversible_removal_with_no_backfill(
+    fence_home,
+):
+    """The defect, stated as the operator sees it: a board created a moment
+    ago could not be removed, because removability could not be determined
+    for a name the register had never heard of."""
+    kb.create_board("removable")
+
+    result = start_removal("removable", mode="reversible")
+
+    assert result.success, result.message
+    assert result.outcome is kb.RemovalIntentOutcome.STARTED
+    assert result.mode is kb.RemovalMode.REVERSIBLE
+    assert register_row("removable")["lifecycle"] == "removing"
+
+
+def test_a_created_board_can_start_a_permanent_removal_with_no_backfill(
+    fence_home,
+):
+    """Same, through the mode that also needs the operator confirmation —
+    minted here by the shipped disclosure/confirm surfaces, so the
+    permanence statement really is what gets confirmed."""
+    kb.create_board("destroyable")
+
+    result = start_removal("destroyable", mode="permanent")
+
+    assert result.success, result.message
+    assert result.outcome is kb.RemovalIntentOutcome.STARTED
+    assert result.mode is kb.RemovalMode.PERMANENT
+    assert register_row("destroyable")["lifecycle"] == "removing"
+
+
+def test_creating_a_removed_name_is_still_refused_before_any_side_effect(
+    fence_home,
+):
+    """Registering at creation must not soften the resurrection guard: the
+    refusal still arrives BEFORE the directory, the metadata or the store."""
+    kb.create_board("gone-for-good")
+    assert kb.remove_board_fenced("gone-for-good", mode="reversible").success
+    assert not kb.board_dir("gone-for-good").exists()
+
+    with pytest.raises(kb.BoardFenceClosedError) as excinfo:
+        kb.create_board("gone-for-good")
+
+    assert excinfo.value.refusal.rule is kb.FenceRefusalRule.GA_2
+    assert excinfo.value.refusal.outcome is kb.FenceOutcome.REFUSED_CLOSED
+    _assert_left_nothing_behind("gone-for-good", what="the refused creation")
+
+
+def test_creating_a_name_whose_marker_is_set_is_still_refused(fence_home):
+    """The marker outlives the entry on purpose (it lives in the other
+    store), so a name it vouches for is refused even with no entry at all —
+    which is exactly the loss the second store exists to survive."""
+    kb.create_board("marked")
+    # Take the storage away through the legacy unguarded path, then LOSE the
+    # register row itself with a plain connection: no shipped path produces
+    # this state, it is the fault the marker is there to outlive.
+    kb.remove_board("marked", archive=False)
+    conn = sqlite3.connect(str(kb.register_db_path()))
+    try:
+        conn.execute("DELETE FROM board_register WHERE board_name = ?", ("marked",))
+        conn.commit()
+    finally:
+        conn.close()
+    assert register_row("marked") is None
+    assert marker_row("marked") is True
+
+    with pytest.raises(kb.BoardFenceClosedError) as excinfo:
+        kb.create_board("marked")
+
+    assert excinfo.value.refusal.rule is kb.FenceRefusalRule.GA_2
+    assert "marker" in excinfo.value.refusal.message
+    _assert_left_nothing_behind("marked", what="the refused creation")
+
+
+def test_an_interrupted_registration_leaves_nothing_durable(fence_home):
+    """The registration is part of the creation, so a creation that cannot
+    register fails as a whole: no half-made board, in any store."""
+    original = kb.transition_register_entry
+    kb.transition_register_entry = lambda entry: (_ for _ in ()).throw(
+        sqlite3.OperationalError("register store unavailable")
+    )
+    try:
+        with pytest.raises(kb.BoardFenceClosedError) as excinfo:
+            kb.create_board("half-born")
+    finally:
+        kb.transition_register_entry = original
+
+    assert excinfo.value.refusal.rule is kb.FenceRefusalRule.GA_5_FAIL
+    _assert_left_nothing_behind("half-born", what="the failed registration")
+    assert register_row("half-born") is None
+    assert marker_row("half-born") is False
+    assert archive_records("half-born") == 0
+    assert intent_rows("half-born") == 0
+
+    # And the name is still creatable: the failure left it repairable.
+    kb.create_board("half-born")
+    _assert_born_registered("half-born")
+    conn = kb.connect(board="half-born")
+    try:
+        assert ready_task(conn, "post-repair")
+    finally:
+        conn.close()
+    assert start_removal("half-born").success
+
+
+def test_a_registration_that_could_not_unwind_is_repaired_on_the_next_attempt(
+    fence_home,
+):
+    """When the unwind itself cannot complete, the intent is deliberately
+    RETAINED — and the next creation's own recovery (the existing
+    ``recover_backfill_intent``, run before any new attempt) settles it and
+    finishes the job. No second repair mechanism, and no name stuck
+    uncreatable behind an intent nobody discharges."""
+    originals = (kb.transition_register_entry, kb._compensate_backfill_mirror)
+    kb.transition_register_entry = lambda entry: (_ for _ in ()).throw(
+        sqlite3.OperationalError("register store unavailable")
+    )
+    kb._compensate_backfill_mirror = lambda slug: False
+    try:
+        with pytest.raises(kb.BoardFenceClosedError) as excinfo:
+            kb.create_board("retained-intent")
+    finally:
+        kb.transition_register_entry, kb._compensate_backfill_mirror = originals
+
+    assert "retained" in excinfo.value.refusal.message
+    # Nothing anyone reads as authority, and nothing on disk — but the
+    # journal remembers there is work left to undo.
+    _assert_left_nothing_behind("retained-intent", what="the failed registration")
+    assert register_row("retained-intent") is None
+    assert marker_row("retained-intent") is False
+    assert intent_rows("retained-intent") == 1
+
+    kb.create_board("retained-intent")
+
+    _assert_born_registered("retained-intent")
+
+
+def test_the_named_backfill_still_refuses_an_already_registered_board(
+    fence_home,
+):
+    """The migration is one-time, and creation is not a licence to re-run
+    it: a board that already carries an entry and a marker gets the same
+    refusal it has always got. (``backfill_all_boards`` reports such a
+    board as already fenced, which is a different question and unchanged.)"""
+    kb.create_board("already-registered")
+
+    result = kb.backfill_register_entry("already-registered")
+
+    assert result.success is False
+    assert "marker" in result.message
+    # The refusal changed nothing: the board is still exactly as created.
+    _assert_born_registered("already-registered")
+    assert dict(kb.backfill_all_boards())["already-registered"].message == (
+        "already fenced"
+    )

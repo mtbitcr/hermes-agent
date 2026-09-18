@@ -29,8 +29,11 @@ def test_surviving_register_machinery_is_functional(fence_home):
     """The backfill/register machinery that does have callers must still work."""
     # backfill_register_entry is the real recorded migration.
     kb.create_board("test-board")
+    # Creation registers the board itself now; the named backfill is for
+    # boards that predate the fence, and it refuses one whose ever-existed
+    # marker is already set.
     result = kb.backfill_register_entry("test-board")
-    assert result.success
+    assert not result.success, result.message
 
     # get_register_entry reads the authority.
     entry = kb.get_register_entry("test-board")

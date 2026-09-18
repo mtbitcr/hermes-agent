@@ -346,6 +346,18 @@ def import_board(
     # Bring the imported schema up to this install's version before the
     # relocation pass writes to it.
     kb.init_db(board=target)
+    # The store arrived from another install carrying that install's in-board
+    # gate and epoch mirror, while this install's register has no entry for
+    # the new board, so every write would be refused as a fenced board with
+    # no authority. The named backfill is the designed path for a store that
+    # predates its entry (it handles a pre-existing gate); an import that
+    # cannot be registered is not an import, so nothing of it is left behind.
+    registered = kb.backfill_register_entry(target)
+    if not registered.success:
+        shutil.rmtree(board_root, ignore_errors=True)
+        raise ValueError(
+            f"imported board {target!r} could not be registered: {registered.message}"
+        )
 
     with kbc.connect_closing(board=target) as conn:
         stats, warnings = _relocate_imported_rows(conn, target)
