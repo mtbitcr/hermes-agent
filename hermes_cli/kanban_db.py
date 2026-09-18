@@ -1320,11 +1320,40 @@ def create_board(
     refuse afterwards, which left a discoverable directory + metadata ghost
     for a name that was supposed to stay removed: a refusal that arrives
     after the side effect is too late.
+
+    **A board born here is born REGISTERED.** The store used to come into
+    existence carrying no Gate A authority at all, so every later operation
+    that needs one — a removal intent above all — refused with "no register
+    entry: cannot determine removability" until an operator ran the named
+    backfill by hand. The authority is published HERE, inside the same
+    admitted window, under the same per-board register lock that already
+    covers the directory and the store: "the board exists" and "the register
+    says live/epoch=1" are one indivisible step a concurrent removal waits
+    behind, not two an interruption can separate. The facts written are the
+    backfill's own (entry + lineage, ever-existed marker + archive receipt,
+    in-board epoch mirror), written by the backfill's own prepared
+    protocol, so there is exactly one write path for them and one recovery
+    path (:func:`recover_backfill_intent`) for an interrupted one. It is
+    entered through :func:`backfill_register_entry` rather than its
+    ``_locked`` body: the window's lock is already held on every route
+    that reaches here, and the re-entrant acquire is free, but the entry
+    point still holds it on the one route where the window took no lock
+    (a store that appeared between this call's own existence check and the
+    window's), which must not be where a register protocol runs
+    unserialized.
     """
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
-    with _admitted_store_creation(kanban_db_path(board=normed), normed):
+    db_path = kanban_db_path(board=normed)
+    # Asked BEFORE the window, because the window's own short-circuit is the
+    # same question: a store that is already there is not being created, and
+    # registering is part of creating. An already-existing board — including
+    # a legacy one — keeps ``mkdir -p`` semantics and is left for the named
+    # backfill, and the race where two creations both read "absent" is
+    # settled under the lock below by the register itself.
+    creating = not db_path.exists()
+    with _admitted_store_creation(db_path, normed):
         meta = write_board_metadata(
             normed,
             name=name,
@@ -1336,6 +1365,25 @@ def create_board(
         )
         # Touch the DB so list_boards() sees it immediately.
         init_db(board=normed)
+        if creating and get_register_entry(normed) is None:
+            registered = backfill_register_entry(normed)
+            if not registered.success:
+                # Fail the creation as a whole rather than hand back a board
+                # with no authority. The raise unwinds this window, which
+                # takes the directory it created back down; the backfill has
+                # already unwound or retained its own intent for
+                # ``recover_backfill_intent`` to settle on the next attempt.
+                raise BoardFenceClosedError(
+                    FenceRefusal(
+                        outcome=FenceOutcome.REFUSED_CLOSED,
+                        rule=FenceRefusalRule.GA_5_FAIL,
+                        board=normed,
+                        message=(
+                            f"board {normed!r} could not be registered at "
+                            f"creation: {registered.message}"
+                        ),
+                    )
+                )
     return meta
 
 
@@ -2465,11 +2513,34 @@ def _ensure_register_initialized(conn: sqlite3.Connection) -> None:
     Keyed by register-database path as well as by the legacy module flag:
     a process that moves ``HERMES_HOME`` (every test does) otherwise saw
     the flag already set and handed back a register with no tables.
+
+    The cache is a claim about a FILE, and the file can go away underneath
+    a live process — §1.3 treats losing the whole register as a fault the
+    guards must survive, so it is one that really happens. Opening the
+    register re-creates it EMPTY, and the cache then said "already
+    initialized" about a store with no tables, so every read and every
+    write raised ``no such table: board_register`` for the rest of the
+    process's life. The same shape :func:`_open_initialized_store` already
+    handles for a board store: trust the cache only as far as the store
+    agrees with it, and re-run the schema script when it does not. A store
+    that cannot be read at all still raises, exactly as before — an
+    unreadable register is indeterminate, not empty.
     """
     global _REGISTER_INITIALIZED
     key = str(register_db_path())
     if _REGISTER_INITIALIZED and key in _REGISTER_INITIALIZED_PATHS:
-        return
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='board_register' LIMIT 1"
+        ).fetchone() is not None:
+            return
+        with _REGISTER_INIT_LOCK:
+            _REGISTER_INITIALIZED_PATHS.discard(key)
+        _log.warning(
+            "the board register at %s lost its schema after this process "
+            "initialized it (deleted or replaced externally); "
+            "re-initializing.", key,
+        )
     with _REGISTER_INIT_LOCK:
         if _REGISTER_INITIALIZED and key in _REGISTER_INITIALIZED_PATHS:
             return

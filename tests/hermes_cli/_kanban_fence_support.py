@@ -21,6 +21,7 @@ mutation deadline can be measured against a real blocking read.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import sqlite3
@@ -93,6 +94,29 @@ def register_row(slug: str):
         except sqlite3.Error:
             return None
     return None if row is None else dict(row)
+
+
+def register_lineage(slug: str):
+    """The board's persisted epoch lineage, parsed, or None.
+
+    Read off the register file directly, like :func:`register_row` — the
+    lineage is a durable fact about the entry, so a test that wants to
+    know it landed must not ask the module that writes it.
+    """
+    path = kb.register_db_path()
+    if not path.exists():
+        return None
+    with read_only(path) as conn:
+        try:
+            row = conn.execute(
+                "SELECT epoch_lineage FROM board_register WHERE board_name = ?",
+                (slug,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+    if row is None or row["epoch_lineage"] is None:
+        return None
+    return json.loads(row["epoch_lineage"])
 
 
 def marker_row(slug: str) -> bool:
@@ -189,17 +213,24 @@ def ready_task(conn, title: str = "work", assignee: str = "worker") -> str:
 
 
 def create_fenced_board(slug: str, **kwargs) -> None:
-    """Create a board and arm its fence via the real recorded migration.
+    """Create a board — which now arms its fence as part of creating it.
 
-    ``create_board`` no longer arms a fence on its own: a freshly created
-    board carries no register entry and no in-board gate until an
-    operator runs the backfill. Tests that need a FENCED board to
-    exercise Gate A/Gate B behaviour go through this, the same recorded
-    path (``hermes kanban boards backfill-fence``) an operator would use.
+    ``create_board`` publishes the board's register authority inside the
+    same admitted-creation window that brings its directory and store into
+    existence, so a freshly created board is already fenced: entry,
+    marker + archive receipt and in-board epoch mirror, all written by the
+    kernel's own registration step. Nothing to backfill afterwards — the
+    named backfill is for boards that PREDATE the fence
+    (:func:`make_legacy_board`), and it refuses a board that already
+    carries a marker.
+
+    Kept as the composed helper tests already call, and it still asserts
+    the fence is really armed — read back from the register, never assumed.
     """
     kb.create_board(slug, **kwargs)
-    result = kb.backfill_register_entry(slug)
-    assert result.success, result.message
+    entry = kb.get_register_entry(slug)
+    assert entry is not None, f"{slug} was created without a register entry"
+    assert entry.lifecycle is kb.BoardLifecycle.LIVE, entry.lifecycle
 
 
 def permanent_confirmation(slug: str) -> "kb.PermanentRemovalConfirmation":
