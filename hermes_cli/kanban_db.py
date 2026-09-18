@@ -1365,7 +1365,13 @@ def create_board(
         )
         # Touch the DB so list_boards() sees it immediately.
         init_db(board=normed)
-        if creating and get_register_entry(normed) is None:
+        # Registration is part of CREATING a store, so it runs only when this
+        # call actually brought one into existence: a caller that stubs the
+        # initialiser (a read-only surface test does) or a store that never
+        # appeared keeps the old make-directory semantics and stays
+        # unregistered for the named backfill to handle later.
+        materialized = db_path.exists() and db_path.stat().st_size > 0
+        if creating and materialized and get_register_entry(normed) is None:
             registered = backfill_register_entry(normed)
             if not registered.success:
                 # Fail the creation as a whole rather than hand back a board

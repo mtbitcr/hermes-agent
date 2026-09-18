@@ -131,6 +131,19 @@ def test_round_trip_preserves_content(kanban_root, tmp_path):
     assert tasks["scratch task"]["assignee"] == "coder"
 
 
+def test_imported_board_is_registered_live(kanban_root, tmp_path):
+    """An import registers the new board on this install, or it is no import."""
+    _seed_board()
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+
+    kanban_root("target")
+    result = kt.import_board(archive)
+
+    entry = kb.get_register_entry(result["board"])
+    assert entry is not None
+    assert entry.lifecycle is kb.BoardLifecycle.LIVE
+
+
 def test_attachment_blob_travels_and_is_readable(kanban_root, tmp_path):
     _seed_board()
     archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
