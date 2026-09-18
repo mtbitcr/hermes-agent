@@ -43,6 +43,10 @@ CRASH_POINTS: "dict[str, tuple[str, str]]" = {
     "apply-after-work-area": ("_destroy_work_area_content", "after"),
     "apply-after-deregister": ("_deregister_work_area", "after"),
     "apply-before-record": ("record_applied_mode_content", "before"),
+    # Inside the REVERSIBLE apply: the retained copy is written to disk
+    # and the verification that alone authorises the live deletion has
+    # not run yet.
+    "apply-mid-retained-copy": ("_complete_retained_copy", "after"),
     "after-apply-content": ("apply_permanent_mode_content", "after"),
     # The last two boundaries, including the window between the terminal
     # transition and the terminal receipt.
@@ -56,6 +60,10 @@ CRASH_POINTS: "dict[str, tuple[str, str]]" = {
     #     not been marked applied.
     "after-prepared-receipt": ("prepare_permanent_removal_receipt", "after"),
     "after-terminal-transition": ("apply_prepared_removal_receipt", "before"),
+    # Inside §9.4's restore: the validated set is installed on disk and
+    # the store has NOT been frozen at the new epoch yet — the window a
+    # restart has to finish, never restart.
+    "restore-after-install": ("_restore_install_store", "after"),
 }
 
 
@@ -87,7 +95,9 @@ def main(argv: "list[str]") -> int:
     parser.add_argument("home")
     parser.add_argument("slug")
     parser.add_argument("crash", choices=sorted(CRASH_POINTS) + ["never"])
-    parser.add_argument("mode", choices=["permanent", "reversible"])
+    parser.add_argument(
+        "mode", choices=["permanent", "reversible", "restore", "resume"],
+    )
     args = parser.parse_args(argv)
 
     os.environ["HERMES_HOME"] = args.home
@@ -103,6 +113,17 @@ def main(argv: "list[str]") -> int:
     from hermes_cli import kanban_db as kb
 
     _install_crash(kb, args.crash)
+
+    if args.mode in ("restore", "resume"):
+        cli_argv = ["boards", args.mode, args.slug]
+        wrap = argparse.ArgumentParser(
+            prog="hermes-crash-child", add_help=False,
+        )
+        top = wrap.add_subparsers(dest="_top")
+        tree = kanban_cli.build_parser(top)
+        code = kanban_cli.kanban_command(tree.parse_args(cli_argv))
+        print(f"CHILD-EXIT {code}", flush=True)
+        return int(code)
 
     cli_argv = ["boards", "rm", args.slug]
     if args.mode == "permanent":

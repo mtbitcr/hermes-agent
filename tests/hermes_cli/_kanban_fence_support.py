@@ -266,9 +266,16 @@ def apply_mode_specific_content(slug: str, removal_id: str):
     board = kb.board_dir(slug)
     retained = None
     if record.mode is kb.RemovalMode.REVERSIBLE:
-        retained = kb.kanban_home() / "retained" / f"{slug}-{removal_id}"
+        retained = kb.reversible_retained_path(slug, removal_id)
         retained.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(board, retained)
+        shutil.copytree(board, retained, dirs_exist_ok=True)
+        # §7.3 also marks the retained copy archived in its own metadata,
+        # so the board is findable in the archived listing. A helper that
+        # stopped short of that would leave every Done test resting on a
+        # copy nothing can find.
+        kb.mark_retained_copy_archived(
+            retained, slug=slug, removal_id=removal_id,
+        )
     if board.exists():
         shutil.rmtree(board)
     db_path = kb.kanban_db_path(board=slug)
@@ -613,6 +620,12 @@ def stage_legacy_db(tmp_path: Path, slug: str) -> Path:
     the assertions can actually read back rather than infer from a size.
     """
     staging = Path(tmp_path) / f"legacy-{slug}.db"
+    # ``connect`` opens; it does not create. The staging file is a scratch
+    # path in a temp dir — not a board path, with no register entry — so the
+    # sanctioned explicit creation route is what brings it into being, and
+    # doing it here weakens nothing: the no-resurrection contract is about
+    # board paths, and this file only becomes one after the move below.
+    kb.init_db(db_path=staging)
     with contextlib.closing(kb.connect(db_path=staging)) as conn:
         kb.create_task(conn, title=LEGACY_SENTINEL_TITLE, assignee="worker")
     kb._INITIALIZED_PATHS.discard(str(staging.resolve()))

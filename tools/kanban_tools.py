@@ -383,7 +383,7 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
-def _connect(board: Optional[str] = None):
+def _connect(board: Optional[str] = None, *, create: bool = False):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
 
@@ -393,9 +393,20 @@ def _connect(board: Optional[str] = None):
     (``HERMES_KANBAN_DB`` → ``HERMES_KANBAN_BOARD`` env → current symlink
     → ``default``). Per-tool ``board`` lets a Telegram-side agent override
     the env-pinned active board without restarting Hermes.
+
+    ``create`` is the first-run bootstrap, and it is opt-in per call site
+    rather than the default. ``kb.connect`` opens an EXISTING store and
+    never makes one, so a tool that merely LOOKS at a board — show, list,
+    the auto-heartbeat and comment-poll bridges, every status transition —
+    cannot bring back a board a removal took away, and keeps failing the
+    way it does today when there is nothing to read. Only
+    :func:`_handle_create`, whose whole contract is to bring new work into
+    existence, passes ``create=True``: it is what a genuinely fresh
+    ``HERMES_HOME`` hits first, and it is still refused (GA-2) for a board
+    the register says is being or has been removed.
     """
     from hermes_cli import kanban_db as kb
-    return kb, kb.connect(board=board)
+    return kb, kb.connect(board=board, create=create)
 
 
 def _board_of_connection(kb, conn) -> Optional[str]:
@@ -1749,7 +1760,10 @@ def _handle_create(args: dict, **kw) -> str:
         )
     board = args.get("board")
     try:
-        kb, conn = _connect(board=board)
+        # The one bootstrap entry point in this module: on a fresh install
+        # nothing else has initialized the board, and `kanban_create` is the
+        # first thing an agent reaches for. Everything else here opens only.
+        kb, conn = _connect(board=board, create=True)
         try:
             _self_tid = os.environ.get("HERMES_KANBAN_TASK")
             _self_task = kb.get_task(conn, _self_tid) if _self_tid else None

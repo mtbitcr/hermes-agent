@@ -33,6 +33,21 @@ class InitLockUnavailable(RuntimeError):
     """
 
 
+class InitLockDirectoryAbsent(FileNotFoundError):
+    """A ``require_existing_directory=True`` caller's directory was not there.
+
+    The lock file is a sibling of the database, so materialising it in an
+    absent directory would ``mkdir`` that directory back into existence. A
+    caller that declared the directory a precondition gets this instead —
+    raised from the ``ENOENT`` the OPEN ITSELF returned, so it reports what
+    the operating system decided at that instant rather than what a
+    preceding ``exists()`` check believed.
+
+    A :class:`FileNotFoundError` subclass so a caller that only wants "the
+    lock could not be placed" can keep catching ``OSError``.
+    """
+
+
 @contextlib.contextmanager
 def cross_process_init_lock(
     path: Path,
@@ -41,6 +56,7 @@ def cross_process_init_lock(
     poll_seconds: float = INIT_LOCK_POLL_SECONDS,
     required: bool = False,
     on_timeout=None,
+    require_existing_directory: bool = False,
 ):
     """Serialize one database's first-connect setup across processes.
 
@@ -71,11 +87,44 @@ def cross_process_init_lock(
     There is deliberately no third mode: a caller that neither passes
     ``required`` nor reads ``on_timeout`` gets the documented best-effort
     contract rather than a silent one.
+
+    ``require_existing_directory`` decides who owns the containing directory:
+
+    * ``False`` (default) — this helper materialises it
+      (``mkdir(parents=True, exist_ok=True)``). Correct for the per-profile
+      projects store and for the kanban board register's own lock directory,
+      which are infrastructure paths no authority governs.
+    * ``True`` — the directory is a PRECONDITION of the call. Nothing is
+      created on the way to the lock, and an absent directory raises
+      :class:`InitLockDirectoryAbsent`. Correct for a store whose existence
+      some authority admits or refuses (the kanban boards), where a helper
+      that quietly re-created the directory would resurrect a removed board's
+      identity behind that authority's back.
+
+      This is deliberately NOT ``if not path.parent.exists(): raise`` — that
+      is the same check/use race one function further out. The open below is
+      the only thing that touches the filesystem, it never creates a
+      directory, and it is the KERNEL that decides whether the directory is
+      still there. A removal landing at any instant, including between the
+      last instruction and the ``open`` itself, therefore yields ``ENOENT``
+      rather than a re-created directory with a lock file in it. Creating
+      the lock FILE inside a directory that is still there is allowed and
+      is not a resurrection: a fresh store and a legacy store both need one,
+      and its parent is what carries the board's discoverable identity.
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".init.lock")
-    handle = lock_path.open("a+b")
+    if require_existing_directory:
+        try:
+            handle = lock_path.open("a+b")
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            raise InitLockDirectoryAbsent(
+                f"{lock_path.parent} does not exist: refusing to create it to "
+                f"place {lock_path.name}"
+            ) from exc
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
     acquired = False
     try:
         deadline = time.monotonic() + timeout_seconds

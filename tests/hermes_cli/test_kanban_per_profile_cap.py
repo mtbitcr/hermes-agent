@@ -25,6 +25,10 @@ def isolated_kanban_home_with_profiles(monkeypatch):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
     from hermes_cli import kanban_db
+
+    # connect() only opens; the "kanban DB" this fixture promises has to be
+    # created explicitly.
+    kanban_db.init_db()
     yield kanban_db
 
 

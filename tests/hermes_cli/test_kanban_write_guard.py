@@ -12,6 +12,8 @@ def test_connect_succeeds_under_test_home(tmp_path, monkeypatch):
     home = tmp_path / "hermes_home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # connect() opens; init_db() is what creates the store.
+    kanban_db.init_db()
     conn = kanban_db.connect()
     try:
         assert str(kanban_db.kanban_db_path()).startswith(str(home))

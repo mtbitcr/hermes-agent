@@ -2083,6 +2083,58 @@ class TestOwnerRetryMutationReceipt:
         }
 
 
+class TestOwnerRemovalMutationReceipt:
+    """The minimal receipt projection for a Project removal."""
+
+    def test_a_genuine_success_keeps_the_removal_state_object_intact(self, adapter):
+        result = {
+            "ok": True, "action": "start", "project_slug": "workshop-pilot",
+            "removal_state": {
+                "phase": "accepted", "mode": "recoverable",
+                "cancelable": True, "restorable": False,
+                "consequences_digest": "abc123", "last_error": None,
+            },
+        }
+        receipt = json.loads(adapter._owner_mutation_receipt(
+            "owner_project_removal", result,
+        ))
+        assert receipt["ok"] is True
+        assert receipt["action"] == "start"
+        assert receipt["project_slug"] == "workshop-pilot"
+        assert receipt["removal_state"]["phase"] == "accepted"
+        assert receipt["removal_state"]["mode"] == "recoverable"
+        assert receipt["removal_state"]["cancelable"] is True
+        assert receipt["removal_state"]["restorable"] is False
+
+    def test_an_unknown_action_projects_nothing(self, adapter):
+        result = {
+            "ok": True, "action": "delete_forever",
+            "project_slug": "workshop-pilot",
+            "removal_state": {"phase": "accepted"},
+        }
+        assert adapter._owner_mutation_receipt(
+            "owner_project_removal", result,
+        ) is None
+
+    @pytest.mark.parametrize("removal_state", [
+        None,
+        "accepted",
+        {},
+        {"phase": 1},
+        {"phase": "Accepted!"},
+    ])
+    def test_a_missing_or_invalid_removal_state_projects_nothing(
+        self, adapter, removal_state,
+    ):
+        result = {
+            "ok": True, "action": "start", "project_slug": "workshop-pilot",
+            "removal_state": removal_state,
+        }
+        assert adapter._owner_mutation_receipt(
+            "owner_project_removal", result,
+        ) is None
+
+
 # ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id} — poll run status
 # ---------------------------------------------------------------------------
@@ -2097,6 +2149,7 @@ class TestRunStatus:
             "owner_task_graph_commit",
             "owner_project_plan_commit",
             "owner_task_retry",
+            "owner_project_removal",
         ],
     )
     async def test_status_exposes_redacted_approval_then_clears_it(self, adapter, operation):
@@ -3207,3 +3260,59 @@ class TestOwnerMutationRefusal:
     )
     def test_a_missing_or_malformed_code_is_dropped(self, result):
         assert _owner_mutation_refusal_code(result) == ""
+
+
+class TestOwnerRemovalRunBoundary:
+    """A removal run is committed when the removal is ACCEPTED."""
+
+    @pytest.mark.asyncio
+    async def test_accepted_removal_completes_its_run(self, adapter):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import owner_workspace as ow
+
+        key = "owner-project-removal-accepted-run"
+        proposal = _new_owner_proposal()
+        created = _committed_owner_project(f"setup-{key}", f"setup-{key}", proposal)
+        if kb.get_register_entry(created["board"]) is None:
+            assert kb.backfill_register_entry(created["board"]).success
+        body = {
+            "input": "Remove the confirmed Project now.",
+            "owner_workspace_context": {
+                "mode": "existing", "project_slug": created["project_slug"],
+                "project_name": proposal["project_name"]},
+            "owner_removal_authority": {
+                "operation": "owner_project_removal", "idempotency_key": key,
+                "payload": {
+                    "idempotency_key": key, "project_id": created["project_id"],
+                    "expected_revision": 0, "action": "start"}},
+        }
+        config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+        app = _create_runs_app(adapter)
+        with (
+            patch("gateway.run._load_gateway_config", return_value=config),
+            patch.object(adapter, "_create_agent") as mock_create,
+            patch("hermes_cli.owner_workspace._confirm",
+                  return_value={"approved": True, "reason": None}),
+        ):
+            mock_create.side_effect = RuntimeError("provider unavailable")
+            async with TestClient(TestServer(app)) as cli:
+                started = await cli.post(
+                    "/v1/runs", json=body, headers={"Idempotency-Key": key})
+                run_id = (await started.json())["run_id"]
+                for _ in range(80):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] in ("completed", "failed"):
+                        break
+                    await asyncio.sleep(0.05)
+        for thread in list(ow._removal_background_threads):
+            thread.join(timeout=60)
+
+        assert started.status == 202
+        assert status["status"] == "completed", status.get("error")
+        assert status["owner_mutation_committed"] is True
+        output = json.loads(status["output"])
+        assert output["ok"] is True
+        assert output["action"] == "start"
+        assert output["project_slug"] == created["project_slug"]
+        assert output["removal_state"]["phase"] == "accepted"
+        mock_create.assert_not_called()

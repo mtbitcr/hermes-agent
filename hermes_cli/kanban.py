@@ -276,6 +276,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_list.add_argument("--all", action="store_true",
                         help="Include archived boards too")
 
+    b_archived = boards_sub.add_parser(
+        "archived",
+        help="List boards retained by a reversible removal (read-only)",
+        description=(
+            "A reversible removal keeps a verified copy of the board OUTSIDE "
+            "boards/, where `boards list` cannot see it. This is the explicit "
+            "listing of those archives: the board slug, the removal that "
+            "archived it, where the copy is, and the archived marker in the "
+            "copy's own metadata. Read-only."
+        ),
+    )
+    b_archived.add_argument("--json", action="store_true")
+
     b_create = boards_sub.add_parser(
         "create", aliases=["new"],
         help="Create a new board",
@@ -364,6 +377,49 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     b_removal_phase.add_argument("slug")
     b_removal_phase.add_argument("--json", action="store_true")
+
+    b_cancel_removal = boards_sub.add_parser(
+        "cancel-removal",
+        help="Cancel a reversible board removal and restore the board to live",
+        description=(
+            "Cancels the recorded removal of a board (design revision 5, "
+            "§9.2) and restores it to live. Accepted strictly before "
+            "Applied; at or past Applied, and for a permanent removal, it "
+            "is refused with a recorded reason."
+        ),
+    )
+    b_cancel_removal.add_argument("slug")
+    b_cancel_removal.add_argument("--json", action="store_true")
+
+    b_restore = boards_sub.add_parser(
+        "restore",
+        help="Restore a board from the copy a reversible removal retained",
+        description=(
+            "Validates the complete retained set — board database, files "
+            "and metadata — file by file against the sizes and digests "
+            "recorded when it was archived, and refuses an incomplete or "
+            "tampered set without touching anything live. A successful "
+            "restore returns the board PAUSED under a new epoch: every "
+            "handle, claim and lease from before the removal is void, and "
+            "the board is usable only after `boards resume`. Shared git "
+            "state is never rewound; anything that cannot be attributed to "
+            "this board is reported UNVERIFIED and left alone."
+        ),
+    )
+    b_restore.add_argument("slug")
+    b_restore.add_argument("--json", action="store_true")
+
+    b_resume = boards_sub.add_parser(
+        "resume",
+        help="Resume a restored board, making it usable again",
+        description=(
+            "The explicit resume a paused restore waits for. Opens the "
+            "restored board at the exact epoch the restore recorded, so "
+            "nothing minted before the removal can act on it even now."
+        ),
+    )
+    b_resume.add_argument("slug")
+    b_resume.add_argument("--json", action="store_true")
 
     b_set_wd = boards_sub.add_parser(
         "set-default-workdir",
@@ -1428,6 +1484,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     sub = getattr(args, "boards_action", None) or "list"
     if sub in {"list", "ls"}:
         return _cmd_boards_list(args)
+    if sub == "archived":
+        return _cmd_boards_archived(args)
     if sub in {"create", "new"}:
         return _cmd_boards_create(args)
     if sub in {"rm", "remove", "delete"}:
@@ -1444,6 +1502,12 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_backfill_fence(args)
     if sub == "removal-phase":
         return _cmd_boards_removal_phase(args)
+    if sub == "cancel-removal":
+        return _cmd_boards_cancel_removal(args)
+    if sub == "restore":
+        return _cmd_boards_restore(args)
+    if sub == "resume":
+        return _cmd_boards_resume(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1495,6 +1559,30 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     print(f"Current board: {current}")
     if len(boards) > 1:
         print("Switch boards with `hermes kanban boards switch <slug>`.")
+    return 0
+
+
+def _cmd_boards_archived(args: argparse.Namespace) -> int:
+    """``hermes kanban boards archived`` — the retained copies, read-only.
+
+    Read from each retained copy's own metadata, so an archived board is
+    findable without the removal record (a different store, and a
+    different loss domain).
+    """
+    entries = kb.list_archived_boards()
+    if getattr(args, "json", False):
+        print(json.dumps(entries, indent=2, ensure_ascii=False))
+        return 0
+    if not entries:
+        print("(no archived boards — a reversible removal creates one)")
+        return 0
+    print(f"{'SLUG':24s}  {'REMOVAL':28s}  PATH")
+    for entry in entries:
+        print(
+            f"{entry['slug']:24s}  {entry['removal_id'] or '(unmarked)':28s}  "
+            f"{entry['retained_path']}"
+            + ("" if entry["archived"] else "  [marker missing]")
+        )
     return 0
 
 
@@ -1614,6 +1702,12 @@ def _cmd_boards_removal_phase(args: argparse.Namespace) -> int:
 
     operator_items = kb.removal_operator_items(record)
     mode_content = kb.applied_mode_content_marker(record)
+    refusal_outcome = None
+    if record.refusal_outcome:
+        try:
+            refusal_outcome = json.loads(record.refusal_outcome)
+        except (TypeError, ValueError):
+            refusal_outcome = record.refusal_outcome
     payload = {
         "board": normed,
         "removal_id": record.removal_id,
@@ -1623,6 +1717,7 @@ def _cmd_boards_removal_phase(args: argparse.Namespace) -> int:
         "quiescence_deadline": record.quiescence_deadline,
         "deadline_basis": record.deadline_basis,
         "outcome": record.outcome,
+        "refusal_outcome": refusal_outcome,
         "gate_closed_at": record.gate_closed_at,
         "scope_declaration_version": record.scope_declaration_version,
         "permanent_confirmed_at": record.permanent_confirmed_at,
@@ -1633,6 +1728,9 @@ def _cmd_boards_removal_phase(args: argparse.Namespace) -> int:
         # still 'removing'.
         "operator_items": operator_items,
         "applied_mode_content": mode_content,
+        # §9.4: what a restore of this removal's retained copy has
+        # really done, read from the same durable journal it writes.
+        "restore": kb.restore_status(record),
     }
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -1644,6 +1742,15 @@ def _cmd_boards_removal_phase(args: argparse.Namespace) -> int:
             print(f"  deadline: {record.quiescence_deadline} ({record.deadline_basis})")
         if record.outcome is not None:
             print(f"  outcome: {record.outcome}")
+        if refusal_outcome is not None:
+            ro = refusal_outcome
+            if isinstance(ro, dict):
+                print(
+                    f"  refusal: {ro.get('outcome', 'unknown')} — "
+                    f"{ro.get('message', '')}"
+                )
+            else:
+                print(f"  refusal: {ro}")
         if kb.applied_mode_content_is_outstanding(record):
             print(
                 f"  applied mode content: OUTSTANDING "
@@ -1658,7 +1765,159 @@ def _cmd_boards_removal_phase(args: argparse.Namespace) -> int:
             )
         for item in operator_items:
             print(f"  operator item: {item.get('identity')} — {item.get('detail')}")
+        restore = payload["restore"]
+        if restore is not None:
+            print(
+                f"  restore: {restore['state']}"
+                + (f" (epoch {restore['epoch']})" if restore["epoch"] else "")
+                + f" — {restore['reason']}"
+            )
+            if restore["paused"]:
+                print(
+                    "  the board is PAUSED: run "
+                    f"`hermes kanban boards resume {normed}` to make it "
+                    "usable"
+                )
     return 0
+
+
+def _cmd_boards_cancel_removal(args: argparse.Namespace) -> int:
+    """``hermes kanban boards cancel-removal <slug>`` (§9.2).
+
+    Cancels by the EXACT recorded removal_id, never a different removal.
+    """
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards cancel-removal: {exc}", file=sys.stderr)
+        return 2
+    if not normed:
+        print("kanban boards cancel-removal: slug is required", file=sys.stderr)
+        return 2
+
+    as_json = getattr(args, "json", False)
+    record = kb.get_removal_phase_record(normed)
+    if record is None:
+        message = "no removal is recorded for this board: nothing to cancel"
+        if as_json:
+            print(json.dumps({"board": normed, "ok": False, "message": message}))
+        else:
+            print(f"{normed}: {message}", file=sys.stderr)
+        return 1
+
+    result = kb.abandon_or_cancel_removal(
+        normed, removal_id=record.removal_id, reason="cancel"
+    )
+    updated = result.record or record
+    if as_json:
+        print(json.dumps({
+            "board": normed,
+            "removal_id": record.removal_id,
+            "ok": result.success,
+            "message": result.message,
+            "phase": updated.phase.value,
+            "outcome": updated.outcome,
+        }, indent=2, ensure_ascii=False))
+    elif result.success:
+        print(
+            f"{normed}: removal {record.removal_id} cancelled — the board is "
+            "live again and can be used"
+        )
+    else:
+        print(
+            f"{normed}: removal {record.removal_id} was NOT cancelled — "
+            f"{result.message}",
+            file=sys.stderr,
+        )
+    return 0 if result.success else 1
+
+
+def _cmd_boards_restore(args: argparse.Namespace) -> int:
+    """``hermes kanban boards restore <slug>`` (§9.4).
+
+    Restores by the EXACT recorded removal_id, never a different removal,
+    and reports the paused state plainly: the board is not usable until
+    it is explicitly resumed.
+    """
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards restore: {exc}", file=sys.stderr)
+        return 2
+    if not normed:
+        print("kanban boards restore: slug is required", file=sys.stderr)
+        return 2
+
+    as_json = getattr(args, "json", False)
+    record = kb.get_removal_phase_record(normed)
+    if record is None:
+        message = (
+            "no removal is recorded for this board: there is no retained "
+            "copy to restore"
+        )
+        if as_json:
+            print(json.dumps({"board": normed, "ok": False, "message": message}))
+        else:
+            print(f"{normed}: {message}", file=sys.stderr)
+        return 1
+
+    result = kb.restore_retained_board(normed, removal_id=record.removal_id)
+    reattachment = result.reattachment or {}
+    if as_json:
+        print(json.dumps({
+            "board": normed,
+            "removal_id": record.removal_id,
+            "ok": result.success,
+            "message": result.message,
+            "state": result.state,
+            "epoch": result.epoch,
+            "paused": bool(result.success),
+            "reattachment": reattachment or None,
+        }, indent=2, ensure_ascii=False))
+    elif result.success:
+        print(
+            f"{normed}: restored from its retained copy and PAUSED at epoch "
+            f"{result.epoch}"
+        )
+        for item in reattachment.get("unverified") or []:
+            print(
+                f"  UNVERIFIED {item.get('member')} "
+                f"{item.get('commit') or item.get('work_area') or ''} — "
+                f"{item.get('reason')}"
+            )
+        print(
+            f"  Run `hermes kanban boards resume {normed}` to make it usable."
+        )
+    else:
+        print(f"{normed}: NOT restored — {result.message}", file=sys.stderr)
+    return 0 if result.success else 1
+
+
+def _cmd_boards_resume(args: argparse.Namespace) -> int:
+    """``hermes kanban boards resume <slug>`` — the explicit resume (§9.4)."""
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards resume: {exc}", file=sys.stderr)
+        return 2
+    if not normed:
+        print("kanban boards resume: slug is required", file=sys.stderr)
+        return 2
+
+    result = kb.resume_restored_board(normed)
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "board": normed,
+            "ok": result.success,
+            "message": result.message,
+            "state": result.state,
+            "epoch": result.epoch,
+        }, indent=2, ensure_ascii=False))
+    elif result.success:
+        print(f"{normed}: resumed — live and usable at epoch {result.epoch}")
+    else:
+        print(f"{normed}: NOT resumed — {result.message}", file=sys.stderr)
+    return 0 if result.success else 1
 
 
 def _read_confirmation_line() -> Optional[str]:

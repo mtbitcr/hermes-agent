@@ -103,7 +103,11 @@ def test_repro_7_the_arbitrary_path_connector_stays_outside_the_fence(
     so it is not a board and the fence has nothing to say about it.
     """
     scratch = tmp_path / "not-a-board.db"
-    conn = kb.connect(db_path=scratch)
+    # Creating is asked for explicitly — opening never creates, for any path.
+    # The point under test is unchanged: even when the connector DOES bring an
+    # arbitrary-path store into being, no admission is consulted and no fence
+    # state appears, because a file with no board identity is not a board.
+    conn = kb.connect(db_path=scratch, create=True)
     try:
         task_id = kb.create_task(conn, title="standalone", assignee="worker")
         assert kb.add_comment(conn, task_id, "a", "b") > 0

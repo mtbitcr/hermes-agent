@@ -329,6 +329,7 @@ TOOLSETS = {
             "owner_workspace_bootstrap", "owner_task_graph_commit",
             "owner_project_plan_commit",
             "owner_task_move", "owner_task_comment", "owner_project_lifecycle",
+            "owner_project_removal",
         ],
         "includes": [],
         # See _get_platform_tools()'s explicit_passthrough filtering — a
@@ -365,6 +366,13 @@ TOOLSETS = {
     "owner_project_lifecycle": {
         "description": "Archive or restore one owner-approved Project",
         "tools": ["owner_project_lifecycle"],
+        "includes": [],
+        "kernel_gated": True,
+    },
+
+    "owner_project_removal": {
+        "description": "Remove one owner-approved Project with retained copy",
+        "tools": ["owner_project_removal"],
         "includes": [],
         "kernel_gated": True,
     },

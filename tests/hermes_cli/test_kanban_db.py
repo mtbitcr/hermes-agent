@@ -1056,7 +1056,14 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 
     with _patch("hermes_cli.kanban_db.sqlite3.connect", side_effect=wal_blocking_connect):
         with caplog.at_level("ERROR", logger="hermes_state"):
-            conn = kb.connect()
+            # create=True is the documented "bring a store into being"
+            # route, and the only one there is: an ordinary connect() never
+            # creates, so it refuses this deliberately-missing store (GA-4)
+            # before the injected WAL behaviour can run. The store is still
+            # genuinely fresh — nothing has touched this path before the
+            # injection is installed — so the first WAL attempt on a
+            # brand-new file is exactly what this exercises.
+            conn = kb.connect(create=True)
 
     # One fallback error, naming kanban.db
     errors = [
@@ -1116,7 +1123,10 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
         side_effect=wal_silent_noop_connect,
     ):
         with caplog.at_level("ERROR", logger="hermes_state"):
-            conn = kb.connect()
+            # Same reason as the locking-protocol test above: creating is
+            # the explicit route, and the store is still brought into being
+            # under the injection rather than pre-initialized.
+            conn = kb.connect(create=True)
 
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
     t = kb.create_task(conn, title="post-silent-fallback task")
@@ -1600,6 +1610,8 @@ def test_connect_sets_secure_delete_on(tmp_path):
     """secure_delete=ON must be active on every new connection."""
     db_path = tmp_path / "kanban.db"
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    # connect() opens; it never creates. init_db() is the creation step.
+    kb.init_db(db_path=db_path)
     with kb.connect(db_path=db_path) as conn:
         row = conn.execute("PRAGMA secure_delete").fetchone()
     assert row[0] == 1, f"expected secure_delete=1, got {row[0]}"
@@ -1678,10 +1690,11 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
     way the file must never come back clean.
     """
     import struct
-    from hermes_cli.kanban_db import connect
+    from hermes_cli.kanban_db import connect, init_db
     from hermes_cli.sqlite_safe_read import file_length_matches_header
 
     db = tmp_path / "synthetic.db"
+    init_db(db_path=db)
     conn = connect(db_path=db)
     conn.execute("PRAGMA journal_mode=DELETE")
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
@@ -1737,6 +1750,7 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     """
     db_path = tmp_path / "kanban.db"
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.init_db(db_path=db_path)
     with kb.connect(db_path=db_path) as conn:
         pass
     # Still usable after with-block exit (the leak).
