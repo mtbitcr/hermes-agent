@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -473,6 +474,462 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert kb.check_respawn_guard(
             conn, review_id, lane="review"
         ) == "rate_limit_cooldown"
+
+
+_HANDBACK_PR_COMMENT = (
+    "Candidate is up at https://github.com/example/repo/pull/123 - please review."
+)
+
+
+def _make_review_handback(conn, *, title: str, pr_comment: str = _HANDBACK_PR_COMMENT) -> str:
+    """Drive a real implement -> PR comment -> review -> changes_requested cycle.
+
+    Returns the task id of a genuine, current review handback: ``ready``,
+    ``current_run_id`` NULL, assignee restored to the implementer — built
+    entirely from real lifecycle calls, matching the shape the dispatcher
+    sees in production.
+    """
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    kb.add_comment(conn, tid, author="worker", body=pr_comment)
+    ok = kb.request_review(
+        conn, tid, summary="candidate ready", reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+    )
+    assert ok is True
+    review_claim = kb.claim_review_task(conn, tid)
+    assert review_claim is not None
+    ok, who = kb.request_changes(
+        conn, tid, reason="fix the guard boundary",
+        expected_run_id=review_claim.current_run_id,
+    )
+    assert ok is True, who
+    return tid
+
+
+_SAME_SECOND_MAX_ATTEMPTS = 50
+
+
+def _retry_until_same_second(attempt):
+    """Retry a real-lifecycle attempt until it lands two rows in one whole
+    second, or skip if the host is too slow/loaded to ever produce that.
+
+    ``attempt`` builds a brand-new, disposable task via the real lifecycle
+    helpers (so a discarded attempt leaves no state behind) and returns
+    ``(task_id, landed_same_second)``. This never fakes the clock — it just
+    keeps trying real wall-clock operations until scheduler jitter happens to
+    cooperate, bounded so a persistently slow machine skips instead of
+    hanging or flaking red.
+    """
+    for _ in range(_SAME_SECOND_MAX_ATTEMPTS):
+        tid, landed = attempt()
+        if landed:
+            return tid
+    pytest.skip(
+        "could not land a same-second race in "
+        f"{_SAME_SECOND_MAX_ATTEMPTS} attempts - host too slow/loaded to "
+        "exercise the same-second tiebreak path"
+    )
+
+
+def test_review_handback_supersedes_earlier_pr_comment_allows_respawn(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuine, current review handback authorises a respawn even though
+    the PR-URL comment that preceded it is still inside the 24h window.
+
+    ``request_changes`` is the kernel-written proof a reviewer already
+    looked at that exact PR and sent the task back for rework — the
+    dispatcher must let the implementer run again, not treat the old PR
+    link as duplicate-work evidence forever.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    with kb.connect() as conn:
+        tid = _make_review_handback(conn, title="handback earlier pr")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.current_run_id is None
+        assert task.assignee == "worker"
+
+        assert kb.check_respawn_guard(conn, tid) is None
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        spawned: list[str] = []
+
+        def spawn(task, workspace):
+            spawned.append(task.id)
+            return None
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert tid in [s[0] for s in result.spawned]
+        assert dict(result.respawn_guarded).get(tid) is None
+        assert tid in spawned
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_review_handback_respawn_claim_is_race_safe(kanban_home: Path) -> None:
+    """Two dispatchers racing the same handed-back task must not double-claim.
+
+    Both ``kanban_db.dispatch_once`` and the decomposed
+    ``kanban_db_dispatch`` dispatch loop claim a ready task through the SAME
+    shared ``kanban_db.claim_task`` CAS (``kanban_db_dispatch`` calls it via
+    its late-bound ``_kb`` alias) — so racing the two dispatchers on this
+    handback reduces to racing two ``claim_task`` calls on it. Both guard
+    copies must first agree the respawn is authorized; then exactly one of
+    two racing claim attempts may land, and the other must see the task
+    already claimed rather than mint a duplicate worker. The guard fix must
+    not have loosened that CAS.
+    """
+    with kb.connect() as conn:
+        tid = _make_review_handback(conn, title="race the handback")
+        assert kb.check_respawn_guard(conn, tid) is None
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        first = kb.claim_task(conn, tid)
+        second = kb.claim_task(conn, tid)
+
+        assert first is not None
+        assert second is None
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.get_task(conn, tid).current_run_id == first.current_run_id
+
+
+def test_stale_review_handback_older_than_pr_comment_stays_blocked(
+    kanban_home: Path,
+) -> None:
+    """A handback OLDER than a PR-URL comment authorises nothing: the newer
+    comment is fresh, still-unreviewed duplicate-work evidence.
+
+    Builds a genuine handback with no PR comment yet, then posts a fresh
+    PR-URL comment afterwards via the real lifecycle calls — the handback
+    event durably precedes the comment's ``commented`` event in real
+    insertion order, so the guard must still return ``active_pr`` in both
+    copies.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stale handback", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        ok = kb.request_review(
+            conn, tid, summary="v1", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert ok is True
+        review_claim = kb.claim_review_task(conn, tid)
+        assert review_claim is not None
+        ok, who = kb.request_changes(
+            conn, tid, reason="fix", expected_run_id=review_claim.current_run_id,
+        )
+        assert ok is True, who
+
+        # A fresh PR-URL comment lands AFTER the handback.
+        kb.add_comment(conn, tid, author="worker", body=_HANDBACK_PR_COMMENT)
+
+        # Confirm real ordering: the handback event durably precedes the
+        # comment's own `commented` event — no history was rewritten.
+        handback_event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? "
+            "AND kind = 'changes_requested'",
+            (tid,),
+        ).fetchone()["id"]
+        comment_event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? "
+            "AND kind = 'commented' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()["id"]
+        assert handback_event_id < comment_event_id
+
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_review_handback_does_not_authorize_unrelated_task(
+    kanban_home: Path,
+) -> None:
+    """A handback on one task must not authorise a duplicate-PR respawn on a
+    different, unrelated task."""
+    with kb.connect() as conn:
+        handback_id = _make_review_handback(conn, title="handback task")
+        other_id = kb.create_task(conn, title="unrelated ready task", assignee="worker")
+        kb.add_comment(conn, other_id, author="worker", body=_HANDBACK_PR_COMMENT)
+
+        assert kb.check_respawn_guard(conn, handback_id) is None
+        assert kbd.check_respawn_guard(conn, handback_id) is None
+
+        assert kb.check_respawn_guard(conn, other_id) == "active_pr"
+        assert kbd.check_respawn_guard(conn, other_id) == "active_pr"
+
+
+def test_review_handback_same_second_as_prior_pr_comment_allows_respawn(
+    kanban_home: Path,
+) -> None:
+    """SAME-SECOND boundary: the common case where the PR-URL comment and
+    the genuine handback that follows it land in the same whole-second tick
+    (a fast ``request_review`` -> ``claim_review_task`` -> ``request_changes``
+    round trip, exactly what ``_make_review_handback`` drives). ``created_at``
+    alone can't order same-second rows, so the guard must fall back to real
+    insertion order (via the comment's own ``commented`` event id) and still
+    recognize the handback as later.
+    """
+    with kb.connect() as conn:
+        def attempt():
+            tid = _make_review_handback(conn, title="same second handback")
+            comment_row = conn.execute(
+                "SELECT created_at FROM task_comments WHERE task_id = ? "
+                "ORDER BY id ASC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            handback_row = conn.execute(
+                "SELECT created_at FROM task_events WHERE task_id = ? "
+                "AND kind = 'changes_requested'",
+                (tid,),
+            ).fetchone()
+            assert comment_row is not None and handback_row is not None
+            landed = int(comment_row["created_at"]) == int(handback_row["created_at"])
+            return tid, landed
+
+        tid = _retry_until_same_second(attempt)
+
+        assert kb.check_respawn_guard(conn, tid) is None
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_new_pr_comment_same_second_as_handback_stays_guarded(
+    kanban_home: Path,
+) -> None:
+    """SAME-SECOND boundary in the other direction: a brand-new, unreviewed
+    PR-URL comment posted in the very same tick as an (already-consumed)
+    handback must still guard the respawn. Flipping the stale comparison to
+    strict ``>`` alone would fix this direction but break the previous one —
+    only the real insertion order (comment's own ``commented`` event id vs.
+    the handback event id) gets both right.
+    """
+    with kb.connect() as conn:
+        def attempt():
+            tid = _make_review_handback(
+                conn, title="new pr same second", pr_comment="Working on the fix."
+            )
+            kb.add_comment(conn, tid, author="worker", body=_HANDBACK_PR_COMMENT)
+
+            handback_row = conn.execute(
+                "SELECT created_at FROM task_events WHERE task_id = ? "
+                "AND kind = 'changes_requested'",
+                (tid,),
+            ).fetchone()
+            new_comment_row = conn.execute(
+                "SELECT created_at FROM task_comments WHERE task_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            assert handback_row is not None and new_comment_row is not None
+            landed = int(handback_row["created_at"]) == int(new_comment_row["created_at"])
+            return tid, landed
+
+        tid = _retry_until_same_second(attempt)
+
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_pr_comment_without_commented_event_same_second_fails_closed(
+    kanban_home: Path,
+) -> None:
+    """A PR-URL comment with no corresponding ``commented`` event (mirroring
+    ``kanban_db``'s inline ``INSERT INTO task_comments`` sites, e.g.
+    ``specify_triage_task``) can't be placed relative to a same-second
+    handback by event id — the guard must fail CLOSED rather than guess, and
+    keep treating it as an active, unreviewed PR.
+
+    This is the one place in the suite allowed to insert a comment row
+    directly: the whole point is exercising the missing-event case. No
+    ``changes_requested``/``review_reopened`` event is fabricated anywhere.
+    """
+    with kb.connect() as conn:
+        tid = _make_review_handback(
+            conn, title="missing commented event", pr_comment="Working on the fix."
+        )
+        handback_row = conn.execute(
+            "SELECT created_at FROM task_events WHERE task_id = ? "
+            "AND kind = 'changes_requested'",
+            (tid,),
+        ).fetchone()
+        assert handback_row is not None
+        handback_at = int(handback_row["created_at"])
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (tid, "worker", _HANDBACK_PR_COMMENT, handback_at),
+            )
+
+        comment_row = conn.execute(
+            "SELECT created_at FROM task_comments WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert comment_row is not None
+        assert int(comment_row["created_at"]) == handback_at
+
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_pr_comment_fingerprint_collision_new_pr_stays_guarded(
+    kanban_home: Path,
+) -> None:
+    """Regression test for a same-author, same-length PR-comment fingerprint
+    collision that used to fail OPEN.
+
+    Two PR-URL comments by the SAME author with the SAME body length (only
+    the PR number differs) used to have byte-identical
+    ``(author, len(body))`` payload fingerprints — indistinguishable to the
+    old content-matching tiebreak. The FIRST comment (posted BEFORE the
+    handback) would match whichever ``commented`` event the matcher found
+    first, letting the guard conclude the SECOND, unreviewed comment (posted
+    AFTER the handback) was also superseded. Ordinal pairing by row id,
+    never by content, cannot confuse the two.
+    """
+    pr1 = "Candidate is up at https://github.com/example/repo/pull/123 - go."
+    pr2 = "Candidate is up at https://github.com/example/repo/pull/456 - go."
+    assert len(pr1) == len(pr2)
+
+    with kb.connect() as conn:
+        def attempt():
+            tid = kb.create_task(conn, title="fingerprint collision", assignee="worker")
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            # PR comment #1 BEFORE the review round trip.
+            kb.add_comment(conn, tid, author="worker", body=pr1)
+            ok = kb.request_review(
+                conn, tid, summary="ready", reviewer="reviewer",
+                expected_run_id=claimed.current_run_id,
+            )
+            assert ok is True
+            review_claim = kb.claim_review_task(conn, tid)
+            assert review_claim is not None
+            ok, who = kb.request_changes(
+                conn, tid, reason="fix", expected_run_id=review_claim.current_run_id,
+            )
+            assert ok is True, who
+            # PR comment #2 AFTER the handback: a NEW, unreviewed PR, same
+            # author and body length as comment #1.
+            kb.add_comment(conn, tid, author="worker", body=pr2)
+
+            handback_row = conn.execute(
+                "SELECT created_at FROM task_events WHERE task_id = ? "
+                "AND kind = 'changes_requested'",
+                (tid,),
+            ).fetchone()
+            comment_rows = conn.execute(
+                "SELECT created_at FROM task_comments WHERE task_id = ? ORDER BY id",
+                (tid,),
+            ).fetchall()
+            assert handback_row is not None
+            seconds = {int(handback_row["created_at"])} | {
+                int(r["created_at"]) for r in comment_rows
+            }
+            return tid, len(seconds) == 1
+
+        tid = _retry_until_same_second(attempt)
+
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_pairing_unavailable_with_mixed_comment_sources_fails_closed(
+    kanban_home: Path,
+) -> None:
+    """When even ONE comment on the task bypassed ``add_comment`` (an inline
+    ``INSERT INTO task_comments``, mirroring ``specify_triage_task``), the
+    task's total comment count no longer equals its total ``commented``
+    event count, so ordinal pairing cannot be established for ANY comment on
+    the task — not just the directly-inserted one. A same-second PR-URL
+    comment that DOES have its own ``commented`` event, and would otherwise
+    be provably superseded, must still fail closed once that correspondence
+    is broken.
+    """
+    with kb.connect() as conn:
+        def attempt():
+            tid = _make_review_handback(
+                conn, title="mixed comment sources", pr_comment="Working on the fix."
+            )
+            handback_row = conn.execute(
+                "SELECT created_at FROM task_events WHERE task_id = ? "
+                "AND kind = 'changes_requested'",
+                (tid,),
+            ).fetchone()
+            assert handback_row is not None
+            handback_at = int(handback_row["created_at"])
+
+            # A comment inserted directly (no ``commented`` event) — mirrors
+            # an inline INSERT site elsewhere in kanban_db, alongside the
+            # normal, event-backed comments already on this task.
+            with kb.write_txn(conn):
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (tid, "worker", "no event for this one", handback_at),
+                )
+
+            # A normal, event-backed PR-URL comment landing in the same second.
+            kb.add_comment(conn, tid, author="worker", body=_HANDBACK_PR_COMMENT)
+
+            comment_rows = conn.execute(
+                "SELECT created_at FROM task_comments WHERE task_id = ? ORDER BY id",
+                (tid,),
+            ).fetchall()
+            landed = all(int(r["created_at"]) == handback_at for r in comment_rows)
+            return tid, landed
+
+        tid = _retry_until_same_second(attempt)
+
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_superseded_handback_does_not_authorize_later_respawn_or_other_task(
+    kanban_home: Path,
+) -> None:
+    """A handback stays powerless once superseded: it must not go on
+    authorizing respawns on ITS OWN task after a newer, unreviewed PR
+    comment lands, and (mirroring
+    ``test_review_handback_does_not_authorize_unrelated_task``) it must
+    never authorize a DIFFERENT task either.
+    """
+    with kb.connect() as conn:
+        tid = _make_review_handback(
+            conn, title="handback then new pr", pr_comment="Working on the fix."
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        # A NEW, unreviewed PR-URL comment lands after the handback.
+        kb.add_comment(conn, tid, author="worker", body=_HANDBACK_PR_COMMENT)
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        # Re-checking later still finds the same (now-superseded) handback
+        # powerless — it does not get to authorize the task again.
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        other_id = kb.create_task(
+            conn, title="unrelated ready task 2", assignee="worker"
+        )
+        kb.add_comment(conn, other_id, author="worker", body=_HANDBACK_PR_COMMENT)
+        assert kb.check_respawn_guard(conn, other_id) == "active_pr"
+        assert kbd.check_respawn_guard(conn, other_id) == "active_pr"
 
 
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
