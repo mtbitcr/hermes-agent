@@ -265,6 +265,30 @@ def test_a_created_board_carries_its_register_authority_immediately(fence_home):
     _assert_born_registered("born-fenced")
 
 
+def test_a_creation_that_lost_the_registration_race_gets_the_board(
+    fence_home, monkeypatch,
+):
+    """Two creations of one new slug: the loser's backfill runs after the
+    winner registered the board, so it refuses on the marker; the board
+    exists, is live and writable, and the loser must get it back the way
+    ``mkdir -p`` would, not a refusal."""
+    real = kb.backfill_register_entry
+
+    def winner_registers_first(slug):
+        won = real(slug)
+        assert won.success, won.message
+        return kb.BackfillResult(
+            False, "GA-5: ever-existed marker is set, backfill not permitted",
+        )
+
+    monkeypatch.setattr(kb, "backfill_register_entry", winner_registers_first)
+
+    meta = kb.create_board("raced")
+
+    assert isinstance(meta, dict)
+    _assert_born_registered("raced")
+
+
 def test_a_created_board_can_start_a_reversible_removal_with_no_backfill(
     fence_home,
 ):

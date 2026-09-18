@@ -1373,7 +1373,12 @@ def create_board(
         materialized = db_path.exists() and db_path.stat().st_size > 0
         if creating and materialized and get_register_entry(normed) is None:
             registered = backfill_register_entry(normed)
-            if not registered.success:
+            # Re-read under the lock the backfill has just released: a refusal
+            # while the entry now exists means a concurrent creation of the
+            # same new slug registered it first, and the loser gets the board
+            # (``mkdir -p`` idempotence), not a refusal. Only a board that
+            # still has no authority fails the creation.
+            if not registered.success and get_register_entry(normed) is None:
                 # Fail the creation as a whole rather than hand back a board
                 # with no authority. The raise unwinds this window, which
                 # takes the directory it created back down; the backfill has
