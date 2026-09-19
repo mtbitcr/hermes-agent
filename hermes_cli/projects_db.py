@@ -1021,7 +1021,7 @@ def get_active_removal_operation(
     """
     row = conn.execute(
         "SELECT * FROM project_removal_operations "
-        "WHERE project_id = ? ORDER BY created_at DESC LIMIT 1",
+        "WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
         (project_id,),
     ).fetchone()
     if row is None:
@@ -1041,7 +1041,7 @@ def list_removal_operations_for_project(
     """All removal operations for one project, newest first."""
     return conn.execute(
         "SELECT * FROM project_removal_operations "
-        "WHERE project_id = ? ORDER BY created_at DESC",
+        "WHERE project_id = ? ORDER BY created_at DESC, rowid DESC",
         (project_id,),
     ).fetchall()
 
