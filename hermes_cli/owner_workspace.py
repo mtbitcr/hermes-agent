@@ -6565,7 +6565,7 @@ def _project_removal_state(
         return None
     ops = conn.execute(
         "SELECT * FROM project_removal_operations "
-        "WHERE project_id = ? ORDER BY created_at DESC LIMIT 1",
+        "WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
         (project_id,),
     ).fetchall()
     if not ops:
