@@ -1123,3 +1123,32 @@ class TestRevisionFence:
         assert r["ok"] and r["removal_state"]["phase"] == "cancelled"
         with projects_db.connect_closing() as c:
             assert ow._project_lifecycle_revision(c, _ctx(), pid) == before + 2
+
+
+class TestRestoredBoardGate:
+    """A board restored from a retained copy comes back with its in-board
+    gate frozen; the owner's Resume and the owner's Delete open it."""
+
+    def test_the_resume_helper_opens_a_frozen_restored_gate(self, monkeypatch):
+        pid, s = _real_board(monkeypatch)
+        _start_and_join(pid, "g1s")
+        assert _call(pid, f"g1r{_n[0]}", "restore")["ok"]
+        assert kanban_db._read_gate_instant(s).gate is kanban_db.InBoardGate.FROZEN
+        ow._resume_restored_gate(s)
+        assert kanban_db._read_gate_instant(s).gate is kanban_db.InBoardGate.OPEN
+        # An open gate is left alone.
+        ow._resume_restored_gate(s)
+        assert kanban_db._read_gate_instant(s).gate is kanban_db.InBoardGate.OPEN
+
+    def test_a_restored_project_can_be_removed_again(self, monkeypatch):
+        pid, s = _real_board(monkeypatch)
+        _start_and_join(pid, "g2s")
+        assert _call(pid, f"g2r{_n[0]}", "restore")["ok"]
+        assert kanban_db._read_gate_instant(s).gate is kanban_db.InBoardGate.FROZEN
+        _start_and_join(pid, "g2t")
+        with projects_db.connect_closing() as c:
+            served = _project_removal_state(c, pid, s)
+        assert served["phase"] == "done", served
+        assert kanban_db.get_register_entry(s).lifecycle is (
+            kanban_db.BoardLifecycle.ARCHIVED
+        )

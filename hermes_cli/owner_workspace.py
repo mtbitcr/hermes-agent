@@ -3871,6 +3871,10 @@ def set_project_archived(
                         resulting_archived = False
                         execution_paused = True
                     else:
+                        # Resume is also the kernel's resume of a board
+                        # restored from a retained copy: open its frozen
+                        # gate first, or every write is refused.
+                        _resume_restored_gate(current.board_slug)
                         _set_project_dispatch_state(
                             current.board_slug,
                             enabled=True,
@@ -6561,7 +6565,7 @@ def _project_removal_state(
         return None
     ops = conn.execute(
         "SELECT * FROM project_removal_operations "
-        "WHERE project_id = ? ORDER BY created_at DESC LIMIT 1",
+        "WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
         (project_id,),
     ).fetchall()
     if not ops:
@@ -6832,6 +6836,34 @@ def resume_removal_operations():
             _dispatch_removal_drive(board_slug, project_id, operation_key)
 
 
+def _resume_restored_gate(board_slug):
+    """Open the in-board gate of a board restored from a retained copy.
+
+    restore_retained_board leaves the restored store FROZEN at its new epoch,
+    usable only after resume_restored_board (the kernel's own permanent
+    continuation does restore then resume). The owner's Resume is that resume,
+    and a removal started on a restored board must open the gate first or the
+    fence can never close ("gate is frozen, cannot close"). A gate that is not
+    frozen is left alone; a frozen gate that cannot be opened refuses the
+    owner action with the generic safe sentence and leaves the project as it
+    was.
+    """
+    if not board_slug:
+        return
+    try:
+        reading = kanban_db._read_gate_instant(board_slug)
+    except Exception:
+        return
+    if (
+        reading.status is not kanban_db.DurableReadStatus.OK
+        or reading.gate is not kanban_db.InBoardGate.FROZEN
+    ):
+        return
+    resumed = kanban_db.resume_restored_board(board_slug)
+    if not resumed.success:
+        raise OwnerWorkspaceError("internal", _REMOVAL_SAFE_ERRORS["internal"])
+
+
 def _removal_start(pconn, ctx, project, idempotency_key, operation, digest, existing_op):
     if existing_op is not None:
         state = _project_removal_state(pconn, project.id, project.board_slug)
@@ -6865,6 +6897,10 @@ def _removal_start(pconn, ctx, project, idempotency_key, operation, digest, exis
         )
         return result
 
+    # A board restored from a retained copy is still frozen until resumed;
+    # a removal of it must open the gate before the intent, or its fence
+    # can never close.
+    _resume_restored_gate(project.board_slug)
     mode = kanban_db.RemovalMode.REVERSIBLE
     intent = kanban_db.record_removal_intent(project.board_slug, mode=mode)
     if not intent.success:
