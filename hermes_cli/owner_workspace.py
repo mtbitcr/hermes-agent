@@ -3596,6 +3596,14 @@ def list_owner_decisions(ctx: OwnerContext) -> dict:
 
         project_id = str(project["project_id"])
         board_slug = str(project["board"])
+        if (
+            _completed_removal_state(project_id) is not None
+            and not kanban_db.board_exists(board_slug)
+        ):
+            # The board is gone because the owner removed the Project. The
+            # Projects list folds it into Deleted; it holds no decisions, and
+            # opening its missing board would fail the whole inbox.
+            continue
         if board_slug == kanban_db.DEFAULT_BOARD:
             board_path = kanban_db.kanban_home() / "kanban.db"
         else:
