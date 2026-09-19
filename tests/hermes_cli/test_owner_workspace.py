@@ -21,6 +21,7 @@ from tools import approval
 
 
 import contextlib
+import shutil
 
 
 @contextlib.contextmanager
@@ -2820,6 +2821,46 @@ def test_project_steward_snapshot_rejects_invalid_lookback(ctx, lookback_days):
             project_id=setup["project_id"], lookback_days=lookback_days
         )
     assert excinfo.value.code == "invalid_argument"
+
+
+def test_owner_decisions_skip_a_deleted_project_whose_board_is_gone(ctx):
+    """A Project the owner removed keeps its record but loses its board; the
+    decision inbox must skip it instead of failing for every other Project."""
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        input_id = kanban_db.create_task(
+            conn,
+            title="Choose the workshop date",
+            project_id=setup["project_id"],
+        )
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input' "
+                "WHERE id = ?",
+                (input_id,),
+            )
+    removed = _committed_project(
+        ctx, key="graph-removed-project", name="Removed Project",
+    )
+    with projects_db.connect_closing() as conn:
+        projects_db.record_removal_operation(
+            conn,
+            project_id=removed["project_id"],
+            idempotency_key="removed-project-permanent",
+            action="confirm_permanent",
+            phase="done",
+            mode="permanent",
+            board_slug=removed["board"],
+            removal_id="rm-removed-project",
+        )
+    shutil.rmtree(kanban_db.board_dir(removed["board"]))
+    assert not kanban_db.board_exists(removed["board"])
+
+    projected = ow.list_owner_decisions(ctx)
+
+    assert projected["truncated"] is False
+    assert [item["title"] for item in projected["data"]] == ["Choose the workshop date"]
+    assert all(item["project_slug"] == setup["board"] for item in projected["data"])
 
 
 def test_owner_decisions_projects_native_gates_without_writes_or_identifiers(ctx):
