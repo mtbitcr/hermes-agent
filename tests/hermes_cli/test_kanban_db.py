@@ -2277,3 +2277,256 @@ def test_blocked_card_waiting_on_dependency_returns_when_parents_finish(kanban_h
         assert kb.recompute_ready(conn) == 1
         assert kb.get_task(conn, child).status == "ready"
         assert kb.get_task(conn, sticky).status == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Review handback: one linked follow-up item per reviewed candidate
+# ---------------------------------------------------------------------------
+
+
+def _followups_of(conn, parent_id: str) -> set:
+    """Every task id linked as a child of ``parent_id``."""
+    return {
+        r["child_id"]
+        for r in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?",
+            (parent_id,),
+        ).fetchall()
+    }
+
+
+def _parents_of(conn, child_id: str) -> list:
+    return [
+        r["parent_id"]
+        for r in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? "
+            "ORDER BY parent_id",
+            (child_id,),
+        ).fetchall()
+    ]
+
+
+def _park_for_review(conn, tid: str, *, reviewer: str = "reviewer") -> int:
+    """Hand ``tid`` to a reviewer and claim it from the review lane."""
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    ok = kb.request_review(
+        conn, tid, summary="candidate ready", reviewer=reviewer,
+        expected_run_id=task.current_run_id,
+    )
+    assert ok is True
+    review_claim = kb.claim_review_task(conn, tid)
+    assert review_claim is not None
+    return review_claim.current_run_id
+
+
+def test_changes_requested_records_one_linked_followup_for_the_implementer(
+    kanban_home,
+):
+    """A non-pass verdict leaves exactly ONE follow-up item, owned by the
+    boundary that did the original work and linked to the reviewed card."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship the widget", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        review_run = _park_for_review(conn, tid)
+
+        ok, who = kb.request_changes(
+            conn, tid, reason="fix the boundary", expected_run_id=review_run,
+        )
+        assert (ok, who) == (True, "worker")
+
+        followups = _followups_of(conn, tid)
+        assert len(followups) == 1, followups
+        followup = kb.get_task(conn, next(iter(followups)))
+        assert followup is not None
+        assert followup.assignee == "worker"
+        assert followup.id != tid
+        # Linked to the reviewed work, and gated behind it.
+        assert _parents_of(conn, followup.id) == [tid]
+        assert followup.status == "todo"
+
+
+def test_replayed_verdict_on_the_same_candidate_adds_no_second_followup(
+    kanban_home,
+):
+    """Replaying the identical verdict against the identical reviewed
+    candidate reuses the existing follow-up instead of creating a second."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship the widget", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        first_run = _park_for_review(conn, tid)
+        ok, _ = kb.request_changes(
+            conn, tid, reason="fix the boundary", expected_run_id=first_run,
+        )
+        assert ok is True
+        after_first = _followups_of(conn, tid)
+        assert len(after_first) == 1
+
+        # The implementer hands the SAME candidate back (no new proven head),
+        # and the reviewer returns changes again.
+        assert kb.claim_task(conn, tid) is not None
+        second_run = _park_for_review(conn, tid)
+        ok, _ = kb.request_changes(
+            conn, tid, reason="still not fixed", expected_run_id=second_run,
+        )
+        assert ok is True
+
+        assert _followups_of(conn, tid) == after_first
+
+
+def _git_in(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        [
+            "git", "-C", str(cwd),
+            "-c", "user.name=Kanban Test",
+            "-c", "user.email=kanban@example.com",
+            "-c", "commit.gpgsign=false",
+            *args,
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
+def _scoped_worktree_task(conn, repo: Path, *, title: str) -> tuple:
+    """A claimed, scoped task with a real worktree the kernel can prove."""
+    tid = kb.create_task(
+        conn, title=title, assignee="worker",
+        workspace_kind="worktree", workspace_path=str(repo),
+        branch_name="feature/followup", owned_paths=["src"],
+    )
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    workspace, branch = kb._resolve_worktree_workspace(claimed)
+    kb.set_workspace_path(conn, tid, workspace)
+    kb.set_branch_name(conn, tid, branch)
+    kb.record_worktree_base(conn, tid, workspace)
+    return tid, workspace
+
+
+def _commit_candidate(workspace: Path, relative: str, content: str) -> str:
+    path = workspace / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    _git_in(workspace, "add", relative)
+    _git_in(workspace, "commit", "-m", f"candidate {content.strip()}")
+    return _git_in(workspace, "rev-parse", "HEAD")
+
+
+def test_a_verdict_on_a_different_candidate_gets_its_own_followup(
+    kanban_home, tmp_path,
+):
+    """Reworked-and-resubmitted work is a DIFFERENT reviewed candidate, so it
+    gets its own follow-up rather than collapsing onto the previous one."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid, workspace = _scoped_worktree_task(conn, repo, title="scoped ship")
+
+        first_head = _commit_candidate(workspace, "src/a.py", "one\n")
+        first_run = _park_for_review(conn, tid)
+        ok, _ = kb.request_changes(
+            conn, tid, reason="first pass", expected_run_id=first_run,
+        )
+        assert ok is True
+        after_first = _followups_of(conn, tid)
+        assert len(after_first) == 1
+
+        # Rework: a genuinely new candidate commit, so the next park proves a
+        # different head.
+        assert kb.claim_task(conn, tid) is not None
+        second_head = _commit_candidate(workspace, "src/a.py", "two\n")
+        assert second_head != first_head
+        second_run = _park_for_review(conn, tid)
+        ok, _ = kb.request_changes(
+            conn, tid, reason="second pass", expected_run_id=second_run,
+        )
+        assert ok is True
+
+        after_second = _followups_of(conn, tid)
+        assert len(after_second) == 2, after_second
+        assert after_first < after_second
+        for fid in after_second:
+            followup = kb.get_task(conn, fid)
+            assert followup is not None
+            assert followup.assignee == "worker"
+            assert _parents_of(conn, fid) == [tid]
+
+
+def test_followup_leaves_handback_counters_and_loop_stop_unchanged(kanban_home):
+    """The follow-up is additive: the handback, the preserved breaker counter
+    and the sticky loop-stop all behave exactly as before."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship the widget", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 2 WHERE id = ?", (tid,),
+        )
+        review_run = _park_for_review(conn, tid)
+
+        ok, who = kb.request_changes(
+            conn, tid, reason="fix the boundary", expected_run_id=review_run,
+        )
+        assert (ok, who) == (True, "worker")
+
+        # Handback: same row, back to the implementer, run closed.
+        handed_back = kb.get_task(conn, tid)
+        assert handed_back is not None
+        assert handed_back.assignee == "worker"
+        assert handed_back.status == "ready"
+        assert handed_back.current_run_id is None
+
+        # Counters: consecutive_failures is PRESERVED, neither reset nor bumped.
+        assert conn.execute(
+            "SELECT consecutive_failures FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()[0] == 2
+
+        # The run outcome and the audit event are unchanged.
+        assert kb.latest_run(conn, tid).outcome == "changes_requested"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert kinds.count("changes_requested") == 1
+
+        # The follow-up is a NEW row; it never becomes the reviewed card.
+        followups = _followups_of(conn, tid)
+        assert len(followups) == 1
+        assert tid not in followups
+
+
+def test_review_findings_repeat_still_stops_without_a_second_followup(
+    kanban_home,
+):
+    """The loop-stop is untouched: an identical repeat on the same candidate
+    still blocks for an owner decision, and adds no further follow-up."""
+    finding = {
+        "fingerprint": "f-1",
+        "file": "src/a.py",
+        "lines": "10-12",
+        "severity": "major",
+        "problem": "the boundary is checked after the write",
+        "impact": "a closed gate still admits one write",
+        "smallest_fix": "move the check above the write",
+        "candidate_digest": "cand1",
+    }
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship the widget", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        first_run = _park_for_review(conn, tid)
+        first = kb.submit_review_findings(
+            conn, tid, findings=[finding], candidate_digest="cand1",
+            expected_run_id=first_run,
+        )
+        assert first["outcome"] == "handed_back", first
+        after_first = _followups_of(conn, tid)
+        assert len(after_first) == 1
+
+        # The identical findings against the identical candidate: the stop.
+        assert kb.claim_task(conn, tid) is not None
+        second_run = _park_for_review(conn, tid)
+        second = kb.submit_review_findings(
+            conn, tid, findings=[finding], candidate_digest="cand1",
+            expected_run_id=second_run,
+        )
+        assert second["outcome"] == "owner_decision_blocked", second
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert _followups_of(conn, tid) == after_first

@@ -194,6 +194,15 @@ _RECOMMENDATION_TASK_TITLE = "hermes recommendation"
 # a bump intentionally re-opens one new card per previously-deduped identity.
 _RECOMMENDATION_IDENTITY_VERSION = "rec1"
 
+# ITEM31BH's mechanism, reused: version tag for the review follow-up dedup
+# identity stored in ``tasks.idempotency_key``. Bump only if the identity
+# tuple changes meaning -- a bump intentionally re-opens one new follow-up
+# per previously-deduped identity.
+_REVIEW_FOLLOWUP_IDENTITY_VERSION = "revfix1"
+
+# Bound on the generated follow-up title, which quotes the reviewed card's own.
+_REVIEW_FOLLOWUP_TITLE_MAX_CHARS = 200
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -19857,6 +19866,39 @@ def _recommendation_identity_key(
     return f"{_RECOMMENDATION_IDENTITY_VERSION}:{digest}"
 
 
+def _review_followup_identity_key(
+    *,
+    reviewed_task_id: str,
+    candidate: str,
+) -> str:
+    """Digest the identity of ONE review follow-up item.
+
+    The sibling of :func:`_recommendation_identity_key`, and deliberately the
+    same mechanism: the digest is stored in ``tasks.idempotency_key`` and
+    :func:`create_task`'s own dedup lookup is what enforces "exactly one".
+    Nothing new is invented here -- this only names the identity.
+
+    Identity is the reviewed WORK plus the exact reviewed CANDIDATE: replaying
+    the same verdict against the same candidate must return the follow-up that
+    already exists, while a verdict on a different candidate (the implementer
+    reworked and resubmitted) is genuinely different work and gets its own
+    item. The reason text, the findings, the reviewer and the observed time are
+    excluded on purpose -- a reworded handback is not a second follow-up.
+
+    Only the digest is durable, never its input.
+    """
+    payload = json.dumps(
+        {
+            "reviewed_task_id": reviewed_task_id,
+            "candidate": candidate,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"{_REVIEW_FOLLOWUP_IDENTITY_VERSION}:{digest}"
+
+
 def create_recommendation(
     conn: sqlite3.Connection,
     *,
@@ -27609,6 +27651,10 @@ def _request_changes_within_txn(
     transaction afterwards, so a failure there handed the task back with the
     findings attached and no delivery record behind them.
 
+    The transition also records ONE follow-up item for the implementer,
+    linked to the reviewed card, in this same transaction -- see the call
+    to :func:`create_task` below.
+
     The caller MUST already hold an open ``write_txn`` on ``conn``, and
     ``reason`` must already be redacted and non-empty. The transition has no
     post-commit side effects of its own, which is what makes sharing the
@@ -27617,7 +27663,7 @@ def _request_changes_within_txn(
     if not reason:
         return False, "reason is required"
     task_row = conn.execute(
-        "SELECT status, assignee, current_run_id FROM tasks "
+        "SELECT status, assignee, current_run_id, title FROM tasks "
         "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
@@ -27736,6 +27782,49 @@ def _request_changes_within_txn(
             "reviewer": reviewer,
             "status": new_status,
         },
+        run_id=run_id,
+    )
+    # ONE follow-up item for the boundary that did the work, linked to the
+    # reviewed card, in THIS transaction -- so the verdict, the handback and
+    # the follow-up commit together or not at all. Both non-pass entry points
+    # (``request_changes`` and ``submit_review_findings``) reach the kernel
+    # through this body, so this is the only call site.
+    #
+    # Identity is the reviewed WORK plus the exact reviewed CANDIDATE: the
+    # kernel's own proven implementation head, read from the park this verdict
+    # is answering. Replaying the same verdict against the same candidate
+    # reaches ``create_task``'s existing ``idempotency_key`` dedup and returns
+    # the follow-up that already exists; a verdict on a DIFFERENT candidate
+    # (the implementer reworked and resubmitted, so the park recorded a new
+    # head) is different work and gets its own item. A card whose park
+    # recorded no head -- legacy unscoped, non-worktree, nothing to prove --
+    # has no distinct candidate to tell apart, so every non-pass verdict on it
+    # collapses onto its one follow-up rather than nagging twice.
+    #
+    # The item is linked as a CHILD of the reviewed card, so it inherits the
+    # existing parent gating and waits in ``todo`` instead of competing with
+    # the rework the implementer is being handed back right now.
+    reviewed_title = str(task_row["title"] or "").strip()
+    followup_id = create_task(
+        conn,
+        title=f"Rework: {reviewed_title}"[:_REVIEW_FOLLOWUP_TITLE_MAX_CHARS],
+        body=(
+            "Rework tracked from a review that returned changes on "
+            f"{task_id}. The reviewed card carries the verdict, the reason "
+            "and any findings document."
+        ),
+        assignee=implementer,
+        parents=[task_id],
+        idempotency_key=_review_followup_identity_key(
+            reviewed_task_id=task_id,
+            candidate=_latest_review_head_provenance(conn, task_id) or "",
+        ),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "review_followup_recorded",
+        {"followup_task_id": followup_id, "implementer": implementer},
         run_id=run_id,
     )
     return True, implementer
