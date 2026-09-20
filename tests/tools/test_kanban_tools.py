@@ -2248,8 +2248,15 @@ def test_capability_receipt_reports_unavailable_rather_than_inventing(monkeypatc
     }
 
 
-def test_capability_receipt_unions_the_cards_force_load_list(monkeypatch, worker_env, tmp_path):
-    """Skills injected without an explicit call still count as used."""
+def test_capability_receipt_reports_only_session_derived_skills(monkeypatch, worker_env, tmp_path):
+    """A skill force-loaded on the card but never called is not reported.
+
+    The receipt is built for a run identified by its session, so the card can
+    only be reached through this process's environment — which names the run's
+    own card just for a worker stamping itself. Reading it would make the same
+    field mean "what this run used" on one ending and "what some other card
+    declared" on the next, so ``skills`` is session evidence only.
+    """
     from hermes_state import SessionDB
     from hermes_cli import profiles, kanban_db as kb
     from tools import kanban_tools as kt
@@ -2270,7 +2277,7 @@ def test_capability_receipt_unions_the_cards_force_load_list(monkeypatch, worker
     conn = kb.connect()
     try:
         conn.execute("UPDATE tasks SET skills = ? WHERE id = ?",
-                     (json.dumps(["forced-skill"]), worker_env))
+                     (json.dumps(["forced-skill-never-called"]), worker_env))
         conn.commit()
     finally:
         conn.close()
@@ -2278,5 +2285,59 @@ def test_capability_receipt_unions_the_cards_force_load_list(monkeypatch, worker
     monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
     capability = kt._worker_runtime_receipt(session_id)["capability"]
 
-    assert capability["skills"] == ["called-skill", "forced-skill"]
+    assert capability["skills"] == ["called-skill"]
     assert capability["source"] == "session-tool-calls"
+    assert capability["skills_truncated"] is False
+    assert capability["truncated"] is False
+
+
+@pytest.mark.parametrize("foreign_card", [False, True])
+def test_capability_receipt_is_bound_to_the_run_not_the_process(monkeypatch, worker_env, tmp_path, foreign_card):
+    """An ending booked outside the run's own worker reports the run's skills.
+
+    The kernel stamps crashed, timed-out, reclaimed, stale and spawn-failed
+    endings from the dispatcher process, which carries no card in its
+    environment or a different one. Either way the receipt must carry only what
+    this session did, never another card's declared skills.
+    """
+    from hermes_state import SessionDB
+    from hermes_cli import profiles, kanban_db as kb
+    from tools import kanban_tools as kt
+
+    profile_dir = tmp_path / "kernel-profile"
+    profile_dir.mkdir()
+    session_id = "kernel-session"
+    db = SessionDB(db_path=profile_dir / "state.db")
+    try:
+        _capability_session(db, session_id, [("skill_view", {"name": "skill-this-run-used"})])
+        db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
+            model="served-model", billing_provider="served-provider",
+            estimated_cost_usd=0.01, cost_status="estimated",
+            cost_source="official_docs_snapshot", api_call_count=1)
+    finally:
+        db.close()
+
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET skills = ? WHERE id = ?",
+                     (json.dumps(["skill-forced-on-this-card"]), worker_env))
+        if foreign_card:
+            other = kb.create_task(conn, title="another-card", assignee="test-worker")
+            conn.execute("UPDATE tasks SET skills = ? WHERE id = ?",
+                         (json.dumps(["skill-forced-on-another-card"]), other))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # The stamping process is not this run's worker: it names another card, or
+    # no card at all.
+    if foreign_card:
+        monkeypatch.setenv("HERMES_KANBAN_TASK", other)
+    else:
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
+    capability = kt._worker_runtime_receipt(session_id)["capability"]
+
+    assert capability["skills"] == ["skill-this-run-used"]
+    assert capability["source"] == "session-tool-calls"
+    assert capability["truncated"] is False

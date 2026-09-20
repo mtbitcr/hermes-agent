@@ -33,7 +33,6 @@ import logging
 import math
 import os
 import re
-import sqlite3
 import time
 from typing import Any, Optional
 
@@ -291,7 +290,6 @@ def _runtime_receipt_cost(route: dict) -> dict:
 _CAPABILITY_SCHEMA_VERSION = 1
 _CAPABILITY_MAX_NAMES = 40
 _CAPABILITY_MAX_ROWS = 4000
-_CAPABILITY_READ_TIMEOUT = 1.0
 _CAPABILITY_MCP_PREFIX = "mcp__"
 _CAPABILITY_SKILL_TOOLS = ("skill_view", "skill_manage")
 # Underscore is deliberate and load-bearing: tool names (``kanban_complete``,
@@ -342,48 +340,6 @@ def _capability_receipt(skills, tools, connections, *, source: str, complete: bo
     }
 
 
-def _capability_card_skills() -> set:
-    """Force-loaded skill names for the card this process is working on.
-
-    Read through a strictly read-only SQLite connection so a receipt built
-    while the kernel holds the ending write transaction can never contend
-    with it: in WAL mode a reader observes the last committed state without
-    taking a lock, and no migration or write is attempted here. Absent env
-    (a kernel ending booked outside the worker process) simply yields no
-    force-load names; the session evidence still stands on its own.
-    """
-    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    if not task_id:
-        return set()
-    try:
-        from hermes_cli.kanban_db import kanban_db_path
-
-        db_path = kanban_db_path()
-        if not db_path.is_file():
-            return set()
-        conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro", uri=True, timeout=_CAPABILITY_READ_TIMEOUT
-        )
-        try:
-            row = conn.execute(
-                "SELECT skills FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone()
-        finally:
-            conn.close()
-    except Exception:
-        logger.debug("could not read force-loaded skills for run receipt", exc_info=True)
-        return set()
-    raw = row[0] if row else None
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (TypeError, ValueError):
-            return set()
-    if not isinstance(raw, list):
-        return set()
-    return {name for name in (_capability_name(item) for item in raw) if name}
-
-
 def _capability_skill_names(message: dict) -> set:
     """Skill names named by this message\u2019s own skill tool calls.
 
@@ -421,8 +377,16 @@ def _capability_from_session(db: Any, session_id: str) -> dict:
     Evidence, never assertion: tool names come from the transcript\u2019s own
     ``tool_name`` column, connections are the server halves of the
     ``mcp__<server>__<tool>`` convention, and skills are the skills those
-    calls named, unioned with the card\u2019s force-load list. A read that
-    fails records ``unavailable`` with empty lists rather than inventing one.
+    calls named. A read that fails records ``unavailable`` with empty
+    lists rather than inventing one.
+
+    The card\u2019s force-load list is deliberately not unioned in: the
+    receipt is built for a run identified by its session, while the kernel
+    books most endings from a process that is not that run\u2019s worker, so
+    this process\u2019s environment names no card, or another card. A skill
+    force-loaded but never called is therefore simply not reported: under
+    an evidence-never-assertion contract, silence beats a list that is
+    borrowed or short while flagged complete.
     """
     try:
         messages = db.get_messages(session_id, limit=_CAPABILITY_MAX_ROWS)
@@ -445,7 +409,6 @@ def _capability_from_session(db: Any, session_id: str) -> dict:
                 connections.add(server)
             continue
         tools.add(name)
-    skills |= _capability_card_skills()
     return _capability_receipt(
         skills,
         tools,
