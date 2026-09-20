@@ -33906,6 +33906,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if protocol_violation else None
             )
             has_evidence = bool(unreported) and unreported.get("evidence") != "none"
+            park_recurrences = 0
             if has_evidence:
                 # Evidence-backed unreported completion: not a failure and
                 # never re-dispatched; parked for a person to accept it.
@@ -33917,12 +33918,27 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             # what was observed, not only what was concluded.
             event_payload.update(identity)
             if has_evidence:
+                # The park is a sticky block like ``kanban_block``: it must
+                # survive the ``recompute_ready`` pass that follows this sweep
+                # in ``dispatch_once`` and leave only through ``unblock_task``.
+                # Same bookkeeping as ``_block_task_within_txn``: the
+                # recurrence counter and, below, the ``blocked`` event.
+                prior = conn.execute(
+                    "SELECT block_kind, block_recurrences FROM tasks WHERE id = ?",
+                    (row["id"],),
+                ).fetchone()
+                park_recurrences = (
+                    int(prior["block_recurrences"] or 0) + 1
+                    if prior is not None and prior["block_kind"] == "needs_input"
+                    else 1
+                )
                 cur = conn.execute(
                     "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input', "
+                    "block_recurrences = ?, "
                     "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
                     "WHERE id = ? AND status = 'running' "
                     "  AND worker_pid = ? AND claim_lock IS ?",
-                    (row["id"], pid, row["claim_lock"]),
+                    (park_recurrences, row["id"], pid, row["claim_lock"]),
                 )
             else:
                 cur = conn.execute(
@@ -33959,6 +33975,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload,
                     run_id=run_id,
                 )
+                if has_evidence:
+                    _append_event(
+                        conn, row["id"], "blocked",
+                        {
+                            "reason": (
+                                "The run exited without reporting its result, "
+                                "but left evidence that the work finished "
+                                f"({unreported.get('evidence')}); accept the "
+                                "result or resume the task."
+                            ),
+                            "kind": "needs_input",
+                            "recurrences": park_recurrences,
+                            "source_status": "running",
+                        },
+                        run_id=run_id,
+                    )
                 exited_hook_payloads.append({
                     "task_id": row["id"],
                     "assignee": row["assignee"],

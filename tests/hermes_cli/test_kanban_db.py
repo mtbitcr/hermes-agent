@@ -2021,6 +2021,45 @@ def test_clean_exit_with_session_terminal_intent_is_not_retried(
         assert task.status == "blocked"
 
 
+def test_evidence_backed_park_survives_recompute_ready_until_unblocked(
+    kanban_home, monkeypatch,
+):
+    """The dispatcher runs recompute_ready right after the crash sweep; a
+    parked unreported completion must stay parked through it (a sticky
+    block, like kanban_block) and leave only through unblock_task."""
+    import json
+
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _running_task_with_dead_pid(conn, monkeypatch)
+        run_id = kb.latest_run(conn, tid).id
+        with kb.write_txn(conn):
+            _kb._link_run_session(conn, run_id, "sess-terminal")
+        monkeypatch.setattr(
+            _kb, "_session_shows_terminal_intent", lambda conn, task_id: True,
+        )
+
+        kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        last_block_event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "AND kind IN ('blocked', 'unblocked') ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert last_block_event["kind"] == "blocked"
+        assert json.loads(last_block_event["payload"])["kind"] == "needs_input"
+
+        kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kb.recompute_ready(conn) == 0
+
+
 def test_session_terminal_intent_reads_real_tool_calls(kanban_home, monkeypatch, tmp_path):
     """End-to-end (no monkeypatched evidence function): a real session store
     row with a kanban_complete tool call is recognized as evidence."""
