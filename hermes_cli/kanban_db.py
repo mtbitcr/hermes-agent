@@ -23183,15 +23183,18 @@ def _link_run_session(
     Written at the FIRST heartbeat instead of at completion, so a run that
     stops, crashes, times out, gives up, or is reclaimed is still joinable
     to its own session log -- those endings never stamped themselves, and
-    they are exactly the ones whose evidence is wanted. Later heartbeats
-    carrying the same id write nothing. Returns True when a link was
-    written.
+    they are exactly the ones whose evidence is wanted. The link is
+    written once: a later heartbeat never overwrites an existing link,
+    whether it repeats the same id or carries a different one (mid-run
+    context compression mints a new session id into the same worker
+    process). Returns True when a link was written.
     """
     if not isinstance(session_id, str) or not session_id.strip():
         return False
     session_id = session_id.strip()
     persisted, _profile = _persisted_run_metadata(conn, run_id)
-    if persisted.get("worker_session_id") == session_id:
+    existing = persisted.get("worker_session_id")
+    if isinstance(existing, str) and existing.strip():
         return False
     persisted["worker_session_id"] = session_id
     conn.execute(

@@ -1803,6 +1803,21 @@ def test_repeat_heartbeat_keeps_the_first_link_and_other_metadata(kanban_home):
         conn.close()
 
 
+def test_later_heartbeat_with_a_different_session_keeps_the_first_link(kanban_home):
+    """Mid-run context compression mints a new session id; the run stays
+    anchored to the session it started in."""
+    conn = kb.connect()
+    try:
+        tid, _run_id = _running_run(conn)
+        kb.heartbeat_worker(conn, tid, session_id="20260920_000001_aaaaaa")
+
+        assert kb.heartbeat_worker(conn, tid, session_id="20260920_004500_bbbbbb") is True
+
+        assert kb.latest_run(conn, tid).metadata["worker_session_id"] == "20260920_000001_aaaaaa"
+    finally:
+        conn.close()
+
+
 def test_heartbeat_without_a_session_writes_no_link(kanban_home):
     conn = kb.connect()
     try:
