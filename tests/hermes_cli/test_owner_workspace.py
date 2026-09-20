@@ -9757,6 +9757,9 @@ def _ineligible_tasks(board: str, project_id: str) -> dict:
         # ``todo`` so parents can release it.
         dependency = _ready_task(conn, project_id, "B11 — Wait for the upstream")
         assert kanban_db.claim_task(conn, dependency) is not None
+        # A dependency stop names the work it waits on; without a parent link
+        # the kernel refuses it.
+        kanban_db.link_tasks(conn, parent_id=parent, child_id=dependency)
         assert kanban_db.block_task(
             conn, dependency, reason="waiting on the upstream card",
             kind="dependency",

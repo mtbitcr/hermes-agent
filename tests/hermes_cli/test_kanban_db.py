@@ -2207,3 +2207,73 @@ def test_protocol_violation_streak_recognizes_completed_unreported_outcome(
             )
         streak = _kb._protocol_violation_streak(conn, tid)
         assert streak == 1
+
+
+# ---------------------------------------------------------------------------
+# Dependency stops: refused without a parent, and the return of blocked work
+# ---------------------------------------------------------------------------
+
+
+def test_dependency_stop_without_a_parent_is_refused(kanban_home):
+    """A dependency stop means "waiting on other work"; with no parent to wait
+    on it is refused before any write, so the card is never parked in a state
+    recompute_ready would promote back on the next tick."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="no parent", assignee="a")
+        kb.claim_task(conn, tid, claimer="w0")
+        run_id = kb.latest_run(conn, tid).id
+
+        with pytest.raises(ValueError, match="dependency stop refused"):
+            kb.block_task(conn, tid, reason="waiting", kind="dependency")
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.block_kind is None
+        assert task.current_run_id == run_id
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "dependency_wait"]
+
+
+def test_dependency_stop_with_a_parent_waits_in_todo(kanban_home):
+    """The same stop with a parent link takes today's path: todo + dependency_wait."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(conn, title="child", assignee="a")
+        kb.claim_task(conn, child, claimer="w0")
+        # Linked while running, as a worker discovering the dependency would be.
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+
+        assert kb.block_task(conn, child, reason="waiting", kind="dependency") is True
+
+        task = kb.get_task(conn, child)
+        assert task.status == "todo"
+        assert task.block_kind == "dependency"
+        assert [e for e in kb.list_events(conn, child) if e.kind == "dependency_wait"]
+
+
+def test_blocked_card_waiting_on_dependency_returns_when_parents_finish(kanban_home):
+    """A card that reached the blocked bucket while still carrying the
+    dependency reason is promoted once its parents finish; a deliberate
+    (sticky) block with the same reason stays until unblock_task."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(conn, title="child", assignee="a")
+        sticky = kb.create_task(conn, title="sticky", assignee="a")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        kb.link_tasks(conn, parent_id=parent, child_id=sticky)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='dependency' "
+                "WHERE id IN (?, ?)",
+                (child, sticky),
+            )
+            kb._append_event(conn, sticky, "blocked", {"reason": "hold", "kind": "dependency"})
+
+        # Parent still open: nothing moves.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "blocked"
+
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.get_task(conn, sticky).status == "blocked"
