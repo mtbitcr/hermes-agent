@@ -2512,6 +2512,18 @@ class _ToolCallAccumulator:
         return None
 
 
+def _is_control_character_stream_error(error: BaseException) -> bool:
+    """True for the Anthropic SDK's strict re-parse of the accumulated tool-call
+    JSON rejecting a literal control character (a raw newline or tab) that the
+    provider streamed inside a string argument. Like the malformed-frame case
+    (``_is_provider_stream_parse_error``) this is wire trouble, not local
+    validation: the turn retries the stream instead of aborting."""
+    if not isinstance(error, ValueError) or isinstance(error, (UnicodeEncodeError, json.JSONDecodeError)):
+        return False
+    text = str(error).lower()
+    return "control character" in text and "parsing a string" in text
+
+
 class _StreamingCall(StreamingWaitMonitor):
     """One streaming request on the chat_completions / anthropic_messages wire.
     State shared between the request worker and the poll-loop monitor (heartbeat,
@@ -3019,8 +3031,13 @@ class _StreamingCall(StreamingWaitMonitor):
                     block = getattr(event, "content_block", None)
                     if block and getattr(block, "type", None) == "tool_use":
                         has_tool_use = True
+                        # Record the in-flight tool call, as the chat-completions
+                        # path does: the retry policy must not read a stream that
+                        # dies here as a partial text response.
+                        self.provider_tool_in_flight["yes"] = True
                         if getattr(block, "name", None):
                             self._emit_tool_started(block.name)
+                            self.result["partial_tool_names"].append(block.name)
                 elif event_type == "content_block_delta":
                     delta = getattr(event, "delta", None)
                     delta_type = getattr(delta, "type", None) if delta else None
@@ -3098,7 +3115,8 @@ class _StreamingCall(StreamingWaitMonitor):
             return False
         _is_timeout = isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout))
         _is_conn_err = isinstance(e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError))
-        _is_stream_parse_err = self.agent._is_provider_stream_parse_error(e)
+        _is_stream_parse_err = (self.agent._is_provider_stream_parse_error(e)
+                                or (self.agent.api_mode == "anthropic_messages" and _is_control_character_stream_error(e)))
         _is_empty_stream = isinstance(e, EmptyStreamError)
         _is_sse_conn_err = not _is_timeout and not _is_conn_err and _is_sse_connection_error(e)
         _is_transient = _is_timeout or _is_conn_err or _is_sse_conn_err or _is_stream_parse_err
