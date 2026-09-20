@@ -1968,9 +1968,11 @@ def test_clean_exit_with_a_deliverable_is_not_retried(kanban_home, monkeypatch):
     """An attachment left behind is deliverable_present evidence; no retry."""
     with kb.connect() as conn:
         tid = _running_task_with_dead_pid(conn, monkeypatch)
-        kb.add_attachment(
-            conn, tid, filename="out.txt", stored_path="/tmp/out.txt",
-            content_type="text/plain", size=3,
+        run_id = kb.latest_run(conn, tid).id
+        # The run's own upload, as the attach tool stores it: run-scoped, by the agent.
+        kb.store_attachment_bytes(
+            conn, tid, "out.txt", b"abc", content_type="text/plain",
+            uploaded_by="agent", expected_run_id=run_id,
         )
 
         crashed = kb.detect_crashed_workers(conn)
@@ -1991,6 +1993,28 @@ def test_clean_exit_with_a_deliverable_is_not_retried(kanban_home, monkeypatch):
 
         events = kb.list_events(conn, tid)
         assert any(e.kind == "protocol_violation" for e in events)
+
+
+def test_owner_attachment_before_the_run_is_not_the_runs_deliverable(
+    kanban_home, monkeypatch,
+):
+    """An owner brief attached before the worker started is not evidence that
+    the run finished anything: evidence stays none and the retry path holds."""
+    with kb.connect() as conn:
+        tid = _running_task_with_dead_pid(conn, monkeypatch)
+        kb.add_attachment(
+            conn, tid, filename="brief.md", stored_path="/tmp/brief.md",
+            content_type="text/markdown", size=5, uploaded_by="owner",
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed
+
+        run = kb.latest_run(conn, tid)
+        assert run.outcome == "completed_unreported"
+        assert run.metadata["unreported_completion"]["evidence"] == "none"
+        assert run.metadata["unreported_completion"]["attachments_at_exit"] == 0
+        assert kb.get_task(conn, tid).status == "ready"
 
 
 def test_clean_exit_with_session_terminal_intent_is_not_retried(

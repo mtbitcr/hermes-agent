@@ -23278,14 +23278,16 @@ def _unreported_completion_evidence(conn: sqlite3.Connection, task_id: str) -> d
     Kernel-written, never model-supplied -- called only from the dead-worker
     classifier's clean-exit branch, before the outcome is finalized as
     ``completed_unreported``. ``evidence`` is ``deliverable_present`` when the
-    run left task attachments, ``session_terminal_intent`` when its own
-    session log (joined via the first-heartbeat ``worker_session_id``, see
+    run itself uploaded attachments (its own ``attached`` receipts, uploaded
+    by the agent -- an owner brief attached before the run is not a
+    deliverable), ``session_terminal_intent`` when its own session log
+    (joined via the first-heartbeat ``worker_session_id``, see
     :func:`_link_run_session`) shows an attempted terminal kanban call, else
     ``none``. Best-effort throughout: any read failure degrades toward
     ``none`` rather than raising inside the reclaim transaction, so a
     session-store outage can only ever fall back to today's retry path.
     """
-    attachments_at_exit = len(list_attachments(conn, task_id))
+    attachments_at_exit = _run_agent_attachment_count(conn, task_id)
     if attachments_at_exit > 0:
         evidence = "deliverable_present"
     elif _session_shows_terminal_intent(conn, task_id):
@@ -23297,6 +23299,44 @@ def _unreported_completion_evidence(conn: sqlite3.Connection, task_id: str) -> d
         "decided_by": "_unreported_completion_evidence",
         "attachments_at_exit": attachments_at_exit,
     }
+
+
+def _run_agent_attachment_count(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the attachments the task's CURRENT run uploaded itself.
+
+    Scoped by the run's own ``attached`` receipts (the tool layer stores a
+    worker upload with its run id and ``uploaded_by="agent"``), so a file the
+    owner attached before the run, or another run's upload, never counts as
+    this run's deliverable. Best-effort: any read error counts zero.
+    """
+    try:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ? AND task_kind = 'work'",
+            (task_id,),
+        ).fetchone()
+        run_id = int(row["current_run_id"]) if row and row["current_run_id"] else None
+        if run_id is None:
+            return 0
+        count = 0
+        for event in conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'attached' ORDER BY id",
+            (task_id, run_id),
+        ).fetchall():
+            try:
+                receipt = json.loads(event["payload"]) if event["payload"] else {}
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if (
+                isinstance(receipt, dict)
+                and isinstance(receipt.get("attachment_id"), int)
+                and receipt.get("by") == "agent"
+            ):
+                count += 1
+        return count
+    except Exception:
+        _log.debug("could not count run attachments for unreported-completion evidence", exc_info=True)
+        return 0
 
 
 def _session_shows_terminal_intent(conn: sqlite3.Connection, task_id: str) -> bool:
