@@ -16094,7 +16094,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     ended_at            INTEGER,
     outcome             TEXT,
     -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
-    --          gave_up | reclaimed | (null while still running)
+    --          gave_up | reclaimed | completed_unreported | stale |
+    --          rate_limited | review_requested | changes_requested |
+    --          scheduled | (null while still running) -- non-exhaustive; see
+    --          each _end_run call site for the authoritative list.
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
@@ -23262,6 +23265,85 @@ def _stamp_run_receipt(
     if receipt is not None:
         stamped["runtime_receipt"] = receipt
     return stamped
+
+
+# Terminal kanban calls a worker may have attempted before a clean exit raced
+# the durable write. Kept narrow and explicit rather than pattern-matched.
+_UNREPORTED_TERMINAL_TOOLS = ("kanban_complete", "kanban_request_review", "kanban_block")
+
+
+def _unreported_completion_evidence(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Classify what a clean exit without a terminal call actually left behind.
+
+    Kernel-written, never model-supplied -- called only from the dead-worker
+    classifier's clean-exit branch, before the outcome is finalized as
+    ``completed_unreported``. ``evidence`` is ``deliverable_present`` when the
+    run left task attachments, ``session_terminal_intent`` when its own
+    session log (joined via the first-heartbeat ``worker_session_id``, see
+    :func:`_link_run_session`) shows an attempted terminal kanban call, else
+    ``none``. Best-effort throughout: any read failure degrades toward
+    ``none`` rather than raising inside the reclaim transaction, so a
+    session-store outage can only ever fall back to today's retry path.
+    """
+    attachments_at_exit = len(list_attachments(conn, task_id))
+    if attachments_at_exit > 0:
+        evidence = "deliverable_present"
+    elif _session_shows_terminal_intent(conn, task_id):
+        evidence = "session_terminal_intent"
+    else:
+        evidence = "none"
+    return {
+        "evidence": evidence,
+        "decided_by": "_unreported_completion_evidence",
+        "attachments_at_exit": attachments_at_exit,
+    }
+
+
+def _session_shows_terminal_intent(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Best-effort read of the run's own session log for an attempted terminal call.
+
+    Reads the task's CURRENT run's ``worker_session_id`` (written at first
+    heartbeat) and profile, then checks that session's own tool-call history
+    for kanban_complete / kanban_request_review / kanban_block. A worker that
+    attempted one of these but whose exit raced the durable write is exactly
+    the case this recognizes. A missing link, missing session store, or any
+    read error degrades to False -- never raises.
+    """
+    try:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ? AND task_kind = 'work'",
+            (task_id,),
+        ).fetchone()
+        run_id = int(row["current_run_id"]) if row and row["current_run_id"] else None
+        if run_id is None:
+            return False
+        persisted, profile = _persisted_run_metadata(conn, run_id)
+        session_id = persisted.get("worker_session_id")
+        if not isinstance(session_id, str) or not session_id.strip():
+            return False
+
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_state import SessionDB
+
+        db_path = get_profile_dir(profile or "default") / "state.db"
+        if not db_path.is_file():
+            return False
+        with SessionDB(db_path=db_path, read_only=True) as db:
+            messages = db.get_messages(session_id.strip(), limit=200, latest=True)
+        for msg in messages:
+            for call in (msg.get("tool_calls") or []):
+                if not isinstance(call, dict):
+                    continue
+                fn = (call.get("function") or {}).get("name")
+                if fn in _UNREPORTED_TERMINAL_TOOLS:
+                    return True
+        return False
+    except Exception:
+        _log.debug(
+            "could not read session for unreported-completion evidence",
+            exc_info=True,
+        )
+        return False
 
 
 def _end_run(
