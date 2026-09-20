@@ -33719,7 +33719,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
         outcome = row["outcome"] or ""
         if outcome == "rate_limited":
             continue
-        if outcome == "crashed":
+        if outcome in ("crashed", "completed_unreported"):
             is_violation = False
             raw_meta = row["metadata"]
             if raw_meta:
@@ -33897,28 +33897,62 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
-            retry_status = _retry_status_for_run(conn, row["id"])
+            # A clean exit is provisionally "completed but unreported": ask
+            # the kernel what the run left behind (attachments, or a terminal
+            # kanban call in its own session log) before deciding whether it
+            # is retried. Kernel-written, read before the run is closed.
+            unreported = (
+                _unreported_completion_evidence(conn, row["id"])
+                if protocol_violation else None
+            )
+            has_evidence = bool(unreported) and unreported.get("evidence") != "none"
+            if has_evidence:
+                # Evidence-backed unreported completion: not a failure and
+                # never re-dispatched; parked for a person to accept it.
+                retry_status = "blocked"
+            else:
+                retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
             # Same evidence rule as the stale-claim reclaim: the event says
             # what was observed, not only what was concluded.
             event_payload.update(identity)
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
-            )
+            if has_evidence:
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input', "
+                    "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (row["id"], pid, row["claim_lock"]),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (retry_status, row["id"], pid, row["claim_lock"]),
+                )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # history doesn't show a phantom crash for a quota wall. A
+                # clean exit that skipped the completion or block call is
+                # ``completed_unreported``: the work usually finished and only
+                # the paperwork was skipped.
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif protocol_violation:
+                    _run_outcome = "completed_unreported"
+                else:
+                    _run_outcome = "crashed"
+                run_metadata = dict(event_payload)
+                if unreported is not None:
+                    run_metadata["unreported_completion"] = unreported
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
                     error=error_text,
-                    metadata=dict(event_payload),
+                    metadata=run_metadata,
                 )
                 _append_event(
                     conn, row["id"], event_kind,
@@ -33946,6 +33980,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif has_evidence:
+                    # Evidence-backed unreported completion: no failure
+                    # message, no crash/breaker accounting, no retry.
+                    pass
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget

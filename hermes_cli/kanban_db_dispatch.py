@@ -797,7 +797,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
         outcome = row["outcome"] or ""
         if outcome == "rate_limited":
             continue
-        if outcome in ("crashed", "completed_unreported") and (
+        if outcome == "crashed" and (
             _kb._json_dict(row["metadata"]).get("protocol_violation")
             or "protocol violation" in (row["error"] or "")
         ):
@@ -836,14 +836,8 @@ class _DeadWorker:
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall. A clean exit that skipped
-        # the completion/block call is ``completed_unreported``: the work usually
-        # finished and only the paperwork was skipped (see _classify_dead_worker).
-        if self.rate_limited:
-            return "rate_limited"
-        if self.protocol_violation:
-            return "completed_unreported"
-        return "crashed"
+        # doesn't show a phantom crash for a quota wall.
+        return "rate_limited" if self.rate_limited else "crashed"
 
 
 def _classify_dead_worker(
@@ -954,17 +948,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], identity)
-            # A clean exit is provisionally "completed but unreported": ask the
-            # kernel whether it left admissible evidence before deciding retry.
-            unreported = (
-                _kb._unreported_completion_evidence(conn, row["id"])
-                if dead.protocol_violation else None
-            )
-            has_evidence = bool(unreported) and unreported.get("evidence") != "none"
-            retry_status = (
-                "blocked" if has_evidence
-                else _kb._retry_status_for_run(conn, row["id"])
-            )
+            retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -975,14 +959,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             )
             if cur.rowcount != 1:
                 continue
-            run_metadata = dict(dead.event_payload)
-            if unreported is not None:
-                run_metadata["unreported_completion"] = unreported
             run_id = _kb._end_run(
                 conn, row["id"],
                 outcome=dead.run_outcome, status=dead.run_outcome,
                 error=dead.error_text,
-                metadata=run_metadata,
+                metadata=dict(dead.event_payload),
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
             sweep.exited_hook_payloads.append({
@@ -995,24 +976,18 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or (dead.protocol_violation and not has_evidence):
+            if dead.rate_limited or dead.protocol_violation:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
                 # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message. An
-                # evidence-backed unreported completion is routed to ``blocked``
-                # instead and carries no failure message.
+                # board UI and retry worker need the corrective message.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
-            elif has_evidence:
-                # Evidence-backed unreported completion: not a failure and never
-                # retried, so it is excluded from crash/breaker accounting.
-                pass
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append(

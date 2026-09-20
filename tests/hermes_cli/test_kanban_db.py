@@ -1943,8 +1943,10 @@ def test_clean_exit_with_no_evidence_is_completed_unreported_and_retried(
     with kb.connect() as conn:
         tid = _running_task_with_dead_pid(conn, monkeypatch)
 
-        crashed = kbd.detect_crashed_workers(conn)
-        assert tid not in crashed  # not counted as a crash/failure
+        crashed = kb.detect_crashed_workers(conn)
+        # No evidence keeps today's retry path: the run is still counted
+        # toward the bounded violation streak, but its outcome is honest.
+        assert tid in crashed
 
         run = kb.latest_run(conn, tid)
         assert run.outcome == "completed_unreported"
@@ -1971,7 +1973,7 @@ def test_clean_exit_with_a_deliverable_is_not_retried(kanban_home, monkeypatch):
             content_type="text/plain", size=3,
         )
 
-        crashed = kbd.detect_crashed_workers(conn)
+        crashed = kb.detect_crashed_workers(conn)
         assert tid not in crashed
 
         run = kb.latest_run(conn, tid)
@@ -2008,7 +2010,7 @@ def test_clean_exit_with_session_terminal_intent_is_not_retried(
             _kb, "_session_shows_terminal_intent", lambda conn, task_id: True,
         )
 
-        crashed = kbd.detect_crashed_workers(conn)
+        crashed = kb.detect_crashed_workers(conn)
         assert tid not in crashed
 
         run = kb.latest_run(conn, tid)
@@ -2032,7 +2034,7 @@ def test_session_terminal_intent_reads_real_tool_calls(kanban_home, monkeypatch,
 
     session_id = "sess-real-terminal"
     db = SessionDB(db_path=profile_dir / "state.db")
-    db.create_session(session_id, model="m", billing_provider="p")
+    db.create_session(session_id, source="cli", model="m")
     db.append_message(
         session_id, "assistant", content="",
         tool_calls=[{"id": "1", "function": {"name": "kanban_complete", "arguments": "{}"}}],
@@ -2045,7 +2047,7 @@ def test_session_terminal_intent_reads_real_tool_calls(kanban_home, monkeypatch,
         with kb.write_txn(conn):
             _kb._link_run_session(conn, run_id, session_id)
 
-        crashed = kbd.detect_crashed_workers(conn)
+        crashed = kb.detect_crashed_workers(conn)
         assert tid not in crashed
 
         run = kb.latest_run(conn, tid)
@@ -2064,14 +2066,18 @@ def test_unreported_completion_evidence_is_best_effort_on_session_read_failure(
         with kb.write_txn(conn):
             _kb._link_run_session(conn, run_id, "sess-broken")
 
-        def _boom(*a, **kw):
-            raise RuntimeError("session store down")
+        import hermes_state
 
-        monkeypatch.setattr(_kb, "_persisted_run_metadata", _boom)
+        class _Boom:
+            def __init__(self, *a, **kw):
+                raise RuntimeError("session store down")
 
-        # Must not raise out of the reclaim transaction.
-        crashed = kbd.detect_crashed_workers(conn)
-        assert tid not in crashed
+        monkeypatch.setattr(hermes_state, "SessionDB", _Boom)
+
+        # Must not raise out of the reclaim transaction; with no evidence
+        # readable the run keeps today's retry path.
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed
 
         run = kb.latest_run(conn, tid)
         assert run.metadata["unreported_completion"]["evidence"] == "none"
@@ -2095,40 +2101,9 @@ def test_protocol_violation_streak_recognizes_completed_unreported_outcome(
             kb._end_run(
                 conn, tid, outcome="completed_unreported",
                 status="completed_unreported",
-                error=_kbd_module()._PROTOCOL_VIOLATION_ERROR,
+                error="worker exited cleanly (rc=0) without calling "
+                      "kanban_complete or kanban_block — protocol violation.",
                 metadata={"protocol_violation": True},
             )
-        streak = _kbd_module()._protocol_violation_streak(conn, tid)
+        streak = _kb._protocol_violation_streak(conn, tid)
         assert streak == 1
-
-
-def _kbd_module():
-    import hermes_cli.kanban_db_dispatch as _kbd
-    return _kbd
-
-
-def test_run_outcome_property_maps_protocol_violation_to_completed_unreported():
-    kbd_mod = _kbd_module()
-    dead = kbd_mod._DeadWorker(
-        kind="clean_exit", code=0, error_text="x", event_kind="protocol_violation",
-        event_payload={}, protocol_violation=True,
-    )
-    assert dead.run_outcome == "completed_unreported"
-
-
-def test_run_outcome_property_still_crashes_when_not_a_protocol_violation():
-    kbd_mod = _kbd_module()
-    dead = kbd_mod._DeadWorker(
-        kind="nonzero_exit", code=1, error_text="x", event_kind="crashed",
-        event_payload={}, protocol_violation=False,
-    )
-    assert dead.run_outcome == "crashed"
-
-
-def test_run_outcome_property_rate_limited_still_wins_over_protocol_violation():
-    kbd_mod = _kbd_module()
-    dead = kbd_mod._DeadWorker(
-        kind="rate_limited", code=1, error_text="x", event_kind="crashed",
-        event_payload={}, protocol_violation=True, rate_limited=True,
-    )
-    assert dead.run_outcome == "rate_limited"
