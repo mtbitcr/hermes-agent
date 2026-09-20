@@ -582,6 +582,72 @@ def test_anthropic_stream_accumulator_merges_plain_provider_object():
     assert response.usage.input_tokens == 10
 
 
+def test_anthropic_stream_accumulator_accepts_control_character_in_tool_input():
+    """A literal control character (e.g. a raw newline) inside a streamed tool-call
+    argument string must decode as ordinary content, not raise. The Anthropic Messages
+    API's ``partial_json`` fragments can carry a real newline/tab inside a string value
+    (e.g. a multi-line shell command); the platform accumulator must accept it (#stream-abort).
+    """
+    accumulator = relay_llm.AnthropicStreamAccumulator()
+    accumulator.observe({
+        "type": "message_start",
+        "message": {
+            "id": "message-1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "usage": {"input_tokens": 10},
+        },
+    })
+    accumulator.observe({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "tool_use", "id": "toolu_1", "name": "terminal", "input": {}},
+    })
+    # Split the fragments so the raw control character lands strictly inside one
+    # ``partial_json`` delta, mirroring how the provider streams a multi-line string.
+    for fragment in ('{"command": "echo a', chr(10) + 'b"', '}'):
+        accumulator.observe({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": fragment},
+        })
+    accumulator.observe({
+        "type": "message_delta",
+        "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+        "usage": {"output_tokens": 3},
+    })
+
+    final = accumulator.finalize()
+
+    assert final["stop_reason"] == "tool_use"
+    block = final["content"][0]
+    assert block["type"] == "tool_use"
+    assert block["input"] == {"command": "echo a\nb"}
+
+
+def test_anthropic_stream_accumulator_still_suppresses_genuinely_malformed_json():
+    """A truncated/invalid tool-call JSON body (not a control-character issue) keeps
+    falling through the existing suppress: ``input`` stays the raw accumulated string
+    instead of raising, exactly as before this change.
+    """
+    accumulator = relay_llm.AnthropicStreamAccumulator()
+    accumulator.observe({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "tool_use", "id": "toolu_1", "name": "terminal", "input": {}},
+    })
+    accumulator.observe({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": '{"command": "unterminated'},
+    })
+
+    final = accumulator.finalize()
+
+    assert final["content"][0]["input"] == '{"command": "unterminated'
+
+
 def test_jsonable_does_not_probe_dynamic_attributes():
     class DynamicProviderObject:
         def __getattr__(self, name):

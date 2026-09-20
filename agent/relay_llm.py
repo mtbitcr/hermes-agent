@@ -600,8 +600,12 @@ class AnthropicStreamAccumulator:
         for block in blocks:
             partial = block.pop("_partial_json", None)
             if partial is not None:
+                # strict=False: a streamed tool-call argument may carry a literal control
+                # character (e.g. a raw newline) inside a JSON string value; accept it as
+                # ordinary content instead of raising. Malformed/truncated JSON still falls
+                # through the suppress and keeps the raw accumulated string as ``input``.
                 with contextlib.suppress(TypeError, ValueError):
-                    partial = json.loads(partial)
+                    partial = json.loads(partial, strict=False)
                 block["input"] = partial
         return {**self._message, "content": blocks}
 
