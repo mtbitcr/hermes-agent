@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -178,7 +179,7 @@ def test_worker_runtime_receipt_uses_persisted_dominant_route(
     assert stamped == {
         "worker_session_id": session_id,
         "runtime_receipt": {
-            "schema_version": 2,
+            "schema_version": 3,
             "engine": "hermes",
             "profile": "test-worker",
             "provider": "served-provider",
@@ -191,6 +192,13 @@ def test_worker_runtime_receipt_uses_persisted_dominant_route(
                 "amount": 0.0123,
                 "source": "official_docs_snapshot",
                 "scope": "dominant-main-route",
+            },
+            "capability": {
+                "schema_version": 1,
+                "skills": [], "skills_truncated": False,
+                "tools": [], "tools_truncated": False,
+                "connections": [], "connections_truncated": False,
+                "source": "session-tool-calls", "truncated": False,
             },
         },
     }
@@ -2129,3 +2137,146 @@ def test_runtime_receipt_can_read_another_profiles_session_store(monkeypatch):
     monkeypatch.setattr(profiles, "get_profile_dir", _fake_get_profile_dir)
     assert kt._worker_runtime_receipt("s1", profile="run-owner") is None
     assert seen["profile"] == "run-owner"
+
+
+def _capability_session(db, session_id, calls):
+    """Write one session whose transcript records ``calls`` as tool messages."""
+    db.create_session(session_id, source="kanban", model="m", profile_name="test-worker")
+    for name, arguments in calls:
+        tool_calls = None
+        if arguments is not None:
+            tool_calls = [{"id": "c", "type": "function", "function": {
+                "name": name, "arguments": json.dumps(arguments)}}]
+            db.append_message(session_id, "assistant", content="", tool_calls=tool_calls)
+        db.append_message(session_id, "tool", content="out", tool_name=name, tool_call_id="c")
+
+
+def test_capability_receipt_records_bounded_session_evidence(monkeypatch, worker_env, tmp_path):
+    """The receipt records the skills, tools and connections the run really used."""
+    from hermes_state import SessionDB
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    profile_dir = tmp_path / "cap-profile"
+    profile_dir.mkdir()
+    session_id = "cap-session"
+    db = SessionDB(db_path=profile_dir / "state.db")
+    try:
+        _capability_session(db, session_id, [
+            ("kanban_show", {}),
+            ("terminal", {"command": "ls"}),
+            ("terminal", {"command": "pwd"}),
+            ("skill_view", {"name": "claude-code"}),
+            ("skill_manage", {"name": "kanban-flow", "action": "patch"}),
+            ("mcp__opensandbox_agent_factory__command_run", {"command": "x"}),
+            ("mcp__github__create_issue", {"title": "t"}),
+        ])
+        db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
+            model="served-model", billing_provider="served-provider",
+            estimated_cost_usd=0.01, cost_status="estimated",
+            cost_source="official_docs_snapshot", api_call_count=1)
+    finally:
+        db.close()
+
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
+    receipt = kt._worker_runtime_receipt(session_id)
+
+    assert receipt["schema_version"] == 3
+    capability = receipt["capability"]
+    assert capability["schema_version"] == 1
+    assert capability["source"] == "session-tool-calls"
+    assert capability["skills"] == ["claude-code", "kanban-flow"]
+    assert capability["tools"] == ["kanban_show", "skill_manage", "skill_view", "terminal"]
+    assert capability["connections"] == ["github", "opensandbox_agent_factory"]
+    assert capability["truncated"] is False
+    assert capability["skills_truncated"] is False
+    assert capability["tools_truncated"] is False
+    assert capability["connections_truncated"] is False
+
+
+def test_capability_receipt_bounds_each_list_with_its_own_flag():
+    """A capped list is never readable as a complete one."""
+    from tools import kanban_tools as kt
+
+    many = [f"tool-{i:03d}" for i in range(kt._CAPABILITY_MAX_NAMES + 5)]
+    capability = kt._capability_receipt(["one-skill"], many, ["srv"], source="session-tool-calls")
+
+    assert len(capability["tools"]) == kt._CAPABILITY_MAX_NAMES
+    assert capability["tools"] == sorted(many)[:kt._CAPABILITY_MAX_NAMES]
+    assert capability["tools_truncated"] is True
+    assert capability["skills_truncated"] is False
+    assert capability["connections_truncated"] is False
+    assert capability["truncated"] is True
+
+
+def test_capability_receipt_reports_unavailable_rather_than_inventing(monkeypatch, worker_env, tmp_path):
+    """A session-store read failure records no evidence, not a guessed list."""
+    from hermes_state import SessionDB
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    profile_dir = tmp_path / "broken-profile"
+    profile_dir.mkdir()
+    session_id = "broken-session"
+    db = SessionDB(db_path=profile_dir / "state.db")
+    try:
+        db.create_session(session_id, source="kanban", model="m", profile_name="test-worker")
+        db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
+            model="served-model", billing_provider="served-provider",
+            estimated_cost_usd=0.01, cost_status="estimated",
+            cost_source="official_docs_snapshot", api_call_count=1)
+    finally:
+        db.close()
+
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
+
+    def _boom(self, *a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(SessionDB, "get_messages", _boom)
+    receipt = kt._worker_runtime_receipt(session_id)
+
+    # The route-and-cost keys stay exactly as today: best-effort by contract.
+    assert receipt["model"] == "served-model"
+    assert receipt["cost"]["state"] == "estimated"
+    assert receipt["capability"] == {
+        "schema_version": 1,
+        "skills": [], "skills_truncated": False,
+        "tools": [], "tools_truncated": False,
+        "connections": [], "connections_truncated": False,
+        "source": "unavailable", "truncated": True,
+    }
+
+
+def test_capability_receipt_unions_the_cards_force_load_list(monkeypatch, worker_env, tmp_path):
+    """Skills injected without an explicit call still count as used."""
+    from hermes_state import SessionDB
+    from hermes_cli import profiles, kanban_db as kb
+    from tools import kanban_tools as kt
+
+    profile_dir = tmp_path / "forced-profile"
+    profile_dir.mkdir()
+    session_id = "forced-session"
+    db = SessionDB(db_path=profile_dir / "state.db")
+    try:
+        _capability_session(db, session_id, [("skill_view", {"name": "called-skill"})])
+        db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
+            model="served-model", billing_provider="served-provider",
+            estimated_cost_usd=0.01, cost_status="estimated",
+            cost_source="official_docs_snapshot", api_call_count=1)
+    finally:
+        db.close()
+
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET skills = ? WHERE id = ?",
+                     (json.dumps(["forced-skill"]), worker_env))
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
+    capability = kt._worker_runtime_receipt(session_id)["capability"]
+
+    assert capability["skills"] == ["called-skill", "forced-skill"]
+    assert capability["source"] == "session-tool-calls"

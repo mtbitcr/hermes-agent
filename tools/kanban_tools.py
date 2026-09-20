@@ -33,6 +33,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import time
 from typing import Any, Optional
 
@@ -284,6 +285,176 @@ def _runtime_receipt_cost(route: dict) -> dict:
     }
 
 
+# Bounds for the capability object carried by every run receipt. Every list is
+# capped on its own and carries its own truncation flag, so a capped list can
+# never be read as a complete one.
+_CAPABILITY_SCHEMA_VERSION = 1
+_CAPABILITY_MAX_NAMES = 40
+_CAPABILITY_MAX_ROWS = 4000
+_CAPABILITY_READ_TIMEOUT = 1.0
+_CAPABILITY_MCP_PREFIX = "mcp__"
+_CAPABILITY_SKILL_TOOLS = ("skill_view", "skill_manage")
+# Underscore is deliberate and load-bearing: tool names (``kanban_complete``,
+# ``skill_view``) and MCP server names carry it, unlike the route identity
+# values matched by ``_RUNTIME_RECEIPT_VALUE``.
+_CAPABILITY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/_-]{0,79}$")
+
+
+def _capability_name(value: Any) -> Optional[str]:
+    """Return one bounded, non-secret capability name, or None."""
+    if not isinstance(value, str):
+        return None
+    clean = value.strip()
+    return clean if _CAPABILITY_NAME.fullmatch(clean) else None
+
+
+def _capability_bounded(names) -> tuple[list, bool]:
+    """Sort, de-duplicate and cap one capability list.
+
+    Returns the bounded list and whether it was cut short, so the caller can
+    record a per-list truncation flag beside it.
+    """
+    ordered = sorted(names)
+    return ordered[:_CAPABILITY_MAX_NAMES], len(ordered) > _CAPABILITY_MAX_NAMES
+
+
+def _capability_receipt(skills, tools, connections, *, source: str, complete: bool = True) -> dict:
+    """Build the bounded capability object for one run.
+
+    Each list carries its own truncation flag; the object-level flag is true
+    when any list was capped or when the evidence itself was cut short.
+    """
+    skill_names, skills_truncated = _capability_bounded(skills)
+    tool_names, tools_truncated = _capability_bounded(tools)
+    server_names, connections_truncated = _capability_bounded(connections)
+    return {
+        "schema_version": _CAPABILITY_SCHEMA_VERSION,
+        "skills": skill_names,
+        "skills_truncated": skills_truncated,
+        "tools": tool_names,
+        "tools_truncated": tools_truncated,
+        "connections": server_names,
+        "connections_truncated": connections_truncated,
+        "source": source,
+        "truncated": (
+            skills_truncated or tools_truncated or connections_truncated or not complete
+        ),
+    }
+
+
+def _capability_card_skills() -> set:
+    """Force-loaded skill names for the card this process is working on.
+
+    Read through a strictly read-only SQLite connection so a receipt built
+    while the kernel holds the ending write transaction can never contend
+    with it: in WAL mode a reader observes the last committed state without
+    taking a lock, and no migration or write is attempted here. Absent env
+    (a kernel ending booked outside the worker process) simply yields no
+    force-load names; the session evidence still stands on its own.
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return set()
+    try:
+        from hermes_cli.kanban_db import kanban_db_path
+
+        db_path = kanban_db_path()
+        if not db_path.is_file():
+            return set()
+        conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True, timeout=_CAPABILITY_READ_TIMEOUT
+        )
+        try:
+            row = conn.execute(
+                "SELECT skills FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("could not read force-loaded skills for run receipt", exc_info=True)
+        return set()
+    raw = row[0] if row else None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return set()
+    if not isinstance(raw, list):
+        return set()
+    return {name for name in (_capability_name(item) for item in raw) if name}
+
+
+def _capability_skill_names(message: dict) -> set:
+    """Skill names named by this message\u2019s own skill tool calls.
+
+    Accepts both persisted tool-call shapes (nested ``function`` with a JSON
+    argument string, and the flat name/input form) because the transcript
+    carries whichever the serving route wrote.
+    """
+    calls = message.get("tool_calls")
+    if not isinstance(calls, list):
+        return set()
+    names = set()
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        if (function.get("name") or call.get("name")) not in _CAPABILITY_SKILL_TOOLS:
+            continue
+        arguments = function.get("arguments", call.get("arguments", call.get("input")))
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(arguments, dict):
+            continue
+        skill = _capability_name(arguments.get("name"))
+        if skill:
+            names.add(skill)
+    return names
+
+
+def _capability_from_session(db: Any, session_id: str) -> dict:
+    """Derive the capability object from the run\u2019s own session log.
+
+    Evidence, never assertion: tool names come from the transcript\u2019s own
+    ``tool_name`` column, connections are the server halves of the
+    ``mcp__<server>__<tool>`` convention, and skills are the skills those
+    calls named, unioned with the card\u2019s force-load list. A read that
+    fails records ``unavailable`` with empty lists rather than inventing one.
+    """
+    try:
+        messages = db.get_messages(session_id, limit=_CAPABILITY_MAX_ROWS)
+    except Exception:
+        logger.debug("could not read session tool calls for run receipt", exc_info=True)
+        return _capability_receipt((), (), (), source="unavailable", complete=False)
+    tools, connections, skills = set(), set(), set()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        skills |= _capability_skill_names(message)
+        name = _capability_name(message.get("tool_name"))
+        if not name:
+            continue
+        if name.startswith(_CAPABILITY_MCP_PREFIX):
+            server = name[len(_CAPABILITY_MCP_PREFIX):].split("__", 1)[0]
+            # Server names only (owner decision): the tool half can carry
+            # call-specific detail the owner did not ask to record.
+            if server:
+                connections.add(server)
+            continue
+        tools.add(name)
+    skills |= _capability_card_skills()
+    return _capability_receipt(
+        skills,
+        tools,
+        connections,
+        source="session-tool-calls",
+        complete=len(messages) < _CAPABILITY_MAX_ROWS,
+    )
+
+
 def _worker_runtime_receipt(
     session_id: str, *, profile: Optional[str] = None
 ) -> Optional[dict]:
@@ -316,6 +487,7 @@ def _worker_runtime_receipt(
             if not session:
                 return None
             dominant = db.get_dominant_session_model_route(session_id) or {}
+            capability = _capability_from_session(db, session_id)
     except Exception:
         logger.warning(
             "could not read trusted runtime receipt for worker session",
@@ -342,7 +514,9 @@ def _worker_runtime_receipt(
     if not model or not provider:
         return None
     return {
-        "schema_version": 2,
+        # 3: adds the bounded ``capability`` object below. The owner-facing
+        # reader accepts 2 and 3 so historical receipts stay readable.
+        "schema_version": 3,
         "engine": "hermes",
         "profile": profile,
         "provider": provider,
@@ -352,6 +526,7 @@ def _worker_runtime_receipt(
             "dominant-session-usage" if dominant else "session-row"
         ),
         "cost": _runtime_receipt_cost(dominant),
+        "capability": capability,
     }
 
 

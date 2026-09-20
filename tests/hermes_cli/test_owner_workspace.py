@@ -9802,3 +9802,125 @@ def test_retry_is_refused_with_a_clear_reason_in_every_other_state(ctx):
         with contextlib.closing(kanban_db.connect(board=setup["board"])) as conn:
             after = kanban_db.get_task(conn, task_id, include_control=True)
         assert after.status == before.status, state
+
+
+def _capability_run(metadata):
+    return kanban_db.Run(
+        id=1, task_id="task-1", profile="raphael-verifier", step_key=None,
+        status="done", claim_lock=None, claim_expires=None, worker_pid=None,
+        max_runtime_seconds=None, last_heartbeat_at=None,
+        started_at=1_700_000_000, ended_at=1_700_000_100, outcome="completed",
+        summary="s", metadata=metadata, error=None,
+    )
+
+
+def _capability_receipt_metadata(schema_version, capability=None):
+    receipt = {
+        "schema_version": schema_version,
+        "engine": "hermes",
+        "profile": "raphael-verifier",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "max",
+        "route_evidence": "dominant-session-usage",
+        "cost": {"state": "estimated", "currency": "USD", "amount": 0.0123,
+                 "source": "official_docs_snapshot", "scope": "dominant-main-route"},
+    }
+    if capability is not None:
+        receipt["capability"] = capability
+    return {"runtime_receipt": receipt}
+
+
+@pytest.mark.parametrize("schema_version", [2, 3])
+def test_owner_reader_accepts_both_receipt_versions(schema_version):
+    """The reader must not go out of step with the writer: version 3 receipts
+    read exactly as version 2 did for route and cost, so bumping the writer
+    never turns every run unknown on the owner view, and historical version 2
+    receipts stay readable."""
+    run = _capability_run(_capability_receipt_metadata(schema_version))
+
+    runtime, cost = ow._owner_project_runtime_and_cost(run, None)
+
+    assert runtime["state"] == "known"
+    assert runtime["model"] == "gpt-5.6-sol"
+    assert cost["state"] == "estimated"
+    assert cost["amount"] == 0.0123
+    # The capability object is read only from version 3.
+    assert "capability" not in runtime
+
+
+def test_owner_reader_still_rejects_an_unknown_receipt_version():
+    run = _capability_run(_capability_receipt_metadata(4))
+
+    runtime, cost = ow._owner_project_runtime_and_cost(run, None)
+
+    assert runtime["state"] == "unknown"
+    assert cost["state"] == "unknown"
+
+
+def test_owner_reader_projects_the_bounded_capability_object():
+    capability = {
+        "schema_version": 1,
+        "skills": ["claude-code"], "skills_truncated": False,
+        "tools": ["kanban_complete", "terminal"], "tools_truncated": True,
+        "connections": ["github"], "connections_truncated": False,
+        "source": "session-tool-calls", "truncated": True,
+    }
+    run = _capability_run(_capability_receipt_metadata(3, capability))
+
+    runtime, _cost = ow._owner_project_runtime_and_cost(run, None)
+
+    assert runtime["capability"] == {
+        "state": "known",
+        "skills": ["claude-code"], "skills_truncated": False,
+        "tools": ["kanban_complete", "terminal"], "tools_truncated": True,
+        "connections": ["github"], "connections_truncated": False,
+        "truncated": True,
+    }
+
+
+def test_owner_reader_rebounds_an_oversized_capability_list():
+    """A receipt is data: a list longer than the bound is reported truncated."""
+    many = [f"tool-{i:03d}" for i in range(ow._OWNER_CAPABILITY_MAX_NAMES + 3)]
+    capability = {
+        "schema_version": 1,
+        "skills": [], "skills_truncated": False,
+        "tools": many, "tools_truncated": False,
+        "connections": [], "connections_truncated": False,
+        "source": "session-tool-calls", "truncated": False,
+    }
+    run = _capability_run(_capability_receipt_metadata(3, capability))
+
+    runtime, _cost = ow._owner_project_runtime_and_cost(run, None)
+
+    assert len(runtime["capability"]["tools"]) == ow._OWNER_CAPABILITY_MAX_NAMES
+    assert runtime["capability"]["tools_truncated"] is True
+    assert runtime["capability"]["truncated"] is True
+
+
+def test_owner_reader_reports_unavailable_capability_evidence_as_unknown():
+    capability = {
+        "schema_version": 1,
+        "skills": [], "skills_truncated": False,
+        "tools": [], "tools_truncated": False,
+        "connections": [], "connections_truncated": False,
+        "source": "unavailable", "truncated": True,
+    }
+    run = _capability_run(_capability_receipt_metadata(3, capability))
+
+    runtime, cost = ow._owner_project_runtime_and_cost(run, None)
+
+    # Route and cost still read: only the capability evidence was missing.
+    assert runtime["state"] == "known"
+    assert cost["state"] == "estimated"
+    assert runtime["capability"]["state"] == "unknown"
+    assert runtime["capability"]["tools"] == []
+
+
+def test_owner_reader_drops_a_malformed_capability_object():
+    run = _capability_run(_capability_receipt_metadata(3, {"source": "invented"}))
+
+    runtime, _cost = ow._owner_project_runtime_and_cost(run, None)
+
+    assert runtime["state"] == "known"
+    assert "capability" not in runtime
