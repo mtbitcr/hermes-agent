@@ -207,6 +207,20 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
     return env_tid or None
 
 
+def _worker_session_id(task_id: str) -> Optional[str]:
+    """Return this process's own session id when it IS task_id's worker.
+
+    The worker mints its session id after it starts, so the dispatcher
+    cannot supply the link at spawn time; the heartbeat is the earliest
+    kernel-owned moment at which it is knowable. Scoped by env task id so
+    no process can offer a session for a task it is not running.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    session_id = (os.environ.get("HERMES_SESSION_ID") or "").strip()
+    return session_id or None
+
+
 def _worker_run_id(task_id: str) -> Optional[int]:
     """Return this worker's dispatcher run id when it is scoped to task_id."""
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
@@ -270,15 +284,24 @@ def _runtime_receipt_cost(route: dict) -> dict:
     }
 
 
-def _worker_runtime_receipt(session_id: str) -> Optional[dict]:
+def _worker_runtime_receipt(
+    session_id: str, *, profile: Optional[str] = None
+) -> Optional[dict]:
     """Read the worker's actual persisted model route from its profile DB.
+
+    ``profile`` names the profile whose session store holds ``session_id``.
+    It defaults to this process's own profile, which is right for a worker
+    stamping itself; the kernel passes the run row's recorded profile so an
+    ending booked by another process still reads the right store.
 
     The receipt is derived from Hermes-owned session accounting rather than
     model-supplied handoff metadata.  It is observation-only and best-effort:
     a session-store outage must not turn a successful task handoff into a
     failed task transition.
     """
-    profile = _runtime_receipt_value(os.environ.get("HERMES_PROFILE") or "default")
+    profile = _runtime_receipt_value(
+        profile or os.environ.get("HERMES_PROFILE") or "default"
+    )
     if not profile:
         return None
     try:
@@ -543,7 +566,10 @@ def heartbeat_current_worker_from_env() -> bool:
             except (TypeError, ValueError):
                 run_id = None
             try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                kb.heartbeat_worker(
+                    conn, tid, note=None, expected_run_id=run_id,
+                    session_id=_worker_session_id(tid),
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
         finally:
@@ -1325,6 +1351,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 tid,
                 note=note,
                 expected_run_id=_worker_run_id(tid),
+                session_id=_worker_session_id(tid),
             )
             if not ok:
                 return tool_error(

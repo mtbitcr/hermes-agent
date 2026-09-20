@@ -1756,3 +1756,138 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Run-to-session link (first heartbeat) + receipt stamped by the one ending path
+# ---------------------------------------------------------------------------
+
+def _running_run(conn, title="linked-run"):
+    tid = kb.create_task(conn, title=title, assignee="w")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    return tid, kb.latest_run(conn, tid).id
+
+
+def test_first_heartbeat_links_run_to_its_session(kanban_home):
+    """The link must exist from the start, not only when a run ends well."""
+    conn = kb.connect()
+    try:
+        tid, run_id = _running_run(conn)
+        assert kb.latest_run(conn, tid).metadata in (None, {})
+
+        assert kb.heartbeat_worker(conn, tid, session_id="20260920_sess") is True
+
+        assert kb.latest_run(conn, tid).metadata["worker_session_id"] == "20260920_sess"
+    finally:
+        conn.close()
+
+
+def test_repeat_heartbeat_keeps_the_first_link_and_other_metadata(kanban_home):
+    conn = kb.connect()
+    try:
+        tid, run_id = _running_run(conn)
+        import json
+        kb.heartbeat_worker(conn, tid, session_id="sess-a")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps({"worker_session_id": "sess-a", "keep": 1}), run_id),
+            )
+
+        assert kb.heartbeat_worker(conn, tid, session_id="sess-a") is True
+
+        meta = kb.latest_run(conn, tid).metadata
+        assert meta == {"worker_session_id": "sess-a", "keep": 1}
+    finally:
+        conn.close()
+
+
+def test_heartbeat_without_a_session_writes_no_link(kanban_home):
+    conn = kb.connect()
+    try:
+        tid, _run_id = _running_run(conn)
+        assert kb.heartbeat_worker(conn, tid, session_id="   ") is True
+        assert kb.heartbeat_worker(conn, tid) is True
+        assert kb.latest_run(conn, tid).metadata in (None, {})
+    finally:
+        conn.close()
+
+
+def test_every_ending_stamps_the_receipt_not_just_the_good_ones(kanban_home, monkeypatch):
+    """A crashed run is linked and stamped by the single ending path."""
+    monkeypatch.setattr(
+        kb, "_trusted_runtime_receipt",
+        lambda session_id, profile: {"schema_version": 2, "model": "m", "profile": profile},
+    )
+    conn = kb.connect()
+    try:
+        tid, run_id = _running_run(conn)
+        kb.heartbeat_worker(conn, tid, session_id="sess-crash")
+
+        with kb.write_txn(conn):
+            assert kb._end_run(conn, tid, outcome="crashed", error="boom") == run_id
+
+        run = kb.latest_run(conn, tid)
+        assert run.outcome == "crashed"
+        assert run.metadata["worker_session_id"] == "sess-crash"
+        assert run.metadata["runtime_receipt"]["model"] == "m"
+    finally:
+        conn.close()
+
+
+def test_ending_receipt_never_keeps_a_caller_supplied_claim(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_trusted_runtime_receipt", lambda session_id, profile: None)
+    conn = kb.connect()
+    try:
+        tid, _run_id = _running_run(conn)
+        kb.heartbeat_worker(conn, tid, session_id="sess-claim")
+
+        with kb.write_txn(conn):
+            kb._end_run(
+                conn, tid, outcome="gave_up",
+                metadata={"runtime_receipt": {"model": "invented"}, "kept": True},
+            )
+
+        meta = kb.latest_run(conn, tid).metadata
+        assert "runtime_receipt" not in meta
+        assert meta == {"kept": True, "worker_session_id": "sess-claim"}
+    finally:
+        conn.close()
+
+
+def test_ending_with_no_known_session_invents_nothing(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    conn = kb.connect()
+    try:
+        tid, _run_id = _running_run(conn)
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="timed_out", metadata={"kept": True})
+        meta = kb.latest_run(conn, tid).metadata
+        assert meta == {"kept": True}
+    finally:
+        conn.close()
+
+
+def test_trusted_receipt_reads_the_runs_own_profile(monkeypatch):
+    """The kernel asks the tools layer for the run row's profile, not its own."""
+    seen = {}
+    import tools.kanban_tools as kt
+
+    def _fake(session_id, *, profile=None):
+        seen["args"] = (session_id, profile)
+        return {"schema_version": 2}
+
+    monkeypatch.setattr(kt, "_worker_runtime_receipt", _fake)
+    assert kb._trusted_runtime_receipt("s1", "other-profile") == {"schema_version": 2}
+    assert seen["args"] == ("s1", "other-profile")
+
+
+def test_trusted_receipt_is_best_effort(monkeypatch):
+    import tools.kanban_tools as kt
+
+    def _boom(session_id, *, profile=None):
+        raise RuntimeError("session store down")
+
+    monkeypatch.setattr(kt, "_worker_runtime_receipt", _boom)
+    assert kb._trusted_runtime_receipt("s1", "p") is None

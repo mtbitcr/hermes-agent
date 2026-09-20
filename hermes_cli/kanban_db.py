@@ -23152,6 +23152,115 @@ def _append_event(
     )
 
 
+def _persisted_run_metadata(
+    conn: sqlite3.Connection, run_id: int
+) -> tuple[dict, Optional[str]]:
+    """Return the stored metadata dict of one run row, plus its profile.
+
+    A row whose metadata is absent, unreadable, or not an object reads as
+    an empty dict: the link and receipt writers below must degrade to
+    "nothing known yet" rather than raise inside a lifecycle transaction.
+    """
+    row = conn.execute(
+        "SELECT profile, metadata FROM task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if row is None:
+        return {}, None
+    try:
+        persisted = json.loads(row["metadata"]) if row["metadata"] else {}
+    except (TypeError, ValueError):
+        persisted = {}
+    if not isinstance(persisted, dict):
+        persisted = {}
+    return persisted, (row["profile"] or None)
+
+
+def _link_run_session(
+    conn: sqlite3.Connection, run_id: int, session_id: Optional[str]
+) -> bool:
+    """Bind a run to the session log of the worker that is driving it.
+
+    Written at the FIRST heartbeat instead of at completion, so a run that
+    stops, crashes, times out, gives up, or is reclaimed is still joinable
+    to its own session log -- those endings never stamped themselves, and
+    they are exactly the ones whose evidence is wanted. Later heartbeats
+    carrying the same id write nothing. Returns True when a link was
+    written.
+    """
+    if not isinstance(session_id, str) or not session_id.strip():
+        return False
+    session_id = session_id.strip()
+    persisted, _profile = _persisted_run_metadata(conn, run_id)
+    if persisted.get("worker_session_id") == session_id:
+        return False
+    persisted["worker_session_id"] = session_id
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+        (json.dumps(persisted, ensure_ascii=False), run_id),
+    )
+    return True
+
+
+def _trusted_runtime_receipt(
+    session_id: str, profile: Optional[str]
+) -> Optional[dict]:
+    """Build one trusted runtime receipt, or None when it cannot be read.
+
+    Imported lazily: the receipt is derived from Hermes-owned session
+    accounting that lives in the tools layer, and that layer imports this
+    module. Best-effort by contract -- a session-store outage must never
+    turn an ending into a failure.
+    """
+    try:
+        from tools.kanban_tools import _worker_runtime_receipt
+
+        return _worker_runtime_receipt(session_id, profile=profile)
+    except Exception:
+        _log.debug("could not stamp runtime receipt for run", exc_info=True)
+        return None
+
+
+def _stamp_run_receipt(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    metadata: Optional[dict],
+) -> Optional[dict]:
+    """Carry the session link forward and stamp the receipt for one ending.
+
+    Called from :func:`_end_run`, the one path every outcome passes
+    through, so every ending is covered -- not only the two endings that
+    stamp themselves on the way in (completion and review request).
+
+    The receipt key is always rebuilt here from Hermes-owned accounting:
+    any caller-supplied value under that key is discarded first, so a
+    model cannot assert its own route. With no session link known the key
+    is left absent rather than invented.
+    """
+    persisted, profile = _persisted_run_metadata(conn, run_id)
+    stamped = dict(metadata) if isinstance(metadata, dict) else {}
+    stamped.pop("runtime_receipt", None)
+    session_id = None
+    for candidate in (
+        stamped.get("worker_session_id"),
+        persisted.get("worker_session_id"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            session_id = candidate.strip()
+            break
+    if session_id is None and os.environ.get("HERMES_KANBAN_TASK") == task_id:
+        session_id = (os.environ.get("HERMES_SESSION_ID") or "").strip() or None
+    if session_id is None:
+        # No link known: hand back the caller's own metadata minus any
+        # model-supplied receipt claim, and never invent one.
+        return stamped if isinstance(metadata, dict) else metadata
+    stamped["worker_session_id"] = session_id
+    receipt = _trusted_runtime_receipt(session_id, profile)
+    if receipt is not None:
+        stamped["runtime_receipt"] = receipt
+    return stamped
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -23190,6 +23299,7 @@ def _end_run(
     run_id = int(row["current_run_id"])
     if expected_run_id is not None and run_id != int(expected_run_id):
         return None
+    metadata = _stamp_run_receipt(conn, task_id, run_id, metadata)
     conn.execute(
         """
         UPDATE task_runs
@@ -32701,6 +32811,7 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    session_id: Optional[str] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -32738,6 +32849,7 @@ def heartbeat_worker(
                 "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
                 (now, run_id),
             )
+            _link_run_session(conn, run_id, session_id)
         _append_event(
             conn, task_id, "heartbeat",
             {"note": note} if note else None,
