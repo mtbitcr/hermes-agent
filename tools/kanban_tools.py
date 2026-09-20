@@ -340,35 +340,30 @@ def _capability_receipt(skills, tools, connections, *, source: str, complete: bo
     }
 
 
-def _capability_skill_names(message: dict) -> set:
-    """Skill names named by this message\u2019s own skill tool calls.
+def _capability_skill_name(message: dict) -> Optional[str]:
+    """The skill name this tool result's own handler reported serving, or None.
 
-    Accepts both persisted tool-call shapes (nested ``function`` with a JSON
-    argument string, and the flat name/input form) because the transcript
-    carries whichever the serving route wrote.
+    Evidence, never assertion, and the same kind of evidence as the tools and
+    connections lists beside it: the name is read from the result the handler
+    wrote, never from the arguments the model typed into its own request. A
+    request argument proves only what the model asked for, so any string it
+    invents -- including a secret-shaped one -- would otherwise reach the
+    owner-facing receipt labelled as this run's own accounting. Only a
+    handler-reported success carries a name, so a failed, refused or merely
+    staged call contributes nothing, and a handler that reports no name (a
+    successful ``skill_manage`` write names none) is simply not listed: under
+    an evidence-never-assertion contract silence beats a name nothing ran.
     """
-    calls = message.get("tool_calls")
-    if not isinstance(calls, list):
-        return set()
-    names = set()
-    for call in calls:
-        if not isinstance(call, dict):
-            continue
-        function = call.get("function") if isinstance(call.get("function"), dict) else {}
-        if (function.get("name") or call.get("name")) not in _CAPABILITY_SKILL_TOOLS:
-            continue
-        arguments = function.get("arguments", call.get("arguments", call.get("input")))
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except (TypeError, ValueError):
-                continue
-        if not isinstance(arguments, dict):
-            continue
-        skill = _capability_name(arguments.get("name"))
-        if skill:
-            names.add(skill)
-    return names
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    try:
+        reported = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(reported, dict) or not reported.get("success"):
+        return None
+    return _capability_name(reported.get("name"))
 
 
 def _capability_from_session(db: Any, session_id: str) -> dict:
@@ -376,9 +371,9 @@ def _capability_from_session(db: Any, session_id: str) -> dict:
 
     Evidence, never assertion: tool names come from the transcript\u2019s own
     ``tool_name`` column, connections are the server halves of the
-    ``mcp__<server>__<tool>`` convention, and skills are the skills those
-    calls named. A read that fails records ``unavailable`` with empty
-    lists rather than inventing one.
+    ``mcp__<server>__<tool>`` convention, and skills are the ones the skill
+    tools' own results reported serving. A read that fails records
+    ``unavailable`` with empty lists rather than inventing one.
 
     The card\u2019s force-load list is deliberately not unioned in: the
     receipt is built for a run identified by its session, while the kernel
@@ -397,7 +392,6 @@ def _capability_from_session(db: Any, session_id: str) -> dict:
     for message in messages:
         if not isinstance(message, dict):
             continue
-        skills |= _capability_skill_names(message)
         name = _capability_name(message.get("tool_name"))
         if not name:
             continue
@@ -408,6 +402,8 @@ def _capability_from_session(db: Any, session_id: str) -> dict:
             if server:
                 connections.add(server)
             continue
+        if name in _CAPABILITY_SKILL_TOOLS and (skill := _capability_skill_name(message)):
+            skills.add(skill)
         tools.add(name)
     return _capability_receipt(
         skills,

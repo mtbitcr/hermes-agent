@@ -2140,15 +2140,26 @@ def test_runtime_receipt_can_read_another_profiles_session_store(monkeypatch):
 
 
 def _capability_session(db, session_id, calls):
-    """Write one session whose transcript records ``calls`` as tool messages."""
+    """Write one session transcript from ``(name, arguments, result)`` calls.
+
+    ``result`` is what the handler reported back and is written as the tool
+    result row's content; ``arguments`` is only what the model asked for. The
+    two are recorded separately so a test can make them disagree, which is the
+    whole point of deriving the receipt from the result.
+    """
     db.create_session(session_id, source="kanban", model="m", profile_name="test-worker")
-    for name, arguments in calls:
-        tool_calls = None
+    for name, arguments, result in calls:
         if arguments is not None:
-            tool_calls = [{"id": "c", "type": "function", "function": {
-                "name": name, "arguments": json.dumps(arguments)}}]
-            db.append_message(session_id, "assistant", content="", tool_calls=tool_calls)
-        db.append_message(session_id, "tool", content="out", tool_name=name, tool_call_id="c")
+            db.append_message(session_id, "assistant", content="", tool_calls=[
+                {"id": "c", "type": "function", "function": {
+                    "name": name, "arguments": json.dumps(arguments)}}])
+        content = result if isinstance(result, str) else json.dumps(result)
+        db.append_message(session_id, "tool", content=content, tool_name=name, tool_call_id="c")
+
+
+def _served(name):
+    """A skill tool result in the shape its handler really reports on success."""
+    return {"success": True, "name": name, "content": "..."}
 
 
 def test_capability_receipt_records_bounded_session_evidence(monkeypatch, worker_env, tmp_path):
@@ -2163,13 +2174,16 @@ def test_capability_receipt_records_bounded_session_evidence(monkeypatch, worker
     db = SessionDB(db_path=profile_dir / "state.db")
     try:
         _capability_session(db, session_id, [
-            ("kanban_show", {}),
-            ("terminal", {"command": "ls"}),
-            ("terminal", {"command": "pwd"}),
-            ("skill_view", {"name": "claude-code"}),
-            ("skill_manage", {"name": "kanban-flow", "action": "patch"}),
-            ("mcp__opensandbox_agent_factory__command_run", {"command": "x"}),
-            ("mcp__github__create_issue", {"title": "t"}),
+            ("kanban_show", {}, "out"),
+            ("terminal", {"command": "ls"}, "out"),
+            ("terminal", {"command": "pwd"}, "out"),
+            ("skill_view", {"name": "claude-code"}, _served("claude-code")),
+            # A successful skill_manage write reports no name of its own, so it
+            # contributes the tool but no skill -- exactly what its handler said.
+            ("skill_manage", {"name": "kanban-flow", "action": "patch"},
+             {"success": True, "message": "Patched SKILL.md in skill 'kanban-flow'."}),
+            ("mcp__opensandbox_agent_factory__command_run", {"command": "x"}, "out"),
+            ("mcp__github__create_issue", {"title": "t"}, "out"),
         ])
         db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
             model="served-model", billing_provider="served-provider",
@@ -2185,13 +2199,79 @@ def test_capability_receipt_records_bounded_session_evidence(monkeypatch, worker
     capability = receipt["capability"]
     assert capability["schema_version"] == 1
     assert capability["source"] == "session-tool-calls"
-    assert capability["skills"] == ["claude-code", "kanban-flow"]
+    assert capability["skills"] == ["claude-code"]
     assert capability["tools"] == ["kanban_show", "skill_manage", "skill_view", "terminal"]
     assert capability["connections"] == ["github", "opensandbox_agent_factory"]
     assert capability["truncated"] is False
     assert capability["skills_truncated"] is False
     assert capability["tools_truncated"] is False
     assert capability["connections_truncated"] is False
+
+
+def test_capability_skills_come_from_the_result_not_the_request(monkeypatch, worker_env, tmp_path):
+    """A name the model only typed never reaches the owner-facing receipt.
+
+    The request argument is the model's own words: it proves what was asked
+    for, not what ran. Deriving the list from it would let any invented
+    string -- here a secret-shaped one -- be published as this run's own
+    accounting, so the name must come from the handler's result, exactly as
+    the tools and connections lists beside it already do.
+    """
+    from hermes_state import SessionDB
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    profile_dir = tmp_path / "claimed-profile"
+    profile_dir.mkdir()
+    session_id = "claimed-session"
+    secret_shaped = "sk-" + "a" * 60
+    db = SessionDB(db_path=profile_dir / "state.db")
+    try:
+        _capability_session(db, session_id, [
+            # The model asks for one name; the handler serves another.
+            ("skill_view", {"name": secret_shaped}, _served("really-served")),
+            # The handler refused outright -- the request names a skill anyway.
+            ("skill_view", {"name": "never-loaded"},
+             {"success": False, "error": "Skill 'never-loaded' not found."}),
+        ])
+        db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
+            model="served-model", billing_provider="served-provider",
+            estimated_cost_usd=0.01, cost_status="estimated",
+            cost_source="official_docs_snapshot", api_call_count=1)
+    finally:
+        db.close()
+
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
+    capability = kt._worker_runtime_receipt(session_id)["capability"]
+
+    assert capability["skills"] == ["really-served"]
+    assert secret_shaped not in capability["skills"]
+    assert "never-loaded" not in capability["skills"]
+    # The call itself still happened, so the tool stays on the evidence list.
+    assert capability["tools"] == ["skill_view"]
+
+
+def test_capability_skill_name_requires_reported_success():
+    """Each non-success result shape contributes nothing.
+
+    A staged write is the sharp one: the gate reports ``success`` for having
+    recorded the request, but nothing was created, loaded or executed.
+    """
+    from tools import kanban_tools as kt
+
+    served = {"success": True, "name": "served-skill"}
+    assert kt._capability_skill_name({"content": json.dumps(served)}) == "served-skill"
+
+    for content in (
+        json.dumps({"success": False, "name": "failed-skill"}),   # handler refused
+        json.dumps({"name": "no-verdict-skill"}),                 # no success verdict
+        json.dumps({"success": True}),                            # served, names none
+        json.dumps({"success": True, "name": "a b"}),             # not a capability name
+        json.dumps(["success", "name"]),                          # not an object
+        "not json at all",                                        # unparseable
+        None,                                                     # no content
+    ):
+        assert kt._capability_skill_name({"content": content}) is None
 
 
 def test_capability_receipt_bounds_each_list_with_its_own_flag():
@@ -2266,7 +2346,8 @@ def test_capability_receipt_reports_only_session_derived_skills(monkeypatch, wor
     session_id = "forced-session"
     db = SessionDB(db_path=profile_dir / "state.db")
     try:
-        _capability_session(db, session_id, [("skill_view", {"name": "called-skill"})])
+        _capability_session(db, session_id, [
+            ("skill_view", {"name": "called-skill"}, _served("called-skill"))])
         db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
             model="served-model", billing_provider="served-provider",
             estimated_cost_usd=0.01, cost_status="estimated",
@@ -2309,7 +2390,9 @@ def test_capability_receipt_is_bound_to_the_run_not_the_process(monkeypatch, wor
     session_id = "kernel-session"
     db = SessionDB(db_path=profile_dir / "state.db")
     try:
-        _capability_session(db, session_id, [("skill_view", {"name": "skill-this-run-used"})])
+        _capability_session(db, session_id, [
+            ("skill_view", {"name": "skill-this-run-used"},
+             _served("skill-this-run-used"))])
         db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
             model="served-model", billing_provider="served-provider",
             estimated_cost_usd=0.01, cost_status="estimated",
