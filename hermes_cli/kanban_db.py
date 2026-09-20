@@ -33947,12 +33947,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             )
             has_evidence = bool(unreported) and unreported.get("evidence") != "none"
             park_recurrences = 0
+            # The lane the run was claimed from (review or ready), resolved
+            # once for both paths: a park must remember it so the owner's
+            # unblock never turns an interrupted reviewer run into an
+            # implementation run.
+            parked_source_status = _retry_status_for_run(conn, row["id"])
             if has_evidence:
                 # Evidence-backed unreported completion: not a failure and
                 # never re-dispatched; parked for a person to accept it.
                 retry_status = "blocked"
             else:
-                retry_status = _retry_status_for_run(conn, row["id"])
+                retry_status = parked_source_status
             event_payload["retry_status"] = retry_status
             # Same evidence rule as the stale-claim reclaim: the event says
             # what was observed, not only what was concluded.
@@ -34027,7 +34032,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                             ),
                             "kind": "needs_input",
                             "recurrences": park_recurrences,
-                            "source_status": "running",
+                            "source_status": parked_source_status,
                         },
                         run_id=run_id,
                     )

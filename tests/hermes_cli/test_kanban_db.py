@@ -2084,6 +2084,43 @@ def test_evidence_backed_park_survives_recompute_ready_until_unblocked(
         assert kb.recompute_ready(conn) == 0
 
 
+def test_evidence_backed_park_out_of_a_review_run_resumes_into_review(
+    kanban_home, monkeypatch,
+):
+    """A reviewer run that exits quietly with evidence is parked; the owner's
+    unblock must return the card to the review lane, never to ready (the
+    read-only review gate would otherwise be lost)."""
+    import json
+
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _running_task_with_dead_pid(conn, monkeypatch)
+        run_id = kb.latest_run(conn, tid).id
+        with kb.write_txn(conn):
+            _kb._link_run_session(conn, run_id, "sess-terminal")
+            # A review claim records its lane on the claimed event.
+            _kb._append_event(
+                conn, tid, "claimed", {"source_status": "review"}, run_id=run_id,
+            )
+        assert _kb._retry_status_for_run(conn, tid) == "review"
+        monkeypatch.setattr(
+            _kb, "_session_shows_terminal_intent", lambda conn, task_id: True,
+        )
+
+        kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
+        last_block_event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert json.loads(last_block_event["payload"])["source_status"] == "review"
+
+        kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "review"
+
+
 def test_session_terminal_intent_reads_real_tool_calls(kanban_home, monkeypatch, tmp_path):
     """End-to-end (no monkeypatched evidence function): a real session store
     row with a kanban_complete tool call is recognized as evidence."""
