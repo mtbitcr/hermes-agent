@@ -46,13 +46,14 @@ def _stream_cm(final_message, events=()):
     return cm
 
 
-def _raising_stream_cm(error):
-    """A stream whose first event raises, the way the SDK's accumulating
-    iterator dies on the delta that carries the raw control character."""
+def _raising_stream_cm(error, events=()):
+    """A stream that yields ``events`` and then raises, the way the SDK's
+    accumulating iterator dies on the delta that carries the raw control
+    character."""
 
     def _boom():
+        yield from list(events)
         raise error
-        yield  # pragma: no cover - makes this a generator
 
     cm = MagicMock()
     stream = MagicMock()
@@ -91,6 +92,31 @@ def test_control_character_parse_error_retries_the_stream():
 
     assert response.stop_reason == "tool_use"
     assert response.content[0].input == {"command": "echo a\nb"}
+    assert agent._anthropic_client.messages.stream.call_count == 2
+
+
+def _text_then_tool_use_events():
+    """The common shape: the model streams a sentence, then starts a tool call
+    whose argument carries the raw line break."""
+    return [
+        SimpleNamespace(type="content_block_delta",
+                        delta=SimpleNamespace(type="text_delta", text="Let me check that.")),
+        SimpleNamespace(type="content_block_start",
+                        content_block=SimpleNamespace(type="tool_use", name="terminal")),
+    ]
+
+
+def test_control_character_parse_error_retries_after_a_text_preamble():
+    """Text already streamed, a tool call in flight: still a retry, not an abort."""
+    agent = _make_anthropic_agent()
+    agent._anthropic_client.messages.stream = MagicMock(side_effect=[
+        _raising_stream_cm(ValueError(CONTROL_CHARACTER_MESSAGE), events=_text_then_tool_use_events()),
+        _stream_cm(_done_message()),
+    ])
+
+    response = agent._interruptible_streaming_api_call({"model": "claude-opus-4-7"})
+
+    assert response.stop_reason == "tool_use"
     assert agent._anthropic_client.messages.stream.call_count == 2
 
 

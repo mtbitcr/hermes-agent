@@ -3031,8 +3031,13 @@ class _StreamingCall(StreamingWaitMonitor):
                     block = getattr(event, "content_block", None)
                     if block and getattr(block, "type", None) == "tool_use":
                         has_tool_use = True
+                        # Record the in-flight tool call, as the chat-completions
+                        # path does: the retry policy must not read a stream that
+                        # dies here as a partial text response.
+                        self.provider_tool_in_flight["yes"] = True
                         if getattr(block, "name", None):
                             self._emit_tool_started(block.name)
+                            self.result["partial_tool_names"].append(block.name)
                 elif event_type == "content_block_delta":
                     delta = getattr(event, "delta", None)
                     delta_type = getattr(delta, "type", None) if delta else None
