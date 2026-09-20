@@ -26756,6 +26756,21 @@ def _block_task_within_txn(
     # here (rather than ``blocked``) is what keeps a cron from ever seeing
     # a dependency-wait as something to "unblock".
     if kind == "dependency":
+        # "Waiting on other work" needs other work to wait on: with no parent
+        # of a kind ``recompute_ready`` gates on, the stop would be promoted
+        # straight back on the next tick, so it is refused before any write
+        # (the caller's transaction rolls back; the block tool reports it).
+        has_parent = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks t ON t.id = l.parent_id "
+            f"WHERE l.child_id = ? AND t.task_kind IN {_DEPENDENCY_PARENT_KINDS} "
+            "LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if has_parent is None:
+            raise ValueError(
+                "dependency stop refused: the task names no parent to wait on; "
+                "link the parent first (kanban_link) or stop with needs_input"
+            )
         cur = conn.execute(
             """
             UPDATE tasks
