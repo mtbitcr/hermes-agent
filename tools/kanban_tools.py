@@ -284,6 +284,136 @@ def _runtime_receipt_cost(route: dict) -> dict:
     }
 
 
+# Bounds for the capability object carried by every run receipt. Every list is
+# capped on its own and carries its own truncation flag, so a capped list can
+# never be read as a complete one.
+_CAPABILITY_SCHEMA_VERSION = 1
+_CAPABILITY_MAX_NAMES = 40
+_CAPABILITY_MAX_ROWS = 4000
+_CAPABILITY_MCP_PREFIX = "mcp__"
+_CAPABILITY_SKILL_TOOLS = ("skill_view", "skill_manage")
+# Underscore is deliberate and load-bearing: tool names (``kanban_complete``,
+# ``skill_view``) and MCP server names carry it, unlike the route identity
+# values matched by ``_RUNTIME_RECEIPT_VALUE``.
+_CAPABILITY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/_-]{0,79}$")
+
+
+def _capability_name(value: Any) -> Optional[str]:
+    """Return one bounded, non-secret capability name, or None."""
+    if not isinstance(value, str):
+        return None
+    clean = value.strip()
+    return clean if _CAPABILITY_NAME.fullmatch(clean) else None
+
+
+def _capability_bounded(names) -> tuple[list, bool]:
+    """Sort, de-duplicate and cap one capability list.
+
+    Returns the bounded list and whether it was cut short, so the caller can
+    record a per-list truncation flag beside it.
+    """
+    ordered = sorted(names)
+    return ordered[:_CAPABILITY_MAX_NAMES], len(ordered) > _CAPABILITY_MAX_NAMES
+
+
+def _capability_receipt(skills, tools, connections, *, source: str, complete: bool = True) -> dict:
+    """Build the bounded capability object for one run.
+
+    Each list carries its own truncation flag; the object-level flag is true
+    when any list was capped or when the evidence itself was cut short.
+    """
+    skill_names, skills_truncated = _capability_bounded(skills)
+    tool_names, tools_truncated = _capability_bounded(tools)
+    server_names, connections_truncated = _capability_bounded(connections)
+    return {
+        "schema_version": _CAPABILITY_SCHEMA_VERSION,
+        "skills": skill_names,
+        "skills_truncated": skills_truncated,
+        "tools": tool_names,
+        "tools_truncated": tools_truncated,
+        "connections": server_names,
+        "connections_truncated": connections_truncated,
+        "source": source,
+        "truncated": (
+            skills_truncated or tools_truncated or connections_truncated or not complete
+        ),
+    }
+
+
+def _capability_skill_name(message: dict) -> Optional[str]:
+    """The skill name this tool result's own handler reported serving, or None.
+
+    Evidence, never assertion, and the same kind of evidence as the tools and
+    connections lists beside it: the name is read from the result the handler
+    wrote, never from the arguments the model typed into its own request. A
+    request argument proves only what the model asked for, so any string it
+    invents -- including a secret-shaped one -- would otherwise reach the
+    owner-facing receipt labelled as this run's own accounting. Only a
+    handler-reported success carries a name, so a failed, refused or merely
+    staged call contributes nothing, and a handler that reports no name (a
+    successful ``skill_manage`` write names none) is simply not listed: under
+    an evidence-never-assertion contract silence beats a name nothing ran.
+    """
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    try:
+        reported = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(reported, dict) or not reported.get("success"):
+        return None
+    return _capability_name(reported.get("name"))
+
+
+def _capability_from_session(db: Any, session_id: str) -> dict:
+    """Derive the capability object from the run\u2019s own session log.
+
+    Evidence, never assertion: tool names come from the transcript\u2019s own
+    ``tool_name`` column, connections are the server halves of the
+    ``mcp__<server>__<tool>`` convention, and skills are the ones the skill
+    tools' own results reported serving. A read that fails records
+    ``unavailable`` with empty lists rather than inventing one.
+
+    The card\u2019s force-load list is deliberately not unioned in: the
+    receipt is built for a run identified by its session, while the kernel
+    books most endings from a process that is not that run\u2019s worker, so
+    this process\u2019s environment names no card, or another card. A skill
+    force-loaded but never called is therefore simply not reported: under
+    an evidence-never-assertion contract, silence beats a list that is
+    borrowed or short while flagged complete.
+    """
+    try:
+        messages = db.get_messages(session_id, limit=_CAPABILITY_MAX_ROWS)
+    except Exception:
+        logger.debug("could not read session tool calls for run receipt", exc_info=True)
+        return _capability_receipt((), (), (), source="unavailable", complete=False)
+    tools, connections, skills = set(), set(), set()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        name = _capability_name(message.get("tool_name"))
+        if not name:
+            continue
+        if name.startswith(_CAPABILITY_MCP_PREFIX):
+            server = name[len(_CAPABILITY_MCP_PREFIX):].split("__", 1)[0]
+            # Server names only (owner decision): the tool half can carry
+            # call-specific detail the owner did not ask to record.
+            if server:
+                connections.add(server)
+            continue
+        if name in _CAPABILITY_SKILL_TOOLS and (skill := _capability_skill_name(message)):
+            skills.add(skill)
+        tools.add(name)
+    return _capability_receipt(
+        skills,
+        tools,
+        connections,
+        source="session-tool-calls",
+        complete=len(messages) < _CAPABILITY_MAX_ROWS,
+    )
+
+
 def _worker_runtime_receipt(
     session_id: str, *, profile: Optional[str] = None
 ) -> Optional[dict]:
@@ -316,6 +446,7 @@ def _worker_runtime_receipt(
             if not session:
                 return None
             dominant = db.get_dominant_session_model_route(session_id) or {}
+            capability = _capability_from_session(db, session_id)
     except Exception:
         logger.warning(
             "could not read trusted runtime receipt for worker session",
@@ -342,7 +473,9 @@ def _worker_runtime_receipt(
     if not model or not provider:
         return None
     return {
-        "schema_version": 2,
+        # 3: adds the bounded ``capability`` object below. The owner-facing
+        # reader accepts 2 and 3 so historical receipts stay readable.
+        "schema_version": 3,
         "engine": "hermes",
         "profile": profile,
         "provider": provider,
@@ -352,6 +485,7 @@ def _worker_runtime_receipt(
             "dominant-session-usage" if dominant else "session-row"
         ),
         "cost": _runtime_receipt_cost(dominant),
+        "capability": capability,
     }
 
 

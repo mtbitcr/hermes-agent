@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -178,7 +179,7 @@ def test_worker_runtime_receipt_uses_persisted_dominant_route(
     assert stamped == {
         "worker_session_id": session_id,
         "runtime_receipt": {
-            "schema_version": 2,
+            "schema_version": 3,
             "engine": "hermes",
             "profile": "test-worker",
             "provider": "served-provider",
@@ -191,6 +192,13 @@ def test_worker_runtime_receipt_uses_persisted_dominant_route(
                 "amount": 0.0123,
                 "source": "official_docs_snapshot",
                 "scope": "dominant-main-route",
+            },
+            "capability": {
+                "schema_version": 1,
+                "skills": [], "skills_truncated": False,
+                "tools": [], "tools_truncated": False,
+                "connections": [], "connections_truncated": False,
+                "source": "session-tool-calls", "truncated": False,
             },
         },
     }
@@ -2129,3 +2137,290 @@ def test_runtime_receipt_can_read_another_profiles_session_store(monkeypatch):
     monkeypatch.setattr(profiles, "get_profile_dir", _fake_get_profile_dir)
     assert kt._worker_runtime_receipt("s1", profile="run-owner") is None
     assert seen["profile"] == "run-owner"
+
+
+def _capability_session(db, session_id, calls):
+    """Write one session transcript from ``(name, arguments, result)`` calls.
+
+    ``result`` is what the handler reported back and is written as the tool
+    result row's content; ``arguments`` is only what the model asked for. The
+    two are recorded separately so a test can make them disagree, which is the
+    whole point of deriving the receipt from the result.
+    """
+    db.create_session(session_id, source="kanban", model="m", profile_name="test-worker")
+    for name, arguments, result in calls:
+        if arguments is not None:
+            db.append_message(session_id, "assistant", content="", tool_calls=[
+                {"id": "c", "type": "function", "function": {
+                    "name": name, "arguments": json.dumps(arguments)}}])
+        content = result if isinstance(result, str) else json.dumps(result)
+        db.append_message(session_id, "tool", content=content, tool_name=name, tool_call_id="c")
+
+
+def _served(name):
+    """A skill tool result in the shape its handler really reports on success."""
+    return {"success": True, "name": name, "content": "..."}
+
+
+def test_capability_receipt_records_bounded_session_evidence(monkeypatch, worker_env, tmp_path):
+    """The receipt records the skills, tools and connections the run really used."""
+    from hermes_state import SessionDB
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    profile_dir = tmp_path / "cap-profile"
+    profile_dir.mkdir()
+    session_id = "cap-session"
+    db = SessionDB(db_path=profile_dir / "state.db")
+    try:
+        _capability_session(db, session_id, [
+            ("kanban_show", {}, "out"),
+            ("terminal", {"command": "ls"}, "out"),
+            ("terminal", {"command": "pwd"}, "out"),
+            ("skill_view", {"name": "claude-code"}, _served("claude-code")),
+            # A successful skill_manage write reports no name of its own, so it
+            # contributes the tool but no skill -- exactly what its handler said.
+            ("skill_manage", {"name": "kanban-flow", "action": "patch"},
+             {"success": True, "message": "Patched SKILL.md in skill 'kanban-flow'."}),
+            ("mcp__opensandbox_agent_factory__command_run", {"command": "x"}, "out"),
+            ("mcp__github__create_issue", {"title": "t"}, "out"),
+        ])
+        db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
+            model="served-model", billing_provider="served-provider",
+            estimated_cost_usd=0.01, cost_status="estimated",
+            cost_source="official_docs_snapshot", api_call_count=1)
+    finally:
+        db.close()
+
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
+    receipt = kt._worker_runtime_receipt(session_id)
+
+    assert receipt["schema_version"] == 3
+    capability = receipt["capability"]
+    assert capability["schema_version"] == 1
+    assert capability["source"] == "session-tool-calls"
+    assert capability["skills"] == ["claude-code"]
+    assert capability["tools"] == ["kanban_show", "skill_manage", "skill_view", "terminal"]
+    assert capability["connections"] == ["github", "opensandbox_agent_factory"]
+    assert capability["truncated"] is False
+    assert capability["skills_truncated"] is False
+    assert capability["tools_truncated"] is False
+    assert capability["connections_truncated"] is False
+
+
+def test_capability_skills_come_from_the_result_not_the_request(monkeypatch, worker_env, tmp_path):
+    """A name the model only typed never reaches the owner-facing receipt.
+
+    The request argument is the model's own words: it proves what was asked
+    for, not what ran. Deriving the list from it would let any invented
+    string -- here a secret-shaped one -- be published as this run's own
+    accounting, so the name must come from the handler's result, exactly as
+    the tools and connections lists beside it already do.
+    """
+    from hermes_state import SessionDB
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    profile_dir = tmp_path / "claimed-profile"
+    profile_dir.mkdir()
+    session_id = "claimed-session"
+    secret_shaped = "sk-" + "a" * 60
+    db = SessionDB(db_path=profile_dir / "state.db")
+    try:
+        _capability_session(db, session_id, [
+            # The model asks for one name; the handler serves another.
+            ("skill_view", {"name": secret_shaped}, _served("really-served")),
+            # The handler refused outright -- the request names a skill anyway.
+            ("skill_view", {"name": "never-loaded"},
+             {"success": False, "error": "Skill 'never-loaded' not found."}),
+        ])
+        db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
+            model="served-model", billing_provider="served-provider",
+            estimated_cost_usd=0.01, cost_status="estimated",
+            cost_source="official_docs_snapshot", api_call_count=1)
+    finally:
+        db.close()
+
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
+    capability = kt._worker_runtime_receipt(session_id)["capability"]
+
+    assert capability["skills"] == ["really-served"]
+    assert secret_shaped not in capability["skills"]
+    assert "never-loaded" not in capability["skills"]
+    # The call itself still happened, so the tool stays on the evidence list.
+    assert capability["tools"] == ["skill_view"]
+
+
+def test_capability_skill_name_requires_reported_success():
+    """Each non-success result shape contributes nothing.
+
+    A staged write is the sharp one: the gate reports ``success`` for having
+    recorded the request, but nothing was created, loaded or executed.
+    """
+    from tools import kanban_tools as kt
+
+    served = {"success": True, "name": "served-skill"}
+    assert kt._capability_skill_name({"content": json.dumps(served)}) == "served-skill"
+
+    for content in (
+        json.dumps({"success": False, "name": "failed-skill"}),   # handler refused
+        json.dumps({"name": "no-verdict-skill"}),                 # no success verdict
+        json.dumps({"success": True}),                            # served, names none
+        json.dumps({"success": True, "name": "a b"}),             # not a capability name
+        json.dumps(["success", "name"]),                          # not an object
+        "not json at all",                                        # unparseable
+        None,                                                     # no content
+    ):
+        assert kt._capability_skill_name({"content": content}) is None
+
+
+def test_capability_receipt_bounds_each_list_with_its_own_flag():
+    """A capped list is never readable as a complete one."""
+    from tools import kanban_tools as kt
+
+    many = [f"tool-{i:03d}" for i in range(kt._CAPABILITY_MAX_NAMES + 5)]
+    capability = kt._capability_receipt(["one-skill"], many, ["srv"], source="session-tool-calls")
+
+    assert len(capability["tools"]) == kt._CAPABILITY_MAX_NAMES
+    assert capability["tools"] == sorted(many)[:kt._CAPABILITY_MAX_NAMES]
+    assert capability["tools_truncated"] is True
+    assert capability["skills_truncated"] is False
+    assert capability["connections_truncated"] is False
+    assert capability["truncated"] is True
+
+
+def test_capability_receipt_reports_unavailable_rather_than_inventing(monkeypatch, worker_env, tmp_path):
+    """A session-store read failure records no evidence, not a guessed list."""
+    from hermes_state import SessionDB
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    profile_dir = tmp_path / "broken-profile"
+    profile_dir.mkdir()
+    session_id = "broken-session"
+    db = SessionDB(db_path=profile_dir / "state.db")
+    try:
+        db.create_session(session_id, source="kanban", model="m", profile_name="test-worker")
+        db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
+            model="served-model", billing_provider="served-provider",
+            estimated_cost_usd=0.01, cost_status="estimated",
+            cost_source="official_docs_snapshot", api_call_count=1)
+    finally:
+        db.close()
+
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
+
+    def _boom(self, *a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(SessionDB, "get_messages", _boom)
+    receipt = kt._worker_runtime_receipt(session_id)
+
+    # The route-and-cost keys stay exactly as today: best-effort by contract.
+    assert receipt["model"] == "served-model"
+    assert receipt["cost"]["state"] == "estimated"
+    assert receipt["capability"] == {
+        "schema_version": 1,
+        "skills": [], "skills_truncated": False,
+        "tools": [], "tools_truncated": False,
+        "connections": [], "connections_truncated": False,
+        "source": "unavailable", "truncated": True,
+    }
+
+
+def test_capability_receipt_reports_only_session_derived_skills(monkeypatch, worker_env, tmp_path):
+    """A skill force-loaded on the card but never called is not reported.
+
+    The receipt is built for a run identified by its session, so the card can
+    only be reached through this process's environment — which names the run's
+    own card just for a worker stamping itself. Reading it would make the same
+    field mean "what this run used" on one ending and "what some other card
+    declared" on the next, so ``skills`` is session evidence only.
+    """
+    from hermes_state import SessionDB
+    from hermes_cli import profiles, kanban_db as kb
+    from tools import kanban_tools as kt
+
+    profile_dir = tmp_path / "forced-profile"
+    profile_dir.mkdir()
+    session_id = "forced-session"
+    db = SessionDB(db_path=profile_dir / "state.db")
+    try:
+        _capability_session(db, session_id, [
+            ("skill_view", {"name": "called-skill"}, _served("called-skill"))])
+        db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
+            model="served-model", billing_provider="served-provider",
+            estimated_cost_usd=0.01, cost_status="estimated",
+            cost_source="official_docs_snapshot", api_call_count=1)
+    finally:
+        db.close()
+
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET skills = ? WHERE id = ?",
+                     (json.dumps(["forced-skill-never-called"]), worker_env))
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
+    capability = kt._worker_runtime_receipt(session_id)["capability"]
+
+    assert capability["skills"] == ["called-skill"]
+    assert capability["source"] == "session-tool-calls"
+    assert capability["skills_truncated"] is False
+    assert capability["truncated"] is False
+
+
+@pytest.mark.parametrize("foreign_card", [False, True])
+def test_capability_receipt_is_bound_to_the_run_not_the_process(monkeypatch, worker_env, tmp_path, foreign_card):
+    """An ending booked outside the run's own worker reports the run's skills.
+
+    The kernel stamps crashed, timed-out, reclaimed, stale and spawn-failed
+    endings from the dispatcher process, which carries no card in its
+    environment or a different one. Either way the receipt must carry only what
+    this session did, never another card's declared skills.
+    """
+    from hermes_state import SessionDB
+    from hermes_cli import profiles, kanban_db as kb
+    from tools import kanban_tools as kt
+
+    profile_dir = tmp_path / "kernel-profile"
+    profile_dir.mkdir()
+    session_id = "kernel-session"
+    db = SessionDB(db_path=profile_dir / "state.db")
+    try:
+        _capability_session(db, session_id, [
+            ("skill_view", {"name": "skill-this-run-used"},
+             _served("skill-this-run-used"))])
+        db.update_token_counts(session_id, input_tokens=10, output_tokens=4,
+            model="served-model", billing_provider="served-provider",
+            estimated_cost_usd=0.01, cost_status="estimated",
+            cost_source="official_docs_snapshot", api_call_count=1)
+    finally:
+        db.close()
+
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET skills = ? WHERE id = ?",
+                     (json.dumps(["skill-forced-on-this-card"]), worker_env))
+        if foreign_card:
+            other = kb.create_task(conn, title="another-card", assignee="test-worker")
+            conn.execute("UPDATE tasks SET skills = ? WHERE id = ?",
+                         (json.dumps(["skill-forced-on-another-card"]), other))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # The stamping process is not this run's worker: it names another card, or
+    # no card at all.
+    if foreign_card:
+        monkeypatch.setenv("HERMES_KANBAN_TASK", other)
+    else:
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: profile_dir)
+    capability = kt._worker_runtime_receipt(session_id)["capability"]
+
+    assert capability["skills"] == ["skill-this-run-used"]
+    assert capability["source"] == "session-tool-calls"
+    assert capability["truncated"] is False

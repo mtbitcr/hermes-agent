@@ -2731,12 +2731,74 @@ def owner_task_route_pin(row: Any) -> Optional[OwnerTaskRoutePin]:
     )
 
 
+_OWNER_RUNTIME_RECEIPT_VERSIONS = (2, 3)
+# The capability object arrived with receipt version 3. The reader re-bounds
+# every list it projects: a receipt is data, and a list that grew past this
+# bound is reported as truncated rather than passed through whole.
+_OWNER_CAPABILITY_VERSION = 3
+_OWNER_CAPABILITY_MAX_NAMES = 40
+_OWNER_CAPABILITY_SOURCES = ("session-tool-calls", "unavailable")
+# Capability names carry underscores (``kanban_complete``, ``skill_view``),
+# unlike the route identity values ``_OWNER_RUNTIME_VALUE_RE`` matches.
+_OWNER_CAPABILITY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/_-]{0,79}$")
+
+
+def _owner_capability_value(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    clean = value.strip()
+    return clean if _OWNER_CAPABILITY_NAME_RE.fullmatch(clean) else None
+
+
+def _owner_capability_names(value: object) -> tuple[list, bool]:
+    """Project one capability list, re-bounded, with its truncation flag."""
+    if not isinstance(value, list):
+        return [], False
+    names = sorted({
+        name for name in (_owner_capability_value(item) for item in value) if name
+    })
+    return names[:_OWNER_CAPABILITY_MAX_NAMES], len(names) > _OWNER_CAPABILITY_MAX_NAMES
+
+
+def _owner_project_capability(raw: dict) -> Optional[dict]:
+    """Project the receipt\u2019s capability object, or None when it proves nothing."""
+    if raw.get("schema_version") != _OWNER_CAPABILITY_VERSION:
+        return None
+    capability = raw.get("capability")
+    if not isinstance(capability, dict):
+        return None
+    source = _owner_runtime_value(capability.get("source"))
+    if source not in _OWNER_CAPABILITY_SOURCES:
+        return None
+    skills, skills_cut = _owner_capability_names(capability.get("skills"))
+    tools, tools_cut = _owner_capability_names(capability.get("tools"))
+    connections, connections_cut = _owner_capability_names(capability.get("connections"))
+    return {
+        "state": "known" if source == "session-tool-calls" else "unknown",
+        "skills": skills,
+        "skills_truncated": skills_cut or capability.get("skills_truncated") is True,
+        "tools": tools,
+        "tools_truncated": tools_cut or capability.get("tools_truncated") is True,
+        "connections": connections,
+        "connections_truncated": (
+            connections_cut or capability.get("connections_truncated") is True
+        ),
+        "truncated": (
+            skills_cut or tools_cut or connections_cut
+            or capability.get("truncated") is True
+        ),
+    }
+
+
 def _owner_project_runtime_and_cost(
     run: kanban_db.Run, task_pin: Optional[OwnerTaskRoutePin],
 ) -> tuple[dict, dict]:
     metadata = run.metadata if isinstance(run.metadata, dict) else {}
     raw = metadata.get("runtime_receipt")
-    if not isinstance(raw, dict) or raw.get("schema_version") != 2:
+    # Versions 2 and 3 carry the same route-and-cost keys; 3 adds the bounded
+    # capability object, read below. Accepting both keeps historical receipts
+    # readable and keeps this reader in step with the writer’s bump.
+    if not isinstance(raw, dict) or raw.get("schema_version") not in _OWNER_RUNTIME_RECEIPT_VERSIONS:
         return dict(_OWNER_UNKNOWN_RUNTIME), dict(_OWNER_UNKNOWN_COST)
 
     engine = _owner_runtime_value(raw.get("engine"))
@@ -2786,6 +2848,9 @@ def _owner_project_runtime_and_cost(
         "model": model,
         "reasoning_effort": effort,
     }
+    capability = _owner_project_capability(raw)
+    if capability is not None:
+        runtime["capability"] = capability
     cost = raw.get("cost")
     if not isinstance(cost, dict):
         return runtime, dict(_OWNER_UNKNOWN_COST)
