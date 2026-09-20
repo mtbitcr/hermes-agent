@@ -1906,3 +1906,304 @@ def test_trusted_receipt_is_best_effort(monkeypatch):
 
     monkeypatch.setattr(kt, "_worker_runtime_receipt", _boom)
     assert kb._trusted_runtime_receipt("s1", "p") is None
+
+
+
+# ---------------------------------------------------------------------------
+# Clean-exit-without-a-terminal-call recorded as completed_unreported (4a)
+# ---------------------------------------------------------------------------
+
+def _exited_status_local(code):
+    return code << 8
+
+
+def _running_task_with_dead_pid(conn, monkeypatch, title="unreported"):
+    """A claimed, running task whose worker pid is dead (protocol-violation shape)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    host = _kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(conn, title=title, assignee="a")
+    kb.claim_task(conn, tid, claimer=f"{host}:w0")
+    pid = 70999
+    conn.execute(
+        "UPDATE tasks SET worker_pid=?, consecutive_failures=? WHERE id=?",
+        (pid, 0, tid),
+    )
+    conn.commit()
+    _kb._record_worker_exit(pid, _exited_status_local(0))
+    return tid
+
+
+def test_clean_exit_with_no_evidence_is_completed_unreported_and_retried(
+    kanban_home, monkeypatch,
+):
+    """No attachments, no session link: outcome renamed, retry path unchanged."""
+    with kb.connect() as conn:
+        tid = _running_task_with_dead_pid(conn, monkeypatch)
+
+        crashed = kb.detect_crashed_workers(conn)
+        # No evidence keeps today's retry path: the run is still counted
+        # toward the bounded violation streak, but its outcome is honest.
+        assert tid in crashed
+
+        run = kb.latest_run(conn, tid)
+        assert run.outcome == "completed_unreported"
+        assert run.status == "completed_unreported"
+        assert run.metadata["protocol_violation"] is True
+        assert run.metadata["unreported_completion"]["evidence"] == "none"
+        assert run.metadata["unreported_completion"]["attachments_at_exit"] == 0
+        assert run.metadata["unreported_completion"]["decided_by"] == (
+            "_unreported_completion_evidence"
+        )
+
+        task = kb.get_task(conn, tid)
+        # No evidence: today's existing retry path is unchanged (back to ready).
+        assert task.status == "ready"
+        assert task.last_failure_error is not None
+
+
+def test_clean_exit_with_a_deliverable_is_not_retried(kanban_home, monkeypatch):
+    """An attachment left behind is deliverable_present evidence; no retry."""
+    with kb.connect() as conn:
+        tid = _running_task_with_dead_pid(conn, monkeypatch)
+        run_id = kb.latest_run(conn, tid).id
+        # The run's own upload, as the attach tool stores it: run-scoped, by the agent.
+        kb.store_attachment_bytes(
+            conn, tid, "out.txt", b"abc", content_type="text/plain",
+            uploaded_by="agent", expected_run_id=run_id,
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+
+        run = kb.latest_run(conn, tid)
+        assert run.outcome == "completed_unreported"
+        unreported = run.metadata["unreported_completion"]
+        assert unreported["evidence"] == "deliverable_present"
+        assert unreported["attachments_at_exit"] == 1
+        # protocol_violation marker + event kind are unchanged.
+        assert run.metadata["protocol_violation"] is True
+
+        task = kb.get_task(conn, tid)
+        # Evidence-backed: NOT the ordinary retry path (never sent to ready).
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 0
+
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "protocol_violation" for e in events)
+
+
+def test_owner_attachment_before_the_run_is_not_the_runs_deliverable(
+    kanban_home, monkeypatch,
+):
+    """An owner brief attached before the worker started is not evidence that
+    the run finished anything: evidence stays none and the retry path holds."""
+    with kb.connect() as conn:
+        tid = _running_task_with_dead_pid(conn, monkeypatch)
+        kb.add_attachment(
+            conn, tid, filename="brief.md", stored_path="/tmp/brief.md",
+            content_type="text/markdown", size=5, uploaded_by="owner",
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed
+
+        run = kb.latest_run(conn, tid)
+        assert run.outcome == "completed_unreported"
+        assert run.metadata["unreported_completion"]["evidence"] == "none"
+        assert run.metadata["unreported_completion"]["attachments_at_exit"] == 0
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_clean_exit_with_session_terminal_intent_is_not_retried(
+    kanban_home, monkeypatch,
+):
+    """A terminal kanban_complete call found in the run's own session log counts
+    as evidence even though the durable board write never landed."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _running_task_with_dead_pid(conn, monkeypatch)
+        run_id = kb.latest_run(conn, tid).id
+        with kb.write_txn(conn):
+            _kb._link_run_session(conn, run_id, "sess-terminal")
+
+        monkeypatch.setattr(
+            _kb, "_session_shows_terminal_intent", lambda conn, task_id: True,
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+
+        run = kb.latest_run(conn, tid)
+        unreported = run.metadata["unreported_completion"]
+        assert unreported["evidence"] == "session_terminal_intent"
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+
+
+def test_evidence_backed_park_survives_recompute_ready_until_unblocked(
+    kanban_home, monkeypatch,
+):
+    """The dispatcher runs recompute_ready right after the crash sweep; a
+    parked unreported completion must stay parked through it (a sticky
+    block, like kanban_block) and leave only through unblock_task."""
+    import json
+
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _running_task_with_dead_pid(conn, monkeypatch)
+        run_id = kb.latest_run(conn, tid).id
+        with kb.write_txn(conn):
+            _kb._link_run_session(conn, run_id, "sess-terminal")
+        monkeypatch.setattr(
+            _kb, "_session_shows_terminal_intent", lambda conn, task_id: True,
+        )
+
+        kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+        last_block_event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "AND kind IN ('blocked', 'unblocked') ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert last_block_event["kind"] == "blocked"
+        assert json.loads(last_block_event["payload"])["kind"] == "needs_input"
+
+        kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kb.recompute_ready(conn) == 0
+
+
+def test_evidence_backed_park_out_of_a_review_run_resumes_into_review(
+    kanban_home, monkeypatch,
+):
+    """A reviewer run that exits quietly with evidence is parked; the owner's
+    unblock must return the card to the review lane, never to ready (the
+    read-only review gate would otherwise be lost)."""
+    import json
+
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _running_task_with_dead_pid(conn, monkeypatch)
+        run_id = kb.latest_run(conn, tid).id
+        with kb.write_txn(conn):
+            _kb._link_run_session(conn, run_id, "sess-terminal")
+            # A review claim records its lane on the claimed event.
+            _kb._append_event(
+                conn, tid, "claimed", {"source_status": "review"}, run_id=run_id,
+            )
+        assert _kb._retry_status_for_run(conn, tid) == "review"
+        monkeypatch.setattr(
+            _kb, "_session_shows_terminal_intent", lambda conn, task_id: True,
+        )
+
+        kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
+        last_block_event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert json.loads(last_block_event["payload"])["source_status"] == "review"
+
+        kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "review"
+
+
+def test_session_terminal_intent_reads_real_tool_calls(kanban_home, monkeypatch, tmp_path):
+    """End-to-end (no monkeypatched evidence function): a real session store
+    row with a kanban_complete tool call is recognized as evidence."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import profiles as _profiles
+    from hermes_state import SessionDB
+
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    monkeypatch.setattr(_profiles, "get_profile_dir", lambda _p: profile_dir)
+
+    session_id = "sess-real-terminal"
+    db = SessionDB(db_path=profile_dir / "state.db")
+    db.create_session(session_id, source="cli", model="m")
+    db.append_message(
+        session_id, "assistant", content="",
+        tool_calls=[{"id": "1", "function": {"name": "kanban_complete", "arguments": "{}"}}],
+    )
+    db.close()
+
+    with kb.connect() as conn:
+        tid = _running_task_with_dead_pid(conn, monkeypatch)
+        run_id = kb.latest_run(conn, tid).id
+        with kb.write_txn(conn):
+            _kb._link_run_session(conn, run_id, session_id)
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+
+        run = kb.latest_run(conn, tid)
+        assert run.metadata["unreported_completion"]["evidence"] == "session_terminal_intent"
+
+
+def test_unreported_completion_evidence_is_best_effort_on_session_read_failure(
+    kanban_home, monkeypatch,
+):
+    """A session-store outage degrades to no-evidence, never raises."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = _running_task_with_dead_pid(conn, monkeypatch)
+        run_id = kb.latest_run(conn, tid).id
+        with kb.write_txn(conn):
+            _kb._link_run_session(conn, run_id, "sess-broken")
+
+        import hermes_state
+
+        class _Boom:
+            def __init__(self, *a, **kw):
+                raise RuntimeError("session store down")
+
+        monkeypatch.setattr(hermes_state, "SessionDB", _Boom)
+
+        # Must not raise out of the reclaim transaction; with no evidence
+        # readable the run keeps today's retry path.
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed
+
+        run = kb.latest_run(conn, tid)
+        assert run.metadata["unreported_completion"]["evidence"] == "none"
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+
+
+def test_protocol_violation_streak_recognizes_completed_unreported_outcome(
+    kanban_home,
+):
+    """The violation-streak scan must still recognize the renamed outcome so the
+    bounded retry budget (and eventual breaker trip) keeps working."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="streak", assignee="a")
+        kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        with kb.write_txn(conn):
+            kb._end_run(
+                conn, tid, outcome="completed_unreported",
+                status="completed_unreported",
+                error="worker exited cleanly (rc=0) without calling "
+                      "kanban_complete or kanban_block — protocol violation.",
+                metadata={"protocol_violation": True},
+            )
+        streak = _kb._protocol_violation_streak(conn, tid)
+        assert streak == 1

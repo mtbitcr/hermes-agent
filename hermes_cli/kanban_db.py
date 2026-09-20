@@ -16094,7 +16094,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     ended_at            INTEGER,
     outcome             TEXT,
     -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
-    --          gave_up | reclaimed | (null while still running)
+    --          gave_up | reclaimed | completed_unreported | stale |
+    --          rate_limited | review_requested | changes_requested |
+    --          scheduled | (null while still running) -- non-exhaustive; see
+    --          each _end_run call site for the authoritative list.
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
@@ -23262,6 +23265,125 @@ def _stamp_run_receipt(
     if receipt is not None:
         stamped["runtime_receipt"] = receipt
     return stamped
+
+
+# Terminal kanban calls a worker may have attempted before a clean exit raced
+# the durable write. Kept narrow and explicit rather than pattern-matched.
+_UNREPORTED_TERMINAL_TOOLS = ("kanban_complete", "kanban_request_review", "kanban_block")
+
+
+def _unreported_completion_evidence(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Classify what a clean exit without a terminal call actually left behind.
+
+    Kernel-written, never model-supplied -- called only from the dead-worker
+    classifier's clean-exit branch, before the outcome is finalized as
+    ``completed_unreported``. ``evidence`` is ``deliverable_present`` when the
+    run itself uploaded attachments (its own ``attached`` receipts, uploaded
+    by the agent -- an owner brief attached before the run is not a
+    deliverable), ``session_terminal_intent`` when its own session log
+    (joined via the first-heartbeat ``worker_session_id``, see
+    :func:`_link_run_session`) shows an attempted terminal kanban call, else
+    ``none``. Best-effort throughout: any read failure degrades toward
+    ``none`` rather than raising inside the reclaim transaction, so a
+    session-store outage can only ever fall back to today's retry path.
+    """
+    attachments_at_exit = _run_agent_attachment_count(conn, task_id)
+    if attachments_at_exit > 0:
+        evidence = "deliverable_present"
+    elif _session_shows_terminal_intent(conn, task_id):
+        evidence = "session_terminal_intent"
+    else:
+        evidence = "none"
+    return {
+        "evidence": evidence,
+        "decided_by": "_unreported_completion_evidence",
+        "attachments_at_exit": attachments_at_exit,
+    }
+
+
+def _run_agent_attachment_count(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the attachments the task's CURRENT run uploaded itself.
+
+    Scoped by the run's own ``attached`` receipts (the tool layer stores a
+    worker upload with its run id and ``uploaded_by="agent"``), so a file the
+    owner attached before the run, or another run's upload, never counts as
+    this run's deliverable. Best-effort: any read error counts zero.
+    """
+    try:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ? AND task_kind = 'work'",
+            (task_id,),
+        ).fetchone()
+        run_id = int(row["current_run_id"]) if row and row["current_run_id"] else None
+        if run_id is None:
+            return 0
+        count = 0
+        for event in conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'attached' ORDER BY id",
+            (task_id, run_id),
+        ).fetchall():
+            try:
+                receipt = json.loads(event["payload"]) if event["payload"] else {}
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if (
+                isinstance(receipt, dict)
+                and isinstance(receipt.get("attachment_id"), int)
+                and receipt.get("by") == "agent"
+            ):
+                count += 1
+        return count
+    except Exception:
+        _log.debug("could not count run attachments for unreported-completion evidence", exc_info=True)
+        return 0
+
+
+def _session_shows_terminal_intent(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Best-effort read of the run's own session log for an attempted terminal call.
+
+    Reads the task's CURRENT run's ``worker_session_id`` (written at first
+    heartbeat) and profile, then checks that session's own tool-call history
+    for kanban_complete / kanban_request_review / kanban_block. A worker that
+    attempted one of these but whose exit raced the durable write is exactly
+    the case this recognizes. A missing link, missing session store, or any
+    read error degrades to False -- never raises.
+    """
+    try:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ? AND task_kind = 'work'",
+            (task_id,),
+        ).fetchone()
+        run_id = int(row["current_run_id"]) if row and row["current_run_id"] else None
+        if run_id is None:
+            return False
+        persisted, profile = _persisted_run_metadata(conn, run_id)
+        session_id = persisted.get("worker_session_id")
+        if not isinstance(session_id, str) or not session_id.strip():
+            return False
+
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_state import SessionDB
+
+        db_path = get_profile_dir(profile or "default") / "state.db"
+        if not db_path.is_file():
+            return False
+        with SessionDB(db_path=db_path, read_only=True) as db:
+            messages = db.get_messages(session_id.strip(), limit=200, latest=True)
+        for msg in messages:
+            for call in (msg.get("tool_calls") or []):
+                if not isinstance(call, dict):
+                    continue
+                fn = (call.get("function") or {}).get("name")
+                if fn in _UNREPORTED_TERMINAL_TOOLS:
+                    return True
+        return False
+    except Exception:
+        _log.debug(
+            "could not read session for unreported-completion evidence",
+            exc_info=True,
+        )
+        return False
 
 
 def _end_run(
@@ -33637,7 +33759,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
         outcome = row["outcome"] or ""
         if outcome == "rate_limited":
             continue
-        if outcome == "crashed":
+        if outcome in ("crashed", "completed_unreported"):
             is_violation = False
             raw_meta = row["metadata"]
             if raw_meta:
@@ -33815,34 +33937,105 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
-            retry_status = _retry_status_for_run(conn, row["id"])
+            # A clean exit is provisionally "completed but unreported": ask
+            # the kernel what the run left behind (attachments, or a terminal
+            # kanban call in its own session log) before deciding whether it
+            # is retried. Kernel-written, read before the run is closed.
+            unreported = (
+                _unreported_completion_evidence(conn, row["id"])
+                if protocol_violation else None
+            )
+            has_evidence = bool(unreported) and unreported.get("evidence") != "none"
+            park_recurrences = 0
+            # The lane the run was claimed from (review or ready), resolved
+            # once for both paths: a park must remember it so the owner's
+            # unblock never turns an interrupted reviewer run into an
+            # implementation run.
+            parked_source_status = _retry_status_for_run(conn, row["id"])
+            if has_evidence:
+                # Evidence-backed unreported completion: not a failure and
+                # never re-dispatched; parked for a person to accept it.
+                retry_status = "blocked"
+            else:
+                retry_status = parked_source_status
             event_payload["retry_status"] = retry_status
             # Same evidence rule as the stale-claim reclaim: the event says
             # what was observed, not only what was concluded.
             event_payload.update(identity)
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
-            )
+            if has_evidence:
+                # The park is a sticky block like ``kanban_block``: it must
+                # survive the ``recompute_ready`` pass that follows this sweep
+                # in ``dispatch_once`` and leave only through ``unblock_task``.
+                # Same bookkeeping as ``_block_task_within_txn``: the
+                # recurrence counter and, below, the ``blocked`` event.
+                prior = conn.execute(
+                    "SELECT block_kind, block_recurrences FROM tasks WHERE id = ?",
+                    (row["id"],),
+                ).fetchone()
+                park_recurrences = (
+                    int(prior["block_recurrences"] or 0) + 1
+                    if prior is not None and prior["block_kind"] == "needs_input"
+                    else 1
+                )
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input', "
+                    "block_recurrences = ?, "
+                    "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (park_recurrences, row["id"], pid, row["claim_lock"]),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ?",
+                    (retry_status, row["id"], pid, row["claim_lock"]),
+                )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # history doesn't show a phantom crash for a quota wall. A
+                # clean exit that skipped the completion or block call is
+                # ``completed_unreported``: the work usually finished and only
+                # the paperwork was skipped.
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif protocol_violation:
+                    _run_outcome = "completed_unreported"
+                else:
+                    _run_outcome = "crashed"
+                run_metadata = dict(event_payload)
+                if unreported is not None:
+                    run_metadata["unreported_completion"] = unreported
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
                     error=error_text,
-                    metadata=dict(event_payload),
+                    metadata=run_metadata,
                 )
                 _append_event(
                     conn, row["id"], event_kind,
                     event_payload,
                     run_id=run_id,
                 )
+                if has_evidence:
+                    _append_event(
+                        conn, row["id"], "blocked",
+                        {
+                            "reason": (
+                                "The run exited without reporting its result, "
+                                "but left evidence that the work finished "
+                                f"({unreported.get('evidence')}); accept the "
+                                "result or resume the task."
+                            ),
+                            "kind": "needs_input",
+                            "recurrences": park_recurrences,
+                            "source_status": parked_source_status,
+                        },
+                        run_id=run_id,
+                    )
                 exited_hook_payloads.append({
                     "task_id": row["id"],
                     "assignee": row["assignee"],
@@ -33864,6 +34057,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif has_evidence:
+                    # Evidence-backed unreported completion: no failure
+                    # message, no crash/breaker accounting, no retry.
+                    pass
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
