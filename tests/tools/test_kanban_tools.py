@@ -2078,3 +2078,54 @@ def test_create_refuses_a_board_claim_on_an_unmappable_pinned_database(worker_en
         assert kb.list_tasks(conn) == []
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Run-to-session link written at the first heartbeat
+# ---------------------------------------------------------------------------
+
+def test_heartbeat_links_the_run_to_this_workers_session(monkeypatch, worker_env):
+    """kanban_heartbeat must hand the kernel this run's session id."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260920_011122_695773")
+    out = kt._handle_heartbeat({})
+    assert json.loads(out)["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        meta = kb.latest_run(conn, worker_env).metadata
+    finally:
+        conn.close()
+    assert meta["worker_session_id"] == "20260920_011122_695773"
+
+
+def test_heartbeat_link_is_scoped_to_this_workers_own_task(monkeypatch, worker_env):
+    """A process may only offer a session for the task it is running."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-x")
+    assert kt._worker_session_id(worker_env) == "sess-x"
+    assert kt._worker_session_id("t_someone_else") is None
+    monkeypatch.setenv("HERMES_SESSION_ID", "   ")
+    assert kt._worker_session_id(worker_env) is None
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    assert kt._worker_session_id(worker_env) is None
+
+
+def test_runtime_receipt_can_read_another_profiles_session_store(monkeypatch):
+    """The kernel stamps endings for runs owned by other profiles."""
+    from tools import kanban_tools as kt
+
+    seen = {}
+    monkeypatch.setenv("HERMES_PROFILE", "this-process")
+
+    def _fake_get_profile_dir(profile):
+        seen["profile"] = profile
+        raise RuntimeError("stop after the profile is chosen")
+
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "get_profile_dir", _fake_get_profile_dir)
+    assert kt._worker_runtime_receipt("s1", profile="run-owner") is None
+    assert seen["profile"] == "run-owner"
