@@ -3519,6 +3519,30 @@ def test_effective_route_fence_fails_closed_on_unprovable_receipts(ctx, monkeypa
     assert excinfo.value.code == "execution_state_busy"
 
 
+def test_effective_route_fence_skips_a_project_whose_board_was_removed(ctx):
+    """A Project removed for good still has committed receipts and a projects
+    row naming its board, but no board store: the fence must skip it (a
+    removed board holds no owner work to pin) instead of refusing the whole
+    settings change on the missing store. Seen in production on 2026-09-21."""
+    setup = _bootstrap_board(ctx)
+    with projects_db.connect_closing() as conn:
+        projects_db.record_removal_operation(
+            conn,
+            project_id=setup["project_id"],
+            idempotency_key="fence-removed-project-permanent",
+            action="confirm_permanent",
+            phase="done",
+            mode="permanent",
+            board_slug=setup["board"],
+            removal_id="rm-fence-removed-project",
+        )
+    shutil.rmtree(kanban_db.board_dir(setup["board"]))
+    assert not kanban_db.board_exists(setup["board"])
+
+    assert setup["board"] not in ow._owner_receipt_task_ids()
+    assert ow.fence_effective_task_routes("default") == []
+
+
 def test_effective_route_fence_needs_no_route_when_nothing_is_exposed(monkeypatch):
     """A role with no routeless owner work must not require a route read."""
     def _never(profile):  # pragma: no cover - asserted by not being called
