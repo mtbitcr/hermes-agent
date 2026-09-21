@@ -2378,6 +2378,15 @@ def _owner_receipt_task_ids() -> dict[str, set[str]]:
                         "an owner work receipt does not resolve to a board"
                     )
                 board_slug = str(row["board_slug"])
+                if (
+                    not kanban_db.board_exists(board_slug)
+                    and _completed_removal_state(project_id) is not None
+                ):
+                    # The board is gone because the owner removed the
+                    # Project for good. Its receipts still name tasks, but a
+                    # removed board holds no owner work to pin, and opening
+                    # the missing store would refuse the whole change.
+                    continue
                 # Ownership must be provable. An unprovable binding is not
                 # "someone else's problem": it means this fence cannot tell
                 # whose work these tasks are, so it must not proceed.
