@@ -2424,3 +2424,185 @@ def test_capability_receipt_is_bound_to_the_run_not_the_process(monkeypatch, wor
     assert capability["skills"] == ["skill-this-run-used"]
     assert capability["source"] == "session-tool-calls"
     assert capability["truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# kanban_read: bounded window onto this task's own attachment or body
+# ---------------------------------------------------------------------------
+
+def _kanban_worker_schema_names(monkeypatch):
+    """Tool names a dispatcher-spawned worker actually sees.
+
+    Mirrors model_tools' worker path: the ``kanban`` toolset is folded in for
+    a dispatcher-owned worker, then each entry's own check_fn decides.
+    """
+    import tools.kanban_tools  # noqa: F401  (ensure registered)
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("kanban")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    invalidate_check_fn_cache()
+    return {n for n in names if n and n.startswith("kanban_")}
+
+
+def _attach_text(task_id, filename, text):
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        return kb.store_attachment_bytes(
+            conn, task_id, filename, text.encode("utf-8"),
+            content_type="text/plain", uploaded_by="owner",
+        )
+
+
+def test_read_returns_exactly_the_requested_attachment_range(worker_env):
+    """An attachment's content comes back byte for byte for a given window."""
+    from tools import kanban_tools as kt
+
+    text = "".join(f"line {i:04d}\n" for i in range(400))
+    att_id = _attach_text(worker_env, "analysis.md", text)
+
+    d = json.loads(kt._handle_read({"attachment_id": att_id, "offset": 100, "limit": 250}))
+    assert d["ok"] is True
+    assert d["content"] == text[100:350]
+    assert d["source"] == "attachment"
+    assert d["attachment_id"] == att_id
+    assert d["filename"] == "analysis.md"
+    assert d["offset"] == 100
+    assert d["returned"] == 250
+    assert d["total"] == len(text)
+    assert d["has_more"] is True
+
+    # The last window reports no more remaining, and the windows reassemble
+    # into the original content with nothing lost or duplicated.
+    tail = json.loads(kt._handle_read(
+        {"attachment_id": att_id, "offset": len(text) - 10, "limit": 4000}))
+    assert tail["content"] == text[-10:]
+    assert tail["has_more"] is False
+    assert tail["returned"] == 10
+
+
+def test_read_defaults_to_the_task_body_when_no_attachment_is_named(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    body = "B" * 5000
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, worker_env))
+        conn.commit()
+
+    d = json.loads(kt._handle_read({}))
+    assert d["source"] == "body"
+    assert d["attachment_id"] is None
+    assert d["total"] == 5000
+    # The default window is bounded, so this tool's own reply can never become
+    # the oversized record it exists to page through.
+    assert d["returned"] == len(d["content"]) <= kt._KANBAN_READ_MAX_LIMIT
+    assert d["has_more"] is True
+    assert d["content"] == body[:d["returned"]]
+
+
+def test_read_refuses_out_of_bounds_and_path_escaping_requests(worker_env):
+    """Out-of-range windows are refused, and a stored path pointing outside the
+    task's attachments dir is refused by the same storage-identity check the
+    download path uses — never served."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    att_id = _attach_text(worker_env, "small.txt", "0123456789")
+
+    past_end = json.loads(kt._handle_read({"attachment_id": att_id, "offset": 99}))
+    assert "error" in past_end and "offset" in past_end["error"]
+    assert "content" not in past_end
+
+    for bad in ({"offset": -1}, {"limit": 0},
+                {"limit": kt._KANBAN_READ_MAX_LIMIT + 1}, {"limit": "lots"}):
+        out = json.loads(kt._handle_read({"attachment_id": att_id, **bad}))
+        assert "error" in out, (bad, out)
+        assert "content" not in out
+
+    # Repoint the row at a file outside the attachments directory, exactly the
+    # shape kanban_db.read_attachment_bytes exists to reject.
+    with kb.connect_closing() as conn:
+        outside = kb.attachments_root().parent / "secret.txt"
+        outside.write_text("TOP SECRET", encoding="utf-8")
+        conn.execute("UPDATE task_attachments SET stored_path = ? WHERE id = ?",
+                     (str(outside), att_id))
+        conn.commit()
+
+    out = json.loads(kt._handle_read({"attachment_id": att_id}))
+    assert "error" in out, out
+    assert "content" not in out
+    assert "TOP SECRET" not in json.dumps(out)
+    assert outside.read_text(encoding="utf-8") == "TOP SECRET"  # untouched
+
+
+def test_read_unknown_attachment_id_is_a_structured_error(worker_env):
+    """Not a crash, and not a silently empty window."""
+    from tools import kanban_tools as kt
+
+    for bad_id in (999999, "not-a-number"):
+        out = json.loads(kt._handle_read({"attachment_id": bad_id}))
+        assert "error" in out, out
+        assert out.get("ok") is not True
+        assert "content" not in out
+
+
+def test_read_refuses_an_attachment_belonging_to_another_task(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect_closing() as conn:
+        other = kb.create_task(conn, title="other", assignee="someone-else")
+    other_att = _attach_text(other, "theirs.txt", "not yours")
+
+    out = json.loads(kt._handle_read({"attachment_id": other_att}))
+    assert "error" in out, out
+    assert "not yours" not in json.dumps(out)
+
+
+def test_read_is_present_for_exactly_the_kanban_show_audience(worker_env, monkeypatch):
+    """Same availability check as kanban_show: present wherever that tool is,
+    absent wherever it isn't."""
+    from tools import kanban_tools as kt
+
+    # A dispatcher-spawned worker sees both.
+    worker = _kanban_worker_schema_names(monkeypatch)
+    assert "kanban_show" in worker, worker
+    assert "kanban_read" in worker, worker
+
+    # An orchestrator profile (kanban toolset, no task of its own) also has
+    # kanban_show, so it has kanban_read too.
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(kt, "_profile_has_kanban_toolset", lambda: True)
+    orchestrator = _kanban_worker_schema_names(monkeypatch)
+    assert "kanban_show" in orchestrator
+    assert "kanban_read" in orchestrator
+
+    # Plain chat has neither.
+    monkeypatch.setattr(kt, "_profile_has_kanban_toolset", lambda: False)
+    plain = _kanban_worker_schema_names(monkeypatch)
+    assert "kanban_show" not in plain
+    assert "kanban_read" not in plain
+
+    # And the two are gated by the same callable, not merely agreeing today.
+    from tools.registry import registry
+    entries = {e.name: e for e in registry._snapshot_entries()}
+    assert entries["kanban_read"].check_fn is entries["kanban_show"].check_fn
+
+
+def test_read_is_hidden_from_a_delegated_child(worker_env, monkeypatch):
+    """A delegate_task child does not own the card, so it sees neither tool."""
+    from agent.delegation_context import delegated_child_context
+    from tools.registry import registry
+
+    # The tool exists at all (otherwise "absent" below is vacuous)...
+    assert "kanban_read" in {e.name for e in registry._snapshot_entries()}
+    assert "kanban_read" in _kanban_worker_schema_names(monkeypatch)
+
+    # ...and is still withheld from an execution that does not own the card.
+    with delegated_child_context():
+        names = _kanban_worker_schema_names(monkeypatch)
+    assert "kanban_show" not in names
+    assert "kanban_read" not in names
