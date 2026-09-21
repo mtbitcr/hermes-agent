@@ -118,6 +118,26 @@ def _is_dispatcher_owned_worker() -> bool:
         return True
 
 
+def _is_delegated_child_process_context() -> bool:
+    """True for a delegate_task child's own in-process context AND for its
+    spawned subprocess.
+
+    ``_is_delegated_child_context`` only sees the in-process ContextVar,
+    which a delegate_task child's own subprocess does not inherit -- that
+    subprocess instead carries the ``HERMES_DELEGATED_CHILD_CONTEXT=1`` env
+    marker that :func:`agent.delegation_context.scrub_kanban_env` sets so the
+    denial survives an exec. Gates that must refuse a delegated child
+    regardless of process shape use this instead. Fails closed (True) on any
+    import/lookup error, since callers treat True as "refuse".
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return is_delegated_child_process_context()
+    except Exception:
+        return True
+
+
 def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
     """Deny Kanban mutations from delegate_task children.
 
@@ -283,7 +303,7 @@ def _check_kanban_status_report_mode() -> bool:
     fills it in. Reporting/planning boundaries are the intended members; no
     name is hardcoded here.
     """
-    if _is_delegated_child_context():
+    if _is_delegated_child_process_context():
         return False
     return _profile_in_status_report_allowlist()
 
@@ -299,7 +319,7 @@ def _require_status_report_profile(tool_name: str) -> Optional[str]:
     closed with a structured refusal and zero reads of another project's
     board.
     """
-    if _is_delegated_child_context():
+    if _is_delegated_child_process_context():
         return tool_error(
             f"{tool_name} refused: delegate_task child agents are not Kanban "
             "run owners. Return findings to the parent agent."
