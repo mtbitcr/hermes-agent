@@ -27663,7 +27663,7 @@ def _request_changes_within_txn(
     if not reason:
         return False, "reason is required"
     task_row = conn.execute(
-        "SELECT status, assignee, current_run_id, title FROM tasks "
+        "SELECT status, assignee, current_run_id, title, tenant FROM tasks "
         "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
@@ -27801,12 +27801,24 @@ def _request_changes_within_txn(
     # has no distinct candidate to tell apart, so every non-pass verdict on it
     # collapses onto its one follow-up rather than nagging twice.
     #
-    # The item is linked as a CHILD of the reviewed card, so it inherits the
-    # existing parent gating and waits in ``todo`` instead of competing with
-    # the rework the implementer is being handed back right now.
+    # The item is linked as a CHILD of the reviewed card and parked in
+    # ``triage``: it is a tracking RECORD of a verdict, not dispatchable work.
+    # Parent gating alone would not keep it inert -- once the rework is
+    # accepted the reviewed card reaches ``done``, the gate opens, and
+    # ``recompute_ready`` (which promotes from ``todo``/``blocked``) would hand
+    # the dispatcher a card telling a worker to redo work that just PASSED
+    # review. ``triage`` is in neither that promote set nor the claim query, so
+    # the item waits for a person to give it a real specification -- exactly
+    # the state's existing meaning -- and no run is ever spawned from it.
     reviewed_title = str(task_row["title"] or "").strip()
     followup_id = create_task(
         conn,
+        triage=True,
+        # Tenant is the board's soft namespace and reaches workers as
+        # ``HERMES_TENANT``; a follow-up that dropped it would vanish from the
+        # tenant's own ``list_tasks`` filter while staying on the board. The
+        # decompose path already copies the root's tenant onto every child.
+        tenant=task_row["tenant"],
         title=f"Rework: {reviewed_title}"[:_REVIEW_FOLLOWUP_TITLE_MAX_CHARS],
         body=(
             "Rework tracked from a review that returned changes on "

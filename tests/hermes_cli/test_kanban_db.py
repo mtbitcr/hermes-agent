@@ -2342,9 +2342,10 @@ def test_changes_requested_records_one_linked_followup_for_the_implementer(
         assert followup is not None
         assert followup.assignee == "worker"
         assert followup.id != tid
-        # Linked to the reviewed work, and gated behind it.
+        # Linked to the reviewed work, and parked as a tracking record a
+        # person promotes -- never auto-dispatched as rework of its own.
         assert _parents_of(conn, followup.id) == [tid]
-        assert followup.status == "todo"
+        assert followup.status == "triage"
 
 
 def test_replayed_verdict_on_the_same_candidate_adds_no_second_followup(
@@ -2530,3 +2531,86 @@ def test_review_findings_repeat_still_stops_without_a_second_followup(
         assert second["outcome"] == "owner_decision_blocked", second
         assert kb.get_task(conn, tid).status == "blocked"
         assert _followups_of(conn, tid) == after_first
+
+
+def test_accepted_rework_never_dispatches_the_followup(
+    kanban_home, all_assignees_spawnable,
+):
+    """The follow-up is a tracking record, so no dispatcher tick spawns it.
+
+    Parent gating alone is not enough: approving the rework moves the reviewed
+    card to ``done``, which opens the gate. A card left in an auto-promotable
+    status would then be handed to a worker as "rework" of work that just
+    PASSED review. The control card proves the tick really does spawn.
+    """
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 4242
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship the widget", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        review_run = _park_for_review(conn, tid)
+        ok, _ = kb.request_changes(
+            conn, tid, reason="fix the boundary", expected_run_id=review_run,
+        )
+        assert ok is True
+        followups = _followups_of(conn, tid)
+        assert len(followups) == 1, followups
+        followup_id = next(iter(followups))
+
+        # The implementer reworks; the reviewer accepts this time.
+        reclaimed = kb.claim_task(conn, tid)
+        assert reclaimed is not None
+        second_review_run = _park_for_review(conn, tid)
+        assert kb.complete_task(
+            conn, tid, summary="rework accepted",
+            expected_run_id=second_review_run,
+        ) is True
+        assert kb.get_task(conn, tid).status == "done"
+
+        # A control card proves this tick really does spawn work.
+        control = kb.create_task(conn, title="control", assignee="worker")
+        kb.recompute_ready(conn)
+        kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        followup = kb.get_task(conn, followup_id)
+
+    assert control in spawns, spawns
+    assert followup_id not in spawns, spawns
+    assert followup is not None
+    assert followup.status == "triage"
+    assert followup.current_run_id is None
+
+
+def test_followup_inherits_the_reviewed_cards_tenant(kanban_home):
+    """The follow-up stays inside the reviewed card's tenant namespace.
+
+    Tenant is the board's soft namespace and reaches workers as
+    ``HERMES_TENANT``. A follow-up that dropped it would be missing from the
+    tenant's own ``list_tasks`` view while still sitting on the board.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="ship the widget", assignee="worker", tenant="acme",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        review_run = _park_for_review(conn, tid)
+        ok, _ = kb.request_changes(
+            conn, tid, reason="fix the boundary", expected_run_id=review_run,
+        )
+        assert ok is True
+
+        followups = _followups_of(conn, tid)
+        assert len(followups) == 1, followups
+        followup = kb.get_task(conn, next(iter(followups)))
+        assert followup is not None
+        assert followup.tenant == "acme"
+
+        scoped = {t.id for t in kb.list_tasks(conn, tenant="acme")}
+
+    assert followup.id in scoped
