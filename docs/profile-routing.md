@@ -115,3 +115,23 @@ activates the per-profile runtime scope (per-profile `HERMES_HOME`, secret scope
 profile-namespaced session keys); routing is the decision layer that picks *which*
 profile a given guild/channel/thread lands in. With multiplexing off, `profile_routes`
 is ignored entirely — behavior is byte-identical to a single-profile gateway.
+
+## Kanban task-creation routes
+
+A Kanban task created from the command line (`hermes kanban create`) carries no model-policy
+route of its own unless all five of these fields are supplied:
+
+1. `assignee`
+2. `provider_override`
+3. `model_override`
+4. `reasoning_effort`
+5. `execution_tier`
+
+(Source: `hermes_cli/kanban_db.py`, `create_task()` function parameters; `mint_policy_lock()` binds
+these same fields under shorter parameter names: `assignee`, `provider`, `model`, `effort`, `execution_tier`.)
+
+Unlike tasks created through the owner surface, the CLI command exposes only three of these
+fields: `--assignee`, `--model` (maps to `model_override`), and `--provider` (maps to
+`provider_override`). The `reasoning_effort` and `execution_tier` fields have no CLI flags,
+so a `hermes kanban create` task cannot supply them — which is why CLI-created tasks stay
+unrouted and unlocked, carrying no owner-approved model-policy authority.
