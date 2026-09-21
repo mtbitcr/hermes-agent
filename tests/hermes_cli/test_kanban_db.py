@@ -2586,6 +2586,33 @@ def test_accepted_rework_never_dispatches_the_followup(
     assert followup.current_run_id is None
 
 
+def test_followup_carries_the_reviewed_cards_project(kanban_home):
+    """The follow-up belongs to the reviewed card's Project.
+
+    The owner surfaces select a Project's cards by ``project_id``, so a
+    follow-up without it exists on the board but on no owner page. The
+    reviewer's process need not hold the Project store, so the id is taken
+    from the reviewed card itself, never resolved again.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship the widget", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET project_id = ? WHERE id = ?", ("p_owner_project", tid),
+        )
+        assert kb.claim_task(conn, tid) is not None
+        review_run = _park_for_review(conn, tid)
+        ok, _ = kb.request_changes(
+            conn, tid, reason="fix the boundary", expected_run_id=review_run,
+        )
+        assert ok is True
+
+        followups = _followups_of(conn, tid)
+        assert len(followups) == 1, followups
+        followup = kb.get_task(conn, next(iter(followups)))
+        assert followup is not None
+        assert followup.project_id == "p_owner_project"
+
+
 def test_followup_inherits_the_reviewed_cards_tenant(kanban_home):
     """The follow-up stays inside the reviewed card's tenant namespace.
 
