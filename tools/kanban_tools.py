@@ -273,15 +273,17 @@ def _check_kanban_status_report_mode() -> bool:
     """``kanban_status_report`` is allow-list-only, narrower than every other
     gate in this module.
 
-    Mirrors :func:`_check_kanban_orchestrator_mode` — delegated children and
-    dispatcher-owned single-task workers are excluded, and the profile must
-    carry the kanban toolset — and then adds the one new requirement: the
-    active profile must be named in the owner's allow-list. That list is
+    The allow-list is the SOLE authority now, not a layer on top of
+    :func:`_check_kanban_orchestrator_mode`: a delegated child is excluded,
+    and every other execution context -- including a dispatcher-spawned
+    single-task worker, which the orchestrator gate unconditionally
+    excludes -- is admitted purely by allow-list membership. There is no
+    remaining kanban-toolset or dispatcher-worker requirement. That list is
     empty at release, so this returns False for everybody until the owner
     fills it in. Reporting/planning boundaries are the intended members; no
     name is hardcoded here.
     """
-    if not _check_kanban_orchestrator_mode():
+    if _is_delegated_child_context():
         return False
     return _profile_in_status_report_allowlist()
 
@@ -291,13 +293,12 @@ def _require_status_report_profile(tool_name: str) -> Optional[str]:
 
     ``_check_kanban_status_report_mode`` keeps the tool out of every
     unauthorized schema, but a stale registration or a cached check_fn result
-    could still route a call here. Repeat the checks so an unauthorized
-    context fails closed with a structured refusal and zero reads of another
-    project's board.
+    could still route a call here. Repeat the allow-list and delegated-child
+    checks -- this no longer repeats an orchestrator-tool check, since the
+    allow-list is now the sole authority -- so an unauthorized context fails
+    closed with a structured refusal and zero reads of another project's
+    board.
     """
-    guard = _require_orchestrator_tool(tool_name)
-    if guard:
-        return guard
     if _is_delegated_child_context():
         return tool_error(
             f"{tool_name} refused: delegate_task child agents are not Kanban "

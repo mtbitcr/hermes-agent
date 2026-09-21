@@ -2755,14 +2755,46 @@ def test_status_report_gate_defaults_to_empty_allow_list(monkeypatch, tmp_path):
     )
     assert "kanban_status_report" not in _kanban_worker_schema_names(monkeypatch)
 
-    # A dispatcher-spawned single-task worker never sees it.
+    # A dispatcher-spawned single-task worker whose profile IS in the
+    # allow-list is admitted, and a live call actually succeeds.
     _status_report_env(
         monkeypatch, tmp_path, profile="reporter", allow=["reporter"]
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_00000000")
+    assert "kanban_status_report" in _kanban_worker_schema_names(monkeypatch)
+    _seed_board(
+        "dispatched-board",
+        [{"title": "dispatched waiting", "status": "blocked"}],
+    )
+    out = json.loads(kt._handle_status_report({"status": "blocked"}))
+    titles = {row["title"] for row in out["cards"]}
+    assert "dispatched waiting" in titles
+
+    # A dispatcher-spawned single-task worker whose profile is NOT in the
+    # allow-list is still refused.
+    _status_report_env(
+        monkeypatch, tmp_path, profile="other-orch", allow=["reporter"]
     )
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_00000000")
     assert "kanban_status_report" not in _kanban_worker_schema_names(monkeypatch)
     refusal = json.loads(kt._handle_status_report({"status": "blocked"}))
     assert "kanban_status_report" in refusal["error"]
+
+    # A delegated child is refused even when dispatched AND allow-listed --
+    # refusal is independent of and takes priority over allow-list status.
+    from agent.delegation_context import delegated_child_context
+
+    _status_report_env(
+        monkeypatch, tmp_path, profile="reporter", allow=["reporter"]
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_00000000")
+    with delegated_child_context():
+        assert (
+            "kanban_status_report"
+            not in _kanban_worker_schema_names(monkeypatch)
+        )
+        refusal = json.loads(kt._handle_status_report({"status": "blocked"}))
+        assert "kanban_status_report" in refusal["error"]
 
 
 def test_status_report_aggregates_across_boards(monkeypatch, tmp_path):
