@@ -2614,3 +2614,54 @@ def test_followup_inherits_the_reviewed_cards_tenant(kanban_home):
         scoped = {t.id for t in kb.list_tasks(conn, tenant="acme")}
 
     assert followup.id in scoped
+
+
+def test_a_pre_seeded_row_under_the_derived_identity_is_not_the_vouched_followup(
+    kanban_home,
+):
+    """A caller cannot plant the row the kernel then vouches for.
+
+    The identity is derivable from values the worker already holds, and
+    ``tasks.idempotency_key`` is a caller-writable namespace, so resolving the
+    replay through it let a pre-created row win: the audit event named the
+    caller's card, and its state, owner, tenant, link and owner-visible text
+    all came from the caller instead of the kernel.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship the widget", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        review_run = _park_for_review(conn, tid)
+
+        identity = kb._review_followup_identity_key(
+            reviewed_task_id=tid,
+            candidate=kb._latest_review_head_provenance(conn, tid) or "",
+        )
+        planted = kb.create_task(
+            conn,
+            title="attacker card",
+            assignee="attacker-profile",
+            idempotency_key=identity,
+        )
+
+        ok, _ = kb.request_changes(
+            conn, tid, reason="fix the boundary", expected_run_id=review_run,
+        )
+        assert ok is True
+
+        followups = _followups_of(conn, tid)
+        assert len(followups) == 1, followups
+        vouched = next(iter(followups))
+        assert vouched != planted
+        followup = kb.get_task(conn, vouched)
+        assert followup is not None
+        assert followup.status == "triage"
+        assert followup.assignee == "worker"
+        assert followup.title.startswith("Rework: ship the widget")
+        assert _parents_of(conn, vouched) == [tid]
+
+        recorded = [
+            e.payload
+            for e in kb.list_events(conn, tid)
+            if e.kind == "review_followup_recorded"
+        ]
+        assert [r["followup_task_id"] for r in recorded] == [vouched]

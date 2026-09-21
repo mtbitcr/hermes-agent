@@ -195,9 +195,10 @@ _RECOMMENDATION_TASK_TITLE = "hermes recommendation"
 _RECOMMENDATION_IDENTITY_VERSION = "rec1"
 
 # ITEM31BH's mechanism, reused: version tag for the review follow-up dedup
-# identity stored in ``tasks.idempotency_key``. Bump only if the identity
-# tuple changes meaning -- a bump intentionally re-opens one new follow-up
-# per previously-deduped identity.
+# identity recorded on the kernel's ``review_followup_recorded`` event -- NOT
+# in ``tasks.idempotency_key``, which callers can write. Bump only if the
+# identity tuple changes meaning -- a bump intentionally re-opens one new
+# follow-up per previously-deduped identity.
 _REVIEW_FOLLOWUP_IDENTITY_VERSION = "revfix1"
 
 # Bound on the generated follow-up title, which quotes the reviewed card's own.
@@ -19873,10 +19874,11 @@ def _review_followup_identity_key(
 ) -> str:
     """Digest the identity of ONE review follow-up item.
 
-    The sibling of :func:`_recommendation_identity_key`, and deliberately the
-    same mechanism: the digest is stored in ``tasks.idempotency_key`` and
-    :func:`create_task`'s own dedup lookup is what enforces "exactly one".
-    Nothing new is invented here -- this only names the identity.
+    The sibling of :func:`_recommendation_identity_key`: the digest only NAMES
+    the identity. It is recorded on the kernel's own ``review_followup_recorded``
+    event and resolved from there (:func:`_recorded_review_followup`), never
+    through ``tasks.idempotency_key`` -- that namespace is caller-writable, so
+    a worker could plant the row the kernel would then vouch for.
 
     Identity is the reviewed WORK plus the exact reviewed CANDIDATE: replaying
     the same verdict against the same candidate must return the follow-up that
@@ -19897,6 +19899,40 @@ def _review_followup_identity_key(
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return f"{_REVIEW_FOLLOWUP_IDENTITY_VERSION}:{digest}"
+
+
+def _recorded_review_followup(
+    conn: sqlite3.Connection, task_id: str, identity: str
+) -> Optional[str]:
+    """The follow-up this task already got for ``identity``, if it still lives.
+
+    Reads the kernel's own ``review_followup_recorded`` events, which no
+    caller-facing surface can write, instead of ``create_task``'s
+    ``idempotency_key`` lookup, which every caller shares. An archived
+    follow-up does not count, mirroring the dedup this replaces.
+    """
+    for row in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_followup_recorded' "
+        "ORDER BY id DESC",
+        (task_id,),
+    ):
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("identity") != identity:
+            continue
+        recorded = payload.get("followup_task_id")
+        if not isinstance(recorded, str) or not recorded:
+            continue
+        alive = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND status != 'archived'",
+            (recorded,),
+        ).fetchone()
+        if alive is not None:
+            return recorded
+    return None
 
 
 def create_recommendation(
@@ -27792,8 +27828,9 @@ def _request_changes_within_txn(
     #
     # Identity is the reviewed WORK plus the exact reviewed CANDIDATE: the
     # kernel's own proven implementation head, read from the park this verdict
-    # is answering. Replaying the same verdict against the same candidate
-    # reaches ``create_task``'s existing ``idempotency_key`` dedup and returns
+    # is answering. Replaying the same verdict against the same candidate finds
+    # that identity on this task's own ``review_followup_recorded`` events --
+    # the kernel writes them and no caller-facing surface can -- and returns
     # the follow-up that already exists; a verdict on a DIFFERENT candidate
     # (the implementer reworked and resubmitted, so the park recorded a new
     # head) is different work and gets its own item. A card whose park
@@ -27811,32 +27848,41 @@ def _request_changes_within_txn(
     # the item waits for a person to give it a real specification -- exactly
     # the state's existing meaning -- and no run is ever spawned from it.
     reviewed_title = str(task_row["title"] or "").strip()
-    followup_id = create_task(
-        conn,
-        triage=True,
-        # Tenant is the board's soft namespace and reaches workers as
-        # ``HERMES_TENANT``; a follow-up that dropped it would vanish from the
-        # tenant's own ``list_tasks`` filter while staying on the board. The
-        # decompose path already copies the root's tenant onto every child.
-        tenant=task_row["tenant"],
-        title=f"Rework: {reviewed_title}"[:_REVIEW_FOLLOWUP_TITLE_MAX_CHARS],
-        body=(
-            "Rework tracked from a review that returned changes on "
-            f"{task_id}. The reviewed card carries the verdict, the reason "
-            "and any findings document."
-        ),
-        assignee=implementer,
-        parents=[task_id],
-        idempotency_key=_review_followup_identity_key(
-            reviewed_task_id=task_id,
-            candidate=_latest_review_head_provenance(conn, task_id) or "",
-        ),
+    identity = _review_followup_identity_key(
+        reviewed_task_id=task_id,
+        candidate=_latest_review_head_provenance(conn, task_id) or "",
     )
+    followup_id = _recorded_review_followup(conn, task_id, identity)
+    if followup_id is None:
+        followup_id = create_task(
+            conn,
+            triage=True,
+            # Tenant is the board's soft namespace and reaches workers as
+            # ``HERMES_TENANT``; a follow-up that dropped it would vanish from
+            # the tenant's own ``list_tasks`` filter while staying on the
+            # board. The decompose path already copies the root's tenant onto
+            # every child.
+            tenant=task_row["tenant"],
+            title=(
+                f"Rework: {reviewed_title}"[:_REVIEW_FOLLOWUP_TITLE_MAX_CHARS]
+            ),
+            body=(
+                "Rework tracked from a review that returned changes on "
+                f"{task_id}. The reviewed card carries the verdict, the reason "
+                "and any findings document."
+            ),
+            assignee=implementer,
+            parents=[task_id],
+        )
     _append_event(
         conn,
         task_id,
         "review_followup_recorded",
-        {"followup_task_id": followup_id, "implementer": implementer},
+        {
+            "followup_task_id": followup_id,
+            "implementer": implementer,
+            "identity": identity,
+        },
         run_id=run_id,
     )
     return True, implementer
