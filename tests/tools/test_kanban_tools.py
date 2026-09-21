@@ -2562,6 +2562,31 @@ def test_read_refuses_an_attachment_belonging_to_another_task(worker_env):
     assert "not yours" not in json.dumps(out)
 
 
+def test_read_refuses_a_foreign_task_id_named_with_its_own_attachment(worker_env):
+    """Naming another card's task_id must not unlock that card's attachment.
+
+    The ownership check is against the caller's own task (HERMES_KANBAN_TASK),
+    not against whatever task_id the caller supplies, so passing the foreign
+    task_id alongside its own attachment id is refused with none of the
+    content -- the same boundary kanban_show and kanban_attachments hold.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    secret = "CROSS-CARD ATTACHMENT SECRET"
+    with kb.connect_closing() as conn:
+        other = kb.create_task(conn, title="other", assignee="someone-else")
+    other_att = _attach_text(other, "theirs.txt", secret)
+
+    out = json.loads(
+        kt._handle_read({"task_id": other, "attachment_id": other_att})
+    )
+    assert "error" in out, out
+    assert out.get("ok") is not True
+    assert "content" not in out
+    assert secret not in json.dumps(out)
+
+
 def test_read_is_present_for_exactly_the_kanban_show_audience(worker_env, monkeypatch):
     """Same availability check as kanban_show: present wherever that tool is,
     absent wherever it isn't."""

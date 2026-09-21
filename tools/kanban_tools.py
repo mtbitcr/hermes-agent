@@ -1866,6 +1866,9 @@ def _handle_read(args: dict, **kw) -> str:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
     board = args.get("board")
     try:
         offset = _read_window_int(args, "offset", 0)
