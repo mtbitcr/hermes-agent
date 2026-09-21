@@ -27699,7 +27699,8 @@ def _request_changes_within_txn(
     if not reason:
         return False, "reason is required"
     task_row = conn.execute(
-        "SELECT status, assignee, current_run_id, title, tenant FROM tasks "
+        "SELECT status, assignee, current_run_id, title, tenant, project_id "
+        "FROM tasks "
         "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
@@ -27873,6 +27874,17 @@ def _request_changes_within_txn(
             ),
             assignee=implementer,
             parents=[task_id],
+        )
+        # The item belongs to the reviewed card's Project: the owner surfaces
+        # select a Project's cards by ``project_id``, so without it the item
+        # exists on the board but on no owner page. ``create_task`` resolves a
+        # project id against the ACTIVE profile's project store and drops one
+        # it cannot resolve, and the reviewer's profile need not hold that
+        # store — so the id is copied from the reviewed card as a fact the
+        # kernel already proved, not resolved again.
+        conn.execute(
+            "UPDATE tasks SET project_id = ? WHERE id = ?",
+            (task_row["project_id"], followup_id),
         )
     _append_event(
         conn,
