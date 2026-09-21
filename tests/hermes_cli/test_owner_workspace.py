@@ -2863,6 +2863,49 @@ def test_owner_decisions_skip_a_deleted_project_whose_board_is_gone(ctx):
     assert all(item["project_slug"] == setup["board"] for item in projected["data"])
 
 
+def test_owner_decisions_checks_board_before_opening_removal_store(ctx, monkeypatch):
+    """The cheap board-exists check must run before the per-project removal
+    store is ever opened; that store is read only for a Project whose board
+    is genuinely gone."""
+    setup = _bootstrap_board(ctx)
+
+    calls: list[str] = []
+    real_completed_removal_state = ow._completed_removal_state
+
+    def _spy(project_id):
+        calls.append(project_id)
+        return real_completed_removal_state(project_id)
+
+    monkeypatch.setattr(ow, "_completed_removal_state", _spy)
+
+    # The Project's board still exists: the removal store must not be opened.
+    assert ow.list_owner_decisions(ctx) == {"data": [], "truncated": False}
+    assert calls == []
+
+    # A Project whose board is genuinely gone must still be skipped, and the
+    # removal store is exactly where that is proven.
+    removed = _committed_project(
+        ctx, key="graph-order-removed-project", name="Order Removed Project",
+    )
+    with projects_db.connect_closing() as conn:
+        projects_db.record_removal_operation(
+            conn,
+            project_id=removed["project_id"],
+            idempotency_key="order-removed-project-permanent",
+            action="confirm_permanent",
+            phase="done",
+            mode="permanent",
+            board_slug=removed["board"],
+            removal_id="rm-order-removed-project",
+        )
+    shutil.rmtree(kanban_db.board_dir(removed["board"]))
+    assert not kanban_db.board_exists(removed["board"])
+
+    calls.clear()
+    assert ow.list_owner_decisions(ctx) == {"data": [], "truncated": False}
+    assert calls == [removed["project_id"]]
+
+
 def test_owner_decisions_projects_native_gates_without_writes_or_identifiers(ctx):
     setup = _bootstrap_board(ctx)
     with kanban_db.connect(board=setup["board"]) as conn:
