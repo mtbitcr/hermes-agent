@@ -33,6 +33,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import time
 from typing import Any, Optional
 
@@ -188,6 +189,129 @@ def _check_kanban_recommend_mode() -> bool:
         return False
     return bool(os.environ.get("HERMES_KANBAN_TASK"))
 
+
+# ---------------------------------------------------------------------------
+# kanban_status_report gating
+# ---------------------------------------------------------------------------
+
+#: Count bound for the cross-project status report. Reuses the shape
+#: ``kanban_list`` already contracts (default 50, hard cap 200) so a report
+#: spanning every board can never become a way to dump a whole fleet in one
+#: call.
+KANBAN_STATUS_REPORT_DEFAULT_LIMIT = KANBAN_LIST_DEFAULT_LIMIT
+KANBAN_STATUS_REPORT_MAX_LIMIT = KANBAN_LIST_MAX_LIMIT
+
+#: Board bound: how many boards one call may open. A larger fleet degrades to
+#: "truncated, ask again" instead of an unbounded walk. The maximum reuses the
+#: one hard cap already set for this tool rather than inventing a second
+#: number.
+KANBAN_STATUS_REPORT_DEFAULT_BOARD_LIMIT = 20
+KANBAN_STATUS_REPORT_MAX_BOARD_LIMIT = KANBAN_LIST_MAX_LIMIT
+
+#: Config path of the allow-list naming the profiles that may use
+#: ``kanban_status_report``. It DEFAULTS TO EMPTY: at release no profile is
+#: enabled, the tool is in nobody's schema, and there is no bypass. The owner
+#: fills this in afterwards; nothing here seeds it.
+KANBAN_STATUS_REPORT_ALLOWLIST_KEYS = ("kanban", "status_report_profiles")
+
+#: Owner-facing headings for the two facts a card can fail to carry. Disclosed
+#: under these, never omitted and never guessed at.
+KANBAN_STATUS_REPORT_NO_PROJECT = "Not attributable"
+KANBAN_STATUS_REPORT_NO_REASON = "Reason not recorded"
+
+
+def _status_report_allowlist() -> tuple:
+    """Profiles the owner has explicitly enabled, normalized.
+
+    Read live through the ordinary config loader under one new key. An
+    absent key, a non-list value, and an unreadable config all mean the same
+    thing: the empty tuple, i.e. nobody is enabled. Failing closed here is
+    what makes "defaults to empty" true in every degraded case, not only in
+    the happy one.
+    """
+    try:
+        raw = cfg_get(load_config(), *KANBAN_STATUS_REPORT_ALLOWLIST_KEYS, default=[])
+    except Exception:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    from hermes_cli.profiles import normalize_profile_name
+
+    names = []
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        try:
+            names.append(normalize_profile_name(entry))
+        except ValueError:
+            continue
+    return tuple(names)
+
+
+def _profile_in_status_report_allowlist() -> bool:
+    """True only when the ACTIVE profile is named in that allow-list.
+
+    An empty allow-list can never match, so the release default (empty) hides
+    the tool from every profile including the ones that carry the rest of the
+    kanban surface.
+    """
+    allowed = _status_report_allowlist()
+    if not allowed:
+        return False
+    try:
+        from hermes_cli.profiles import (
+            get_active_profile_name,
+            normalize_profile_name,
+        )
+
+        return normalize_profile_name(get_active_profile_name()) in allowed
+    except Exception:
+        return False
+
+
+def _check_kanban_status_report_mode() -> bool:
+    """``kanban_status_report`` is allow-list-only, narrower than every other
+    gate in this module.
+
+    Mirrors :func:`_check_kanban_orchestrator_mode` — delegated children and
+    dispatcher-owned single-task workers are excluded, and the profile must
+    carry the kanban toolset — and then adds the one new requirement: the
+    active profile must be named in the owner's allow-list. That list is
+    empty at release, so this returns False for everybody until the owner
+    fills it in. Reporting/planning boundaries are the intended members; no
+    name is hardcoded here.
+    """
+    if not _check_kanban_orchestrator_mode():
+        return False
+    return _profile_in_status_report_allowlist()
+
+
+def _require_status_report_profile(tool_name: str) -> Optional[str]:
+    """Runtime half of the allow-list gate.
+
+    ``_check_kanban_status_report_mode`` keeps the tool out of every
+    unauthorized schema, but a stale registration or a cached check_fn result
+    could still route a call here. Repeat the checks so an unauthorized
+    context fails closed with a structured refusal and zero reads of another
+    project's board.
+    """
+    guard = _require_orchestrator_tool(tool_name)
+    if guard:
+        return guard
+    if _is_delegated_child_context():
+        return tool_error(
+            f"{tool_name} refused: delegate_task child agents are not Kanban "
+            "run owners. Return findings to the parent agent."
+        )
+    if not _profile_in_status_report_allowlist():
+        return tool_error(
+            f"{tool_name} refused: this profile is not in the "
+            f"{'.'.join(KANBAN_STATUS_REPORT_ALLOWLIST_KEYS)} allow-list. The "
+            "allow-list is empty by default; the owner names the reporting "
+            "and planning boundaries in configuration before this tool can "
+            "be used."
+        )
+    return None
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -1052,6 +1176,305 @@ def _handle_list(args: dict, **kw) -> str:
         logger.exception("kanban_list failed")
         return tool_error(f"kanban_list: {e}")
 
+
+
+def _status_report_readonly_conn(kb, board: str):
+    """Open one board's store through sqlite's read-only URI mode.
+
+    This is the same ``mode=ro`` URI path the kernel's own read-only reader
+    already uses for a caller that must never write. Taking it here means a
+    bug in this tool cannot mutate a board by construction rather than by
+    convention — sqlite itself refuses the write. It also means this tool
+    never runs the ready-promotion side write that single-board listing
+    performs: a cross-project report must not change the boards it reads.
+
+    Returns ``None`` when the board has no store on disk or sqlite refuses
+    to open it; the caller discloses that board instead of failing the whole
+    report.
+    """
+    path = kb.kanban_db_path(board=board)
+    try:
+        if not path.exists():
+            return None
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _status_report_block_event(kb, conn, task_id: str):
+    """The most recent ``blocked`` event for a task, or ``None``.
+
+    Same "walk the events, take the latest block" pattern the task-diagnostics
+    module already implements read-only; reused rather than re-derived so the
+    reason category and the age agree with what every other reader reports.
+    """
+    try:
+        events = kb.list_events(conn, task_id)
+    except Exception:
+        return None
+    for event in reversed(list(events)):
+        if event.kind == "blocked":
+            return event
+    return None
+
+
+def _status_report_project_names(project_ids) -> dict:
+    """Resolve project ids to their stored names, read-only.
+
+    The project registry is opened through the same ``mode=ro`` URI path the
+    boards use, so a report can neither create the registry nor migrate it as
+    a side effect of being read. An absent or unreadable registry resolves
+    every id to ``None``, which the caller discloses as not attributable
+    instead of inventing a name.
+    """
+    wanted = {pid for pid in project_ids if pid}
+    if not wanted:
+        return {}
+    try:
+        from hermes_cli import projects_db
+
+        path = projects_db.projects_db_path()
+        if not path.exists():
+            return {}
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except Exception:
+        return {}
+    names: dict = {}
+    try:
+        conn.row_factory = sqlite3.Row
+        for pid in sorted(wanted):
+            try:
+                project = projects_db.get_project(conn, pid)
+            except Exception:
+                project = None
+            if project is not None:
+                names[pid] = getattr(project, "name", None)
+    finally:
+        conn.close()
+    return names
+
+
+def _status_report_owner_text(value, projector, fallback: str) -> str:
+    """Project one owner-visible string, then prove no internal residue.
+
+    Two existing scrubs, composed, neither reimplemented: the owner-workspace
+    display projection (``owner_title`` / ``owner_project_name``) does the
+    sanitizing, redaction, bounding and private-pattern check, and
+    :data:`_OWNER_INTERNAL_REFERENCE_PATTERNS` — the same pattern set the
+    owner-visible attachment guard enforces — is then re-run on the RESULT.
+    Anything one catches and the other does not (a raw task/run id, a
+    workspace path, a profile name) collapses to ``fallback`` rather than
+    reaching the owner.
+    """
+    try:
+        text = projector(value)
+    except Exception:
+        return fallback
+    if not text:
+        return fallback
+    if any(pattern.search(text) for pattern in _OWNER_INTERNAL_REFERENCE_PATTERNS):
+        return fallback
+    return text
+
+
+def _status_report_row(kb, conn, task, project_name: Optional[str], now: int) -> dict:
+    """One owner-facing report row: the five required fields plus the anchor.
+
+    Every field is projected, never raw. The state and the waiting-reason
+    category come from the owner-workspace label maps, so this report cannot
+    disagree with any other owner-facing surface about what a state is
+    called. The waiting reason is a CATEGORY drawn from that fixed map — no
+    free text from the card ever reaches it.
+    """
+    from hermes_cli.owner_workspace import (
+        _OWNER_BLOCK_REASONS,
+        _OWNER_STATE_LABELS,
+        _UNTITLED_WORK_ITEM,
+        _owner_timestamp,
+        owner_project_name,
+        owner_title,
+    )
+
+    block_event = None
+    if task.status == "blocked":
+        block_event = _status_report_block_event(kb, conn, task.id)
+    anchor = None
+    if block_event is not None:
+        anchor = block_event.created_at
+    if anchor is None:
+        anchor = task.started_at or task.created_at
+    try:
+        anchor = int(anchor)
+    except (TypeError, ValueError):
+        anchor = int(now)
+    age_seconds = max(0, int(now) - anchor)
+
+    kind = str(getattr(task, "block_kind", None) or "")
+    reason = _OWNER_BLOCK_REASONS.get(kind, KANBAN_STATUS_REPORT_NO_REASON)
+    return {
+        "title": _status_report_owner_text(
+            task.title, owner_title, _UNTITLED_WORK_ITEM
+        ),
+        "project": (
+            _status_report_owner_text(
+                project_name,
+                owner_project_name,
+                KANBAN_STATUS_REPORT_NO_PROJECT,
+            )
+            if project_name
+            else KANBAN_STATUS_REPORT_NO_PROJECT
+        ),
+        "state": _OWNER_STATE_LABELS.get(task.status, "Needs attention"),
+        "waiting_reason": reason,
+        "age_days": age_seconds // 86_400,
+        "age_seconds": age_seconds,
+        "since": _owner_timestamp(anchor),
+    }
+
+
+def _status_report_bounded_int(args: dict, name: str, default: int, maximum: int):
+    """Parse one bound. Returns ``(value, error)``."""
+    raw = args.get(name)
+    if raw is None:
+        return default, None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default, f"{name} must be an integer"
+    if value < 1:
+        return default, f"{name} must be >= 1"
+    if value > maximum:
+        return default, f"{name} must be <= {maximum}"
+    return value, None
+
+
+def _handle_status_report(args: dict, **kw) -> str:
+    """Bounded, read-only listing of cards in one status across every board.
+
+    Scans up to ``board_limit`` boards, collects up to ``limit`` matching
+    cards, and returns owner-safe rows. Every board is opened read-only and
+    the ready-promotion side write single-board listing performs is
+    deliberately NOT done here. Whatever the bounds exclude is disclosed in
+    the response; nothing is dropped silently.
+    """
+    guard = _require_status_report_profile("kanban_status_report")
+    if guard:
+        return guard
+
+    status = args.get("status")
+    if not status or not str(status).strip():
+        return tool_error("kanban_status_report: status is required")
+    status = str(status).strip()
+
+    limit, err = _status_report_bounded_int(
+        args,
+        "limit",
+        KANBAN_STATUS_REPORT_DEFAULT_LIMIT,
+        KANBAN_STATUS_REPORT_MAX_LIMIT,
+    )
+    if err:
+        return tool_error(f"kanban_status_report: {err}")
+    board_limit, err = _status_report_bounded_int(
+        args,
+        "board_limit",
+        KANBAN_STATUS_REPORT_DEFAULT_BOARD_LIMIT,
+        KANBAN_STATUS_REPORT_MAX_BOARD_LIMIT,
+    )
+    if err:
+        return tool_error(f"kanban_status_report: {err}")
+
+    try:
+        from hermes_cli import kanban_db as kb
+
+        if status not in kb.VALID_STATUSES:
+            return tool_error(
+                "kanban_status_report: status must be one of "
+                f"{sorted(kb.VALID_STATUSES)}"
+            )
+        return _status_report_collect(kb, status, limit, board_limit)
+    except ValueError as e:
+        return tool_error(f"kanban_status_report: {e}")
+    except Exception as e:
+        logger.exception("kanban_status_report failed")
+        return tool_error(f"kanban_status_report: {e}")
+
+
+def _status_report_collect(kb, status: str, limit: int, board_limit: int) -> str:
+    """Walk the bounded board set and build the owner-facing response."""
+    boards = [
+        str(meta.get("slug"))
+        for meta in kb.list_boards(include_archived=False)
+        if meta.get("slug")
+    ]
+    scanned = boards[:board_limit]
+    boards_excluded = boards[board_limit:]
+
+    now = int(time.time())
+    collected: list = []
+    cards_excluded_by_limit = 0
+    boards_unreadable: list = []
+
+    for slug in scanned:
+        conn = _status_report_readonly_conn(kb, slug)
+        if conn is None:
+            boards_unreadable.append(slug)
+            continue
+        try:
+            # No recompute_ready() here: the ready-promotion side write that
+            # single-board listing performs is out of scope for a report and
+            # would mutate a board this caller only reads.
+            rows = kb.list_tasks(conn, status=status)
+            project_ids = {row.project_id for row in rows if row.project_id}
+            names = _status_report_project_names(project_ids)
+            for row in rows:
+                if len(collected) >= limit:
+                    cards_excluded_by_limit += 1
+                    continue
+                collected.append(
+                    _status_report_row(
+                        kb, conn, row, names.get(row.project_id), now
+                    )
+                )
+        except Exception:
+            logger.exception("kanban_status_report: board read failed")
+            boards_unreadable.append(slug)
+        finally:
+            conn.close()
+
+    truncated = bool(cards_excluded_by_limit or boards_excluded)
+    not_attributable = sum(
+        1 for row in collected if row["project"] == KANBAN_STATUS_REPORT_NO_PROJECT
+    )
+    reason_not_recorded = sum(
+        1
+        for row in collected
+        if row["waiting_reason"] == KANBAN_STATUS_REPORT_NO_REASON
+    )
+    return json.dumps(
+        {
+            "status": status,
+            "cards": collected,
+            "count": len(collected),
+            "limit": limit,
+            "board_limit": board_limit,
+            "boards_scanned": len(scanned),
+            "truncated": truncated,
+            "next_limit": (
+                min(limit * 2, KANBAN_STATUS_REPORT_MAX_LIMIT)
+                if cards_excluded_by_limit and limit < KANBAN_STATUS_REPORT_MAX_LIMIT
+                else None
+            ),
+            "excluded": {
+                "cards_over_limit": cards_excluded_by_limit,
+                "boards_over_board_limit": len(boards_excluded),
+                "boards_unreadable": len(boards_unreadable),
+            },
+            KANBAN_STATUS_REPORT_NO_PROJECT: not_attributable,
+            KANBAN_STATUS_REPORT_NO_REASON: reason_not_recorded,
+        }
+    )
 
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
@@ -2981,6 +3404,48 @@ KANBAN_READ_SCHEMA = {
     },
 }
 
+KANBAN_STATUS_REPORT_SCHEMA = {
+    "name": "kanban_status_report",
+    "description": (
+        "List the cards in one status across every project, bounded and "
+        "read-only. Each row carries the work item's title, its project, a "
+        "plain-language state, the category of what it is waiting on, and "
+        "how long it has been there. Scans at most `board_limit` boards and "
+        "returns at most `limit` rows; whatever the bounds exclude is "
+        "reported as a count, never dropped silently. Opens every board "
+        "read-only and changes nothing."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "description": (
+                    "The one status to report on, e.g. 'blocked' for work "
+                    "that is waiting. Required."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    "Maximum rows to return, 1.."
+                    f"{KANBAN_STATUS_REPORT_MAX_LIMIT}. Defaults to "
+                    f"{KANBAN_STATUS_REPORT_DEFAULT_LIMIT}."
+                ),
+            },
+            "board_limit": {
+                "type": "integer",
+                "description": (
+                    "Maximum boards to scan in one call, 1.."
+                    f"{KANBAN_STATUS_REPORT_MAX_BOARD_LIMIT}. Defaults to "
+                    f"{KANBAN_STATUS_REPORT_DEFAULT_BOARD_LIMIT}."
+                ),
+            },
+        },
+        "required": ["status"],
+    },
+}
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
@@ -3480,6 +3945,15 @@ registry.register(
     handler=_handle_read,
     check_fn=_check_kanban_mode,
     emoji="\U0001F4D6",
+)
+
+registry.register(
+    name="kanban_status_report",
+    toolset="kanban",
+    schema=KANBAN_STATUS_REPORT_SCHEMA,
+    handler=_handle_status_report,
+    check_fn=_check_kanban_status_report_mode,
+    emoji="\U0001F4CA",
 )
 
 registry.register(
