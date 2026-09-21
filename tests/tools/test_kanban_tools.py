@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -2631,3 +2632,426 @@ def test_read_is_hidden_from_a_delegated_child(worker_env, monkeypatch):
         names = _kanban_worker_schema_names(monkeypatch)
     assert "kanban_show" not in names
     assert "kanban_read" not in names
+
+
+# ---------------------------------------------------------------------------
+# kanban_status_report: bounded cross-project listing (read-only)
+# ---------------------------------------------------------------------------
+
+def _status_report_env(monkeypatch, tmp_path, *, profile="reporter", allow=None):
+    """Isolated HERMES_HOME running as ``profile`` with the allow-list set.
+
+    ``allow=None`` writes no config key at all, which is the release default:
+    the allow-list is absent, so it reads as empty.
+    """
+    import yaml
+
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    from pathlib import Path as _Path
+
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    cfg = {"toolsets": ["kanban"]}
+    if allow is not None:
+        cfg["kanban"] = {"status_report_profiles": list(allow)}
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    import tools.kanban_tools as kt
+
+    monkeypatch.setattr(
+        kt, "_profile_has_kanban_toolset", lambda: True
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: profile
+    )
+    return home
+
+
+def _seed_board(slug, cards, *, project=None):
+    """Create one board and its cards. ``cards`` is a list of dicts.
+
+    Returns the project id used (or ``None``). Each card dict may carry
+    ``title``, ``status`` and ``block_kind``.
+    """
+    from hermes_cli import kanban_db as kb
+
+    kb._INITIALIZED_PATHS.clear()
+    if slug != kb.DEFAULT_BOARD:
+        kb.create_board(slug)
+    else:
+        kb.init_db()
+
+    project_id = None
+    if project is not None:
+        from hermes_cli import projects_db
+
+        pconn = projects_db.connect()
+        try:
+            project_id = projects_db.create_project(
+                pconn, name=project, allow_duplicate_path=True
+            )
+        finally:
+            pconn.close()
+
+    conn = kb.connect(board=slug)
+    try:
+        for card in cards:
+            tid = kb.create_task(
+                conn,
+                title=card["title"],
+                assignee="worker",
+                board=slug,
+                project_id=project_id,
+            )
+            want = card.get("status", "ready")
+            if want == "blocked":
+                kb.claim_task(conn, tid)
+                kb.block_task(
+                    conn, tid, reason=card.get("reason"),
+                    kind=card.get("block_kind"),
+                )
+            elif want == "running":
+                kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    return project_id
+
+
+def test_status_report_gate_defaults_to_empty_allow_list(monkeypatch, tmp_path):
+    """Analysis test 1 (gate). Dispatch through the real registry.
+
+    At release the allow-list is empty, so no profile sees the tool even with
+    the whole kanban toolset enabled; naming a profile makes it visible to
+    exactly that profile; and a dispatcher-spawned single-task worker never
+    sees it at all.
+    """
+    import tools.kanban_tools as kt
+
+    # Default: key absent entirely -> empty -> invisible.
+    _status_report_env(monkeypatch, tmp_path, profile="reporter", allow=None)
+    assert kt._status_report_allowlist() == ()
+    assert "kanban_status_report" not in _kanban_worker_schema_names(monkeypatch)
+
+    # Explicitly empty list -> still invisible.
+    _status_report_env(monkeypatch, tmp_path, profile="reporter", allow=[])
+    assert "kanban_status_report" not in _kanban_worker_schema_names(monkeypatch)
+
+    # Named -> visible to that profile, alongside the rest of the surface.
+    _status_report_env(
+        monkeypatch, tmp_path, profile="reporter", allow=["reporter", "planner"]
+    )
+    names = _kanban_worker_schema_names(monkeypatch)
+    assert "kanban_status_report" in names
+    assert "kanban_list" in names
+
+    # A different profile, same config -> still invisible.
+    _status_report_env(
+        monkeypatch, tmp_path, profile="other-orch", allow=["reporter", "planner"]
+    )
+    assert "kanban_status_report" not in _kanban_worker_schema_names(monkeypatch)
+
+    # A dispatcher-spawned single-task worker never sees it.
+    _status_report_env(
+        monkeypatch, tmp_path, profile="reporter", allow=["reporter"]
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_00000000")
+    assert "kanban_status_report" not in _kanban_worker_schema_names(monkeypatch)
+    refusal = json.loads(kt._handle_status_report({"status": "blocked"}))
+    assert "kanban_status_report" in refusal["error"]
+
+
+def test_status_report_aggregates_across_boards(monkeypatch, tmp_path):
+    """Analysis test 2 (cross-board aggregation).
+
+    Two boards, each with its own project and a mix of statuses. One status
+    is asked for; rows come back from every board that has a match, each
+    carrying its own project name, and none from the board with no match.
+    """
+    _status_report_env(monkeypatch, tmp_path, allow=["reporter"])
+    import tools.kanban_tools as kt
+
+    _seed_board(
+        "alpha-board",
+        [
+            {"title": "alpha waiting", "status": "blocked",
+             "block_kind": "needs_input"},
+            {"title": "alpha moving", "status": "running"},
+        ],
+        project="Alpha Project",
+    )
+    _seed_board(
+        "beta-board",
+        [{"title": "beta waiting", "status": "blocked",
+          "block_kind": "capability"}],
+        project="Beta Project",
+    )
+    _seed_board(
+        "gamma-board",
+        [{"title": "gamma moving", "status": "running"}],
+        project="Gamma Project",
+    )
+
+    out = json.loads(kt._handle_status_report({"status": "blocked"}))
+    titles = {row["title"] for row in out["cards"]}
+    assert titles == {"alpha waiting", "beta waiting"}
+
+    by_title = {row["title"]: row for row in out["cards"]}
+    assert by_title["alpha waiting"]["project"] == "Alpha Project"
+    assert by_title["beta waiting"]["project"] == "Beta Project"
+
+    # The five required fields are present on every row.
+    for row in out["cards"]:
+        assert set(
+            ["title", "project", "state", "waiting_reason", "age_days"]
+        ) <= set(row)
+
+    # Exact owner-facing phrasing, taken from the shared label maps.
+    assert by_title["alpha waiting"]["state"] == "Blocked"
+    assert by_title["alpha waiting"]["waiting_reason"] == "Waiting for owner input"
+    assert by_title["beta waiting"]["waiting_reason"] == (
+        "A required capability is not available"
+    )
+    assert out["truncated"] is False
+
+
+def test_status_report_count_bound_truncates_and_discloses(monkeypatch, tmp_path):
+    """Analysis test 3 (count bound) plus the card's disclosure requirement.
+
+    More matching cards than the limit: the same truncated/next-limit shape
+    the single-board listing already contracts, AND an explicit count of the
+    cards the bound excluded. Also pins the defaults and the hard caps.
+    """
+    _status_report_env(monkeypatch, tmp_path, allow=["reporter"])
+    import tools.kanban_tools as kt
+
+    assert kt.KANBAN_STATUS_REPORT_DEFAULT_LIMIT == 50
+    assert kt.KANBAN_STATUS_REPORT_MAX_LIMIT == 200
+    assert kt.KANBAN_STATUS_REPORT_DEFAULT_BOARD_LIMIT == 20
+
+    _seed_board(
+        "busy-board",
+        [
+            {"title": f"waiting {i}", "status": "blocked",
+             "block_kind": "needs_input"}
+            for i in range(7)
+        ],
+        project="Busy Project",
+    )
+
+    out = json.loads(kt._handle_status_report({"status": "blocked", "limit": 3}))
+    assert out["count"] == 3
+    assert out["limit"] == 3
+    assert out["truncated"] is True
+    assert out["next_limit"] == 6
+    # Excluded cards are counted, not dropped in silence.
+    assert out["excluded"]["cards_over_limit"] == 4
+
+    # Under the bound: nothing truncated, nothing excluded.
+    full = json.loads(kt._handle_status_report({"status": "blocked"}))
+    assert full["count"] == 7
+    assert full["truncated"] is False
+    assert full["excluded"]["cards_over_limit"] == 0
+    assert full["next_limit"] is None
+
+    # The hard caps are enforced on input.
+    assert "limit must be <= 200" in kt._handle_status_report(
+        {"status": "blocked", "limit": 201}
+    )
+    assert "board_limit must be >= 1" in kt._handle_status_report(
+        {"status": "blocked", "board_limit": 0}
+    )
+
+
+def test_status_report_leaves_every_board_byte_for_byte_unchanged(
+    monkeypatch, tmp_path
+):
+    """Analysis test 4 (read-only proof).
+
+    Snapshot every board's store before and after the call and assert not a
+    byte moved — including the board that is not the caller's own, and
+    including a board holding a card whose parents are all done (which the
+    single-board listing path WOULD promote as a side effect of listing).
+    """
+    import hashlib
+
+    _status_report_env(monkeypatch, tmp_path, allow=["reporter"])
+    import tools.kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _seed_board(
+        "ro-a",
+        [{"title": "a waiting", "status": "blocked",
+          "block_kind": "needs_input"}],
+        project="RO A",
+    )
+    _seed_board("ro-b", [{"title": "b idle"}], project="RO B")
+
+    # A card whose only parent is already done: promotable, and must NOT be
+    # promoted by a report.
+    conn = kb.connect(board="ro-b")
+    try:
+        parent = kb.create_task(conn, title="parent", assignee="worker", board="ro-b")
+        child = kb.create_task(
+            conn, title="child", assignee="worker", board="ro-b", parents=(parent,)
+        )
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, summary="done")
+        child_status_before = kb.get_task(conn, child).status
+    finally:
+        conn.close()
+
+    def snapshot():
+        out = {}
+        for meta in kb.list_boards(include_archived=False):
+            path = kb.kanban_db_path(board=meta["slug"])
+            if path.exists():
+                out[meta["slug"]] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return out
+
+    before = snapshot()
+    assert len(before) >= 2
+    result = json.loads(kt._handle_status_report({"status": "blocked"}))
+    assert result["count"] == 1
+    assert snapshot() == before
+
+    # ...and the gated card really was left alone.
+    conn = kb.connect(board="ro-b")
+    try:
+        assert kb.get_task(conn, child).status == child_status_before
+    finally:
+        conn.close()
+
+
+def test_status_report_output_is_owner_safe(monkeypatch, tmp_path):
+    """Analysis test 5 (owner-safe output).
+
+    A card whose title carries a raw internal id, an absolute path and a
+    profile name: none of the three may appear anywhere in the returned
+    text.
+    """
+    _status_report_env(monkeypatch, tmp_path, allow=["reporter"])
+    import tools.kanban_tools as kt
+
+    _seed_board(
+        "leaky-board",
+        [
+            {"title": "t_deadbeef leaked", "status": "blocked",
+             "block_kind": "needs_input"},
+            {"title": "see /home/deploy/secret/plan.md", "status": "blocked",
+             "block_kind": "needs_input"},
+            {"title": "owned by raphael-planner", "status": "blocked",
+             "block_kind": "needs_input"},
+        ],
+        project="Leaky Project",
+    )
+
+    raw = kt._handle_status_report({"status": "blocked"})
+    out = json.loads(raw)
+    assert out["count"] == 3
+
+    assert "t_deadbeef" not in raw
+    assert "/home/deploy/secret/plan.md" not in raw
+    assert "raphael-planner" not in raw
+
+    # Each offending title collapsed to the shared placeholder rather than
+    # being silently dropped from the report.
+    assert [row["title"] for row in out["cards"]] == ["Untitled work item"] * 3
+
+
+def test_status_report_discloses_rather_than_guesses(monkeypatch, tmp_path):
+    """Analysis test 6 (disclosure, not guessing).
+
+    A card with no project link and a card with no recorded reason are both
+    counted and reported under the explicit headings, never omitted and
+    never invented. Board-level exclusions are disclosed the same way.
+    """
+    _status_report_env(monkeypatch, tmp_path, allow=["reporter"])
+    import tools.kanban_tools as kt
+
+    # No project link at all, and an untyped block (no recorded reason).
+    _seed_board(
+        "orphan-board",
+        [{"title": "unattributed waiting", "status": "blocked"}],
+        project=None,
+    )
+    _seed_board(
+        "known-board",
+        [{"title": "attributed waiting", "status": "blocked",
+          "block_kind": "capability"}],
+        project="Known Project",
+    )
+
+    out = json.loads(kt._handle_status_report({"status": "blocked"}))
+    by_title = {row["title"]: row for row in out["cards"]}
+    assert set(by_title) == {"unattributed waiting", "attributed waiting"}
+
+    orphan = by_title["unattributed waiting"]
+    assert orphan["project"] == "Not attributable"
+    assert orphan["waiting_reason"] == "Reason not recorded"
+    assert out["Not attributable"] == 1
+    assert out["Reason not recorded"] == 1
+
+    known = by_title["attributed waiting"]
+    assert known["project"] == "Known Project"
+    assert known["waiting_reason"] == (
+        "A required capability is not available"
+    )
+
+    # Board bound: the unscanned boards are disclosed as a count.
+    bounded = json.loads(
+        kt._handle_status_report({"status": "blocked", "board_limit": 1})
+    )
+    assert bounded["boards_scanned"] == 1
+    assert bounded["excluded"]["boards_over_board_limit"] >= 1
+    assert bounded["truncated"] is True
+
+
+def test_status_report_age_is_measured_from_the_block_event(
+    monkeypatch, tmp_path
+):
+    """Analysis test 7 (age correctness).
+
+    A card created long ago but blocked recently must report the age since
+    the recorded block event, not since it was created.
+    """
+    _status_report_env(monkeypatch, tmp_path, allow=["reporter"])
+    import tools.kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _seed_board(
+        "aged-board",
+        [{"title": "long waiting", "status": "blocked",
+          "block_kind": "needs_input"}],
+        project="Aged Project",
+    )
+
+    now = int(time.time())
+    created_at = now - 30 * 86_400
+    blocked_at = now - 3 * 86_400
+
+    conn = kb.connect(board="aged-board")
+    try:
+        tid = kb.list_tasks(conn, status="blocked")[0].id
+        conn.execute(
+            "UPDATE tasks SET created_at = ?, started_at = ? WHERE id = ?",
+            (created_at, created_at, tid),
+        )
+        conn.execute(
+            "UPDATE task_events SET created_at = ? "
+            "WHERE task_id = ? AND kind = 'blocked'",
+            (blocked_at, tid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    row = json.loads(kt._handle_status_report({"status": "blocked"}))["cards"][0]
+    # Since the block event (3 days), not since creation (30 days).
+    assert row["age_days"] == 3
+    assert abs(row["age_seconds"] - 3 * 86_400) < 120
+
