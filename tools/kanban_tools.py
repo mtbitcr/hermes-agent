@@ -1829,6 +1829,121 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(f"kanban_attachments: {e}")
 
 
+# Bounded-window read caps. The window is capped in characters so this tool's
+# own response can never become the oversized record it exists to page through.
+_KANBAN_READ_DEFAULT_LIMIT = 4000
+_KANBAN_READ_MAX_LIMIT = 10000
+
+
+def _read_window_int(args: dict, name: str, default: int) -> int:
+    """Coerce an offset/limit arg, rejecting anything non-integral."""
+    value = args.get(name)
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer")
+
+
+def _handle_read(args: dict, **kw) -> str:
+    """Return a bounded character window of this task's attachment or body.
+
+    Read-only counterpart to the attachment listing: that names a file and
+    its path, this hands back the text itself in slices the caller controls,
+    so a worker with no general file-reading tool can still follow the
+    pointer. ``attachment_id`` selects one of this task's own attachments;
+    omitting it reads the task body. Storage identity and path containment
+    are enforced by the same ``read_attachment_bytes`` the download path
+    already uses, so this can never read outside the attachments directory.
+    """
+    from hermes_cli import kanban_db as kb
+
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    board = args.get("board")
+    try:
+        offset = _read_window_int(args, "offset", 0)
+        limit = _read_window_int(args, "limit", _KANBAN_READ_DEFAULT_LIMIT)
+    except ValueError as e:
+        return tool_error(f"kanban_read: {e}")
+    if offset < 0:
+        return tool_error(f"kanban_read: offset must be >= 0 (got {offset})")
+    if limit < 1 or limit > _KANBAN_READ_MAX_LIMIT:
+        return tool_error(
+            f"kanban_read: limit must be between 1 and "
+            f"{_KANBAN_READ_MAX_LIMIT} (got {limit})"
+        )
+    att_id = args.get("attachment_id")
+    try:
+        _, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"task {tid} not found")
+            if att_id is None:
+                source = "body"
+                att_id_out = None
+                filename = None
+                text = task.body or ""
+            else:
+                try:
+                    att_key = int(att_id)
+                except (TypeError, ValueError):
+                    return tool_error(
+                        f"kanban_read: attachment_id must be an integer "
+                        f"(got {att_id!r})"
+                    )
+                att = kb.get_attachment(conn, att_key)
+                if att is None or att.task_id != tid:
+                    return tool_error(
+                        f"attachment {att_key} not found on task {tid}"
+                    )
+                source = "attachment"
+                att_id_out = att.id
+                filename = att.filename
+                text = kb.read_attachment_bytes(att, board=board).decode(
+                    "utf-8", errors="replace"
+                )
+        finally:
+            conn.close()
+    except ValueError as e:
+        # Invalid board slug, or the download path's own storage-identity /
+        # path-containment refusal.
+        return tool_error(f"kanban_read: {e}")
+    except Exception as e:
+        logger.exception("kanban_read failed")
+        return tool_error(f"kanban_read: {e}")
+
+    total = len(text)
+    if offset > total:
+        return tool_error(
+            f"kanban_read: offset {offset} is past the end of the content "
+            f"(total {total})"
+        )
+    window = text[offset:offset + limit]
+    return _ok(
+        task_id=tid,
+        source=source,
+        attachment_id=att_id_out,
+        filename=filename,
+        offset=offset,
+        limit=limit,
+        returned=len(window),
+        total=total,
+        has_more=(offset + len(window)) < total,
+        content=window,
+    )
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -2821,6 +2936,51 @@ KANBAN_ATTACHMENTS_SCHEMA = {
     },
 }
 
+KANBAN_READ_SCHEMA = {
+    "name": "kanban_read",
+    "description": (
+        "Read a bounded window of your own task's text: an attachment's "
+        "content when you name an attachment id, or the task body when you "
+        "don't. Returns at most `limit` characters starting at `offset`, "
+        "plus the total size and whether more remains, so you can page "
+        "through a large file the attachment listing only gives you a path "
+        "to. Read-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "attachment_id": {
+                "type": "integer",
+                "description": (
+                    "Id of an attachment on this task (from the attachment "
+                    "listing). Omit to read the task's body instead."
+                ),
+            },
+            "offset": {
+                "type": "integer",
+                "description": (
+                    "Character offset to start at. Defaults to 0. Must not "
+                    "be past the end of the content."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    "Maximum characters to return, 1.."
+                    f"{_KANBAN_READ_MAX_LIMIT}. Defaults to "
+                    f"{_KANBAN_READ_DEFAULT_LIMIT}."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
@@ -3311,6 +3471,15 @@ registry.register(
     handler=_handle_attachments,
     check_fn=_check_kanban_mode,
     emoji="📎",
+)
+
+registry.register(
+    name="kanban_read",
+    toolset="kanban",
+    schema=KANBAN_READ_SCHEMA,
+    handler=_handle_read,
+    check_fn=_check_kanban_mode,
+    emoji="\U0001F4D6",
 )
 
 registry.register(
