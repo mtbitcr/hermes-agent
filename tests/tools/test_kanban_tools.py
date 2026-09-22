@@ -2909,6 +2909,34 @@ def test_status_report_reads_other_boards_under_the_dispatcher_pin(
     assert out["excluded"]["boards_unreadable"] == 0
 
 
+def test_status_report_names_projects_from_the_shared_root_registry(
+    monkeypatch, tmp_path
+):
+    """Regression (production 2026-09-22): a worker runs as a profile whose
+    ``$HERMES_HOME`` holds no project registry; the owner's projects live in
+    the shared root's ``projects.db`` beside the shared board. The report must
+    read that registry, or every card comes back not attributable.
+    """
+    home = _status_report_env(monkeypatch, tmp_path, allow=["reporter"])
+    import tools.kanban_tools as kt
+
+    _seed_board(
+        "named-board",
+        [{"title": "named waiting", "status": "blocked"}],
+        project="Named Project",
+    )
+    profile_home = home / "profiles" / "reporter"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        (home / "config.yaml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    out = json.loads(kt._handle_status_report({"status": "blocked"}))
+    assert [row["title"] for row in out["cards"]] == ["named waiting"]
+    assert out["cards"][0]["project"] == "Named Project"
+
+
 def test_status_report_count_bound_truncates_and_discloses(monkeypatch, tmp_path):
     """Analysis test 3 (count bound) plus the card's disclosure requirement.
 
