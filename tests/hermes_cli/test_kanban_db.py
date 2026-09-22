@@ -2692,3 +2692,62 @@ def test_a_pre_seeded_row_under_the_derived_identity_is_not_the_vouched_followup
             if e.kind == "review_followup_recorded"
         ]
         assert [r["followup_task_id"] for r in recorded] == [vouched]
+
+
+def test_worker_context_caps_parent_results_by_completion_recency(kanban_home):
+    """Beyond ``_CTX_MAX_PARENT_RESULTS`` finished parents, the child's
+    context replaces the inlined summary with a pointer line, keeping the
+    most-recently-completed parents in full — selection is by completion
+    recency, not by creation order or id order.
+    """
+    with kb.connect() as conn:
+        cap = kb._CTX_MAX_PARENT_RESULTS
+        n = cap + 1
+        parent_ids = [kb.create_task(conn, title=f"parent-{i}") for i in range(n)]
+
+        # Complete in the REVERSE of creation order, with a real gap between
+        # each completion, so completion recency provably differs from
+        # creation order (and from parent_id order, which is unrelated to
+        # either).
+        completion_order = list(reversed(parent_ids))
+        for i, pid in enumerate(completion_order):
+            kb.complete_task(conn, pid, result=f"RESULT_MARKER_{pid}")
+            if i < len(completion_order) - 1:
+                time.sleep(1.1)
+
+        child = kb.create_task(conn, title="child", parents=parent_ids)
+        ctx = kb.build_worker_context(conn, child)
+
+        # The last `cap` parents completed (in wall-clock time) are the
+        # most recent; everything completed earlier than that overflows.
+        most_recent = completion_order[-cap:]
+        overflow = completion_order[:-cap]
+        assert len(overflow) == 1
+
+        for pid in most_recent:
+            assert f"RESULT_MARKER_{pid}" in ctx
+
+        for pid in overflow:
+            assert f"RESULT_MARKER_{pid}" not in ctx
+            pt = kb.get_task(conn, pid)
+            assert pid in ctx
+            assert pt.title in ctx
+
+
+def test_worker_context_parent_results_unchanged_at_or_under_cap(kanban_home):
+    """At or under ``_CTX_MAX_PARENT_RESULTS`` finished parents, every
+    parent still shows its full result and no overflow pointer line appears
+    — regression guard for the common case.
+    """
+    with kb.connect() as conn:
+        parent_ids = [kb.create_task(conn, title=f"parent-{i}") for i in range(3)]
+        for pid in parent_ids:
+            kb.complete_task(conn, pid, result=f"RESULT_MARKER_{pid}")
+
+        child = kb.create_task(conn, title="child", parents=parent_ids)
+        ctx = kb.build_worker_context(conn, child)
+
+        for pid in parent_ids:
+            assert f"RESULT_MARKER_{pid}" in ctx
+
+        assert "more finished parent" not in ctx
