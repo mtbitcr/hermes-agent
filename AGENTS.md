@@ -867,7 +867,7 @@ kanban task.
   `assignees`, `heartbeat`, `notify-*`, `dispatch`, `daemon`, `gc`.
 - **Worker/orchestrator toolset:** `tools/kanban_tools.py` exposes
   `kanban_show`, `kanban_complete`, `kanban_request_review`,
-  `kanban_request_changes`, `kanban_block`,
+  `kanban_request_changes`, `kanban_review_findings`, `kanban_block`,
   `kanban_heartbeat`, `kanban_comment`, `kanban_create`, `kanban_link`,
   `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_read`; profiles that
   explicitly enable the `kanban` toolset outside a dispatcher-spawned

@@ -40,7 +40,7 @@ zero outside a kanban task (footprint ladder rung 3).
   reopen-review, block, unblock, archive, tail`, plus `watch, stats, runs, log, assignees, heartbeat,
   notify-*, dispatch, daemon, gc`. Argparse alias dispatch must accept both `list` and `ls` (root).
 - **Toolset:** `tools/kanban_tools.py` — `kanban_show, kanban_complete, kanban_request_review,
-  kanban_request_changes, kanban_block, kanban_heartbeat, kanban_comment, kanban_create, kanban_link,
+  kanban_request_changes, kanban_review_findings, kanban_block, kanban_heartbeat, kanban_comment, kanban_create, kanban_link,
   kanban_attach, kanban_attach_url, kanban_attachments`; profiles enabling `kanban` outside a
   dispatched task also get `kanban_list` and `kanban_unblock` for board routing.
 - **Dispatcher:** long-lived loop (default 60s) that reclaims stale claims, promotes ready tasks,

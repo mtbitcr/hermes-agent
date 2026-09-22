@@ -36803,7 +36803,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append("## Reviewer contract")
         lines.append(
             "This run was claimed from the review lane. Report findings ONLY "
-            "via `hermes kanban review-findings <task_id>` (severity: one of "
+            "via the `kanban_review_findings` tool (severity: one of "
             f"{', '.join(REVIEW_FINDING_SEVERITIES)}; each finding needs "
             "severity, file, lines, problem, impact, smallest_fix, and "
             "candidate_digest). Every finding you report stays outstanding — "
