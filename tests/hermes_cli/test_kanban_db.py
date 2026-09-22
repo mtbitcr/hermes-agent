@@ -2736,18 +2736,29 @@ def test_worker_context_caps_parent_results_by_completion_recency(kanban_home):
 
 def test_worker_context_parent_results_unchanged_at_or_under_cap(kanban_home):
     """At or under ``_CTX_MAX_PARENT_RESULTS`` finished parents, every
-    parent still shows its full result and no overflow pointer line appears
-    — regression guard for the common case.
+    parent still shows its full result, in the parent-id order the section
+    always had, and no overflow pointer line appears — regression guard for
+    the common case. Completion recency only decides WHICH parents stay
+    inlined once the cap is exceeded; it never reorders the section.
     """
     with kb.connect() as conn:
-        parent_ids = [kb.create_task(conn, title=f"parent-{i}") for i in range(3)]
-        for pid in parent_ids:
+        parent_ids = sorted(
+            kb.create_task(conn, title=f"parent-{i}") for i in range(3)
+        )
+        # Complete in parent-id order with real gaps, so a recency-first
+        # rendering would come out reversed and be caught below.
+        for i, pid in enumerate(parent_ids):
             kb.complete_task(conn, pid, result=f"RESULT_MARKER_{pid}")
+            if i < len(parent_ids) - 1:
+                time.sleep(1.1)
 
         child = kb.create_task(conn, title="child", parents=parent_ids)
         ctx = kb.build_worker_context(conn, child)
 
         for pid in parent_ids:
             assert f"RESULT_MARKER_{pid}" in ctx
+
+        headings = [ctx.index(f"### {pid}") for pid in parent_ids]
+        assert headings == sorted(headings)
 
         assert "more finished parent" not in ctx
