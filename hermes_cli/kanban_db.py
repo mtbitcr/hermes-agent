@@ -36901,9 +36901,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     parent_ids = [r["parent_id"] for r in parent_rows]
 
     if parent_ids:
-        # Resolve finished parents first so they can be ordered by
-        # completion recency (most-recently-completed first), independent
-        # of the ``ORDER BY parent_id`` order the SQL above returns.
+        # Resolve finished parents first (in the ``ORDER BY parent_id`` order
+        # the SQL above returns) so the cap can pick the most recently
+        # completed ones without changing the section's order.
         finished_parents = []
         for pid in parent_ids:
             pt = get_task(conn, pid)
@@ -36922,7 +36922,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 done_ts = pt.completed_at
             finished_parents.append((done_ts, pid, pt, run))
 
-        finished_parents.sort(key=lambda x: (x[0] is None, -(x[0] or 0)))
+        # Completion recency decides only WHICH finished parents stay inlined
+        # once their count exceeds the cap; the section itself keeps the
+        # parent-id order the SQL above returns, so an under-cap child reads
+        # byte for byte as before the cap existed.
+        by_recency = sorted(
+            finished_parents, key=lambda x: (x[0] is None, -(x[0] or 0))
+        )
+        shown_ids = {entry[1] for entry in by_recency[:_CTX_MAX_PARENT_RESULTS]}
 
         if finished_parents:
             lines.append("## Parent task results")
@@ -36934,8 +36941,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 "source before acting on it as current._"
             )
 
-            shown_parents = finished_parents[:_CTX_MAX_PARENT_RESULTS]
-            overflow_parents = finished_parents[_CTX_MAX_PARENT_RESULTS:]
+            shown_parents = [p for p in finished_parents if p[1] in shown_ids]
+            overflow_parents = [p for p in finished_parents if p[1] not in shown_ids]
 
             attach_budget = _CTX_MAX_PARENT_ATTACHMENTS_BYTES
             budget_noted = False
