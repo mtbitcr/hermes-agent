@@ -2872,6 +2872,71 @@ def test_status_report_aggregates_across_boards(monkeypatch, tmp_path):
     assert out["truncated"] is False
 
 
+def test_status_report_reads_other_boards_under_the_dispatcher_pin(
+    monkeypatch, tmp_path
+):
+    """Regression (production 2026-09-22): the dispatcher pins
+    ``HERMES_KANBAN_DB`` to the worker's own board, and ``kanban_db_path``
+    honours that pin before its ``board`` argument. The report must still
+    open every other board by its slug, not the pinned store once per slug.
+    """
+    _status_report_env(monkeypatch, tmp_path, allow=["reporter"])
+    import tools.kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _seed_board(kb.DEFAULT_BOARD, [{"title": "default moving", "status": "running"}])
+    _seed_board(
+        "own-board",
+        [{"title": "own moving", "status": "running"}],
+        project="Own Project",
+    )
+    _seed_board(
+        "other-board",
+        [{"title": "other waiting", "status": "blocked"}],
+        project="Other Project",
+    )
+    monkeypatch.setenv(
+        "HERMES_KANBAN_DB", str(kb.board_dir("own-board") / "kanban.db")
+    )
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "own-board")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_00000000")
+
+    out = json.loads(kt._handle_status_report({"status": "blocked"}))
+    assert {row["title"] for row in out["cards"]} == {"other waiting"}
+    assert out["cards"][0]["project"] == "Other Project"
+    # default + own + other, every one opened by its own path.
+    assert out["boards_scanned"] == 3
+    assert out["excluded"]["boards_unreadable"] == 0
+
+
+def test_status_report_names_projects_from_the_shared_root_registry(
+    monkeypatch, tmp_path
+):
+    """Regression (production 2026-09-22): a worker runs as a profile whose
+    ``$HERMES_HOME`` holds no project registry; the owner's projects live in
+    the shared root's ``projects.db`` beside the shared board. The report must
+    read that registry, or every card comes back not attributable.
+    """
+    home = _status_report_env(monkeypatch, tmp_path, allow=["reporter"])
+    import tools.kanban_tools as kt
+
+    _seed_board(
+        "named-board",
+        [{"title": "named waiting", "status": "blocked"}],
+        project="Named Project",
+    )
+    profile_home = home / "profiles" / "reporter"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        (home / "config.yaml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    out = json.loads(kt._handle_status_report({"status": "blocked"}))
+    assert [row["title"] for row in out["cards"]] == ["named waiting"]
+    assert out["cards"][0]["project"] == "Named Project"
+
+
 def test_status_report_count_bound_truncates_and_discloses(monkeypatch, tmp_path):
     """Analysis test 3 (count bound) plus the card's disclosure requirement.
 
