@@ -523,7 +523,6 @@ def test_conflicting_database_pin_cannot_mutate_another_board(board, monkeypatch
     kb, conn, tid, head, review = board
     foreign = "copied-board"
     kb.create_board(foreign)
-    src_db = Path(os.environ["HERMES_KANBAN_DB"])
     dst_db = kb.board_dir(foreign) / "kanban.db"
     conn.commit()
     kb._INITIALIZED_PATHS.clear()
@@ -804,3 +803,36 @@ def test_registered_and_exposed_in_both_toolset_lists():
 
     assert "kanban_review_findings" in _HERMES_CORE_TOOLS
     assert "kanban_review_findings" in TOOLSETS["kanban"]["tools"]
+
+
+def test_database_pin_is_not_mutated_during_a_successful_call(board, monkeypatch):
+    """An authority check must not make the trusted pin momentarily absent,
+    because concurrent readers in the same process would resolve a lower-precedence
+    database during that window when HERMES_KANBAN_DB is transiently removed.
+    """
+    kb, conn, tid, head, review = board
+    from tools.registry import registry
+
+    original_pin = os.environ["HERMES_KANBAN_DB"]
+    observed_pins = []
+    real_kanban_db_path = kb.kanban_db_path
+
+    def _observing_kanban_db_path(*args, **kwargs):
+        observed_pins.append(os.environ.get("HERMES_KANBAN_DB"))
+        return real_kanban_db_path(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "kanban_db_path", _observing_kanban_db_path)
+
+    out = json.loads(registry.dispatch("kanban_review_findings", {
+        "task_id": tid,
+        "findings": [],
+        "candidate_digest": head,
+    }))
+
+    assert out.get("ok") is True, out
+    assert out["outcome"] == "passed"
+    assert len(observed_pins) >= 1, "observer recorded no calls to kanban_db_path"
+    assert all(v == original_pin for v in observed_pins), (
+        f"HERMES_KANBAN_DB was transiently mutated during a successful call: {observed_pins!r}"
+    )
+    assert os.environ["HERMES_KANBAN_DB"] == original_pin

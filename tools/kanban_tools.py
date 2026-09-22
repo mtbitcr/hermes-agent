@@ -1942,29 +1942,6 @@ def _active_reviewer_run_id(task_id: str) -> tuple[Optional[int], Optional[str]]
     return run_id, None
 
 
-def _without_database_pin():
-    """Resolve board paths with ``HERMES_KANBAN_DB`` temporarily out of the way.
-
-    The database pin outranks a board name in the shared resolver, so asking
-    what path a board NAME means while the pin is in effect just echoes the
-    pin back. Callers that need the two answers to be independent borrow this
-    for the board-name side only; the pin is restored immediately afterwards
-    and the shared resolver itself is untouched.
-    """
-    import contextlib
-
-    @contextlib.contextmanager
-    def _scope():
-        saved = os.environ.pop("HERMES_KANBAN_DB", None)
-        try:
-            yield
-        finally:
-            if saved is not None:
-                os.environ["HERMES_KANBAN_DB"] = saved
-
-    return _scope()
-
-
 def _handle_review_findings(args: dict, **kw) -> str:
     """Reviewer verdict: submit a typed findings document (the sole handback)."""
     delegated_err = _reject_delegated_child_mutation("kanban_review_findings")
@@ -2041,18 +2018,25 @@ def _handle_review_findings(args: dict, **kw) -> str:
                 "open could not be resolved; refusing before any board "
                 "database was opened"
             )
-        # The pinned board's own path must be resolved with the database pin
-        # ignored, or HERMES_KANBAN_DB would answer for both sides and the
-        # comparison would always agree.
-        with _without_database_pin():
-            try:
-                pinned_db = kb.kanban_db_path(board=pinned_board)
-            except Exception:
-                return tool_error(
-                    "kanban_review_findings: the board this worker is pinned "
-                    f"to ('{pinned_board}') could not be resolved to a board "
-                    "database; refusing before any board database was opened"
-                )
+        # We cannot call kb.kanban_db_path(board=pinned_board) here because
+        # HERMES_KANBAN_DB outranks the board argument inside the shared
+        # resolver — it would echo the pin back for both sides and the
+        # comparison would always agree. We therefore derive the pinned board's
+        # path directly from the same native path helpers, WITHOUT mutating the
+        # environment, because the authority check must not make the
+        # process-global pin momentarily observable as absent to concurrent
+        # readers.
+        try:
+            if pinned_board == kb.DEFAULT_BOARD:
+                pinned_db = kb.kanban_home() / "kanban.db"
+            else:
+                pinned_db = kb.board_dir(pinned_board) / "kanban.db"
+        except Exception:
+            return tool_error(
+                "kanban_review_findings: the board this worker is pinned "
+                f"to ('{pinned_board}') could not be resolved to a board "
+                "database; refusing before any board database was opened"
+            )
         pinned_db = pinned_db.expanduser().resolve()
         if target_db != pinned_db:
             return tool_error(
