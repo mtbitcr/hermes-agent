@@ -2638,7 +2638,9 @@ def test_read_is_hidden_from_a_delegated_child(worker_env, monkeypatch):
 # kanban_status_report: bounded cross-project listing (read-only)
 # ---------------------------------------------------------------------------
 
-def _status_report_env(monkeypatch, tmp_path, *, profile="reporter", allow=None):
+def _status_report_env(
+    monkeypatch, tmp_path, *, profile="reporter", allow=None, has_kanban_toolset=True
+):
     """Isolated HERMES_HOME running as ``profile`` with the allow-list set.
 
     ``allow=None`` writes no config key at all, which is the release default:
@@ -2664,7 +2666,7 @@ def _status_report_env(monkeypatch, tmp_path, *, profile="reporter", allow=None)
     import tools.kanban_tools as kt
 
     monkeypatch.setattr(
-        kt, "_profile_has_kanban_toolset", lambda: True
+        kt, "_profile_has_kanban_toolset", lambda: has_kanban_toolset
     )
     monkeypatch.setattr(
         "hermes_cli.profiles.get_active_profile_name", lambda: profile
@@ -2755,11 +2757,62 @@ def test_status_report_gate_defaults_to_empty_allow_list(monkeypatch, tmp_path):
     )
     assert "kanban_status_report" not in _kanban_worker_schema_names(monkeypatch)
 
-    # A dispatcher-spawned single-task worker never sees it.
+    # A dispatcher-spawned single-task worker whose profile IS in the
+    # allow-list is admitted, and a live call actually succeeds.
+    _status_report_env(
+        monkeypatch,
+        tmp_path,
+        profile="reporter",
+        allow=["reporter"],
+        has_kanban_toolset=False,
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_00000000")
+    assert "kanban_status_report" in _kanban_worker_schema_names(monkeypatch)
+    _seed_board(
+        "dispatched-board",
+        [{"title": "dispatched waiting", "status": "blocked"}],
+    )
+    out = json.loads(kt._handle_status_report({"status": "blocked"}))
+    titles = {row["title"] for row in out["cards"]}
+    assert "dispatched waiting" in titles
+
+    # A dispatcher-spawned single-task worker whose profile is NOT in the
+    # allow-list is still refused.
+    _status_report_env(
+        monkeypatch, tmp_path, profile="other-orch", allow=["reporter"]
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_00000000")
+    assert "kanban_status_report" not in _kanban_worker_schema_names(monkeypatch)
+    refusal = json.loads(kt._handle_status_report({"status": "blocked"}))
+    assert "kanban_status_report" in refusal["error"]
+
+    # A delegated child is refused even when dispatched AND allow-listed --
+    # refusal is independent of and takes priority over allow-list status.
+    from agent.delegation_context import (
+        DELEGATED_CHILD_ENV_MARKER,
+        delegated_child_context,
+    )
+
     _status_report_env(
         monkeypatch, tmp_path, profile="reporter", allow=["reporter"]
     )
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_00000000")
+    with delegated_child_context():
+        assert (
+            "kanban_status_report"
+            not in _kanban_worker_schema_names(monkeypatch)
+        )
+        refusal = json.loads(kt._handle_status_report({"status": "blocked"}))
+        assert "kanban_status_report" in refusal["error"]
+
+    # A delegate_task child's own SPAWNED SUBPROCESS carries no ContextVar --
+    # only the HERMES_DELEGATED_CHILD_CONTEXT=1 env marker that
+    # scrub_kanban_env sets (with HERMES_KANBAN_TASK removed). That shape must
+    # be refused too.
+    _status_report_env(
+        monkeypatch, tmp_path, profile="reporter", allow=["reporter"]
+    )
+    monkeypatch.setenv(DELEGATED_CHILD_ENV_MARKER, "1")
     assert "kanban_status_report" not in _kanban_worker_schema_names(monkeypatch)
     refusal = json.loads(kt._handle_status_report({"status": "blocked"}))
     assert "kanban_status_report" in refusal["error"]

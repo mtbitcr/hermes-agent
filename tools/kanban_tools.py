@@ -118,6 +118,26 @@ def _is_dispatcher_owned_worker() -> bool:
         return True
 
 
+def _is_delegated_child_process_context() -> bool:
+    """True for a delegate_task child's own in-process context AND for its
+    spawned subprocess.
+
+    ``_is_delegated_child_context`` only sees the in-process ContextVar,
+    which a delegate_task child's own subprocess does not inherit -- that
+    subprocess instead carries the ``HERMES_DELEGATED_CHILD_CONTEXT=1`` env
+    marker that :func:`agent.delegation_context.scrub_kanban_env` sets so the
+    denial survives an exec. Gates that must refuse a delegated child
+    regardless of process shape use this instead. Fails closed (True) on any
+    import/lookup error, since callers treat True as "refuse".
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return is_delegated_child_process_context()
+    except Exception:
+        return True
+
+
 def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
     """Deny Kanban mutations from delegate_task children.
 
@@ -273,15 +293,17 @@ def _check_kanban_status_report_mode() -> bool:
     """``kanban_status_report`` is allow-list-only, narrower than every other
     gate in this module.
 
-    Mirrors :func:`_check_kanban_orchestrator_mode` — delegated children and
-    dispatcher-owned single-task workers are excluded, and the profile must
-    carry the kanban toolset — and then adds the one new requirement: the
-    active profile must be named in the owner's allow-list. That list is
+    The allow-list is the SOLE authority now, not a layer on top of
+    :func:`_check_kanban_orchestrator_mode`: a delegated child is excluded,
+    and every other execution context -- including a dispatcher-spawned
+    single-task worker, which the orchestrator gate unconditionally
+    excludes -- is admitted purely by allow-list membership. There is no
+    remaining kanban-toolset or dispatcher-worker requirement. That list is
     empty at release, so this returns False for everybody until the owner
     fills it in. Reporting/planning boundaries are the intended members; no
     name is hardcoded here.
     """
-    if not _check_kanban_orchestrator_mode():
+    if _is_delegated_child_process_context():
         return False
     return _profile_in_status_report_allowlist()
 
@@ -291,14 +313,13 @@ def _require_status_report_profile(tool_name: str) -> Optional[str]:
 
     ``_check_kanban_status_report_mode`` keeps the tool out of every
     unauthorized schema, but a stale registration or a cached check_fn result
-    could still route a call here. Repeat the checks so an unauthorized
-    context fails closed with a structured refusal and zero reads of another
-    project's board.
+    could still route a call here. Repeat the allow-list and delegated-child
+    checks -- this no longer repeats an orchestrator-tool check, since the
+    allow-list is now the sole authority -- so an unauthorized context fails
+    closed with a structured refusal and zero reads of another project's
+    board.
     """
-    guard = _require_orchestrator_tool(tool_name)
-    if guard:
-        return guard
-    if _is_delegated_child_context():
+    if _is_delegated_child_process_context():
         return tool_error(
             f"{tool_name} refused: delegate_task child agents are not Kanban "
             "run owners. Return findings to the parent agent."
