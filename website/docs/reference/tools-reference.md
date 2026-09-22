@@ -148,6 +148,8 @@ Registered when the agent is either (a) spawned by the kanban dispatcher (`HERME
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64). Stored as a real attachment under the task's attachments dir, capped at 25 MB. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_attach_url` | Attach a file to a task by URL — Hermes downloads it server-side and stores it as a real attachment (capped at 25 MB). Only http/https URLs. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_attachments` | List the files attached to a task: id, filename, content_type, size, uploader, and the absolute on-disk path. | `HERMES_KANBAN_TASK` or `kanban` toolset |
+| `kanban_read` | Read a bounded character window (default 4000, max 10000) of the caller's own task: an attachment's text by attachment id, or the task body when none is named; returns offset, total and whether more remains. Read-only; refuses any other task's data. | `HERMES_KANBAN_TASK` or `kanban` toolset |
+| `kanban_status_report` | List the cards in one status across every board of the owner's store: title, project name, owner-friendly state, waiting-reason category and age, bounded by count (default 50, cap 200) and boards scanned (default 20, cap 200), with what the bounds excluded disclosed. Other boards are opened read-only. | Profiles named in `kanban.status_report_profiles`, their dispatcher-spawned task workers included; `delegate_task` children are refused |
 
 ## `project` toolset
 
