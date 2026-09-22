@@ -1265,9 +1265,15 @@ def _status_report_project_names(project_ids) -> dict:
     if not wanted:
         return {}
     try:
+        from hermes_cli import kanban_db as kb
         from hermes_cli import projects_db
 
-        path = projects_db.projects_db_path()
+        # The owner's registry sits beside the shared board at the root
+        # (``kanban_home()``), never in the reporting profile's own home: a
+        # worker runs as a profile whose ``projects_db_path()`` holds no
+        # registry, so every card would come back not attributable
+        # (production, 2026-09-22).
+        path = kb.kanban_home() / "projects.db"
         if not path.exists():
             return {}
         conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
