@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import itertools
 import time
 import types
 import unittest.mock
@@ -2692,3 +2693,94 @@ def test_a_pre_seeded_row_under_the_derived_identity_is_not_the_vouched_followup
             if e.kind == "review_followup_recorded"
         ]
         assert [r["followup_task_id"] for r in recorded] == [vouched]
+
+
+def test_worker_context_caps_parent_results_by_completion_recency(kanban_home):
+    """Beyond ``_CTX_MAX_PARENT_RESULTS`` finished parents, the child's
+    context replaces the inlined summary with a pointer line, keeping the
+    most-recently-completed parents in full — selection is by completion
+    recency, not by creation order or id order.
+    """
+    with kb.connect() as conn:
+        cap = kb._CTX_MAX_PARENT_RESULTS
+        n = cap + 1
+        parent_ids = [kb.create_task(conn, title=f"parent-{i}") for i in range(n)]
+
+        # Complete in the REVERSE of creation order, with a real gap between
+        # each completion, so completion recency provably differs from
+        # creation order (and from parent_id order, which is unrelated to
+        # either).
+        completion_order = list(reversed(parent_ids))
+        for i, pid in enumerate(completion_order):
+            kb.complete_task(conn, pid, result=f"RESULT_MARKER_{pid}")
+            if i < len(completion_order) - 1:
+                time.sleep(1.1)
+
+        child = kb.create_task(conn, title="child", parents=parent_ids)
+        ctx = kb.build_worker_context(conn, child)
+
+        # The last `cap` parents completed (in wall-clock time) are the
+        # most recent; everything completed earlier than that overflows.
+        most_recent = completion_order[-cap:]
+        overflow = completion_order[:-cap]
+        assert len(overflow) == 1
+
+        for pid in most_recent:
+            assert f"RESULT_MARKER_{pid}" in ctx
+
+        for pid in overflow:
+            assert f"RESULT_MARKER_{pid}" not in ctx
+            pt = kb.get_task(conn, pid)
+            assert pid in ctx
+            assert pt.title in ctx
+
+
+def test_worker_context_parent_results_unchanged_at_or_under_cap(
+    kanban_home, monkeypatch
+):
+    """At or under ``_CTX_MAX_PARENT_RESULTS`` finished parents the assembled
+    context is byte-identical to what the pre-cap code produced for the same
+    fixture: the golden below was recorded on the released head e393b535
+    (before the cap existed) with pinned ids, a pinned clock that steps 100 s per completion and a fixed read time 21 minutes later. Completion
+    recency only decides WHICH parents stay inlined once the cap is
+    exceeded; it never reorders or reshapes the section.
+    """
+    counter = itertools.count(1)
+    monkeypatch.setattr(kb, "_new_task_id", lambda: f"t_{next(counter):08x}")
+    monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_000)
+
+    with kb.connect() as conn:
+        parent_ids = [kb.create_task(conn, title=f"parent-{i}") for i in range(3)]
+        for i, pid in enumerate(parent_ids):
+            # Each parent finishes 100 s after the previous one, so a
+            # recency-first rendering would come out reversed.
+            monkeypatch.setattr(kb.time, "time", lambda t=1_700_000_000 + 100 * i: t)
+            kb.complete_task(conn, pid, result=f"RESULT_MARKER_{pid}")
+
+        child = kb.create_task(conn, title="child", parents=parent_ids)
+        # Read 21 minutes later so the ages are fixed text, not a call count.
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_001_260)
+        ctx = kb.build_worker_context(conn, child)
+
+    assert ctx == _UNDER_CAP_GOLDEN
+
+
+_UNDER_CAP_GOLDEN = (
+    '# Kanban task t_00000004: child\n'
+    '\n'
+    'Assignee: (unassigned)\n'
+    'Status:   ready\n'
+    'Workspace: scratch @ (unresolved)\n'
+    'Repository ownership: legacy exclusive whole repository\n'
+    '\n'
+    '## Parent task results\n'
+    "_Handoffs from upstream tasks, captured when each parent completed (see age below). These are point-in-time snapshots, not live state — if a result drives your current work and it's not recent, re-verify against the source before acting on it as current._\n"
+    '### t_00000001 (completed 21m ago)\n'
+    'RESULT_MARKER_t_00000001\n'
+    '\n'
+    '### t_00000002 (completed 19m ago)\n'
+    'RESULT_MARKER_t_00000002\n'
+    '\n'
+    '### t_00000003 (completed 17m ago)\n'
+    'RESULT_MARKER_t_00000003\n'
+)
