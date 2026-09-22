@@ -1212,8 +1212,19 @@ def _status_report_readonly_conn(kb, board: str):
     Returns ``None`` when the board has no store on disk or sqlite refuses
     to open it; the caller discloses that board instead of failing the whole
     report.
+
+    The store is resolved from the slug alone, never through
+    :func:`kanban_db_path`: that resolver honours the ``HERMES_KANBAN_DB`` pin
+    before its ``board`` argument, and the dispatcher injects the pin into
+    every worker, so a dispatched reporter would open its own board once per
+    slug and report every other board empty (seen in production on
+    2026-09-22).
     """
-    path = kb.kanban_db_path(board=board)
+    slug = kb._normalize_board_slug(board) or kb.DEFAULT_BOARD
+    if slug == kb.DEFAULT_BOARD:
+        path = kb.kanban_home() / "kanban.db"
+    else:
+        path = kb.board_dir(slug) / "kanban.db"
     try:
         if not path.exists():
             return None
