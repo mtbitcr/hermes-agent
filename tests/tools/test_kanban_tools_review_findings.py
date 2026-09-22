@@ -471,6 +471,188 @@ def test_matching_board_argument_still_opens_the_connection(
     assert task.status == "done"
 
 
+@pytest.mark.parametrize("pin", [None, "", "   ", "Not A Slug!", "-leading"])
+@pytest.mark.parametrize("selector", [None, "different-review-board"])
+def test_unusable_board_pin_is_refused_before_any_connection(
+    board, monkeypatch, pin, selector
+):
+    """An unusable HERMES_KANBAN_BOARD (absent, empty, whitespace, or malformed)
+    must trigger a pre-connection refusal, regardless of the explicit board selector.
+    Without this guard the pre-connection check is skipped for every bad pin value
+    and write-capable _connect is reached; every connection runs schema/WAL writes,
+    so opening one at all is already a side-effect that must be prevented.
+    """
+    kb, conn, tid, head, review = board
+    kb.create_board("different-review-board")
+    import tools.kanban_tools as kt
+    from tools.registry import registry
+
+    if pin is None:
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", pin)
+
+    called = []
+
+    def _sentinel_connect(*args, **kwargs):
+        called.append((args, kwargs))
+        raise AssertionError("write-capable connect reached before refusal")
+
+    monkeypatch.setattr(kt, "_connect", _sentinel_connect)
+
+    args = {"task_id": tid, "findings": [], "candidate_digest": head}
+    if selector is not None:
+        args["board"] = selector
+
+    out = json.loads(registry.dispatch("kanban_review_findings", args))
+
+    assert called == []
+    assert out.get("ok") is not True
+    assert out.get("error")
+    assert kb.get_task(conn, tid).status == "running"
+
+
+def test_conflicting_database_pin_cannot_mutate_another_board(board, monkeypatch):
+    """With an omitted board selector the post-connection board check is skipped in
+    the current code, so HERMES_KANBAN_DB repointed at a copy of the worker's own
+    database (placed inside a foreign board's directory) can flip tasks to 'done' on
+    that foreign copy, leaving the worker's own task 'running'. The fix must compare
+    the connection's effective board against the validated HERMES_KANBAN_BOARD pin
+    even when no explicit selector is supplied.
+    """
+    kb, conn, tid, head, review = board
+    foreign = "copied-board"
+    kb.create_board(foreign)
+    src_db = Path(os.environ["HERMES_KANBAN_DB"])
+    dst_db = kb.board_dir(foreign) / "kanban.db"
+    conn.commit()
+    kb._INITIALIZED_PATHS.clear()
+    # A live WAL database is not a consistent snapshot on disk: a plain file
+    # copy takes the main file and leaves the -wal sidecar behind, so the rows
+    # written by this fixture would be missing from the copy. SQLite's own
+    # online-backup API produces a consistent copy including the WAL contents.
+    import sqlite3
+
+    backup_target = sqlite3.connect(dst_db)
+    try:
+        conn.backup(backup_target)
+    finally:
+        backup_target.close()
+
+    # Prove the copy is a real, usable foreign board carrying this task; without
+    # this the non-mutation assertion below could pass vacuously on an empty copy.
+    seeded = kb.connect(db_path=dst_db)
+    try:
+        seeded_task = kb.get_task(seeded, tid)
+        assert seeded_task is not None
+        assert seeded_task.status == "running"
+    finally:
+        seeded.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(dst_db))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
+
+    from tools.registry import registry
+
+    out = json.loads(registry.dispatch("kanban_review_findings", {
+        "task_id": tid,
+        "findings": [],
+        "candidate_digest": head,
+    }))
+
+    assert out.get("ok") is not True
+    assert out.get("error")
+
+    foreign_conn = kb.connect(db_path=dst_db)
+    try:
+        foreign_task = kb.get_task(foreign_conn, tid)
+        assert foreign_task is not None
+        assert foreign_task.status == "running"
+    finally:
+        foreign_conn.close()
+
+    assert kb.get_task(conn, tid).status == "running"
+
+
+@pytest.mark.parametrize("selector", [None, "default"])
+def test_conflicting_database_pin_is_refused_before_any_connection(
+    board, monkeypatch, selector
+):
+    """HERMES_KANBAN_DB outranks the board argument in the shared resolver, so a
+    valid board pin plus a conflicting database pin is an inconsistent target; the
+    connection must not be opened at all while the target is unproven, because every
+    connection this helper opens is write-capable (it enables WAL and, on first open,
+    runs schema creation and the additive migrations).
+
+    Note that the sentinel stops the actual connection, so this pins down call
+    ORDERING — it is not a claim that foreign writes were measured.
+    """
+    kb, conn, tid, head, review = board
+    kb.create_board("foreign-review-board")
+    import tools.kanban_tools as kt
+    from tools.registry import registry
+
+    # The trusted board pin stays VALID and unchanged; only the database pin is
+    # repointed at another existing board's store.
+    monkeypatch.setenv(
+        "HERMES_KANBAN_DB",
+        str(kb.board_dir("foreign-review-board") / "kanban.db"),
+    )
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
+
+    called = []
+
+    def _sentinel_connect(*args, **kwargs):
+        called.append((args, kwargs))
+        raise AssertionError("write-capable connect reached before refusal")
+
+    monkeypatch.setattr(kt, "_connect", _sentinel_connect)
+
+    args = {"task_id": tid, "findings": [], "candidate_digest": head}
+    if selector is not None:
+        args["board"] = selector
+
+    out = json.loads(registry.dispatch("kanban_review_findings", args))
+
+    assert called == [], out
+    assert out.get("ok") is not True
+    assert out.get("error")
+    assert kb.get_task(conn, tid).status == "running"
+
+
+def test_omitted_board_with_valid_pin_still_opens_the_connection(board, monkeypatch):
+    """With a valid HERMES_KANBAN_BOARD pin and no explicit board selector, the call
+    must still reach _connect and succeed normally. This is the positive control for
+    requirement (a): enforcing a valid pin must not block ordinary omitted-selector
+    calls when the pin itself is well-formed.
+    """
+    kb, conn, tid, head, review = board
+    import tools.kanban_tools as kt
+    from tools.registry import registry
+
+    real_connect = kt._connect
+    called = []
+
+    def _recording_connect(*args, **kwargs):
+        called.append((args, kwargs))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(kt, "_connect", _recording_connect)
+
+    out = json.loads(registry.dispatch("kanban_review_findings", {
+        "task_id": tid,
+        "findings": [],
+        "candidate_digest": head,
+    }))
+
+    assert called != []
+    assert out.get("ok") is True, out
+    assert out["outcome"] == "passed"
+
+    task = kb.get_task(conn, tid)
+    assert task.status == "done"
+
+
 # ---------------------------------------------------------------------------
 # 8. Delegated-child context -> denial
 # ---------------------------------------------------------------------------

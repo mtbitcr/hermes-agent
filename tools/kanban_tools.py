@@ -1942,6 +1942,29 @@ def _active_reviewer_run_id(task_id: str) -> tuple[Optional[int], Optional[str]]
     return run_id, None
 
 
+def _without_database_pin():
+    """Resolve board paths with ``HERMES_KANBAN_DB`` temporarily out of the way.
+
+    The database pin outranks a board name in the shared resolver, so asking
+    what path a board NAME means while the pin is in effect just echoes the
+    pin back. Callers that need the two answers to be independent borrow this
+    for the board-name side only; the pin is restored immediately afterwards
+    and the shared resolver itself is untouched.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _scope():
+        saved = os.environ.pop("HERMES_KANBAN_DB", None)
+        try:
+            yield
+        finally:
+            if saved is not None:
+                os.environ["HERMES_KANBAN_DB"] = saved
+
+    return _scope()
+
+
 def _handle_review_findings(args: dict, **kw) -> str:
     """Reviewer verdict: submit a typed findings document (the sole handback)."""
     delegated_err = _reject_delegated_child_mutation("kanban_review_findings")
@@ -1970,21 +1993,75 @@ def _handle_review_findings(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         from hermes_cli import kanban_db as kb
+        # This mutator is dispatcher-only, so the dispatcher's own board pin is
+        # the one trusted statement of which board this reviewer may touch. It
+        # is required, and it is validated BEFORE anything is opened: every
+        # connection _connect makes is write-capable (it enables WAL and, on
+        # first open, runs schema creation and the additive migrations), so a
+        # call that cannot prove its target must not open a board at all. A
+        # missing, empty or malformed pin is not "nothing to compare against",
+        # it is an unproven target.
+        try:
+            pinned_board = kb._normalize_board_slug(
+                os.environ.get("HERMES_KANBAN_BOARD")
+            )
+        except ValueError:
+            pinned_board = None
+        if not pinned_board:
+            return tool_error(
+                "kanban_review_findings: this worker has no valid board pin "
+                "(HERMES_KANBAN_BOARD is missing, empty or malformed), so the "
+                "board holding the review cannot be established; refusing "
+                "before any board database was opened"
+            )
         requested_board = kb._normalize_board_slug(board)
-        if requested_board:
+        if requested_board and requested_board != pinned_board:
+            return tool_error(
+                f"kanban_review_findings: board '{requested_board}' "
+                f"does not match the board this worker is pinned to "
+                f"('{pinned_board}'); refusing before any board "
+                "database was opened"
+            )
+        # HERMES_KANBAN_DB outranks the board argument inside the shared
+        # resolver, so a valid pin and an agreeable selector still do not
+        # establish WHICH store is about to be opened. Resolve the path the
+        # call would actually open, without opening it, and require it to be
+        # the path the trusted pin names. Comparing resolved paths - rather
+        # than mapping the path back to a slug - deliberately avoids the
+        # legacy "assume the current board" fallback that a reverse lookup
+        # applies to an arbitrary path, which would let an unrelated file
+        # inherit the pinned board's identity.
+        try:
+            target_db = kb.kanban_db_path(board=board).expanduser().resolve()
+        except ValueError:
+            raise
+        except Exception:
+            return tool_error(
+                "kanban_review_findings: the board database this call would "
+                "open could not be resolved; refusing before any board "
+                "database was opened"
+            )
+        # The pinned board's own path must be resolved with the database pin
+        # ignored, or HERMES_KANBAN_DB would answer for both sides and the
+        # comparison would always agree.
+        with _without_database_pin():
             try:
-                pinned_board = kb._normalize_board_slug(
-                    os.environ.get("HERMES_KANBAN_BOARD")
-                )
-            except ValueError:
-                pinned_board = None
-            if pinned_board and requested_board != pinned_board:
+                pinned_db = kb.kanban_db_path(board=pinned_board)
+            except Exception:
                 return tool_error(
-                    f"kanban_review_findings: board '{requested_board}' "
-                    f"does not match the board this worker is pinned to "
-                    f"('{pinned_board}'); refusing before any board "
-                    "database was opened"
+                    "kanban_review_findings: the board this worker is pinned "
+                    f"to ('{pinned_board}') could not be resolved to a board "
+                    "database; refusing before any board database was opened"
                 )
+        pinned_db = pinned_db.expanduser().resolve()
+        if target_db != pinned_db:
+            return tool_error(
+                "kanban_review_findings: the board database this call would "
+                f"open is not the one board '{pinned_board}' names; the "
+                "database location pin and the board pin disagree, so the "
+                "review target is unproven; refusing before any board "
+                "database was opened"
+            )
         kb, conn = _connect(board=board)
         try:
             effective_board = _board_of_connection(kb, conn)
@@ -1993,6 +2070,20 @@ def _handle_review_findings(args: dict, **kw) -> str:
                 return tool_error(
                     f"kanban_review_findings: board '{requested_board}' does not match the board "
                     f"database this worker is pinned to ('{effective_board or 'a file outside the boards tree'}')"
+                )
+            # HERMES_KANBAN_DB outranks the board argument in the shared
+            # resolver, so the connection that was actually opened - not the
+            # caller's selector - is the last word on which board is about to
+            # be mutated. Checking it against the validated pin closes the
+            # omitted-selector path, where there is no requested_board for the
+            # check above to compare.
+            if effective_board != pinned_board:
+                return tool_error(
+                    f"kanban_review_findings: the board database this call "
+                    f"opened "
+                    f"('{effective_board or 'a file outside the boards tree'}') "
+                    f"is not the board this worker is pinned to "
+                    f"('{pinned_board}')"
                 )
             kernel_head = kb._latest_review_head_provenance(conn, tid)
             if kernel_head is None:
