@@ -334,6 +334,61 @@ def test_another_board_is_refused(board, tmp_path, monkeypatch):
     assert own_task.status == "running"
 
 
+def test_mismatched_board_argument_is_refused_without_repointing_pins(board):
+    """A caller-supplied ``board`` argument that disagrees with the board the
+    worker is actually pinned to must be refused, even though the trusted
+    env pins (``HERMES_KANBAN_DB``/``HERMES_KANBAN_BOARD``/``HERMES_KANBAN_TASK``/
+    ``HERMES_KANBAN_RUN_ID``) are left completely untouched here.
+
+    ``kb.connect`` honours ``HERMES_KANBAN_DB`` before its own ``board``
+    argument, so a naive implementation silently reinterprets a mismatched
+    ``board`` as the worker's own pinned board and approves the worker's OWN
+    task instead of refusing the mismatch. Unlike
+    ``test_another_board_is_refused`` above (which repoints the pins
+    themselves), this test proves the tool call's own ``board`` argument is
+    validated against the connection actually opened.
+    """
+    kb, conn, tid, head, review = board
+    kb.create_board("different-review-board")
+
+    from tools.registry import registry
+
+    out = json.loads(registry.dispatch("kanban_review_findings", {
+        "task_id": tid,
+        "findings": [],
+        "candidate_digest": head,
+        "board": "different-review-board",
+    }))
+    assert out.get("ok") is not True
+    assert out.get("error")
+
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "running"
+    assert kb.list_attachments(conn, tid) == []
+
+
+def test_matching_own_board_argument_still_approves(board):
+    """The benign counterpart: passing ``board`` equal to the worker's own
+    pinned board slug is not a mismatch and must keep approving exactly as
+    an omitted ``board`` does — the fix refuses only a genuine mismatch.
+    """
+    kb, conn, tid, head, review = board
+
+    out = _dispatch({
+        "task_id": tid,
+        "findings": [],
+        "candidate_digest": head,
+        "board": kb.DEFAULT_BOARD,
+    })
+    assert out.get("ok") is True, out
+    assert out["outcome"] == "passed"
+
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "done"
+
+
 # ---------------------------------------------------------------------------
 # 8. Delegated-child context -> denial
 # ---------------------------------------------------------------------------

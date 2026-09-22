@@ -1971,6 +1971,13 @@ def _handle_review_findings(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            effective_board = _board_of_connection(kb, conn)
+            requested_board = kb._normalize_board_slug(board)
+            if requested_board and requested_board != effective_board:
+                return tool_error(
+                    f"kanban_review_findings: board '{requested_board}' does not match the board "
+                    f"database this worker is pinned to ('{effective_board or 'a file outside the boards tree'}')"
+                )
             kernel_head = kb._latest_review_head_provenance(conn, tid)
             if kernel_head is None:
                 return tool_error(
