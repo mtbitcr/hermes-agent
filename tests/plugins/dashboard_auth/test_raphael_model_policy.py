@@ -1,5 +1,6 @@
 """Item 32Q: Raphael may manage only its admitted native model lanes."""
 
+import hashlib
 import json
 import stat
 from types import SimpleNamespace
@@ -35,25 +36,29 @@ from plugins.dashboard_auth.raphael_workspace.model_policy import (
 
 
 @pytest.mark.parametrize(
-    ("profile", "provider", "family", "effort"),
+    ("profile", "provider", "model", "label", "effort"),
     [
-        ("raphael-planner", "anthropic", "claude-sonnet-", "max"),
-        ("default", "anthropic", "claude-opus-", "max"),
-        ("raphael-business", "anthropic", "claude-sonnet-", "high"),
-        ("raphael-designer", "anthropic", "claude-opus-", "max"),
-        ("raphael-claude-worker", "anthropic", "claude-sonnet-", "max"),
-        ("raphael-builder", "anthropic", "claude-sonnet-", "max"),
-        ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max"),
-        ("raphael-verifier", "anthropic", "claude-opus-", "max"),
-        ("raphael-planner", "openai-codex", "gpt-5.6-sol", "max"),
-        ("default", "openai-codex", "gpt-5.6-sol", "max"),
-        ("raphael-business", "openai-codex", "gpt-5.6-terra", "max"),
+        ("raphael-planner", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"),
+        ("default", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"),
+        ("raphael-business", "anthropic", "claude-sonnet-5", "Claude Sonnet 5", "high"),
+        ("raphael-designer", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"),
+        (
+            "raphael-claude-worker", "anthropic", "claude-opus-5-5",
+            "Claude Opus 5.5 + Claude Code", "max",
+        ),
+        ("raphael-builder", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"),
+        ("raphael-verifier", "openai-codex", "gpt-6-sol", "GPT-6 Sol", "max"),
+        ("raphael-verifier", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"),
+        ("raphael-planner", "openai-codex", "gpt-6-sol", "GPT-6 Sol", "max"),
+        ("default", "openai-codex", "gpt-6-sol", "GPT-6 Sol", "max"),
+        ("raphael-business", "openai-codex", "gpt-5.6-terra", "GPT-5.6 Terra", "max"),
     ],
 )
-def test_admitted_assignment_is_role_bound(profile, provider, family, effort):
+def test_admitted_assignment_is_role_bound(profile, provider, model, label, effort):
     assignment = assignment_for(profile, provider)
     assert assignment.provider == provider
-    assert assignment.model.startswith(family)
+    assert assignment.model == model
+    assert assignment.model_label == label
     assert assignment.reasoning_effort == effort
     validate_assignment(
         profile,
@@ -82,6 +87,18 @@ def test_admitted_assignment_is_role_bound(profile, provider, family, effort):
         ("raphael-builder", "openai-codex", "gpt-5.6-sol", "max", True),
         ("raphael-verifier", "anthropic", "claude-sonnet-5", "max", True),
         ("raphael-verifier", "anthropic", "claude-opus-5", "high", True),
+        ("raphael-verifier", "anthropic", "claude-opus-5-5", "high", True),
+        # A superseded base route is history for lock validation only; it is
+        # never a configurable profile route again.
+        ("default", "anthropic", "claude-opus-5", "max", True),
+        ("default", "openai-codex", "gpt-5.6-sol", "max", True),
+        ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max", True),
+        ("raphael-builder", "anthropic", "claude-sonnet-5", "max", True),
+        # The deep-only Astra lane is not a base route, and business routine
+        # keeps its owner-approved effort rather than drifting up to max.
+        ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh", True),
+        ("raphael-business", "anthropic", "claude-sonnet-5", "max", True),
+        ("raphael-business", "openai-codex", "gpt-6-sol", "max", True),
     ],
 )
 def test_unadmitted_or_fallback_capable_assignment_fails_closed(
@@ -97,6 +114,80 @@ def test_unadmitted_or_fallback_capable_assignment_fails_closed(
         )
 
 
+# The owner-approved effective policy: (profile, provider) -> routine, deep, as
+# (model, model_label, reasoning_effort).
+_OPUS_55 = ("claude-opus-5-5", "Claude Opus 5.5", "max")
+_OPUS_55_WORKER = ("claude-opus-5-5", "Claude Opus 5.5 + Claude Code", "max")
+_SOL_6 = ("gpt-6-sol", "GPT-6 Sol", "max")
+_APPROVED_ROUTES = {
+    ("default", "anthropic"): (_OPUS_55, _OPUS_55),
+    ("raphael-planner", "anthropic"): (_OPUS_55, _OPUS_55),
+    ("raphael-designer", "anthropic"): (_OPUS_55, _OPUS_55),
+    ("raphael-claude-worker", "anthropic"): (_OPUS_55_WORKER, _OPUS_55_WORKER),
+    ("raphael-builder", "anthropic"): (_OPUS_55, _OPUS_55),
+    ("raphael-business", "anthropic"): (
+        ("claude-sonnet-5", "Claude Sonnet 5", "high"), _OPUS_55,
+    ),
+    ("raphael-verifier", "openai-codex"): (
+        _SOL_6, ("gpt-6-astra", "GPT-6 Astra", "xhigh"),
+    ),
+    ("raphael-verifier", "anthropic"): (_OPUS_55, _OPUS_55),
+    ("default", "openai-codex"): (_SOL_6, _SOL_6),
+    ("raphael-planner", "openai-codex"): (_SOL_6, _SOL_6),
+    ("raphael-business", "openai-codex"): (
+        ("gpt-5.6-terra", "GPT-5.6 Terra", "max"),
+        ("gpt-5.6-terra", "GPT-5.6 Terra", "max"),
+    ),
+}
+
+
+@pytest.mark.parametrize(("profile", "provider"), sorted(_APPROVED_ROUTES))
+def test_every_task_route_resolves_to_the_approved_effective_policy(profile, provider):
+    routine_route, deep_route = _APPROVED_ROUTES[(profile, provider)]
+    for tier, (model, label, effort) in (
+        ("routine", routine_route), ("deep", deep_route),
+    ):
+        route = task_assignment_for(profile, provider, tier)
+        assert (route.profile, route.provider) == (profile, provider)
+        assert (route.model, route.model_label, route.reasoning_effort) == (
+            model, label, effort,
+        ), tier
+        # Every approved route is also exactly what a new lock may bind.
+        assert model_policy.mint_policy_lock(
+            profile, provider, model, effort, tier,
+        ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
+        # ...and the runtime validator admits it for the role.
+        assert validate_runtime_assignment(
+            profile, provider, model, effort, disable_fallbacks=True,
+        ) == route
+    # The routine route is the role's configured base route.
+    assert task_assignment_for(profile, provider, "routine") == assignment_for(
+        profile, provider
+    )
+
+
+def test_the_matrix_admits_no_new_role_provider_pairs():
+    """The migration re-points existing lanes; it never wakes a new one."""
+    assert set(model_policy._ASSIGNMENTS) == set(_APPROVED_ROUTES)
+    # A deep route exists only where a base route is already admitted.
+    assert set(model_policy._DEEP_ROUTES) <= set(model_policy._ASSIGNMENTS)
+
+
+def test_preserved_efforts_survive_the_migration():
+    """Base/task work stays at max; business routine stays at high."""
+    for profile, provider in _APPROVED_ROUTES:
+        if (profile, provider) == ("raphael-business", "anthropic"):
+            continue
+        assert assignment_for(profile, provider).reasoning_effort == "max"
+        assert task_assignment_for(profile, provider, "routine").reasoning_effort == "max"
+    business = task_assignment_for("raphael-business", "anthropic", "routine")
+    assert (business.model, business.reasoning_effort) == ("claude-sonnet-5", "high")
+    business_deep = task_assignment_for("raphael-business", "anthropic", "deep")
+    assert (business_deep.model, business_deep.reasoning_effort) == (
+        "claude-opus-5-5", "max",
+    )
+
+
 def test_task_route_uses_opus_max_only_for_deep_anthropic_work():
     routine = task_assignment_for(
         "raphael-claude-worker", "anthropic", "routine"
@@ -104,14 +195,20 @@ def test_task_route_uses_opus_max_only_for_deep_anthropic_work():
     deep = task_assignment_for("raphael-claude-worker", "anthropic", "deep")
 
     assert (routine.model, routine.reasoning_effort) == (
-        "claude-sonnet-5",
+        "claude-opus-5-5",
         "max",
     )
-    assert (deep.model, deep.reasoning_effort) == ("claude-opus-5", "max")
-    assert deep.model_label == "Claude Opus 5 + Claude Code"
+    assert (deep.model, deep.reasoning_effort) == ("claude-opus-5-5", "max")
+    assert deep.model_label == "Claude Opus 5.5 + Claude Code"
+    # The OpenAI family has exactly one deep lane: the verifier's Astra route.
+    # Every other OpenAI pair keeps its base route for deep work.
+    for profile in ("default", "raphael-planner", "raphael-business"):
+        assert task_assignment_for(
+            profile, "openai-codex", "deep"
+        ) == assignment_for(profile, "openai-codex")
     assert task_assignment_for(
         "raphael-verifier", "openai-codex", "deep"
-    ) == assignment_for("raphael-verifier", "openai-codex")
+    ) != assignment_for("raphael-verifier", "openai-codex")
 
 
 @pytest.mark.parametrize("tier", ["routine", "deep"])
@@ -126,17 +223,22 @@ def test_no_builder_lane_leaves_the_claude_family(tier):
         assignment_for("raphael-builder", "openai-codex")
     with pytest.raises(ValueError):
         task_assignment_for("raphael-builder", "openai-codex", tier)
-    with pytest.raises(ValueError):
-        model_policy.mint_policy_lock(
-            "raphael-builder", "openai-codex", "gpt-5.6-terra", "max", tier,
-        )
-    # The admitted deep builder lane is Claude Opus 5 at max, and nothing else.
+    for model, effort in (
+        ("gpt-5.6-terra", "max"),
+        ("gpt-6-sol", "max"),
+        ("gpt-6-astra", "xhigh"),
+    ):
+        with pytest.raises(ValueError):
+            model_policy.mint_policy_lock(
+                "raphael-builder", "openai-codex", model, effort, tier,
+            )
+    # The admitted deep builder lane is Claude Opus 5.5 at max, and nothing else.
     deep = task_assignment_for("raphael-builder", "anthropic", "deep")
     assert (deep.provider, deep.model, deep.reasoning_effort) == (
-        "anthropic", "claude-opus-5", "max",
+        "anthropic", "claude-opus-5-5", "max",
     )
     assert model_policy.mint_policy_lock(
-        "raphael-builder", "anthropic", "claude-opus-5", "max", "deep",
+        "raphael-builder", "anthropic", "claude-opus-5-5", "max", "deep",
     ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
 
 
@@ -144,30 +246,188 @@ def test_no_builder_lane_leaves_the_claude_family(tier):
 def test_independent_review_recommends_openai_and_admits_only_the_claude_security_lane(tier):
     """The verifier stays independent of the builder's lane.
 
-    The OpenAI route remains the recommended one; the named Claude Security
-    lane resolves to Claude Opus 5 / max on every tier and is never presented
-    as recommended, and the builder's Sonnet lane is refused.
+    The OpenAI route remains the recommended one (GPT-6 Sol / max for routine
+    work, GPT-6 Astra / xhigh for deep work); the named Claude Security lane
+    resolves to Claude Opus 5.5 / max on every tier and is never presented as
+    recommended, and a Sonnet lane is refused.
     """
     claude_lane = assignment_for("raphael-verifier", "anthropic")
     assert (claude_lane.model, claude_lane.reasoning_effort, claude_lane.recommended) == (
-        "claude-opus-5", "max", False,
+        "claude-opus-5-5", "max", False,
     )
     assert task_assignment_for("raphael-verifier", "anthropic", tier) == claude_lane
     assert model_policy.mint_policy_lock(
-        "raphael-verifier", "anthropic", "claude-opus-5", "max", tier,
+        "raphael-verifier", "anthropic", "claude-opus-5-5", "max", tier,
     ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
     with pytest.raises(ValueError):
         model_policy.mint_policy_lock(
             "raphael-verifier", "anthropic", "claude-sonnet-5", "max", tier,
         )
+    expected = {
+        "routine": ("gpt-6-sol", "max"),
+        "deep": ("gpt-6-astra", "xhigh"),
+    }[tier]
     verifier = task_assignment_for("raphael-verifier", "openai-codex", tier)
     assert verifier.recommended is True
     assert (verifier.provider, verifier.model, verifier.reasoning_effort) == (
-        "openai-codex", "gpt-5.6-sol", "max",
+        "openai-codex", *expected,
     )
     assert model_policy.mint_policy_lock(
-        "raphael-verifier", "openai-codex", "gpt-5.6-sol", "max", tier,
+        "raphael-verifier", "openai-codex", *expected, tier,
     ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
+    # Each OpenAI verifier lane belongs to its own tier only.
+    other = {"routine": "deep", "deep": "routine"}[tier]
+    with pytest.raises(ValueError):
+        model_policy.mint_policy_lock(
+            "raphael-verifier", "openai-codex", *expected, other,
+        )
+
+
+def _sealed(
+    assignee, provider, model, effort, tier,
+    *, authority="raphael", version=1,
+):
+    """A lock in the stored ``<authority>:v<version>:<digest>`` format.
+
+    Computed here from the documented canonical form rather than through the
+    module, so it is byte-for-byte what an earlier build stored for a route —
+    including one the current matrix no longer mints.
+    """
+    canonical = json.dumps(
+        {
+            "authority": authority,
+            "version": version,
+            "assignee": assignee,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": effort,
+            "execution_tier": tier,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"{authority}:v{version}:{digest}"
+
+
+# Routes minted under the previous matrix (Opus 5, the changed-profile Sonnet 5
+# lanes, and every Sol 5.6 lane), each on the role/provider/tier it was
+# admitted for.
+_HISTORICAL_ROUTES = [
+    ("default", "anthropic", "claude-opus-5", "max", "routine"),
+    ("default", "anthropic", "claude-opus-5", "max", "deep"),
+    ("raphael-designer", "anthropic", "claude-opus-5", "max", "routine"),
+    ("raphael-planner", "anthropic", "claude-opus-5", "max", "deep"),
+    ("raphael-business", "anthropic", "claude-opus-5", "max", "deep"),
+    ("raphael-claude-worker", "anthropic", "claude-opus-5", "max", "deep"),
+    ("raphael-builder", "anthropic", "claude-opus-5", "max", "deep"),
+    ("raphael-verifier", "anthropic", "claude-opus-5", "max", "routine"),
+    ("raphael-planner", "anthropic", "claude-sonnet-5", "max", "routine"),
+    ("raphael-claude-worker", "anthropic", "claude-sonnet-5", "max", "routine"),
+    ("raphael-builder", "anthropic", "claude-sonnet-5", "max", "routine"),
+    ("default", "openai-codex", "gpt-5.6-sol", "max", "routine"),
+    ("raphael-planner", "openai-codex", "gpt-5.6-sol", "max", "deep"),
+    ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max", "routine"),
+    ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max", "deep"),
+]
+
+
+@pytest.mark.parametrize("route", _HISTORICAL_ROUTES)
+def test_a_historical_seal_still_verifies_but_can_no_longer_be_minted(route):
+    """A migration never invalidates an already-claimed receipt, and never
+    lets a superseded route become a new selection."""
+    lock = _sealed(*route)
+    assert model_policy.policy_lock_error(lock, *route) is None
+    with pytest.raises(ValueError):
+        model_policy.mint_policy_lock(*route)
+
+
+@pytest.mark.parametrize("route", [
+    ("raphael-business", "anthropic", "claude-sonnet-5", "high", "routine"),
+    ("raphael-business", "openai-codex", "gpt-5.6-terra", "max", "deep"),
+    ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh", "deep"),
+    ("raphael-builder", "anthropic", "claude-opus-5-5", "max", "routine"),
+])
+def test_a_current_route_mints_the_same_seal_it_validates(route):
+    lock = model_policy.mint_policy_lock(*route)
+    assert lock == _sealed(*route)
+    assert model_policy.policy_lock_error(lock, *route) is None
+
+
+def test_a_tampered_or_foreign_seal_still_fails_closed():
+    route = ("raphael-builder", "anthropic", "claude-opus-5", "max", "deep")
+    lock = _sealed(*route)
+    assert model_policy.policy_lock_error(lock, *route) is None
+
+    head, digest = lock.rsplit(":", 1)
+    flipped = f"{head}:{('0' if digest[0] != '0' else '1')}{digest[1:]}"
+    assert model_policy.policy_lock_error(flipped, *route) == (
+        "policy lock digest does not bind this route"
+    )
+    # A valid seal does not transfer to any other field of the route.
+    assert model_policy.policy_lock_error(
+        lock, "raphael-builder", "anthropic", "claude-opus-5-5", "max", "deep",
+    ) == "policy lock digest does not bind this route"
+    assert model_policy.policy_lock_error(
+        lock, "raphael-claude-worker", "anthropic", "claude-opus-5", "max", "deep",
+    ) == "policy lock digest does not bind this route"
+
+    foreign = _sealed(*route, authority="mallory")
+    assert "unknown authority" in model_policy.policy_lock_error(foreign, *route)
+    future = _sealed(*route, version=2)
+    assert "stale" in model_policy.policy_lock_error(future, *route)
+    assert model_policy.policy_lock_error(
+        "raphael:v1:not-a-digest", *route
+    ) == "policy lock provenance is unreadable"
+    # An invalid lock is never treated as absent.
+    assert model_policy.policy_lock_error("", *route) == "policy lock is missing"
+
+
+@pytest.mark.parametrize("route", [
+    # Another role's historical route: Sonnet 5 / max was the planner's
+    # routine lane, never business's (business routine was and is high).
+    ("raphael-business", "anthropic", "claude-sonnet-5", "max", "routine"),
+    # Business's Terra lane is not a verifier route.
+    ("raphael-verifier", "openai-codex", "gpt-5.6-terra", "max", "routine"),
+    # A historical route on a tier it was never admitted on.
+    ("raphael-business", "anthropic", "claude-opus-5", "max", "routine"),
+    ("raphael-claude-worker", "anthropic", "claude-sonnet-5", "max", "deep"),
+    # The verifier's Astra lane is deep-only, and deep-only for the verifier.
+    ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh", "routine"),
+    ("raphael-planner", "openai-codex", "gpt-6-astra", "xhigh", "deep"),
+    # Superseded model at an effort it never had.
+    ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "xhigh", "routine"),
+])
+def test_a_seal_for_a_route_never_admitted_there_is_rejected(route):
+    error = model_policy.policy_lock_error(_sealed(*route), *route)
+    assert error is not None
+    assert "is not the admitted route for" in error
+    with pytest.raises(ValueError):
+        model_policy.mint_policy_lock(*route)
+
+
+@pytest.mark.parametrize(("route", "fragment"), [
+    (("raphael-builder", "anthropic", "claude-fable-5", "max", "deep"),
+     "forbidden model"),
+    (("default", "anthropic", "claude-opus-ultracode-1", "max", "routine"),
+     "forbidden model"),
+    (("raphael-builder", "anthropic", "claude-opus-5-5", "ultra", "deep"),
+     "forbidden reasoning effort"),
+    (("raphael-builder", "anthropic", "claude-opus-5", "ultra", "deep"),
+     "forbidden reasoning effort"),
+    (("raphael-builder", "openai-codex", "gpt-5.6-sol", "max", "deep"),
+     "no admitted authority"),
+    (("other-profile", "anthropic", "claude-opus-5", "max", "deep"),
+     "no admitted authority"),
+    (("raphael-builder", "anthropic", "claude-opus-5", "max", "ultra"),
+     "no admitted authority"),
+])
+def test_forbidden_and_unadmitted_seals_are_rejected(route, fragment):
+    error = model_policy.policy_lock_error(_sealed(*route), *route)
+    assert error is not None and fragment in error
+    with pytest.raises(ValueError):
+        model_policy.mint_policy_lock(*route)
 
 
 def test_removed_lanes_are_not_exposed_as_selectable_options():
@@ -177,12 +437,16 @@ def test_removed_lanes_are_not_exposed_as_selectable_options():
             {
                 "slug": "anthropic",
                 "authenticated": True,
-                "models": ["claude-sonnet-5", "claude-opus-5"],
+                "models": [
+                    "claude-sonnet-5", "claude-opus-5", "claude-opus-5-5",
+                ],
             },
             {
                 "slug": "openai-codex",
                 "authenticated": True,
-                "models": ["gpt-5.6-sol", "gpt-5.6-terra"],
+                "models": [
+                    "gpt-5.6-sol", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-terra",
+                ],
             },
         ]
     }
@@ -191,15 +455,21 @@ def test_removed_lanes_are_not_exposed_as_selectable_options():
     assert by_slug["openai-codex"]["assignment"] is None
     assert by_slug["openai-codex"]["task_routes"] is None
     assert by_slug["openai-codex"]["models"] == []
-    assert by_slug["anthropic"]["models"] == ["claude-sonnet-5", "claude-opus-5"]
+    # Superseded models are history, not options.
+    assert by_slug["anthropic"]["models"] == ["claude-opus-5-5"]
 
     verifier = project_options_payload(native, profile="raphael-verifier")
     by_slug = {row["slug"]: row for row in verifier["providers"]}
-    assert by_slug["anthropic"]["assignment"]["model"] == "claude-opus-5"
+    assert by_slug["anthropic"]["assignment"]["model"] == "claude-opus-5-5"
     assert by_slug["anthropic"]["assignment"]["recommended"] is False
-    assert by_slug["anthropic"]["models"] == ["claude-opus-5"]
+    assert by_slug["anthropic"]["models"] == ["claude-opus-5-5"]
     assert by_slug["openai-codex"]["assignment"]["recommended"] is True
-    assert by_slug["openai-codex"]["models"] == ["gpt-5.6-sol"]
+    assert by_slug["openai-codex"]["models"] == ["gpt-6-sol", "gpt-6-astra"]
+    assert by_slug["openai-codex"]["task_routes"]["routine"]["model"] == "gpt-6-sol"
+    assert by_slug["openai-codex"]["task_routes"]["deep"]["model"] == "gpt-6-astra"
+    assert (
+        by_slug["openai-codex"]["task_routes"]["deep"]["reasoning_effort"] == "xhigh"
+    )
 
 
 def test_task_route_rejects_invented_tiers_and_forbidden_runtime_choices():
@@ -217,9 +487,28 @@ def test_task_route_rejects_invented_tiers_and_forbidden_runtime_choices():
         validate_runtime_assignment(
             "raphael-claude-worker",
             "anthropic",
-            "claude-opus-5",
+            "claude-opus-5-5",
             "max",
             disable_fallbacks=False,
+        )
+    # A superseded route is never a live runtime route, even though a lock
+    # minted for it while it was current still verifies.
+    for model in ("claude-opus-5", "claude-sonnet-5"):
+        with pytest.raises(ValueError):
+            validate_runtime_assignment(
+                "raphael-claude-worker",
+                "anthropic",
+                model,
+                "max",
+                disable_fallbacks=True,
+            )
+    with pytest.raises(ValueError):
+        validate_runtime_assignment(
+            "raphael-verifier",
+            "openai-codex",
+            "gpt-5.6-sol",
+            "max",
+            disable_fallbacks=True,
         )
 
 
@@ -233,6 +522,7 @@ def test_model_options_project_one_canonical_base_and_task_routes():
                     "models": [
                         "claude-sonnet-5",
                         "claude-opus-5",
+                        "claude-opus-5-5",
                         "claude-fable-5",
                         "claude-opus-ultracode-1",
                     ],
@@ -240,7 +530,7 @@ def test_model_options_project_one_canonical_base_and_task_routes():
                 {
                     "slug": "openai-codex",
                     "authenticated": True,
-                    "models": ["gpt-5.6-sol", "gpt-5.6-terra"],
+                    "models": ["gpt-5.6-sol", "gpt-6-sol", "gpt-5.6-terra"],
                 },
             ]
         },
@@ -249,13 +539,16 @@ def test_model_options_project_one_canonical_base_and_task_routes():
 
     assert result["profile"] == "raphael-claude-worker"
     anthropic = result["providers"][0]
-    assert anthropic["models"] == ["claude-sonnet-5", "claude-opus-5"]
-    assert anthropic["assignment"]["model"] == "claude-sonnet-5"
+    assert anthropic["models"] == ["claude-opus-5-5"]
+    assert anthropic["assignment"]["model"] == "claude-opus-5-5"
     # Workspace consumes this as a closed set of exactly the two task classes,
     # each carrying the same fields as the base assignment.
     assert set(anthropic["task_routes"]) == {"routine", "deep"}
-    assert anthropic["task_routes"]["routine"]["model"] == "claude-sonnet-5"
-    assert anthropic["task_routes"]["deep"]["model"] == "claude-opus-5"
+    assert anthropic["task_routes"]["routine"]["model"] == "claude-opus-5-5"
+    assert anthropic["task_routes"]["deep"]["model"] == "claude-opus-5-5"
+    assert anthropic["task_routes"]["deep"]["model_label"] == (
+        "Claude Opus 5.5 + Claude Code"
+    )
     for route in anthropic["task_routes"].values():
         assert set(route) == set(anthropic["assignment"])
         assert (route["profile"], route["provider"]) == (
@@ -281,7 +574,7 @@ def test_new_work_uses_the_provider_currently_selected_for_its_role(
         lambda: {
             "model": {
                 "provider": "openai-codex",
-                "default": "gpt-5.6-sol",
+                "default": "gpt-6-sol",
             },
             "agent": {"reasoning_effort": "max"},
             "fallback_providers": [],
@@ -300,9 +593,14 @@ def test_new_work_uses_the_provider_currently_selected_for_its_role(
     assert configured.provider == "openai-codex"
     assert (deep.provider, deep.model, deep.reasoning_effort) == (
         "openai-codex",
-        "gpt-5.6-sol",
+        "gpt-6-sol",
         "max",
     )
+    # The verifier's deep work on the same provider moves to its Astra lane.
+    verifier_deep = resolve_task_assignment("raphael-verifier", "deep")
+    assert (
+        verifier_deep.provider, verifier_deep.model, verifier_deep.reasoning_effort
+    ) == ("openai-codex", "gpt-6-astra", "xhigh")
 
 
 def test_machine_request_is_bound_to_the_models_provider():
@@ -493,7 +791,7 @@ async def test_profile_model_machine_update_returns_exact_applied_assignment(
 ):
     body = ProfileModelUpdate(
         provider="anthropic",
-        model="claude-opus-5",
+        model="claude-opus-5-5",
         reasoning_effort="max",
         disable_fallbacks=True,
     )
@@ -505,7 +803,7 @@ async def test_profile_model_machine_update_returns_exact_applied_assignment(
     assert result == {
         "ok": True,
         "provider": "anthropic",
-        "model": "claude-opus-5",
+        "model": "claude-opus-5-5",
         "reasoning_effort": "max",
         # The Hermes-owned route revision the caller must echo back on its
         # next conditional write.
@@ -518,7 +816,7 @@ async def test_profile_model_machine_update_returns_exact_applied_assignment(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("raw_body", [
-    {"provider": "anthropic", "model": "claude-opus-5", "reasoning_effort": "max",
+    {"provider": "anthropic", "model": "claude-opus-5-5", "reasoning_effort": "max",
      "disable_fallbacks": True, "expected_revision": None},
 ])
 async def test_present_but_null_expected_revision_is_refused_before_any_write(
@@ -546,7 +844,7 @@ async def test_present_but_null_expected_revision_is_refused_before_any_write(
 async def test_omitted_expected_revision_stays_supported(machine_route_env):
     """Documented compatibility: not sending the field is still allowed."""
     body = ProfileModelUpdate(
-        provider="anthropic", model="claude-opus-5",
+        provider="anthropic", model="claude-opus-5-5",
         reasoning_effort="max", disable_fallbacks=True,
     )
     assert "expected_revision" not in body.model_fields_set
@@ -564,7 +862,7 @@ async def test_stale_and_exact_expected_revision_behave_as_a_compare_and_swap(
     first = await profile_routes.update_profile_model_endpoint(
         "default",
         ProfileModelUpdate(
-            provider="anthropic", model="claude-opus-5",
+            provider="anthropic", model="claude-opus-5-5",
             reasoning_effort="max", disable_fallbacks=True,
         ),
         _machine_request(),
@@ -573,7 +871,7 @@ async def test_stale_and_exact_expected_revision_behave_as_a_compare_and_swap(
     second = await profile_routes.update_profile_model_endpoint(
         "default",
         ProfileModelUpdate(
-            provider="openai-codex", model="gpt-5.6-sol",
+            provider="openai-codex", model="gpt-6-sol",
             reasoning_effort="max", disable_fallbacks=True,
             expected_revision=first["revision"],
         ),
@@ -585,7 +883,7 @@ async def test_stale_and_exact_expected_revision_behave_as_a_compare_and_swap(
         await profile_routes.update_profile_model_endpoint(
             "default",
             ProfileModelUpdate(
-                provider="anthropic", model="claude-opus-5",
+                provider="anthropic", model="claude-opus-5-5",
                 reasoning_effort="max", disable_fallbacks=True,
                 expected_revision=first["revision"],
             ),
@@ -614,7 +912,7 @@ async def test_a_post_write_failure_restores_config_and_enrollment(
     first = await profile_routes.update_profile_model_endpoint(
         "default",
         ProfileModelUpdate(
-            provider="anthropic", model="claude-opus-5",
+            provider="anthropic", model="claude-opus-5-5",
             reasoning_effort="max", disable_fallbacks=True,
         ),
         _machine_request(),
@@ -636,7 +934,7 @@ async def test_a_post_write_failure_restores_config_and_enrollment(
         await profile_routes.update_profile_model_endpoint(
             "default",
             ProfileModelUpdate(
-                provider="openai-codex", model="gpt-5.6-sol",
+                provider="openai-codex", model="gpt-6-sol",
                 reasoning_effort="max", disable_fallbacks=True,
                 expected_revision=first["revision"],
             ),

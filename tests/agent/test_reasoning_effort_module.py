@@ -160,6 +160,51 @@ class TestCodexVocabulary:
         assert clamp_effort("ultra", CODEX_LEGACY_EFFORTS) == "xhigh"
         assert clamp_effort("minimal", CODEX_LEGACY_EFFORTS) == "low"
 
+    @pytest.mark.parametrize(
+        "model", ["gpt-6-sol", "openai/gpt-6-sol", "GPT-6-Sol", "gpt-6-sol-900k"]
+    )
+    def test_gpt6_sol_keeps_max_instead_of_silently_clamping(self, model):
+        """GPT-6 Sol speaks the gpt-5.6 vocabulary. On the legacy set a
+        requested 'max' would silently become 'xhigh' — a reasoning downgrade."""
+        from agent.reasoning_effort import codex_supported_efforts
+
+        assert codex_supported_efforts(model) is CODEX_GPT56_EFFORTS
+        assert clamp_effort("max", codex_supported_efforts(model)) == "max"
+        assert clamp_effort("xhigh", codex_supported_efforts(model)) == "xhigh"
+        # Never-escalate still holds: ultra caps at max, minimal floors at low.
+        assert clamp_effort("ultra", codex_supported_efforts(model)) == "max"
+        assert clamp_effort("minimal", codex_supported_efforts(model)) == "low"
+
+    @pytest.mark.parametrize(
+        "model", ["gpt-6-astra", "gpt-6-astra-900k", "openai/gpt-6-astra"]
+    )
+    def test_astra_keeps_its_own_vocabulary(self, model):
+        """Astra is resolved before any generation marker and is unchanged:
+        no disable level, max supported."""
+        from agent.reasoning_effort import (
+            CODEX_ASTRA_EFFORTS,
+            codex_supported_efforts,
+            is_astra_model,
+        )
+
+        assert CODEX_ASTRA_EFFORTS == ("low", "medium", "high", "xhigh", "max")
+        assert is_astra_model(model) is True
+        assert codex_supported_efforts(model) is CODEX_ASTRA_EFFORTS
+        assert clamp_effort("xhigh", codex_supported_efforts(model)) == "xhigh"
+        assert clamp_effort("max", codex_supported_efforts(model)) == "max"
+        assert is_astra_model("gpt-6-sol") is False
+
+    @pytest.mark.parametrize(
+        "model", ["gpt-5.5", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-6-astra-pro", None]
+    )
+    def test_older_and_unverified_codex_models_stay_legacy(self, model):
+        """Only the verified generations gain max; an id that merely shares
+        the gpt-6 prefix is not rerouted."""
+        from agent.reasoning_effort import CODEX_LEGACY_EFFORTS, codex_supported_efforts
+
+        assert codex_supported_efforts(model) is CODEX_LEGACY_EFFORTS
+        assert clamp_effort("max", codex_supported_efforts(model)) == "xhigh"
+
 
 class TestRequestedEffort:
     def test_extracts_effort(self):

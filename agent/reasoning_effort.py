@@ -28,9 +28,12 @@ EFFORT_LADDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "x
 OPENAI_COMPAT_WIRE_EFFORTS: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 #: OpenAI/Codex Responses per model generation (live-verified): ``minimal`` is rejected by
-#: both (clamps to low); ``max`` is gpt-5.6-only.
+#: both (clamps to low); ``max`` arrived with gpt-5.6 and GPT-6 Sol speaks the same set.
 CODEX_GPT56_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
 CODEX_LEGACY_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh")
+# Slug markers of the Codex generations that accept ``max``. Deliberately not a bare ``gpt-6``:
+# Astra is resolved first by ``is_astra_model`` and other GPT-6 ids stay legacy until verified.
+_CODEX_MAX_EFFORT_MARKERS: tuple[str, ...] = ("gpt-5.6", "gpt-6-sol")
 # GPT-6 Astra is account-gated and its Responses API accepts no disable/minimal
 # wire level; callers normalize those requests to ``low`` at the transport boundary.
 CODEX_ASTRA_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
@@ -93,7 +96,8 @@ def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set for an OpenAI/Codex Responses model."""
     if is_astra_model(model):
         return CODEX_ASTRA_EFFORTS
-    return CODEX_GPT56_EFFORTS if "gpt-5.6" in (model or "").lower() else CODEX_LEGACY_EFFORTS
+    m = (model or "").lower()
+    return CODEX_GPT56_EFFORTS if any(marker in m for marker in _CODEX_MAX_EFFORT_MARKERS) else CODEX_LEGACY_EFFORTS
 
 
 def kimi_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
