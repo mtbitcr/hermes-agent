@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import itertools
 import time
 import types
 import unittest.mock
@@ -2734,31 +2735,52 @@ def test_worker_context_caps_parent_results_by_completion_recency(kanban_home):
             assert pt.title in ctx
 
 
-def test_worker_context_parent_results_unchanged_at_or_under_cap(kanban_home):
-    """At or under ``_CTX_MAX_PARENT_RESULTS`` finished parents, every
-    parent still shows its full result, in the parent-id order the section
-    always had, and no overflow pointer line appears — regression guard for
-    the common case. Completion recency only decides WHICH parents stay
-    inlined once the cap is exceeded; it never reorders the section.
+def test_worker_context_parent_results_unchanged_at_or_under_cap(
+    kanban_home, monkeypatch
+):
+    """At or under ``_CTX_MAX_PARENT_RESULTS`` finished parents the assembled
+    context is byte-identical to what the pre-cap code produced for the same
+    fixture: the golden below was recorded on the released head e393b535
+    (before the cap existed) with pinned ids, a pinned clock that steps 100 s per completion and a fixed read time 21 minutes later. Completion
+    recency only decides WHICH parents stay inlined once the cap is
+    exceeded; it never reorders or reshapes the section.
     """
+    counter = itertools.count(1)
+    monkeypatch.setattr(kb, "_new_task_id", lambda: f"t_{next(counter):08x}")
+    monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_000)
+
     with kb.connect() as conn:
-        parent_ids = sorted(
-            kb.create_task(conn, title=f"parent-{i}") for i in range(3)
-        )
-        # Complete in parent-id order with real gaps, so a recency-first
-        # rendering would come out reversed and be caught below.
+        parent_ids = [kb.create_task(conn, title=f"parent-{i}") for i in range(3)]
         for i, pid in enumerate(parent_ids):
+            # Each parent finishes 100 s after the previous one, so a
+            # recency-first rendering would come out reversed.
+            monkeypatch.setattr(kb.time, "time", lambda t=1_700_000_000 + 100 * i: t)
             kb.complete_task(conn, pid, result=f"RESULT_MARKER_{pid}")
-            if i < len(parent_ids) - 1:
-                time.sleep(1.1)
 
         child = kb.create_task(conn, title="child", parents=parent_ids)
+        # Read 21 minutes later so the ages are fixed text, not a call count.
+        monkeypatch.setattr(kb.time, "time", lambda: 1_700_001_260)
         ctx = kb.build_worker_context(conn, child)
 
-        for pid in parent_ids:
-            assert f"RESULT_MARKER_{pid}" in ctx
+    assert ctx == _UNDER_CAP_GOLDEN
 
-        headings = [ctx.index(f"### {pid}") for pid in parent_ids]
-        assert headings == sorted(headings)
 
-        assert "more finished parent" not in ctx
+_UNDER_CAP_GOLDEN = (
+    '# Kanban task t_00000004: child\n'
+    '\n'
+    'Assignee: (unassigned)\n'
+    'Status:   ready\n'
+    'Workspace: scratch @ (unresolved)\n'
+    'Repository ownership: legacy exclusive whole repository\n'
+    '\n'
+    '## Parent task results\n'
+    "_Handoffs from upstream tasks, captured when each parent completed (see age below). These are point-in-time snapshots, not live state — if a result drives your current work and it's not recent, re-verify against the source before acting on it as current._\n"
+    '### t_00000001 (completed 21m ago)\n'
+    'RESULT_MARKER_t_00000001\n'
+    '\n'
+    '### t_00000002 (completed 19m ago)\n'
+    'RESULT_MARKER_t_00000002\n'
+    '\n'
+    '### t_00000003 (completed 17m ago)\n'
+    'RESULT_MARKER_t_00000003\n'
+)
