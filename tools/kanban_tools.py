@@ -1969,6 +1969,22 @@ def _handle_review_findings(args: dict, **kw) -> str:
         return run_err
     board = args.get("board")
     try:
+        from hermes_cli import kanban_db as kb
+        requested_board = kb._normalize_board_slug(board)
+        if requested_board:
+            try:
+                pinned_board = kb._normalize_board_slug(
+                    os.environ.get("HERMES_KANBAN_BOARD")
+                )
+            except ValueError:
+                pinned_board = None
+            if pinned_board and requested_board != pinned_board:
+                return tool_error(
+                    f"kanban_review_findings: board '{requested_board}' "
+                    f"does not match the board this worker is pinned to "
+                    f"('{pinned_board}'); refusing before any board "
+                    "database was opened"
+                )
         kb, conn = _connect(board=board)
         try:
             effective_board = _board_of_connection(kb, conn)

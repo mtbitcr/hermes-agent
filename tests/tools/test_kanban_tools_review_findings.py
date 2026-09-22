@@ -389,6 +389,88 @@ def test_matching_own_board_argument_still_approves(board):
     assert task.status == "done"
 
 
+def test_mismatched_board_argument_is_refused_before_any_connection(
+    board, monkeypatch
+):
+    """A mismatched explicit ``board`` must be refused before ``_connect``
+    is ever reached.
+
+    Every connection ``_connect`` opens is write-capable — it enables WAL
+    and, on first open, runs schema creation / additive migrations, and
+    even the already-initialized fast path still executes WAL and
+    persistence-related pragmas. A rejected explicit target must never
+    open a board at all, so this replaces ``_connect`` with a sentinel
+    that fails the test if it is ever reached for a foreign board.
+    """
+    kb, conn, tid, head, review = board
+    kb.create_board("different-review-board")
+
+    import tools.kanban_tools as kt
+    from tools.registry import registry
+
+    called = []
+
+    def _sentinel_connect(*args, **kwargs):
+        called.append((args, kwargs))
+        raise AssertionError(
+            "write-capable connect reached before refusal"
+        )
+
+    monkeypatch.setattr(kt, "_connect", _sentinel_connect)
+
+    out = json.loads(registry.dispatch("kanban_review_findings", {
+        "task_id": tid,
+        "findings": [],
+        "candidate_digest": head,
+        "board": "different-review-board",
+    }))
+
+    assert called == []
+    assert out.get("ok") is not True
+    assert out.get("error")
+
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "running"
+
+
+def test_matching_board_argument_still_opens_the_connection(
+    board, monkeypatch
+):
+    """The benign control: the worker's own pinned board slug is not a
+    mismatch and must still reach ``_connect`` and approve normally — the
+    new pre-connect gate refuses only a genuine mismatch.
+    """
+    kb, conn, tid, head, review = board
+
+    import tools.kanban_tools as kt
+    from tools.registry import registry
+
+    real_connect = kt._connect
+    called = []
+
+    def _recording_connect(*args, **kwargs):
+        called.append((args, kwargs))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(kt, "_connect", _recording_connect)
+
+    out = json.loads(registry.dispatch("kanban_review_findings", {
+        "task_id": tid,
+        "findings": [],
+        "candidate_digest": head,
+        "board": kb.DEFAULT_BOARD,
+    }))
+
+    assert called != []
+    assert out.get("ok") is True, out
+    assert out["outcome"] == "passed"
+
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "done"
+
+
 # ---------------------------------------------------------------------------
 # 8. Delegated-child context -> denial
 # ---------------------------------------------------------------------------
