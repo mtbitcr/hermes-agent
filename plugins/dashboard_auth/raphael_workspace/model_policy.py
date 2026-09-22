@@ -248,7 +248,24 @@ def validate_runtime_assignment(
     *,
     disable_fallbacks: bool,
 ) -> ModelAssignment:
-    """Accept a configured base route or an admitted task-specific route."""
+    """Accept a route this policy lineage admitted for a recorded unpinned run.
+
+    This is a history question, asked only when reading back an unpinned
+    runtime receipt: "was this fallback-free route one this role was allowed
+    to run on this provider?" Current authority answers it for the matrix as
+    it stands — the base route or its deep lane. Lineage authority answers it
+    for a run recorded before an approved matrix migration: the same
+    ``_SUPERSEDED_ROUTES`` fact that lets a historical seal verify, consulted
+    on both tiers because a run may have been routine or deep work. Without
+    it every pre-migration receipt silently read as unknown.
+
+    Reading history confers no live authority. ``mint_policy_lock``,
+    ``validate_assignment`` and :func:`resolve_task_assignment` never consult
+    the lineage, so a superseded route accepted here still cannot mint a
+    lock, be configured, or start new work. A fallback-capable run, a route
+    the lineage never admitted for this exact role/provider, an unknown pair,
+    an incomplete route and every never-admissible value are still refused.
+    """
     if disable_fallbacks is not True:
         raise ValueError("unadmitted Raphael model assignment")
     candidates = {
@@ -262,11 +279,27 @@ def validate_runtime_assignment(
             == candidate.reasoning_effort
         ):
             return candidate
+    for tier in ("routine", "deep"):
+        parts = _normalized_lock_parts(
+            profile, provider, model, reasoning_effort, tier
+        )
+        if _route_authority_error(*parts, admit_superseded=True) is None:
+            assignee, provider_id, model_id, effort, _tier = parts
+            # Never recommended: a superseded route describes what a past run
+            # was allowed to use, not something anyone should select.
+            return ModelAssignment(
+                profile=assignee,
+                provider=provider_id,
+                model=model_id,
+                model_label=model_id,
+                reasoning_effort=effort,
+                recommended=False,
+            )
     raise ValueError("unadmitted Raphael model assignment")
 
 
-def configured_assignment_for(profile: str) -> ModelAssignment:
-    """Read and validate the profile's current native, fallback-free route."""
+def _configured_route(profile: str) -> tuple[str, str, str, bool]:
+    """Read ``(provider, model, effort, fallbacks_disabled)`` from native config."""
     from hermes_cli.config import load_config_readonly
     from hermes_cli.profiles import get_profile_dir
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -290,18 +323,103 @@ def configured_assignment_for(profile: str) -> ModelAssignment:
             or (isinstance(fallback_model, str) and not fallback_model.strip())
         )
     )
-    return validate_assignment(
-        profile,
+    return (
         str(model_config.get("provider") or ""),
         str(model_config.get("default") or model_config.get("model") or ""),
         str(agent_config.get("reasoning_effort") or ""),
-        disable_fallbacks=fallbacks_disabled,
+        fallbacks_disabled,
     )
 
 
+def _superseded_configured_assignment(
+    profile: str,
+    provider: str,
+    model: str,
+    reasoning_effort: str,
+    *,
+    disable_fallbacks: bool,
+) -> Optional[ModelAssignment]:
+    """Return the superseded base route this lineage admitted here, else None.
+
+    Lineage authority, not current authority: the answer is "this policy once
+    admitted exactly this fallback-free route as this role's base route on
+    this provider", the same ``_SUPERSEDED_ROUTES`` fact that lets a historical
+    seal verify. A configured route is the role's base assignment, which is
+    exactly its routine task route, so only the routine lineage can vouch for
+    it — a superseded deep lane was never a configured route and does not
+    become one here. Every never-admissible value, unknown pair and incomplete
+    route is refused by the same checks lock validation applies.
+    """
+    if disable_fallbacks is not True:
+        return None
+    parts = _normalized_lock_parts(
+        profile, provider, model, reasoning_effort, "routine"
+    )
+    if _route_authority_error(*parts, admit_superseded=True) is not None:
+        return None
+    assignee, provider, model, reasoning_effort, _tier = parts
+    # Never recommended: a superseded route is something existing work may be
+    # held to, not something anyone should select.
+    return ModelAssignment(
+        profile=assignee,
+        provider=provider,
+        model=model,
+        model_label=model,
+        reasoning_effort=reasoning_effort,
+        recommended=False,
+    )
+
+
+def configured_assignment_for(profile: str) -> ModelAssignment:
+    """Read the profile's native, fallback-free route and prove its authority.
+
+    The question this answers is "which approved route is this role's existing
+    work on right now", which the rollout fence asks immediately BEFORE a
+    route change so it can pin that work. During an approved matrix migration
+    the role's on-disk route is, by definition, the superseded one, so a
+    current-only read here refused the very change that moves the role onto
+    the new route — the governed old->new transition dead-locked at 409.
+
+    So the current admitted base route is accepted, and so is a base route
+    this policy lineage admitted for this exact role/provider and has since
+    superseded. Anything the lineage never admitted there, and any route that
+    still allows a fallback, is refused exactly as before.
+
+    Reading is not minting. A superseded route returned here confers no new
+    authority: ``mint_policy_lock`` never consults the lineage, so work the
+    fence tries to pin onto it gets no lock and is parked for re-approval
+    rather than left runnable, and :func:`resolve_task_assignment` refuses new
+    work until the role is on the current route.
+    """
+    provider, model, effort, fallbacks_disabled = _configured_route(profile)
+    try:
+        return validate_assignment(
+            profile, provider, model, effort, disable_fallbacks=fallbacks_disabled,
+        )
+    except ValueError:
+        superseded = _superseded_configured_assignment(
+            profile, provider, model, effort, disable_fallbacks=fallbacks_disabled,
+        )
+        if superseded is None:
+            raise
+        return superseded
+
+
 def resolve_task_assignment(profile: str, execution_tier: str) -> ModelAssignment:
-    """Resolve a new task against the provider selected for its role."""
+    """Resolve a new task against the provider selected for its role.
+
+    New work is a current-authority question, so the configured route must be
+    the one this policy admits RIGHT NOW. The configured read also admits a
+    superseded route so existing work can be pinned to it; a role still on
+    one gets no new task until its route is approved again.
+    """
     configured = configured_assignment_for(profile)
+    current = assignment_for(profile, configured.provider)
+    if (configured.model, configured.reasoning_effort) != (
+        current.model,
+        current.reasoning_effort,
+    ):
+        raise ValueError("unadmitted Raphael model assignment")
     return task_assignment_for(profile, configured.provider, execution_tier)
 
 

@@ -491,25 +491,23 @@ def test_task_route_rejects_invented_tiers_and_forbidden_runtime_choices():
             "max",
             disable_fallbacks=False,
         )
-    # A superseded route is never a live runtime route, even though a lock
-    # minted for it while it was current still verifies.
-    for model in ("claude-opus-5", "claude-sonnet-5"):
+    # A superseded route is never a live route: a past run recorded on it
+    # still reads back, but it can mint no lock and is no base assignment.
+    for profile, provider, model in (
+        ("raphael-claude-worker", "anthropic", "claude-opus-5"),
+        ("raphael-claude-worker", "anthropic", "claude-sonnet-5"),
+        ("raphael-verifier", "openai-codex", "gpt-5.6-sol"),
+    ):
+        assert validate_runtime_assignment(
+            profile, provider, model, "max", disable_fallbacks=True,
+        ).recommended is False
+        for tier in ("routine", "deep"):
+            with pytest.raises(ValueError):
+                model_policy.mint_policy_lock(profile, provider, model, "max", tier)
         with pytest.raises(ValueError):
-            validate_runtime_assignment(
-                "raphael-claude-worker",
-                "anthropic",
-                model,
-                "max",
-                disable_fallbacks=True,
+            validate_assignment(
+                profile, provider, model, "max", disable_fallbacks=True
             )
-    with pytest.raises(ValueError):
-        validate_runtime_assignment(
-            "raphael-verifier",
-            "openai-codex",
-            "gpt-5.6-sol",
-            "max",
-            disable_fallbacks=True,
-        )
 
 
 def test_model_options_project_one_canonical_base_and_task_routes():
@@ -601,6 +599,281 @@ def test_new_work_uses_the_provider_currently_selected_for_its_role(
     assert (
         verifier_deep.provider, verifier_deep.model, verifier_deep.reasoning_effort
     ) == ("openai-codex", "gpt-6-astra", "xhigh")
+
+
+def _on_disk_route(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    provider: str,
+    model: str,
+    effort: str,
+    *,
+    fallback_providers=(),
+):
+    """Make every profile's native config carry exactly this route."""
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir", lambda _profile: tmp_path
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "model": {"provider": provider, "default": model},
+            "agent": {"reasoning_effort": effort},
+            "fallback_providers": list(fallback_providers),
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_constants.set_hermes_home_override", lambda _path: object()
+    )
+    monkeypatch.setattr(
+        "hermes_constants.reset_hermes_home_override", lambda _token: None
+    )
+
+
+# A role's configured route as the previous matrix left it on disk: its
+# superseded BASE (routine) route on that provider.
+_SUPERSEDED_CONFIGURED_ROUTES = [
+    ("default", "anthropic", "claude-opus-5", "max"),
+    ("default", "openai-codex", "gpt-5.6-sol", "max"),
+    ("raphael-planner", "anthropic", "claude-sonnet-5", "max"),
+    ("raphael-planner", "openai-codex", "gpt-5.6-sol", "max"),
+    ("raphael-designer", "anthropic", "claude-opus-5", "max"),
+    ("raphael-claude-worker", "anthropic", "claude-sonnet-5", "max"),
+    ("raphael-builder", "anthropic", "claude-sonnet-5", "max"),
+    ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max"),
+    ("raphael-verifier", "anthropic", "claude-opus-5", "max"),
+]
+
+
+@pytest.mark.parametrize("route", _SUPERSEDED_CONFIGURED_ROUTES)
+def test_a_superseded_configured_route_is_readable_but_grants_no_new_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, route
+):
+    """The fence can read the route existing work is on; nothing new can use it.
+
+    This is the read that refused a governed old->new migration with 409: the
+    role's on-disk route is the superseded one until the change lands.
+    """
+    profile, provider, model, effort = route
+    _on_disk_route(monkeypatch, tmp_path, provider, model, effort)
+
+    configured = configured_assignment_for(profile)
+
+    assert (
+        configured.profile, configured.provider, configured.model,
+        configured.reasoning_effort, configured.recommended,
+    ) == (profile, provider, model, effort, False)
+    # New work is refused rather than quietly started on another route...
+    with pytest.raises(ValueError):
+        resolve_task_assignment(profile, "routine")
+    with pytest.raises(ValueError):
+        resolve_task_assignment(profile, "deep")
+    # ...no new lock can be minted for it on any tier...
+    for tier in ("routine", "deep"):
+        with pytest.raises(ValueError):
+            model_policy.mint_policy_lock(profile, provider, model, effort, tier)
+    # ...and the strict base check still refuses it. A past run recorded on
+    # it reads back as history, which is not authority.
+    with pytest.raises(ValueError):
+        validate_assignment(profile, provider, model, effort, disable_fallbacks=True)
+    assert validate_runtime_assignment(
+        profile, provider, model, effort, disable_fallbacks=True
+    ).recommended is False
+
+
+@pytest.mark.parametrize("route", [
+    # Another role's superseded route: Sonnet 5 / max was never business's.
+    ("raphael-business", "anthropic", "claude-sonnet-5", "max"),
+    # A superseded DEEP lane was never anyone's configured base route.
+    ("raphael-planner", "anthropic", "claude-opus-5", "max"),
+    ("raphael-builder", "anthropic", "claude-opus-5", "max"),
+    # A superseded model at an effort it never had.
+    ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "xhigh"),
+    ("default", "anthropic", "claude-opus-5", "high"),
+    # A current deep-only lane is still not a base route.
+    ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh"),
+    # No lane on this provider at all, then or now.
+    ("raphael-builder", "openai-codex", "gpt-5.6-sol", "max"),
+    # Never-admissible values stay refused regardless of lineage.
+    ("default", "anthropic", "claude-fable-5", "max"),
+    ("default", "anthropic", "claude-opus-ultracode-1", "max"),
+    ("default", "anthropic", "claude-opus-5", "ultra"),
+    # A profile this policy does not govern.
+    ("other-profile", "anthropic", "claude-opus-5", "max"),
+    # Incomplete.
+    ("default", "anthropic", "", "max"),
+    ("default", "", "claude-opus-5", "max"),
+])
+def test_a_configured_route_the_lineage_never_admitted_there_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, route
+):
+    profile, provider, model, effort = route
+    _on_disk_route(monkeypatch, tmp_path, provider, model, effort)
+
+    with pytest.raises(ValueError):
+        configured_assignment_for(profile)
+    with pytest.raises(ValueError):
+        resolve_task_assignment(profile, "routine")
+
+
+@pytest.mark.parametrize("route", [
+    ("default", "anthropic", "claude-opus-5", "max"),
+    ("default", "anthropic", "claude-opus-5-5", "max"),
+])
+def test_a_fallback_capable_configured_route_is_refused_on_every_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, route
+):
+    profile, provider, model, effort = route
+    _on_disk_route(
+        monkeypatch, tmp_path, provider, model, effort,
+        fallback_providers=[{"provider": "openrouter", "model": "anything"}],
+    )
+
+    with pytest.raises(ValueError):
+        configured_assignment_for(profile)
+
+
+@pytest.mark.parametrize(("profile", "provider"), sorted(model_policy._ASSIGNMENTS))
+def test_a_current_configured_route_still_resolves_and_mints_new_work(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, profile, provider
+):
+    current = assignment_for(profile, provider)
+    _on_disk_route(
+        monkeypatch, tmp_path, provider, current.model, current.reasoning_effort
+    )
+
+    assert configured_assignment_for(profile) == current
+    for tier in ("routine", "deep"):
+        route = resolve_task_assignment(profile, tier)
+        assert route == task_assignment_for(profile, provider, tier)
+        lock = model_policy.mint_policy_lock(
+            profile, route.provider, route.model, route.reasoning_effort, tier,
+        )
+        assert model_policy.policy_lock_error(
+            lock, profile, route.provider, route.model, route.reasoning_effort, tier,
+        ) is None
+
+
+# Routes a run recorded before the matrix migration may carry in an unpinned
+# runtime receipt. Routine lineage first, then deep lanes that were never the
+# role's base route, so reading history must consult both tiers.
+_SUPERSEDED_ROUTINE_RUNTIME_ROUTES = [
+    ("default", "anthropic", "claude-opus-5", "max"),
+    ("raphael-planner", "anthropic", "claude-sonnet-5", "max"),
+    ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max"),
+]
+_SUPERSEDED_DEEP_RUNTIME_ROUTES = [
+    ("raphael-planner", "anthropic", "claude-opus-5", "max"),
+    ("raphael-business", "anthropic", "claude-opus-5", "max"),
+    ("raphael-builder", "anthropic", "claude-opus-5", "max"),
+    ("raphael-claude-worker", "anthropic", "claude-opus-5", "max"),
+]
+_SUPERSEDED_RUNTIME_ROUTES = (
+    _SUPERSEDED_ROUTINE_RUNTIME_ROUTES + _SUPERSEDED_DEEP_RUNTIME_ROUTES
+)
+
+
+@pytest.mark.parametrize("route", _SUPERSEDED_RUNTIME_ROUTES)
+def test_a_superseded_runtime_route_reads_back_as_history(route):
+    profile, provider, model, effort = route
+
+    read = validate_runtime_assignment(
+        profile, provider, model, effort, disable_fallbacks=True
+    )
+
+    assert (
+        read.profile, read.provider, read.model, read.reasoning_effort,
+        read.recommended,
+    ) == (profile, provider, model, effort, False)
+
+
+@pytest.mark.parametrize("route", _SUPERSEDED_DEEP_RUNTIME_ROUTES)
+def test_a_superseded_deep_lane_is_history_only_on_the_deep_tier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, route
+):
+    """A deep lane reads back from a run receipt, never as a configured route."""
+    profile, provider, model, effort = route
+    assert validate_runtime_assignment(
+        profile, provider, model, effort, disable_fallbacks=True
+    ).model == model
+    _on_disk_route(monkeypatch, tmp_path, provider, model, effort)
+    with pytest.raises(ValueError):
+        configured_assignment_for(profile)
+
+
+@pytest.mark.parametrize(("profile", "provider"), sorted(model_policy._ASSIGNMENTS))
+def test_a_current_runtime_route_still_reads_as_the_current_assignment(
+    profile, provider
+):
+    for tier in ("routine", "deep"):
+        route = task_assignment_for(profile, provider, tier)
+        assert validate_runtime_assignment(
+            profile, provider, route.model, route.reasoning_effort,
+            disable_fallbacks=True,
+        ) == route
+
+
+@pytest.mark.parametrize("route", [
+    # Another role's superseded route: Sonnet 5 / max was the planner's and
+    # builder's, never business's; Sol 5.6 was never business's on OpenAI.
+    ("raphael-business", "anthropic", "claude-sonnet-5", "max"),
+    ("raphael-business", "openai-codex", "gpt-5.6-sol", "max"),
+    # A superseded model at an effort it never had.
+    ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "xhigh"),
+    ("default", "anthropic", "claude-opus-5", "high"),
+    # No lane on this provider at all, then or now.
+    ("raphael-builder", "openai-codex", "gpt-5.6-sol", "max"),
+    ("other-profile", "anthropic", "claude-opus-5", "max"),
+    # Never-admissible values stay refused regardless of lineage.
+    ("default", "anthropic", "claude-fable-5", "max"),
+    ("default", "anthropic", "claude-opus-ultracode-1", "max"),
+    ("default", "anthropic", "claude-opus-5", "ultra"),
+    # Incomplete.
+    ("default", "anthropic", "", "max"),
+    ("default", "anthropic", "claude-opus-5", ""),
+    ("default", "", "claude-opus-5", "max"),
+    ("", "anthropic", "claude-opus-5", "max"),
+])
+def test_a_runtime_route_the_lineage_never_admitted_there_is_refused(route):
+    profile, provider, model, effort = route
+    with pytest.raises(ValueError):
+        validate_runtime_assignment(
+            profile, provider, model, effort, disable_fallbacks=True
+        )
+
+
+@pytest.mark.parametrize(
+    "route", _SUPERSEDED_RUNTIME_ROUTES + [
+        ("default", "anthropic", "claude-opus-5-5", "max"),
+    ],
+)
+def test_a_fallback_capable_runtime_route_is_refused_even_when_admitted(route):
+    profile, provider, model, effort = route
+    with pytest.raises(ValueError):
+        validate_runtime_assignment(
+            profile, provider, model, effort, disable_fallbacks=False
+        )
+
+
+@pytest.mark.parametrize("route", _SUPERSEDED_RUNTIME_ROUTES)
+def test_reading_a_superseded_runtime_route_grants_no_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, route
+):
+    """The line between history and authority: it reads, it never mints."""
+    profile, provider, model, effort = route
+    assert validate_runtime_assignment(
+        profile, provider, model, effort, disable_fallbacks=True
+    ).recommended is False
+
+    for tier in ("routine", "deep"):
+        with pytest.raises(ValueError):
+            model_policy.mint_policy_lock(profile, provider, model, effort, tier)
+    with pytest.raises(ValueError):
+        validate_assignment(profile, provider, model, effort, disable_fallbacks=True)
+    _on_disk_route(monkeypatch, tmp_path, provider, model, effort)
+    for tier in ("routine", "deep"):
+        with pytest.raises(ValueError):
+            resolve_task_assignment(profile, tier)
 
 
 def test_machine_request_is_bound_to_the_models_provider():
@@ -1774,3 +2047,235 @@ def test_a_concurrent_batch_rollback_never_erases_the_other_batch(
 
     # The audit trail says exactly what happened: the survivor, nobody else.
     assert _audited_roles() == [surviving]
+
+
+# ---------------------------------------------------------------------------
+# Owner-only Models options read: the shared OpenAI account's own catalog
+# ---------------------------------------------------------------------------
+
+# The live account-scoped Codex catalog, keyed by the bearer it is asked with.
+# Only the ROOT's shared grant belongs to an account entitled to the GPT-6
+# lanes; a profile's own independent grant is a different, smaller account.
+_ROOT_ACCOUNT_TOKEN = "root-shared-codex-access"
+_OTHER_ACCOUNT_TOKEN = "profile-own-codex-access"
+_ACCOUNT_CATALOGS = {
+    _ROOT_ACCOUNT_TOKEN: ["gpt-6-sol", "gpt-6-astra", "gpt-5.6-terra"],
+    _OTHER_ACCOUNT_TOKEN: ["gpt-5.6-terra"],
+}
+
+
+@pytest.fixture
+def codex_accounts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Real root/profile auth stores; only the remote account API is faked."""
+    from hermes_cli import codex_models
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_constants import get_default_hermes_root
+
+    # The Codex CLI's own files are a compatibility hint the static fallback
+    # reads; keep them out of the picture so each row says where it came from.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-cli"))
+    asked_with: list = []
+
+    def _account_catalog(access_token):
+        asked_with.append(access_token)
+        return list(_ACCOUNT_CATALOGS.get(access_token, []))
+
+    monkeypatch.setattr(codex_models, "_fetch_models_from_api", _account_catalog)
+
+    def _scoped_build(_ctx, *, explicit_only, include_unconfigured, refresh):
+        # The picker's own Codex row source, run under whatever scope the
+        # endpoint established.
+        from hermes_cli.models import cached_provider_model_ids
+
+        return {
+            "providers": [{
+                "slug": "openai-codex",
+                "authenticated": True,
+                "models": cached_provider_model_ids(
+                    "openai-codex", force_refresh=refresh
+                ),
+            }],
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.inventory.build_model_options_payload", _scoped_build
+    )
+    monkeypatch.setattr("hermes_cli.inventory.load_picker_context", lambda: None)
+    monkeypatch.setattr(
+        model_policy, "audit_models_machine_success", lambda *_a, **_k: None
+    )
+
+    root = get_default_hermes_root()
+
+    def _store(home: Path, document: dict) -> Path:
+        home.mkdir(parents=True, exist_ok=True)
+        path = home / "auth.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return path
+
+    def _pool_grant(token: str) -> dict:
+        # A grant held only as a pool row: the shape a root login leaves and
+        # the one the named-role catalog read could not see.
+        return {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {"openai-codex": [{
+                "id": "codex-grant",
+                "source": "device_code",
+                "auth_type": "oauth",
+                "access_token": token,
+                "refresh_token": f"{token}-refresh",
+            }]},
+        }
+
+    def _profile(name: str) -> Path:
+        home = get_profile_dir(name)
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({
+                "model": {"provider": "openai-codex", "default": "gpt-6-sol"},
+                "agent": {"reasoning_effort": "max"},
+                "fallback_providers": [],
+            }),
+            encoding="utf-8",
+        )
+        return home
+
+    return SimpleNamespace(
+        root=root,
+        store=_store,
+        pool_grant=_pool_grant,
+        profile=_profile,
+        asked_with=asked_with,
+    )
+
+
+def _options_request(*, machine: bool):
+    principal = SimpleNamespace(provider="raphael-models-token")
+    return SimpleNamespace(
+        method="GET",
+        url=SimpleNamespace(path="/api/model/options"),
+        state=SimpleNamespace(
+            token_authenticated=machine,
+            token_principal=principal if machine else None,
+        ),
+    )
+
+
+def _codex_models(payload: dict) -> list:
+    row = next(
+        row for row in payload["providers"]
+        if (row.get("slug") or row.get("id")) == "openai-codex"
+    )
+    return list(row["models"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("profile", "expected"), [
+    ("raphael-verifier", {"gpt-6-sol", "gpt-6-astra"}),
+    ("raphael-planner", {"gpt-6-sol"}),
+])
+async def test_owner_models_read_lists_the_shared_account_it_actually_runs_on(
+    codex_accounts, profile, expected
+):
+    """A named role with no grant of its own runs on the root's shared grant.
+
+    Its owner-only Models read now lists THAT account's live catalog — the same
+    one the root's own read lists — instead of the static fallback, and does
+    so without moving any credential into the profile.
+    """
+    root_auth = codex_accounts.store(
+        codex_accounts.root, codex_accounts.pool_grant(_ROOT_ACCOUNT_TOKEN)
+    )
+    root_bytes = root_auth.read_bytes()
+    home = codex_accounts.profile(profile)
+
+    # The root's own, unprojected catalog read.
+    root_read = await web_server.get_model_options(
+        _options_request(machine=False), profile="default", refresh=True
+    )
+    role_read = await web_server.get_model_options(
+        _options_request(machine=True), profile=profile, refresh=True
+    )
+
+    # One account, one catalog: the role's admitted models are listed from the
+    # same source the root reads.
+    assert set(_codex_models(role_read)) == expected
+    assert expected <= set(_codex_models(root_read))
+    assert set(codex_accounts.asked_with) == {_ROOT_ACCOUNT_TOKEN}
+    # Nothing was copied: the profile still holds no grant, and the root's
+    # store is byte-for-byte what it was.
+    assert not (home / "auth.json").exists()
+    assert root_auth.read_bytes() == root_bytes
+
+
+@pytest.mark.asyncio
+async def test_generic_profile_reads_keep_their_own_isolated_catalog(codex_accounts):
+    """Outside the owner's Models machine nothing about the scoped read moves."""
+    codex_accounts.store(
+        codex_accounts.root, codex_accounts.pool_grant(_ROOT_ACCOUNT_TOKEN)
+    )
+    codex_accounts.profile("raphael-verifier")
+
+    interactive = await web_server.get_model_options(
+        _options_request(machine=False), profile="raphael-verifier", refresh=True
+    )
+
+    # The profile-scoped read never reached the shared account, and the static
+    # fallback it lands on never advertises the account-gated lane.
+    assert "gpt-6-astra" not in _codex_models(interactive)
+    assert codex_accounts.asked_with == []
+
+
+@pytest.mark.asyncio
+async def test_a_role_with_its_own_grant_never_reads_the_root_account(codex_accounts):
+    """An independent grant is a different account and is never swapped out."""
+    codex_accounts.store(
+        codex_accounts.root, codex_accounts.pool_grant(_ROOT_ACCOUNT_TOKEN)
+    )
+    home = codex_accounts.profile("raphael-verifier")
+    own_auth = codex_accounts.store(
+        home, codex_accounts.pool_grant(_OTHER_ACCOUNT_TOKEN)
+    )
+    own_bytes = own_auth.read_bytes()
+
+    role_read = await web_server.get_model_options(
+        _options_request(machine=True), profile="raphael-verifier", refresh=True
+    )
+
+    # Only the role's own account was asked, and it lists no GPT-6 lane.
+    assert _ROOT_ACCOUNT_TOKEN not in codex_accounts.asked_with
+    assert "gpt-6-astra" not in _codex_models(role_read)
+    assert "gpt-6-sol" not in _codex_models(role_read)
+    assert own_auth.read_bytes() == own_bytes
+
+
+@pytest.mark.asyncio
+async def test_no_account_catalog_is_claimed_when_the_root_has_no_grant(
+    codex_accounts,
+):
+    codex_accounts.store(codex_accounts.root, {"version": 1, "providers": {}})
+    codex_accounts.profile("raphael-verifier")
+
+    role_read = await web_server.get_model_options(
+        _options_request(machine=True), profile="raphael-verifier", refresh=True
+    )
+
+    assert codex_accounts.asked_with == []
+    assert "gpt-6-astra" not in _codex_models(role_read)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("foreign", ["someone-else", "raphael-intruder", "../default"])
+async def test_owner_models_read_refuses_a_foreign_profile(codex_accounts, foreign):
+    codex_accounts.store(
+        codex_accounts.root, codex_accounts.pool_grant(_ROOT_ACCOUNT_TOKEN)
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await web_server.get_model_options(
+            _options_request(machine=True), profile=foreign, refresh=True
+        )
+
+    assert exc.value.status_code == 400
+    assert codex_accounts.asked_with == []

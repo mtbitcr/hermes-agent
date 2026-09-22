@@ -6901,6 +6901,68 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
 )
 
 
+def _shared_codex_owning_root() -> Optional[Path]:
+    """The root home whose Codex grant the SCOPED profile actually runs on.
+
+    Called inside a named profile's scope. Single-use OAuth grants live once,
+    at the global root, and a named profile with no Codex material of its own
+    runs on that grant through the root fallback in ``read_credential_pool`` /
+    ``_load_provider_state``. The catalog read's pool fallback is profile-local,
+    so for exactly that profile the picker raised AuthError against an account
+    its sessions were already using.
+
+    Returns ``None`` — keep the profile's own read — whenever that is not
+    provably the case: the scope IS the root, the profile holds any Codex
+    grant of its own (a different account, never to be exchanged for root's),
+    or its store cannot be read.
+    """
+    from hermes_cli.auth import _auth_file_path, _global_auth_file_path
+
+    root_auth = _global_auth_file_path()
+    if root_auth is None:
+        return None
+    try:
+        auth_path = _auth_file_path()
+        store = (
+            json.loads(auth_path.read_text(encoding="utf-8-sig"))
+            if auth_path.exists()
+            else {}
+        )
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not isinstance(store, dict):
+        return None
+    for section in ("providers", "credential_pool"):
+        entries = store.get(section)
+        if isinstance(entries, dict) and entries.get("openai-codex"):
+            return None
+    return root_auth.parent
+
+
+def _codex_catalog_at_owning_root(root: Path, *, refresh: bool) -> Optional[list]:
+    """The Codex model ids the owning root's own catalog read lists.
+
+    Resolution, any refresh and the catalog cache all stay in the root's own
+    store, exactly as the root's own Models read uses them; only model ids
+    leave this function, so no token or grant is copied into the profile.
+    ``None`` when the root has no usable grant either, so nothing is claimed
+    for an account nobody can reach.
+    """
+    from hermes_cli.auth import resolve_codex_runtime_credentials
+    from hermes_cli.models import cached_provider_model_ids
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(root))
+    try:
+        try:
+            resolve_codex_runtime_credentials(refresh_if_expiring=True)
+        except Exception:
+            return None
+        return list(cached_provider_model_ids("openai-codex", force_refresh=refresh))
+    finally:
+        reset_hermes_home_override(token)
+
+
 @app.get("/api/model/options")
 async def get_model_options(
     request: Request,
@@ -6937,18 +6999,42 @@ async def get_model_options(
         )
         if model_machine_request(request) and (include_unconfigured or explicit_only):
             raise HTTPException(status_code=400, detail="Invalid model options")
+        # Only the owner's Models machine, and only for a named admitted role:
+        # every other caller keeps the profile-isolated read unchanged.
+        shared_codex_read = model_machine_request(request) and scoped_profile is not None
 
         def _build_payload_scoped() -> dict:
             # Keep the profile override inside the worker thread so the full
             # sync picker build (config load, pricing, refresh probes) runs
             # off the event loop under the requested profile.
             with _profile_scope(scoped_profile):
-                return build_model_options_payload(
+                payload = build_model_options_payload(
                     load_picker_context(),
                     explicit_only=bool(explicit_only),
                     include_unconfigured=bool(include_unconfigured),
                     refresh=bool(refresh),
                 )
+                owning_root = (
+                    _shared_codex_owning_root() if shared_codex_read else None
+                )
+            if owning_root is None:
+                return payload
+            for row in payload.get("providers") or []:
+                # Only a row the profile already reports as connected: this
+                # corrects which account's catalog it lists, never whether the
+                # role is connected at all.
+                if (
+                    isinstance(row, dict)
+                    and row.get("slug") == "openai-codex"
+                    and row.get("authenticated") is True
+                ):
+                    models = _codex_catalog_at_owning_root(
+                        owning_root, refresh=bool(refresh)
+                    )
+                    if models is not None:
+                        row["models"] = models
+                        row["total_models"] = len(models)
+            return payload
 
         result = await run_in_threadpool(_build_payload_scoped)
         from plugins.dashboard_auth.raphael_workspace.model_policy import (
