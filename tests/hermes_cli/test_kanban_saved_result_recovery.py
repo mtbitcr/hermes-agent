@@ -502,3 +502,126 @@ def test_runtime_cap_leaves_a_set_aside_run_to_the_next_scan(running_build, monk
         (run_id, {"run_id": run_id, "attachment_id": attachment}),
     ]
     assert "timed_out" not in [event.kind for event in kb.list_events(conn, task_id)]
+
+
+def _lapse_before_any_scan(setup: dict, lapse: str) -> int:
+    """The claim expires, or the run goes two hours without a heartbeat,
+    before any scan has set the run aside.
+
+    Returns the ``stale_timeout_seconds`` the dispatcher tick runs with.
+    """
+    conn, task_id, run_id = setup["conn"], setup["task"], setup["run"]
+    # No scan has run yet, so nothing marks the run for the handover.
+    assert "unreported_completion" not in (kb.get_run(conn, run_id).metadata or {})
+    long_ago = int(time.time()) - 7200
+    with kb.write_txn(conn):
+        if lapse == "expired_claim":
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ? WHERE id = ?", (long_ago, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET claim_expires = ? WHERE id = ?", (long_ago, run_id),
+            )
+        else:
+            # Running for two hours, and the worker never sent a heartbeat.
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?", (long_ago, run_id),
+            )
+    return 60 if lapse == "stale_run" else 0
+
+
+@pytest.mark.parametrize("lapse", ["expired_claim", "stale_run"])
+def test_run_not_yet_set_aside_is_handed_over_by_the_first_dispatcher_tick(
+    running_build, monkeypatch, lapse,
+):
+    """The claim or the heartbeat can lapse before any scan has set the run
+    aside; the sweeps that run before the scan in ``dispatch_once`` still
+    leave it to the scan on the same tick."""
+    setup = running_build()
+    conn, task_id, run_id = setup["conn"], setup["task"], setup["run"]
+    attachment = _save_patch(
+        setup, "x.patch", _new_file_patch(f"{OWNED}/saved.py", "saved = True"),
+    )
+    _exit_cleanly_without_reporting(setup, monkeypatch)
+    stale_timeout_seconds = _lapse_before_any_scan(setup, lapse)
+
+    result = kb.dispatch_once(
+        conn, max_spawn=0, board=SLUG, stale_timeout_seconds=stale_timeout_seconds,
+    )
+
+    assert (result.reclaimed, result.stale) == (0, [])
+    assert kb.get_task(conn, task_id).status == "review"
+    run = kb.get_run(conn, run_id)
+    assert run.ended_at is not None
+    assert (run.outcome, run.summary) == ("review_requested", SUMMARY)
+    assert _handed_over(setup) == [
+        (run_id, {"run_id": run_id, "attachment_id": attachment}),
+    ]
+    kinds = [event.kind for event in kb.list_events(conn, task_id)]
+    assert "reclaimed" not in kinds
+    assert "stale" not in kinds
+
+
+def test_process_stopped_right_after_the_review_transition_still_leaves_one_handover_event(
+    running_build, monkeypatch,
+):
+    """The handover's event commits with the review transition itself: a
+    process that stops the moment the card is in review has recorded it, and
+    the restarted process does not record it again."""
+    setup = running_build()
+    conn, task_id, run_id = setup["conn"], setup["task"], setup["run"]
+    attachment = _save_patch(
+        setup, "x.patch", _new_file_patch(f"{OWNED}/saved.py", "saved = True"),
+    )
+    _exit_cleanly_without_reporting(setup, monkeypatch)
+    real_request_review = kb.request_review
+
+    def stop_once_in_review(*args, **kwargs):
+        parked = real_request_review(*args, **kwargs)
+        if parked:
+            raise _ProcessStopped
+        return parked
+
+    monkeypatch.setattr(kb, "request_review", stop_once_in_review)
+    with pytest.raises(_ProcessStopped):
+        kb.detect_crashed_workers(conn)
+
+    assert kb.get_task(conn, task_id).status == "review"
+    handed_over = [(run_id, {"run_id": run_id, "attachment_id": attachment})]
+    assert _handed_over(setup) == handed_over
+
+    # A restarted process: the real review transition, and a reap registry
+    # that no longer remembers how the worker exited.
+    monkeypatch.setattr(kb, "request_review", real_request_review)
+    monkeypatch.setattr(kb, "_recent_worker_exits", {})
+
+    assert kb.detect_crashed_workers(conn) == []
+
+    assert kb.get_task(conn, task_id).status == "review"
+    assert _handed_over(setup) == handed_over
+
+
+@pytest.mark.parametrize("lapse", ["expired_claim", "stale_run"])
+def test_dirty_worktree_still_parks_with_the_refusal_on_the_first_dispatcher_tick(
+    running_build, monkeypatch, lapse,
+):
+    """On that same first tick, a handover the worktree refuses still parks
+    the card for a person, with the refusal on the run."""
+    setup = running_build()
+    conn, task_id = setup["conn"], setup["task"]
+    _save_patch(setup, "x.patch", _new_file_patch(f"{OWNED}/saved.py", "saved = True"))
+    _exit_cleanly_without_reporting(setup, monkeypatch)
+    # An untracked file left behind in the task's own worktree.
+    workspace = Path(kb.get_task(conn, task_id).workspace_path)
+    (workspace / OWNED / "leftover.py").write_text("leftover = True\n", encoding="utf-8")
+    stale_timeout_seconds = _lapse_before_any_scan(setup, lapse)
+
+    kb.dispatch_once(
+        conn, max_spawn=0, board=SLUG, stale_timeout_seconds=stale_timeout_seconds,
+    )
+
+    unreported = _assert_parked_for_a_person(setup)
+    assert "dirty" in unreported["handover_refusal"]
+    kinds = [event.kind for event in kb.list_events(conn, task_id)]
+    assert "reclaimed" not in kinds
+    assert "stale" not in kinds
