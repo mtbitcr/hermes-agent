@@ -945,6 +945,9 @@ class CredentialPool(CredentialPoolAdminMixin):
         # entries" and the caller's 401 retry loop runs unbounded. Reset when a
         # real entry is identified or an escape path returns None.
         self._unmatched_rotation_streak: int = 0
+        # Set only by preview_runtime_selection(): the pool is an in-memory
+        # replica of load_pool() whose mutations never reach any auth.json.
+        self._read_only = False
 
     # ---- read accessors ---------------------------------------------------
 
@@ -1046,6 +1049,8 @@ class CredentialPool(CredentialPoolAdminMixin):
         removed_ids: Optional[List[str]] = None,
         status_cleared_ids: Optional[List[str]] = None,
     ) -> None:
+        if self._read_only:
+            return
         # Self-locking: snapshotting self._entries must not race a rotation.
         with self._lock:
             persist_pool_entries(
@@ -2713,8 +2718,29 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 
 def load_pool(provider: str) -> CredentialPool:
+    return _assemble_pool(provider, read_only=False)
+
+
+def preview_runtime_selection(provider: str) -> Tuple[Optional[PooledCredential], bool]:
+    """The entry ``load_pool(provider).select()`` would run on now, and whether it is borrowed.
+
+    Same assembly as :func:`load_pool` (``read_credential_pool``'s per-provider global-root
+    fallback, singleton/env seeding, borrowed-rows-first ordering, priorities) and the same
+    ``_select_unlocked`` strategy and cooldown filter, on an in-memory replica: nothing is healed,
+    persisted, leased, counted or refreshed. An entry due for refresh is reported as the account it
+    belongs to (``select()`` defers its refresh, the account does not change). The second value is
+    True when the entry is a row read through the global-root fallback (``_borrowed_root_ids``).
+    Raises what ``load_pool`` raises for an unreadable store.
+    """
+    pool = _assemble_pool(provider, read_only=True)
+    with pool._lock:
+        entry, _pending = pool._select_unlocked(refresh=False, count=False)
+    return entry, entry is not None and entry.id in pool._borrowed_root_ids
+
+
+def _assemble_pool(provider: str, *, read_only: bool) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS:
+    if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS and not read_only:
         # One-time heal for installs that forked this grant across profiles
         # before the clone-strip / root write-through existed (#100339).
         auth_mod.heal_forked_single_use_oauth_grants(provider)
@@ -2772,7 +2798,7 @@ def load_pool(provider: str) -> CredentialPool:
             )
         changed |= _normalize_pool_priorities(provider, entries)
 
-    if changed:
+    if changed and not read_only:
         new_ids = {entry.id for entry in entries}
         persist_pool_entries(
             provider,
@@ -2780,6 +2806,7 @@ def load_pool(provider: str) -> CredentialPool:
             removed_ids=disk_ids - new_ids,
         )
     pool = CredentialPool(provider, entries)
+    pool._read_only = read_only
     # Remember the root's borrowed rows so a later ``add_entry`` in this
     # profile leaves them out of the profile's own store (#100339).
     if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS and not _profile_owns_pool_provider(provider):

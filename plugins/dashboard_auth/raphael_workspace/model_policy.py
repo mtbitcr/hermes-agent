@@ -103,16 +103,16 @@ def _assignment(
 
 _ASSIGNMENTS = {
     ("raphael-planner", "anthropic"): _assignment(
-        "raphael-planner", "anthropic", "claude-sonnet-5", "Claude Sonnet 5", "max"
+        "raphael-planner", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"
     ),
     ("default", "anthropic"): _assignment(
-        "default", "anthropic", "claude-opus-5", "Claude Opus 5", "max"
+        "default", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"
     ),
     ("raphael-planner", "openai-codex"): _assignment(
-        "raphael-planner", "openai-codex", "gpt-5.6-sol", "GPT-5.6 Sol", "max"
+        "raphael-planner", "openai-codex", "gpt-6-sol", "GPT-6 Sol", "max"
     ),
     ("default", "openai-codex"): _assignment(
-        "default", "openai-codex", "gpt-5.6-sol", "GPT-5.6 Sol", "max"
+        "default", "openai-codex", "gpt-6-sol", "GPT-6 Sol", "max"
     ),
     ("raphael-business", "anthropic"): _assignment(
         "raphael-business", "anthropic", "claude-sonnet-5", "Claude Sonnet 5", "high"
@@ -121,44 +121,63 @@ _ASSIGNMENTS = {
         "raphael-business", "openai-codex", "gpt-5.6-terra", "GPT-5.6 Terra", "max"
     ),
     ("raphael-designer", "anthropic"): _assignment(
-        "raphael-designer", "anthropic", "claude-opus-5", "Claude Opus 5", "max"
+        "raphael-designer", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"
     ),
     ("raphael-claude-worker", "anthropic"): _assignment(
-        "raphael-claude-worker", "anthropic", "claude-sonnet-5", "Claude Sonnet 5 + Claude Code", "max"
+        "raphael-claude-worker", "anthropic", "claude-opus-5-5", "Claude Opus 5.5 + Claude Code", "max"
     ),
     ("raphael-builder", "anthropic"): _assignment(
-        "raphael-builder", "anthropic", "claude-sonnet-5", "Claude Sonnet 5", "max"
+        "raphael-builder", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"
     ),
     # There is deliberately NO builder route on the OpenAI family. The builder
     # integrates verified work and operates infrastructure, so its deep lane is
-    # high-risk coding, and high-risk coding may mint only Claude Opus 5 / max
-    # (see _DEEP_ANTHROPIC_PROFILES). Admitting an OpenAI builder assignment
-    # would make ``task_assignment_for(builder, openai-codex, 'deep')`` fall
-    # through to that provider's base route, which is not a qualified deep
-    # coding lane.
+    # high-risk coding, and high-risk coding may mint only Claude Opus 5.5 / max
+    # (see _DEEP_ROUTES). Admitting an OpenAI builder assignment would make
+    # ``task_assignment_for(builder, openai-codex, 'deep')`` fall through to
+    # that provider's base route, which is not a qualified deep coding lane.
     ("raphael-verifier", "openai-codex"): _assignment(
-        "raphael-verifier", "openai-codex", "gpt-5.6-sol", "GPT-5.6 Sol", "max"
+        "raphael-verifier", "openai-codex", "gpt-6-sol", "GPT-6 Sol", "max"
     ),
     # Independent verification exists to be independent OF the implementation
     # family: Claude writes the code, so a Claude verifier is the same family
-    # reviewing itself, and the OpenAI GPT-5.6 Sol / max lane stays the only
-    # recommended verifier route. The Anthropic entry below is the named,
-    # non-recommended "Claude Security" lane: security analysis runs on two
-    # explicitly identified lanes (Codex Security on the recommended route,
-    # Claude Security on this one), so a finding is never verified only by
-    # the family that wrote the code. It is the strongest Claude model, so the
-    # builder's Sonnet lane never reviews itself. Admitted, never recommended.
+    # reviewing itself, and the OpenAI GPT-6 Sol / max lane (GPT-6 Astra /
+    # xhigh for deep work) stays the only recommended verifier route. The
+    # Anthropic entry below is the named, non-recommended "Claude Security"
+    # lane: security analysis runs on two explicitly identified lanes (Codex
+    # Security on the recommended route, Claude Security on this one), so a
+    # finding is never verified only by the family that wrote the code. It is
+    # the strongest Claude model and never a weaker Claude lane than the one
+    # that did the building. Admitted, never recommended.
     ("raphael-verifier", "anthropic"): _assignment(
-        "raphael-verifier", "anthropic", "claude-opus-5", "Claude Opus 5", "max"
+        "raphael-verifier", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"
     ),
 }
 
-_DEEP_ANTHROPIC_PROFILES = frozenset({
+# Deep work is the only place a task route may differ from the role's base
+# assignment, and only on the (profile, provider) pairs declared here. Every
+# other deep request resolves to its admitted base route. A deep route is
+# reachable only where ``_ASSIGNMENTS`` already admits the pair, so this table
+# can never admit a lane on its own.
+_CLAUDE_DEEP_PROFILES = frozenset({
     "raphael-planner",
     "raphael-business",
     "raphael-claude-worker",
     "raphael-builder",
 })
+
+_DEEP_ROUTES: dict[tuple[str, str], tuple[str, str, str]] = {
+    **{
+        (profile, "anthropic"): (
+            "claude-opus-5-5",
+            "Claude Opus 5.5 + Claude Code"
+            if profile == "raphael-claude-worker"
+            else "Claude Opus 5.5",
+            "max",
+        )
+        for profile in _CLAUDE_DEEP_PROFILES
+    },
+    ("raphael-verifier", "openai-codex"): ("gpt-6-astra", "GPT-6 Astra", "xhigh"),
+}
 
 _EXECUTION_TIERS = frozenset({"routine", "deep"})
 
@@ -206,26 +225,18 @@ def task_assignment_for(
 
     The planner may classify work as ``routine`` or ``deep`` but never chooses a
     provider, model id, or effort.  Deep Claude planning, business, coding, and
-    delivery work moves to the currently qualified Opus lane.  Other provider
-    choices retain their admitted profile assignment until that provider has a
-    separately qualified deep lane.
+    delivery work moves to the currently qualified Opus lane, and deep
+    verification on the OpenAI family moves to GPT-6 Astra (see
+    ``_DEEP_ROUTES``).  Every other provider choice retains its admitted
+    profile assignment until that provider has a separately qualified deep
+    lane.
     """
     tier = normalize_execution_tier(execution_tier)
     base = assignment_for(profile, provider)
-    if (
-        tier == "deep"
-        and provider == "anthropic"
-        and profile in _DEEP_ANTHROPIC_PROFILES
-    ):
-        return _assignment(
-            profile,
-            provider,
-            "claude-opus-5",
-            "Claude Opus 5 + Claude Code"
-            if profile == "raphael-claude-worker"
-            else "Claude Opus 5",
-            "max",
-        )
+    if tier == "deep":
+        deep = _DEEP_ROUTES.get((base.profile, base.provider))
+        if deep is not None:
+            return _assignment(base.profile, base.provider, *deep)
     return base
 
 
@@ -237,7 +248,24 @@ def validate_runtime_assignment(
     *,
     disable_fallbacks: bool,
 ) -> ModelAssignment:
-    """Accept a configured base route or an admitted task-specific route."""
+    """Accept a route this policy lineage admitted for a recorded unpinned run.
+
+    This is a history question, asked only when reading back an unpinned
+    runtime receipt: "was this fallback-free route one this role was allowed
+    to run on this provider?" Current authority answers it for the matrix as
+    it stands — the base route or its deep lane. Lineage authority answers it
+    for a run recorded before an approved matrix migration: the same
+    ``_SUPERSEDED_ROUTES`` fact that lets a historical seal verify, consulted
+    on both tiers because a run may have been routine or deep work. Without
+    it every pre-migration receipt silently read as unknown.
+
+    Reading history confers no live authority. ``mint_policy_lock``,
+    ``validate_assignment`` and :func:`resolve_task_assignment` never consult
+    the lineage, so a superseded route accepted here still cannot mint a
+    lock, be configured, or start new work. A fallback-capable run, a route
+    the lineage never admitted for this exact role/provider, an unknown pair,
+    an incomplete route and every never-admissible value are still refused.
+    """
     if disable_fallbacks is not True:
         raise ValueError("unadmitted Raphael model assignment")
     candidates = {
@@ -251,11 +279,27 @@ def validate_runtime_assignment(
             == candidate.reasoning_effort
         ):
             return candidate
+    for tier in ("routine", "deep"):
+        parts = _normalized_lock_parts(
+            profile, provider, model, reasoning_effort, tier
+        )
+        if _route_authority_error(*parts, admit_superseded=True) is None:
+            assignee, provider_id, model_id, effort, _tier = parts
+            # Never recommended: a superseded route describes what a past run
+            # was allowed to use, not something anyone should select.
+            return ModelAssignment(
+                profile=assignee,
+                provider=provider_id,
+                model=model_id,
+                model_label=model_id,
+                reasoning_effort=effort,
+                recommended=False,
+            )
     raise ValueError("unadmitted Raphael model assignment")
 
 
-def configured_assignment_for(profile: str) -> ModelAssignment:
-    """Read and validate the profile's current native, fallback-free route."""
+def _configured_route(profile: str) -> tuple[str, str, str, bool]:
+    """Read ``(provider, model, effort, fallbacks_disabled)`` from native config."""
     from hermes_cli.config import load_config_readonly
     from hermes_cli.profiles import get_profile_dir
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -279,18 +323,103 @@ def configured_assignment_for(profile: str) -> ModelAssignment:
             or (isinstance(fallback_model, str) and not fallback_model.strip())
         )
     )
-    return validate_assignment(
-        profile,
+    return (
         str(model_config.get("provider") or ""),
         str(model_config.get("default") or model_config.get("model") or ""),
         str(agent_config.get("reasoning_effort") or ""),
-        disable_fallbacks=fallbacks_disabled,
+        fallbacks_disabled,
     )
 
 
+def _superseded_configured_assignment(
+    profile: str,
+    provider: str,
+    model: str,
+    reasoning_effort: str,
+    *,
+    disable_fallbacks: bool,
+) -> Optional[ModelAssignment]:
+    """Return the superseded base route this lineage admitted here, else None.
+
+    Lineage authority, not current authority: the answer is "this policy once
+    admitted exactly this fallback-free route as this role's base route on
+    this provider", the same ``_SUPERSEDED_ROUTES`` fact that lets a historical
+    seal verify. A configured route is the role's base assignment, which is
+    exactly its routine task route, so only the routine lineage can vouch for
+    it — a superseded deep lane was never a configured route and does not
+    become one here. Every never-admissible value, unknown pair and incomplete
+    route is refused by the same checks lock validation applies.
+    """
+    if disable_fallbacks is not True:
+        return None
+    parts = _normalized_lock_parts(
+        profile, provider, model, reasoning_effort, "routine"
+    )
+    if _route_authority_error(*parts, admit_superseded=True) is not None:
+        return None
+    assignee, provider, model, reasoning_effort, _tier = parts
+    # Never recommended: a superseded route is something existing work may be
+    # held to, not something anyone should select.
+    return ModelAssignment(
+        profile=assignee,
+        provider=provider,
+        model=model,
+        model_label=model,
+        reasoning_effort=reasoning_effort,
+        recommended=False,
+    )
+
+
+def configured_assignment_for(profile: str) -> ModelAssignment:
+    """Read the profile's native, fallback-free route and prove its authority.
+
+    The question this answers is "which approved route is this role's existing
+    work on right now", which the rollout fence asks immediately BEFORE a
+    route change so it can pin that work. During an approved matrix migration
+    the role's on-disk route is, by definition, the superseded one, so a
+    current-only read here refused the very change that moves the role onto
+    the new route — the governed old->new transition dead-locked at 409.
+
+    So the current admitted base route is accepted, and so is a base route
+    this policy lineage admitted for this exact role/provider and has since
+    superseded. Anything the lineage never admitted there, and any route that
+    still allows a fallback, is refused exactly as before.
+
+    Reading is not minting. A superseded route returned here confers no new
+    authority: ``mint_policy_lock`` never consults the lineage, so work the
+    fence tries to pin onto it gets no lock and is parked for re-approval
+    rather than left runnable, and :func:`resolve_task_assignment` refuses new
+    work until the role is on the current route.
+    """
+    provider, model, effort, fallbacks_disabled = _configured_route(profile)
+    try:
+        return validate_assignment(
+            profile, provider, model, effort, disable_fallbacks=fallbacks_disabled,
+        )
+    except ValueError:
+        superseded = _superseded_configured_assignment(
+            profile, provider, model, effort, disable_fallbacks=fallbacks_disabled,
+        )
+        if superseded is None:
+            raise
+        return superseded
+
+
 def resolve_task_assignment(profile: str, execution_tier: str) -> ModelAssignment:
-    """Resolve a new task against the provider selected for its role."""
+    """Resolve a new task against the provider selected for its role.
+
+    New work is a current-authority question, so the configured route must be
+    the one this policy admits RIGHT NOW. The configured read also admits a
+    superseded route so existing work can be pinned to it; a role still on
+    one gets no new task until its route is approved again.
+    """
     configured = configured_assignment_for(profile)
+    current = assignment_for(profile, configured.provider)
+    if (configured.model, configured.reasoning_effort) != (
+        current.model,
+        current.reasoning_effort,
+    ):
+        raise ValueError("unadmitted Raphael model assignment")
     return task_assignment_for(profile, configured.provider, execution_tier)
 
 
@@ -303,9 +432,13 @@ def resolve_task_assignment(profile: str, execution_tier: str) -> ModelAssignmen
 # and execution tier — so no single field of a locked row can be edited (by
 # hand, by a migration, or by a future code path) without the lock ceasing to
 # validate.  Validation additionally re-derives the route from this module's
-# matrix, so a lock minted under a policy that no longer admits that route is
-# stale and therefore invalid.  There is exactly one authority name and one
-# version: anything else is unknown provenance and fails closed.
+# matrix: a lock is valid only for the route the current policy admits for
+# that exact assignee/provider/tier, or for a route this policy lineage
+# admitted there before and has since superseded (``_SUPERSEDED_ROUTES``), so
+# already-minted receipts stay verifiable after a matrix migration while a
+# route that was never admitted there is invalid.  Minting never consults the
+# superseded table.  There is exactly one authority name and one version:
+# anything else is unknown provenance and fails closed.
 
 POLICY_LOCK_AUTHORITY = "raphael"
 POLICY_LOCK_VERSION = 1
@@ -314,6 +447,38 @@ POLICY_LOCK_VERSION = 1
 # can never be admitted by a future matrix edit alone.
 _FORBIDDEN_MODEL_MARKERS = ("fable", "ultracode")
 _FORBIDDEN_EFFORTS = frozenset({"ultra"})
+
+# Routes this policy lineage once admitted for an exact assignee/provider/tier
+# and has since superseded, as ``(model, reasoning_effort)``.  Validation-only
+# history: a lock minted for one of these while it was current still verifies,
+# but no new lock can be minted for it.  Each entry names the one tier it was
+# admitted on, so a historical route never verifies for a different role,
+# provider or tier.  Pairs whose route never changed have no entry.
+_OPUS_5_MAX = ("claude-opus-5", "max")
+_SONNET_5_MAX = ("claude-sonnet-5", "max")
+_SOL_56_MAX = ("gpt-5.6-sol", "max")
+
+_SUPERSEDED_ROUTES: Mapping[tuple[str, str, str], frozenset[tuple[str, str]]] = {
+    ("default", "anthropic", "routine"): frozenset({_OPUS_5_MAX}),
+    ("default", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
+    ("default", "openai-codex", "routine"): frozenset({_SOL_56_MAX}),
+    ("default", "openai-codex", "deep"): frozenset({_SOL_56_MAX}),
+    ("raphael-planner", "anthropic", "routine"): frozenset({_SONNET_5_MAX}),
+    ("raphael-planner", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
+    ("raphael-planner", "openai-codex", "routine"): frozenset({_SOL_56_MAX}),
+    ("raphael-planner", "openai-codex", "deep"): frozenset({_SOL_56_MAX}),
+    ("raphael-business", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
+    ("raphael-designer", "anthropic", "routine"): frozenset({_OPUS_5_MAX}),
+    ("raphael-designer", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
+    ("raphael-claude-worker", "anthropic", "routine"): frozenset({_SONNET_5_MAX}),
+    ("raphael-claude-worker", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
+    ("raphael-builder", "anthropic", "routine"): frozenset({_SONNET_5_MAX}),
+    ("raphael-builder", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
+    ("raphael-verifier", "openai-codex", "routine"): frozenset({_SOL_56_MAX}),
+    ("raphael-verifier", "openai-codex", "deep"): frozenset({_SOL_56_MAX}),
+    ("raphael-verifier", "anthropic", "routine"): frozenset({_OPUS_5_MAX}),
+    ("raphael-verifier", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
+}
 
 _LOCK_RE = re.compile(r"\A([a-z][a-z0-9-]{0,31}):v(\d{1,4}):([0-9a-f]{64})\Z")
 
@@ -372,9 +537,20 @@ def _normalized_lock_parts(
 
 
 def _route_authority_error(
-    assignee: str, provider: str, model: str, reasoning_effort: str, execution_tier: str
+    assignee: str,
+    provider: str,
+    model: str,
+    reasoning_effort: str,
+    execution_tier: str,
+    *,
+    admit_superseded: bool = False,
 ) -> Optional[str]:
-    """Return why this five-tuple is not an admitted locked route, else None."""
+    """Return why this five-tuple is not an admitted locked route, else None.
+
+    ``admit_superseded`` additionally accepts a route recorded in
+    ``_SUPERSEDED_ROUTES`` for this exact assignee/provider/tier.  Only lock
+    validation passes it; minting always requires the current route.
+    """
     if not assignee or not provider or not model or not reasoning_effort:
         return (
             "policy-locked route is incomplete "
@@ -397,7 +573,12 @@ def _route_authority_error(
             "policy-locked route names no admitted authority for "
             f"{assignee!r}/{provider!r}/{execution_tier or None!r}"
         )
-    if model != expected.model or reasoning_effort != expected.reasoning_effort:
+    admitted = {(expected.model, expected.reasoning_effort)}
+    if admit_superseded:
+        admitted |= _SUPERSEDED_ROUTES.get(
+            (expected.profile, expected.provider, execution_tier), frozenset()
+        )
+    if (model, reasoning_effort) not in admitted:
         return (
             f"policy-locked route {model!r}/{reasoning_effort!r} is not the "
             f"admitted route for {assignee!r}/{provider!r}/{execution_tier!r}"
@@ -417,9 +598,12 @@ def policy_lock_error(
 
     Fails closed on every ambiguity: an unparseable or foreign authority, a
     version this build does not mint, a digest that does not bind these exact
-    five components, an incomplete route, and a route the current policy no
-    longer admits are all invalid.  Never treats an invalid lock as absent —
-    callers ask about a lock only after deciding one is present.
+    five components, an incomplete route, and a route this policy lineage never
+    admitted for that exact assignee/provider/tier are all invalid.  A route
+    the lineage admitted there and has since superseded still verifies, so a
+    matrix migration never invalidates an already-minted receipt.  Never treats
+    an invalid lock as absent — callers ask about a lock only after deciding
+    one is present.
     """
     text = str(lock or "").strip()
     if not text:
@@ -438,7 +622,7 @@ def policy_lock_error(
     parts = _normalized_lock_parts(
         assignee, provider, model, reasoning_effort, execution_tier
     )
-    error = _route_authority_error(*parts)
+    error = _route_authority_error(*parts, admit_superseded=True)
     if error:
         return error
     if digest != _lock_digest(*parts):
@@ -812,15 +996,26 @@ def project_oauth_payload(payload: Mapping[str, Any]) -> dict:
     providers = []
     raw_rows = payload.get("providers")
     if isinstance(raw_rows, list):
+
+        def _logged_in(raw: Any) -> bool:
+            status = raw.get("status") if isinstance(raw, Mapping) else None
+            return isinstance(status, Mapping) and status.get("logged_in") is True
+
+        # Since 2026-09-23 every Claude lane borrows the one Server 1 Claude
+        # Code login, which the native "anthropic" entry deliberately does not
+        # read; for the owner that login is the Anthropic connection.
+        claude_code_login = any(
+            isinstance(raw, Mapping) and raw.get("id") == "claude-code" and _logged_in(raw)
+            for raw in raw_rows
+        )
         for raw in raw_rows:
             if not isinstance(raw, Mapping):
                 continue
             provider_id = str(raw.get("id") or "")
             if provider_id not in allowed:
                 continue
-            status = raw.get("status")
-            logged_in = bool(
-                isinstance(status, Mapping) and status.get("logged_in") is True
+            logged_in = _logged_in(raw) or (
+                provider_id == "anthropic" and claude_code_login
             )
             providers.append({
                 "id": provider_id,

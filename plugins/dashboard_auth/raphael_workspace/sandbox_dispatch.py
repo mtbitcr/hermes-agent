@@ -180,6 +180,13 @@ VAULT_MATCH_METHODS = ("GET", "POST")
 #: substitutes the vault credential on the way out.
 PLACEHOLDER_TOKEN = "sk-ant-api03-hermes-credential-proxy-placeholder-not-a-secret"
 
+#: The effort levels Claude Code accepts in ``CLAUDE_CODE_EFFORT_LEVEL``. The
+#: board's vocabulary is wider — a task may pin ``minimal``, ``none`` or
+#: ``ultra`` for a Hermes worker — so a pinned effort outside this set is
+#: withheld from the machine and the reason logged, rather than handed to a
+#: client that does not accept it.
+CLAUDE_CODE_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
 #: A Claude *account* access token is refreshable but short-lived, so one that
 #: is valid now can still die inside a bounded task. Require it to outlive the
 #: whole sandbox lease plus this buffer, or refresh it before the vault write.
@@ -1226,6 +1233,50 @@ def _sandbox_env(secret: str) -> dict:
     return {"ANTHROPIC_API_KEY": PLACEHOLDER_TOKEN}
 
 
+def _route_env(task: Any, ctx: _WorkerContext) -> dict:
+    """The model route the kernel pinned for this task, as Claude Code reads it.
+
+    Claude Code in the machine takes its model and effort from these two
+    variables; without them it runs its own defaults, not the route approved
+    for the task. Both come from the task record alone — never from
+    worker-authored text or this process's environment — so the worker cannot
+    choose the model it runs on.
+
+    A task that pins no model gets neither variable. A pinned model with no
+    pinned effort takes the effort of the route the model policy admits for
+    the task's own assignee, provider and tier. An effort Claude Code does not
+    accept is withheld and the reason logged; the model still passes. Neither
+    value is a credential, so the placeholder from :func:`_sandbox_env` stays
+    the only credential-shaped value in the env.
+    """
+    model = (task.model_override or "").strip()
+    if not model:
+        return {}
+    env = {"ANTHROPIC_MODEL": model}
+    effort = str(task.reasoning_effort or "").strip().lower()
+    if not effort:
+        from plugins.dashboard_auth.raphael_workspace import model_policy
+
+        try:
+            effort = model_policy.task_assignment_for(
+                task.assignee, task.provider_override, task.execution_tier,
+            ).reasoning_effort
+        except ValueError:
+            _log_event(
+                ctx, "effort_withheld", level=logging.WARNING,
+                reason="policy_route_unresolved",
+            )
+            return env
+    if effort not in CLAUDE_CODE_EFFORT_LEVELS:
+        _log_event(
+            ctx, "effort_withheld", level=logging.WARNING,
+            reason="effort_not_accepted", effort=effort,
+        )
+        return env
+    env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
+    return env
+
+
 def _vault_payload(sdk: _Sdk, secret: str) -> tuple:
     if _credential_is_oauth(secret):
         auth = {"type": "bearer", "credential": VAULT_CREDENTIAL_NAME}
@@ -1971,7 +2022,8 @@ def _provision(
         # this board's own store, and it mints the identity the machine is
         # stamped with — the only way a machine created during a crash can
         # be recognised afterwards. Fails closed: no intent, no machine.
-        project = str(getattr(_resolve_task(ctx), "project_id", "") or "")
+        task = _resolve_task(ctx)
+        project = str(getattr(task, "project_id", "") or "")
         kb = _kanban()
         try:
             intent_id = kb.record_kernel_creation(
@@ -2000,7 +2052,10 @@ def _provision(
                 timeout=timedelta(seconds=SANDBOX_TIMEOUT_SECONDS),
                 ready_timeout=timedelta(seconds=SANDBOX_READY_TIMEOUT_SECONDS),
                 resource=dict(SANDBOX_RESOURCES),
-                env=_sandbox_env(secret) if secret is not None else {},
+                env={
+                    **(_sandbox_env(secret) if secret is not None else {}),
+                    **_route_env(task, ctx),
+                },
                 metadata=_kernel_metadata(
                     ctx, generation=generation, project=project,
                     intent_id=intent_id,

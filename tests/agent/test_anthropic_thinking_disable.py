@@ -37,6 +37,15 @@ ADAPTIVE_DISABLEABLE = [
     "claude-opus-4-6",
 ]
 
+# Opus 5.5 is reasoning-mandatory. Its id reaches the adapter with a hyphen or
+# a dot, with or without the Portal prefix.
+OPUS_55_SPELLINGS = [
+    "claude-opus-5-5",
+    "claude-opus-5.5",
+    "anthropic/claude-opus-5-5",
+    "anthropic/claude-opus-5.5",
+]
+
 
 def _kwargs(model: str, reasoning_config: dict | None, **extra):
     return build_anthropic_kwargs(
@@ -69,6 +78,37 @@ class TestThinkingOffIsSentExplicitly:
         kwargs = _kwargs("anthropic/claude-fable-5", {"enabled": False})
         assert "thinking" not in kwargs
 
+    @pytest.mark.parametrize("model", OPUS_55_SPELLINGS)
+    def test_opus_5_5_is_mandatory_thinking_in_every_spelling(self, model: str) -> None:
+        """Opus 5.5 400s on the disable too; dot and hyphen ids are one family."""
+        kwargs = _kwargs(model, {"enabled": False})
+        assert "thinking" not in kwargs
+        assert "output_config" not in kwargs
+
+    @pytest.mark.parametrize("model", OPUS_55_SPELLINGS)
+    def test_opus_5_5_omits_the_disable_with_dots_preserved(self, model: str) -> None:
+        """``preserve_dots`` keeps ``claude-opus-5.5`` on the wire; the verdict
+        must not depend on the hyphen normalization having happened."""
+        kwargs = _kwargs(model, {"enabled": False}, preserve_dots=True)
+        assert "thinking" not in kwargs
+
+    def test_opus_5_5_omits_the_disable_on_the_portal_route(self) -> None:
+        """Nous Portal keeps the ``anthropic/`` prefix and the dot verbatim."""
+        kwargs = _kwargs(
+            "anthropic/claude-opus-5.5",
+            {"enabled": False},
+            base_url="https://inference-api.nousresearch.com/v1",
+        )
+        assert kwargs["model"] == "anthropic/claude-opus-5.5"
+        assert "thinking" not in kwargs
+
+    @pytest.mark.parametrize("preserve_dots", [False, True])
+    def test_opus_5_0_still_receives_the_disable(self, preserve_dots: bool) -> None:
+        """The 5.0 / 5.5 boundary: plain Opus 5 is NOT mandatory-thinking."""
+        for model in ("claude-opus-5", "anthropic/claude-opus-5"):
+            kwargs = _kwargs(model, {"enabled": False}, preserve_dots=preserve_dots)
+            assert kwargs["thinking"] == {"type": "disabled"}, model
+
     def test_legacy_manual_thinking_models_keep_the_omission(self) -> None:
         """Pre-4.6 thinking is opt-in via budget_tokens: absence IS off."""
         kwargs = _kwargs("claude-sonnet-4-5", {"enabled": False})
@@ -100,6 +140,17 @@ class TestEnablePathIsUnchanged:
         assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kwargs["output_config"] == {"effort": "max"}
 
+    @pytest.mark.parametrize("model", OPUS_55_SPELLINGS)
+    def test_opus_5_5_enable_path_is_the_adaptive_contract(self, model: str) -> None:
+        """Only the disable branch changed: max and xhigh still map verbatim
+        and the caller's max_tokens is untouched."""
+        kwargs = _kwargs(model, {"enabled": True, "effort": "max"})
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kwargs["output_config"] == {"effort": "max"}
+        kwargs = _kwargs(model, {"enabled": True, "effort": "xhigh"})
+        assert kwargs["output_config"] == {"effort": "xhigh"}
+        assert kwargs["max_tokens"] == 4096
+
     def test_legacy_enable_still_sends_budget_tokens(self) -> None:
         kwargs = _kwargs("claude-sonnet-4-5", {"enabled": True, "effort": "high"})
         assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 16000}
@@ -122,6 +173,8 @@ class TestDisableVerdictHelper:
         assert _accepts_thinking_disable("anthropic/claude-opus-5") is True
         assert _accepts_thinking_disable("anthropic/claude-sonnet-5") is True
         assert _accepts_thinking_disable("anthropic/claude-fable-5") is False
+        for model in OPUS_55_SPELLINGS:
+            assert _accepts_thinking_disable(model) is False, model
 
     def test_non_claude_models_are_left_alone(self) -> None:
         from agent.anthropic_adapter import _accepts_thinking_disable

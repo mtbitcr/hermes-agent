@@ -155,12 +155,12 @@ def _spawn_profile_home(monkeypatch, tmp_path):
 def _pinned_task(kb, *, assignee: str = _PINNED_ASSIGNEE):
     """A task locked to the deep Claude lane its assignee is approved for."""
     task = _make_task(kb, assignee=assignee)
-    task.model_override = "claude-opus-5"
+    task.model_override = "claude-opus-5-5"
     task.provider_override = "anthropic"
     task.reasoning_effort = "max"
     task.execution_tier = "deep"
     task.model_policy_lock = kb.mint_policy_lock(
-        _PINNED_ASSIGNEE, "anthropic", "claude-opus-5", "max", "deep",
+        _PINNED_ASSIGNEE, "anthropic", "claude-opus-5-5", "max", "deep",
     )
     return task
 
@@ -201,7 +201,7 @@ def test_default_spawn_disables_fallbacks_for_a_policy_locked_task(monkeypatch, 
     cmd = captured["cmd"]
     assert cmd[1:3] == ["-p", _PINNED_ASSIGNEE]
     assert NO_FALLBACK_FLAG in cmd
-    assert cmd[cmd.index("-m") + 1] == "claude-opus-5"
+    assert cmd[cmd.index("-m") + 1] == "claude-opus-5-5"
     assert cmd[cmd.index("--provider") + 1] == "anthropic"
     assert cmd[cmd.index("--reasoning") + 1] == "max"
 
@@ -445,7 +445,10 @@ def test_default_spawn_refuses_a_locked_task_it_cannot_honor(monkeypatch, tmp_pa
         ("reasoning_effort", "ultra", "forbidden reasoning effort"),
         # A single hand-edited column breaks the digest that binds the tuple.
         ("model_override", "claude-sonnet-5", "not the admitted route"),
-        ("execution_tier", "routine", "not the admitted route"),
+        # The builder's routine route is the same claude-opus-5-5/max as its
+        # deep lane, so the route-authority check admits the flipped tier; the
+        # lock digest, which binds the tier, is the guard that refuses it.
+        ("execution_tier", "routine", "digest does not bind this route"),
         # Unknown, stale and legacy-truthy authorities are never "unlocked".
         ("model_policy_lock", "bogus:v1:" + "a" * 64, "unknown authority"),
         ("model_policy_lock", "raphael:v99:" + "a" * 64, "stale"),

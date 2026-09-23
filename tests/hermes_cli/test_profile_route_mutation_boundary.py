@@ -26,13 +26,15 @@ from hermes_cli.profiles import get_profile_dir, profile_name_for_home
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from plugins.dashboard_auth.raphael_workspace import model_policy
 
+# The CURRENT admitted base routes (model_policy._ASSIGNMENTS). Superseded
+# routes are validation-only history and are never an admitted base route.
 _ADMITTED = {
-    "model": {"provider": "anthropic", "default": "claude-opus-5"},
+    "model": {"provider": "anthropic", "default": "claude-opus-5-5"},
     "agent": {"reasoning_effort": "max"},
     "fallback_providers": [],
 }
 _VERIFIER_ADMITTED = {
-    "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+    "model": {"provider": "openai-codex", "default": "gpt-6-sol"},
     "agent": {"reasoning_effort": "max"},
     "fallback_providers": [],
 }
@@ -124,13 +126,13 @@ def test_an_enrolled_profile_stays_governed_even_when_it_has_drifted():
         )
     # An admitted route is still accepted, which is how a drifted role recovers.
     _scoped_save("raphael-verifier", _VERIFIER_ADMITTED)
-    assert _written("raphael-verifier")["model"]["default"] == "gpt-5.6-sol"
+    assert _written("raphael-verifier")["model"]["default"] == "gpt-6-sol"
 
 
 def test_an_unenrolled_default_profile_on_the_same_model_stays_native():
     """Same name AND same model as a policy role, but never enrolled."""
     _scoped_save("default", _ADMITTED)
-    assert _written("default")["model"]["default"] == "claude-opus-5"
+    assert _written("default")["model"]["default"] == "claude-opus-5-5"
     # Unrestricted: it can move anywhere, including off the policy's route.
     _scoped_save("default", {"model": {"provider": "openai", "default": "gpt-x"}})
     assert _written("default")["model"]["default"] == "gpt-x"
@@ -170,34 +172,57 @@ def test_unadmitted_route_is_refused_at_the_shared_boundary(override):
     with pytest.raises(ValueError, match="unadmitted Raphael model assignment"):
         _scoped_save("raphael-verifier", {**_VERIFIER_ADMITTED, **override})
     # The admitted route survived; nothing half-applied.
-    assert _written("raphael-verifier")["model"]["default"] == "gpt-5.6-sol"
+    assert _written("raphael-verifier")["model"]["default"] == "gpt-6-sol"
 
 
 def test_a_deep_task_lane_is_not_a_valid_base_route():
     """Base configs use validate_assignment; deep lanes are task authority only.
 
-    ``raphael-builder``/anthropic admits ``claude-sonnet-5`` as its BASE route
-    and ``claude-opus-5`` only as its deep TASK lane. Accepting the deep lane
-    as a base route would erase the routine/deep separation.
+    ``raphael-verifier``/openai-codex admits ``gpt-6-sol`` / max as its BASE
+    route and ``gpt-6-astra`` / xhigh only as its deep TASK lane. Accepting the
+    deep lane as a base route would erase the routine/deep separation. (This
+    pair is used because the current matrix really does give it a deep lane
+    that differs from its base route; ``raphael-builder``'s base and deep lanes
+    are now the same Opus 5.5 / max route, so it can no longer show this.)
     """
-    base = {
-        "model": {"provider": "anthropic", "default": "claude-sonnet-5"},
-        "agent": {"reasoning_effort": "max"},
-        "fallback_providers": [],
-    }
-    _scoped_save("raphael-builder", base)
-    model_policy.enroll_profile("raphael-builder")
-    deep = model_policy.task_assignment_for("raphael-builder", "anthropic", "deep")
-    assert deep.model == "claude-opus-5"
-    with pytest.raises(ValueError, match="unadmitted Raphael model assignment"):
-        _scoped_save("raphael-builder", {**base, "model": {
-            "provider": "anthropic", "default": deep.model,
-        }})
-    assert _written("raphael-builder")["model"]["default"] == "claude-sonnet-5"
-    # The same route IS admitted as a task pin.
-    model_policy.validate_runtime_assignment(
-        "raphael-builder", "anthropic", deep.model, "max", disable_fallbacks=True,
+    base = dict(_VERIFIER_ADMITTED)
+    _scoped_save("raphael-verifier", base)
+    model_policy.enroll_profile("raphael-verifier")
+    routine = model_policy.task_assignment_for(
+        "raphael-verifier", "openai-codex", "routine",
     )
+    deep = model_policy.task_assignment_for("raphael-verifier", "openai-codex", "deep")
+    assert (routine.model, routine.reasoning_effort) == ("gpt-6-sol", "max")
+    assert (deep.model, deep.reasoning_effort) == ("gpt-6-astra", "xhigh")
+    # Neither the deep model alone nor the exact deep lane is a base route.
+    for deep_route in (
+        {**base, "model": {"provider": "openai-codex", "default": deep.model}},
+        {
+            **base,
+            "model": {"provider": "openai-codex", "default": deep.model},
+            "agent": {"reasoning_effort": deep.reasoning_effort},
+        },
+    ):
+        with pytest.raises(ValueError, match="unadmitted Raphael model assignment"):
+            _scoped_save("raphael-verifier", deep_route)
+        assert _written("raphael-verifier")["model"]["default"] == "gpt-6-sol"
+        assert _written("raphael-verifier")["agent"]["reasoning_effort"] == "max"
+    # The same route IS admitted as a task pin.
+    assert model_policy.validate_runtime_assignment(
+        "raphael-verifier", "openai-codex", deep.model, deep.reasoning_effort,
+        disable_fallbacks=True,
+    ) == deep
+    # Lineage never widens the base-route boundary either: the superseded
+    # routine route still reads back as history, but cannot be written.
+    assert model_policy.validate_runtime_assignment(
+        "raphael-verifier", "openai-codex", "gpt-5.6-sol", "max",
+        disable_fallbacks=True,
+    ).recommended is False
+    with pytest.raises(ValueError, match="unadmitted Raphael model assignment"):
+        _scoped_save("raphael-verifier", {
+            **base, "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+        })
+    assert _written("raphael-verifier")["model"]["default"] == "gpt-6-sol"
 
 
 def test_unrelated_config_writes_do_not_enter_the_guard(monkeypatch):
@@ -230,7 +255,7 @@ def test_route_change_fences_existing_owner_work_before_writing(monkeypatch):
     monkeypatch.setattr(ow, "fence_effective_task_routes", _boom)
     with pytest.raises(ow.OwnerWorkspaceError):
         _scoped_save("default", {
-            "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+            "model": {"provider": "openai-codex", "default": "gpt-6-sol"},
             "agent": {"reasoning_effort": "max"},
             "fallback_providers": [],
         })
@@ -255,7 +280,7 @@ def test_single_key_writers_reach_the_same_boundary(round_trip):
         hermes_config.save_shared_config_key(
             path, "model.default", "gpt-5.6-terra", round_trip=round_trip,
         )
-    assert _written("raphael-verifier")["model"]["default"] == "gpt-5.6-sol"
+    assert _written("raphael-verifier")["model"]["default"] == "gpt-6-sol"
     # An unrelated key still writes normally.
     hermes_config.save_shared_config_key(
         path, "display.timestamps", True, round_trip=round_trip,
@@ -281,7 +306,7 @@ def test_config_set_reaches_the_boundary(monkeypatch):
             hermes_config.set_config_value("model.default", "gpt-5.6-terra")
     finally:
         reset_hermes_home_override(token)
-    assert _written("raphael-verifier")["model"]["default"] == "gpt-5.6-sol"
+    assert _written("raphael-verifier")["model"]["default"] == "gpt-6-sol"
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +452,7 @@ def test_fence_pins_owner_work_before_a_real_route_change(monkeypatch):
     )
 
     _scoped_save(profile, {
-        "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+        "model": {"provider": "openai-codex", "default": "gpt-6-sol"},
         "agent": {"reasoning_effort": "max"},
         "fallback_providers": [],
     })
@@ -436,10 +461,10 @@ def test_fence_pins_owner_work_before_a_real_route_change(monkeypatch):
         pinned = kanban_db.get_task(conn, task_id)
     # Frozen on the route it was already running, not on the new selection.
     assert (pinned.provider_override, pinned.model_override) == (
-        "anthropic", "claude-opus-5",
+        "anthropic", "claude-opus-5-5",
     )
     assert kanban_db.policy_lock_error(
-        pinned.model_policy_lock, profile, "anthropic", "claude-opus-5", "max",
+        pinned.model_policy_lock, profile, "anthropic", "claude-opus-5-5", "max",
         "routine",
     ) is None
     assert _written(profile)["model"]["provider"] == "openai-codex"

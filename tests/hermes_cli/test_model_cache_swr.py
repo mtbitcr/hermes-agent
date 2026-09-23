@@ -148,6 +148,154 @@ class TestProviderModelsSWR:
         assert "openrouter" not in mod._swr_refresh_inflight  # cleared on completion
 
 
+class TestSWRRefreshOwnership:
+    """A background refresh belongs to the HERMES_HOME that scheduled it.
+
+    ``set_hermes_home_override`` is a ContextVar, and on this Python a new
+    ``threading.Thread`` starts with an EMPTY context, so without carrying the
+    scheduling context along the refresh thread silently fell back to the
+    process home: it called the fetcher under the wrong home and wrote the
+    result into the wrong home's ``provider_models_cache.json``. The dedupe
+    key was also the bare provider slug, so one profile's in-flight refresh
+    suppressed another profile's refresh of its own cache.
+
+    These tests use real threads and real on-disk caches — nothing about the
+    thread, the context or the cache file is stubbed.
+    """
+
+    @staticmethod
+    def _cache_rows(home):
+        import json as _json
+
+        path = home / "provider_models_cache.json"
+        return _json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+    @staticmethod
+    def _wait_for_idle(mod, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with mod._swr_refresh_lock:
+                if not mod._swr_refresh_inflight:
+                    return True
+            time.sleep(0.01)
+        return False
+
+    def test_default_refresh_fetches_and_stores_under_the_scheduling_home(
+        self, tmp_path, monkeypatch,
+    ):
+        import hermes_cli.models as mod
+        from hermes_constants import (
+            get_hermes_home, reset_hermes_home_override, set_hermes_home_override,
+        )
+
+        process_home = tmp_path / "process-home"
+        root = tmp_path / "root-home"
+        process_home.mkdir()
+        root.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(process_home))
+
+        fetched_under = []
+
+        def fake_live(provider, force_refresh=False):
+            fetched_under.append((provider, str(get_hermes_home()), force_refresh))
+            return ["gpt-6-sol", "gpt-6-astra"]
+
+        monkeypatch.setattr(mod, "provider_model_ids", fake_live)
+        token = set_hermes_home_override(str(root))
+        try:
+            mod._spawn_swr_refresh("openai-codex")
+        finally:
+            reset_hermes_home_override(token)
+        assert self._wait_for_idle(mod), "background refresh did not finish"
+
+        assert fetched_under == [("openai-codex", str(root), True)]
+        assert self._cache_rows(root)["openai-codex"]["models"] == [
+            "gpt-6-sol", "gpt-6-astra",
+        ]
+        # The process home's cache was never written by the root's refresh.
+        assert "openai-codex" not in self._cache_rows(process_home)
+
+    def test_custom_refresh_callback_runs_under_the_scheduling_home(
+        self, tmp_path, monkeypatch,
+    ):
+        """``cached_fetch_api_models`` passes its own refresh callback; the
+        callback and the store it feeds must both see the scheduling home."""
+        import hermes_cli.models as mod
+        from hermes_constants import (
+            get_hermes_home, reset_hermes_home_override, set_hermes_home_override,
+        )
+
+        process_home = tmp_path / "process-home"
+        profile = tmp_path / "profile-home"
+        process_home.mkdir()
+        profile.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(process_home))
+        key = "custom:https://gw.example.com/v1#fp"
+        seen = []
+
+        def refresh():
+            seen.append(str(get_hermes_home()))
+            return {"fp": "fp", "at": time.time(), "models": ["refreshed"]}
+
+        token = set_hermes_home_override(str(profile))
+        try:
+            mod._spawn_swr_refresh(key, refresh)
+        finally:
+            reset_hermes_home_override(token)
+        assert self._wait_for_idle(mod), "background refresh did not finish"
+
+        assert seen == [str(profile)]
+        assert self._cache_rows(profile)[key]["models"] == ["refreshed"]
+        assert key not in self._cache_rows(process_home)
+
+    def test_concurrent_profiles_each_refresh_their_own_cache(
+        self, tmp_path, monkeypatch,
+    ):
+        """Two homes refreshing the same provider at once are two refreshes.
+
+        A profile's in-flight refresh must neither suppress another profile's
+        refresh nor write into the other profile's cache.
+        """
+        import threading as _threading
+
+        import hermes_cli.models as mod
+        from hermes_constants import (
+            get_hermes_home, reset_hermes_home_override, set_hermes_home_override,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "process-home"))
+        homes = {name: tmp_path / name for name in ("alpha", "beta")}
+        for home in homes.values():
+            home.mkdir()
+        both_started = _threading.Barrier(2, timeout=5)
+        calls = []
+
+        def fake_live(provider, force_refresh=False):
+            home = str(get_hermes_home())
+            calls.append(home)
+            # Hold each refresh open until BOTH are in flight, so a
+            # cross-profile dedupe would deadlock this barrier and fail.
+            both_started.wait()
+            return [f"model-for-{get_hermes_home().name}"]
+
+        monkeypatch.setattr(mod, "provider_model_ids", fake_live)
+        for home in homes.values():
+            token = set_hermes_home_override(str(home))
+            try:
+                mod._spawn_swr_refresh("openai-codex")
+                # Same home, same key: still deduped while in flight.
+                mod._spawn_swr_refresh("openai-codex")
+            finally:
+                reset_hermes_home_override(token)
+        assert self._wait_for_idle(mod), "background refreshes did not finish"
+
+        assert sorted(calls) == sorted(str(home) for home in homes.values())
+        for name, home in homes.items():
+            assert self._cache_rows(home)["openai-codex"]["models"] == [
+                f"model-for-{name}"
+            ]
+
+
 class TestCatalogSWR:
     def test_stale_disk_catalog_served_with_background_refresh(self, tmp_path, monkeypatch):
         import hermes_cli.model_catalog as mc

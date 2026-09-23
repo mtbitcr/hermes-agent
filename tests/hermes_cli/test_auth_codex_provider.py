@@ -104,6 +104,499 @@ def test_resolve_codex_runtime_credentials_falls_back_to_pool_when_singleton_emp
     assert resolved["base_url"]  # default codex backend URL
 
 
+# ---------------------------------------------------------------------------
+# Catalog account boundary: a named profile resolves the account its runtime
+# actually runs on — the profile's own material first, else the global root's
+# through ``_load_provider_state`` / ``read_credential_pool`` — and never
+# another profile's, never a guess over an unreadable store.
+# ---------------------------------------------------------------------------
+
+
+def _codex_pool_row(access_token: str, *, source: str = "manual:device_code") -> dict:
+    return {
+        "id": f"id-{access_token}",
+        "source": source,
+        "auth_type": "oauth",
+        "access_token": access_token,
+        "refresh_token": f"{access_token}-refresh",
+        "last_status": "ok",
+    }
+
+
+def _write_codex_store(home: Path, *, singleton=None, pool=None, raw=None) -> Path:
+    home.mkdir(parents=True, exist_ok=True)
+    auth_file = home / "auth.json"
+    if raw is not None:
+        auth_file.write_text(raw, encoding="utf-8")
+        return auth_file
+    store = {"version": 1, "providers": {}}
+    if singleton is not None:
+        store["providers"]["openai-codex"] = singleton
+    if pool is not None:
+        store["credential_pool"] = {"openai-codex": pool}
+    auth_file.write_text(json.dumps(store), encoding="utf-8")
+    return auth_file
+
+
+def _singleton(access_token: str) -> dict:
+    return {
+        "tokens": {"access_token": access_token, "refresh_token": f"{access_token}-refresh"},
+        "last_refresh": "2026-09-01T00:00:00Z",
+        "auth_mode": "chatgpt",
+    }
+
+
+@pytest.fixture
+def codex_profiles(tmp_path, monkeypatch):
+    """A global root with two named profiles, scoped to ``worker``.
+
+    ``HERMES_HOME`` is the root (so ``get_default_hermes_root()`` is the root)
+    and the request scope is the context-local override, exactly as the
+    dashboard's ``_profile_scope`` sets it.
+    """
+    import hermes_cli.auth as auth_mod
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    root = tmp_path / "root"
+    worker = root / "profiles" / "worker"
+    other = root / "profiles" / "other"
+    for home in (root, worker, other):
+        home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex-cli"))
+    monkeypatch.setattr(auth_mod, "_global_auth_store_cache", None)
+    token = set_hermes_home_override(str(worker))
+    try:
+        yield SimpleNamespace(root=root, worker=worker, other=other)
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _owning_root():
+    from hermes_cli.web_server import _shared_codex_owning_root
+
+    return _shared_codex_owning_root()
+
+
+def _resolve_at(home: Path) -> dict:
+    """The catalog account read exactly as ``_codex_catalog_at_owning_root``
+    performs it: under the owning home's own scope."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(home))
+    try:
+        return resolve_codex_runtime_credentials()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _catalog_of(access_token) -> list:
+    """The model ids the fake account API lists for *access_token*."""
+    return [f"model-of-{access_token}"]
+
+
+def _record_codex_catalog_fetches(monkeypatch) -> list:
+    """Patch the Codex account-catalog fetcher to report which token it was asked for.
+
+    Both catalog paths end in ``get_codex_model_ids``: the owning home's own
+    read (via ``hermes_cli.models._codex_catalog``, with that home's resolved
+    token) and the selected-token fallback. Returns the list of tokens asked.
+    """
+    asked = []
+
+    def fake_get_codex_model_ids(access_token=None):
+        asked.append(access_token)
+        return _catalog_of(access_token)
+
+    monkeypatch.setattr(
+        "hermes_cli.codex_models.get_codex_model_ids", fake_get_codex_model_ids
+    )
+    return asked
+
+
+def _runtime_selected_token():
+    """What the scoped profile's runtime selects, via the production selector's
+    read-only replica (``load_pool`` + ``select``), and whether it is borrowed."""
+    from agent.credential_pool import preview_runtime_selection
+
+    entry, borrowed = preview_runtime_selection("openai-codex")
+    return (entry.access_token if entry is not None else None), borrowed
+
+
+def _route_codex_catalog(*, refresh: bool = False):
+    """The Codex catalog the owner's Models route lists for the scoped profile,
+    composed exactly as ``get_model_options`` composes it."""
+    from hermes_cli.web_server import (
+        _codex_catalog_for_runtime_account,
+        _codex_runtime_account,
+    )
+
+    account = _codex_runtime_account()
+    if account is None:
+        return None, None
+    home, token = account
+    return account, _codex_catalog_for_runtime_account(home, token, refresh=refresh)
+
+
+def test_profile_without_codex_material_is_owned_by_the_roots_account(codex_profiles):
+    """The operator's defect: the runtime ran on the root's pool grant.
+
+    ``read_credential_pool`` hands a profile with zero Codex entries the root's
+    slice, and ``_load_provider_state_with_source`` finds no singleton of the
+    profile's own, so the root owns the account the profile runs on and the
+    owner's catalog read is taken there — resolving the root's pool account
+    rather than raising ``codex_auth_missing`` (which degraded the picker to
+    the static list and dropped account-gated models such as Astra).
+
+    An ORDINARY profile-scoped read stays isolated and does not borrow the
+    root's pool (the approved behaviour pinned by
+    ``test_generic_profile_reads_keep_their_own_isolated_catalog``).
+    """
+    from hermes_cli.auth import read_credential_pool
+
+    _write_codex_store(codex_profiles.root, pool=[_codex_pool_row("root-pool-at")])
+
+    assert [row["access_token"] for row in read_credential_pool("openai-codex")] == [
+        "root-pool-at"
+    ]
+    assert _owning_root() == codex_profiles.root
+    resolved = _resolve_at(_owning_root())
+    assert (resolved["api_key"], resolved["source"]) == ("root-pool-at", "credential_pool")
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+    assert exc.value.code == "codex_auth_missing"
+    # Reading never copies the root's material into the profile.
+    assert not (codex_profiles.worker / "auth.json").exists()
+
+
+def test_malformed_profile_store_keeps_its_corrupt_copy_and_reads_as_empty(codex_profiles):
+    """(a) Malformed JSON is preserved on disk, never discarded or rewritten.
+
+    ``_load_auth_store`` copies the bytes to ``auth.json.corrupt`` and reads the
+    store as empty — the runtime's existing behaviour — so the account is
+    decided exactly as the runtime decides it (here: the root's pool, which a
+    profile with no readable entries of its own borrows).
+    """
+    garbage = '{"providers": {"openai-codex": {"tokens": '
+    auth_file = _write_codex_store(codex_profiles.worker, raw=garbage)
+    _write_codex_store(codex_profiles.root, pool=[_codex_pool_row("root-pool-at")])
+
+    assert _owning_root() == codex_profiles.root
+    assert _resolve_at(codex_profiles.root)["api_key"] == "root-pool-at"
+    # The profile's own read neither guesses the lost tokens nor borrows.
+    with pytest.raises(AuthError):
+        resolve_codex_runtime_credentials()
+
+    corrupt = codex_profiles.worker / "auth.json.corrupt"
+    assert corrupt.read_text(encoding="utf-8") == garbage
+    # The original is still on disk, byte for byte: nothing was discarded.
+    assert auth_file.read_text(encoding="utf-8") == garbage
+
+
+def test_unreadable_profile_store_is_refused_rather_than_guessed(codex_profiles):
+    """(b) A store that exists but cannot be read is not an empty store.
+
+    Mechanism: ``auth.json`` is a DIRECTORY, so ``read_text`` raises
+    ``IsADirectoryError`` (an ``OSError``). ``chmod 000`` is deliberately NOT
+    used: this suite runs as root, which reads a mode-000 file anyway, so a
+    chmod-based test would silently prove nothing.
+    """
+    (codex_profiles.worker / "auth.json").mkdir()
+    root_file = _write_codex_store(
+        codex_profiles.root,
+        singleton=_singleton("root-at"),
+        pool=[_codex_pool_row("root-pool-at")],
+    )
+    before = root_file.read_bytes()
+
+    # Refused: neither degraded to "no credentials" nor silently swapped for
+    # the root's grant.
+    with pytest.raises(OSError):
+        resolve_codex_runtime_credentials()
+    assert _owning_root() is None
+    assert root_file.read_bytes() == before
+    assert (codex_profiles.worker / "auth.json").is_dir()
+
+
+def test_own_singleton_plus_borrowed_root_pool_resolves_the_profiles_own_grant(
+    codex_profiles, monkeypatch,
+):
+    """(c) Catalog account == the account the runtime actually selects; no store mutates.
+
+    The profile's own singleton-first read resolves its own grant
+    (``worker-at``), but the runtime runs on ``load_pool().select()``, which
+    puts the borrowed root pool row (priority 0) ahead of the profile's seeded
+    singleton and selects ``root-pool-at``. The catalog must therefore be
+    ``root-pool-at``'s: not the profile singleton's (the account's own read),
+    and not the root singleton's (what the root's own read would resolve).
+    Only model ids cross the boundary: neither auth store changes by a byte,
+    and none of the root's material reaches the profile.
+    """
+    from hermes_cli.auth import read_credential_pool
+
+    worker_file = _write_codex_store(
+        codex_profiles.worker, singleton=_singleton("worker-at")
+    )
+    root_file = _write_codex_store(
+        codex_profiles.root,
+        singleton=_singleton("root-at"),
+        pool=[_codex_pool_row("root-pool-at")],
+    )
+    worker_before, root_before = worker_file.read_bytes(), root_file.read_bytes()
+    asked = _record_codex_catalog_fetches(monkeypatch)
+
+    assert [row["access_token"] for row in read_credential_pool("openai-codex")] == [
+        "root-pool-at"
+    ]
+    # The profile's own read is unchanged: its own singleton, singleton first.
+    resolved = resolve_codex_runtime_credentials()
+    assert (resolved["api_key"], resolved["source"]) == ("worker-at", "hermes-auth-store")
+
+    # The runtime selects the borrowed root pool row, not the profile's grant.
+    assert _runtime_selected_token() == ("root-pool-at", True)
+    assert _owning_root() == codex_profiles.root
+    # The root's own read would list a different grant (its singleton) ...
+    assert _resolve_at(codex_profiles.root)["api_key"] == "root-at"
+
+    # ... so the route asks the catalog for exactly the selected account.
+    account, models = _route_codex_catalog()
+    assert account == (codex_profiles.root, "root-pool-at")
+    assert models == _catalog_of("root-pool-at")
+    assert asked == ["root-pool-at"]
+
+    assert worker_file.read_bytes() == worker_before
+    assert root_file.read_bytes() == root_before
+    assert not (codex_profiles.worker / "provider_models_cache.json").exists()
+
+
+def test_profile_with_only_its_own_pool_never_borrows_the_roots_pool(codex_profiles):
+    """(d) Any pool entry of the profile's own shadows the root's pool slice."""
+    _write_codex_store(
+        codex_profiles.worker, pool=[_codex_pool_row("worker-pool-at")],
+    )
+    _write_codex_store(codex_profiles.root, pool=[_codex_pool_row("root-pool-at")])
+
+    resolved = resolve_codex_runtime_credentials()
+    assert (resolved["api_key"], resolved["source"]) == (
+        "worker-pool-at", "credential_pool",
+    )
+    assert _owning_root() is None
+
+
+def test_profile_and_root_with_no_account_claim_nothing(codex_profiles):
+    """(e) No account anywhere: the catalog read raises and no owner is claimed."""
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+    assert exc.value.code == "codex_auth_missing"
+    assert _owning_root() is None
+    assert not (codex_profiles.worker / "auth.json").exists()
+
+
+def test_a_foreign_profiles_grant_is_never_borrowed(codex_profiles):
+    """(f) The only fallback is the global root — never a sibling profile.
+
+    ``other`` holds a full Codex account; ``worker`` holds nothing. Nothing of
+    ``other``'s may reach ``worker``: with an empty root there is no account at
+    all, and once the root has one, the root's account is what resolves.
+    """
+    _write_codex_store(
+        codex_profiles.other,
+        singleton=_singleton("other-at"),
+        pool=[_codex_pool_row("other-pool-at")],
+    )
+
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+    assert exc.value.code == "codex_auth_missing"
+    assert _owning_root() is None
+
+    _write_codex_store(codex_profiles.root, pool=[_codex_pool_row("root-pool-at")])
+    owner = _owning_root()
+    assert owner == codex_profiles.root
+    assert owner != codex_profiles.other
+    assert _resolve_at(owner)["api_key"] == "root-pool-at"
+    # And the scoped profile's own read still reaches nobody else's account.
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+    assert exc.value.code == "codex_auth_missing"
+
+
+def test_a_singleton_grant_alone_never_establishes_the_account(
+    codex_profiles, monkeypatch,
+):
+    """The root holding a singleton is not, by itself, the profile's account.
+
+    The profile carries its own (empty) ``providers.openai-codex`` block, which
+    ``_load_provider_state_with_source`` resolves profile-first: it SHADOWS the
+    root's singleton for this profile. The runtime reaches the root only
+    through the borrowed POOL and selects ``root-pool-at``. Invariant: the
+    catalog account equals that runtime-selected account — never the root's
+    SINGLETON, which is what re-reading the catalog at the root would resolve —
+    and neither auth store is mutated to get there.
+    """
+    worker_file = _write_codex_store(codex_profiles.worker, singleton={})
+    root_file = _write_codex_store(
+        codex_profiles.root,
+        singleton=_singleton("root-singleton-at"),
+        pool=[_codex_pool_row("root-pool-at")],
+    )
+    worker_before, root_before = worker_file.read_bytes(), root_file.read_bytes()
+    asked = _record_codex_catalog_fetches(monkeypatch)
+
+    # What the root's own read would have picked: its singleton, not the pool.
+    assert _resolve_at(codex_profiles.root)["api_key"] == "root-singleton-at"
+    # The profile's own read still resolves nothing: its empty block shadows
+    # the root's singleton and its pool fallback stays profile-local.
+    with pytest.raises(AuthError):
+        resolve_codex_runtime_credentials()
+
+    # The runtime runs on the borrowed pool row, so that is the catalog account.
+    assert _runtime_selected_token() == ("root-pool-at", True)
+    account, models = _route_codex_catalog()
+    assert account == (codex_profiles.root, "root-pool-at")
+    assert models == _catalog_of("root-pool-at")
+    assert asked == ["root-pool-at"]
+    assert "root-singleton-at" not in asked
+
+    assert worker_file.read_bytes() == worker_before
+    assert root_file.read_bytes() == root_before
+    assert not (codex_profiles.worker / "provider_models_cache.json").exists()
+
+
+def test_catalog_is_the_runtime_selected_borrowed_pool_account_not_either_singleton(
+    codex_profiles, monkeypatch,
+):
+    """Three-way mix: root pool A (priority 0, borrowed), root singleton B, profile singleton C.
+
+    The runtime (``load_pool().select()``) runs on A. The profile's own read
+    resolves C and the root's own read resolves B, so a route that listed
+    either read's catalog would show an account the runtime does not run on.
+    Invariant: the catalog returned is A's — not B's, not C's, and not the
+    foreign profile's — and no auth store changes by a byte.
+    """
+    worker_file = _write_codex_store(
+        codex_profiles.worker, singleton=_singleton("profile-singleton-c-at")
+    )
+    root_file = _write_codex_store(
+        codex_profiles.root,
+        singleton=_singleton("root-singleton-b-at"),
+        pool=[dict(_codex_pool_row("root-pool-a-at"), priority=0)],
+    )
+    other_file = _write_codex_store(
+        codex_profiles.other,
+        singleton=_singleton("other-at"),
+        pool=[_codex_pool_row("other-pool-at")],
+    )
+    before = {f: f.read_bytes() for f in (worker_file, root_file, other_file)}
+    asked = _record_codex_catalog_fetches(monkeypatch)
+
+    # The two reads a regressed route could list instead.
+    assert resolve_codex_runtime_credentials()["api_key"] == "profile-singleton-c-at"
+    assert _resolve_at(codex_profiles.root)["api_key"] == "root-singleton-b-at"
+
+    assert _runtime_selected_token() == ("root-pool-a-at", True)
+    account, models = _route_codex_catalog()
+    assert account == (codex_profiles.root, "root-pool-a-at")
+    assert models == _catalog_of("root-pool-a-at")
+    assert models != _catalog_of("root-singleton-b-at")
+    assert models != _catalog_of("profile-singleton-c-at")
+    assert asked == ["root-pool-a-at"]
+
+    for auth_file, raw in before.items():
+        assert auth_file.read_bytes() == raw
+    assert not (codex_profiles.worker / "provider_models_cache.json").exists()
+
+
+def test_a_borrowed_root_singleton_is_refreshed_in_the_roots_store(
+    codex_profiles, monkeypatch,
+):
+    """Refreshing the root's single-use grant from a profile must not fork it.
+
+    The rotated chain lands back in the root's auth.json (where the grant was
+    read) and the profile never acquires a copy of the root's tokens.
+    """
+    expiring = _jwt_with_exp(int(time.time()) - 60)
+    fresh = _jwt_with_exp(int(time.time()) + 3600)
+    root_file = _write_codex_store(codex_profiles.root, singleton=_singleton(expiring))
+    calls = []
+
+    def fake_refresh(access_token, refresh_token, *, timeout_seconds=20.0):
+        calls.append(refresh_token)
+        return {
+            "access_token": fresh,
+            "refresh_token": "rotated-refresh",
+            "last_refresh": "2026-09-23T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", fake_refresh)
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert resolved["api_key"] == fresh
+    assert calls == [f"{expiring}-refresh"]
+    root_tokens = json.loads(root_file.read_text())["providers"]["openai-codex"]["tokens"]
+    assert root_tokens == {"access_token": fresh, "refresh_token": "rotated-refresh"}
+    worker_file = codex_profiles.worker / "auth.json"
+    if worker_file.exists():
+        assert "openai-codex" not in json.loads(worker_file.read_text()).get("providers", {})
+
+
+def test_catalog_at_owning_root_reads_and_refreshes_only_the_roots_cache(
+    codex_profiles, monkeypatch,
+):
+    """Only model ids cross the scope boundary; fetch, cache and SWR stay at root.
+
+    A stale root cache row is served and its background refresh runs the
+    fetcher under the ROOT's home and writes the ROOT's cache — not the
+    profile's, and not whatever home the refresh thread would otherwise
+    inherit.
+    """
+    import hermes_cli.models as models_mod
+    from hermes_cli.web_server import _codex_catalog_at_owning_root
+    from hermes_constants import get_hermes_home
+
+    _write_codex_store(codex_profiles.root, pool=[_codex_pool_row("root-pool-at")])
+    fetched_under = []
+
+    def fake_live(provider, force_refresh=False):
+        fetched_under.append((provider, str(get_hermes_home())))
+        return ["gpt-6-sol", "gpt-6-astra"]
+
+    monkeypatch.setattr(models_mod, "provider_model_ids", fake_live)
+    root = _owning_root()
+    assert root == codex_profiles.root
+
+    # Cold: a blocking fetch under the root's home, persisted in its cache.
+    assert _codex_catalog_at_owning_root(root, refresh=False) == [
+        "gpt-6-sol", "gpt-6-astra",
+    ]
+    assert fetched_under == [("openai-codex", str(codex_profiles.root))]
+    root_cache = codex_profiles.root / "provider_models_cache.json"
+    rows = json.loads(root_cache.read_text())
+    assert rows["openai-codex"]["models"] == ["gpt-6-sol", "gpt-6-astra"]
+
+    # Stale: served immediately, refreshed off-thread — still at the root.
+    rows["openai-codex"]["at"] = time.time() - 7200
+    rows["openai-codex"]["models"] = ["gpt-6-sol"]
+    root_cache.write_text(json.dumps(rows))
+    fetched_under.clear()
+    assert _codex_catalog_at_owning_root(root, refresh=False) == ["gpt-6-sol"]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with models_mod._swr_refresh_lock:
+            if not models_mod._swr_refresh_inflight:
+                break
+        time.sleep(0.01)
+    assert fetched_under == [("openai-codex", str(codex_profiles.root))]
+    assert json.loads(root_cache.read_text())["openai-codex"]["models"] == [
+        "gpt-6-sol", "gpt-6-astra",
+    ]
+
+    # The profile got neither a cache row nor any token material.
+    assert not (codex_profiles.worker / "provider_models_cache.json").exists()
+    assert not (codex_profiles.worker / "auth.json").exists()
+
+
 
 
 def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):

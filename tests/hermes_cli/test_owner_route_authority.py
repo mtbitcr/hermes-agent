@@ -14,6 +14,7 @@ Covers the facts the owner's approval actually rests on:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import sqlite3
 import threading
@@ -30,7 +31,7 @@ from tools import approval
 
 _OWNER_PROFILE = "default"
 _OWNER_ROUTE = {
-    "model": {"provider": "anthropic", "default": "claude-opus-5"},
+    "model": {"provider": "anthropic", "default": "claude-opus-5-5"},
     "agent": {"reasoning_effort": "max"},
     "fallback_providers": [],
 }
@@ -40,7 +41,7 @@ _OWNER_ROUTE = {
 # Claude one, so neither can stand in for this.
 _NAMED_ROLE = "raphael-planner"
 _NAMED_ROLE_ROUTE = {
-    "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+    "model": {"provider": "openai-codex", "default": "gpt-6-sol"},
     "agent": {"reasoning_effort": "max"},
     "fallback_providers": [],
 }
@@ -219,7 +220,7 @@ def test_named_role_route_change_fences_default_receipt_owned_work(bootstrapped)
     # The named-role route write scopes HERMES_HOME to that profile, and moves
     # it to that role's OTHER admitted provider.
     _write_profile_route(_NAMED_ROLE, {
-        "model": {"provider": "anthropic", "default": "claude-sonnet-5"},
+        "model": {"provider": "anthropic", "default": "claude-opus-5-5"},
         "agent": {"reasoning_effort": "max"},
         "fallback_providers": [],
     })
@@ -228,17 +229,197 @@ def test_named_role_route_change_fences_default_receipt_owned_work(bootstrapped)
         pinned = kanban_db.get_task(conn, task_id)
     # Frozen on the route it was already approved for, not the new selection.
     assert (pinned.provider_override, pinned.model_override) == (
-        "openai-codex", "gpt-5.6-sol",
+        "openai-codex", "gpt-6-sol",
     )
     assert pinned.model_policy_lock
     assert kanban_db.policy_lock_error(
         pinned.model_policy_lock,
         _NAMED_ROLE,
         "openai-codex",
-        "gpt-5.6-sol",
+        "gpt-6-sol",
         "max",
         "routine",
     ) is None
+
+
+# The role's route as the previous matrix left it on disk: Opus 5 / max was
+# the owner role's base route before the approved migration superseded it.
+_SUPERSEDED_OWNER_ROUTE = {
+    "model": {"provider": "anthropic", "default": "claude-opus-5"},
+    "agent": {"reasoning_effort": "max"},
+    "fallback_providers": [],
+}
+
+
+def _historical_seal(assignee, provider, model, effort, tier) -> str:
+    """A lock byte-for-byte as an earlier build stored it for this route."""
+    canonical = json.dumps(
+        {
+            "authority": "raphael",
+            "version": 1,
+            "assignee": assignee,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": effort,
+            "execution_tier": tier,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return "raphael:v1:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_a_governed_old_route_role_moves_to_the_approved_route(
+    bootstrapped, monkeypatch
+):
+    """The operator's migration: enrolled on the OLD route, then moved to the NEW.
+
+    Before the fix this exact fresh-revision Models batch was refused with 409
+    ("the role's current route could not be confirmed before the change") and
+    nothing was written, because the fence demanded the role's on-disk route
+    already be the new one. Now the change lands, and the role's existing work
+    is fenced the only safe way a superseded route allows: work that already
+    names an approved route is pinned, work that would inherit the superseded
+    route is parked for re-approval, and nothing queued becomes runnable.
+    """
+    from types import SimpleNamespace
+
+    from hermes_cli.web_models import ProfileModelBatchEntry, ProfileModelBatchUpdate
+    from hermes_cli.web_routers import profiles as profile_routes
+
+    # Enrolled while the old route was live — the old-state copy.
+    _write_profile_route(_OWNER_PROFILE, _SUPERSEDED_OWNER_ROUTE)
+    model_policy.enroll_profile(_OWNER_PROFILE)
+    current = model_policy.assignment_for(_OWNER_PROFILE, "anthropic")
+    historic_route = (_OWNER_PROFILE, "anthropic", "claude-opus-5", "max", "routine")
+    historic_lock = _historical_seal(*historic_route)
+
+    board = bootstrapped["board"]
+    with kanban_db.connect(board=board) as conn:
+        # Five unsealed owner tasks: four inherit the role's route, one
+        # already names the currently approved route itself.
+        inheriting = {
+            status: kanban_db.create_task(
+                conn,
+                title=f"queued owner work ({status})",
+                assignee=_OWNER_PROFILE,
+                execution_tier="deep" if status == "triage" else "routine",
+                project_id=bootstrapped["project_id"],
+            )
+            for status in ("todo", "ready", "scheduled", "triage")
+        }
+        named_current = kanban_db.create_task(
+            conn,
+            title="owner work that names the approved route",
+            assignee=_OWNER_PROFILE,
+            execution_tier="routine",
+            project_id=bootstrapped["project_id"],
+        )
+        # A receipt already sealed under the superseded route.
+        historic = kanban_db.create_task(
+            conn,
+            title="owner work sealed before the migration",
+            assignee=_OWNER_PROFILE,
+            execution_tier="routine",
+            project_id=bootstrapped["project_id"],
+        )
+        with kanban_db.write_txn(conn):
+            for status, task_id in inheriting.items():
+                conn.execute(
+                    "UPDATE tasks SET status = ? WHERE id = ?", (status, task_id)
+                )
+            conn.execute(
+                "UPDATE tasks SET status = 'todo', model_override = ?, "
+                "provider_override = ?, reasoning_effort = ? WHERE id = ?",
+                (current.model, current.provider, current.reasoning_effort,
+                 named_current),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'todo', model_override = ?, "
+                "provider_override = ?, reasoning_effort = ?, "
+                "model_policy_lock = ? WHERE id = ?",
+                ("claude-opus-5", "anthropic", "max", historic_lock, historic),
+            )
+    _record_graph_receipt(
+        bootstrapped["project_id"], board,
+        [*inheriting.values(), named_current, historic],
+    )
+
+    monkeypatch.setattr(
+        model_policy,
+        "journal_models_machine_batch_success",
+        lambda *_args, **_kwargs: SimpleNamespace(commit=lambda: None),
+    )
+    home = get_profile_dir(_OWNER_PROFILE)
+    before = profile_routes._profile_route_revision(home)
+    request = SimpleNamespace(
+        method="POST",
+        url=SimpleNamespace(path="/api/profiles/model-batch"),
+        state=SimpleNamespace(
+            token_authenticated=True,
+            token_principal=SimpleNamespace(provider="raphael-models-token"),
+        ),
+    )
+
+    result = await profile_routes.update_profile_model_batch_endpoint(
+        ProfileModelBatchUpdate(assignments=[ProfileModelBatchEntry(
+            profile=_OWNER_PROFILE,
+            provider=current.provider,
+            model=current.model,
+            reasoning_effort=current.reasoning_effort,
+            expected_revision=before,
+        )]),
+        request,
+    )
+
+    # The approved change landed and the role now reads as the current route.
+    assert result["ok"] is True
+    assert profile_routes._profile_route_revision(home) != before
+    assert model_policy.configured_assignment_for(_OWNER_PROFILE) == current
+
+    def _rows(conn) -> dict:
+        return {
+            row["id"]: row
+            for row in conn.execute(
+                "SELECT id, status, block_kind, model_override, provider_override, "
+                "reasoning_effort, model_policy_lock FROM tasks WHERE id IN "
+                f"({','.join('?' for _ in range(6))})",
+                (*inheriting.values(), named_current, historic),
+            )
+        }
+
+    with kanban_db.connect(board=board) as conn:
+        rows = _rows(conn)
+        kanban_db.recompute_ready(conn)
+        promoted = _rows(conn)
+    # Inherited work got no authority from the superseded route and none from
+    # the new one: it is parked for re-approval, and a readiness pass leaves it
+    # parked.
+    for task_id in inheriting.values():
+        for row in (rows[task_id], promoted[task_id]):
+            assert (row["status"], row["block_kind"]) == ("blocked", "needs_input")
+            assert row["status"] not in kanban_db.EXECUTABLE_STATUSES
+            assert (
+                row["model_override"], row["provider_override"],
+                row["model_policy_lock"],
+            ) == (None, None, None)
+        with kanban_db.connect(board=board) as conn:
+            with pytest.raises(RuntimeError, match="approved again"):
+                kanban_db.claim_task(conn, task_id)
+    # Work that already named the approved route is pinned to it, in place.
+    pinned = rows[named_current]
+    assert pinned["status"] == "todo"
+    assert kanban_db.policy_lock_error(
+        pinned["model_policy_lock"], _OWNER_PROFILE, current.provider,
+        current.model, current.reasoning_effort, "routine",
+    ) is None
+    # The historical seal was never touched and still verifies.
+    sealed = rows[historic]
+    assert sealed["model_policy_lock"] == historic_lock
+    assert (sealed["status"], sealed["model_override"]) == ("todo", "claude-opus-5")
+    assert kanban_db.policy_lock_error(historic_lock, *historic_route) is None
 
 
 def _record_graph_receipt(project_id: str, board: str, task_ids: list[str]) -> None:
@@ -363,7 +544,7 @@ def test_a_fully_specified_but_unlocked_task_is_not_skipped(monkeypatch):
             conn,
             title="fully specified owner work",
             assignee=_OWNER_PROFILE,
-            model_override="claude-opus-5",
+            model_override="claude-opus-5-5",
             provider_override="anthropic",
             reasoning_effort="max",
             execution_tier="routine",
