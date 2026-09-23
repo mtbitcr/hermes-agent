@@ -24513,6 +24513,11 @@ def release_stale_claims(
     API traffic. ``enforce_max_runtime`` and ``detect_crashed_workers``
     remain the upper bounds for genuinely wedged or dead workers.
 
+    A run ``detect_crashed_workers`` set aside for the review handover is
+    left to it untouched (:func:`_saved_patch_handover_pending`): a process
+    that stopped before the handover usually restarts past the claim
+    deadline, and reclaiming the run then would lose its saved patch.
+
     Returns the number of stale claims actually reclaimed (live-pid
     extensions don't count). Safe to call often.
     """
@@ -24521,13 +24526,15 @@ def release_stale_claims(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, worker_start_time, claim_expires, "
-        "       last_heartbeat_at, assignee "
+        "       last_heartbeat_at, assignee, current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ? AND task_kind = 'work'",
         (now,),
     ).fetchall()
     for row in stale:
+        if _saved_patch_handover_pending(conn, row):
+            continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -33504,6 +33511,11 @@ def enforce_max_runtime(
     Runs host-local: only tasks claimed by this host are candidates
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
+
+    A run ``detect_crashed_workers`` set aside for the review handover is
+    left to it untouched (:func:`_saved_patch_handover_pending`): this sweep
+    runs after the scan, and a handover that did not land this tick is the
+    next scan's to retry, not a timeout that would lose the saved patch.
     """
     import signal
     timed_out: list[str] = []
@@ -33529,6 +33541,8 @@ def enforce_max_runtime(
         # must be measured from the active task_runs row when present.
         elapsed = now - int(row["active_started_at"])
         if elapsed < int(row["max_runtime_seconds"]):
+            continue
+        if _saved_patch_handover_pending(conn, row):
             continue
 
         pid = int(row["worker_pid"])
@@ -33710,6 +33724,11 @@ def detect_stale_running(
     Only considers ``status='running'`` tasks. Blocked tasks are never
     candidates.  Returns the list of reclaimed task IDs.
 
+    A run ``detect_crashed_workers`` set aside for the review handover is
+    left to it untouched (:func:`_saved_patch_handover_pending`): its worker
+    is gone and sends no heartbeat, so after a process stop the run reads as
+    stale, and reclaiming it then would lose its saved patch.
+
     ``stale_timeout_seconds=0`` disables the check entirely (returns ``[]``
     immediately).  ``signal_fn`` is a test hook; defaults to ``os.kill``
     on POSIX.
@@ -33723,7 +33742,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_start_time, t.last_heartbeat_at, "
-        "       t.claim_lock, "
+        "       t.claim_lock, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -33743,6 +33762,8 @@ def detect_stale_running(
         hb_age = (now - int(last_hb)) if last_hb is not None else None
         if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
             continue  # recent heartbeat → still alive
+        if _saved_patch_handover_pending(conn, row):
+            continue
 
         pid = row["worker_pid"]
         tid = row["id"]
@@ -34101,6 +34122,34 @@ def _saved_patch_handover_marker(
     return unreported
 
 
+def _saved_patch_handover_pending(conn: sqlite3.Connection, row) -> bool:
+    """Whether :func:`detect_crashed_workers` will hand this running row over itself.
+
+    True only for a row the scan takes up again from its marker: a claim made
+    on this host, a recorded worker its identity proves gone, and a marker on
+    the task's current open run. The sweeps that can close a running task's
+    run -- the stale-claim and stale-running reclaims before the scan, the
+    runtime cap after it -- skip such a row untouched: after a process stop
+    the claim, the heartbeat or the runtime has usually lapsed by the next
+    tick, and closing the run there would dispatch a rebuild instead of
+    handing the saved patch to review. A row the scan would not take keeps
+    its sweep's ordinary outcome, so nothing is held that no scan hands over.
+
+    ``row`` carries the task's ``id``, ``claim_lock``, ``worker_pid``,
+    ``worker_start_time`` and ``current_run_id``.
+    """
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    if not (row["claim_lock"] or "").startswith(host_prefix) or not row["worker_pid"]:
+        return False
+    # The marker before the identity probe: an unmarked row -- nearly every
+    # row -- then reaches its sweep without an extra probe.
+    if _saved_patch_handover_marker(conn, row["id"], row["current_run_id"]) is None:
+        return False
+    return _worker_identity_presence(
+        row["worker_pid"], _row_worker_start_time(row),
+    ) is HolderPresence.PROVABLY_ABSENT
+
+
 def _merge_unreported_completion(
     conn: sqlite3.Connection, run_id: int, fields: dict,
 ) -> None:
@@ -34221,6 +34270,10 @@ def _hand_over_saved_patch(
     meanwhile (another scan may already have handed it over) is left as it is,
     and only the reason is recorded on the run.
 
+    An accepted handover is recorded once, on the implementation run, whatever
+    the card's status by then: a reviewer may claim the parked review the
+    moment ``complete_task`` commits, and that must not cost the receipt.
+
     ``park`` holds :func:`_park_unreported_completion`'s arguments. Returns the
     worker-exited observer payload, or ``None`` when no exit was settled here.
     """
@@ -34242,23 +34295,16 @@ def _hand_over_saved_patch(
     if refusal is None:
         with _after_durable_commit(what):
             with write_txn(conn):
-                parked = conn.execute(
-                    "SELECT 1 FROM tasks WHERE id = ? AND status = 'review' "
-                    "AND task_kind = 'work'",
-                    (task_id,),
+                recorded = conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? "
+                    "AND kind = 'saved_result_handed_over'",
+                    (task_id, run_id),
                 ).fetchone()
-                if parked is not None:
+                if recorded is None:
                     _append_event(
                         conn, task_id, "saved_result_handed_over",
                         {"run_id": run_id, "attachment_id": attachment_id},
                         run_id=run_id,
-                    )
-                else:
-                    _log.warning(
-                        "kanban: the saved patch of %s (run %s) was accepted "
-                        "but the card is no longer in review; no handover "
-                        "event recorded",
-                        task_id, run_id,
                     )
         return {
             "task_id": task_id,
