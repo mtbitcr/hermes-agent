@@ -211,6 +211,79 @@ def test_a_second_approval_records_nothing_new(kanban_home):
         )
 
 
+def test_an_item_a_worker_is_running_is_resolved_and_its_run_closed(kanban_home):
+    """An item a worker holds when the approval lands is resolved all the same.
+
+    The owner took this item out of triage and a worker claimed it, so it
+    holds a live run. The approval still accepts the rework the item tracks,
+    so the item closes in the approving transaction like any other -- and the
+    run it held closes with it, the way ``archive_task`` closes a run it takes
+    a card out from under, rather than being left open or stranded.
+    """
+    with kb.connect() as conn:
+        tid, item = _returned_once(conn)
+        assert kb.unlink_tasks(conn, tid, item) is True
+        promoted = kb.cas_transition_task(
+            conn, item, expected_status="triage",
+            expected_revision=kb.task_event_revision(conn, item),
+            to_status="ready",
+        )
+        assert promoted["moved"] is True, promoted
+        held = kb.claim_task(conn, item)
+        assert held is not None and held.status == "running"
+        worker_run = held.current_run_id
+        assert worker_run is not None
+        kb._set_worker_pid(conn, item, os.getpid())
+        live = kb.get_task(conn, item)
+        assert None not in (live.claim_lock, live.claim_expires, live.worker_pid)
+
+        _reviewer_approves(conn, tid)
+        _assert_resolved_with_receipt(conn, tid, item)
+        approving_run = kb.latest_run(conn, tid).id
+
+        claim = conn.execute(
+            "SELECT current_run_id, claim_lock, claim_expires, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (item,),
+        ).fetchone()
+        assert tuple(claim) == (None, None, None, None)
+
+        run_sql = (
+            "SELECT status, outcome, summary, ended_at, "
+            "claim_lock, claim_expires, worker_pid "
+            "FROM task_runs WHERE id = ? AND task_id = ?"
+        )
+        run_key = (worker_run, item)
+        closed = tuple(conn.execute(run_sql, run_key).fetchone())
+        status, outcome, summary, ended_at, *run_claim = closed
+        assert (status, outcome) == ("reclaimed", "reclaimed")
+        assert ended_at is not None
+        assert run_claim == [None, None, None]
+        assert tid in summary and f"run {approving_run}" in summary
+
+        # The worker that held the item cannot finish it through its old run.
+        resolved = kb.get_task(conn, item)
+        item_revision = kb.task_event_revision(conn, item)
+        assert kb.complete_task(
+            conn, item, summary="finished late", expected_run_id=worker_run,
+        ) is False
+        late = kb.get_task(conn, item)
+        assert (late.status, late.result, late.completed_at) == (
+            resolved.status, resolved.result, resolved.completed_at,
+        )
+        assert late.current_run_id is None
+        assert tuple(conn.execute(run_sql, run_key).fetchone()) == closed
+        assert kb.task_event_revision(conn, item) == item_revision
+
+        # And a second approval records nothing new.
+        card_revision = kb.task_event_revision(conn, tid)
+        assert kb.complete_task(conn, tid, summary="approved again") is False
+        assert _receipts(conn, tid) == [(item, approving_run)]
+        assert kb.task_event_revision(conn, tid) == card_revision
+        assert kb.task_event_revision(conn, item) == item_revision
+        assert tuple(conn.execute(run_sql, run_key).fetchone()) == closed
+
+
 def test_a_worker_pinned_to_its_board_resolves_and_still_reaches_the_root(
     tmp_path, monkeypatch,
 ):

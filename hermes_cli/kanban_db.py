@@ -19958,10 +19958,12 @@ def _resolve_recorded_review_followups(
     move -- the same kernel-written record :func:`_recorded_review_followup`
     trusts -- so a card anyone else linked under the task is never touched.
     An item already ``done`` or ``archived`` is left as it is -- which is why
-    no approval resolves the same item twice -- and so is one a worker
-    currently holds, because finishing it here would strand that worker's
-    open run. Each item moved gets ONE ``review_followup_resolved`` receipt
-    on the approved task, stamped with the approving run.
+    no approval resolves the same item twice. One a worker currently holds is
+    resolved all the same, and its run is not stranded: the claim clears with
+    the status change and the live run closes as ``reclaimed``, the way
+    :func:`archive_task` closes a run it takes a card out from under. Each
+    item moved gets ONE ``review_followup_resolved`` receipt on the approved
+    task, stamped with the approving run.
     """
     followup_ids: list[str] = []
     for row in conn.execute(
@@ -19985,13 +19987,23 @@ def _resolve_recorded_review_followups(
     )
     for followup_id in followup_ids:
         cur = conn.execute(
-            "UPDATE tasks SET status = 'done', result = ?, completed_at = ? "
+            "UPDATE tasks SET status = 'done', result = ?, completed_at = ?, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND task_kind = 'work' "
-            "AND status NOT IN ('done', 'archived') "
-            "AND current_run_id IS NULL",
+            "AND status NOT IN ('done', 'archived')",
             (summary, now, followup_id),
         )
         if cur.rowcount == 1:
+            # Closes the run of a worker still holding the item; a no-op for
+            # an item no run holds.
+            _end_run(
+                conn, followup_id,
+                outcome="reclaimed", status="reclaimed",
+                summary=(
+                    f"item resolved by the review approval of {task_id} "
+                    f"(run {run_id}) with this run still active"
+                ),
+            )
             _append_event(
                 conn,
                 task_id,
