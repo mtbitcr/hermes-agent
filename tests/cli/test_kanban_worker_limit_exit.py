@@ -4,6 +4,8 @@ The dispatcher books exit ``KANBAN_RATE_LIMIT_EXIT_CODE`` as ``rate_limited`` an
 card again by itself, while a clean exit 0 without a terminal kanban call is booked as a
 protocol violation. Workers normally run ``chat -q`` without ``-Q``, so the ordinary one-shot
 branch must reach the same exit code as the quiet one; every other exit code stays as it was.
+A goal-mode worker (always ``-Q``) stops at such a turn, first or later, before the goal loop's
+judge or its turn-budget block can see it.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import pytest
 import cli
 from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED, STATUS_OK, PooledCredential
 from agent.turn_author import TURN_AUTHOR_ENV
-from hermes_cli import kanban_db
+from hermes_cli import goals, kanban_db
 from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
 from tools import skills_tool
 
@@ -295,3 +297,122 @@ def test_failed_reset_record_keeps_the_limit_exit(recorded, monkeypatch, broken)
 
     assert excinfo.value.code == TEMPFAIL
     assert worker.calls == ["chat", "summary", "finalize"]
+
+
+class _GoalWorker(_Worker):
+    """A goal-mode worker whose model calls answer with ``turns`` in order, one per call."""
+
+    def __init__(self, *turns, pool=None):
+        super().__init__(None, pool=pool)
+        self.turns = list(turns)
+
+    def _run_conversation(self, **_kwargs):
+        self.calls.append("run")
+        return self.turns.pop(0)
+
+
+@pytest.fixture
+def goal_card(monkeypatch, recorded):
+    """Arrange a goal-mode card on ``recorded``'s stand-in board, with a scripted judge.
+
+    ``goal_card(max_turns, verdicts)`` returns the card: ``judged`` collects every response the
+    judge saw, ``blocked`` every ``block_task`` call.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setattr(kanban_db, "goal_run_status", lambda _conn, _task_id, _run_id=None: "running")
+
+    def arrange(max_turns, verdicts):
+        card = SimpleNamespace(
+            title="Fix the parser", body="Acceptance: the parser tests pass.", goal_max_turns=max_turns,
+            judged=[], blocked=[],
+        )
+        pending = list(verdicts)
+
+        def judge_goal(_goal, last_response, **_kwargs):
+            card.judged.append(last_response)
+            verdict = pending.pop(0)
+            return verdict, f"scripted {verdict}", False, None, False
+
+        def block_task(_conn, task_id, *, reason=None, kind=None, expected_run_id=None):
+            card.blocked.append((task_id, expected_run_id, reason))
+            return True
+
+        monkeypatch.setattr(goals, "judge_goal", judge_goal)
+        monkeypatch.setattr(kanban_db, "get_task", lambda _conn, _task_id, **_kwargs: card)
+        monkeypatch.setattr(kanban_db, "block_task", block_task)
+        return card
+
+    return arrange
+
+
+@pytest.mark.parametrize("max_turns", [1, 3], ids=["turn-budget-of-one", "turn-budget-left"])
+@pytest.mark.parametrize("reason", ["rate_limit", "billing", "overloaded"])
+def test_goal_worker_stops_at_a_first_turn_usage_limit(recorded, goal_card, capsys, reason, max_turns):
+    """The limited first turn is never judged and never blocks the card: the worker leaves for a requeue."""
+    now = int(time.time())
+    card = goal_card(max_turns, ["continue"] * max_turns)
+    worker = _GoalWorker(_failed(reason), SUCCESS, SUCCESS, pool=_pool(now, [(STATUS_EXHAUSTED, 7200)]))
+
+    with pytest.raises(SystemExit) as excinfo:
+        _one_shot(worker, quiet=True)
+
+    assert excinfo.value.code == TEMPFAIL
+    assert recorded == [(True, TASK, 42, now + 7200)]
+    assert (card.judged, card.blocked) == ([], [])
+    assert worker.calls == ["run", "finalize"]  # no model call after the limited one
+    assert "\nsession_id: worker-session\n" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("reason", ["rate_limit", "billing", "overloaded"])
+def test_goal_worker_stops_at_a_later_turn_usage_limit(recorded, goal_card, capsys, reason):
+    """A continuation stopped by the limit ends the loop before the judge or the turn budget sees it."""
+    now = int(time.time())
+    card = goal_card(3, ["continue"] * 3)
+    worker = _GoalWorker(SUCCESS, _failed(reason), SUCCESS, pool=_pool(now, [(STATUS_EXHAUSTED, 7200)]))
+
+    with pytest.raises(SystemExit) as excinfo:
+        _one_shot(worker, quiet=True)
+
+    assert excinfo.value.code == TEMPFAIL
+    assert recorded == [(True, TASK, 42, now + 7200)]
+    assert (card.judged, card.blocked) == (["done"], [])  # only the first turn was judged
+    assert worker.calls == ["run", "run", "finalize"]
+    assert "\nsession_id: worker-session\n" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "first, later, code",
+    [
+        pytest.param(SUCCESS, _failed("server_error"), 0, id="later-turn-other-failure"),
+        pytest.param(
+            SUCCESS, {"final_response": "", "failed": True, "error": "boom"}, 0,
+            id="later-turn-failure-without-reason",
+        ),
+        pytest.param(_failed("server_error"), SUCCESS, 1, id="first-turn-other-failure"),
+    ],
+)
+def test_goal_worker_is_judged_and_blocked_as_before_unless_a_turn_hit_a_usage_limit(
+    recorded, goal_card, first, later, code,
+):
+    now = int(time.time())
+    card = goal_card(2, ["continue", "continue"])
+    worker = _GoalWorker(first, later, pool=_pool(now, [(STATUS_EXHAUSTED, 7200)]))
+
+    with pytest.raises(SystemExit) as excinfo:
+        _one_shot(worker, quiet=True)
+
+    # As before: every turn is judged, the spent budget blocks the card, the first turn sets the exit.
+    assert excinfo.value.code == code
+    assert card.judged == [first["final_response"], later["final_response"]]
+    assert [(task, run) for task, run, _reason in card.blocked] == [(TASK, 42)]
+    assert card.blocked[0][2].startswith("Goal-mode worker exhausted its turn budget (2/2)")
+    assert worker.calls == ["run", "run", "finalize"]
+    assert recorded == []
+
+    # Control: the same later turn stopped by a usage limit requeues the card instead.
+    card = goal_card(2, ["continue", "continue"])
+    limited = _GoalWorker(first, _failed("rate_limit"), pool=_pool(now, [(STATUS_EXHAUSTED, 7200)]))
+    with pytest.raises(SystemExit) as excinfo:
+        _one_shot(limited, quiet=True)
+    assert (excinfo.value.code, card.judged, card.blocked) == (TEMPFAIL, [first["final_response"]], [])
+    assert recorded == [(True, TASK, 42, now + 7200)]

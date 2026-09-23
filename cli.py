@@ -4007,9 +4007,18 @@ def _interrupt_agent_for_signal(agent, signum) -> None:
         pass  # never block signal handling
 
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+class _KanbanUsageLimitStop(Exception):
+    """A kanban goal-mode continuation turn stopped at the provider's usage limit.
+
+    ``goals.run_kanban_goal_loop`` ends on any ``run_turn`` error without judging or blocking,
+    so raising this stops the loop before either can see the turn; the worker then exits for a requeue.
+    """
+
+
+def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> "dict | None":
     """Drive a kanban goal_mode worker through ``goals.run_kanban_goal_loop`` after its first turn.
 
+    Returns the continuation turn result that stopped at the provider's usage limit, if any.
     The caller swallows all errors: a broken loop must never wedge a worker.
     """
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
@@ -4034,12 +4043,20 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     if not goal_text:
         return
 
+    limited = None
+
     def _run_turn(prompt: str) -> str:
+        nonlocal limited
         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
         _sync_cli_session_id_from_agent(cli)
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
+        # A usage-limit turn must reach neither the judge nor the turn budget (whose block is
+        # sticky): stop the loop here and hand the result back for the requeue exit.
+        if _single_query_exit_code(result, default=0):
+            limited = result
+            raise _KanbanUsageLimitStop(result.get("failure_reason"))
         return resp or ""
 
     def _task_status() -> "str | None":
@@ -4055,6 +4072,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
     )
+    return limited
 
 
 def _sync_cli_session_id_from_agent(cli) -> None:
@@ -4165,19 +4183,22 @@ def _run_quiet_single_query(cli, effective_query):
     elif response:
         print(response)
 
+    # Exit code 0/1 for automation wrappers; a kanban worker stopped at the provider's
+    # usage limit exits with the EX_TEMPFAIL sentinel instead (see _single_query_exit_code).
+    _default_code = 1 if isinstance(result, dict) and result.get("failed") else 0
+    _exit_code = _single_query_exit_code(result, default=_default_code)
+
     # Kanban goal_mode: keep working in THIS session until a judge agrees the card is
-    # done, the worker terminates it, or the turn budget runs out (sticky block).
-    if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+    # done, the worker terminates it, or the turn budget runs out (sticky block). A usage-limit
+    # stop, on the first turn or a later one, ends it at once: the card must wait and restart,
+    # not be judged or blocked.
+    if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _exit_code == _default_code:
         try:
-            _run_kanban_goal_loop_q(cli, response)
+            _exit_code = _single_query_exit_code(_run_kanban_goal_loop_q(cli, response), default=_exit_code)
         except Exception as _goal_exc:
             logger.debug("kanban goal loop failed: %s", _goal_exc)
 
     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
-
-    # Exit code 0/1 for automation wrappers; a kanban worker stopped at the provider's
-    # usage limit exits with the EX_TEMPFAIL sentinel instead (see _single_query_exit_code).
-    _exit_code = _single_query_exit_code(result, default=1 if isinstance(result, dict) and result.get("failed") else 0)
     _record_kanban_rate_limit_reset(cli, _exit_code)
     sys.exit(_exit_code)
 
