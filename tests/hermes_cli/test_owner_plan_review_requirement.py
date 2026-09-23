@@ -514,13 +514,21 @@ def test_a_non_boolean_requirement_is_refused(ctx, value):
 # A plan that says nothing about review is byte-for-byte the plan it was
 # ---------------------------------------------------------------------------
 
-# Captured from the PRE-CHANGE implementation: the pristine baseline tree
-# (/workspace/baseline, copied to /tmp/baseline-probe) ran this very test and
-# digested this very payload to this value. It is frozen here so that accepting
-# ``requires_review`` can never disturb the request digest — and therefore the
-# receipt identity and replay — of any plan that omits it.
+# The request digest of ``_fixed_changes()`` — a plan that never states
+# ``requires_review`` — normalized under the autouse ``_configured_provider``
+# stub, whose anthropic selection lets the real policy pin every created task
+# to the admitted routine route for ``default`` (claude-opus-5-5 / max) and
+# mint its lock. It was first frozen as 0eb2ef8b…6723
+# before ``requires_review`` existed, and re-frozen when the owner-approved
+# policy migration moved that route to claude-opus-5-5, after comparing the two
+# normalized payloads: exactly eight leaves differ — ``model_override`` and its
+# ``model_policy_lock`` on each of the four created-task specs — and neither
+# payload carries a ``requires_review`` key. It stays a literal so that
+# accepting ``requires_review`` can never disturb the request digest — and
+# therefore the receipt identity and replay — of any plan that omits it; only a
+# route-only delta like that one may ever move it.
 _OMITTED_REQUIREMENT_DIGEST = (
-    "0eb2ef8b4b6d9c464913a26ffedd5234910843fea59c2ff741deda8085bf6723"
+    "1525d9ddd8653cdcba19f95dc0f49f4835e4b3d5f82da3787fe2ddf5e956413e"
 )
 
 

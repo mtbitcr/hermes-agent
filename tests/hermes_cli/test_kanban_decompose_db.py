@@ -127,11 +127,11 @@ def test_decompose_locks_each_preapproved_model_route(kanban_home):
                 "title": "build the feature",
                 "assignee": "raphael-claude-worker",
                 "execution_tier": "deep",
-                "model_override": "claude-opus-5",
+                "model_override": "claude-opus-5-5",
                 "provider_override": "anthropic",
                 "reasoning_effort": "max",
                 "model_policy_lock": kb.mint_policy_lock(
-                    "raphael-claude-worker", "anthropic", "claude-opus-5",
+                    "raphael-claude-worker", "anthropic", "claude-opus-5-5",
                     "max", "deep",
                 ),
             }],
@@ -145,12 +145,12 @@ def test_decompose_locks_each_preapproved_model_route(kanban_home):
             if event.kind == "created"
         )
 
-        assert child.model_override == "claude-opus-5"
+        assert child.model_override == "claude-opus-5-5"
         assert child.provider_override == "anthropic"
         assert child.reasoning_effort == "max"
         assert child.execution_tier == "deep"
         assert child.model_policy_lock == kb.mint_policy_lock(
-            "raphael-claude-worker", "anthropic", "claude-opus-5", "max", "deep",
+            "raphael-claude-worker", "anthropic", "claude-opus-5-5", "max", "deep",
         )
         assert kb.task_policy_lock_error(
             kb.connect().execute(
@@ -168,7 +168,7 @@ def test_decompose_locks_each_preapproved_model_route(kanban_home):
 
         reread = kb.get_task(conn, child.id)
         assert (reread.model_override, reread.reasoning_effort) == (
-            "claude-opus-5",
+            "claude-opus-5-5",
             "max",
         )
 
@@ -181,17 +181,17 @@ def test_decompose_rejects_a_forbidden_locked_route(kanban_home):
         )
     with pytest.raises(ValueError, match="forbidden reasoning effort"):
         kb.mint_policy_lock(
-            "raphael-claude-worker", "anthropic", "claude-opus-5", "ultra", "deep",
+            "raphael-claude-worker", "anthropic", "claude-opus-5-5", "ultra", "deep",
         )
     # ...and a hand-written authority string never authorizes one either.
     real = kb.mint_policy_lock(
-        "raphael-claude-worker", "anthropic", "claude-opus-5", "max", "deep",
+        "raphael-claude-worker", "anthropic", "claude-opus-5-5", "max", "deep",
     )
     with kb.connect() as conn:
         tid = _create_triage(conn, title="ship a complex feature")
         for model, effort, expected in (
             ("claude-fable-5", "max", "forbidden model"),
-            ("claude-opus-5", "ultra", "forbidden reasoning effort"),
+            ("claude-opus-5-5", "ultra", "forbidden reasoning effort"),
             ("claude-sonnet-5", "max", "not the admitted route"),
         ):
             with pytest.raises(ValueError, match=expected):
