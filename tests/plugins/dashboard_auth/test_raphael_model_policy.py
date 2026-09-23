@@ -2279,3 +2279,29 @@ async def test_owner_models_read_refuses_a_foreign_profile(codex_accounts, forei
 
     assert exc.value.status_code == 400
     assert codex_accounts.asked_with == []
+
+
+def test_oauth_projection_counts_the_claude_code_login_as_anthropic():
+    """Every Claude lane borrows the one Claude Code login (2026-09-23), so the
+    owner's Anthropic connection is that login when no PKCE or key is present."""
+    projected = model_policy.project_oauth_payload({
+        "providers": [
+            {"id": "anthropic", "status": {"logged_in": False, "source": None}},
+            {"id": "claude-code", "status": {"logged_in": True, "source": "claude_code_cli"}},
+            {"id": "openai-codex", "status": {"logged_in": True}},
+        ]
+    })
+    rows = {row["id"]: row for row in projected["providers"]}
+    assert set(rows) == {"anthropic", "openai-codex"}
+    assert rows["anthropic"]["status"] == {"logged_in": True}
+
+
+def test_oauth_projection_keeps_anthropic_disconnected_without_any_login():
+    projected = model_policy.project_oauth_payload({
+        "providers": [
+            {"id": "anthropic", "status": {"logged_in": False}},
+            {"id": "claude-code", "status": {"logged_in": False}},
+        ]
+    })
+    rows = {row["id"]: row for row in projected["providers"]}
+    assert rows["anthropic"]["status"] == {"logged_in": False}
