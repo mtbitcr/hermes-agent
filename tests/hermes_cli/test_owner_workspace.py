@@ -1770,6 +1770,68 @@ def test_run_receipt_is_checked_against_that_task_own_pinned_route(ctx):
     ) == ow._OWNER_UNKNOWN_RUNTIME
 
 
+def _ended_run(outcome, metadata, *, ended_at=1_790_172_000):
+    return kanban_db.Run(
+        id=9,
+        task_id="task-1",
+        profile="raphael-builder",
+        step_key=None,
+        status=outcome,
+        claim_lock=None,
+        claim_expires=None,
+        worker_pid=None,
+        max_runtime_seconds=None,
+        last_heartbeat_at=None,
+        started_at=1_790_171_000,
+        ended_at=ended_at,
+        outcome=outcome,
+        summary=None,
+        metadata=metadata,
+        error=None,
+    )
+
+
+def test_rate_limited_run_summary_names_the_usage_limit_and_its_reset():
+    reset = 1_790_179_200  # 2026-09-23 16:00 UTC, two hours after the run ended
+    limited = ow._owner_project_run_receipt(
+        _ended_run("rate_limited", {"rate_limit_reset_at": reset}), None,
+    )
+    assert limited["outcome"] == "attention"
+    assert limited["summary"] == (
+        "Work stopped at the AI provider's usage limit and will start again "
+        "by itself after 2026-09-23 16:00 UTC."
+    )
+    # A run with no recorded end is anchored on its start.
+    assert ow._owner_project_run_receipt(
+        _ended_run("rate_limited", {"rate_limit_reset_at": reset}, ended_at=None), None,
+    )["summary"].endswith("after 2026-09-23 16:00 UTC.")
+
+    ended = 1_790_172_000
+    for metadata in (
+        None,
+        {},
+        {"rate_limit_reset_at": ended - 60},
+        {"rate_limit_reset_at": ended},
+        {"rate_limit_reset_at": ended + 8 * 86400},
+        {"rate_limit_reset_at": True},
+        {"rate_limit_reset_at": float(reset)},
+        {"rate_limit_reset_at": str(reset)},
+    ):
+        receipt = ow._owner_project_run_receipt(_ended_run("rate_limited", metadata), None)
+        assert receipt["outcome"] == "attention", metadata
+        assert receipt["summary"] == (
+            "Work stopped at the AI provider's usage limit and will start again by itself."
+        ), metadata
+
+    crashed = ow._owner_project_run_receipt(
+        _ended_run("crashed", {"rate_limit_reset_at": reset}), None,
+    )
+    assert crashed["outcome"] == "attention"
+    assert crashed["summary"] == "Work stopped and needs attention."
+    # Only the wording changes: the owner application's closed run shape holds.
+    assert set(limited) == set(crashed)
+
+
 def test_task_route_pin_distinguishes_unlocked_from_invalid():
     locked = {
         "assignee": "raphael-verifier",

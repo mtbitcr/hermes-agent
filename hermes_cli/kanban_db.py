@@ -74,6 +74,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import math
 import os
 import re
 import random
@@ -635,6 +636,12 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # conventional "temporary failure, retry later" code, and well clear of the
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+
+# Furthest ahead a provider reset recorded on a run (see
+# ``record_run_rate_limit_reset``) is believed: no caller can hold a card
+# waiting longer than seven days.
+RATE_LIMIT_RESET_MAX_WAIT_SECONDS = 7 * 24 * 3600
+_RATE_LIMIT_RESET_KEY = "rate_limit_reset_at"
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -23321,10 +23328,17 @@ def _stamp_run_receipt(
     any caller-supplied value under that key is discarded first, so a
     model cannot assert its own route. With no session link known the key
     is left absent rather than invented.
+
+    A provider reset the worker recorded on the run
+    (:func:`record_run_rate_limit_reset`) is carried forward too: the
+    closing caller builds its metadata from scratch, and the respawn guard
+    reads the reset off the closed run.
     """
     persisted, profile = _persisted_run_metadata(conn, run_id)
     stamped = dict(metadata) if isinstance(metadata, dict) else {}
     stamped.pop("runtime_receipt", None)
+    if _RATE_LIMIT_RESET_KEY in persisted:
+        stamped.setdefault(_RATE_LIMIT_RESET_KEY, persisted[_RATE_LIMIT_RESET_KEY])
     session_id = None
     for candidate in (
         stamped.get("worker_session_id"),
@@ -23336,14 +23350,78 @@ def _stamp_run_receipt(
     if session_id is None and os.environ.get("HERMES_KANBAN_TASK") == task_id:
         session_id = (os.environ.get("HERMES_SESSION_ID") or "").strip() or None
     if session_id is None:
-        # No link known: hand back the caller's own metadata minus any
-        # model-supplied receipt claim, and never invent one.
-        return stamped if isinstance(metadata, dict) else metadata
+        # No link known: hand back the caller's own metadata (plus a carried
+        # reset) minus any model-supplied receipt claim, and never invent one.
+        return stamped if isinstance(metadata, dict) or stamped else metadata
     stamped["worker_session_id"] = session_id
     receipt = _trusted_runtime_receipt(session_id, profile)
     if receipt is not None:
         stamped["runtime_receipt"] = receipt
     return stamped
+
+
+def record_run_rate_limit_reset(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    reset_at: Any,
+    now: Optional[int] = None,
+) -> bool:
+    """Record on a worker's own run when the provider's usage limit lifts.
+
+    Written by the worker right before it exits with
+    ``KANBAN_RATE_LIMIT_EXIT_CODE``, so :func:`check_respawn_guard` keeps the
+    card waiting until then instead of probing again after every fixed
+    cooldown. Stored as int epoch seconds under ``rate_limit_reset_at`` in
+    the run's own metadata; every other key there is kept.
+
+    Returns False and writes nothing unless ``reset_at`` is a real number
+    after ``now`` and at most ``RATE_LIMIT_RESET_MAX_WAIT_SECONDS`` later,
+    ``run_id`` is ``task_id``'s current open run, and both are the ones the
+    dispatcher gave the calling worker (``HERMES_KANBAN_TASK`` and
+    ``HERMES_KANBAN_RUN_ID``), so no caller can write another task's run.
+    """
+    if (
+        task_id != (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        or str(run_id) != (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    ):
+        return False
+    # A bool is an int to Python but is no time; NaN and the infinities fail
+    # the window check below.
+    if isinstance(reset_at, bool) or not isinstance(reset_at, (int, float)):
+        return False
+    now = int(time.time()) if now is None else now
+    if not now < reset_at <= now + RATE_LIMIT_RESET_MAX_WAIT_SECONDS:
+        return False
+    with write_txn(conn):
+        if _validated_open_current_run(conn, task_id, run_id) is None:
+            return False
+        persisted, _profile = _persisted_run_metadata(conn, run_id)
+        persisted[_RATE_LIMIT_RESET_KEY] = math.ceil(reset_at)
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(persisted, ensure_ascii=False), run_id),
+        )
+    return True
+
+
+def recorded_rate_limit_reset(metadata: Any, *, anchor: Optional[int]) -> Optional[int]:
+    """Return the provider reset recorded in a run's metadata, if it is believable.
+
+    Only an int (never a bool) after ``anchor`` -- the moment the run
+    ended, or started while it has no end -- and at most
+    ``RATE_LIMIT_RESET_MAX_WAIT_SECONDS`` later counts. Anything else,
+    including non-object metadata, means no reset is known.
+    """
+    if not isinstance(metadata, dict) or anchor is None:
+        return None
+    reset = metadata.get(_RATE_LIMIT_RESET_KEY)
+    if isinstance(reset, bool) or not isinstance(reset, int):
+        return None
+    if not anchor < reset <= anchor + RATE_LIMIT_RESET_MAX_WAIT_SECONDS:
+        return None
+    return reset
 
 
 # Terminal kanban calls a worker may have attempted before a clean exit raced
@@ -34733,7 +34811,9 @@ def check_respawn_guard(
         (a worker bailed on a provider quota wall via the EX_TEMPFAIL
         sentinel) within ``_resolve_rate_limit_cooldown_seconds()``. The
         quota almost certainly hasn't reset yet, so defer the respawn until
-        the cooldown elapses — then allow a cheap probe. This is checked
+        the cooldown elapses — or until the provider reset the worker
+        recorded on that run (:func:`record_run_rate_limit_reset`), when
+        that is later — then allow a cheap probe. This is checked
         BEFORE ``blocker_auth`` because the rate-limit requeue stamps a
         quota-flavored ``last_failure_error`` that would otherwise match the
         auth-blocker regex and park the task forever (the rate-limit path
@@ -34797,7 +34877,7 @@ def check_respawn_guard(
     #    no longer applies and the normal paths take over.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at FROM task_runs "
+        "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
@@ -34812,8 +34892,20 @@ def check_respawn_guard(
             # re-trap the task.
             return None
         ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-            return "rate_limit_cooldown"
+        if ended_at is not None:
+            # When the worker recorded the provider's reset on this run and
+            # it is later than the cooldown, probing sooner only hits the
+            # same wall: wait for the reset instead.
+            try:
+                run_metadata = json.loads(latest_run["metadata"] or "{}")
+            except (TypeError, ValueError):
+                run_metadata = None
+            wait_until = int(ended_at) + rl_cooldown
+            reset = recorded_rate_limit_reset(run_metadata, anchor=int(ended_at))
+            if reset is not None:
+                wait_until = max(wait_until, reset)
+            if now < wait_until:
+                return "rate_limit_cooldown"
         # Cooldown elapsed — allow the respawn. Return early so the
         # blocker_auth check below doesn't catch the rate-limit text we
         # stamped on the task; this path intentionally retries forever

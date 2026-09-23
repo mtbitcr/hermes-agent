@@ -406,6 +406,232 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+# A worker that stops at the provider's usage limit records, on its own run,
+# when the provider's limit lifts; the respawn guard then waits until that
+# time instead of probing again after every fixed cooldown.
+
+
+@pytest.fixture
+def rate_limit_exits(kanban_home, monkeypatch):
+    """Dead worker pids and no launch grace, so the crash sweep closes runs at once."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    # A sweep running inside a worker of the same task would link that
+    # worker's own session; these runs are closed from outside.
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    return kanban_home
+
+
+def _claim_worker_run(conn, task_id: str, pid: int) -> int:
+    """Claim ``task_id`` for worker process ``pid`` on this host; return the run id."""
+    host = kb._claimer_id().split(":", 1)[0]
+    run_id = kb.claim_task(conn, task_id, claimer=f"{host}:w{pid}").current_run_id
+    conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (pid, task_id))
+    conn.commit()
+    return run_id
+
+
+def _worker_exits_rate_limited(conn, run_id: int, pid: int) -> kb.Run:
+    """Worker ``pid`` exits with the rate-limit sentinel; the real crash sweep closes its run."""
+    kb._record_worker_exit(pid, _exited_status(kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+    kb.detect_crashed_workers(conn)
+    run = kb.get_run(conn, run_id)
+    assert run.outcome == "rate_limited"
+    return run
+
+
+def _raw_run_metadata(conn, run_id: int):
+    return conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()["metadata"]
+
+
+def _record_as_worker(monkeypatch, conn, task_id: str, run_id: int, reset_at, **kwargs):
+    """Record a reset from inside the worker the dispatcher started for ``run_id`` of ``task_id``."""
+    with monkeypatch.context() as worker_env:
+        worker_env.setenv("HERMES_KANBAN_TASK", task_id)
+        worker_env.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+        return kb.record_run_rate_limit_reset(
+            conn, task_id, run_id=run_id, reset_at=reset_at, **kwargs,
+        )
+
+
+def test_recorded_provider_reset_keeps_the_card_waiting_until_it_passes(
+    rate_limit_exits, monkeypatch,
+):
+    """A reset two hours out outlasts the 300-second cooldown; without one
+    the cooldown alone decides, exactly as before."""
+    reset = int(time.time()) + 7200
+    with kb.connect() as conn:
+        waiting = kb.create_task(conn, title="limit with a known reset", assignee="a")
+        run_id = _claim_worker_run(conn, waiting, 71001)
+        assert _record_as_worker(monkeypatch, conn, waiting, run_id, reset) is True
+        run = _worker_exits_rate_limited(conn, run_id, 71001)
+        assert kb.get_task(conn, waiting).status == "ready"
+
+        plain = kb.create_task(conn, title="limit without a known reset", assignee="a")
+        plain_run = _worker_exits_rate_limited(
+            conn, _claim_worker_run(conn, plain, 71002), 71002,
+        )
+
+        monkeypatch.setattr(kb.time, "time", lambda: run.ended_at + 301)
+        assert kb.check_respawn_guard(conn, waiting) == "rate_limit_cooldown"
+        monkeypatch.setattr(kb.time, "time", lambda: reset - 1)
+        assert kb.check_respawn_guard(conn, waiting) == "rate_limit_cooldown"
+        monkeypatch.setattr(kb.time, "time", lambda: reset + 1)
+        assert kb.check_respawn_guard(conn, waiting) is None
+
+        monkeypatch.setattr(kb.time, "time", lambda: plain_run.ended_at + 299)
+        assert kb.check_respawn_guard(conn, plain) == "rate_limit_cooldown"
+        monkeypatch.setattr(kb.time, "time", lambda: plain_run.ended_at + 301)
+        assert kb.check_respawn_guard(conn, plain) is None
+
+        # An operator who disabled rate-limit waiting gets no wait at all.
+        monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+        monkeypatch.setattr(kb.time, "time", lambda: run.ended_at + 1)
+        assert kb.check_respawn_guard(conn, waiting) is None
+
+
+@pytest.mark.parametrize(
+    "session_id", [None, "worker-session-1"], ids=["no-session-link", "session-linked"],
+)
+def test_rate_limited_close_keeps_the_reset_the_worker_recorded(
+    rate_limit_exits, session_id, monkeypatch,
+):
+    reset = int(time.time()) + 3600
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="reset survives the close", assignee="a")
+        run_id = _claim_worker_run(conn, tid, 71003)
+        if session_id is not None:
+            assert kb.heartbeat_worker(
+                conn, tid, expected_run_id=run_id, session_id=session_id,
+            )
+        assert _record_as_worker(monkeypatch, conn, tid, run_id, reset) is True
+        run = _worker_exits_rate_limited(conn, run_id, 71003)
+
+    assert run.metadata["rate_limit_reset_at"] == reset
+    # The close still writes its own record of the exit beside it.
+    assert run.metadata["exit_code"] == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert run.metadata.get("worker_session_id") == session_id
+
+
+def test_reset_outside_the_next_seven_days_is_never_waited_for(
+    rate_limit_exits, monkeypatch,
+):
+    """A past or far-future reset is refused at record time, and a guard fed
+    one straight from the run row keeps the plain 300-second cooldown."""
+    import json
+
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="limit with a bogus reset", assignee="a")
+        run_id = _claim_worker_run(conn, tid, 71004)
+        before = _raw_run_metadata(conn, run_id)
+        for bogus in (
+            now - 60, now, now + 8 * 86400, now + 7 * 86400 + 1,
+            True, float("nan"), float("inf"), str(now + 3600), None,
+        ):
+            assert _record_as_worker(
+                monkeypatch, conn, tid, run_id, bogus, now=now,
+            ) is False, bogus
+        assert _raw_run_metadata(conn, run_id) == before
+        # Exactly seven days ahead is still inside the bound.
+        assert _record_as_worker(
+            monkeypatch, conn, tid, run_id, now + 7 * 86400, now=now,
+        ) is True
+        run = _worker_exits_rate_limited(conn, run_id, 71004)
+
+        ended = run.ended_at
+        for stored in (
+            json.dumps({"rate_limit_reset_at": ended - 60}),
+            json.dumps({"rate_limit_reset_at": ended}),
+            json.dumps({"rate_limit_reset_at": ended + 8 * 86400}),
+            json.dumps({"rate_limit_reset_at": True}),
+            json.dumps({"rate_limit_reset_at": ended + 3600.5}),
+            json.dumps({"rate_limit_reset_at": str(ended + 3600)}),
+            json.dumps([ended + 3600]),
+            "{not json",
+        ):
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?", (stored, run_id),
+            )
+            conn.commit()
+            monkeypatch.setattr(kb.time, "time", lambda: ended + 299)
+            assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown", stored
+            monkeypatch.setattr(kb.time, "time", lambda: ended + 301)
+            assert kb.check_respawn_guard(conn, tid) is None, stored
+
+
+def test_reset_is_recorded_only_on_the_task_current_open_run(rate_limit_exits, monkeypatch):
+    reset = int(time.time()) + 3600
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="records on its own run", assignee="a")
+        other = kb.create_task(conn, title="another card", assignee="a")
+        idle = kb.create_task(conn, title="never claimed", assignee="a")
+        old_run_id = _claim_worker_run(conn, tid, 71005)
+        _worker_exits_rate_limited(conn, old_run_id, 71005)
+        other_run_id = _claim_worker_run(conn, other, 71006)
+
+        def record(task_id, run_id):
+            return _record_as_worker(monkeypatch, conn, task_id, run_id, reset)
+
+        def metadata_of(*run_ids):
+            return [_raw_run_metadata(conn, rid) for rid in run_ids]
+
+        before = metadata_of(old_run_id, other_run_id)
+        # No current run: neither the task's own last run nor any other run.
+        assert record(tid, old_run_id) is False
+        assert record(tid, other_run_id) is False
+        assert record(idle, old_run_id) is False
+        assert record(idle, other_run_id) is False
+        assert metadata_of(old_run_id, other_run_id) == before
+
+        current_run_id = _claim_worker_run(conn, tid, 71007)
+        before = metadata_of(old_run_id, other_run_id, current_run_id)
+        # An older, closed run of the same task.
+        assert record(tid, old_run_id) is False
+        # A run of another task, even that task's own open current run.
+        assert record(tid, other_run_id) is False
+        assert record(other, current_run_id) is False
+        assert metadata_of(old_run_id, other_run_id, current_run_id) == before
+
+        # The task's own current open run takes it.
+        assert record(tid, current_run_id) is True
+        assert kb.get_run(conn, current_run_id).metadata == {"rate_limit_reset_at": reset}
+
+
+def test_reset_is_recorded_only_by_the_worker_of_that_run(rate_limit_exits, monkeypatch):
+    """The identifiers must be the ones the dispatcher gave the calling worker: a worker
+    cannot record a reset on another task's open run, or under another run id, and a
+    caller outside any worker records nothing."""
+    reset = int(time.time()) + 3600
+    with kb.connect() as conn:
+        mine = kb.create_task(conn, title="my card", assignee="a")
+        theirs = kb.create_task(conn, title="their card", assignee="a")
+        my_run = _claim_worker_run(conn, mine, 71008)
+        their_run = _claim_worker_run(conn, theirs, 71009)
+        before = [_raw_run_metadata(conn, rid) for rid in (my_run, their_run)]
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", mine)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(my_run))
+        # Another task's own current open run, named by my worker.
+        assert kb.record_run_rate_limit_reset(
+            conn, theirs, run_id=their_run, reset_at=reset,
+        ) is False
+        # My task, but a run id that is not my worker's.
+        assert kb.record_run_rate_limit_reset(
+            conn, mine, run_id=their_run, reset_at=reset,
+        ) is False
+        monkeypatch.delenv("HERMES_KANBAN_TASK")
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+        # No worker at all.
+        assert kb.record_run_rate_limit_reset(
+            conn, mine, run_id=my_run, reset_at=reset,
+        ) is False
+        assert [_raw_run_metadata(conn, rid) for rid in (my_run, their_run)] == before
+
+
 
 
 
