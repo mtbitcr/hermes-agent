@@ -210,6 +210,29 @@ def _check_kanban_recommend_mode() -> bool:
     return bool(os.environ.get("HERMES_KANBAN_TASK"))
 
 
+def _check_kanban_review_findings_mode() -> bool:
+    """``kanban_review_findings`` is listed only for the run the kernel claimed
+    from the review lane.
+
+    Narrower than ``_check_kanban_mode``: an ordinary worker run, a profile
+    with the ``kanban`` toolset, a delegate_task child and a cron job fired
+    in-process from a worker never see the tool, because no call from them
+    could succeed. This only shapes the schema; ``_handle_review_findings``
+    repeats every admission check at call time. Any error hides the tool.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+    run_id, refusal = _active_reviewer_run_id(task_id)
+    if refusal is not None:
+        return False
+    try:
+        from hermes_cli import kanban_db as kb
+
+        with kb.connect_closing(board=os.environ.get("HERMES_KANBAN_BOARD")) as conn:
+            return kb.run_claimed_from_review(conn, task_id, run_id)
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # kanban_status_report gating
 # ---------------------------------------------------------------------------
@@ -4219,7 +4242,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_REVIEW_FINDINGS_SCHEMA,
     handler=_handle_review_findings,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_review_findings_mode,
     emoji="🔎",
 )
 
