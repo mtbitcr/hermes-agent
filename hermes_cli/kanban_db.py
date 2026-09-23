@@ -25533,6 +25533,15 @@ def _review_approval_head(
     return head, None, proven_parents
 
 
+class _SavedResultHandoverRefused(Exception):
+    """Internal: the review transition refused a saved-result handover.
+
+    Raised by :func:`complete_task` in place of ``False``, and only for
+    :func:`_hand_over_saved_patch`, so that the run it parks records
+    :func:`request_review`'s own reason rather than a bare refusal.
+    """
+
+
 @bounded_mutation("complete_task")
 def complete_task(
     conn: sqlite3.Connection,
@@ -25648,7 +25657,10 @@ def complete_task(
     ``_saved_result_attachment_id`` is KERNEL-INTERNAL: only
     :func:`_hand_over_saved_patch` passes it, and the review park hands it on
     unchanged to :func:`request_review`, which records that handover in the
-    transaction that parks the card.
+    transaction that parks the card. When that review transition refuses, the
+    commit this call materialized is rolled back and
+    :class:`_SavedResultHandoverRefused` carries ``request_review``'s reason
+    instead of ``False``.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
@@ -25829,7 +25841,7 @@ def complete_task(
     # rather than back to its own implementer. The destination was resolved
     # (and, for the governed case, refused) above, before any of this ran.
     if park_for_review:
-        return bool(
+        parked, refusal = (
             request_review(
                 conn,
                 task_id,
@@ -25856,8 +25868,43 @@ def complete_task(
                 # handover; ``complete_task`` accepts those today, so the park
                 # must not become the one thing that refuses them.
                 force=expected_run_id is None,
+                with_reason=True,
             )
         )
+        if not parked and _saved_result_attachment_id is not None:
+            # The saved-result handover already committed its patch to the
+            # task branch. A refused review transition takes back only the
+            # commit this call made, and only while its run still owns the
+            # card; the rollback leaves a head another writer moved alone. The
+            # refusal then reaches the handover with ``request_review``'s own
+            # reason, and the handover parks the card as it always has.
+            materialized_head = (materialization_receipt or {}).get(
+                "materialized_head"
+            )
+            if (
+                materialization_start is not None
+                and materialized_head is not None
+                and materialized_head != materialization_start
+            ):
+                try:
+                    with write_txn(conn):
+                        if (
+                            _validated_open_current_run(conn, task_id, expected_run_id)
+                            is not None
+                        ):
+                            _rollback_worktree_materialization(
+                                conn,
+                                task_id,
+                                materialization_start,
+                                materialized_head=materialized_head,
+                                expected_run_id=expected_run_id,
+                            )
+                except Exception as exc:
+                    raise _SavedResultHandoverRefused(
+                        f"{refusal}; rollback also failed: {exc}"
+                    ) from exc
+            raise _SavedResultHandoverRefused(refusal)
+        return bool(parked)
     # THE RETURN LEG of that same park. A completion that takes the card out of
     # the reviewer's hands consumes the provenance the park wrote: the exact
     # implementation head, restored below in the one statement that finishes the

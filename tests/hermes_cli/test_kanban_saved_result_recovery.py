@@ -625,3 +625,93 @@ def test_dirty_worktree_still_parks_with_the_refusal_on_the_first_dispatcher_tic
     kinds = [event.kind for event in kb.list_events(conn, task_id)]
     assert "reclaimed" not in kinds
     assert "stale" not in kinds
+
+
+def _parent_reopens_before_the_review_transition(
+    setup: dict, monkeypatch, *, meanwhile=None,
+) -> int:
+    """A done parent of the build reopens after the handover has committed the
+    saved patch to the task branch, before the review transition runs.
+
+    ``meanwhile``, when given, runs first, while the branch holds that commit.
+    Returns the attachment id.
+    """
+    conn = setup["conn"]
+    parent_id = kb.create_task(conn, title="parent of the build", assignee="planner")
+    assert kb.complete_task(conn, parent_id)
+    assert kb.get_task(conn, parent_id).status == "done"
+    kb.link_tasks(conn, parent_id, setup["task"])
+    attachment = _save_patch(
+        setup, "x.patch", _new_file_patch(f"{OWNED}/saved.py", "saved = True"),
+    )
+    _exit_cleanly_without_reporting(setup, monkeypatch)
+    real_request_review = kb.request_review
+
+    def reopen_the_parent_first(*args, **kwargs):
+        assert f"Hermes-Patch-Attachment: {attachment}" in git(
+            setup["repo"], "log", "-1", "--format=%B", setup["branch"],
+        )
+        if meanwhile is not None:
+            meanwhile()
+        # The minimal stand-in for a reopen surface: done -> todo.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'todo', completed_at = NULL WHERE id = ?",
+                (parent_id,),
+            )
+        return real_request_review(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "request_review", reopen_the_parent_first)
+    return attachment
+
+
+def test_parent_reopened_before_the_review_transition_still_parks_at_the_base_with_the_refusal_on_the_run(
+    running_build, monkeypatch,
+):
+    """The review transition refuses a build whose parent reopened after the
+    saved patch was committed: the handover takes back the commit it made, and
+    the run records why the review lane refused."""
+    setup = running_build()
+    _parent_reopens_before_the_review_transition(setup, monkeypatch)
+
+    assert kb.detect_crashed_workers(setup["conn"]) == []
+
+    unreported = _assert_parked_for_a_person(setup)
+    workspace = Path(kb.get_task(setup["conn"], setup["task"]).workspace_path)
+    assert git(workspace, "status", "--porcelain") == ""
+    assert "parent dependencies are not satisfied" in unreported["handover_refusal"]
+    assert "without giving a reason" not in unreported["handover_refusal"]
+
+
+def test_head_another_writer_moved_is_never_moved_back_when_a_reopened_parent_refuses_the_review(
+    running_build, monkeypatch,
+):
+    """Another writer commits on top of the saved patch before the refused
+    review transition: that head stays exactly where the other writer put it."""
+    setup = running_build()
+    conn, task_id, run_id = setup["conn"], setup["task"], setup["run"]
+    workspace = Path(kb.get_task(conn, task_id).workspace_path)
+    moved: dict = {}
+
+    def another_writer_commits_on_top():
+        git(
+            workspace, "commit", "--allow-empty", "-m", "another writer",
+            author=DEFAULT_GIT_IDENTITY,
+        )
+        moved["head"] = git(workspace, "rev-parse", "HEAD")
+
+    _parent_reopens_before_the_review_transition(
+        setup, monkeypatch, meanwhile=another_writer_commits_on_top,
+    )
+
+    kb.detect_crashed_workers(conn)
+
+    assert git(setup["repo"], "rev-parse", setup["branch"]) == moved["head"]
+    task = kb.get_task(conn, task_id)
+    assert (task.status, task.block_kind) == ("blocked", "needs_input")
+    run = kb.get_run(conn, run_id)
+    assert run.outcome == "completed_unreported"
+    assert _handed_over(setup) == []
+    refusal = run.metadata["unreported_completion"]["handover_refusal"]
+    assert "parent dependencies are not satisfied" in refusal
+    assert "without giving a reason" not in refusal
