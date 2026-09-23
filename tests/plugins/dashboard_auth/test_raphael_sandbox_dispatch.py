@@ -835,6 +835,110 @@ class TestReviewBaseline:
 
 
 # ---------------------------------------------------------------------------
+# 3c. The model route the kernel pinned, carried into the machine's env
+# ---------------------------------------------------------------------------
+
+
+def _pin_route(host, *, model, provider, effort, tier=None, lock=None):
+    """Store a route on the fixture task's row, in the kernel's own columns."""
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET model_override=?, provider_override=?, "
+            "reasoning_effort=?, execution_tier=?, model_policy_lock=? "
+            "WHERE id=?",
+            (model, provider, effort, tier, lock, host.task_id),
+        )
+        conn.commit()
+        # Still a row the kernel itself would start a run on.
+        kb.assert_claimable_route(conn, host.task_id)
+
+
+def _pin_deep_implementation_route(host):
+    """Pin the coding worker's deep route the way an owner plan pins one."""
+    from plugins.dashboard_auth.raphael_workspace.model_policy import task_assignment_for
+
+    route = task_assignment_for(sd.WORKER_PROFILE, "anthropic", "deep")
+    _pin_route(
+        host, model=route.model, provider=route.provider,
+        effort=route.reasoning_effort, tier="deep",
+        lock=kb.mint_policy_lock(
+            sd.WORKER_PROFILE, route.provider, route.model,
+            route.reasoning_effort, "deep",
+        ),
+    )
+    return route
+
+
+class TestPinnedRoute:
+    """Claude Code in the machine runs the route pinned on the task, or none.
+
+    The task record is the only source, so neither the worker nor this host
+    process's own environment chooses the model a task runs on.
+    """
+
+    def test_a_pinned_deep_route_reaches_the_machine_env_exactly(self, host, sdk):
+        route = _pin_deep_implementation_route(host)
+        out = _provision()
+        kwargs = FakeSandbox.created[0].create_kwargs
+        env = dict(kwargs["env"])
+        assert env.pop("ANTHROPIC_MODEL", None) == route.model
+        assert env.pop("CLAUDE_CODE_EFFORT_LEVEL", None) == route.reasoning_effort
+        # Beside the credential contract, never instead of it: what remains is
+        # the placeholder alone, exactly as for a task with no route.
+        assert env == {"ANTHROPIC_API_KEY": sd.PLACEHOLDER_TOKEN}
+        # And the machine's env is the only place the route goes.
+        assert route.model not in json.dumps(kwargs["metadata"])
+        assert route.model not in json.dumps(out)
+
+    def test_a_task_with_no_pinned_route_gets_neither_variable(
+        self, host, sdk, monkeypatch
+    ):
+        # This host process's own environment is not a route source.
+        monkeypatch.setenv("ANTHROPIC_MODEL", "claude-from-the-host-process")
+        monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "low")
+        _provision()
+        env = FakeSandbox.created[0].create_kwargs["env"]
+        assert "ANTHROPIC_MODEL" not in env
+        assert "CLAUDE_CODE_EFFORT_LEVEL" not in env
+        # The absence is the missing pin, not a dispatch that never forwards a
+        # route: once the kernel pins one on this same task, the replacement
+        # machine carries it.
+        route = _pin_deep_implementation_route(host)
+        FakeSandbox.live.clear()
+        _provision()
+        replacement = FakeSandbox.created[-1].create_kwargs["env"]
+        assert replacement.get("ANTHROPIC_MODEL") == route.model
+        assert replacement.get("CLAUDE_CODE_EFFORT_LEVEL") == route.reasoning_effort
+
+    def test_an_effort_claude_code_does_not_accept_is_withheld(
+        self, host, sdk, caplog
+    ):
+        # The board admits "minimal" for a Hermes worker; Claude Code does not.
+        # No policy lock can bind it, so this is an ordinary manual pin.
+        _pin_route(
+            host, model="claude-sonnet-5", provider="anthropic", effort="minimal",
+        )
+        with caplog.at_level(logging.WARNING):
+            _provision()
+        env = FakeSandbox.created[0].create_kwargs["env"]
+        assert "CLAUDE_CODE_EFFORT_LEVEL" not in env
+        # Withheld out loud: this module says why at warning level, and never
+        # beside a credential.
+        warnings = [
+            record.getMessage() for record in caplog.records
+            if record.name == sd.logger.name
+            and record.levelno == logging.WARNING
+            and "minimal" in record.getMessage()
+        ]
+        assert warnings
+        for message in warnings:
+            assert REAL_SECRET not in message
+            assert sd.PLACEHOLDER_TOKEN not in message
+        # Only the effort is dropped; the model pin still stands.
+        assert env.get("ANTHROPIC_MODEL") == "claude-sonnet-5"
+
+
+# ---------------------------------------------------------------------------
 # 4. The Server 1 → Server 2 transport
 # ---------------------------------------------------------------------------
 
