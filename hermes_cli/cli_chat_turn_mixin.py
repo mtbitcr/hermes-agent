@@ -40,6 +40,8 @@ class CLIChatTurnMixin:
         set_secret_capture_callback(self._secret_capture_callback)
         # Reset per turn; only a real interrupt flips it, so early returns leave it False.
         self._last_turn_interrupted = False
+        # Likewise the finished turn's result (the one-shot exit code reads it); None on early returns.
+        self._last_turn_result = None
 
         if not self._ensure_runtime_credentials():
             return None
@@ -433,6 +435,7 @@ class CLIChatTurnMixin:
 
     def _chat_settle_turn(self, turn):
         """After the agent thread ends: freeze timers, flush streams, drain TTS, sync history/session id."""
+        self._last_turn_result = turn.result
         if self._prompt_start_time is not None:
             self._prompt_duration = max(0.0, time.time() - self._prompt_start_time)
             self._prompt_start_time = None

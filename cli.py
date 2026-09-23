@@ -4063,6 +4063,78 @@ def _sync_cli_session_id_from_agent(cli) -> None:
         cli.session_id = cli.agent.session_id
 
 
+# Turn failure reasons that mean the AI provider's usage limit, not the task.
+_KANBAN_USAGE_LIMIT_REASONS = frozenset({"rate_limit", "billing", "overloaded"})
+
+
+def _single_query_exit_code(result, *, default: int) -> int:
+    """Automation exit code of a one-shot turn: ``default``, except for a kanban usage-limit stop.
+
+    A kanban worker whose turn still failed at the provider's usage limit after its retries exits
+    with the EX_TEMPFAIL sentinel, so the dispatcher releases the task without counting a failure
+    (a quota window must not trip the breaker) and starts it again by itself.
+    """
+    if not (
+        os.environ.get("HERMES_KANBAN_TASK") and isinstance(result, dict) and result.get("failed")
+        and result.get("failure_reason") in _KANBAN_USAGE_LIMIT_REASONS
+    ):
+        return default
+    try:
+        from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+    except Exception:
+        return default
+    return KANBAN_RATE_LIMIT_EXIT_CODE
+
+
+def _exhausted_pool_reset_at(pool, now: float) -> Optional[float]:
+    """Earliest reset of a credential pool that is exhausted as a whole, else None.
+
+    Dead credentials never come back and are ignored; any other credential that is usable, or
+    exhausted without a known future reset, means the pool gives no wait worth recording.
+    """
+    from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED, _parse_absolute_timestamp
+
+    resets = []
+    for entry in pool.entries():
+        if entry.last_status == STATUS_DEAD:
+            continue
+        if entry.last_status != STATUS_EXHAUSTED:
+            return None
+        reset = _parse_absolute_timestamp(entry.last_error_reset_at)
+        if reset is None or reset <= now:
+            return None
+        resets.append(reset)
+    return min(resets) if resets else None
+
+
+def _record_kanban_rate_limit_reset(cli, exit_code: int) -> None:
+    """Before a usage-limit exit, record on this worker's own run when the provider's limit lifts.
+
+    The dispatcher then keeps the card waiting until that time instead of probing again after
+    each fixed cooldown. Best-effort: never raises and never changes the exit code; with nothing
+    recorded, the plain cooldown applies.
+    """
+    try:
+        import math
+        from hermes_cli import kanban_db as _kb
+
+        if exit_code != _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
+            return
+        task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+        run_id = _int_or(os.environ.get("HERMES_KANBAN_RUN_ID"), None)
+        pool = getattr(getattr(cli, "agent", None), "_credential_pool", None)
+        if not task_id or run_id is None or pool is None:
+            return
+        now = time.time()
+        reset = _exhausted_pool_reset_at(pool, now)
+        if reset is None or reset > now + _kb.RATE_LIMIT_RESET_MAX_WAIT_SECONDS:
+            return
+        with _kb.connect_closing() as conn:
+            _kb.record_run_rate_limit_reset(conn, task_id, run_id=run_id, reset_at=math.ceil(reset))
+    except Exception:
+        logger.debug("could not record the provider reset on this kanban run", exc_info=True)
+
+
 def _run_quiet_single_query(cli, effective_query):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
     HERMES_TURN_AUTHOR (set only by a bot-to-bot dispatcher) is consumed here so tool subprocesses do not inherit it."""
@@ -4103,18 +4175,10 @@ def _run_quiet_single_query(cli, effective_query):
 
     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
-    # Exit code 0/1 for automation wrappers. Kanban workers that failed purely on
-    # rate-limit/billing exit with the EX_TEMPFAIL sentinel so the dispatcher releases
-    # the task without counting a failure (a quota window must not trip the breaker).
-    _exit_code = 0
-    if isinstance(result, dict) and result.get("failed"):
-        _exit_code = 1
-        if os.environ.get("HERMES_KANBAN_TASK") and result.get("failure_reason") in ("rate_limit", "billing"):
-            try:
-                from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE
-                _exit_code = _RL_CODE
-            except Exception:
-                _exit_code = 1
+    # Exit code 0/1 for automation wrappers; a kanban worker stopped at the provider's
+    # usage limit exits with the EX_TEMPFAIL sentinel instead (see _single_query_exit_code).
+    _exit_code = _single_query_exit_code(result, default=1 if isinstance(result, dict) and result.get("failed") else 0)
+    _record_kanban_rate_limit_reset(cli, _exit_code)
     sys.exit(_exit_code)
 
 
@@ -4433,6 +4497,12 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
         cli._show_security_advisories()
         cli.chat(query, images=single_query_images or None)
         cli._print_exit_summary(clear_screen=False)
+        # Kanban workers run ``chat -q`` without -Q: a usage-limit stop must reach the dispatcher
+        # as the same sentinel exit, not as a clean exit 0 (booked as a protocol violation).
+        _exit_code = _single_query_exit_code(getattr(cli, "_last_turn_result", None), default=0)
+        if _exit_code:
+            _record_kanban_rate_limit_reset(cli, _exit_code)
+            sys.exit(_exit_code)
     finally:
         _finalize_single_query(cli)
 

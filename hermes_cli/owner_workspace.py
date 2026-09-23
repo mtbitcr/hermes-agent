@@ -2892,6 +2892,24 @@ def _owner_project_runtime_and_cost(
     }
 
 
+def _owner_rate_limited_summary(run: kanban_db.Run) -> str:
+    """Say that the provider's usage limit stopped the run and that it restarts by itself.
+
+    Names the reset in UTC only when the run carries a believable one.
+    """
+    reset = kanban_db.recorded_rate_limit_reset(
+        run.metadata,
+        anchor=run.ended_at if run.ended_at is not None else run.started_at,
+    )
+    if reset is None:
+        return "Work stopped at the AI provider's usage limit and will start again by itself."
+    when = datetime.fromtimestamp(reset, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return (
+        "Work stopped at the AI provider's usage limit and will start again "
+        f"by itself after {when}."
+    )
+
+
 def _owner_project_run_receipt(
     run: kanban_db.Run,
     task_pin: Optional[OwnerTaskRoutePin],
@@ -2917,8 +2935,10 @@ def _owner_project_run_receipt(
         owner_outcome, summary = "completed", "Work finished and is awaiting review."
     elif outcome == "scheduled":
         owner_outcome, summary = "unknown", "Work is scheduled for later."
+    elif outcome == "rate_limited":
+        owner_outcome, summary = "attention", _owner_rate_limited_summary(run)
     elif outcome in {
-        "blocked", "changes_requested", "crashed", "gave_up", "rate_limited",
+        "blocked", "changes_requested", "crashed", "gave_up",
         "reclaimed", "spawn_failed", "stale", "timed_out",
     }:
         owner_outcome, summary = "attention", "Work stopped and needs attention."
