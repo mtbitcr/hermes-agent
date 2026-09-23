@@ -996,15 +996,26 @@ def project_oauth_payload(payload: Mapping[str, Any]) -> dict:
     providers = []
     raw_rows = payload.get("providers")
     if isinstance(raw_rows, list):
+
+        def _logged_in(raw: Any) -> bool:
+            status = raw.get("status") if isinstance(raw, Mapping) else None
+            return isinstance(status, Mapping) and status.get("logged_in") is True
+
+        # Since 2026-09-23 every Claude lane borrows the one Server 1 Claude
+        # Code login, which the native "anthropic" entry deliberately does not
+        # read; for the owner that login is the Anthropic connection.
+        claude_code_login = any(
+            isinstance(raw, Mapping) and raw.get("id") == "claude-code" and _logged_in(raw)
+            for raw in raw_rows
+        )
         for raw in raw_rows:
             if not isinstance(raw, Mapping):
                 continue
             provider_id = str(raw.get("id") or "")
             if provider_id not in allowed:
                 continue
-            status = raw.get("status")
-            logged_in = bool(
-                isinstance(status, Mapping) and status.get("logged_in") is True
+            logged_in = _logged_in(raw) or (
+                provider_id == "anthropic" and claude_code_login
             )
             providers.append({
                 "id": provider_id,
