@@ -16,7 +16,7 @@ import json
 import os
 import threading
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
 from hermes_cli.auth_constants import (
@@ -418,6 +418,16 @@ def resolve_codex_runtime_credentials(
     in the pool — for example after a manual pool seed, a partial re-auth, or pool-only restoration from a
     backup — gets a bare HTTP 401 ``Missing Authentication header`` from the wire instead of a usable
     credential. See issue #32992.
+
+    The singleton is read through ``_load_provider_state`` (profile first, then the global root),
+    and a refresh rotates it in the store it was read from (``_codex_grant_source_home``). The pool
+    fallback stays profile-local: an ordinary profile-scoped catalog read never borrows the root's
+    pool. This singleton-first order is NOT the runtime's account selection (the runtime runs on
+    ``load_pool(...).select()``) and can disagree with it, e.g. an own singleton beside a borrowed
+    priority-0 root pool row. Only the owner's Models read reconciles the two: it takes the
+    account from the runtime's own selection (``agent.credential_pool.preview_runtime_selection``)
+    and reads that account's catalog in the store holding it
+    (``hermes_cli.web_server._codex_runtime_account``).
     """
     from hermes_cli.auth import (
         _auth_store_lock, _codex_access_token_is_expiring, _probe_codex_quota_restored,
@@ -467,9 +477,10 @@ def resolve_codex_runtime_credentials(
             refresh_if_expiring and _codex_access_token_is_expiring(token, refresh_skew_seconds))
 
     if _should_refresh(access_token):
-        # Re-read under lock to avoid racing with other Hermes processes
+        # Re-read under lock to avoid racing with other Hermes processes, in the store the grant
+        # came from (a borrowed root grant is rotated at the root, never forked into the profile).
         lock_timeout = max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)
-        with _auth_store_lock(timeout_seconds=lock_timeout):
+        with _codex_grant_source_home(), _auth_store_lock(timeout_seconds=lock_timeout):
             data = _read_codex_tokens(_lock=False)
             tokens = dict(data["tokens"])
             if _should_refresh(_stripped(tokens.get("access_token"))):
@@ -612,6 +623,30 @@ def _read_codex_pool_entries() -> Optional[List[Any]]:
     with _auth_store_lock():
         auth_store = _load_auth_store()
     return _pool_entries(auth_store, "openai-codex")
+
+
+@contextmanager
+def _codex_grant_source_home() -> Iterator[None]:
+    """Scope a Codex singleton refresh to the auth store the grant was read from.
+
+    ``_read_codex_tokens`` resolves ``providers.openai-codex`` profile-first, then from the global
+    root (``_load_provider_state_with_source``). Refresh tokens are single-use, so a named profile
+    running on the root's grant must rotate it IN the root's store: refreshing under the profile
+    would write the new chain into the profile's auth.json (a forked grant) and strand the root's
+    copy. When the grant is the profile's own, or nothing resolves, this is a no-op.
+    """
+    from hermes_cli.auth import (
+        _auth_file_path, _load_auth_store, _load_provider_state_with_source, _same_path)
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    _state, source_path = _load_provider_state_with_source(_load_auth_store(), "openai-codex")
+    if source_path is None or _same_path(source_path, _auth_file_path()):
+        yield
+        return
+    token = set_hermes_home_override(str(source_path.parent))
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
 
 
 def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:

@@ -8,6 +8,7 @@ Origin module; cohesive clusters live in siblings and are re-imported here so
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import json
 import logging
@@ -1478,11 +1479,21 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
     """Fire-and-forget daemon refresh of *cache_key*'s cache entry, at most one in flight per key.
     Failures are swallowed — the stale entry stays served until a later refresh succeeds.
     ``refresh_fn`` (no-args → fresh entry dict or None) lets ``custom:<base_url>`` keys from
-    :func:`cached_fetch_api_models` reuse the same inflight-dedupe scaffolding."""
+    :func:`cached_fetch_api_models` reuse the same inflight-dedupe scaffolding.
+
+    The refresh belongs to the HERMES_HOME that scheduled it. The context-local home override is a
+    ContextVar and a new thread starts with an empty context, so the scheduling context is copied
+    and the whole refresh — fetch, ``refresh_fn`` and the cache write — runs inside it. The
+    in-flight key includes that home, so concurrent profiles refresh their own caches instead of
+    deduping against each other."""
+    from hermes_constants import get_hermes_home
+
+    context = contextvars.copy_context()
+    inflight_key = (str(get_hermes_home()), cache_key)
     with _swr_refresh_lock:
-        if cache_key in _swr_refresh_inflight:
+        if inflight_key in _swr_refresh_inflight:
             return
-        _swr_refresh_inflight.add(cache_key)
+        _swr_refresh_inflight.add(inflight_key)
 
     def _default_refresh():
         live = provider_model_ids(cache_key, force_refresh=True)
@@ -1499,9 +1510,11 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
             logger.debug("SWR refresh failed for %s", cache_key, exc_info=True)
         finally:
             with _swr_refresh_lock:
-                _swr_refresh_inflight.discard(cache_key)
+                _swr_refresh_inflight.discard(inflight_key)
 
-    threading.Thread(target=_refresh, daemon=True, name=f"model-cache-swr-{cache_key}").start()
+    threading.Thread(
+        target=lambda: context.run(_refresh), daemon=True, name=f"model-cache-swr-{cache_key}",
+    ).start()
 
 
 def _provider_models_cache_path() -> Path:

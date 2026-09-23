@@ -6901,50 +6901,120 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
 )
 
 
-def _shared_codex_owning_root() -> Optional[Path]:
-    """The root home whose Codex grant the SCOPED profile actually runs on.
+def _codex_catalog_account_token() -> Optional[str]:
+    """The access token the CURRENT scope's own Codex catalog read resolves.
 
-    Called inside a named profile's scope. Single-use OAuth grants live once,
-    at the global root, and a named profile with no Codex material of its own
-    runs on that grant through the root fallback in ``read_credential_pool`` /
-    ``_load_provider_state``. The catalog read's pool fallback is profile-local,
-    so for exactly that profile the picker raised AuthError against an account
-    its sessions were already using.
-
-    Returns ``None`` — keep the profile's own read — whenever that is not
-    provably the case: the scope IS the root, the profile holds any Codex
-    grant of its own (a different account, never to be exchanged for root's),
-    or its store cannot be read.
+    That read is ``resolve_codex_runtime_credentials`` (what
+    ``hermes_cli.models._codex_catalog`` asks the account API with), taken here
+    without a refresh so nothing rotates just to compare. ``None`` when it
+    resolves nothing.
     """
-    from hermes_cli.auth import _auth_file_path, _global_auth_file_path
+    from hermes_cli.auth import resolve_codex_runtime_credentials
+
+    try:
+        creds = resolve_codex_runtime_credentials(refresh_if_expiring=False)
+    except Exception:
+        return None
+    return str(creds.get("api_key") or "").strip() or None
+
+
+def _codex_runtime_account() -> Optional[Tuple[Path, str]]:
+    """The Codex account the SCOPED profile's runtime selects, when its own
+    catalog read would list a different one.
+
+    Called inside a named profile's scope. The runtime runs on
+    ``load_pool("openai-codex").select()`` (``_resolve_from_pool``): the pool
+    ``read_credential_pool`` assembles — the profile's own rows, or the global
+    root's when it has none — plus the seeded singleton, in priority order.
+    The catalog read is ``resolve_codex_runtime_credentials``, singleton first
+    with a profile-local pool fallback, so the two can disagree: a profile
+    holding its own singleton while borrowing the root's pool runs on the
+    root's priority-0 row, yet its catalog read lists its own singleton's.
+
+    The decision is therefore the runtime's own selection
+    (``agent.credential_pool.preview_runtime_selection``, a read-only replica
+    of ``load_pool`` + ``select``) — never "a grant exists, so it must be the
+    account". Returns the home whose store holds the selected entry (the root
+    for a borrowed row, else the profile) and its access token, which only
+    ever stays in memory to ask for that account's model ids.
+
+    ``None`` — keep the profile's own read — when that read already resolves
+    the selected account, when the pool selects nothing (the runtime then
+    falls back to that same read), when the scope IS the root, or when the
+    profile's store cannot be read (refused, never guessed to be empty). A
+    malformed store is handled exactly as the runtime handles it:
+    ``_load_auth_store`` preserves the corrupt copy on disk and reads it as
+    empty.
+    """
+    from agent.credential_pool import preview_runtime_selection
+    from hermes_cli.auth import _global_auth_file_path
+    from hermes_constants import get_hermes_home
 
     root_auth = _global_auth_file_path()
     if root_auth is None:
         return None
     try:
-        auth_path = _auth_file_path()
-        store = (
-            json.loads(auth_path.read_text(encoding="utf-8-sig"))
-            if auth_path.exists()
-            else {}
-        )
-    except (OSError, RuntimeError, ValueError):
+        entry, borrowed = preview_runtime_selection("openai-codex")
+    except (OSError, RuntimeError):
         return None
-    if not isinstance(store, dict):
+    if entry is None:
         return None
-    for section in ("providers", "credential_pool"):
-        entries = store.get(section)
-        if isinstance(entries, dict) and entries.get("openai-codex"):
-            return None
-    return root_auth.parent
+    token = str(entry.runtime_api_key or entry.access_token or "").strip()
+    if not token or token == _codex_catalog_account_token():
+        return None
+    return (root_auth.parent if borrowed else get_hermes_home()), token
+
+
+def _shared_codex_owning_root() -> Optional[Path]:
+    """The root home whose Codex account the SCOPED profile's runtime selects.
+
+    ``_codex_runtime_account`` narrowed to a borrowed root row: ``None`` when
+    the profile's own read lists the selected account, or when the selected
+    account is one of the profile's own.
+    """
+    from hermes_cli.auth import _global_auth_file_path, _same_path
+
+    account = _codex_runtime_account()
+    root_auth = _global_auth_file_path()
+    if account is None or root_auth is None:
+        return None
+    return account[0] if _same_path(account[0], root_auth.parent) else None
+
+
+def _codex_catalog_for_runtime_account(
+    home: Path, token: str, *, refresh: bool
+) -> Optional[list]:
+    """Model ids of the runtime-selected account, read in the store holding it.
+
+    When *home*'s own catalog read resolves exactly this account, that read
+    is used as is — its resolve/refresh, its catalog cache and its SWR
+    refresh (``_codex_catalog_at_owning_root``). Otherwise every cache row of
+    *home* belongs to a different account, so the selected account's catalog
+    is asked from the same fetcher the cache fills from
+    (``get_codex_model_ids``) with the selected token, under *home*'s scope,
+    and nothing is cached or written. Only model ids leave this function.
+    """
+    from hermes_cli.codex_models import get_codex_model_ids
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    scope = set_hermes_home_override(str(home))
+    try:
+        if _codex_catalog_account_token() == token:
+            return _codex_catalog_at_owning_root(home, refresh=refresh)
+        return list(get_codex_model_ids(access_token=token))
+    finally:
+        reset_hermes_home_override(scope)
 
 
 def _codex_catalog_at_owning_root(root: Path, *, refresh: bool) -> Optional[list]:
     """The Codex model ids the owning root's own catalog read lists.
 
     Resolution, any refresh and the catalog cache all stay in the root's own
-    store, exactly as the root's own Models read uses them; only model ids
-    leave this function, so no token or grant is copied into the profile.
+    store, exactly as the root's own Models read uses them — including a
+    stale-while-revalidate refresh scheduled here, which carries the root's
+    home into its background thread (``hermes_cli.models._spawn_swr_refresh``);
+    only model ids leave this function, so no token or grant is copied into
+    the profile.
     ``None`` when the root has no usable grant either, so nothing is claimed
     for an account nobody can reach.
     """
@@ -7014,11 +7084,12 @@ async def get_model_options(
                     include_unconfigured=bool(include_unconfigured),
                     refresh=bool(refresh),
                 )
-                owning_root = (
-                    _shared_codex_owning_root() if shared_codex_read else None
+                runtime_account = (
+                    _codex_runtime_account() if shared_codex_read else None
                 )
-            if owning_root is None:
+            if runtime_account is None:
                 return payload
+            account_home, account_token = runtime_account
             for row in payload.get("providers") or []:
                 # Only a row the profile already reports as connected: this
                 # corrects which account's catalog it lists, never whether the
@@ -7028,8 +7099,8 @@ async def get_model_options(
                     and row.get("slug") == "openai-codex"
                     and row.get("authenticated") is True
                 ):
-                    models = _codex_catalog_at_owning_root(
-                        owning_root, refresh=bool(refresh)
+                    models = _codex_catalog_for_runtime_account(
+                        account_home, account_token, refresh=bool(refresh)
                     )
                     if models is not None:
                         row["models"] = models

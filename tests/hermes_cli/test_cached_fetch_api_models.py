@@ -361,6 +361,59 @@ class TestSalvageFollowups:
         assert saved["custom:https://gw.example.com/v1#fp"]["models"] == ["refreshed"]
         assert "custom:https://gw.example.com/v1#fp" not in mod._swr_refresh_inflight
 
+    def test_stale_serve_refresh_stays_in_the_scheduling_profiles_cache(
+        self, tmp_path, monkeypatch,
+    ):
+        """End to end through the real disk cache: a stale custom entry served
+        under a profile's HERMES_HOME is refreshed off-thread by the fetcher
+        running under THAT home, into THAT home's cache — never the process
+        home's, which has no such entry at all."""
+        import json as _json
+
+        import hermes_cli.models as mod
+        from hermes_constants import (
+            get_hermes_home, reset_hermes_home_override, set_hermes_home_override,
+        )
+
+        process_home = tmp_path / "process-home"
+        profile = tmp_path / "profile-home"
+        process_home.mkdir()
+        profile.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(process_home))
+        monkeypatch.setattr(mod, "_custom_endpoint_fingerprint", lambda *a, **k: "fp")
+        key = "custom:https://gw.example.com/v1#fp"
+        (profile / "provider_models_cache.json").write_text(
+            _json.dumps({key: self._entry(["stale-ok"], age_seconds=7200)}),
+            encoding="utf-8",
+        )
+        fetched_under = []
+
+        def live():
+            fetched_under.append(str(get_hermes_home()))
+            return ["fresh-model"]
+
+        token = set_hermes_home_override(str(profile))
+        try:
+            out = mod.cached_fetch_api_models(
+                "sk-key", "https://gw.example.com/v1", fetch_models=live,
+            )
+        finally:
+            reset_hermes_home_override(token)
+        assert out == ["stale-ok"]  # served immediately, never blocked
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with mod._swr_refresh_lock:
+                if not mod._swr_refresh_inflight:
+                    break
+            time.sleep(0.01)
+        assert fetched_under == [str(profile)]
+        rows = _json.loads(
+            (profile / "provider_models_cache.json").read_text(encoding="utf-8")
+        )
+        assert rows[key]["models"] == ["fresh-model"]
+        assert not (process_home / "provider_models_cache.json").exists()
+
     def test_corrupt_at_field_degrades_to_live_fetch_instead_of_raising(self):
         """provider_models_cache.json is user-editable; a corrupted 'at' must
         be a cache miss (live fetch), never an exception out of the wrapper."""

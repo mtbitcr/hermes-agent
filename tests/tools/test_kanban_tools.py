@@ -573,10 +573,10 @@ def test_create_on_governed_board_pins_the_admitted_route(worker_env, monkeypatc
         child = kb.get_task(conn, d["task_id"])
         assert child.execution_tier == "deep"
         assert child.provider_override == "anthropic"
-        assert child.model_override == "claude-opus-5"
+        assert child.model_override == "claude-opus-5-5"
         assert child.reasoning_effort == "max"
         assert kb.policy_lock_error(
-            child.model_policy_lock, "raphael-builder", "anthropic", "claude-opus-5", "max", "deep",
+            child.model_policy_lock, "raphael-builder", "anthropic", "claude-opus-5-5", "max", "deep",
         ) is None
     finally:
         conn.close()

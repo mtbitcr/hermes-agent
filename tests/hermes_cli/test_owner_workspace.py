@@ -479,20 +479,23 @@ def test_task_graph_resolves_and_locks_model_routes_before_approval(ctx):
             assignee, "anthropic", model, "max", tier,
         )
 
-    # 'default'/anthropic admits claude-opus-5 on BOTH lanes, so the digest —
+    # 'default'/anthropic admits claude-opus-5-5 on BOTH lanes, so the digest —
     # not the model — is what distinguishes the deep pin from the routine one.
     assert route(first) == (
-        "anthropic", "claude-opus-5", "max", lock("default", "claude-opus-5", "deep"),
+        "anthropic", "claude-opus-5-5", "max",
+        lock("default", "claude-opus-5-5", "deep"),
     )
     assert route(second) == (
-        "anthropic", "claude-opus-5", "max",
-        lock("default", "claude-opus-5", "routine"),
+        "anthropic", "claude-opus-5-5", "max",
+        lock("default", "claude-opus-5-5", "routine"),
     )
+    assert route(first)[3] != route(second)[3]
     assert (first.execution_tier, second.execution_tier) == ("deep", "routine")
     # The executable root reviews a milestone containing deep work, so it is
     # pinned too — and on the deep lane.
     assert route(root) == (
-        "anthropic", "claude-opus-5", "max", lock("default", "claude-opus-5", "deep"),
+        "anthropic", "claude-opus-5-5", "max",
+        lock("default", "claude-opus-5-5", "deep"),
     )
     # Every persisted lock is one the dispatcher would actually accept.
     with kanban_db.connect(board=result["board"]) as conn:
@@ -553,7 +556,7 @@ def test_committed_owner_task_route_cannot_be_mutated_afterwards(ctx):
             with pytest.raises(RuntimeError, match="owner-governed"):
                 kanban_db.set_reasoning_effort(conn, task_id, "ultra")
             task = kanban_db.get_task(conn, task_id)
-            assert task.model_override == "claude-opus-5"
+            assert task.model_override == "claude-opus-5-5"
             assert task.reasoning_effort == "max"
 
 
@@ -1771,18 +1774,18 @@ def test_task_route_pin_distinguishes_unlocked_from_invalid():
     locked = {
         "assignee": "raphael-verifier",
         "provider_override": "openai-codex",
-        "model_override": "gpt-5.6-sol",
+        "model_override": "gpt-6-sol",
         "reasoning_effort": "MAX",
         "execution_tier": "routine",
         "model_policy_lock": kanban_db.mint_policy_lock(
-            "raphael-verifier", "openai-codex", "gpt-5.6-sol", "max", "routine",
+            "raphael-verifier", "openai-codex", "gpt-6-sol", "max", "routine",
         ),
     }
     assert ow.owner_task_route_pin(locked) == ow.OwnerTaskRoutePin(
         valid=True,
         profile="raphael-verifier",
         provider="openai-codex",
-        model="gpt-5.6-sol",
+        model="gpt-6-sol",
         reasoning_effort="max",
     )
     # An unlocked (manual / pre-lock) task has no pin and keeps the older
@@ -3327,9 +3330,9 @@ def test_project_plan_resolves_and_locks_a_new_task_model_route(ctx):
         task.execution_tier,
         task.model_policy_lock,
     ) == (
-        "anthropic", "claude-opus-5", "max", "deep",
+        "anthropic", "claude-opus-5-5", "max", "deep",
         kanban_db.mint_policy_lock(
-            "default", "anthropic", "claude-opus-5", "max", "deep",
+            "default", "anthropic", "claude-opus-5-5", "max", "deep",
         ),
     )
 
@@ -3405,8 +3408,10 @@ def test_effective_route_fence_pins_exposed_owner_work_and_nothing_else(ctx, mon
     result = _commit_task_graph(ctx, **_task_graph_args(idempotency_key="graph-fence"))
     approver.join()
 
+    # The role's CURRENT admitted routine route — the one the committed graph
+    # locked and the one the fence below pins the rewound task onto.
     approved_lock = kanban_db.mint_policy_lock(
-        "default", "anthropic", "claude-opus-5", "max", "routine",
+        "default", "anthropic", "claude-opus-5-5", "max", "routine",
     )
     routeless_id, partial_id = result["task_ids"][0], result["root_task_id"]
     with kanban_db.connect(board=result["board"]) as conn:
@@ -3453,7 +3458,7 @@ def test_effective_route_fence_pins_exposed_owner_work_and_nothing_else(ctx, mon
         ow,
         "configured_assignment_for",
         lambda profile: SimpleNamespace(
-            provider="anthropic", model="claude-opus-5", reasoning_effort="max",
+            provider="anthropic", model="claude-opus-5-5", reasoning_effort="max",
         ),
     )
     # Only the task the policy can actually authorize is pinned.
@@ -3466,7 +3471,7 @@ def test_effective_route_fence_pins_exposed_owner_work_and_nothing_else(ctx, mon
             fully_inherited.model_override,
             fully_inherited.reasoning_effort,
             fully_inherited.model_policy_lock,
-        ) == ("anthropic", "claude-opus-5", "max", approved_lock)
+        ) == ("anthropic", "claude-opus-5-5", "max", approved_lock)
 
         # Its explicit components are preserved exactly — the fence never
         # rewrites an operator's route. Completing it from the profile still
@@ -3804,7 +3809,7 @@ def test_project_plan_replace_carries_an_explicit_ownership_scope(ctx, tmp_path)
         )
         # The route lock still binds the whole approved route tuple.
         assert replacement.model_policy_lock == kanban_db.mint_policy_lock(
-            "default", "anthropic", "claude-opus-5", "max", "deep",
+            "default", "anthropic", "claude-opus-5-5", "max", "deep",
         )
         assert replacement.responsibility == "R09"
         with pytest.raises(RuntimeError, match="owner-governed"):
@@ -6763,16 +6768,19 @@ def test_real_profile_config_resolves_and_locks_owner_task_routes(ctx, real_reso
     and effort, and the lock is minted, persisted and then re-validated exactly
     as ``_default_spawn`` does.
     """
+    # raphael-business is the Anthropic role whose current matrix really does
+    # give routine and deep work different lanes (Sonnet 5 / high vs Opus 5.5
+    # / max), so the pins below can only be right if the matrix chose them.
     _write_real_profile_config(
-        "raphael-builder", "anthropic", "claude-sonnet-5", "max"
+        "raphael-business", "anthropic", "claude-sonnet-5", "high"
     )
     args = _task_graph_args(
         idempotency_key="graph-real-config",
         project_name="Real Config Project",
-        root_assignee="raphael-builder",
+        root_assignee="raphael-business",
     )
     for task in args["tasks"]:
-        task["assignee"] = "raphael-builder"
+        task["assignee"] = "raphael-business"
         task["responsibility"] = "B03"
     args["tasks"][0]["execution_tier"] = "deep"
     args["tasks"][1]["execution_tier"] = "routine"
@@ -6791,14 +6799,18 @@ def test_real_profile_config_resolves_and_locks_owner_task_routes(ctx, real_reso
 
     deep_row = rows[result["task_ids"][0]]
     routine_row = rows[result["task_ids"][1]]
-    # The matrix — not the test — decides the lanes: raphael-builder on
+    # The matrix — not the test — decides the lanes: raphael-business on
     # anthropic is Sonnet for routine work and Opus for deep work.
-    assert (deep_row["execution_tier"], deep_row["model_override"]) == (
-        "deep", "claude-opus-5",
-    )
-    assert (routine_row["execution_tier"], routine_row["model_override"]) == (
-        "routine", "claude-sonnet-5",
-    )
+    assert (
+        deep_row["execution_tier"],
+        deep_row["model_override"],
+        deep_row["reasoning_effort"],
+    ) == ("deep", "claude-opus-5-5", "max")
+    assert (
+        routine_row["execution_tier"],
+        routine_row["model_override"],
+        routine_row["reasoning_effort"],
+    ) == ("routine", "claude-sonnet-5", "high")
     # Every persisted lock is one the dispatcher would honour.
     for task_id, row in rows.items():
         assert row["model_policy_lock"], task_id
@@ -6807,9 +6819,9 @@ def test_real_profile_config_resolves_and_locks_owner_task_routes(ctx, real_reso
     # Selecting the other provider afterwards changes only NEW work: the fence
     # runs first, and the already-pinned rows keep their approved route.
     _write_real_profile_config(
-        "raphael-builder", "openai-codex", "gpt-5.6-terra", "max"
+        "raphael-business", "openai-codex", "gpt-5.6-terra", "max"
     )
-    assert ow.fence_effective_task_routes("raphael-builder") == []
+    assert ow.fence_effective_task_routes("raphael-business") == []
     with kanban_db.connect(board=result["board"]) as conn:
         for task_id, row in rows.items():
             after = conn.execute(
@@ -6879,7 +6891,7 @@ def test_locked_review_handoff_is_refused_rather_than_silently_repinned(ctx):
         before = conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
-        assert before["model_override"] == "claude-sonnet-5"
+        assert before["model_override"] == "claude-opus-5-5"
         with kanban_db.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,)
