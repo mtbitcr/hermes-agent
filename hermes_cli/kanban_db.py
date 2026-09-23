@@ -23378,8 +23378,15 @@ def record_run_rate_limit_reset(
 
     Returns False and writes nothing unless ``reset_at`` is a real number
     after ``now`` and at most ``RATE_LIMIT_RESET_MAX_WAIT_SECONDS`` later,
-    and ``run_id`` is ``task_id``'s current open run.
+    ``run_id`` is ``task_id``'s current open run, and both are the ones the
+    dispatcher gave the calling worker (``HERMES_KANBAN_TASK`` and
+    ``HERMES_KANBAN_RUN_ID``), so no caller can write another task's run.
     """
+    if (
+        task_id != (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        or str(run_id) != (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    ):
+        return False
     # A bool is an int to Python but is no time; NaN and the infinities fail
     # the window check below.
     if isinstance(reset_at, bool) or not isinstance(reset_at, (int, float)):
