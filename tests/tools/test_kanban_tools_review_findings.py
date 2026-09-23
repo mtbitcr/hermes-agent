@@ -836,3 +836,47 @@ def test_database_pin_is_not_mutated_during_a_successful_call(board, monkeypatch
         f"HERMES_KANBAN_DB was transiently mutated during a successful call: {observed_pins!r}"
     )
     assert os.environ["HERMES_KANBAN_DB"] == original_pin
+
+
+# ---------------------------------------------------------------------------
+# Schema exposure: only the run claimed from the review lane lists the tool
+# ---------------------------------------------------------------------------
+
+def _schema_tool_names() -> set:
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    return {s["function"].get("name") for s in schema if "function" in s}
+
+
+def test_review_lane_run_lists_the_tool(board):
+    assert "kanban_review_findings" in _schema_tool_names()
+
+
+def test_worker_run_not_claimed_from_review_does_not_list_the_tool(board, monkeypatch):
+    kb, conn, _tid, _head, _review = board
+    other = kb.create_task(conn, title="ordinary build", assignee=IMPLEMENTER)
+    run = kb.claim_task(conn, other, claimer=f"{IMPLEMENTER}:2")
+    assert run is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", other)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.current_run_id))
+
+    names = _schema_tool_names()
+    assert "kanban_complete" in names
+    assert "kanban_review_findings" not in names
+
+
+def test_kanban_toolset_profile_without_task_pin_does_not_list_the_tool(
+    board, tmp_path, monkeypatch,
+):
+    (tmp_path / ".hermes" / "config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+
+    names = _schema_tool_names()
+    assert "kanban_show" in names
+    assert "kanban_review_findings" not in names
