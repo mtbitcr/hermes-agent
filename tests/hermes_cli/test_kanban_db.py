@@ -2809,7 +2809,7 @@ def test_accepted_rework_never_dispatches_the_followup(
     assert control in spawns, spawns
     assert followup_id not in spawns, spawns
     assert followup is not None
-    assert followup.status == "triage"
+    assert followup.status == "done"
     assert followup.current_run_id is None
 
 
