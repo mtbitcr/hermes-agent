@@ -706,6 +706,19 @@ def test_reviewer_contract_only_on_review_lane_runs(kanban_home):
         assert len(section) < 800
 
 
+def test_reviewer_contract_names_the_native_tool_not_the_host_cli(kanban_home):
+    """An isolated reviewer worker cannot reach the host CLI, so the
+    kernel-supplied contract must point at the native tool it can actually
+    call, not `hermes kanban review-findings <task_id>`."""
+    with kb.connect() as conn:
+        tid, review = _hand_off_to_review(conn, title="review lane task")
+        review_context = kb.build_worker_context(conn, tid)
+        section = review_context.split("## Reviewer contract", 1)[1]
+        section = section.split("##", 1)[0]
+        assert "kanban_review_findings" in section
+        assert "hermes kanban review-findings" not in section
+
+
 # ---------------------------------------------------------------------------
 # 6b. The mutation fence sits on the MUTATOR, not on one of its helpers
 # ---------------------------------------------------------------------------

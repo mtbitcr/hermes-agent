@@ -210,6 +210,29 @@ def _check_kanban_recommend_mode() -> bool:
     return bool(os.environ.get("HERMES_KANBAN_TASK"))
 
 
+def _check_kanban_review_findings_mode() -> bool:
+    """``kanban_review_findings`` is listed only for the run the kernel claimed
+    from the review lane.
+
+    Narrower than ``_check_kanban_mode``: an ordinary worker run, a profile
+    with the ``kanban`` toolset, a delegate_task child and a cron job fired
+    in-process from a worker never see the tool, because no call from them
+    could succeed. This only shapes the schema; ``_handle_review_findings``
+    repeats every admission check at call time. Any error hides the tool.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+    run_id, refusal = _active_reviewer_run_id(task_id)
+    if refusal is not None:
+        return False
+    try:
+        from hermes_cli import kanban_db as kb
+
+        with kb.connect_closing(board=os.environ.get("HERMES_KANBAN_BOARD")) as conn:
+            return kb.run_claimed_from_review(conn, task_id, run_id)
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # kanban_status_report gating
 # ---------------------------------------------------------------------------
@@ -1907,6 +1930,216 @@ def _handle_request_changes(args: dict, **kw) -> str:
         return tool_error(f"kanban_request_changes: {e}")
 
 
+def _active_reviewer_run_id(task_id: str) -> tuple[Optional[int], Optional[str]]:
+    """Resolve the caller's own active-reviewer run id for ``task_id``.
+
+    Returns ``(run_id, refusal)`` where exactly one of the two is set.
+    Used ONLY by ``_handle_review_findings``: a review verdict is a final,
+    irreversible board action, so it may be submitted only by the active
+    reviewer run of that exact task. Unlike ``_enforce_worker_task_ownership``
+    (which deliberately allows unscoped orchestrator callers for routing
+    tools), this refuses an absent ``HERMES_KANBAN_TASK``/``HERMES_KANBAN_
+    RUN_ID`` pin outright rather than treating it as an orchestrator pass —
+    an orchestrator profile with the ``kanban`` toolset enabled, a
+    delegate_task child, or a cron job fired in-process from a worker must
+    never be able to approve or hand back someone else's review.
+    """
+    refusal = tool_error(
+        "kanban_review_findings refused: only the active reviewer run of "
+        f"task {task_id} may submit findings"
+    )
+    if _is_delegated_child_context():
+        return None, refusal
+    if not _is_dispatcher_owned_worker():
+        return None, refusal
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not env_tid or env_tid != task_id:
+        return None, refusal
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if not raw:
+        return None, refusal
+    try:
+        run_id = int(raw)
+    except ValueError:
+        return None, refusal
+    return run_id, None
+
+
+def _handle_review_findings(args: dict, **kw) -> str:
+    """Reviewer verdict: submit a typed findings document (the sole handback)."""
+    delegated_err = _reject_delegated_child_mutation("kanban_review_findings")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    findings = args.get("findings")
+    if not isinstance(findings, list):
+        got = type(findings).__name__ if "findings" in args else "no key"
+        return tool_error(
+            "findings must be a list of finding objects; an explicitly "
+            "empty list is the only clean verdict — a missing key, null, "
+            f"or any other non-list value is refused, never coerced to an "
+            f"empty list (got {got})"
+        )
+    run_id, run_err = _active_reviewer_run_id(tid)
+    if run_err:
+        return run_err
+    board = args.get("board")
+    try:
+        from hermes_cli import kanban_db as kb
+        # This mutator is dispatcher-only, so the dispatcher's own board pin is
+        # the one trusted statement of which board this reviewer may touch. It
+        # is required, and it is validated BEFORE anything is opened: every
+        # connection _connect makes is write-capable (it enables WAL and, on
+        # first open, runs schema creation and the additive migrations), so a
+        # call that cannot prove its target must not open a board at all. A
+        # missing, empty or malformed pin is not "nothing to compare against",
+        # it is an unproven target.
+        try:
+            pinned_board = kb._normalize_board_slug(
+                os.environ.get("HERMES_KANBAN_BOARD")
+            )
+        except ValueError:
+            pinned_board = None
+        if not pinned_board:
+            return tool_error(
+                "kanban_review_findings: this worker has no valid board pin "
+                "(HERMES_KANBAN_BOARD is missing, empty or malformed), so the "
+                "board holding the review cannot be established; refusing "
+                "before any board database was opened"
+            )
+        requested_board = kb._normalize_board_slug(board)
+        if requested_board and requested_board != pinned_board:
+            return tool_error(
+                f"kanban_review_findings: board '{requested_board}' "
+                f"does not match the board this worker is pinned to "
+                f"('{pinned_board}'); refusing before any board "
+                "database was opened"
+            )
+        # HERMES_KANBAN_DB outranks the board argument inside the shared
+        # resolver, so a valid pin and an agreeable selector still do not
+        # establish WHICH store is about to be opened. Resolve the path the
+        # call would actually open, without opening it, and require it to be
+        # the path the trusted pin names. Comparing resolved paths - rather
+        # than mapping the path back to a slug - deliberately avoids the
+        # legacy "assume the current board" fallback that a reverse lookup
+        # applies to an arbitrary path, which would let an unrelated file
+        # inherit the pinned board's identity.
+        try:
+            target_db = kb.kanban_db_path(board=board).expanduser().resolve()
+        except ValueError:
+            raise
+        except Exception:
+            return tool_error(
+                "kanban_review_findings: the board database this call would "
+                "open could not be resolved; refusing before any board "
+                "database was opened"
+            )
+        # We cannot call kb.kanban_db_path(board=pinned_board) here because
+        # HERMES_KANBAN_DB outranks the board argument inside the shared
+        # resolver — it would echo the pin back for both sides and the
+        # comparison would always agree. We therefore derive the pinned board's
+        # path directly from the same native path helpers, WITHOUT mutating the
+        # environment, because the authority check must not make the
+        # process-global pin momentarily observable as absent to concurrent
+        # readers.
+        try:
+            if pinned_board == kb.DEFAULT_BOARD:
+                pinned_db = kb.kanban_home() / "kanban.db"
+            else:
+                pinned_db = kb.board_dir(pinned_board) / "kanban.db"
+        except Exception:
+            return tool_error(
+                "kanban_review_findings: the board this worker is pinned "
+                f"to ('{pinned_board}') could not be resolved to a board "
+                "database; refusing before any board database was opened"
+            )
+        pinned_db = pinned_db.expanduser().resolve()
+        if target_db != pinned_db:
+            return tool_error(
+                "kanban_review_findings: the board database this call would "
+                f"open is not the one board '{pinned_board}' names; the "
+                "database location pin and the board pin disagree, so the "
+                "review target is unproven; refusing before any board "
+                "database was opened"
+            )
+        kb, conn = _connect(board=board)
+        try:
+            effective_board = _board_of_connection(kb, conn)
+            requested_board = kb._normalize_board_slug(board)
+            if requested_board and requested_board != effective_board:
+                return tool_error(
+                    f"kanban_review_findings: board '{requested_board}' does not match the board "
+                    f"database this worker is pinned to ('{effective_board or 'a file outside the boards tree'}')"
+                )
+            # HERMES_KANBAN_DB outranks the board argument in the shared
+            # resolver, so the connection that was actually opened - not the
+            # caller's selector - is the last word on which board is about to
+            # be mutated. Checking it against the validated pin closes the
+            # omitted-selector path, where there is no requested_board for the
+            # check above to compare.
+            if effective_board != pinned_board:
+                return tool_error(
+                    f"kanban_review_findings: the board database this call "
+                    f"opened "
+                    f"('{effective_board or 'a file outside the boards tree'}') "
+                    f"is not the board this worker is pinned to "
+                    f"('{pinned_board}')"
+                )
+            kernel_head = kb._latest_review_head_provenance(conn, tid)
+            if kernel_head is None:
+                return tool_error(
+                    f"kanban_review_findings: no repository head was parked "
+                    f"by the kernel for {tid} at review handover; the only "
+                    "supported candidate is a repository head the kernel "
+                    "parks at review handover, so no candidate can be bound "
+                    "for this run"
+                )
+            caller_digest = args.get("candidate_digest")
+            if (
+                caller_digest is not None
+                and str(caller_digest).strip()
+                and str(caller_digest) != kernel_head
+            ):
+                return tool_error(
+                    f"kanban_review_findings: candidate_digest does not "
+                    f"match the kernel-parked review head for {tid}; the "
+                    "reviewed candidate is fixed at handover, not "
+                    "re-declared by the caller"
+                )
+            try:
+                result = kb.submit_review_findings(
+                    conn, tid,
+                    findings=findings,
+                    candidate_digest=kernel_head,
+                    expected_run_id=run_id,
+                )
+            except kb.ReviewFindingsError as e:
+                return tool_error(
+                    f"kanban_review_findings: malformed findings document: {e}"
+                )
+            outcome = result.get("outcome")
+            if outcome == "error":
+                return tool_error(
+                    f"could not submit review findings for {tid}: "
+                    f"{result.get('reason') or 'invalid review state'}"
+                )
+            return _ok(task_id=tid, **result)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_review_findings: {e}")
+    except Exception as e:
+        logger.exception("kanban_review_findings failed")
+        return tool_error(f"kanban_review_findings: {e}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -3218,6 +3451,79 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
     },
 }
 
+KANBAN_REVIEW_FINDINGS_SCHEMA = {
+    "name": "kanban_review_findings",
+    "description": (
+        "Reviewer verdict: submit a typed findings document — the sole "
+        "handback path for a run claimed from the review lane. An "
+        "explicitly EMPTY findings array is the only thing that approves "
+        "the task; any non-empty list hands the run back to the original "
+        "implementer with concrete required changes. Each finding needs "
+        "severity (one of blocking, major, minor), file, lines, problem, "
+        "impact, smallest_fix, and candidate_digest. The candidate is "
+        "always the repository head the kernel itself parked at review "
+        "handover — omit candidate_digest to use it, or pass it back "
+        "verbatim; a digest that disagrees with the kernel-parked head is "
+        "refused, and a task with no kernel-parked head cannot be reviewed "
+        "through this tool at all. Reporting the SAME findings against an "
+        "unchanged candidate twice in a row blocks the task for an owner "
+        "decision instead of re-running the implementer. Only valid from a "
+        "task claimed from the review column, and only for your own task."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "findings": {
+                "type": "array",
+                "description": (
+                    "List of finding objects. An explicitly empty list "
+                    "approves the task; a missing key, null, or any other "
+                    "non-list value is refused rather than treated as "
+                    "empty. Each entry needs severity "
+                    "(blocking|major|minor), file, lines, problem, impact, "
+                    "smallest_fix, and candidate_digest matching this "
+                    "call's resolved candidate."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "severity": {
+                            "type": "string",
+                            "enum": ["blocking", "major", "minor"],
+                        },
+                        "file": {"type": "string"},
+                        "lines": {"type": "string"},
+                        "problem": {"type": "string"},
+                        "impact": {"type": "string"},
+                        "smallest_fix": {"type": "string"},
+                        "candidate_digest": {"type": "string"},
+                    },
+                    "required": [
+                        "severity", "file", "lines", "problem", "impact",
+                        "smallest_fix", "candidate_digest",
+                    ],
+                },
+            },
+            "candidate_digest": {
+                "type": "string",
+                "description": (
+                    "Optional. Must equal the repository head the kernel "
+                    "parked at review handover — omit it to use that head "
+                    "automatically. A value that disagrees with the "
+                    "kernel-parked head is refused; this tool never binds "
+                    "a candidate the kernel did not itself park."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["findings"],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -3929,6 +4235,15 @@ registry.register(
     handler=_handle_request_changes,
     check_fn=_check_kanban_mode,
     emoji="↩",
+)
+
+registry.register(
+    name="kanban_review_findings",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_FINDINGS_SCHEMA,
+    handler=_handle_review_findings,
+    check_fn=_check_kanban_review_findings_mode,
+    emoji="🔎",
 )
 
 registry.register(
