@@ -17,6 +17,7 @@ gone and the reap registry saw it exit 0.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -157,6 +158,34 @@ def _assert_parked_for_a_person(setup: dict) -> dict:
     unreported = run.metadata["unreported_completion"]
     assert unreported["evidence"] == "deliverable_present"
     return unreported
+
+
+class _ProcessStopped(BaseException):
+    """The process going away after the scan committed, before the handover."""
+
+
+def _set_aside_then_restart(setup: dict, monkeypatch) -> int:
+    """The scan sets one saved patch aside and the process stops before the
+    handover; then a new process starts.
+
+    The restarted process has the real handover and a reap registry that no
+    longer remembers how the worker exited. Returns the attachment id.
+    """
+    attachment = _save_patch(
+        setup, "x.patch", _new_file_patch(f"{OWNED}/saved.py", "saved = True"),
+    )
+    _exit_cleanly_without_reporting(setup, monkeypatch)
+    real_complete_task = kb.complete_task
+
+    def stop(*_args, **_kwargs):
+        raise _ProcessStopped
+
+    monkeypatch.setattr(kb, "complete_task", stop)
+    with pytest.raises(_ProcessStopped):
+        kb.detect_crashed_workers(setup["conn"])
+    monkeypatch.setattr(kb, "complete_task", real_complete_task)
+    monkeypatch.setattr(kb, "_recent_worker_exits", {})
+    return attachment
 
 
 def test_saved_patch_is_handed_to_review_when_the_worker_exits_without_reporting(
@@ -341,3 +370,135 @@ def test_run_set_aside_before_the_process_stopped_is_handed_over_by_the_next_sca
     kinds = [event.kind for event in kb.list_events(conn, task_id)]
     assert "crashed" not in kinds
     assert "blocked" not in kinds
+
+
+@pytest.mark.parametrize("lapse", ["expired_claim", "stale_run"])
+def test_run_set_aside_before_the_process_stopped_is_handed_over_by_the_next_dispatcher_tick(
+    running_build, monkeypatch, lapse,
+):
+    """However long the process stayed down, the sweeps that run before the
+    scan in ``dispatch_once`` leave the set-aside run to it."""
+    setup = running_build()
+    conn, task_id, run_id = setup["conn"], setup["task"], setup["run"]
+    attachment = _set_aside_then_restart(setup, monkeypatch)
+    long_ago = int(time.time()) - 7200
+    with kb.write_txn(conn):
+        if lapse == "expired_claim":
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ? WHERE id = ?", (long_ago, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET claim_expires = ? WHERE id = ?", (long_ago, run_id),
+            )
+        else:
+            # Running for two hours, and the worker never sent a heartbeat.
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?", (long_ago, run_id),
+            )
+
+    result = kb.dispatch_once(
+        conn, max_spawn=0, board=SLUG,
+        stale_timeout_seconds=60 if lapse == "stale_run" else 0,
+    )
+
+    assert (result.reclaimed, result.stale) == (0, [])
+    assert kb.get_task(conn, task_id).status == "review"
+    run = kb.get_run(conn, run_id)
+    assert run.ended_at is not None
+    assert (run.outcome, run.summary) == ("review_requested", SUMMARY)
+    assert _handed_over(setup) == [
+        (run_id, {"run_id": run_id, "attachment_id": attachment}),
+    ]
+    kinds = [event.kind for event in kb.list_events(conn, task_id)]
+    assert "reclaimed" not in kinds
+    assert "stale" not in kinds
+
+
+def test_review_claimed_before_the_audit_keeps_the_handover_event_on_the_implementation_run(
+    running_build, exited_workers, monkeypatch,
+):
+    """A reviewer may claim the parked review the moment the handover commits.
+    The kernel's receipt still names the implementation run and its patch, and
+    the reviewer's run is left exactly as its claim made it."""
+    setup = running_build()
+    conn, task_id, run_id = setup["conn"], setup["task"], setup["run"]
+    attachment = _save_patch(
+        setup, "x.patch", _new_file_patch(f"{OWNED}/saved.py", "saved = True"),
+    )
+    _exit_cleanly_without_reporting(setup, monkeypatch)
+    real_complete_task = kb.complete_task
+    host = kb._claimer_id().split(":", 1)[0]
+    review: dict = {}
+
+    def bound_to(bound_run_id):
+        return [
+            event for event in kb.list_events(conn, task_id)
+            if event.run_id == bound_run_id
+        ]
+
+    def a_reviewer_claims_the_review_at_once(*args, **kwargs):
+        handed_over = real_complete_task(*args, **kwargs)
+        if handed_over:
+            claimed = kb.claim_review_task(conn, task_id, claimer=f"{host}:r0")
+            review["task"] = claimed
+            if claimed is not None:
+                review["run"] = kb.get_run(conn, claimed.current_run_id)
+                review["events"] = bound_to(claimed.current_run_id)
+        return handed_over
+
+    monkeypatch.setattr(kb, "complete_task", a_reviewer_claims_the_review_at_once)
+    assert kb.detect_crashed_workers(conn) == []
+
+    # The handover returned True and the reviewer's claim succeeded.
+    assert review.get("task") is not None
+    reviewer_run_id = review["task"].current_run_id
+    assert reviewer_run_id != run_id
+    task = kb.get_task(conn, task_id)
+    assert (task.status, task.current_run_id) == ("running", reviewer_run_id)
+    assert _handed_over(setup) == [
+        (run_id, {"run_id": run_id, "attachment_id": attachment}),
+    ]
+    # Still open, and nothing of the handover landed on it.
+    reviewer_run = kb.get_run(conn, reviewer_run_id)
+    assert reviewer_run.ended_at is None
+    assert reviewer_run == review["run"]
+    assert bound_to(reviewer_run_id) == review["events"]
+    assert kb.get_run(conn, run_id).outcome == "review_requested"
+    assert [
+        (fields["run_id"], fields["outcome"]) for fields in exited_workers
+    ] == [(run_id, "review_requested")]
+
+
+def test_runtime_cap_leaves_a_set_aside_run_to_the_next_scan(running_build, monkeypatch):
+    """The runtime cap runs after the scan in ``dispatch_once``: a handover that
+    has not happened yet is the next scan's to retry, not a timeout."""
+    setup = running_build()
+    conn, task_id, run_id = setup["conn"], setup["task"], setup["run"]
+    attachment = _set_aside_then_restart(setup, monkeypatch)
+    with kb.write_txn(conn):
+        # A one-minute cap on a run that started two hours ago.
+        conn.execute(
+            "UPDATE tasks SET max_runtime_seconds = 60 WHERE id = ?", (task_id,),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE id = ?",
+            (int(time.time()) - 7200, run_id),
+        )
+
+    assert kb.enforce_max_runtime(conn) == []
+
+    task = kb.get_task(conn, task_id)
+    assert (task.status, task.current_run_id, task.worker_pid) == (
+        "running", run_id, WORKER_PID,
+    )
+    run = kb.get_run(conn, run_id)
+    assert run.ended_at is None
+    assert run.metadata["unreported_completion"]["handover_attachment_id"] == attachment
+
+    assert kb.detect_crashed_workers(conn) == []
+
+    assert kb.get_task(conn, task_id).status == "review"
+    assert _handed_over(setup) == [
+        (run_id, {"run_id": run_id, "attachment_id": attachment}),
+    ]
+    assert "timed_out" not in [event.kind for event in kb.list_events(conn, task_id)]
