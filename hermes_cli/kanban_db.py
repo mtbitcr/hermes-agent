@@ -25657,8 +25657,7 @@ def complete_task(
     ``_saved_result_attachment_id`` is KERNEL-INTERNAL: only
     :func:`_hand_over_saved_patch` passes it, and the review park hands it on
     unchanged to :func:`request_review`, which records that handover in the
-    transaction that parks the card. When that review transition refuses, the
-    commit this call materialized is rolled back and
+    transaction that parks the card. When that review transition refuses,
     :class:`_SavedResultHandoverRefused` carries ``request_review``'s reason
     instead of ``False``.
 
@@ -25872,37 +25871,8 @@ def complete_task(
             )
         )
         if not parked and _saved_result_attachment_id is not None:
-            # The saved-result handover already committed its patch to the
-            # task branch. A refused review transition takes back only the
-            # commit this call made, and only while its run still owns the
-            # card; the rollback leaves a head another writer moved alone. The
-            # refusal then reaches the handover with ``request_review``'s own
-            # reason, and the handover parks the card as it always has.
-            materialized_head = (materialization_receipt or {}).get(
-                "materialized_head"
-            )
-            if (
-                materialization_start is not None
-                and materialized_head is not None
-                and materialized_head != materialization_start
-            ):
-                try:
-                    with write_txn(conn):
-                        if (
-                            _validated_open_current_run(conn, task_id, expected_run_id)
-                            is not None
-                        ):
-                            _rollback_worktree_materialization(
-                                conn,
-                                task_id,
-                                materialization_start,
-                                materialized_head=materialized_head,
-                                expected_run_id=expected_run_id,
-                            )
-                except Exception as exc:
-                    raise _SavedResultHandoverRefused(
-                        f"{refusal}; rollback also failed: {exc}"
-                    ) from exc
+            # The committed patch stays on the task branch; the handover parks
+            # the card with ``request_review``'s own reason.
             raise _SavedResultHandoverRefused(refusal)
         return bool(parked)
     # THE RETURN LEG of that same park. A completion that takes the card out of
@@ -34364,9 +34334,13 @@ def _hand_over_saved_patch(
     because the card requires review, parks the work in the review lane. Any
     refusal -- an exception, or ``False`` -- parks the card exactly as the scan
     would have, keeping the reason on the run as
-    ``unreported_completion["handover_refusal"]``. A card that has moved on
-    meanwhile (another scan may already have handed it over) is left as it is,
-    and only the reason is recorded on the run.
+    ``unreported_completion["handover_refusal"]``. A patch the handover already
+    committed stays on the task branch, so beside the reason the run records
+    ``handover_branch_head``: that branch's head, read from its own ref rather
+    than whatever the worktree has checked out, or ``None`` when it cannot be
+    read. A card that has moved on meanwhile (another scan may already have
+    handed it over) is left as it is, and only the reason and that head are
+    recorded on the run.
 
     An accepted handover is recorded once, on the implementation run, by the
     review park itself: ``request_review`` appends the
@@ -34411,6 +34385,26 @@ def _hand_over_saved_patch(
         "to review: %s",
         task_id, run_id, attachment_id, refusal,
     )
+    # A patch the handover already committed stays on the task branch, so the
+    # run records where that branch stands. Read from the branch's own ref: the
+    # worktree may have been switched to another branch meanwhile. Git runs
+    # outside the park's transaction, and a head it cannot read is recorded as
+    # None rather than stopping the park.
+    branch_head: Optional[str] = None
+    try:
+        task = get_task(conn, task_id)
+        branch_name = (task.branch_name or "").strip() if task is not None else ""
+        if task is not None and task.workspace_path and branch_name:
+            branch_head = str(
+                _git_output(
+                    Path(task.workspace_path).expanduser(),
+                    "rev-parse",
+                    "--verify",
+                    f"refs/heads/{branch_name}^{{commit}}",
+                )
+            ).strip()
+    except Exception:
+        branch_head = None
     exited = None
     with _after_durable_commit(what):
         with write_txn(conn):
@@ -34418,12 +34412,17 @@ def _hand_over_saved_patch(
                 conn,
                 **{
                     **park,
-                    "unreported": {**park["unreported"], "handover_refusal": refusal},
+                    "unreported": {
+                        **park["unreported"],
+                        "handover_refusal": refusal,
+                        "handover_branch_head": branch_head,
+                    },
                 },
             )
             if settled is None:
                 _merge_unreported_completion(
-                    conn, run_id, {"handover_refusal": refusal},
+                    conn, run_id,
+                    {"handover_refusal": refusal, "handover_branch_head": branch_head},
                 )
         # Only once the park has committed: an abandoned transaction parked
         # nothing, and the observer must not hear of an exit that was not settled.

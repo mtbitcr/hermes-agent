@@ -138,9 +138,10 @@ def _handed_over(setup: dict) -> list:
     ]
 
 
-def _assert_parked_for_a_person(setup: dict) -> dict:
+def _assert_parked_for_a_person(setup: dict, *, branch_head: str | None = None) -> dict:
     """Today's park, read back from durable state.
 
+    The task branch is expected at ``branch_head``, by default the base.
     Returns the run's ``unreported_completion`` record.
     """
     conn, task_id, run_id = setup["conn"], setup["task"], setup["run"]
@@ -153,8 +154,11 @@ def _assert_parked_for_a_person(setup: dict) -> dict:
     assert [e.run_id for e in events if e.kind == "protocol_violation"] == [run_id]
     assert [e.run_id for e in events if e.kind == "blocked"] == [run_id]
     assert _handed_over(setup) == []
-    # Nothing of the saved patch reached the task branch.
-    assert git(setup["repo"], "rev-parse", setup["branch"]) == setup["base"]
+    # Nothing of the saved patch reached the task branch, unless the handover
+    # had committed it before the review transition was refused.
+    assert git(setup["repo"], "rev-parse", setup["branch"]) == (
+        setup["base"] if branch_head is None else branch_head
+    )
     unreported = run.metadata["unreported_completion"]
     assert unreported["evidence"] == "deliverable_present"
     return unreported
@@ -665,53 +669,156 @@ def _parent_reopens_before_the_review_transition(
     return attachment
 
 
-def test_parent_reopened_before_the_review_transition_still_parks_at_the_base_with_the_refusal_on_the_run(
+def _committed_patch(setup: dict, attachment: int) -> str:
+    """The task branch head, proven to be the kernel commit of the saved patch.
+
+    Its message carries the attachment's trailer, its one parent is the base
+    and its tree holds the saved file.
+    """
+    head = git(setup["repo"], "rev-parse", setup["branch"])
+    assert f"Hermes-Patch-Attachment: {attachment}" in git(
+        setup["repo"], "log", "-1", "--format=%B", head,
+    )
+    assert git(setup["repo"], "log", "-1", "--format=%P", head) == setup["base"]
+    assert git(setup["repo"], "show", f"{head}:{OWNED}/saved.py") == "saved = True"
+    return head
+
+
+def _assert_never_done(setup: dict) -> None:
+    """The card did not reach done: no completion time, no ``completed`` event."""
+    conn, task_id = setup["conn"], setup["task"]
+    task = kb.get_task(conn, task_id)
+    assert task.status != "done"
+    assert task.completed_at is None
+    assert "completed" not in [event.kind for event in kb.list_events(conn, task_id)]
+
+
+def test_parent_reopened_before_the_review_transition_parks_at_the_committed_patch_with_the_refusal_on_the_run(
     running_build, monkeypatch,
 ):
     """The review transition refuses a build whose parent reopened after the
-    saved patch was committed: the handover takes back the commit it made, and
-    the run records why the review lane refused."""
+    saved patch was committed: the commit stays on the task branch, and the
+    run records why the review lane refused and where the branch stands."""
     setup = running_build()
-    _parent_reopens_before_the_review_transition(setup, monkeypatch)
+    attachment = _parent_reopens_before_the_review_transition(setup, monkeypatch)
 
     assert kb.detect_crashed_workers(setup["conn"]) == []
 
-    unreported = _assert_parked_for_a_person(setup)
+    committed = _committed_patch(setup, attachment)
+    unreported = _assert_parked_for_a_person(setup, branch_head=committed)
     workspace = Path(kb.get_task(setup["conn"], setup["task"]).workspace_path)
     assert git(workspace, "status", "--porcelain") == ""
+    assert git(workspace, "rev-parse", "HEAD") == committed
     assert "parent dependencies are not satisfied" in unreported["handover_refusal"]
     assert "without giving a reason" not in unreported["handover_refusal"]
+    assert unreported["handover_branch_head"] == committed
+    _assert_never_done(setup)
 
 
-def test_head_another_writer_moved_is_never_moved_back_when_a_reopened_parent_refuses_the_review(
+def test_review_transition_that_raises_after_the_patch_commit_parks_at_the_committed_patch_with_its_error_on_the_run(
     running_build, monkeypatch,
 ):
-    """Another writer commits on top of the saved patch before the refused
-    review transition: that head stays exactly where the other writer put it."""
+    """The review transition fails outright once the saved patch is committed:
+    the commit stays on the task branch, and the run records the error and
+    where the branch stands."""
+    setup = running_build()
+    attachment = _save_patch(
+        setup, "x.patch", _new_file_patch(f"{OWNED}/saved.py", "saved = True"),
+    )
+    _exit_cleanly_without_reporting(setup, monkeypatch)
+    failure = "the review lane went away before it could park the card"
+
+    def the_review_transition_fails(*_args, **_kwargs):
+        assert f"Hermes-Patch-Attachment: {attachment}" in git(
+            setup["repo"], "log", "-1", "--format=%B", setup["branch"],
+        )
+        raise RuntimeError(failure)
+
+    monkeypatch.setattr(kb, "request_review", the_review_transition_fails)
+
+    assert kb.detect_crashed_workers(setup["conn"]) == []
+
+    committed = _committed_patch(setup, attachment)
+    unreported = _assert_parked_for_a_person(setup, branch_head=committed)
+    assert unreported["handover_refusal"] == failure
+    assert unreported["handover_branch_head"] == committed
+    _assert_never_done(setup)
+
+
+def test_restart_after_the_patch_commit_parks_at_the_same_commit_with_the_refusal_on_the_run(
+    running_build, monkeypatch,
+):
+    """The process stops once the saved patch is committed, before the review
+    transition: the next scan finds the patch already on the task branch,
+    commits it no second time, and parks with the review lane's refusal."""
     setup = running_build()
     conn, task_id, run_id = setup["conn"], setup["task"], setup["run"]
+    stopped: list = []
+
+    def the_process_stops_the_first_time():
+        if not stopped:
+            stopped.append(True)
+            raise _ProcessStopped
+
+    attachment = _parent_reopens_before_the_review_transition(
+        setup, monkeypatch, meanwhile=the_process_stops_the_first_time,
+    )
+    with pytest.raises(_ProcessStopped):
+        kb.detect_crashed_workers(conn)
+
+    # Still running under its dead worker, the run open and marked for
+    # handover, and the saved patch already on the task branch.
+    task = kb.get_task(conn, task_id)
+    assert (task.status, task.current_run_id, task.worker_pid) == (
+        "running", run_id, WORKER_PID,
+    )
+    run = kb.get_run(conn, run_id)
+    assert run.ended_at is None
+    assert run.metadata["unreported_completion"]["handover_attachment_id"] == attachment
+    committed = _committed_patch(setup, attachment)
+
+    # A restarted process: a reap registry that no longer remembers how the
+    # worker exited, and a review transition the reopened parent now refuses.
+    monkeypatch.setattr(kb, "_recent_worker_exits", {})
+
+    assert kb.detect_crashed_workers(conn) == []
+
+    unreported = _assert_parked_for_a_person(setup, branch_head=committed)
+    assert git(
+        setup["repo"], "rev-list", "--count", f"{setup['base']}..{setup['branch']}",
+    ) == "1"
+    assert "parent dependencies are not satisfied" in unreported["handover_refusal"]
+    assert "without giving a reason" not in unreported["handover_refusal"]
+    assert unreported["handover_branch_head"] == committed
+    _assert_never_done(setup)
+
+
+def test_worktree_switched_to_another_branch_keeps_both_branches_at_the_committed_patch_when_the_review_is_refused(
+    running_build, monkeypatch,
+):
+    """The task worktree is switched to another branch at the committed patch
+    before the reopened parent refuses the review: neither branch moves, the
+    worktree stays on the other branch, and the run records the task branch's
+    own head."""
+    setup = running_build()
+    conn, task_id = setup["conn"], setup["task"]
     workspace = Path(kb.get_task(conn, task_id).workspace_path)
-    moved: dict = {}
+    other = "feature/elsewhere"
 
-    def another_writer_commits_on_top():
-        git(
-            workspace, "commit", "--allow-empty", "-m", "another writer",
-            author=DEFAULT_GIT_IDENTITY,
-        )
-        moved["head"] = git(workspace, "rev-parse", "HEAD")
+    def switch_to_another_branch():
+        git(workspace, "checkout", "-b", other)
 
-    _parent_reopens_before_the_review_transition(
-        setup, monkeypatch, meanwhile=another_writer_commits_on_top,
+    attachment = _parent_reopens_before_the_review_transition(
+        setup, monkeypatch, meanwhile=switch_to_another_branch,
     )
 
-    kb.detect_crashed_workers(conn)
+    assert kb.detect_crashed_workers(conn) == []
 
-    assert git(setup["repo"], "rev-parse", setup["branch"]) == moved["head"]
-    task = kb.get_task(conn, task_id)
-    assert (task.status, task.block_kind) == ("blocked", "needs_input")
-    run = kb.get_run(conn, run_id)
-    assert run.outcome == "completed_unreported"
-    assert _handed_over(setup) == []
-    refusal = run.metadata["unreported_completion"]["handover_refusal"]
-    assert "parent dependencies are not satisfied" in refusal
-    assert "without giving a reason" not in refusal
+    committed = _committed_patch(setup, attachment)
+    assert git(setup["repo"], "rev-parse", other) == committed
+    assert git(workspace, "symbolic-ref", "HEAD") == f"refs/heads/{other}"
+    unreported = _assert_parked_for_a_person(setup, branch_head=committed)
+    assert "parent dependencies are not satisfied" in unreported["handover_refusal"]
+    assert "without giving a reason" not in unreported["handover_refusal"]
+    assert unreported["handover_branch_head"] == committed
+    _assert_never_done(setup)
