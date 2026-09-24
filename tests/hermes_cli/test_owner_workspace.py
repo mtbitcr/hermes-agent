@@ -436,6 +436,8 @@ def test_task_graph_commit_creates_native_project_and_atomic_graph(ctx):
     assert second.project_id == result["project_id"]
     assert second.responsibility == "R12"
     assert first.id in second_parents
+    # Neither child is scoped build work, so neither carries a skill.
+    assert (first.skills, second.skills) == (None, None)
 
 
 def test_task_graph_resolves_and_locks_model_routes_before_approval(ctx):
@@ -611,10 +613,16 @@ def test_task_graph_exact_replay_creates_no_duplicate_tasks(ctx):
             "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?",
             (first["project_id"],),
         ).fetchone()["n"]
+        skills = [
+            kanban_db.get_task(kconn, task_id).skills
+            for task_id in first["task_ids"]
+        ]
 
     assert second == first
     # root + two children + the Project's one hidden control anchor
     assert before == after == 4
+    # Neither child is scoped build work, so the replay leaves both skill-free.
+    assert skills == [None, None]
 
 
 def test_task_graph_rejects_fake_whole_project_before_persistence(ctx):
@@ -4330,8 +4338,112 @@ def test_every_plan_action_that_creates_a_task_can_carry_a_scope(
             kanban_db.get_task(conn, task_id).owned_paths
             for task_id in result["created_task_ids"]
         ]
+        skills = [
+            kanban_db.get_task(conn, task_id).skills
+            for task_id in result["created_task_ids"]
+        ]
     assert all(scope for scope in scopes), scopes
     assert scopes[0] == ["docs"]
+    # A scope alone is not build work: this role carries no build skill.
+    assert skills == [None] * len(skills)
+
+
+@pytest.mark.parametrize("action", ["add", "replace", "split", "merge"])
+def test_every_plan_action_that_creates_a_task_derives_the_build_skill(
+    ctx, tmp_path, action
+):
+    """Each creating plan action gives the build skill to scoped build work only.
+
+    The kernel derives it from the created task's role and scope: another
+    role with a scope, a read-only build task and an unscoped build task all
+    keep the NULL skills column they always had.
+    """
+    _install_profiles("raphael-claude-worker")
+    setup = _bootstrap_board(ctx)
+    # (assignee, owned_paths or None when the change states no scope, skills)
+    cases = [
+        ("raphael-claude-worker", ["docs"], ["running-build-work"]),
+        ("default", ["src"], None),
+        ("raphael-claude-worker", [], None),
+        ("raphael-claude-worker", None, None),
+    ]
+    with kanban_db.connect(board=setup["board"]) as conn:
+        target_ids = [
+            kanban_db.create_task(
+                conn,
+                title=f"Legacy item {index}",
+                assignee="default",
+                parents=[setup["task_id"]],
+                project_id=setup["project_id"],
+            )
+            for index in range(2 * len(cases))
+        ]
+    # Attached only after the legacy items exist, so they hold no repository
+    # boundary and a replace that states no scope has none to inherit.
+    _project_repo(tmp_path, ctx, setup["project_id"])
+    specs = [
+        {
+            "title": f"Planned work item {index}",
+            "body": "Deliver the planned change.",
+            "assignee": assignee,
+            "execution_tier": "routine",
+            "responsibility": "R10",
+            **({} if scope is None else {"owned_paths": scope}),
+        }
+        for index, (assignee, scope, _skills) in enumerate(cases)
+    ]
+
+    def refs(task_ids):
+        with kanban_db.connect(board=setup["board"]) as conn:
+            return [_project_task_ref(conn, task_id) for task_id in task_ids]
+
+    def commit(key, changes):
+        approver = _with_approver(ctx.session)
+        result = _commit_project_plan(
+            ctx, **_project_plan_args(setup, changes, idempotency_key=key)
+        )
+        approver.join()
+        assert result["ok"] is True
+        return result["created_task_ids"]
+
+    if action == "add":
+        created = commit("steward-build-skill-add", [
+            {
+                "action": "add", "reason": "Add the planned work.", **spec,
+                "existing_parents": [], "new_parents": [],
+            }
+            for spec in specs
+        ])
+    elif action == "replace":
+        created = commit("steward-build-skill-replace", [
+            {
+                "action": "replace", "reason": "Replace a legacy item.",
+                "target": target, "replacement": spec,
+            }
+            for target, spec in zip(refs(target_ids), specs)
+        ])
+    elif action == "split":
+        created = commit("steward-build-skill-split", [{
+            "action": "split", "reason": "Split a legacy item.",
+            "target": refs(target_ids[:1])[0],
+            "replacements": [{**spec, "parents": []} for spec in specs],
+        }])
+    else:
+        # A merge must be the only change in its owner approval, so each
+        # planned task is merged from its own pair of legacy items.
+        created = [
+            task_id
+            for index, spec in enumerate(specs)
+            for task_id in commit(f"steward-build-skill-merge-{index}", [{
+                "action": "merge", "reason": "Merge two legacy items.",
+                "targets": refs(target_ids[2 * index:2 * index + 2]),
+                "replacement": spec,
+            }])
+        ]
+
+    with kanban_db.connect(board=setup["board"]) as conn:
+        skills = [kanban_db.get_task(conn, task_id).skills for task_id in created]
+    assert skills == [expected for _assignee, _scope, expected in cases]
 
 
 def test_a_plan_without_a_scope_keeps_the_default_boundary(ctx, tmp_path):
@@ -4556,6 +4668,8 @@ def test_task_graph_carries_explicit_scopes_into_committed_children(ctx, tmp_pat
             kanban_db.get_task(conn, task_id) for task_id in result["task_ids"]
         ]
     assert [child.owned_paths for child in children] == [["src/api"], ["src/web"]]
+    # Scoped work for a role other than the build role is not build work.
+    assert [child.skills for child in children] == [None, None]
     for child in children:
         assert child.workspace_kind == "worktree"
         assert child.workspace_path == str(repo / ".worktrees" / child.id)
@@ -4595,6 +4709,7 @@ def test_task_graph_defaults_verifier_children_to_read_only(ctx, tmp_path):
         task = kanban_db.get_task(conn, result["task_ids"][0])
         assert task.assignee == "raphael-verifier"
         assert task.owned_paths == []
+        assert task.skills is None
 
 
 def test_task_graph_scope_is_never_inferred_from_the_assignee(ctx, tmp_path):
@@ -4628,6 +4743,145 @@ def test_task_graph_scope_is_never_inferred_from_the_assignee(ctx, tmp_path):
         assert kanban_db.get_task(
             conn, result["task_ids"][0]
         ).owned_paths is None
+
+
+def _build_graph_child(title: str, assignee: str, **scope) -> dict:
+    return {
+        "title": title,
+        "body": "Deliver this part of the milestone.",
+        "assignee": assignee,
+        "responsibility": "R11",
+        "execution_tier": "routine",
+        "parents": [],
+        **scope,
+    }
+
+
+def test_task_graph_gives_the_build_skill_only_to_scoped_build_children(
+    ctx, tmp_path
+):
+    """The kernel, not the planner, attaches the build rules to build work.
+
+    Only the implementation boundary holding a mutating scope is build work.
+    Another role with a scope, a read-only build child and an unscoped build
+    child all keep the NULL skills column they always had.
+    """
+    _install_profiles("raphael-claude-worker")
+    setup = _bootstrap_board(ctx)
+    _project_repo(tmp_path, ctx, setup["project_id"])
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(
+        ctx,
+        idempotency_key="graph-build-skill",
+        mode="existing",
+        project_id=setup["project_id"],
+        request_title="Deliver the build milestone",
+        specification="Only the scoped build child is build work.",
+        current_milestone="Build one subtree under the build rules.",
+        owner_visible_result="The api subtree changes.",
+        root_assignee="default",
+        tasks=[
+            _build_graph_child(
+                "Build the api", "raphael-claude-worker", owned_paths=["src/api"],
+            ),
+            _build_graph_child("Edit the web", "default", owned_paths=["src/web"]),
+            _build_graph_child(
+                "Read the api", "raphael-claude-worker", owned_paths=[],
+            ),
+            _build_graph_child("Unscoped build", "raphael-claude-worker"),
+        ],
+    )
+    approver.join()
+
+    assert result["ok"] is True
+    expected = [["running-build-work"], None, None, None]
+    with kanban_db.connect(board=setup["board"]) as conn:
+        skills = [
+            kanban_db.get_task(conn, task_id).skills for task_id in result["task_ids"]
+        ]
+        created = [
+            next(
+                event.payload
+                for event in kanban_db.list_events(conn, task_id)
+                if event.kind == "created"
+            )
+            for task_id in result["task_ids"]
+        ]
+    assert skills == expected
+    # The audit trail records the derived value the way create_task does.
+    assert [payload.get("skills") for payload in created] == expected
+
+
+def test_the_build_skill_leaves_the_graph_digest_and_replay_unchanged(
+    ctx, tmp_path
+):
+    """The build skill rides the task row, never the graph digest input.
+
+    A receipt committed before the kernel derived the skill hashed the same
+    approved plan, so the digest must not see the skill: the committed graph
+    and its exact replay are recognized exactly as before.
+    """
+    _install_profiles("raphael-claude-worker")
+    setup = _bootstrap_board(ctx)
+    _project_repo(tmp_path, ctx, setup["project_id"])
+    args = {
+        "idempotency_key": "graph-build-skill-replay",
+        "mode": "existing",
+        "project_id": setup["project_id"],
+        "request_title": "Deliver the build milestone",
+        "specification": "One scoped build child.",
+        "current_milestone": "Build one subtree.",
+        "owner_visible_result": "The api subtree changes.",
+        "root_assignee": "default",
+        "tasks": [
+            _build_graph_child(
+                "Build the api", "raphael-claude-worker", owned_paths=["src/api"],
+            ),
+        ],
+    }
+    real_digest = ow._digest
+    hashed: list[dict] = []
+
+    def recording_digest(payload):
+        # A copy taken when hashed: exactly what the digest covered.
+        hashed.append(json.loads(json.dumps(payload)))
+        return real_digest(payload)
+
+    approver = _with_approver(ctx.session)
+    with _temporarily_patch(ow, "_digest", recording_digest):
+        first = _commit_task_graph(ctx, **args)
+    approver.join()
+
+    [graph_input] = [payload for payload in hashed if "root_route" in payload]
+    assert all("skills" not in task for task in graph_input["tasks"])
+    with kanban_db.connect(board=first["board"]) as kconn:
+        [decomposed] = [
+            event.payload
+            for event in kanban_db.list_events(kconn, first["root_task_id"])
+            if event.kind == "decomposed"
+        ]
+        before = kconn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?",
+            (first["project_id"],),
+        ).fetchone()["n"]
+    # Crash recovery matches the committed graph by the digest of that input.
+    assert decomposed["owner_task_graph_digest"] == real_digest(graph_input)
+
+    # No approver: an exact replay must recognize the committed receipt.
+    approval.unregister_gateway_notify(ctx.session)
+    second = _commit_task_graph(ctx, **args)
+    with kanban_db.connect(board=first["board"]) as kconn:
+        after = kconn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?",
+            (first["project_id"],),
+        ).fetchone()["n"]
+        child = kanban_db.get_task(kconn, first["task_ids"][0])
+
+    assert second == first
+    # root + one child + the Project's one hidden control anchor
+    assert before == after == 3
+    # ...while the committed build child does carry the skill.
+    assert child.skills == ["running-build-work"]
 
 
 def test_a_new_project_cannot_declare_a_mutating_scope(ctx):
