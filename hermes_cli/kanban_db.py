@@ -19943,6 +19943,76 @@ def _recorded_review_followup(
     return None
 
 
+def _resolve_recorded_review_followups(
+    conn: sqlite3.Connection, task_id: str, *, run_id: int, now: int
+) -> None:
+    """Close the follow-ups this task's own verdicts recorded, on approval.
+
+    Called by :func:`complete_task` inside the transaction that approves
+    ``task_id`` out of review. A changes-requested verdict records its
+    follow-up as the tracking record of the rework it asked for; the approval
+    is what accepts that rework, so it is what ends the record -- left open,
+    the item would sit on the board until a person tidied it away.
+
+    Only the ids named by this task's own ``review_followup_recorded`` events
+    move -- the same kernel-written record :func:`_recorded_review_followup`
+    trusts -- so a card anyone else linked under the task is never touched.
+    An item already ``done`` or ``archived`` is left as it is -- which is why
+    no approval resolves the same item twice. One a worker currently holds is
+    resolved all the same, and its run is not stranded: the claim clears with
+    the status change and the live run closes as ``reclaimed``, the way
+    :func:`archive_task` closes a run it takes a card out from under. Each
+    item moved gets ONE ``review_followup_resolved`` receipt on the approved
+    task, stamped with the approving run.
+    """
+    followup_ids: list[str] = []
+    for row in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_followup_recorded' "
+        "ORDER BY id",
+        (task_id,),
+    ).fetchall():
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        recorded = payload.get("followup_task_id")
+        if isinstance(recorded, str) and recorded and recorded not in followup_ids:
+            followup_ids.append(recorded)
+    summary = (
+        f"Resolved by the review approval of {task_id} (run {run_id}): the "
+        "rework this item tracked was accepted."
+    )
+    for followup_id in followup_ids:
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'done', result = ?, completed_at = ?, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND task_kind = 'work' "
+            "AND status NOT IN ('done', 'archived')",
+            (summary, now, followup_id),
+        )
+        if cur.rowcount == 1:
+            # Closes the run of a worker still holding the item; a no-op for
+            # an item no run holds.
+            _end_run(
+                conn, followup_id,
+                outcome="reclaimed", status="reclaimed",
+                summary=(
+                    f"item resolved by the review approval of {task_id} "
+                    f"(run {run_id}) with this run still active"
+                ),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "review_followup_resolved",
+                {"followup_task_id": followup_id},
+                run_id=run_id,
+            )
+
+
 def create_recommendation(
     conn: sqlite3.Connection,
     *,
@@ -26160,6 +26230,13 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        # An approval accepts the rework the card's own changes-requested
+        # verdicts recorded, so the items tracking it close in THIS
+        # transaction too, each with a receipt naming the approving run.
+        if approves_from_review and run_id is not None:
+            _resolve_recorded_review_followups(
+                conn, task_id, run_id=run_id, now=now,
+            )
     # Everything below this point runs AFTER the completion is durable, so
     # none of it may turn into a refusal of the completion: a caller told
     # "REFUSED_TIMEOUT" while the board says ``status='done'`` has been
