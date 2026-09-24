@@ -984,6 +984,56 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     assert captured == [["domain-specific-review", "sdlc-review"]]
 
 
+def test_review_dispatch_drops_the_build_skill_and_keeps_every_other_skill(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reviewer never receives build instructions.
+
+    A build card carries ``running-build-work`` for its implementer. When the
+    card reaches review, the review lane drops exactly that name: the reviewer
+    keeps its own ``sdlc-review`` skill and every other skill the task
+    carries, and the card itself keeps the build skill for any rework.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod,
+        "load_config",
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+    )
+    monkeypatch.setattr(kb, "check_respawn_guard", lambda _conn, _task_id, **_kw: None)
+    captured: list[list[str]] = []
+
+    def spawn(task, workspace):
+        captured.append(list(task.skills or []))
+        return None
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="scoped build",
+            assignee="reviewer",
+            skills=["running-build-work", "domain-specific-review"],
+        )
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        stored = kb.get_task(conn, task_id)
+
+    assert task_id in [task[0] for task in result.spawned]
+    assert captured == [["domain-specific-review", "sdlc-review"]]
+    assert stored is not None
+    assert stored.skills == ["running-build-work", "domain-specific-review"]
+
+
 def test_review_dispatch_honors_global_and_per_profile_caps(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
