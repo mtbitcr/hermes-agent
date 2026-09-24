@@ -748,6 +748,53 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_default_spawn_force_loads_the_build_skill_of_owner_build_work(
+    kanban_home, monkeypatch, tmp_path
+):
+    """Owner-approved build work reaches its worker with the build rules.
+
+    A child that an owner receipt creates for the implementation boundary
+    with a mutating write scope gets ``running-build-work`` from the kernel,
+    and ``_default_spawn`` force-loads it. The triage decomposer's child of
+    the same shape is not owner-approved work, so it gets no skill.
+    """
+    argv_by_spawn: list[list[str]] = []
+
+    class FakeProc:
+        pid = 99999
+
+    def fake_popen(cmd, **kwargs):
+        argv_by_spawn.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    def spawned_skills(conn, *, receipt_owned: bool) -> list[str]:
+        root = kb.create_task(conn, title="approved milestone", triage=True)
+        [child_id] = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee=None,
+            children=[{
+                "title": "build the api",
+                "assignee": "raphael-claude-worker",
+                "owned_paths": ["src/api"],
+                "workspace_kind": "worktree",
+            }],
+            receipt_owned=receipt_owned,
+        )
+        task = kb.get_task(conn, child_id)
+        assert kb._default_spawn(task, str(tmp_path)) == 99999
+        argv = argv_by_spawn[-1]
+        return [argv[i + 1] for i, arg in enumerate(argv) if arg == "--skills"]
+
+    conn = kb.connect()
+    try:
+        assert spawned_skills(conn, receipt_owned=True) == ["running-build-work"]
+        assert spawned_skills(conn, receipt_owned=False) == []
+    finally:
+        conn.close()
+
 
 
 

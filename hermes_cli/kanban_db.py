@@ -19115,6 +19115,11 @@ _MAX_OWNED_PATHS = 64
 _MAX_OWNED_PATH_LENGTH = 512
 _MAX_RECEIPT_CHANGED_PATHS = 256
 _READ_ONLY_PROFILES = frozenset({"raphael-verifier"})
+# The implementation boundary and the skill that carries its build rules. The
+# kernel derives the skill for owner-approved build work itself (see
+# _owner_plan_task_skills), so no planner has to copy the rules into a card.
+_BUILD_WORKER_PROFILE = "raphael-claude-worker"
+_BUILD_WORK_SKILL = "running-build-work"
 
 
 def normalize_responsibility(value: Optional[str]) -> Optional[str]:
@@ -19196,6 +19201,24 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
+
+
+def _owner_plan_task_skills(
+    assignee: Optional[str], owned_paths: Optional[Iterable[str]],
+) -> Optional[list[str]]:
+    """Skills the kernel derives for a task created from an approved owner plan.
+
+    Build work is the implementation boundary holding a mutating write scope,
+    and only that carries the build skill. Every other task — another role, a
+    read-only ``[]`` scope or no scope at all — gets ``None`` and keeps the
+    NULL skills column it always had. Derived where the row is written, never
+    carried in the approved plan, so no plan or graph digest changes.
+    """
+    if _canonical_assignee(assignee) != _BUILD_WORKER_PROFILE:
+        return None
+    if not normalize_owned_paths(owned_paths):
+        return None
+    return [_BUILD_WORK_SKILL]
 
 
 @bounded_mutation("create_task")
@@ -29536,6 +29559,11 @@ def decompose_triage_task(
     :func:`activate_owner_work` compare-and-swaps against, so only this
     operation's own activation releases them afterwards.
 
+    A ``receipt_owned`` child that is build work also gets the build skill,
+    derived here from its role and scope rather than read from ``children``
+    (see :func:`_owner_plan_task_skills`). Children of an ordinary triage
+    decomposition carry no owner receipt and never get it.
+
     Validation of titles/assignees happens inside the same write_txn as
     the inserts so a malformed entry aborts the whole decomposition
     cleanly (no orphan children).
@@ -29675,6 +29703,13 @@ def decompose_triage_task(
                     f"child[{idx}] read-only reviewer work cannot itself "
                     "require review"
                 )
+            # Written with the row but never part of the approved children,
+            # so the owner graph digest that names them is unchanged.
+            skills = (
+                _owner_plan_task_skills(assignee, owned_paths)
+                if receipt_owned
+                else None
+            )
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -29716,11 +29751,11 @@ def decompose_triage_task(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, responsibility, status, workspace_kind, "
                 " workspace_path, tenant, project_id, owned_paths, "
-                " integrates_parent_heads, model_override, provider_override, "
+                " integrates_parent_heads, skills, model_override, provider_override, "
                 " reasoning_effort, execution_tier, model_policy_lock, "
                 " owner_receipt_bound, requires_review, park_generation, "
                 " created_at, created_by) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -29734,6 +29769,7 @@ def decompose_triage_task(
                     project_id,
                     json.dumps(owned_paths) if owned_paths is not None else None,
                     1 if integrates_parent_heads else 0,
+                    json.dumps(skills) if skills is not None else None,
                     model_override,
                     provider_override,
                     reasoning_effort,
@@ -29753,6 +29789,7 @@ def decompose_triage_task(
                     "from_decompose_of": task_id,
                     "owned_paths": owned_paths,
                     "integrates_parent_heads": integrates_parent_heads or None,
+                    "skills": skills,
                     "requires_review": requires_review or None,
                     "execution_tier": execution_tier,
                     "model_route_pinned": bool(model_policy_lock),
@@ -30179,6 +30216,11 @@ def apply_owner_project_plan(
                 # owner-approved explicit write boundary and forces the
                 # project-anchored worktree inside create_task.
                 owned_paths=spec.get("owned_paths"),
+                # Derived from the approved role and scope, never carried in
+                # the plan, so the plan digest is unchanged.
+                skills=_owner_plan_task_skills(
+                    spec["assignee"], spec.get("owned_paths"),
+                ),
                 created_by=actor,
                 parents=parent_task_ids,
                 idempotency_key=_owner_plan_task_key(
@@ -36504,9 +36546,17 @@ def _dispatch_once_locked(
         # the review logic (AC verification, merge, etc.). The mandatory
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
+        # review agent needs. The build skill is the implementer's, never the
+        # reviewer's: it is dropped from this spawn only, so the stored task
+        # keeps it for any rework.
         claimed.skills = list(
-            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
+            dict.fromkeys([
+                *(
+                    skill for skill in (claimed.skills or [])
+                    if skill != _BUILD_WORK_SKILL
+                ),
+                "sdlc-review",
+            ])
         )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
