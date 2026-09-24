@@ -23544,26 +23544,33 @@ def _run_agent_attachment_count(conn: sqlite3.Connection, task_id: str) -> int:
         run_id = int(row["current_run_id"]) if row and row["current_run_id"] else None
         if run_id is None:
             return 0
-        count = 0
-        for event in conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND run_id = ? AND kind = 'attached' ORDER BY id",
-            (task_id, run_id),
-        ).fetchall():
-            try:
-                receipt = json.loads(event["payload"]) if event["payload"] else {}
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if (
-                isinstance(receipt, dict)
-                and isinstance(receipt.get("attachment_id"), int)
-                and receipt.get("by") == "agent"
-            ):
-                count += 1
-        return count
+        return len(_run_agent_attachment_receipts(conn, task_id, run_id))
     except Exception:
         _log.debug("could not count run attachments for unreported-completion evidence", exc_info=True)
         return 0
+
+
+def _run_agent_attachment_receipts(
+    conn: sqlite3.Connection, task_id: str, run_id: int,
+) -> list[dict]:
+    """The ``attached`` receipts ``run_id`` wrote for its own agent uploads, oldest first."""
+    receipts = []
+    for event in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'attached' ORDER BY id",
+        (task_id, run_id),
+    ).fetchall():
+        try:
+            receipt = json.loads(event["payload"]) if event["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if (
+            isinstance(receipt, dict)
+            and isinstance(receipt.get("attachment_id"), int)
+            and receipt.get("by") == "agent"
+        ):
+            receipts.append(receipt)
+    return receipts
 
 
 def _session_shows_terminal_intent(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -24576,6 +24583,13 @@ def release_stale_claims(
     API traffic. ``enforce_max_runtime`` and ``detect_crashed_workers``
     remain the upper bounds for genuinely wedged or dead workers.
 
+    A run ``detect_crashed_workers`` set aside for the review handover, or
+    sets aside later on this tick, is left to it untouched
+    (:func:`_saved_patch_handover_pending`): a process that stopped before
+    the handover usually restarts past the claim deadline, a claim can lapse
+    before the first scan, and reclaiming the run then would lose its saved
+    patch.
+
     Returns the number of stale claims actually reclaimed (live-pid
     extensions don't count). Safe to call often.
     """
@@ -24584,13 +24598,15 @@ def release_stale_claims(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, worker_start_time, claim_expires, "
-        "       last_heartbeat_at, assignee "
+        "       last_heartbeat_at, assignee, current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ? AND task_kind = 'work'",
         (now,),
     ).fetchall()
     for row in stale:
+        if _saved_patch_handover_pending(conn, row, before_scan=True):
+            continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -25587,6 +25603,15 @@ def _review_approval_head(
     return head, None, proven_parents
 
 
+class _SavedResultHandoverRefused(Exception):
+    """Internal: the review transition refused a saved-result handover.
+
+    Raised by :func:`complete_task` in place of ``False``, and only for
+    :func:`_hand_over_saved_patch`, so that the run it parks records
+    :func:`request_review`'s own reason rather than a bare refusal.
+    """
+
+
 @bounded_mutation("complete_task")
 def complete_task(
     conn: sqlite3.Connection,
@@ -25600,6 +25625,7 @@ def complete_task(
     merge_parent_heads: bool = False,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    _saved_result_attachment_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -25697,6 +25723,13 @@ def complete_task(
     it is accepted only for a task declared with
     ``integrates_parent_heads=true``. Neither option grants the worker host
     filesystem or shell access.
+
+    ``_saved_result_attachment_id`` is KERNEL-INTERNAL: only
+    :func:`_hand_over_saved_patch` passes it, and the review park hands it on
+    unchanged to :func:`request_review`, which records that handover in the
+    transaction that parks the card. When that review transition refuses,
+    :class:`_SavedResultHandoverRefused` carries ``request_review``'s reason
+    instead of ``False``.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
@@ -25877,7 +25910,7 @@ def complete_task(
     # rather than back to its own implementer. The destination was resolved
     # (and, for the governed case, refused) above, before any of this ran.
     if park_for_review:
-        return bool(
+        parked, refusal = (
             request_review(
                 conn,
                 task_id,
@@ -25896,13 +25929,22 @@ def complete_task(
                 # It is the receipt object, not a head: nothing here is in a
                 # position to name a commit the kernel did not verify.
                 _kernel_execution_receipt=execution_receipt,
+                # A saved-result handover's own event, recorded by the park in
+                # the transaction that moves the card to review.
+                _saved_result_attachment_id=_saved_result_attachment_id,
                 expected_run_id=expected_run_id,
                 # A caller that proves no run ownership is a human/CLI
                 # handover; ``complete_task`` accepts those today, so the park
                 # must not become the one thing that refuses them.
                 force=expected_run_id is None,
+                with_reason=True,
             )
         )
+        if not parked and _saved_result_attachment_id is not None:
+            # The committed patch stays on the task branch; the handover parks
+            # the card with ``request_review``'s own reason.
+            raise _SavedResultHandoverRefused(refusal)
+        return bool(parked)
     # THE RETURN LEG of that same park. A completion that takes the card out of
     # the reviewer's hands consumes the provenance the park wrote: the exact
     # implementation head, restored below in the one statement that finishes the
@@ -27474,6 +27516,7 @@ def request_review(
     force: bool = False,
     with_reason: bool = False,
     _kernel_execution_receipt: Optional[dict[str, Any]] = None,
+    _saved_result_attachment_id: Optional[int] = None,
 ):
     """Transition implementation work into the first-class review phase.
 
@@ -27536,6 +27579,15 @@ def request_review(
     a head — a receipt that this kernel did not derive proves nothing, and the
     park records only ``receipt["head_commit"]`` after re-checking it is an
     exact git object id.
+
+    ``_saved_result_attachment_id`` is KERNEL-INTERNAL too: nothing outside
+    this module may pass it. It exists so the dead-worker scan's handover of a
+    saved patch (:func:`_hand_over_saved_patch`, through :func:`complete_task`)
+    records its ``saved_result_handed_over`` event in the SAME transaction as
+    this transition, bound to the implementation run it closes. Appended in a
+    transaction of its own afterwards, a process stop in between lost the
+    event for good: the next scan no longer sees a running task to record it
+    for.
 
     ``unassign_reviewer=True`` is the one way to park a card on the review lane
     with NO assignee, and it is deliberately explicit: omitting ``reviewer``
@@ -27799,6 +27851,12 @@ def request_review(
             },
             run_id=run_id,
         )
+        if _saved_result_attachment_id is not None:
+            _append_event(
+                conn, task_id, "saved_result_handed_over",
+                {"run_id": run_id, "attachment_id": _saved_result_attachment_id},
+                run_id=run_id,
+            )
     return _ret(True)
 
 
@@ -33574,6 +33632,11 @@ def enforce_max_runtime(
     Runs host-local: only tasks claimed by this host are candidates
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
+
+    A run ``detect_crashed_workers`` set aside for the review handover is
+    left to it untouched (:func:`_saved_patch_handover_pending`): this sweep
+    runs after the scan, and a handover that did not land this tick is the
+    next scan's to retry, not a timeout that would lose the saved patch.
     """
     import signal
     timed_out: list[str] = []
@@ -33599,6 +33662,8 @@ def enforce_max_runtime(
         # must be measured from the active task_runs row when present.
         elapsed = now - int(row["active_started_at"])
         if elapsed < int(row["max_runtime_seconds"]):
+            continue
+        if _saved_patch_handover_pending(conn, row):
             continue
 
         pid = int(row["worker_pid"])
@@ -33780,6 +33845,12 @@ def detect_stale_running(
     Only considers ``status='running'`` tasks. Blocked tasks are never
     candidates.  Returns the list of reclaimed task IDs.
 
+    A run ``detect_crashed_workers`` set aside for the review handover, or
+    sets aside later on this tick, is left to it untouched
+    (:func:`_saved_patch_handover_pending`): its worker is gone and sends no
+    heartbeat, so after a process stop, or before the first scan, the run
+    reads as stale, and reclaiming it then would lose its saved patch.
+
     ``stale_timeout_seconds=0`` disables the check entirely (returns ``[]``
     immediately).  ``signal_fn`` is a test hook; defaults to ``os.kill``
     on POSIX.
@@ -33793,7 +33864,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_start_time, t.last_heartbeat_at, "
-        "       t.claim_lock, "
+        "       t.claim_lock, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -33813,6 +33884,8 @@ def detect_stale_running(
         hb_age = (now - int(last_hb)) if last_hb is not None else None
         if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
             continue  # recent heartbeat → still alive
+        if _saved_patch_handover_pending(conn, row, before_scan=True):
+            continue
 
         pid = row["worker_pid"]
         tid = row["id"]
@@ -34108,6 +34181,332 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+_SAVED_PATCH_HANDOVER_SUMMARY = (
+    "The kernel handed the saved patch to review because the worker exited "
+    "without reporting its result."
+)
+
+
+def _saved_patch_for_review_handover(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+    unreported: dict,
+) -> Optional[int]:
+    """The one patch a quietly exited run saved for review, or ``None``.
+
+    Only an implementer's run on a card that requires review qualifies: the
+    existing handover then parks the work in the review lane, so the kernel
+    never finishes a card on a worker's behalf. A run claimed from review is
+    the reviewer's own, and ``complete_task`` would read it as an approval.
+    Counted from the run's own agent ``attached`` receipts; with several
+    patches the kernel does not pick one.
+    """
+    if unreported.get("evidence") != "deliverable_present" or run_id is None:
+        return None
+    if run_claimed_from_review(conn, task_id, run_id):
+        return None
+    row = conn.execute(
+        "SELECT requires_review FROM tasks WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["requires_review"]:
+        return None
+    patches = [
+        receipt["attachment_id"]
+        for receipt in _run_agent_attachment_receipts(conn, task_id, run_id)
+        if str(receipt.get("filename") or "").lower().endswith(".patch")
+    ]
+    return patches[0] if len(patches) == 1 else None
+
+
+def _saved_patch_handover_marker(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
+) -> Optional[dict]:
+    """The ``unreported_completion`` record of a run set aside for the handover.
+
+    The scan writes it onto the still-open run in the transaction that sets the
+    run aside, because what classified the exit as clean -- the reap registry --
+    lives in process memory: after a restart the same dead worker would read as
+    a crash, and its saved patch would never reach review. Only the task's
+    current OPEN run counts; nothing but the kernel writes an open run's
+    metadata, so a worker cannot mint the marker for itself.
+    """
+    if _validated_open_current_run(conn, task_id, run_id) is None:
+        return None
+    persisted, _profile = _persisted_run_metadata(conn, run_id)
+    unreported = persisted.get("unreported_completion")
+    if not isinstance(unreported, dict):
+        return None
+    attachment_id = unreported.get("handover_attachment_id")
+    if isinstance(attachment_id, bool) or not isinstance(attachment_id, int):
+        return None
+    return unreported
+
+
+def _saved_patch_handover_pending(
+    conn: sqlite3.Connection, row, *, before_scan: bool = False,
+) -> bool:
+    """Whether :func:`detect_crashed_workers` will hand this running row over itself.
+
+    True for a row the scan takes up again from its marker: a claim made
+    on this host, a recorded worker its identity proves gone, and a marker on
+    the task's current open run. The sweeps that can close a running task's
+    run -- the stale-claim and stale-running reclaims before the scan, the
+    runtime cap after it -- skip such a row untouched: after a process stop
+    the claim, the heartbeat or the runtime has usually lapsed by the next
+    tick, and closing the run there would dispatch a rebuild instead of
+    handing the saved patch to review. A row the scan would not take keeps
+    its sweep's ordinary outcome, so nothing is held that no scan hands over.
+
+    ``before_scan`` is passed only by the two reclaims that run before the
+    scan. It also recognizes the unmarked row the scan sets aside later on
+    the same tick, in the scan's own terms: the reap registry saw its worker
+    exit cleanly, its identity proves it gone, and
+    :func:`_saved_patch_for_review_handover` finds the one patch its run saved
+    for review. Its claim or heartbeat can lapse before the first scan has
+    marked it. The runtime cap runs after the scan, which has handed such a
+    row over or marked it by then, and does not pass it.
+
+    ``row`` carries the task's ``id``, ``claim_lock``, ``worker_pid``,
+    ``worker_start_time`` and ``current_run_id``.
+    """
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    if not (row["claim_lock"] or "").startswith(host_prefix) or not row["worker_pid"]:
+        return False
+    # The marker before the identity probe: an unmarked row -- nearly every
+    # row -- then reaches its sweep without an extra probe.
+    if _saved_patch_handover_marker(conn, row["id"], row["current_run_id"]) is None:
+        # The registry lookup likewise before the probe and the evidence
+        # read: only a worker it saw exit cleanly is judged any further.
+        return (
+            before_scan
+            and _classify_worker_exit(row["worker_pid"])[0] == "clean_exit"
+            and _worker_identity_presence(
+                row["worker_pid"], _row_worker_start_time(row),
+            ) is HolderPresence.PROVABLY_ABSENT
+            and _saved_patch_for_review_handover(
+                conn, row["id"], row["current_run_id"],
+                _unreported_completion_evidence(conn, row["id"]),
+            ) is not None
+        )
+    return _worker_identity_presence(
+        row["worker_pid"], _row_worker_start_time(row),
+    ) is HolderPresence.PROVABLY_ABSENT
+
+
+def _merge_unreported_completion(
+    conn: sqlite3.Connection, run_id: int, fields: dict,
+) -> None:
+    """Merge ``fields`` into one run's persisted ``unreported_completion``.
+
+    Every other key the run's metadata already carries (``worker_session_id``
+    among them) is kept. Runs inside the caller's write transaction.
+    """
+    persisted, _profile = _persisted_run_metadata(conn, run_id)
+    recorded = persisted.get("unreported_completion")
+    persisted["unreported_completion"] = {
+        **(recorded if isinstance(recorded, dict) else {}),
+        **fields,
+    }
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+        (json.dumps(persisted, ensure_ascii=False), run_id),
+    )
+
+
+def _park_unreported_completion(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    assignee: Optional[str],
+    pid: int,
+    claim_lock: Optional[str],
+    run_id: Optional[int],
+    exit_kind: str,
+    exit_code: Optional[int],
+    error_text: str,
+    event_payload: dict,
+    unreported: dict,
+    source_status: str,
+) -> Optional[dict]:
+    """Park an evidence-backed unreported completion for a person to accept.
+
+    Not a failure and never re-dispatched: no failure message, no crash or
+    breaker accounting, no retry. The park is a sticky block like
+    ``kanban_block``: it must survive the ``recompute_ready`` pass that follows
+    the sweep in ``dispatch_once`` and leave only through ``unblock_task``, so
+    it keeps the same bookkeeping as ``_block_task_within_txn`` (the recurrence
+    counter and the ``blocked`` event). ``source_status`` is the lane the run
+    was claimed from, so the owner's unblock never turns an interrupted
+    reviewer run into an implementation run.
+
+    Applied only while the task is still running under this worker, claim and
+    run, inside the caller's write transaction. Returns the worker-exited
+    observer payload, or ``None`` (having written nothing) when the card has
+    moved on.
+    """
+    prior = conn.execute(
+        "SELECT block_kind, block_recurrences FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    recurrences = (
+        int(prior["block_recurrences"] or 0) + 1
+        if prior is not None and prior["block_kind"] == "needs_input"
+        else 1
+    )
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input', "
+        "block_recurrences = ?, "
+        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+        "WHERE id = ? AND status = 'running' "
+        "  AND worker_pid = ? AND claim_lock IS ? AND current_run_id IS ?",
+        (recurrences, task_id, pid, claim_lock, run_id),
+    )
+    if cur.rowcount != 1:
+        return None
+    closed_run_id = _end_run(
+        conn, task_id,
+        outcome="completed_unreported", status="completed_unreported",
+        error=error_text,
+        metadata={**event_payload, "unreported_completion": unreported},
+    )
+    _append_event(
+        conn, task_id, "protocol_violation", event_payload, run_id=closed_run_id,
+    )
+    _append_event(
+        conn, task_id, "blocked",
+        {
+            "reason": (
+                "The run exited without reporting its result, "
+                "but left evidence that the work finished "
+                f"({unreported.get('evidence')}); accept the "
+                "result or resume the task."
+            ),
+            "kind": "needs_input",
+            "recurrences": recurrences,
+            "source_status": source_status,
+        },
+        run_id=closed_run_id,
+    )
+    return {
+        "task_id": task_id,
+        "assignee": assignee,
+        "run_id": closed_run_id,
+        "worker_pid": pid,
+        "exit_kind": exit_kind,
+        "exit_code": exit_code,
+        "outcome": "completed_unreported",
+        "retry_status": "blocked",
+    }
+
+
+def _hand_over_saved_patch(
+    conn: sqlite3.Connection, *, attachment_id: int, park: dict,
+) -> Optional[dict]:
+    """Hand a quietly exited run's saved patch to review, or park it as today.
+
+    The handover is the existing one: ``complete_task`` with the run's own
+    patch materializes it in the task worktree, proves the declared scope and,
+    because the card requires review, parks the work in the review lane. Any
+    refusal -- an exception, or ``False`` -- parks the card exactly as the scan
+    would have, keeping the reason on the run as
+    ``unreported_completion["handover_refusal"]``. A patch the handover already
+    committed stays on the task branch, so beside the reason the run records
+    ``handover_branch_head``: that branch's head, read from its own ref rather
+    than whatever the worktree has checked out, or ``None`` when it cannot be
+    read. A card that has moved on meanwhile (another scan may already have
+    handed it over) is left as it is, and only the reason and that head are
+    recorded on the run.
+
+    An accepted handover is recorded once, on the implementation run, by the
+    review park itself: ``request_review`` appends the
+    ``saved_result_handed_over`` event in the transaction that moves the card
+    to review, so neither a process stop right after it nor a reviewer claiming
+    the parked review the moment it commits can cost the receipt.
+
+    ``park`` holds :func:`_park_unreported_completion`'s arguments. Returns the
+    worker-exited observer payload, or ``None`` when no exit was settled here.
+    """
+    task_id, run_id = park["task_id"], park["run_id"]
+    what = f"detect_crashed_workers({task_id})"
+    try:
+        handed_over = complete_task(
+            conn, task_id,
+            summary=_SAVED_PATCH_HANDOVER_SUMMARY,
+            patch_attachment_id=attachment_id,
+            expected_run_id=run_id,
+            _saved_result_attachment_id=attachment_id,
+        )
+        refusal = None if handed_over else (
+            "The review handover declined the saved patch without giving a "
+            "reason (complete_task returned False)."
+        )
+    except Exception as exc:
+        refusal = str(exc)[:800] or type(exc).__name__
+    if refusal is None:
+        return {
+            "task_id": task_id,
+            "assignee": park["assignee"],
+            "run_id": run_id,
+            "worker_pid": park["pid"],
+            "exit_kind": park["exit_kind"],
+            "exit_code": park["exit_code"],
+            # For a card that requires review, True means request_review
+            # parked it: the run closed as a review request, the card in review.
+            "outcome": "review_requested",
+            "retry_status": "review",
+        }
+    _log.warning(
+        "kanban: the saved patch of %s (run %s, attachment %s) was not handed "
+        "to review: %s",
+        task_id, run_id, attachment_id, refusal,
+    )
+    # A patch the handover already committed stays on the task branch, so the
+    # run records where that branch stands. Read from the branch's own ref: the
+    # worktree may have been switched to another branch meanwhile. Git runs
+    # outside the park's transaction, and a head it cannot read is recorded as
+    # None rather than stopping the park.
+    branch_head: Optional[str] = None
+    try:
+        task = get_task(conn, task_id)
+        branch_name = (task.branch_name or "").strip() if task is not None else ""
+        if task is not None and task.workspace_path and branch_name:
+            branch_head = str(
+                _git_output(
+                    Path(task.workspace_path).expanduser(),
+                    "rev-parse",
+                    "--verify",
+                    f"refs/heads/{branch_name}^{{commit}}",
+                )
+            ).strip()
+    except Exception:
+        branch_head = None
+    exited = None
+    with _after_durable_commit(what):
+        with write_txn(conn):
+            settled = _park_unreported_completion(
+                conn,
+                **{
+                    **park,
+                    "unreported": {
+                        **park["unreported"],
+                        "handover_refusal": refusal,
+                        "handover_branch_head": branch_head,
+                    },
+                },
+            )
+            if settled is None:
+                _merge_unreported_completion(
+                    conn, run_id,
+                    {"handover_refusal": refusal, "handover_branch_head": branch_head},
+                )
+        # Only once the park has committed: an abandoned transaction parked
+        # nothing, and the observer must not hear of an exit that was not settled.
+        exited = settled
+    return exited
+
+
 @bounded_mutation("detect_crashed_workers")
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
@@ -34143,6 +34542,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    A clean exit whose run saved exactly one patch of its own, on a card that
+    requires review, is handed to review through :func:`complete_task` -- the
+    existing handover -- once the main transaction has committed, instead of
+    being parked for a person to hand over by hand; a refused handover parks it
+    exactly as before. Until then the task stays running with its run open,
+    marked so the next scan finds it again should this process stop first.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
@@ -34158,12 +34564,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # ``_end_run`` closed for it inside the txn below — so a breaker trip can
     # bind its ``gave_up`` event to that exact attempt.
     # Worker-exit observer payloads (RFC #58548), collected inside the main
-    # txn and fired only after every reclaim/accounting txn has committed.
+    # txn (and by the review handovers after it) and fired only after every
+    # reclaim/handover/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
+    # Clean exits set aside for the review handover, which needs the main txn
+    # committed first (complete_task runs git and opens its own transactions):
+    # ``{"attachment_id": ..., "park": ...}``, ``park`` being the arguments of
+    # the park a refused handover falls back to.
+    handovers: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, worker_start_time, claim_lock, started_at, "
-            "       assignee "
+            "       assignee, current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL "
             "AND task_kind = 'work'"
@@ -34195,7 +34607,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
 
             pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
+            open_run_id = row["current_run_id"]
+            # A run an earlier scan set aside for the review handover already
+            # proved a clean exit, and says so on the run itself; the reap
+            # registry that proved it is process memory, and after a restart
+            # would report this same dead worker as a crash.
+            handover_marker = _saved_patch_handover_marker(
+                conn, row["id"], open_run_id,
+            )
+            if handover_marker is not None:
+                kind, code = "clean_exit", 0
+            else:
+                kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -34270,13 +34693,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             # A clean exit is provisionally "completed but unreported": ask
             # the kernel what the run left behind (attachments, or a terminal
             # kanban call in its own session log) before deciding whether it
-            # is retried. Kernel-written, read before the run is closed.
-            unreported = (
-                _unreported_completion_evidence(conn, row["id"])
-                if protocol_violation else None
-            )
+            # is retried. Kernel-written, read before the run is closed; a run
+            # set aside earlier keeps the evidence it was set aside on.
+            if handover_marker is not None:
+                unreported = handover_marker
+            else:
+                unreported = (
+                    _unreported_completion_evidence(conn, row["id"])
+                    if protocol_violation else None
+                )
             has_evidence = bool(unreported) and unreported.get("evidence") != "none"
-            park_recurrences = 0
             # The lane the run was claimed from (review or ready), resolved
             # once for both paths: a park must remember it so the owner's
             # unblock never turns an interrupted reviewer run into an
@@ -34293,36 +34719,52 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             # what was observed, not only what was concluded.
             event_payload.update(identity)
             if has_evidence:
-                # The park is a sticky block like ``kanban_block``: it must
-                # survive the ``recompute_ready`` pass that follows this sweep
-                # in ``dispatch_once`` and leave only through ``unblock_task``.
-                # Same bookkeeping as ``_block_task_within_txn``: the
-                # recurrence counter and, below, the ``blocked`` event.
-                prior = conn.execute(
-                    "SELECT block_kind, block_recurrences FROM tasks WHERE id = ?",
-                    (row["id"],),
-                ).fetchone()
-                park_recurrences = (
-                    int(prior["block_recurrences"] or 0) + 1
-                    if prior is not None and prior["block_kind"] == "needs_input"
-                    else 1
+                park = {
+                    "task_id": row["id"],
+                    "assignee": row["assignee"],
+                    "pid": pid,
+                    "claim_lock": row["claim_lock"],
+                    "run_id": open_run_id,
+                    "exit_kind": kind,
+                    "exit_code": code,
+                    "error_text": error_text,
+                    "event_payload": event_payload,
+                    "unreported": unreported,
+                    "source_status": parked_source_status,
+                }
+                attachment_id = (
+                    handover_marker["handover_attachment_id"]
+                    if handover_marker is not None
+                    else _saved_patch_for_review_handover(
+                        conn, row["id"], open_run_id, unreported,
+                    )
                 )
-                cur = conn.execute(
-                    "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input', "
-                    "block_recurrences = ?, "
-                    "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-                    "WHERE id = ? AND status = 'running' "
-                    "  AND worker_pid = ? AND claim_lock IS ?",
-                    (park_recurrences, row["id"], pid, row["claim_lock"]),
-                )
-            else:
-                cur = conn.execute(
-                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL "
-                    "WHERE id = ? AND status = 'running' "
-                    "  AND worker_pid = ? AND claim_lock IS ?",
-                    (retry_status, row["id"], pid, row["claim_lock"]),
-                )
+                if attachment_id is not None:
+                    # Set aside, not parked: the handover needs the task still
+                    # running with this run current and open, so neither is
+                    # touched here. The marker lands on the run in this same
+                    # transaction, so a process that stops before the handover
+                    # still leaves the next scan something to find.
+                    if handover_marker is None:
+                        park["unreported"] = {
+                            **unreported, "handover_attachment_id": attachment_id,
+                        }
+                        _merge_unreported_completion(
+                            conn, open_run_id, park["unreported"],
+                        )
+                    handovers.append({"attachment_id": attachment_id, "park": park})
+                    continue
+                exited = _park_unreported_completion(conn, **park)
+                if exited is not None:
+                    exited_hook_payloads.append(exited)
+                continue
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'running' "
+                "  AND worker_pid = ? AND claim_lock IS ?",
+                (retry_status, row["id"], pid, row["claim_lock"]),
+            )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
@@ -34350,22 +34792,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload,
                     run_id=run_id,
                 )
-                if has_evidence:
-                    _append_event(
-                        conn, row["id"], "blocked",
-                        {
-                            "reason": (
-                                "The run exited without reporting its result, "
-                                "but left evidence that the work finished "
-                                f"({unreported.get('evidence')}); accept the "
-                                "result or resume the task."
-                            ),
-                            "kind": "needs_input",
-                            "recurrences": park_recurrences,
-                            "source_status": parked_source_status,
-                        },
-                        run_id=run_id,
-                    )
                 exited_hook_payloads.append({
                     "task_id": row["id"],
                     "assignee": row["assignee"],
@@ -34387,10 +34813,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
-                elif has_evidence:
-                    # Evidence-backed unreported completion: no failure
-                    # message, no crash/breaker accounting, no retry.
-                    pass
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -34409,6 +34831,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, error_text, run_id)
                     )
+    # The review handover of every run set aside above, now that the main txn
+    # has committed; a refusal parks the card exactly as the scan would have.
+    for handover in handovers:
+        exited = _hand_over_saved_patch(conn, **handover)
+        if exited is not None:
+            exited_hook_payloads.append(exited)
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
     # on top of the event we already emitted).
