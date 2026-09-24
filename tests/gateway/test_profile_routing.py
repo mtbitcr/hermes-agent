@@ -187,3 +187,96 @@ class TestWhatsAppChatIdIdentityMatching:
         tg = ProfileRoute(name="tg", platform="telegram", profile="owner", chat_id="640466638")
         assert tg.matches("telegram", chat_id="640466638")
         assert not tg.matches("telegram", chat_id="640466638@s.whatsapp.net")
+
+
+# ── Delivery-only routes ─────────────────────────────────────────────────────
+# A ``delivery_only`` route only lends the primary bot to its profile's scheduled reports for one
+# exact chat. Every inbound use of the routes skips it, so the owner keeps reaching today's profile.
+
+OWNER_CHAT = "640466638"  # Telegram DM: chat_id == the owner's user id
+
+
+def _owner_route(**extra):
+    return {"name": "owner-reports", "platform": "telegram", "chat_id": OWNER_CHAT,
+            "profile": "planning", **extra}
+
+
+@pytest.fixture
+def served_planning(tmp_path, monkeypatch):
+    """A multiplex root serving ``default`` plus a real ``planning`` profile directory."""
+    root = tmp_path / "root"
+    (root / "profiles" / "planning").mkdir(parents=True)
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
+    return root
+
+
+def _runner_with_route(route, primary_bot):
+    """Bare multiplex ``GatewayRunner`` whose only route is ``route``; ``planning`` holds no bot of
+    its own (the ``{}`` startup placeholder), the default profile's shared bot is ``primary_bot``."""
+    from gateway.config import GatewayConfig, Platform
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig.from_dict({"multiplex_profiles": True, "profile_routes": [route]})
+    runner.adapters = {Platform.TELEGRAM: primary_bot}
+    runner._profile_adapters = {"planning": {}}
+    runner._primary_profile_name = "default"
+    return runner
+
+
+def _owner_dm_source(runner):
+    """The owner's DM as the shared bot's intake builds it (``build_source`` resolves the profile)."""
+    from gateway.config import Platform
+    from gateway.platforms.base import BasePlatformAdapter
+
+    class _SharedBot:
+        platform = Platform.TELEGRAM
+        gateway_runner = runner
+        _owner_profile = None
+
+    return BasePlatformAdapter.build_source(
+        _SharedBot(), chat_id=OWNER_CHAT, chat_type="dm", user_id=OWNER_CHAT)
+
+
+class TestDeliveryOnlyRoutes:
+    def test_inbound_matcher_skips_delivery_only_route(self):
+        routes = parse_profile_routes([_owner_route(delivery_only=True)])
+        assert [route.delivery_only for route in routes] == [True]
+        assert match_profile_route(routes, "telegram", chat_id=OWNER_CHAT) is None
+
+    def test_owner_message_from_delivery_only_chat_still_reaches_default_profile(self, served_planning):
+        source = _owner_dm_source(_runner_with_route(_owner_route(delivery_only=True), object()))
+        assert source.profile is None  # the default profile answers, as with no route at all
+        assert source.profile_route_rejected is False
+
+    def test_ordinary_route_parses_delivery_only_off_and_still_rehomes_inbound(self, served_planning):
+        runner = _runner_with_route(_owner_route(), object())
+        assert [route.delivery_only for route in runner.config.profile_routes] == [False]
+        assert _owner_dm_source(runner).profile == "planning"
+
+    def test_delivery_only_route_lends_no_live_bot_to_its_profile(self, served_planning):
+        from gateway.config import Platform
+
+        primary_bot = object()
+        runner = _runner_with_route(_owner_route(delivery_only=True), primary_bot)
+        assert runner._adapters_for_profile("planning") == {}
+        # An ordinary route keeps making planning a shared-bot satellite, as before.
+        ordinary = _runner_with_route(_owner_route(), primary_bot)
+        assert ordinary._adapters_for_profile("planning") == {Platform.TELEGRAM: primary_bot}
+
+    def test_kanban_notifier_ignores_delivery_only_route(self, served_planning):
+        from gateway.config import Platform
+        from gateway.kanban_watchers_notifier import _Collector, _adapter_for_subscription
+
+        primary_bot = object()
+        runner = _runner_with_route(_owner_route(delivery_only=True), primary_bot)
+        owner_sub = {"chat_id": OWNER_CHAT, "chat_type": "dm"}
+        # The default profile's card notices keep reaching the owner's chat through its own bot ...
+        assert _adapter_for_subscription(runner, Platform.TELEGRAM, owner_sub, None) is primary_bot
+        # ... and the delivery-only route lends planning nothing for them.
+        assert _adapter_for_subscription(runner, Platform.TELEGRAM, owner_sub, "planning") is None
+
+        runner._profile_adapters = {}
+        runner._owns_kanban_dispatcher_lock = lambda: False
+        collector = _Collector(runner, None, notifier_profile=None, gc_due=False, gc_retention_days=30)
+        assert "planning" not in collector.notifier_profiles
