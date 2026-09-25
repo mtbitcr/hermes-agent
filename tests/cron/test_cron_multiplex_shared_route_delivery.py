@@ -396,9 +396,10 @@ def test_multiplex_ticker_refuses_a_satellite_target_on_a_platform_no_route_name
     tmp_path, monkeypatch, shape,
 ):
     """A satellite under multiplex reaches a chat only through its own live adapter or a route that
-    names that exact chat. On a platform no route names for it, an explicit target and the home
-    channel that "all" resolves from the process env are both refused: the standalone send would
-    carry the main bot's token, which the unscoped delivery config reads from the process env."""
+    names that exact chat. On a platform no route names for it, an explicit target, a stored
+    origin, and the home channel that "all" or an origin-less "origin" resolves from the process
+    env are all refused: the standalone send would carry the main bot's token, which the unscoped
+    delivery config reads from the process env."""
     from agent import secret_scope
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "placeholder-bot-token")
@@ -413,6 +414,9 @@ def test_multiplex_ticker_refuses_a_satellite_target_on_a_platform_no_route_name
     jobs = [
         {"id": "explicit-brief", "name": "explicit brief", "deliver": "telegram:222"},
         {"id": "all-brief", "name": "all brief", "deliver": "all"},
+        {"id": "origin-brief", "name": "origin brief", "deliver": "origin",
+         "origin": {"platform": "telegram", "chat_id": "333"}},
+        {"id": "origin-home-brief", "name": "origin home brief", "deliver": "origin"},
     ]
 
     was_multiplex = secret_scope.is_multiplex_active()
@@ -428,9 +432,90 @@ def test_multiplex_ticker_refuses_a_satellite_target_on_a_platform_no_route_name
 
     assert primary.sent == []
     assert standalone == []
-    assert "not named by an enabled route for this profile" in delivery_errors["explicit-brief"]
-    # "all" resolved the home channel and was refused, not left unresolved.
-    assert "not named by an enabled route for this profile" in delivery_errors["all-brief"]
+    # Each target was resolved (the home channel for "all" and the origin-less "origin") and then
+    # refused, not left unresolved.
+    for job_id in ("explicit-brief", "all-brief", "origin-brief", "origin-home-brief"):
+        assert "not named by an enabled route for this profile" in delivery_errors[job_id]
+
+
+def _manual_run_as_planning(tmp_path, monkeypatch, deliver):
+    """Run one planning job through the manual ``cronjob(action="run")`` path inside a planning turn
+    of a multiplex gateway whose live map holds only the main Telegram bot; one enabled route names
+    the owner's chat for planning. Returns ``(delivery_error, main_sent, standalone)``."""
+    from types import SimpleNamespace
+
+    from agent import secret_scope
+    from tools.cronjob_tools import _execute_job_now
+
+    root = tmp_path / "root"
+    planning_home = root / "profiles" / "planning"
+    (planning_home / "cron").mkdir(parents=True)
+    (root / "config.yaml").write_text(yaml.safe_dump({"gateway": {
+        "multiplex_profiles": True,
+        "profile_routes": [{"name": "owner-reports", "platform": "telegram", "chat_id": OWNER_CHAT,
+                            "profile": "planning", "delivery_only": True}],
+    }}), encoding="utf-8")
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
+    monkeypatch.setenv("HERMES_HOME", str(root))  # the launch profile's process home
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "placeholder-bot-token")
+
+    primary = _primary_adapter()
+    loop = asyncio.new_event_loop()  # the gateway's running loop
+    loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+    loop_thread.start()
+    runner = SimpleNamespace(adapters={Platform.TELEGRAM: primary}, _profile_adapters={},
+                             _gateway_loop=loop)
+    job = {"id": "manual-brief", "name": "manual brief", "prompt": "hi", "deliver": deliver,
+           "schedule": {"kind": "cron", "expr": "0 9 * * *"}}
+    outcome = {}
+
+    def record_run(job_id, success, error=None, **kwargs):
+        outcome["delivery_error"] = kwargs.get("delivery_error")
+        return True
+
+    standalone = []
+
+    async def standalone_send(platform, pconfig, chat_id, *args, **kwargs):
+        standalone.append((chat_id, getattr(pconfig, "token", None)))
+        return {"success": True, "message_id": "standalone-1"}
+
+    was_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    home_token = set_hermes_home_override(str(planning_home))  # the planning turn's scope
+    try:
+        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=dict(job)), \
+             patch("tools.cronjob_tools.get_job", return_value={}), \
+             patch("gateway.run._gateway_runner_ref", return_value=runner), \
+             patch("cron.scheduler.run_job", side_effect=_weekly_report), \
+             patch("cron.scheduler.save_job_output", return_value=str(tmp_path / "out.md")), \
+             patch("cron.scheduler.mark_job_run", side_effect=record_run), \
+             patch("tools.send_message_tool._send_to_platform", standalone_send):
+            _execute_job_now(dict(job))
+    finally:
+        reset_hermes_home_override(home_token)
+        secret_scope.set_multiplex_active(was_multiplex)
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=5)
+        loop.close()
+    assert "delivery_error" in outcome
+    return outcome["delivery_error"], primary.sent, standalone
+
+
+def test_manual_run_of_a_satellite_job_refuses_a_chat_no_route_names(tmp_path, monkeypatch):
+    """A manual run inside a satellite's turn gets the map the ticker builds for that profile, not
+    the launch profile's live map: otherwise the main bot counts as the job's own adapter and posts
+    into any chat."""
+    error, main_sent, standalone = _manual_run_as_planning(
+        tmp_path, monkeypatch, f"telegram:{STRAY_CHAT}")
+    assert main_sent == [] and standalone == []
+    assert "not named by an enabled route for this profile" in error
+
+
+def test_manual_run_of_a_satellite_job_still_reaches_its_routed_chat(tmp_path, monkeypatch):
+    error, main_sent, standalone = _manual_run_as_planning(
+        tmp_path, monkeypatch, f"telegram:{OWNER_CHAT}")
+    assert error is None
+    assert main_sent == [OWNER_CHAT] and standalone == []
 
 
 def _tick_under_named_launch(tmp_path, monkeypatch, jobs_by_profile):

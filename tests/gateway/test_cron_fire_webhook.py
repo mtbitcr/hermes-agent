@@ -373,6 +373,82 @@ async def test_fire_passes_live_adapters_to_provider(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fire_for_a_satellite_hands_over_only_its_routed_lend(adapter, monkeypatch, tmp_path):
+    """Under multiplex a fire scoped to a satellite profile (``/p/<profile>/api/cron/fire``) hands
+    the provider the map the ticker builds for that profile, never the launch profile's live map,
+    with which the scheduler would treat the main bot as the job's own adapter."""
+    import yaml
+
+    from agent import secret_scope
+    from cron.scheduler_preflight import SharedRouteAdapters
+    from gateway.config import Platform
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    root = tmp_path / "root"
+    planning_home = root / "profiles" / "planning"
+    planning_home.mkdir(parents=True)
+    (root / "config.yaml").write_text(yaml.safe_dump({"gateway": {
+        "multiplex_profiles": True,
+        "profile_routes": [{"name": "owner-reports", "platform": "telegram", "chat_id": "640466638",
+                            "profile": "planning", "delivery_only": True}],
+    }}), encoding="utf-8")
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
+    monkeypatch.setenv("HERMES_HOME", str(root))  # the launch profile's process home
+    seen = {}
+
+    class _AdapterSpyProvider:
+        def fire_due(self, job_id, *, adapters=None, loop=None):
+            seen["adapters"] = adapters
+            return True
+
+    main_bot = object()
+    runner = SimpleNamespace(
+        _draining=False, _external_drain_active=False,
+        adapters={Platform.TELEGRAM: main_bot}, _profile_adapters={},
+    )
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler", lambda: _AdapterSpyProvider(),
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+
+    @web.middleware
+    async def planning_scope(request, handler):
+        # What the profile-prefix middleware does for a /p/planning/ request.
+        token = set_hermes_home_override(str(planning_home))
+        try:
+            return await handler(request)
+        finally:
+            reset_hermes_home_override(token)
+
+    app = web.Application(middlewares=[cors_middleware, planning_scope])
+    app["api_server_adapter"] = adapter
+    app.router.add_post("/api/cron/fire", adapter._handle_cron_fire)
+    was_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        with patch("gateway.run._gateway_runner_ref", lambda: runner):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/api/cron/fire",
+                                      headers={"Authorization": "Bearer good"},
+                                      json={"job_id": "planning-brief"})
+                assert resp.status == 202
+            for _ in range(50):
+                if seen:
+                    break
+                await asyncio.sleep(0.01)
+    finally:
+        secret_scope.set_multiplex_active(was_multiplex)
+
+    handed = seen["adapters"]
+    assert isinstance(handed, SharedRouteAdapters)
+    assert handed.get(Platform.TELEGRAM, {"chat_id": "640466638"}) is main_bot
+    assert handed.get(Platform.TELEGRAM, {"chat_id": "555000111"}) is None
+
+
+@pytest.mark.asyncio
 async def test_fire_without_runner_passes_none_adapters(adapter, monkeypatch):
     """No gateway runner (standalone/edge case) → fire still works with
     adapters=None, preserving the historical standalone delivery path."""
