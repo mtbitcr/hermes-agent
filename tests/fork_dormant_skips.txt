@@ -60,7 +60,6 @@ tests/cron/test_cron_live_bot_delivery.py
 tests/cron/test_cron_live_delivery_confirmation.py
 tests/cron/test_cron_multiplex_desktop_ticker_scope.py
 tests/cron/test_cron_multiplex_served_profile_parity.py
-tests/cron/test_cron_multiplex_shared_route_delivery.py
 tests/cron/test_cron_reasoning_effort.py
 tests/cron/test_cron_relay_run_forward.py
 tests/cron/test_cron_request_overrides.py
