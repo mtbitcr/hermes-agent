@@ -185,11 +185,14 @@ def _weekly_report(job, **kwargs):
 
 def _tick_planning_briefs(
     tmp_path, monkeypatch, delivery_only, *, adapters, planning_adapters, run_job=_weekly_report,
-    routes=None, jobs=None,
+    routes=None, jobs=None, launch=None, jobs_by_profile=None,
 ):
     """Fire planning's owner, stray and ops telegram briefs (or the given ``jobs`` under the given
     ``routes``) through the regular multiplex ticker (``_start_multiplex`` → ``cron.scheduler.tick``).
-    ``adapters`` is the launch profile's live map, ``planning_adapters`` planning's own. Returns
+    ``adapters`` is the launch profile's live map, ``planning_adapters`` planning's own. With
+    ``launch`` the gateway runs as ``hermes -p <launch> gateway``: the process home and env are that
+    profile's, it owns ``adapters``, and the root profile is served as a secondary; then
+    ``jobs_by_profile`` maps a profile name (``None`` for the root) to its jobs. Returns
     ``(delivery_errors, standalone)``; ``standalone`` holds ``(chat_id, token)`` for every
     standalone ``_send_to_platform`` call."""
     from cron.scheduler_provider import InProcessCronScheduler
@@ -199,6 +202,14 @@ def _tick_planning_briefs(
     planning_home = root / "profiles" / "planning"
     (planning_home / "cron").mkdir(parents=True)
     (root / "cron").mkdir()
+    homes = {None: root, "planning": planning_home}
+    served = [(None, root), ("planning", planning_home)]
+    profile_adapters = {"planning": planning_adapters}
+    if launch is not None:
+        homes[launch] = root / "profiles" / launch
+        (homes[launch] / "cron").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(homes[launch]))
+        served, profile_adapters = [(launch, homes[launch]), (None, root)], {}
     if routes is None:
         routes = [
             {"name": "owner-reports", "platform": "telegram", "chat_id": OWNER_CHAT,
@@ -217,14 +228,20 @@ def _tick_planning_briefs(
             {"id": "stray-brief", "name": "stray brief", "deliver": f"telegram:{STRAY_CHAT}"},
             {"id": "ops-brief", "name": "ops brief", "deliver": f"telegram:{OPS_CHAT}"},
         ]
-    handed_out = threading.Event()
+    jobs_by_home = {
+        homes[name].resolve(): list(profile_jobs)
+        for name, profile_jobs in (jobs_by_profile or {"planning": jobs}).items()
+    }
+    job_ids = {job["id"] for profile_jobs in jobs_by_home.values() for job in profile_jobs}
+    handed_out = set()
 
     def planning_due_jobs():
-        # These jobs live in planning's store only; hand them out on its first tick.
-        if handed_out.is_set() or Path(get_hermes_home()).resolve() != planning_home.resolve():
+        # Each profile's jobs live in its own store only; hand them out on its first tick.
+        home = Path(get_hermes_home()).resolve()
+        if home in handed_out or home not in jobs_by_home:
             return []
-        handed_out.set()
-        return [dict(job) for job in jobs]
+        handed_out.add(home)
+        return [dict(job) for job in jobs_by_home[home]]
 
     delivery_errors = {}
 
@@ -254,14 +271,14 @@ def _tick_planning_briefs(
              patch("tools.send_message_tool._send_to_platform", standalone_send):
             ticker = threading.Thread(target=InProcessCronScheduler().start, args=(stop,), kwargs={
                 "interval": 0, "loop": loop,
-                "profile_homes": [(None, root), ("planning", planning_home)],
+                "profile_homes": served,
                 "adapters": adapters,
-                "profile_adapters": {"planning": planning_adapters},
-                "default_profile": None,
+                "profile_adapters": profile_adapters,
+                "default_profile": launch,
             }, daemon=True)
             ticker.start()
             deadline = time.monotonic() + 30
-            while len(delivery_errors) < len(jobs) and time.monotonic() < deadline:
+            while len(delivery_errors) < len(job_ids) and time.monotonic() < deadline:
                 time.sleep(0.01)
             stop.set()
             ticker.join(timeout=10)
@@ -270,7 +287,7 @@ def _tick_planning_briefs(
         loop_thread.join(timeout=5)
         loop.close()
 
-    assert set(delivery_errors) == {job["id"] for job in jobs}
+    assert set(delivery_errors) == job_ids
     return delivery_errors, standalone
 
 
@@ -412,6 +429,91 @@ def test_multiplex_ticker_refuses_a_satellite_target_on_a_platform_no_route_name
     assert primary.sent == []
     assert standalone == []
     assert "not named by an enabled route for this profile" in delivery_errors["explicit-brief"]
+    # "all" resolved the home channel and was refused, not left unresolved.
+    assert "not named by an enabled route for this profile" in delivery_errors["all-brief"]
+
+
+def _tick_under_named_launch(tmp_path, monkeypatch, jobs_by_profile):
+    """Run the given profiles' jobs under a multiplex gateway launched as ``hermes -p coder
+    gateway`` whose live map holds only a Telegram adapter; no route names any profile."""
+    from agent import secret_scope
+
+    primary = _primary_adapter()
+    was_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        delivery_errors, standalone = _tick_planning_briefs(
+            tmp_path, monkeypatch, False,
+            adapters={Platform.TELEGRAM: primary}, planning_adapters={},
+            routes=[], launch="coder", jobs_by_profile=jobs_by_profile,
+        )
+    finally:
+        secret_scope.set_multiplex_active(was_multiplex)
+    return delivery_errors, standalone, primary
+
+
+def test_named_launch_profile_keeps_its_own_delivery_on_a_platform_without_a_live_adapter(
+    tmp_path, monkeypatch,
+):
+    """The launch profile of a multiplex gateway is the primary, not a satellite, even when it is
+    not the root: its process env and live adapters are its own. Its job to a platform missing
+    from its live map keeps its own path, the standalone send with its own settings."""
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "placeholder-coder-discord-token")
+    delivery_errors, standalone, primary = _tick_under_named_launch(tmp_path, monkeypatch, {
+        "coder": [{"id": "coder-brief", "name": "coder brief", "deliver": "discord:424242"}],
+    })
+    assert delivery_errors["coder-brief"] is None
+    assert standalone == [("424242", "placeholder-coder-discord-token")]
+    assert primary.sent == []
+
+
+def test_named_launch_serves_the_root_profile_as_a_satellite(tmp_path, monkeypatch):
+    """Under a gateway launched as ``hermes -p coder gateway`` the root profile is a secondary and
+    the process env holds coder's bot token. With no route naming the root profile, its explicit
+    target and its "all" home target are refused: nothing goes through coder's adapter or the
+    standalone send."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "placeholder-bot-token")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "111")
+    delivery_errors, standalone, primary = _tick_under_named_launch(tmp_path, monkeypatch, {
+        None: [
+            {"id": "root-explicit", "name": "root explicit", "deliver": "telegram:222"},
+            {"id": "root-all", "name": "root all", "deliver": "all"},
+        ],
+    })
+    assert primary.sent == []
+    assert standalone == []
+    for job_id in ("root-explicit", "root-all"):
+        assert "not named by an enabled route for this profile" in delivery_errors[job_id]
+
+
+def test_thread_only_route_lends_the_main_bot_for_no_chat():
+    """Telegram topic ids and Slack thread timestamps are per chat, so a route that names only a
+    thread would lend the main bot for any chat carrying that thread id. A cron target always
+    carries a chat, so only a route that names the chat lends."""
+    from gateway.profile_routing import parse_profile_routes
+
+    shared = SharedRouteAdapters({Platform.TELEGRAM: _primary_adapter()}, parse_profile_routes([
+        {"name": "topic", "platform": "telegram", "thread_id": "14", "profile": "planning"},
+    ]))
+    assert shared.get(Platform.TELEGRAM, {"chat_id": "-100999", "thread_id": "14"}) is None
+    assert shared.get(Platform.TELEGRAM, {"chat_id": OWNER_CHAT, "thread_id": "14"}) is None
+
+
+def test_chat_and_thread_route_lends_the_main_bot_for_exactly_that_topic():
+    from gateway.profile_routing import parse_profile_routes
+
+    primary = _primary_adapter()
+    shared = SharedRouteAdapters({Platform.TELEGRAM: primary}, parse_profile_routes([
+        {"name": "topic", "platform": "telegram", "chat_id": OPS_CHAT, "thread_id": "14",
+         "profile": "planning"},
+    ]))
+    assert shared.get(Platform.TELEGRAM, {"chat_id": OPS_CHAT, "thread_id": "14"}) is primary
+    for target in (
+        {"chat_id": OPS_CHAT, "thread_id": "15"},
+        {"chat_id": "-100999", "thread_id": "14"},
+        {"chat_id": OPS_CHAT},
+    ):
+        assert shared.get(Platform.TELEGRAM, target) is None
 
 
 def test_live_native_adapter_without_platform_block_is_not_treated_as_disabled():
