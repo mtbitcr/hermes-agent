@@ -247,6 +247,26 @@ class SharedRouteAdapters:
         return default
 
 
+def served_profile_adapters(runner):
+    """The adapter map a job of the profile being served may deliver through, as the multiplex ticker
+    builds it (``InProcessCronScheduler._start_multiplex``): the gateway's live map for its launch
+    profile; for any other served profile, its own live adapters or, with none, the launch bot lent
+    only for the exact chats an enabled route names for it. ``None`` without a runner. A path that
+    fires one job outside the ticker (a manual run, an external fire) uses this instead of
+    ``runner.adapters``: ``_deliver_result`` treats an adapter in the map it is given as the
+    profile's own."""
+    adapters = getattr(runner, "adapters", None) if runner is not None else None
+    if adapters is None or not _serving_multiplex_satellite():
+        return adapters
+    from hermes_cli.profiles import get_active_profile_name
+
+    own = (getattr(runner, "_profile_adapters", None) or {}).get(get_active_profile_name()) or {}
+    if own:
+        return own
+    routes = _primary_profile_routes_for_current_home()
+    return SharedRouteAdapters(adapters, routes) if routes else {}
+
+
 def _preflight_check_delivery(job: dict) -> Optional[str]:
     """Check delivery targets resolve to configured platforms. ``local``/``origin``/``all`` are
     never checked (no gateway-config load). Unknown platform always blocks; known platform blocks
