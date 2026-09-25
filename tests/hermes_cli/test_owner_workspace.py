@@ -3066,6 +3066,123 @@ def test_owner_decisions_projects_native_gates_without_writes_or_identifiers(ctx
     assert ow.list_owner_decisions(ctx) == {"data": [], "truncated": False}
 
 
+def test_owner_decides_one_listed_suggestion_only_through_its_decision_key(ctx):
+    """An on-screen decision reaches a suggestion only through the key the
+    Decisions feed showed. Every refusal writes nothing; the decision keeps
+    the owner's reason, applies nothing, and the feed keeps its shape."""
+    setup = _bootstrap_board(ctx)
+    with kanban_db.connect(board=setup["board"]) as conn:
+        input_id = kanban_db.create_task(
+            conn,
+            title="Choose the workshop date",
+            project_id=setup["project_id"],
+        )
+        recommendation_id = kanban_db.create_recommendation(
+            conn,
+            project_id=setup["project_id"],
+            target_profile="raphael-planner",
+            recommendation_kind="skill",
+            recommendation_subject_id="workshop-research",
+            recommendation_label="Add workshop research support",
+            recommendation_rationale="The current milestone needs public-source research.",
+            recommendation_evidence={
+                "schema_version": 1,
+                "need": "The workshop outline needs current public evidence.",
+                "expected_benefit": "Keep the owner-facing advice current.",
+                "requested_scope": {
+                    flag: False for flag in kanban_db.RECOMMENDATION_SCOPE_FLAGS
+                },
+                "risks": "Low",
+                "cost": "No added cost",
+                "rollback": "Remove the staged skill configuration.",
+            },
+            provenance_authority="project-steward",
+        )
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input' "
+                "WHERE id = ?",
+                (input_id,),
+            )
+
+    def _recorded():
+        with kanban_db.connect(board=setup["board"]) as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (recommendation_id,)
+            ).fetchone()
+            events = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                "ORDER BY id",
+                (recommendation_id,),
+            ).fetchall()
+        return (
+            kanban_db.recommendation_lifecycle_snapshot(row),
+            [(event["kind"], event["payload"]) for event in events],
+        )
+
+    listed = ow.list_owner_decisions(ctx)["data"]
+    [suggestion] = [item for item in listed if item["kind"] == "capability"]
+    [owner_input] = [item for item in listed if item["kind"] == "owner_input"]
+    stranger = ow.OwnerContext(actor="stranger", profile="stranger", session="run_owt")
+    before = _recorded()
+    for decision_ref, action, reason, code in (
+        # Listed for this owner, but an owner-input gate is not a suggestion.
+        (owner_input["decision_ref"], "accept", "Yes", "decision_not_found"),
+        # A key this owner was never shown.
+        ("decision_" + "0" * 32, "accept", "Yes", "decision_not_found"),
+        # The same suggestion's key as someone else's feed would mint it.
+        (
+            ow._owner_decision_ref(
+                stranger, authority="recommendation", native_id=recommendation_id,
+            ),
+            "accept", "Yes", "decision_not_found",
+        ),
+        # A native id is never a decision key.
+        (recommendation_id, "accept", "Yes", "decision_not_found"),
+        (suggestion["decision_ref"], "apply", "Yes", "invalid_argument"),
+        (suggestion["decision_ref"], "accept", "   ", "invalid_argument"),
+    ):
+        with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+            ow.decide_owner_suggestion(
+                ctx, decision_ref=decision_ref, action=action, reason=reason,
+            )
+        assert excinfo.value.code == code
+    assert _recorded() == before
+
+    decided = ow.decide_owner_suggestion(
+        ctx,
+        decision_ref=suggestion["decision_ref"],
+        action="defer",
+        reason="Not before the workshop",
+    )
+
+    assert decided == {
+        "decision_ref": suggestion["decision_ref"],
+        "decision": "deferred",
+    }
+    snapshot, events = _recorded()
+    assert (snapshot["decision"], snapshot["effective_state"]) == ("deferred", "none")
+    kind, payload = events[-1]
+    record = json.loads(payload)
+    assert kind == "recommendation_decided"
+    assert (record["reason"], record["actor"], record["authority"]) == (
+        "Not before the workshop", ctx.actor, "owner_approved",
+    )
+    # The feed keeps its shape: the other gate is listed exactly as before.
+    assert ow.list_owner_decisions(ctx) == {"data": [owner_input], "truncated": False}
+
+    after = _recorded()
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.decide_owner_suggestion(
+            ctx,
+            decision_ref=suggestion["decision_ref"],
+            action="accept",
+            reason="Changed my mind",
+        )
+    assert excinfo.value.code == "decision_not_found"
+    assert _recorded() == after
+
+
 # A stored Project name Raphael never validated on the way in: an ANSI
 # colour sequence, a NUL, a zero-width space, a right-to-left override, an
 # interlinear annotation separator, and ``user:password@`` URL userinfo.
