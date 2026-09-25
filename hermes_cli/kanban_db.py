@@ -20558,6 +20558,87 @@ def decide_recommendation(
         }
 
 
+def decide_recommendation_on_owner_screen(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision: str,
+    reason: str,
+    actor: str,
+    owner_screen_ref: str,
+    expected_lifecycle_version: int,
+) -> dict[str, Any]:
+    """Record the owner's on-screen decision; never apply configuration.
+
+    The owner decided that a decision made on the owner screen is its own
+    record, so no governance Task/run backs it: the owner is the actor, their
+    reason is kept with the decision in the same transaction, and
+    ``owner_screen_ref`` names the screen the owner decided on. Only a
+    suggestion still pending owner review can be decided here; the operator
+    command (:func:`decide_recommendation`) keeps its governance rule.
+    """
+    _assert_recommendation_lifecycle_operator()
+    if decision not in {"deferred", "rejected", "accepted"}:
+        raise ValueError("decision must be deferred, rejected, or accepted")
+    if (
+        isinstance(expected_lifecycle_version, bool)
+        or not isinstance(expected_lifecycle_version, int)
+        or expected_lifecycle_version < 0
+    ):
+        raise ValueError("expected_lifecycle_version must be a non-negative integer")
+    reason = _bounded_lifecycle_text(reason, name="reason")
+    actor = _bounded_lifecycle_text(actor, name="actor")
+    owner_screen_ref = _lifecycle_reference(owner_screen_ref, name="owner_screen_ref")
+
+    with write_txn(conn):
+        row = _recommendation_row(conn, task_id)
+        snapshot = recommendation_lifecycle_snapshot(row)
+        if snapshot["lifecycle_version"] != expected_lifecycle_version:
+            raise ValueError(
+                "recommendation lifecycle version mismatch: "
+                f"expected {expected_lifecycle_version}, found "
+                f"{snapshot['lifecycle_version']}"
+            )
+        # The operator's table also allows deferred -> rejected or accepted;
+        # the owner screen lists, and so decides, only a pending suggestion.
+        if snapshot["decision"] != "pending" or row["status"] != "review":
+            raise ValueError(
+                "only a recommendation pending owner review can be decided on "
+                f"the owner screen, found {snapshot['decision']} in {row['status']}"
+            )
+        evidence = parse_recommendation_evidence(row["recommendation_evidence"])
+        if decision == "accepted" and evidence is None:
+            raise ValueError("legacy recommendation without evidence cannot be accepted")
+
+        next_version = expected_lifecycle_version + 1
+        cur = conn.execute(
+            "UPDATE tasks SET recommendation_decision = ?, "
+            "recommendation_lifecycle_version = ? "
+            "WHERE id = ? AND task_kind = 'recommendation' "
+            "AND COALESCE(recommendation_lifecycle_version, 0) = ?",
+            (decision, next_version, task_id, expected_lifecycle_version),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("recommendation lifecycle version changed concurrently")
+        # Recorded, never applied: the effective state stays as it is.
+        payload = {
+            "lifecycle_version": next_version,
+            "decision": decision,
+            "effective_state": snapshot["effective_state"],
+            "authority": "owner_approved",
+            "reason": reason,
+            "actor": actor,
+            "owner_screen_ref": owner_screen_ref,
+        }
+        _append_event(conn, task_id, "recommendation_decided", redact_review_value(payload))
+        return {
+            "recommendation_id": task_id,
+            "decision": decision,
+            "effective_state": snapshot["effective_state"],
+            "lifecycle_version": next_version,
+        }
+
+
 _RECOMMENDATION_EFFECTIVE_TRANSITIONS = {
     "none": {"staged"},
     "staged": {"canary_running", "rolled_back"},

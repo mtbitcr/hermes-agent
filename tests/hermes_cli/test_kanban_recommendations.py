@@ -913,3 +913,102 @@ def test_decision_rejects_incomplete_and_cross_project_governance(
         with pytest.raises(ValueError, match="recommendation project"):
             _decide(conn, rec_id, other_project)
         assert _snapshot(conn, rec_id)["decision"] == "pending"
+
+
+# --- Owner on-screen decision: the decision is its own record ---
+
+_OWNER_SCREEN_REF = "owner-workspace:decisions"
+
+
+def _owner_decide(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision: str = "accepted",
+    version: int = 0,
+    reason: str = "Worth trying on the next milestone",
+) -> dict:
+    return kb.decide_recommendation_on_owner_screen(
+        conn,
+        task_id,
+        decision=decision,
+        reason=reason,
+        actor="raphael-owner",
+        owner_screen_ref=_OWNER_SCREEN_REF,
+        expected_lifecycle_version=version,
+    )
+
+
+def _decided_payloads(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    return [
+        json.loads(row["payload"])
+        for row in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'recommendation_decided' ORDER BY id",
+            (task_id,),
+        )
+    ]
+
+
+def test_operator_command_still_requires_its_governance_run(
+    kanban_home: Path,
+) -> None:
+    # The owner decided that an on-screen decision is its own record; the
+    # operator command keeps its rule. Both meet the same pending suggestion.
+    from hermes_cli import kanban as kc
+
+    with kb.connect_closing() as conn:
+        rec_id = kb.create_recommendation(conn, **_VALID_KWARGS)
+    operator = (
+        f"recommendation decide {rec_id} --decision accepted "
+        "--authority owner_approved --gate-ref owner-gate:item32e "
+        "--reason reviewed --expected-version 0"
+    )
+    assert "required: --governance-task, --governance-run" in kc.run_slash(operator)
+    assert "governance Task/run evidence was not found" in kc.run_slash(
+        f"{operator} --governance-task t_00000000 --governance-run 1"
+    )
+    with kb.connect_closing() as conn:
+        assert _snapshot(conn, rec_id)["decision"] == "pending"
+        assert _decided_payloads(conn, rec_id) == []
+
+        assert _owner_decide(conn, rec_id)["decision"] == "accepted"
+        [record] = _decided_payloads(conn, rec_id)
+    assert record["owner_screen_ref"] == _OWNER_SCREEN_REF
+    assert not {"governance_task_id", "governance_run_id"} & set(record)
+
+
+def test_owner_screen_decides_only_a_pending_suggestion_and_keeps_the_reason(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with kb.connect_closing() as conn:
+        rec_id = kb.create_recommendation(conn, **_VALID_KWARGS)
+        with pytest.raises(ValueError, match="version mismatch"):
+            _owner_decide(conn, rec_id, version=1)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        with pytest.raises(PermissionError, match="operator-only"):
+            _owner_decide(conn, rec_id)
+        monkeypatch.delenv("HERMES_KANBAN_TASK")
+        assert _decided_payloads(conn, rec_id) == []
+
+        deferred = _owner_decide(
+            conn, rec_id, decision="deferred", reason="Not before the workshop"
+        )
+        assert deferred == {
+            "recommendation_id": rec_id,
+            "decision": "deferred",
+            "effective_state": "none",
+            "lifecycle_version": 1,
+        }
+        # The operator's table still allows deferred -> accepted; the owner
+        # screen decides only a suggestion that is still pending.
+        with pytest.raises(ValueError, match="pending"):
+            _owner_decide(conn, rec_id, version=1)
+        assert _snapshot(conn, rec_id) == deferred
+        [record] = _decided_payloads(conn, rec_id)
+    assert (record["reason"], record["actor"], record["authority"]) == (
+        "Not before the workshop",
+        "raphael-owner",
+        "owner_approved",
+    )
+    assert record["effective_state"] == "none"

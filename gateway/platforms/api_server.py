@@ -18,6 +18,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/owner-workspace/projects/{project_slug}/snapshot — exact read-only Project surface
 - GET  /v1/owner-workspace/projects/{project_slug}/attachments/{attachment_id} — exact owner attachment
 - GET  /v1/owner-workspace/decisions — project pending native owner gates
+- POST /v1/owner-workspace/decisions/{decision_ref}/accept|reject|defer — record the owner's decision on one listed pending suggestion; never applies it
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
@@ -6771,6 +6772,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._handle_owner_workspace_project_attachment,
             ),
             ("GET", "/v1/owner-workspace/decisions", self._handle_owner_workspace_decisions),
+            (
+                "POST",
+                "/v1/owner-workspace/decisions/{decision_ref}/accept",
+                self._handle_owner_workspace_suggestion_decision,
+            ),
+            (
+                "POST",
+                "/v1/owner-workspace/decisions/{decision_ref}/reject",
+                self._handle_owner_workspace_suggestion_decision,
+            ),
+            (
+                "POST",
+                "/v1/owner-workspace/decisions/{decision_ref}/defer",
+                self._handle_owner_workspace_suggestion_decision,
+            ),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -12989,6 +13005,90 @@ class APIServerAdapter(BasePlatformAdapter):
             # everything Raphael is waiting on.
             "truncated": truncated or len(decisions) > 100,
             "data": decisions[:100],
+        })
+
+    async def _handle_owner_workspace_suggestion_decision(
+        self, request: "web.Request",
+    ) -> "web.Response":
+        """POST accept, reject or defer for one pending suggestion the feed lists.
+
+        Addressed by the Decisions feed's own opaque key, never a native id.
+        The owner's reason is kept as the decision's record and the suggestion
+        is never applied.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from hermes_cli.owner_workspace import OwnerWorkspaceError
+
+        try:
+            from gateway.run import _load_gateway_config
+
+            if not _owner_workspace_toolset_enabled(_load_gateway_config()):
+                return web.json_response(
+                    _openai_error(
+                        "Owner workspace is not enabled for this profile",
+                        code="owner_workspace_not_enabled",
+                    ),
+                    status=404,
+                )
+            body, err = await self._read_json_body(request)
+            if err:
+                return err
+            reason = body.get("reason")
+            if set(body) != {"reason"} or not isinstance(reason, str) or not reason.strip():
+                return web.json_response(
+                    _openai_error("Invalid owner decision request"),
+                    status=400,
+                )
+            from hermes_cli.owner_workspace import (
+                decide_owner_suggestion,
+                resolve_owner_context,
+            )
+
+            decided = decide_owner_suggestion(
+                resolve_owner_context(),
+                decision_ref=request.match_info.get("decision_ref", ""),
+                action=request.path.rsplit("/", 1)[-1],
+                reason=reason,
+            )
+        except OwnerWorkspaceError as exc:
+            if exc.code == "decision_not_found":
+                return web.json_response(
+                    _openai_error(
+                        "Owner decision was not found",
+                        code="decision_not_found",
+                    ),
+                    status=404,
+                )
+            if exc.code == "invalid_argument":
+                return web.json_response(
+                    _openai_error(exc.message, code="invalid_argument"),
+                    status=400,
+                )
+            logger.warning(
+                "[api_server] owner-workspace decision unavailable (%s)", exc.code
+            )
+            return web.json_response(
+                _openai_error(
+                    "Owner workspace decision is unavailable",
+                    code="owner_workspace_unavailable",
+                ),
+                status=503,
+            )
+        except Exception:
+            logger.exception("[api_server] owner-workspace decision failed")
+            return web.json_response(
+                _openai_error(
+                    "Owner workspace decision is unavailable",
+                    code="owner_workspace_unavailable",
+                ),
+                status=500,
+            )
+
+        return web.json_response({
+            "object": "hermes.owner_workspace.decision",
+            "data": decided,
         })
 
     @staticmethod

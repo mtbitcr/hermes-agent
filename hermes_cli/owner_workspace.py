@@ -3785,6 +3785,127 @@ def list_owner_decisions(ctx: OwnerContext) -> dict:
     }
 
 
+_OWNER_SUGGESTION_DECISIONS = {
+    "accept": "accepted",
+    "reject": "rejected",
+    "defer": "deferred",
+}
+
+
+def _owner_pending_suggestion(
+    ctx: OwnerContext, decision_ref: Any,
+) -> Optional[tuple[str, sqlite3.Row]]:
+    """Resolve a Decisions-feed key to this owner's own pending suggestion.
+
+    Reads exactly the suggestions :func:`list_owner_decisions` can list — the
+    same Project scope and the same pending-suggestion filter — and recomputes
+    their keys, so a key is never reversed and a native id, an owner-input
+    gate or a key minted for another owner never matches. Returns
+    ``(board, row)`` or ``None``, and never writes.
+    """
+    for project in list_committed_projects(ctx):
+        if project["archived"]:
+            continue
+
+        project_id = str(project["project_id"])
+        board_slug = str(project["board"])
+        if (
+            not kanban_db.board_exists(board_slug)
+            and _completed_removal_state(project_id) is not None
+        ):
+            continue
+        if board_slug == kanban_db.DEFAULT_BOARD:
+            board_path = kanban_db.kanban_home() / "kanban.db"
+        else:
+            board_path = kanban_db.board_dir(board_slug) / "kanban.db"
+
+        conn = _open_read_only_sqlite(board_path, label="kanban.db")
+        try:
+            rows = conn.execute(
+                "SELECT id, recommendation_lifecycle_version, "
+                "recommendation_evidence IS NULL AS legacy FROM tasks "
+                "WHERE project_id = ? AND task_kind = 'recommendation' "
+                "AND status = 'review' AND review_policy = 'owner' "
+                "AND COALESCE(recommendation_decision, 'pending') = 'pending'",
+                (project_id,),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise OwnerWorkspaceError(
+                "snapshot_unavailable", "the Project decisions could not be read"
+            ) from exc
+        finally:
+            conn.close()
+        for row in rows:
+            if _owner_decision_ref(
+                ctx, authority="recommendation", native_id=str(row["id"])
+            ) == decision_ref:
+                return board_slug, row
+    return None
+
+
+def decide_owner_suggestion(
+    ctx: OwnerContext, *, decision_ref: Any, action: Any, reason: Any,
+) -> dict:
+    """Record the owner's decision on one pending suggestion the feed lists.
+
+    The owner decided that an on-screen decision is its own record: it goes
+    through the native recommendation lifecycle with ``owner_approved``
+    authority, this owner as actor and their reason, and no governance
+    Task/run. Only the opaque key the Decisions feed showed this owner reaches
+    the suggestion; an unknown, foreign, stale or non-suggestion key is
+    ``decision_not_found`` and writes nothing. Nothing is ever applied.
+    """
+    decision = (
+        _OWNER_SUGGESTION_DECISIONS.get(action) if isinstance(action, str) else None
+    )
+    if decision is None:
+        raise OwnerWorkspaceError(
+            "invalid_argument", "action must be accept, reject or defer"
+        )
+    if not isinstance(reason, str) or not reason.strip():
+        raise OwnerWorkspaceError(
+            "invalid_argument", "a decision needs the owner's reason"
+        )
+    reason = reason.strip()
+    if len(reason) > kanban_db._RECOMMENDATION_LIFECYCLE_TEXT_MAX_LEN:
+        raise OwnerWorkspaceError(
+            "invalid_argument", "the owner's reason is too long"
+        )
+
+    found = _owner_pending_suggestion(ctx, decision_ref)
+    if found is None:
+        raise OwnerWorkspaceError(
+            "decision_not_found", "no pending suggestion has this decision key"
+        )
+    board_slug, row = found
+    if decision == "accepted" and row["legacy"]:
+        raise OwnerWorkspaceError(
+            "invalid_argument",
+            "this suggestion has no recorded evidence, so it cannot be accepted",
+        )
+    with contextlib.closing(kanban_db.connect(board=board_slug)) as kconn:
+        try:
+            kanban_db.decide_recommendation_on_owner_screen(
+                kconn,
+                str(row["id"]),
+                decision=decision,
+                reason=reason,
+                actor=ctx.actor,
+                owner_screen_ref=f"owner-workspace:decisions:{decision_ref}",
+                expected_lifecycle_version=int(
+                    row["recommendation_lifecycle_version"] or 0
+                ),
+            )
+        except ValueError as exc:
+            # Decided or changed since the lookup: the lifecycle's own version
+            # and pending guards refused it inside the write, so nothing was
+            # written.
+            raise OwnerWorkspaceError(
+                "decision_not_found", "no pending suggestion has this decision key"
+            ) from exc
+    return {"decision_ref": decision_ref, "decision": decision}
+
+
 def set_project_archived(
     ctx: OwnerContext,
     *,
