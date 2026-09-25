@@ -95,15 +95,15 @@ def test_satellite_routes_exact_target_through_primary_adapter(tmp_path, monkeyp
         assert primary.sent == ["1543065293755256852"]
         assert standalone == []
 
-        # unmatched chat, disabled route, route for another profile → the
-        # primary bot is NEVER used; delivery stays on the satellite's own
-        # (credentialless) standalone path and reports its failure.
+        # unmatched chat, disabled route, route for another profile → refused:
+        # the primary bot is NEVER used and the satellite's standalone path is
+        # never tried.
         for chat in ("424242", "999", "777"):
             primary.sent.clear()
             error, standalone = _run(_job(chat), shared)
-            assert error is not None and "DISCORD_BOT_TOKEN" in error
+            assert error is not None
             assert primary.sent == []
-            assert standalone == [chat]
+            assert standalone == []
     finally:
         reset_hermes_home_override(token)
 
@@ -239,6 +239,20 @@ def test_multiplex_ticker_delivers_satellite_report_only_to_its_routed_chat(
     assert primary.sent == [OWNER_CHAT]  # the primary bot reached exactly the routed chat
     assert delivery_errors["stray-brief"] and delivery_errors["ops-brief"]  # refused
     assert standalone == []
+
+
+@pytest.mark.parametrize("delivery_only", [True, False])
+def test_multiplex_ticker_refuses_other_targets_when_process_env_holds_main_bot_token(
+    tmp_path, monkeypatch, delivery_only,
+):
+    """The normal multiplex deployment: the gateway process env holds the main bot's token (the
+    launch profile's .env), so the satellite's unscoped gateway config enables telegram although
+    planning has no telegram section. The report still reaches only the routed chat, through the
+    PRIMARY adapter; the stray and ops briefs are refused and nothing is sent standalone."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "placeholder-bot-token")
+    test_multiplex_ticker_delivers_satellite_report_only_to_its_routed_chat(
+        tmp_path, monkeypatch, delivery_only,
+    )
 
 
 def test_live_native_adapter_without_platform_block_is_not_treated_as_disabled():

@@ -2598,16 +2598,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
-        from cron.scheduler_preflight import SharedRouteAdapters
+        from cron.scheduler_preflight import SharedRouteAdapters, _delivery_platform_routed_from_primary_gateway
         from gateway.delivery import DeliveryTransport, resolve_delivery_transport
 
         target_adapters, router_config, transport = adapters, config, None
         if isinstance(adapters, SharedRouteAdapters):
             # Credentialless satellite: the primary adapter serves THIS target only when an
-            # enabled primary route names it for this profile. A miss has no live transport: it
-            # meets today's configured/enabled gate and the satellite's own standalone path below,
-            # never the primary bot.
+            # enabled primary route names it for this profile. A miss on a platform the primary
+            # serves for this profile (its adapter is here, or a route names that platform) is
+            # refused: the standalone path below would send it with the primary bot's token from
+            # the process env. A miss on any other platform keeps the satellite's own path below.
             shared = adapters.get(platform, target)
+            if shared is None and (
+                adapters._primary.get(platform) is not None
+                or _delivery_platform_routed_from_primary_gateway(platform_name)
+            ):
+                msg = f"platform '{platform_name}' target is not named by an enabled route for this profile"
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
             target_adapters = {platform: shared} if shared is not None else {}
             if shared is not None:
                 # The primary's route authorised this exact adapter. The satellite's own
