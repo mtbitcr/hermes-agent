@@ -2598,9 +2598,32 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
-        from gateway.delivery import resolve_delivery_transport
+        from cron.scheduler_preflight import SharedRouteAdapters
+        from gateway.delivery import DeliveryTransport, resolve_delivery_transport
 
-        transport = resolve_delivery_transport(platform, config, adapters)
+        target_adapters, router_config, transport = adapters, config, None
+        if isinstance(adapters, SharedRouteAdapters):
+            # Credentialless satellite: the primary adapter serves THIS target only when an
+            # enabled primary route names it for this profile. A miss has no live transport: it
+            # meets today's configured/enabled gate and the satellite's own standalone path below,
+            # never the primary bot.
+            shared = adapters.get(platform, target)
+            target_adapters = {platform: shared} if shared is not None else {}
+            if shared is not None:
+                # The primary's route authorised this exact adapter. The satellite's own
+                # platforms.<p> block describes a connector it never runs, so neither its
+                # absence nor enabled: false may veto the shared transport, here or when the
+                # DeliveryRouter below re-resolves it; its non-credential settings are kept.
+                from dataclasses import replace
+                from gateway.config import PlatformConfig
+
+                own = config.platforms.get(platform)
+                shared_config = replace(own, enabled=True) if own is not None else PlatformConfig(enabled=True)
+                transport = DeliveryTransport(shared, shared_config, platform)
+                if own is not None and not own.enabled:
+                    router_config = replace(config, platforms={**config.platforms, platform: shared_config})
+        if transport is None:
+            transport = resolve_delivery_transport(platform, config, target_adapters)
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -2821,7 +2844,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
-                    router = DeliveryRouter(config, adapters)
+                    router = DeliveryRouter(router_config, target_adapters)
                     route_target = DeliveryTarget(
                         platform=platform,
                         chat_id=str(chat_id),
@@ -4214,6 +4237,8 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
         platform_parts.append(part.split(":", 1)[0].strip())
     if not platform_parts:
         return None
+    # Imported here: cron.scheduler_preflight imports this module at its bottom.
+    from cron.scheduler_preflight import _delivery_platform_routed_from_primary_gateway
 
     connected: Optional[set] = None
     for platform_name in platform_parts:
@@ -4238,7 +4263,13 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                     "delivery credential check", exc_info=True,
                 )
                 return None  # fail-open
-        if platform_name.lower() not in connected:
+        if (
+            platform_name.lower() not in connected
+            # Multiplex: a satellite whose deliveries a primary profile route serves through the
+            # primary's bot reads unconnected here, a false block (#97476). _deliver_result
+            # still lends that bot only for the exact routed chat.
+            and not _delivery_platform_routed_from_primary_gateway(platform_name)
+        ):
             return (
                 f"delivery platform '{platform_name}' has no gateway "
                 "credentials configured (not connected). Configure it via "

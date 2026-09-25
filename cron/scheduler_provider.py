@@ -502,6 +502,7 @@ class InProcessCronScheduler(CronScheduler):
         ``web_server.py`` scopes per-profile cron API calls.
         """
         import logging
+        from cron import scheduler_preflight as sched_preflight
         from cron.scheduler import tick as cron_tick
         from cron.jobs import (
             clear_ticker_error,
@@ -548,13 +549,22 @@ class InProcessCronScheduler(CronScheduler):
                         home = entry[1] if isinstance(entry, tuple) else entry
                         # The launch profile owns adapters; another profile must
                         # never inherit its bot when its own transport is absent.
+                        is_launch = (profile_name or "default") == (default_profile or "default")
                         tick_adapters = (
                             adapters
-                            if (profile_name or "default") == (default_profile or "default")
+                            if is_launch
                             else (profile_adapters or {}).get(profile_name) or {}
                         )
                         home_token = set_hermes_home_override(str(home))
                         try:
+                            # A satellite with no bot of its own may still reach the exact
+                            # chats a primary route names for it: SharedRouteAdapters lends
+                            # the launch bot per target only, as the restart-safe drain does.
+                            # Routes are read under the override so they match this home.
+                            if not is_launch and not tick_adapters and adapters:
+                                routes = sched_preflight._primary_profile_routes_for_current_home()
+                                if routes:
+                                    tick_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
                             with use_cron_store(home):
                                 cron_tick(
                                     verbose=False,

@@ -264,7 +264,11 @@ class GatewayAuthorizationMixin:
         if (getattr(self, "_profile_failed_platforms", None) or {}).get(profile_name):
             return False
         routes = getattr(config, "profile_routes", None) or []
-        if not any(r.enabled and r.profile == profile_name and r.bot_profile is None for r in routes):
+        # A delivery-only route lends the bot to scheduled reports only, never to live chat.
+        if not any(
+            r.enabled and r.profile == profile_name and r.bot_profile is None and not r.delivery_only
+            for r in routes
+        ):
             return False
         from gateway.run import _multiplex_profile_homes
         try:
