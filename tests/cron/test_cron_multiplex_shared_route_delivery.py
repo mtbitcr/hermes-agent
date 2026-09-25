@@ -108,6 +108,34 @@ def test_satellite_routes_exact_target_through_primary_adapter(tmp_path, monkeyp
         reset_hermes_home_override(token)
 
 
+def test_chat_only_route_lends_the_primary_adapter_for_the_bare_chat_only(tmp_path, monkeypatch):
+    """A route that names only a chat lends the main bot for that bare chat, never for a target that
+    adds a thread: Discord sends to the thread part as a channel, so a job could otherwise post
+    through the main bot into any channel it can see."""
+    root = tmp_path / "root"
+    fitness_home = root / "profiles" / "fitness"
+    fitness_home.mkdir(parents=True)
+    (root / "config.yaml").write_text(yaml.safe_dump(PRIMARY_YAML), encoding="utf-8")
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
+    primary = _primary_adapter()
+
+    token = set_hermes_home_override(str(fitness_home))
+    try:
+        shared = SharedRouteAdapters(
+            {Platform.DISCORD: primary}, _primary_profile_routes_for_current_home()
+        )
+        error, standalone = _run(_job("1543065293755256852"), shared)
+        assert error is None, error
+        assert primary.sent == ["1543065293755256852"] and standalone == []
+
+        primary.sent.clear()
+        error, standalone = _run(_job("1543065293755256852:9"), shared)
+        assert error is not None
+        assert primary.sent == [] and standalone == []
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_shared_view_is_falsy_without_routes_or_primary_adapters():
     assert not SharedRouteAdapters({}, [])
     assert SharedRouteAdapters({Platform.DISCORD: object()}, []).get(Platform.DISCORD) is None
@@ -157,11 +185,13 @@ def _weekly_report(job, **kwargs):
 
 def _tick_planning_briefs(
     tmp_path, monkeypatch, delivery_only, *, adapters, planning_adapters, run_job=_weekly_report,
+    routes=None, jobs=None,
 ):
-    """Fire planning's owner, stray and ops telegram briefs through the regular multiplex ticker
-    (``_start_multiplex`` → ``cron.scheduler.tick``). ``adapters`` is the launch profile's live map,
-    ``planning_adapters`` planning's own. Returns ``(delivery_errors, standalone)``; ``standalone``
-    holds ``(chat_id, token)`` for every standalone ``_send_to_platform`` call."""
+    """Fire planning's owner, stray and ops telegram briefs (or the given ``jobs`` under the given
+    ``routes``) through the regular multiplex ticker (``_start_multiplex`` → ``cron.scheduler.tick``).
+    ``adapters`` is the launch profile's live map, ``planning_adapters`` planning's own. Returns
+    ``(delivery_errors, standalone)``; ``standalone`` holds ``(chat_id, token)`` for every
+    standalone ``_send_to_platform`` call."""
     from cron.scheduler_provider import InProcessCronScheduler
     from hermes_constants import get_hermes_home
 
@@ -169,21 +199,24 @@ def _tick_planning_briefs(
     planning_home = root / "profiles" / "planning"
     (planning_home / "cron").mkdir(parents=True)
     (root / "cron").mkdir()
-    (root / "config.yaml").write_text(yaml.safe_dump({"gateway": {
-        "multiplex_profiles": True,
-        "profile_routes": [
+    if routes is None:
+        routes = [
             {"name": "owner-reports", "platform": "telegram", "chat_id": OWNER_CHAT,
              "profile": "planning", "delivery_only": delivery_only},
             {"name": "ops", "platform": "telegram", "chat_id": OPS_CHAT, "profile": "ops"},
-        ],
+        ]
+    (root / "config.yaml").write_text(yaml.safe_dump({"gateway": {
+        "multiplex_profiles": True,
+        "profile_routes": routes,
     }}), encoding="utf-8")
     monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
 
-    jobs = [
-        {"id": "owner-brief", "name": "owner brief", "deliver": f"telegram:{OWNER_CHAT}"},
-        {"id": "stray-brief", "name": "stray brief", "deliver": f"telegram:{STRAY_CHAT}"},
-        {"id": "ops-brief", "name": "ops brief", "deliver": f"telegram:{OPS_CHAT}"},
-    ]
+    if jobs is None:
+        jobs = [
+            {"id": "owner-brief", "name": "owner brief", "deliver": f"telegram:{OWNER_CHAT}"},
+            {"id": "stray-brief", "name": "stray brief", "deliver": f"telegram:{STRAY_CHAT}"},
+            {"id": "ops-brief", "name": "ops brief", "deliver": f"telegram:{OPS_CHAT}"},
+        ]
     handed_out = threading.Event()
 
     def planning_due_jobs():
@@ -336,6 +369,49 @@ def test_multiplex_ticker_refuses_unrouted_targets_whatever_the_adapter_map(
     # The routed brief still goes on: once, and only to the routed chat.
     assert [chat for _, chat in sends] == [OWNER_CHAT]
     assert delivery_errors["owner-brief"] is None
+
+
+@pytest.mark.parametrize("shape", [
+    pytest.param("no_route", id="no-route"),
+    pytest.param("routed_on_discord_only", id="routed-on-another-platform"),
+])
+def test_multiplex_ticker_refuses_a_satellite_target_on_a_platform_no_route_names(
+    tmp_path, monkeypatch, shape,
+):
+    """A satellite under multiplex reaches a chat only through its own live adapter or a route that
+    names that exact chat. On a platform no route names for it, an explicit target and the home
+    channel that "all" resolves from the process env are both refused: the standalone send would
+    carry the main bot's token, which the unscoped delivery config reads from the process env."""
+    from agent import secret_scope
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "placeholder-bot-token")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "111")
+    primary = _primary_adapter()
+    routes = [{"name": "ops", "platform": "telegram", "chat_id": OPS_CHAT, "profile": "ops"}]
+    planning_adapters = {}
+    if shape == "routed_on_discord_only":
+        routes.append({"name": "planning-discord", "platform": "discord", "chat_id": "424242",
+                       "profile": "planning"})
+        planning_adapters = {Platform.DISCORD: _primary_adapter()}
+    jobs = [
+        {"id": "explicit-brief", "name": "explicit brief", "deliver": "telegram:222"},
+        {"id": "all-brief", "name": "all brief", "deliver": "all"},
+    ]
+
+    was_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        delivery_errors, standalone = _tick_planning_briefs(
+            tmp_path, monkeypatch, False,
+            adapters={Platform.TELEGRAM: primary}, planning_adapters=planning_adapters,
+            routes=routes, jobs=jobs,
+        )
+    finally:
+        secret_scope.set_multiplex_active(was_multiplex)
+
+    assert primary.sent == []
+    assert standalone == []
+    assert "not named by an enabled route for this profile" in delivery_errors["explicit-brief"]
 
 
 def test_live_native_adapter_without_platform_block_is_not_treated_as_disabled():
