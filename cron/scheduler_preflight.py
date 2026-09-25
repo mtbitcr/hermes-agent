@@ -162,6 +162,29 @@ def _primary_profile_routes_for_current_home() -> list:
         return []
 
 
+def _serving_multiplex_satellite() -> bool:
+    """True while a multiplex gateway serves a profile other than its launch profile. The launch
+    profile's home is the process home (the root, or ``<root>/profiles/<name>`` under ``hermes -p
+    <name> gateway``): it owns the live adapters and the process environment. Any other served
+    profile may deliver only through its own live adapters or a route-exact lend of the launch
+    profile's: the standalone send's settings come from the unscoped delivery config, whose
+    environment holds the launch bot's credentials. Fails closed (True) under multiplex when the
+    homes cannot be compared."""
+    from agent.secret_scope import is_multiplex_active
+
+    if not is_multiplex_active():
+        return False
+    try:
+        from hermes_constants import get_hermes_home, get_process_hermes_home
+        return (
+            get_process_hermes_home().expanduser().resolve(strict=False)
+            != _sched.Path(get_hermes_home()).expanduser().resolve(strict=False)
+        )
+    except Exception:
+        logger.debug("multiplex home comparison unavailable", exc_info=True)
+        return True
+
+
 def _delivery_platform_routed_from_primary_gateway(platform_name: str) -> bool:
     """True when the primary gateway routes this platform to the profile being served.
 
@@ -201,18 +224,47 @@ class SharedRouteAdapters:
         thread_id = target.get("thread_id")
         thread_id = str(thread_id) if thread_id else None
         # A cron target carries no inbound guild anchor, so a route's guild_id is matched against
-        # itself — the target-exact discriminators (chat_id/thread_id) authorize the send. Without
-        # this the documented ``guild_id + chat_id`` Discord route never authorized cron output.
+        # itself — the target-exact discriminators (chat_id, plus thread_id when named) authorize
+        # the send. Without this the documented ``guild_id + chat_id`` Discord route never
+        # authorized cron output.
         for route in self._routes:
             if str(route.platform).lower() != platform_key:
                 continue
-            if not (route.chat_id or route.thread_id):
-                continue  # guild-only routes are not target-exact
+            if not route.chat_id:
+                # Only a route naming the chat is target-exact: a guild-only route names none, and a
+                # thread id alone is per chat on some platforms (Telegram topics, Slack threads), so
+                # a thread-only route would lend the main bot for any chat carrying that thread id.
+                continue
+            if thread_id and str(route.thread_id or "") != thread_id:
+                # A thread target is lent only by a route naming that exact thread: some platforms
+                # (Discord) send to the thread part as a channel, so a chat-only route would lend
+                # the main bot for any channel id given as the thread.
+                continue
             if route.matches(
                 str(route.platform), guild_id=route.guild_id, chat_id=chat_id, thread_id=thread_id,
             ):
                 return adapter
         return default
+
+
+def served_profile_adapters(runner):
+    """The adapter map a job of the profile being served may deliver through, as the multiplex ticker
+    builds it (``InProcessCronScheduler._start_multiplex``): the gateway's live map for its launch
+    profile; for any other served profile, its own live adapters or, with none, the launch bot lent
+    only for the exact chats an enabled route names for it. ``None`` without a runner. A path that
+    fires one job outside the ticker (a manual run, an external fire) uses this instead of
+    ``runner.adapters``: ``_deliver_result`` treats an adapter in the map it is given as the
+    profile's own."""
+    adapters = getattr(runner, "adapters", None) if runner is not None else None
+    if adapters is None or not _serving_multiplex_satellite():
+        return adapters
+    from hermes_cli.profiles import get_active_profile_name
+
+    own = (getattr(runner, "_profile_adapters", None) or {}).get(get_active_profile_name()) or {}
+    if own:
+        return own
+    routes = _primary_profile_routes_for_current_home()
+    return SharedRouteAdapters(adapters, routes) if routes else {}
 
 
 def _preflight_check_delivery(job: dict) -> Optional[str]:

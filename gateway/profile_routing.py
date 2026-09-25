@@ -9,6 +9,10 @@ A route applies only to messages received by the bot of its ``bot_profile`` (def
 default profile's shared bot). Telegram DM ``chat_id == user_id`` for EVERY bot, so without
 this a ``chat_id`` route meant for the shared bot would re-home the same user's DM with a
 dedicated secondary bot into another profile (#104933).
+
+A ``delivery_only`` route is outbound only: it lets the shared bot deliver its profile's scheduled
+reports to exactly that chat (``SharedRouteAdapters``), and every inbound use of the routes skips it.
+Otherwise a route to the owner's DM would also move the owner's own messages to that profile.
 """
 
 from __future__ import annotations
@@ -64,6 +68,7 @@ class ProfileRoute:
     thread_id: Optional[str] = None
     enabled: bool = True
     bot_profile: Optional[str] = None  # None = the default profile's bot
+    delivery_only: bool = False  # True = outbound delivery only, never matched for inbound
 
     @property
     def specificity(self) -> int:
@@ -150,6 +155,14 @@ def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRou
         except (ValueError, ImportError):
             logger.warning("Skipping profile route %s: invalid profile name %r", name, profile)
             continue
+        # Strict: only a real ``true`` stops inbound matching; anything else keeps today's route.
+        delivery_only = entry.get("delivery_only", False)
+        if not isinstance(delivery_only, bool):
+            logger.warning(
+                "Profile route %s: delivery_only must be true or false, got %r; "
+                "keeping it an ordinary route.", name, delivery_only,
+            )
+            delivery_only = False
         routes.append(ProfileRoute(
             name=name, platform=platform, profile=profile,
             guild_id=_coerce_route_id(entry.get("guild_id")),
@@ -157,6 +170,7 @@ def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRou
             thread_id=_coerce_route_id(entry.get("thread_id")),
             enabled=entry.get("enabled", True),
             bot_profile=_bot_profile_key(entry.get("bot_profile")),
+            delivery_only=delivery_only,
         ))
     routes.sort(key=lambda r: r.specificity, reverse=True)
     logger.debug("Loaded %d profile routes (most-specific-first)", len(routes))
@@ -168,9 +182,14 @@ def match_profile_route(
     thread_id: Optional[str] = None, parent_chat_id: Optional[str] = None,
     adapter_profile: Optional[str] = None,
 ) -> Optional[ProfileRoute]:
-    """Return the first (most specific) matching route, or None."""
+    """Return the first (most specific) matching inbound route, or None.
+
+    Delivery-only routes are skipped so they never re-home an inbound message.
+    """
     for route in routes:
-        if route.matches(platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id,
-                         parent_chat_id=parent_chat_id, adapter_profile=adapter_profile):
+        if not route.delivery_only and route.matches(
+            platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id,
+            parent_chat_id=parent_chat_id, adapter_profile=adapter_profile,
+        ):
             return route
     return None

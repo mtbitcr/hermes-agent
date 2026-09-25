@@ -833,11 +833,15 @@ def _run_claimed_job(
         # such as Matrix/aiohttp. Calling those clients from run_one_job's
         # standalone asyncio.run() loop raises errors like "Timeout context
         # manager should be used inside a task" and can break encrypted Matrix
-        # delivery (#61495 — salvaged from #63586 by @Fly-onlyone).
+        # delivery (#61495 — salvaged from #63586 by @Fly-onlyone). A satellite
+        # profile's run gets the map the ticker would give it, never the launch
+        # profile's live map.
+        from cron.scheduler_preflight import served_profile_adapters
+
         gateway_module = sys.modules.get("gateway.run")
         runner_ref = getattr(gateway_module, "_gateway_runner_ref", None)
         runner = runner_ref() if callable(runner_ref) else None
-        adapters = getattr(runner, "adapters", None) if runner is not None else None
+        adapters = served_profile_adapters(runner)
         gateway_loop = getattr(runner, "_gateway_loop", None) if runner is not None else None
 
         try:

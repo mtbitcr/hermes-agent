@@ -128,6 +128,35 @@ class TestRoutedSatellitePreflight:
         finally:
             reset_hermes_home_override(token)
 
+    @pytest.mark.parametrize("delivery_only", [False, True])
+    def test_live_scheduler_preflight_allows_only_the_routed_platform(
+        self, tmp_path, monkeypatch, delivery_only,
+    ):
+        """``cron.scheduler`` — the module the regular multiplex ticker runs — applies the same
+        rescue before a satellite job runs; a delivery-only route rescues like an ordinary one."""
+        from cron import scheduler as live_scheduler
+
+        root = tmp_path / "root"
+        grant_home = root / "profiles" / "grant"
+        grant_home.mkdir(parents=True)
+        cfg = yaml.safe_load(yaml.safe_dump(PRIMARY_YAML))
+        cfg["gateway"]["profile_routes"][0]["delivery_only"] = delivery_only
+        (root / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        monkeypatch.setattr(
+            "hermes_constants.get_default_hermes_root", lambda: root
+        )
+        token = set_hermes_home_override(str(grant_home))
+        try:
+            with patch("gateway.config.load_gateway_config",
+                       return_value=_gateway_config(set())):
+                assert live_scheduler._preflight_check_delivery(
+                    {"deliver": "telegram:-1004306455751:14"}) is None
+                reason = live_scheduler._preflight_check_delivery(
+                    {"deliver": "discord:12345"})
+        finally:
+            reset_hermes_home_override(token)
+        assert reason is not None and "discord" in reason
+
     def test_disabled_route_does_not_rescue(self, tmp_path, monkeypatch):
         """``enabled: false`` routes are inert — the block stands."""
         root = tmp_path / "root"

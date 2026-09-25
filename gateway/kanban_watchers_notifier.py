@@ -126,6 +126,10 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
     # route's matcher (including platform-specific identity aliases), not a second
     # hand-maintained equality implementation.
     for route in getattr(config, "profile_routes", None) or []:
+        # A delivery-only route does not move the chat to its profile, so it cannot
+        # re-home that chat's card notices either.
+        if route.delivery_only:
+            continue
         if route.matches(platform.value, guild_id=guild, chat_id=chat,
                          thread_id=thread, parent_chat_id=parent):
             if route.profile != profile:
@@ -160,7 +164,8 @@ class _Collector:
         if getattr(config, "multiplex_profiles", False):
             self.notifier_profiles.update(
                 route.profile for route in config.profile_routes
-                if route.enabled and route.platform in _platform_names(runner.adapters)
+                if route.enabled and not route.delivery_only
+                and route.platform in _platform_names(runner.adapters)
             )
         # Include every platform any secondary profile has live. This is only a
         # coarse pre-filter; exact destination authorization runs before claim

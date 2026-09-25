@@ -649,3 +649,61 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch, primary
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
     assert tick_count[:3] == [primary_adapters, secondary_adapters, {}]
+
+
+def test_multiplex_ticker_lends_primary_bot_to_satellite_only_for_its_routed_chat(tmp_path, monkeypatch):
+    """A satellite with no bot of its own is handed the shared-route adapter map the restart-safe
+    drain builds: the launch profile's bot for exactly the chat a primary route names for it, and
+    nothing else. A secondary with its own bot, or a satellite no route names, keeps its own map."""
+    from pathlib import Path
+
+    import yaml
+
+    from cron.scheduler_provider import InProcessCronScheduler
+    from gateway.config import Platform
+    from hermes_constants import get_hermes_home
+
+    root = tmp_path / "root"
+    homes = {name: root / "profiles" / name for name in ("home-ops", "planning", "lonely")}
+    for home in (root, *homes.values()):
+        (home / "cron").mkdir(parents=True)
+    (root / "config.yaml").write_text(yaml.safe_dump({"gateway": {
+        "multiplex_profiles": True,
+        "profile_routes": [
+            {"name": "owner-reports", "platform": "telegram", "chat_id": "640466638",
+             "profile": "planning", "delivery_only": True},
+            {"name": "ops", "platform": "telegram", "chat_id": "-100777", "profile": "home-ops"},
+        ],
+    }}), encoding="utf-8")
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
+
+    primary_bot, ops_bot = object(), object()
+    handed = {}
+
+    def _tracking_tick(*args, **kwargs):
+        handed.setdefault(Path(get_hermes_home()).name, kwargs["adapters"])
+        return 0
+
+    stop = threading.Event()
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        t = threading.Thread(target=InProcessCronScheduler().start, args=(stop,), kwargs={
+            "interval": 0, "profile_homes": [(None, root), *homes.items()],
+            "adapters": {Platform.TELEGRAM: primary_bot},
+            "profile_adapters": {"home-ops": {Platform.TELEGRAM: ops_bot}, "planning": {}, "lonely": {}},
+            "default_profile": None,
+        }, daemon=True)
+        t.start()
+        assert _wait_until(lambda: len(handed) >= 4), f"ticked only {sorted(handed)}"
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive()
+    shared = handed["planning"]
+    assert shared.get(Platform.TELEGRAM, {"chat_id": "640466638"}) is primary_bot
+    assert shared.get(Platform.TELEGRAM, {"chat_id": "-100777"}) is None  # another profile's chat
+    assert shared.get(Platform.TELEGRAM, {"chat_id": "555000111"}) is None
+    assert shared.get(Platform.TELEGRAM) is None  # never lent without an exact target
+    assert handed["root"] == {Platform.TELEGRAM: primary_bot}
+    assert handed["home-ops"] == {Platform.TELEGRAM: ops_bot}
+    assert handed["lonely"] == {}

@@ -11717,7 +11717,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # (whose only send path IS the live relay adapter — no native
             # credential exists) fail with "platform 'X' not
             # configured/enabled" on every external-provider fire even though
-            # the same job delivers fine under the built-in ticker.
+            # the same job delivers fine under the built-in ticker. A fire scoped
+            # to a satellite profile gets the map the ticker would give it,
+            # never the launch profile's live map.
+            from cron.scheduler_preflight import served_profile_adapters
+
             runner = self.gateway_runner or request.app.get("gateway_runner")
             if runner is None:
                 try:
@@ -11726,7 +11730,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     runner = _gateway_runner_ref()
                 except Exception:
                     runner = None
-            adapters = getattr(runner, "adapters", None) or None
+            adapters = served_profile_adapters(runner) or None
 
             if not provider_supports_split_fire(provider):
                 # Legacy single-phase provider: it overrides the documented
