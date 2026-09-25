@@ -2598,25 +2598,46 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
-        from cron.scheduler_preflight import SharedRouteAdapters, _delivery_platform_routed_from_primary_gateway
+        from cron.scheduler_preflight import (
+            SharedRouteAdapters,
+            _delivery_platform_routed_from_primary_gateway,
+            _primary_profile_routes_for_current_home,
+        )
         from gateway.delivery import DeliveryTransport, resolve_delivery_transport
 
-        target_adapters, router_config, transport = adapters, config, None
-        if isinstance(adapters, SharedRouteAdapters):
-            # Credentialless satellite: the primary adapter serves THIS target only when an
-            # enabled primary route names it for this profile. A miss on a platform the primary
-            # serves for this profile (its adapter is here, or a route names that platform) is
-            # refused: the standalone path below would send it with the primary bot's token from
-            # the process env. A miss on any other platform keeps the satellite's own path below.
-            shared = adapters.get(platform, target)
-            if shared is None and (
-                adapters._primary.get(platform) is not None
-                or _delivery_platform_routed_from_primary_gateway(platform_name)
-            ):
-                msg = f"platform '{platform_name}' target is not named by an enabled route for this profile"
+        # The one check that decides which targets a profile may reach on a platform it has no
+        # live adapter of its own for (a shared map, None, {}, or a plain map of other platforms
+        # only), whatever the map type. Once a primary route names this platform for the profile,
+        # or the shared map's primary serves it, a target goes on only if SharedRouteAdapters.get
+        # lends it: an enabled route for this profile names it exactly (and, from a shared map, the
+        # primary's adapter for it is live). Anything else is refused here, before the transport
+        # resolution, the DeliveryRouter and the standalone send, whose settings come from the
+        # unscoped config and so from the main bot's token in the process env.
+        shared_map = adapters if isinstance(adapters, SharedRouteAdapters) else None
+        if not (isinstance(adapters, dict) and adapters.get(platform) is not None) and (
+            _delivery_platform_routed_from_primary_gateway(platform_name)
+            or (shared_map is not None and shared_map._primary.get(platform) is not None)
+        ):
+            # A plain map carries no primary adapter: a placeholder stands in for it, so the same
+            # exact match runs against this profile's enabled primary routes.
+            lender = shared_map if shared_map is not None else SharedRouteAdapters(
+                {platform: object()}, _primary_profile_routes_for_current_home(),
+            )
+            if lender.get(platform, target) is None:
+                msg = (
+                    f"platform '{platform_name}' target is not named by an enabled route for this profile"
+                    if lender._primary.get(platform) is not None
+                    else f"platform '{platform_name}' has no live main-bot adapter for this profile's routes"
+                )
                 logger.warning("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
                 continue
+
+        target_adapters, router_config, transport = adapters, config, None
+        if isinstance(adapters, SharedRouteAdapters):
+            # Past the check above, a miss here is a platform the primary neither serves nor routes
+            # to this profile; it keeps the satellite's own path below.
+            shared = adapters.get(platform, target)
             target_adapters = {platform: shared} if shared is not None else {}
             if shared is not None:
                 # The primary's route authorised this exact adapter. The satellite's own

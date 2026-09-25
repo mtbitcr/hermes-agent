@@ -151,14 +151,17 @@ STRAY_CHAT = "555000111"
 OPS_CHAT = "-1002223334445"
 
 
-@pytest.mark.parametrize("delivery_only", [True, False])
-def test_multiplex_ticker_delivers_satellite_report_only_to_its_routed_chat(
-    tmp_path, monkeypatch, delivery_only,
+def _weekly_report(job, **kwargs):
+    return True, "out", "Weekly report", None
+
+
+def _tick_planning_briefs(
+    tmp_path, monkeypatch, delivery_only, *, adapters, planning_adapters, run_job=_weekly_report,
 ):
-    """Through the regular multiplex ticker (``_start_multiplex`` → ``cron.scheduler.tick``), a
-    credential-less satellite's scheduled report reaches the owner's chat through the PRIMARY bot,
-    because an enabled primary route names that exact chat for this satellite (delivery-only or
-    ordinary alike). Any other target — unrouted, or routed to another profile — is refused."""
+    """Fire planning's owner, stray and ops telegram briefs through the regular multiplex ticker
+    (``_start_multiplex`` → ``cron.scheduler.tick``). ``adapters`` is the launch profile's live map,
+    ``planning_adapters`` planning's own. Returns ``(delivery_errors, standalone)``; ``standalone``
+    holds ``(chat_id, token)`` for every standalone ``_send_to_platform`` call."""
     from cron.scheduler_provider import InProcessCronScheduler
     from hermes_constants import get_hermes_home
 
@@ -199,10 +202,10 @@ def test_multiplex_ticker_delivers_satellite_report_only_to_its_routed_chat(
     standalone = []
 
     async def standalone_send(platform, pconfig, chat_id, *args, **kwargs):
-        standalone.append(chat_id)
-        return {"error": "planning holds no telegram credential"}
+        # The token is whatever the unscoped gateway config handed the standalone path.
+        standalone.append((chat_id, getattr(pconfig, "token", None)))
+        return {"success": True, "message_id": "standalone-1"}
 
-    primary = _primary_adapter()
     loop = asyncio.new_event_loop()  # the gateway's running loop
     loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
     loop_thread.start()
@@ -211,7 +214,7 @@ def test_multiplex_ticker_delivers_satellite_report_only_to_its_routed_chat(
         with patch("cron.scheduler.get_due_jobs", side_effect=planning_due_jobs), \
              patch("cron.scheduler.advance_next_runs"), \
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
-             patch("cron.scheduler.run_job", return_value=(True, "out", "Weekly report", None)), \
+             patch("cron.scheduler.run_job", side_effect=run_job), \
              patch("cron.scheduler.save_job_output", return_value=str(tmp_path / "out.md")), \
              patch("cron.scheduler.mark_job_run", side_effect=record_run), \
              patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None), \
@@ -219,8 +222,8 @@ def test_multiplex_ticker_delivers_satellite_report_only_to_its_routed_chat(
             ticker = threading.Thread(target=InProcessCronScheduler().start, args=(stop,), kwargs={
                 "interval": 0, "loop": loop,
                 "profile_homes": [(None, root), ("planning", planning_home)],
-                "adapters": {Platform.TELEGRAM: primary},
-                "profile_adapters": {"planning": {}},  # planning holds no bot of its own
+                "adapters": adapters,
+                "profile_adapters": {"planning": planning_adapters},
                 "default_profile": None,
             }, daemon=True)
             ticker.start()
@@ -235,6 +238,23 @@ def test_multiplex_ticker_delivers_satellite_report_only_to_its_routed_chat(
         loop.close()
 
     assert set(delivery_errors) == {job["id"] for job in jobs}
+    return delivery_errors, standalone
+
+
+@pytest.mark.parametrize("delivery_only", [True, False])
+def test_multiplex_ticker_delivers_satellite_report_only_to_its_routed_chat(
+    tmp_path, monkeypatch, delivery_only,
+):
+    """Through the regular multiplex ticker (``_start_multiplex`` → ``cron.scheduler.tick``), a
+    credential-less satellite's scheduled report reaches the owner's chat through the PRIMARY bot,
+    because an enabled primary route names that exact chat for this satellite (delivery-only or
+    ordinary alike). Any other target — unrouted, or routed to another profile — is refused."""
+    primary = _primary_adapter()
+    delivery_errors, standalone = _tick_planning_briefs(
+        tmp_path, monkeypatch, delivery_only,
+        adapters={Platform.TELEGRAM: primary},
+        planning_adapters={},  # planning holds no bot of its own
+    )
     assert delivery_errors["owner-brief"] is None
     assert primary.sent == [OWNER_CHAT]  # the primary bot reached exactly the routed chat
     assert delivery_errors["stray-brief"] and delivery_errors["ops-brief"]  # refused
@@ -253,6 +273,69 @@ def test_multiplex_ticker_refuses_other_targets_when_process_env_holds_main_bot_
     test_multiplex_ticker_delivers_satellite_report_only_to_its_routed_chat(
         tmp_path, monkeypatch, delivery_only,
     )
+
+
+@pytest.mark.parametrize("delivery_only", [True, False])
+@pytest.mark.parametrize("shape", [
+    pytest.param("own_bot_on_discord", id="B-own-discord-bot"),
+    pytest.param("empty_main_map", id="A-empty-main-map"),
+])
+def test_multiplex_ticker_refuses_unrouted_targets_whatever_the_adapter_map(
+    tmp_path, monkeypatch, shape, delivery_only,
+):
+    """The refusal of a target no route names for this profile must not depend on the ticker
+    handing the profile a SharedRouteAdapters map. Two ordinary shapes hand it a plain map instead:
+    (B) planning runs its own bot on another platform, so its own map is not empty; (A) the main
+    adapter map is empty, e.g. while its Telegram adapter is popped for a reconnect. The process env
+    holds the main bot's token (a placeholder), and the real preflight runs inside run_job under
+    planning's secret scope with multiplex active; its per-platform route exception lets all three
+    briefs run. No brief may reach a chat no route names for planning: not through the main
+    adapter, not through planning's own adapter, not through the standalone send."""
+    from agent import secret_scope
+    from cron import scheduler as live_scheduler
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "placeholder-bot-token")
+    primary, own = _primary_adapter(), _primary_adapter()
+    if shape == "own_bot_on_discord":
+        adapters, planning_adapters = {Platform.TELEGRAM: primary}, {Platform.DISCORD: own}
+    else:
+        adapters, planning_adapters = {}, {}
+
+    preflight = {}
+
+    def run_job_behind_real_preflight(job, **kwargs):
+        # run_one_job has installed planning's secret scope around this call.
+        scoped_token = secret_scope.get_secret("TELEGRAM_BOT_TOKEN")
+        reason = live_scheduler._preflight_check_delivery(job)
+        preflight[job["id"]] = (scoped_token, reason)
+        if reason:  # what run_job returns when its preflight blocks
+            return False, reason, "", f"{live_scheduler.BLOCKED_CONFIG_MARKER} {reason}"
+        return _weekly_report(job)
+
+    was_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    try:
+        delivery_errors, standalone = _tick_planning_briefs(
+            tmp_path, monkeypatch, delivery_only,
+            adapters=adapters, planning_adapters=planning_adapters,
+            run_job=run_job_behind_real_preflight,
+        )
+    finally:
+        secret_scope.set_multiplex_active(was_multiplex)
+
+    # Planning's scope holds no bot token, and the route exception let every brief run.
+    assert preflight == {job_id: (None, None) for job_id in ("owner-brief", "stray-brief", "ops-brief")}
+    sends = (
+        [("main adapter", chat) for chat in primary.sent]
+        + [("planning's own adapter", chat) for chat in own.sent]
+        + [(f"standalone send, token={token}", chat) for chat, token in standalone]
+    )
+    assert [send for send in sends if send[1] in (STRAY_CHAT, OPS_CHAT)] == []
+    for job_id in ("stray-brief", "ops-brief"):
+        assert "not named by an enabled route for this profile" in delivery_errors[job_id]
+    # The routed brief still goes on: once, and only to the routed chat.
+    assert [chat for _, chat in sends] == [OWNER_CHAT]
+    assert delivery_errors["owner-brief"] is None
 
 
 def test_live_native_adapter_without_platform_block_is_not_treated_as_disabled():
