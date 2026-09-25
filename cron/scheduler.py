@@ -2602,20 +2602,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             SharedRouteAdapters,
             _delivery_platform_routed_from_primary_gateway,
             _primary_profile_routes_for_current_home,
+            _serving_multiplex_satellite,
         )
         from gateway.delivery import DeliveryTransport, resolve_delivery_transport
 
         # The one check that decides which targets a profile may reach on a platform it has no
         # live adapter of its own for (a shared map, None, {}, or a plain map of other platforms
-        # only), whatever the map type. Once a primary route names this platform for the profile,
-        # or the shared map's primary serves it, a target goes on only if SharedRouteAdapters.get
+        # only), whatever the map type. For a satellite served by a multiplex gateway it runs on
+        # every such platform; otherwise once a primary route names this platform for the profile,
+        # or the shared map's primary serves it. A target goes on only if SharedRouteAdapters.get
         # lends it: an enabled route for this profile names it exactly (and, from a shared map, the
         # primary's adapter for it is live). Anything else is refused here, before the transport
         # resolution, the DeliveryRouter and the standalone send, whose settings come from the
         # unscoped config and so from the main bot's token in the process env.
         shared_map = adapters if isinstance(adapters, SharedRouteAdapters) else None
         if not (isinstance(adapters, dict) and adapters.get(platform) is not None) and (
-            _delivery_platform_routed_from_primary_gateway(platform_name)
+            _serving_multiplex_satellite()
+            or _delivery_platform_routed_from_primary_gateway(platform_name)
             or (shared_map is not None and shared_map._primary.get(platform) is not None)
         ):
             # A plain map carries no primary adapter: a placeholder stands in for it, so the same

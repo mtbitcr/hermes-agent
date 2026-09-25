@@ -162,6 +162,26 @@ def _primary_profile_routes_for_current_home() -> list:
         return []
 
 
+def _serving_multiplex_satellite() -> bool:
+    """True while a multiplex gateway serves a non-primary profile. Such a profile's delivery may use
+    only its own live adapters or a route-exact lend of the primary's: the standalone send's settings
+    come from the unscoped delivery config, whose environment holds the main bot's credentials.
+    Fails closed (True) under multiplex when the homes cannot be compared."""
+    from agent.secret_scope import is_multiplex_active
+
+    if not is_multiplex_active():
+        return False
+    try:
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+        return (
+            get_default_hermes_root().expanduser().resolve(strict=False)
+            != _sched.Path(get_hermes_home()).expanduser().resolve(strict=False)
+        )
+    except Exception:
+        logger.debug("multiplex home comparison unavailable", exc_info=True)
+        return True
+
+
 def _delivery_platform_routed_from_primary_gateway(platform_name: str) -> bool:
     """True when the primary gateway routes this platform to the profile being served.
 
@@ -208,6 +228,11 @@ class SharedRouteAdapters:
                 continue
             if not (route.chat_id or route.thread_id):
                 continue  # guild-only routes are not target-exact
+            if thread_id and str(route.thread_id or "") != thread_id:
+                # A thread target is lent only by a route naming that exact thread: some platforms
+                # (Discord) send to the thread part as a channel, so a chat-only route would lend
+                # the main bot for any channel id given as the thread.
+                continue
             if route.matches(
                 str(route.platform), guild_id=route.guild_id, chat_id=chat_id, thread_id=thread_id,
             ):
