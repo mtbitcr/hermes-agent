@@ -35,6 +35,7 @@ import os
 import re
 import sqlite3
 import time
+from collections import Counter
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -1536,6 +1537,414 @@ def _status_report_collect(kb, status: str, limit: int, board_limit: int) -> str
             KANBAN_STATUS_REPORT_NO_REASON: reason_not_recorded,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# kanban_receipts_summary
+# ---------------------------------------------------------------------------
+
+#: Day bound for ``kanban_receipts_summary``: how far back one call looks for
+#: ended runs. Its board bound is the status report's.
+KANBAN_RECEIPTS_SUMMARY_DEFAULT_DAYS = 30
+KANBAN_RECEIPTS_SUMMARY_MAX_DAYS = 90
+
+#: Owner-facing labels for the facts a run or its card can fail to carry.
+#: Disclosed under these, never guessed at.
+KANBAN_RECEIPTS_SUMMARY_NO_PROFILE = "Profile not recorded"
+#: Stands in for a run's profile that is not a bounded identifier.
+KANBAN_RECEIPTS_SUMMARY_PROFILE_UNREADABLE = "Profile not readable"
+KANBAN_RECEIPTS_SUMMARY_NO_OUTCOME = "Outcome not recorded"
+KANBAN_RECEIPTS_SUMMARY_NO_CARD = "Card not found"
+KANBAN_RECEIPTS_SUMMARY_NO_MODEL_PIN = "No model pinned on the card"
+KANBAN_RECEIPTS_SUMMARY_NO_EFFORT_PIN = "Effort not pinned on the card"
+#: Stands in for a pinned model or effort that is not a bounded identifier.
+KANBAN_RECEIPTS_SUMMARY_PIN_UNREADABLE = "Pin not readable"
+#: Carried by every coding tool route line. No receipt records that route, so
+#: the line states what the card asks for now, never what ran.
+KANBAN_RECEIPTS_SUMMARY_REQUESTED = (
+    "requested: the card's current pin, which can differ from the pin a past "
+    "run was dispatched with"
+)
+
+# The one receipt shape trusted here is the one _worker_runtime_receipt
+# writes, and only on a run the kernel opened by a claim; any other counts
+# as a missing receipt rather than a guess.
+_RECEIPTS_SUMMARY_SCHEMA_VERSION = 3
+_RECEIPTS_SUMMARY_COST_SCOPE = "dominant-main-route"
+_RECEIPTS_SUMMARY_ROUTE_EVIDENCE = ("dominant-session-usage", "session-row")
+_RECEIPTS_SUMMARY_COST_CURRENCY = "USD"
+# The cap _runtime_receipt_cost applies before it writes an amount.
+_RECEIPTS_SUMMARY_MAX_COST = 1_000_000
+# Also the order of the per-state cost breakdown.
+_RECEIPTS_SUMMARY_KNOWN_COST_STATES = ("reported", "exact", "estimated", "included")
+
+
+def _receipts_summary_receipt(metadata: Any, profile: Any) -> Optional[tuple]:
+    """Validate one run's receipt; ``None`` when missing or of another shape.
+
+    ``profile`` is the run row's own: a receipt written for another profile,
+    or on a run with none recorded, is of another shape. Returns
+    ``(route, cost)``: ``route`` is the recorded (provider, model,
+    reasoning effort); ``cost`` is ``None`` when the receipt states that the
+    cost is unknown, else ``(currency, state, amount)``. A receipt failing
+    any check is not used at all, not even the parts that would pass.
+    """
+    if not isinstance(metadata, str):
+        return None
+    try:
+        parsed = json.loads(metadata)
+    except (ValueError, RecursionError):
+        return None
+    receipt = parsed.get("runtime_receipt") if isinstance(parsed, dict) else None
+    if not isinstance(receipt, dict):
+        return None
+    version = receipt.get("schema_version")
+    # bool is an int subclass: ``true`` is not a schema version.
+    if not isinstance(version, int) or isinstance(version, bool):
+        return None
+    if version != _RECEIPTS_SUMMARY_SCHEMA_VERSION or receipt.get("engine") != "hermes":
+        return None
+    receipt_profile = _runtime_receipt_value(receipt.get("profile"))
+    if (
+        receipt_profile is None
+        or receipt_profile != profile
+        or receipt.get("route_evidence") not in _RECEIPTS_SUMMARY_ROUTE_EVIDENCE
+        or not isinstance(receipt.get("capability"), dict)
+    ):
+        return None
+    route = tuple(
+        _runtime_receipt_value(receipt.get(key))
+        for key in ("provider", "model", "reasoning_effort")
+    )
+    cost = receipt.get("cost")
+    if None in route or not isinstance(cost, dict):
+        return None
+    if cost.get("scope") != _RECEIPTS_SUMMARY_COST_SCOPE:
+        return None
+    state = cost.get("state")
+    if state == "unknown":
+        return route, None
+    currency = cost.get("currency")
+    amount = cost.get("amount")
+    if (
+        state not in _RECEIPTS_SUMMARY_KNOWN_COST_STATES
+        or currency != _RECEIPTS_SUMMARY_COST_CURRENCY
+        or _runtime_receipt_value(cost.get("source")) is None
+        or not isinstance(amount, (int, float))
+        or isinstance(amount, bool)
+    ):
+        return None
+    try:
+        value = float(amount)
+    except OverflowError:
+        # A JSON integer too large for a float records no usable amount.
+        return None
+    if not math.isfinite(value) or value < 0 or value > _RECEIPTS_SUMMARY_MAX_COST:
+        return None
+    return route, (currency, state, value)
+
+
+def _receipts_summary_duration(started: Any, ended: Any) -> Optional[int]:
+    """Seconds between the run row's own start and end stamps, or ``None``.
+
+    The stamps are the kernel's, never the model's. A pair that is not two
+    integers, or that ends before it starts, has no valid duration.
+    """
+    if not isinstance(started, int) or not isinstance(ended, int):
+        return None
+    return ended - started if ended >= started else None
+
+
+def _receipts_summary_requested_route(row) -> tuple:
+    """The coding tool route the run's card requests, as ``(model, effort)``.
+
+    Read from the card as it is pinned now, so a pin changed after the run
+    shows the new one. Deliberately not resolved through the model policy
+    and not filtered by what the coding tool accepts: this is the request as
+    written, and the caller labels it as requested. Each pin is free text
+    from whoever wrote the card, so each is checked on its own like a
+    receipt value, and one that fails is reported as not readable, never
+    echoed.
+    """
+    if not row["card_found"]:
+        return KANBAN_RECEIPTS_SUMMARY_NO_CARD, KANBAN_RECEIPTS_SUMMARY_NO_CARD
+    model = str(row["model_override"] or "").strip()
+    if not model:
+        return (
+            KANBAN_RECEIPTS_SUMMARY_NO_MODEL_PIN,
+            KANBAN_RECEIPTS_SUMMARY_NO_MODEL_PIN,
+        )
+    model = _runtime_receipt_value(model) or KANBAN_RECEIPTS_SUMMARY_PIN_UNREADABLE
+    effort = str(row["reasoning_effort"] or "").strip()
+    if not effort:
+        return model, KANBAN_RECEIPTS_SUMMARY_NO_EFFORT_PIN
+    effort = _runtime_receipt_value(effort) or KANBAN_RECEIPTS_SUMMARY_PIN_UNREADABLE
+    return model, effort
+
+
+def _receipts_summary_read_board(conn, window_start: int):
+    """One board's ended runs inside the window, plus the runs left out.
+
+    Returns ``(rows, runs_still_open, runs_ended_before_window)``. Reads only
+    ``task_runs``, per run its own card's pinned model and effort, and whether
+    ``task_events`` holds the ``claimed`` event the kernel writes with a run
+    it opens by a claim. Run summaries and errors and the card's result are
+    written by the model, so they are never read.
+    """
+    rows = conn.execute(
+        "SELECT r.profile, r.outcome, r.started_at, r.ended_at, r.metadata, "
+        "t.id IS NOT NULL AS card_found, t.model_override, t.reasoning_effort, "
+        "EXISTS(SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
+        "AND e.run_id = r.id AND e.kind = 'claimed') AS kernel_claimed "
+        "FROM task_runs r LEFT JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.ended_at IS NOT NULL AND r.ended_at >= ?",
+        (window_start,),
+    ).fetchall()
+    left_out = conn.execute(
+        "SELECT COALESCE(SUM(ended_at IS NULL), 0), "
+        "COALESCE(SUM(ended_at < ?), 0) FROM task_runs",
+        (window_start,),
+    ).fetchone()
+    return rows, left_out[0], left_out[1]
+
+
+def _receipts_summary_add_run(boundaries: dict, row) -> None:
+    """Fold one ended run into its boundary's totals.
+
+    Outcome, run time and the requested route come from the run row and its
+    card whatever the receipt says; the recorded route and the cost come
+    only from a valid receipt on a run the kernel opened by a claim. A run
+    it synthesized for a card nobody claimed stores its caller's metadata
+    verbatim, so any receipt there counts as missing; so does one on a run
+    whose claim record event cleanup removed, which fails closed. Each run
+    lands in exactly one cost bucket: known, unknown, or receipt missing.
+    The boundary name is checked like a receipt value, and one that fails
+    is counted under the unreadable label, never echoed.
+    """
+    name = str(row["profile"] or "").strip()
+    if not name:
+        name = KANBAN_RECEIPTS_SUMMARY_NO_PROFILE
+    else:
+        name = (
+            _runtime_receipt_value(name) or KANBAN_RECEIPTS_SUMMARY_PROFILE_UNREADABLE
+        )
+    totals = boundaries.setdefault(
+        name,
+        {
+            "runs": 0,
+            "outcomes": Counter(),
+            "session_routes": Counter(),
+            "requested_routes": Counter(),
+            "seconds": 0,
+            "timed": 0,
+            # (currency, state) -> amounts, one per run.
+            "amounts": {},
+            "unknown_cost": 0,
+            "missing": 0,
+        },
+    )
+    totals["runs"] += 1
+    outcome = str(row["outcome"] or "").strip() or KANBAN_RECEIPTS_SUMMARY_NO_OUTCOME
+    totals["outcomes"][outcome] += 1
+    totals["requested_routes"][_receipts_summary_requested_route(row)] += 1
+    elapsed = _receipts_summary_duration(row["started_at"], row["ended_at"])
+    if elapsed is not None:
+        totals["seconds"] += elapsed
+        totals["timed"] += 1
+    receipt = (
+        _receipts_summary_receipt(row["metadata"], row["profile"])
+        if row["kernel_claimed"]
+        else None
+    )
+    if receipt is None:
+        totals["missing"] += 1
+        return
+    route, cost = receipt
+    totals["session_routes"][route] += 1
+    if cost is None:
+        totals["unknown_cost"] += 1
+    else:
+        currency, state, amount = cost
+        totals["amounts"].setdefault((currency, state), []).append(amount)
+
+
+def _receipts_summary_cost_view(amounts: dict) -> list:
+    """Known cost per currency: the sum, the runs it covers, and by state.
+
+    Only stated amounts are here. Unknown cost is never summed as zero, so a
+    boundary whose every cost is unknown has no currency line at all.
+    """
+    known = []
+    for currency in sorted({currency for currency, _ in amounts}):
+        by_state = [
+            {
+                "state": state,
+                "amount": round(math.fsum(amounts[(currency, state)]), 8),
+                "runs_covered": len(amounts[(currency, state)]),
+            }
+            for state in _RECEIPTS_SUMMARY_KNOWN_COST_STATES
+            if (currency, state) in amounts
+        ]
+        values = [
+            value
+            for state in _RECEIPTS_SUMMARY_KNOWN_COST_STATES
+            for value in amounts.get((currency, state), ())
+        ]
+        known.append(
+            {
+                "currency": currency,
+                "amount": round(math.fsum(values), 8),
+                "runs_covered": len(values),
+                "by_state": by_state,
+            }
+        )
+    return known
+
+
+def _receipts_summary_boundary_view(name: str, totals: dict) -> dict:
+    """Owner-facing figures for one boundary."""
+    return {
+        "boundary": name,
+        "runs": totals["runs"],
+        "runs_by_outcome": dict(sorted(totals["outcomes"].items())),
+        "session_routes_recorded": [
+            {
+                "provider": provider,
+                "model": model,
+                "reasoning_effort": effort,
+                "runs": runs,
+            }
+            for (provider, model, effort), runs in sorted(
+                totals["session_routes"].items()
+            )
+        ],
+        # Kept apart from the recorded routes above, never merged into them.
+        "coding_tool_routes_requested": [
+            {
+                "label": KANBAN_RECEIPTS_SUMMARY_REQUESTED,
+                "model": model,
+                "reasoning_effort": effort,
+                "runs": runs,
+            }
+            for (model, effort), runs in sorted(totals["requested_routes"].items())
+        ],
+        "run_time": {
+            "total_seconds": totals["seconds"],
+            "runs_covered": totals["timed"],
+            "runs_without_valid_duration": totals["runs"] - totals["timed"],
+        },
+        "cost": {
+            "scope": _RECEIPTS_SUMMARY_COST_SCOPE,
+            "known": _receipts_summary_cost_view(totals["amounts"]),
+            "unknown_runs": totals["unknown_cost"],
+        },
+        "receipts_missing": totals["missing"],
+    }
+
+
+def _receipts_summary_collect(kb, days: int, board_limit: int) -> str:
+    """Walk the bounded board set and build the per-boundary summary."""
+    boards = [
+        str(meta.get("slug"))
+        for meta in kb.list_boards(include_archived=False)
+        if meta.get("slug")
+    ]
+    scanned = boards[:board_limit]
+    boards_excluded = boards[board_limit:]
+
+    window_start = int(time.time()) - days * 86_400
+    boundaries: dict = {}
+    boards_unreadable = 0
+    runs_still_open = 0
+    runs_before_window = 0
+
+    for slug in scanned:
+        # By the board's own store path and read-only: never through the
+        # resolver that honours the dispatcher's board pin, and no
+        # ready-promotion side write.
+        conn = _status_report_readonly_conn(kb, slug)
+        if conn is None:
+            boards_unreadable += 1
+            continue
+        try:
+            rows, open_runs, before_window = _receipts_summary_read_board(
+                conn, window_start
+            )
+        except sqlite3.Error:
+            logger.exception("kanban_receipts_summary: board read failed")
+            boards_unreadable += 1
+            continue
+        finally:
+            conn.close()
+        # Counted only once the whole board has been read, so a board that
+        # fails partway adds nothing but its unreadable count.
+        runs_still_open += open_runs
+        runs_before_window += before_window
+        for row in rows:
+            _receipts_summary_add_run(boundaries, row)
+
+    return json.dumps(
+        {
+            "window_days": days,
+            "window_start": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(window_start)
+            ),
+            "board_limit": board_limit,
+            "boards_scanned": len(scanned),
+            "boundaries": [
+                _receipts_summary_boundary_view(name, boundaries[name])
+                for name in sorted(boundaries)
+            ],
+            "excluded": {
+                "boards_over_board_limit": len(boards_excluded),
+                "boards_unreadable": boards_unreadable,
+                "runs_ended_before_window": runs_before_window,
+                "runs_still_open": runs_still_open,
+            },
+            "truncated": bool(boards_excluded),
+        }
+    )
+
+
+def _handle_receipts_summary(args: dict, **kw) -> str:
+    """Per-boundary summary of past runs from their trusted receipts.
+
+    Gated exactly like ``kanban_status_report``, with the check repeated
+    here at call time. Scans up to ``board_limit`` boards and the runs that
+    ended in the last ``days`` days; what either bound leaves out is
+    disclosed as counts.
+    """
+    guard = _require_status_report_profile("kanban_receipts_summary")
+    if guard:
+        return guard
+
+    days, err = _status_report_bounded_int(
+        args,
+        "days",
+        KANBAN_RECEIPTS_SUMMARY_DEFAULT_DAYS,
+        KANBAN_RECEIPTS_SUMMARY_MAX_DAYS,
+    )
+    if err:
+        return tool_error(f"kanban_receipts_summary: {err}")
+    board_limit, err = _status_report_bounded_int(
+        args,
+        "board_limit",
+        KANBAN_STATUS_REPORT_DEFAULT_BOARD_LIMIT,
+        KANBAN_STATUS_REPORT_MAX_BOARD_LIMIT,
+    )
+    if err:
+        return tool_error(f"kanban_receipts_summary: {err}")
+
+    try:
+        from hermes_cli import kanban_db as kb
+
+        return _receipts_summary_collect(kb, days, board_limit)
+    except Exception:
+        # Not the exception text: it can carry a store path, and the owner
+        # sees this result.
+        logger.exception("kanban_receipts_summary failed")
+        return tool_error("kanban_receipts_summary: the boards could not be read")
+
 
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
@@ -3790,6 +4199,52 @@ KANBAN_STATUS_REPORT_SCHEMA = {
     },
 }
 
+KANBAN_RECEIPTS_SUMMARY_SCHEMA = {
+    "name": "kanban_receipts_summary",
+    "description": (
+        "Summarize past Kanban runs per boundary (the profile that ran "
+        "them) across every board, over the last `days` days, from the "
+        "runs' trusted receipts. For each boundary: runs by outcome; runs "
+        "per provider, model and reasoning effort as the receipts record "
+        "them; the coding tool route each card requests, on its own line "
+        "and labelled as requested, since receipts do not record it: the "
+        "card's current pin, which can differ from the pin a past run was "
+        "dispatched with, shown as "
+        f"'{KANBAN_RECEIPTS_SUMMARY_PIN_UNREADABLE}' when it is not a plain "
+        "identifier; total run time; and cost as the receipts record it, "
+        "with known amounts summed per currency beside the runs they cover "
+        "and runs of unknown cost counted on their own line, never as zero. "
+        "A receipt counts only on a run the kernel opened by a claim; a run "
+        "without such a receipt of the expected shape is counted as "
+        "missing, including a run whose claim record was removed by event "
+        "cleanup. Opens every board read-only and changes nothing; scans at "
+        "most `board_limit` boards, and whatever the bounds leave out is "
+        "reported as a count."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "days": {
+                "type": "integer",
+                "description": (
+                    "How many days back to count runs that ended, 1.."
+                    f"{KANBAN_RECEIPTS_SUMMARY_MAX_DAYS}. Defaults to "
+                    f"{KANBAN_RECEIPTS_SUMMARY_DEFAULT_DAYS}."
+                ),
+            },
+            "board_limit": {
+                "type": "integer",
+                "description": (
+                    "Maximum boards to scan in one call, 1.."
+                    f"{KANBAN_STATUS_REPORT_MAX_BOARD_LIMIT}. Defaults to "
+                    f"{KANBAN_STATUS_REPORT_DEFAULT_BOARD_LIMIT}."
+                ),
+            },
+        },
+        "required": [],
+    },
+}
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
@@ -4307,6 +4762,15 @@ registry.register(
     handler=_handle_status_report,
     check_fn=_check_kanban_status_report_mode,
     emoji="\U0001F4CA",
+)
+
+registry.register(
+    name="kanban_receipts_summary",
+    toolset="kanban",
+    schema=KANBAN_RECEIPTS_SUMMARY_SCHEMA,
+    handler=_handle_receipts_summary,
+    check_fn=_check_kanban_status_report_mode,
+    emoji="\U0001F9FE",
 )
 
 registry.register(
