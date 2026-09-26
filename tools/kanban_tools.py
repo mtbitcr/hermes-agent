@@ -1555,22 +1555,34 @@ KANBAN_RECEIPTS_SUMMARY_NO_OUTCOME = "Outcome not recorded"
 KANBAN_RECEIPTS_SUMMARY_NO_CARD = "Card not found"
 KANBAN_RECEIPTS_SUMMARY_NO_MODEL_PIN = "No model pinned on the card"
 KANBAN_RECEIPTS_SUMMARY_NO_EFFORT_PIN = "Effort not pinned on the card"
+#: Stands in for a pinned model or effort that is not a bounded identifier.
+KANBAN_RECEIPTS_SUMMARY_PIN_UNREADABLE = "Pin not readable"
 #: Carried by every coding tool route line. No receipt records that route, so
-#: the line states what the card asks for, never what ran.
-KANBAN_RECEIPTS_SUMMARY_REQUESTED = "requested (from the card's pin)"
+#: the line states what the card asks for now, never what ran.
+KANBAN_RECEIPTS_SUMMARY_REQUESTED = (
+    "requested: the card's current pin, which can differ from the pin a past "
+    "run was dispatched with"
+)
 
 # The one receipt shape trusted here is the one _worker_runtime_receipt
-# writes; any other shape counts as a missing receipt rather than a guess.
+# writes, and only on a run the kernel opened by a claim; any other counts
+# as a missing receipt rather than a guess.
 _RECEIPTS_SUMMARY_SCHEMA_VERSION = 3
 _RECEIPTS_SUMMARY_COST_SCOPE = "dominant-main-route"
+_RECEIPTS_SUMMARY_ROUTE_EVIDENCE = ("dominant-session-usage", "session-row")
+_RECEIPTS_SUMMARY_COST_CURRENCY = "USD"
+# The cap _runtime_receipt_cost applies before it writes an amount.
+_RECEIPTS_SUMMARY_MAX_COST = 1_000_000
 # Also the order of the per-state cost breakdown.
 _RECEIPTS_SUMMARY_KNOWN_COST_STATES = ("reported", "exact", "estimated", "included")
 
 
-def _receipts_summary_receipt(metadata: Any) -> Optional[tuple]:
+def _receipts_summary_receipt(metadata: Any, profile: Any) -> Optional[tuple]:
     """Validate one run's receipt; ``None`` when missing or of another shape.
 
-    Returns ``(route, cost)``: ``route`` is the recorded (provider, model,
+    ``profile`` is the run row's own: a receipt written for another profile,
+    or on a run with none recorded, is of another shape. Returns
+    ``(route, cost)``: ``route`` is the recorded (provider, model,
     reasoning effort); ``cost`` is ``None`` when the receipt states that the
     cost is unknown, else ``(currency, state, amount)``. A receipt failing
     any check is not used at all, not even the parts that would pass.
@@ -1590,6 +1602,14 @@ def _receipts_summary_receipt(metadata: Any) -> Optional[tuple]:
         return None
     if version != _RECEIPTS_SUMMARY_SCHEMA_VERSION or receipt.get("engine") != "hermes":
         return None
+    receipt_profile = _runtime_receipt_value(receipt.get("profile"))
+    if (
+        receipt_profile is None
+        or receipt_profile != profile
+        or receipt.get("route_evidence") not in _RECEIPTS_SUMMARY_ROUTE_EVIDENCE
+        or not isinstance(receipt.get("capability"), dict)
+    ):
+        return None
     route = tuple(
         _runtime_receipt_value(receipt.get(key))
         for key in ("provider", "model", "reasoning_effort")
@@ -1602,11 +1622,12 @@ def _receipts_summary_receipt(metadata: Any) -> Optional[tuple]:
     state = cost.get("state")
     if state == "unknown":
         return route, None
-    currency = _runtime_receipt_value(cost.get("currency"))
+    currency = cost.get("currency")
     amount = cost.get("amount")
     if (
         state not in _RECEIPTS_SUMMARY_KNOWN_COST_STATES
-        or currency is None
+        or currency != _RECEIPTS_SUMMARY_COST_CURRENCY
+        or _runtime_receipt_value(cost.get("source")) is None
         or not isinstance(amount, (int, float))
         or isinstance(amount, bool)
     ):
@@ -1616,7 +1637,7 @@ def _receipts_summary_receipt(metadata: Any) -> Optional[tuple]:
     except OverflowError:
         # A JSON integer too large for a float records no usable amount.
         return None
-    if not math.isfinite(value) or value < 0:
+    if not math.isfinite(value) or value < 0 or value > _RECEIPTS_SUMMARY_MAX_COST:
         return None
     return route, (currency, state, value)
 
@@ -1638,7 +1659,10 @@ def _receipts_summary_requested_route(row) -> tuple:
     Read from the card as it is pinned now, so a pin changed after the run
     shows the new one. Deliberately not resolved through the model policy
     and not filtered by what the coding tool accepts: this is the request as
-    written, and the caller labels it as requested.
+    written, and the caller labels it as requested. Each pin is free text
+    from whoever wrote the card, so each is checked on its own like a
+    receipt value, and one that fails is reported as not readable, never
+    echoed.
     """
     if not row["card_found"]:
         return KANBAN_RECEIPTS_SUMMARY_NO_CARD, KANBAN_RECEIPTS_SUMMARY_NO_CARD
@@ -1648,21 +1672,28 @@ def _receipts_summary_requested_route(row) -> tuple:
             KANBAN_RECEIPTS_SUMMARY_NO_MODEL_PIN,
             KANBAN_RECEIPTS_SUMMARY_NO_MODEL_PIN,
         )
+    model = _runtime_receipt_value(model) or KANBAN_RECEIPTS_SUMMARY_PIN_UNREADABLE
     effort = str(row["reasoning_effort"] or "").strip()
-    return model, effort or KANBAN_RECEIPTS_SUMMARY_NO_EFFORT_PIN
+    if not effort:
+        return model, KANBAN_RECEIPTS_SUMMARY_NO_EFFORT_PIN
+    effort = _runtime_receipt_value(effort) or KANBAN_RECEIPTS_SUMMARY_PIN_UNREADABLE
+    return model, effort
 
 
 def _receipts_summary_read_board(conn, window_start: int):
     """One board's ended runs inside the window, plus the runs left out.
 
     Returns ``(rows, runs_still_open, runs_ended_before_window)``. Reads only
-    ``task_runs`` and, per run, its own card's pinned model and effort. Run
-    summaries and errors and the card's result are written by the model, so
-    they are never read.
+    ``task_runs``, per run its own card's pinned model and effort, and whether
+    ``task_events`` holds the ``claimed`` event the kernel writes with a run
+    it opens by a claim. Run summaries and errors and the card's result are
+    written by the model, so they are never read.
     """
     rows = conn.execute(
         "SELECT r.profile, r.outcome, r.started_at, r.ended_at, r.metadata, "
-        "t.id IS NOT NULL AS card_found, t.model_override, t.reasoning_effort "
+        "t.id IS NOT NULL AS card_found, t.model_override, t.reasoning_effort, "
+        "EXISTS(SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
+        "AND e.run_id = r.id AND e.kind = 'claimed') AS kernel_claimed "
         "FROM task_runs r LEFT JOIN tasks t ON t.id = r.task_id "
         "WHERE r.ended_at IS NOT NULL AND r.ended_at >= ?",
         (window_start,),
@@ -1680,8 +1711,11 @@ def _receipts_summary_add_run(boundaries: dict, row) -> None:
 
     Outcome, run time and the requested route come from the run row and its
     card whatever the receipt says; the recorded route and the cost come
-    only from a valid receipt. Each run lands in exactly one cost bucket:
-    known, unknown, or receipt missing.
+    only from a valid receipt on a run the kernel opened by a claim. A run
+    it synthesized for a card nobody claimed stores its caller's metadata
+    verbatim, so any receipt there counts as missing; so does one on a run
+    whose claim record event cleanup removed, which fails closed. Each run
+    lands in exactly one cost bucket: known, unknown, or receipt missing.
     """
     name = str(row["profile"] or "").strip() or KANBAN_RECEIPTS_SUMMARY_NO_PROFILE
     totals = boundaries.setdefault(
@@ -1707,7 +1741,11 @@ def _receipts_summary_add_run(boundaries: dict, row) -> None:
     if elapsed is not None:
         totals["seconds"] += elapsed
         totals["timed"] += 1
-    receipt = _receipts_summary_receipt(row["metadata"])
+    receipt = (
+        _receipts_summary_receipt(row["metadata"], row["profile"])
+        if row["kernel_claimed"]
+        else None
+    )
     if receipt is None:
         totals["missing"] += 1
         return
@@ -4159,13 +4197,19 @@ KANBAN_RECEIPTS_SUMMARY_SCHEMA = {
         "runs' trusted receipts. For each boundary: runs by outcome; runs "
         "per provider, model and reasoning effort as the receipts record "
         "them; the coding tool route each card requests, on its own line "
-        "and labelled as requested, since receipts do not record it; total "
-        "run time; and cost as the receipts record it, with known amounts "
-        "summed per currency beside the runs they cover and runs of unknown "
-        "cost counted on their own line, never as zero. A run without a "
-        "receipt of the expected shape is counted as missing. Opens every "
-        "board read-only and changes nothing; scans at most `board_limit` "
-        "boards, and whatever the bounds leave out is reported as a count."
+        "and labelled as requested, since receipts do not record it: the "
+        "card's current pin, which can differ from the pin a past run was "
+        "dispatched with, shown as "
+        f"'{KANBAN_RECEIPTS_SUMMARY_PIN_UNREADABLE}' when it is not a plain "
+        "identifier; total run time; and cost as the receipts record it, "
+        "with known amounts summed per currency beside the runs they cover "
+        "and runs of unknown cost counted on their own line, never as zero. "
+        "A receipt counts only on a run the kernel opened by a claim; a run "
+        "without such a receipt of the expected shape is counted as "
+        "missing, including a run whose claim record was removed by event "
+        "cleanup. Opens every board read-only and changes nothing; scans at "
+        "most `board_limit` boards, and whatever the bounds leave out is "
+        "reported as a count."
     ),
     "parameters": {
         "type": "object",
