@@ -1551,6 +1551,8 @@ KANBAN_RECEIPTS_SUMMARY_MAX_DAYS = 90
 #: Owner-facing labels for the facts a run or its card can fail to carry.
 #: Disclosed under these, never guessed at.
 KANBAN_RECEIPTS_SUMMARY_NO_PROFILE = "Profile not recorded"
+#: Stands in for a run's profile that is not a bounded identifier.
+KANBAN_RECEIPTS_SUMMARY_PROFILE_UNREADABLE = "Profile not readable"
 KANBAN_RECEIPTS_SUMMARY_NO_OUTCOME = "Outcome not recorded"
 KANBAN_RECEIPTS_SUMMARY_NO_CARD = "Card not found"
 KANBAN_RECEIPTS_SUMMARY_NO_MODEL_PIN = "No model pinned on the card"
@@ -1716,8 +1718,16 @@ def _receipts_summary_add_run(boundaries: dict, row) -> None:
     verbatim, so any receipt there counts as missing; so does one on a run
     whose claim record event cleanup removed, which fails closed. Each run
     lands in exactly one cost bucket: known, unknown, or receipt missing.
+    The boundary name is checked like a receipt value, and one that fails
+    is counted under the unreadable label, never echoed.
     """
-    name = str(row["profile"] or "").strip() or KANBAN_RECEIPTS_SUMMARY_NO_PROFILE
+    name = str(row["profile"] or "").strip()
+    if not name:
+        name = KANBAN_RECEIPTS_SUMMARY_NO_PROFILE
+    else:
+        name = (
+            _runtime_receipt_value(name) or KANBAN_RECEIPTS_SUMMARY_PROFILE_UNREADABLE
+        )
     totals = boundaries.setdefault(
         name,
         {
