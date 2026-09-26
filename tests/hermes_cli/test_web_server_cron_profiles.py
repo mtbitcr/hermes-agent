@@ -1302,6 +1302,8 @@ def test_automations_machine_token_has_exact_native_cron_contour(
                 "claimed_at",
                 "started_at",
                 "finished_at",
+                "delivery_outcome",
+                "delivery",
             }
             assert owner_execution["job_id"] == job_id
             assert owner_execution["status"] == "failed"

@@ -93,7 +93,6 @@ tests/gateway/test_background_command.py
 tests/gateway/test_browser_control_api.py
 tests/gateway/test_browser_control_artifacts.py
 tests/gateway/test_choice_picker.py
-tests/gateway/test_cron_delivery_housekeeping.py
 tests/gateway/test_fast_command.py
 tests/gateway/test_hosted_room_execution_policy.py
 tests/gateway/test_kanban_changes_requested_notifier.py

@@ -506,6 +506,7 @@ from cron.jobs import (
     use_cron_store,
 )
 from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron import delivery_record
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -2346,12 +2347,13 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
+) -> bool:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
     send_video, send_document) based on file extension — mirroring the routing logic
-    in ``BasePlatformAdapter._process_message_background``.
+    in ``BasePlatformAdapter._process_message_background``. Returns True only when the
+    adapter confirmed every file.
     """
     from pathlib import Path
 
@@ -2359,6 +2361,7 @@ def _send_media_via_adapter(
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
+    complete = True
     for media_path, _is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
@@ -2379,7 +2382,7 @@ def _send_media_via_adapter(
                     "Job '%s': cannot send media %s, gateway loop unavailable",
                     job.get("id", "?"), media_path,
                 )
-                return
+                return False
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
@@ -2390,8 +2393,11 @@ def _send_media_via_adapter(
                     "Job '%s': media send failed for %s: %s",
                     job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
                 )
+            complete = complete and _confirm_adapter_delivery(result)
         except Exception as e:
+            complete = False
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+    return complete
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -2535,6 +2541,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from gateway.platforms.base import BasePlatformAdapter
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    # Inert unless this is a run's recorded report delivery: saves the exact text and attachments
+    # with every target pending before anything is handed over.
+    recorder = delivery_record.active_recorder()
+    recorder.begin(cleaned_delivery_content, media_files, targets)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -2554,11 +2564,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception as e:
         msg = f"failed to load gateway config: {e}"
         logger.error("Job '%s': %s", job["id"], msg)
+        recorder.settings_not_loaded()
         return msg
 
     delivery_errors = []
 
     for target in targets:
+        recorder.next_target()
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
@@ -2596,6 +2608,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             msg = f"unknown platform '{platform_name}'"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
+            recorder.note_failed("no_connection")
             continue
 
         from cron.scheduler_preflight import (
@@ -2634,6 +2647,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 )
                 logger.warning("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
+                recorder.note_failed(
+                    "route_refused" if lender._primary.get(platform) is not None else "no_connection"
+                )
                 continue
 
         target_adapters, router_config, transport = adapters, config, None
@@ -2681,6 +2697,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
+            recorder.note_failed("no_connection")
             continue
 
         # Prefer the resolved live transport when the gateway is running. This
@@ -2872,6 +2889,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
                 text_to_send = cleaned_delivery_content.strip()
+                recorder.handing_over(text_to_send)
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -2898,6 +2916,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         loop,
                     )
                     if future is None:
+                        recorder.note_failed("no_connection")
                         adapter_ok = False
                         target_errors.append("live adapter event loop scheduling failed")
                     else:
@@ -2906,6 +2925,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         try:
                             send_result = future.result(timeout=60)
                         except TimeoutError:
+                            recorder.note_unknown("timeout")
                             # #38922: a slow confirmation does NOT necessarily
                             # mean the send failed — but we must distinguish two
                             # cases via future.cancel()'s return value:
@@ -2976,6 +2996,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 send_raw_response = getattr(send_result, "raw_response", None)
 
                             if not send_success:
+                                recorder.note_unknown("error_after_handover")
                                 if isinstance(send_result, dict):
                                     err = send_result.get("error", "unknown")
                                     shape = "dict"
@@ -3020,6 +3041,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # payload is already assumed delivered (#38922).  Record the
                 # skipped attachments so the drop is visible rather than silently
                 # lost.
+                media_complete = True
                 if adapter_ok and not timed_out and media_files:
                     routed_media_metadata = dict(media_metadata or {})
                     if transport is not None and transport.is_relay:
@@ -3030,7 +3052,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _send_media_via_adapter(
+                    media_complete = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -3048,6 +3070,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     delivery_errors.append(msg)
 
                 if adapter_ok:
+                    if not timed_out:  # an in-flight timeout stays unknown
+                        recorder.note_sent(media_complete)
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
                     # Seed the thread session only now that delivery into it
@@ -3076,6 +3100,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
             except Exception as e:
+                recorder.live_error(e, cleaned_delivery_content.strip(), runtime_adapter, chat_id)
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
@@ -3097,6 +3122,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         f"relay delivery to {platform_name}:{chat_id} failed"
                     )
                 delivery_errors.extend(target_errors)
+                if not live_adapter_ready:
+                    recorder.note_failed("no_connection")
                 continue
             # If the interpreter is finalizing (gateway SIGTERM / restart /
             # OOM), scheduling any new delivery is futile — asyncio.run and a
@@ -3105,12 +3132,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             # rather than emitting an ERROR traceback on every restart-race
             # (#58720, #55924).
             if _interpreter_shutting_down():
+                recorder.note_unknown("interrupted")
                 msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
                 logger.warning("Job '%s': %s", job["id"], msg)
                 target_errors.append(msg)
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
+            recorder.handing_over(cleaned_delivery_content)
             coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
                 result = asyncio.run(coro)
@@ -3119,11 +3148,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # when it raises, the original coro was never started — close it to
                 # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
                 # fresh thread that has no running loop.
+                recorder.standalone_started(coro)
                 coro.close()
                 # If the RuntimeError is the interpreter-finalization signal,
                 # the fresh-thread fallback would fail identically — skip
                 # gracefully instead of logging a shutdown-race traceback.
                 if _interpreter_shutting_down(run_err):
+                    recorder.note_unknown("interrupted")
                     msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
                     logger.warning("Job '%s': %s", job["id"], msg)
                     target_errors.append(msg)
@@ -3148,23 +3179,27 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     # A shutdown-race here is expected during teardown; downgrade
                     # to a warning so it doesn't read as a genuine failure.
                     if _interpreter_shutting_down(e):
+                        recorder.note_unknown("interrupted")
                         msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
                         logger.warning("Job '%s': %s", job["id"], msg)
                         target_errors.append(msg)
                         delivery_errors.extend(target_errors)
                         continue
+                    recorder.standalone_error(e)
                     msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                     logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                     target_errors.extend([msg])
                     delivery_errors.extend(target_errors)
                     continue
             except Exception as e:
+                recorder.standalone_error(e)
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
                 continue
 
+            recorder.standalone_result(result, cleaned_delivery_content, platform, media_files)
             if result and result.get("error"):
                 # Include target context (platform/chat) so a bare error string
                 # like "Discord send failed: TimeoutError: " is attributable.
@@ -6423,12 +6458,17 @@ def _run_one_job_body(
                         if not owns_delivery:
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
-                        delivery_error = _deliver_result(
-                            job,
-                            deliver_content,
-                            adapters=adapters,
-                            loop=loop,
-                        )
+                        # Only the report itself is recorded, never a failure notice.
+                        with (
+                            delivery_record.recording(execution_id, job["id"])
+                            if success else contextlib.nullcontext()
+                        ):
+                            delivery_error = _deliver_result(
+                                job,
+                                deliver_content,
+                                adapters=adapters,
+                                loop=loop,
+                            )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
                         raise
