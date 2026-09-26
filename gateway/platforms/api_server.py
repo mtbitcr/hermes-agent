@@ -1391,6 +1391,10 @@ _OWNER_INTERRUPTED_TURN_MESSAGE = (
     "Raphael could not prepare a safe plan for this request. Nothing was "
     "changed. You can send it again."
 )
+_OWNER_REFUSED_TURN_MESSAGE = (
+    "Raphael could not work on this request as it is worded. Nothing was "
+    "changed. Rewording the request may help."
+)
 _OWNER_RUN_STOPPED_MESSAGE = (
     "This stopped before it finished. Nothing was changed. You can ask for it "
     "again."
@@ -2519,6 +2523,7 @@ class ResponseStore:
             )
 
         from agent.redact import redact_sensitive_text
+        from agent.turn_truncation import CONTENT_POLICY_REFUSAL_NOTICE_FIRST_LINE
 
         turns: List[Dict[str, str]] = []
         owner_text: Optional[str] = None
@@ -2529,6 +2534,9 @@ class ResponseStore:
         # Raphael reply at all. Reset at every owner boundary and read exactly
         # once, for the trailing turn, below the loop.
         unreadable_reply = False
+        # Whether the most recent such output of that turn is the platform's
+        # own refusal notice. Reset and read with ``unreadable_reply``.
+        refusal_notice_reply = False
         substituted_failure_turn = False
 
         def _flush() -> None:
@@ -2572,6 +2580,7 @@ class ResponseStore:
                 text = content.strip()
                 _flush()
                 unreadable_reply = False
+                refusal_notice_reply = False
                 if len(text) > _OWNER_HISTORY_OWNER_MAX_CHARS:
                     text = (
                         "[Earlier owner message omitted from this view because it "
@@ -2587,6 +2596,8 @@ class ResponseStore:
                 # Output that is not text at all still answered this turn with
                 # something no reader can turn into an outcome.
                 unreadable_reply = unreadable_reply or bool(content)
+                if content:
+                    refusal_notice_reply = False
                 continue
             text = content.strip()
             if not text:
@@ -2598,6 +2609,11 @@ class ResponseStore:
                 # shape that stranded the Workspace. Only the FACT that it
                 # happened is carried forward; the text itself never is.
                 unreadable_reply = True
+                # The platform's own refusal notice is recognised only by its
+                # fixed first line at the very start of the stored text.
+                refusal_notice_reply = content.startswith(
+                    CONTENT_POLICY_REFUSAL_NOTICE_FIRST_LINE
+                )
                 continue
             if (
                 not isinstance(candidate, dict)
@@ -2608,6 +2624,7 @@ class ResponseStore:
                 # Structured, but not a versioned Raphael reply: it names no
                 # kind this service ever writes, so it carries no outcome.
                 unreadable_reply = True
+                refusal_notice_reply = False
                 continue
             if (
                 candidate["kind"]
@@ -2653,12 +2670,22 @@ class ResponseStore:
         # turn is no longer a HIDDEN one: it is shown, with a terminal outcome
         # the owner can act on, so reporting it as missing would tell the caller
         # to warn about a turn it is already rendering.
+        #
+        # A turn the model provider declined as a safety matter ends on the
+        # platform's own refusal notice. Sending it again unchanged is only
+        # declined again, so its failure says rewording may help instead — also
+        # a fixed constant, so neither the notice nor the model's explanation
+        # reaches the owner.
         if owner_text is not None and raphael_text is None and unreadable_reply:
             raphael_text = json.dumps(
                 {
                     "schema_version": 1,
                     "kind": "failure",
-                    "message": _OWNER_INTERRUPTED_TURN_MESSAGE,
+                    "message": (
+                        _OWNER_REFUSED_TURN_MESSAGE
+                        if refusal_notice_reply
+                        else _OWNER_INTERRUPTED_TURN_MESSAGE
+                    ),
                 },
                 ensure_ascii=False,
             )
