@@ -12854,12 +12854,14 @@ def _list_cron_jobs_sync(profile: str = "all"):
 
 def _list_cron_executions_for_profile(profile: str, limit: int) -> List[Dict[str, Any]]:
     _profile_name, home = _cron_profile_home(profile)
+    from cron.delivery_record import history_deliveries
     from cron.executions import list_executions
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     token = set_hermes_home_override(str(home))
     try:
         rows = list_executions(limit=limit)
+        deliveries = history_deliveries(rows)
     finally:
         reset_hermes_home_override(token)
     return [
@@ -12869,8 +12871,10 @@ def _list_cron_executions_for_profile(profile: str, limit: int) -> List[Dict[str
             "claimed_at": row.get("claimed_at"),
             "started_at": row.get("started_at"),
             "finished_at": row.get("finished_at"),
+            "delivery_outcome": row.get("delivery_outcome"),
+            "delivery": delivery,
         }
-        for row in rows
+        for row, delivery in zip(rows, deliveries)
     ]
 
 
