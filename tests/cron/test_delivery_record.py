@@ -10,6 +10,7 @@ import contextlib
 import importlib
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -583,3 +584,94 @@ def test_old_records_are_pruned_but_never_inside_seven_days(monkeypatch):
     assert [store.load(f"old-{index}") for index in range(3)] == [None, None, None]
     assert all(store.load(f"recent-{index}") is not None for index in range(3))
     assert store.load("today") is not None
+
+
+def _history(store, *execution_ids):
+    rows = [{"id": execution_id, "status": "completed"} for execution_id in execution_ids]
+    return store.history_deliveries(rows, now=NOW)
+
+
+def test_store_file_is_private_under_a_permissive_umask():
+    store = _store()
+    previous = os.umask(0o022)
+    try:
+        _deliver(_job(CHAT), "Numbers are up.", standalone_reply=STANDALONE_BLOCKED)
+    finally:
+        os.umask(previous)
+
+    path = store._path()
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_text_over_the_size_cap_is_not_kept_and_reads_output_expired(monkeypatch):
+    store = _store()
+    monkeypatch.setattr(store, "MAX_SAVED_TEXT_BYTES", 64, raising=False)
+    monkeypatch.setattr(store, "_clock", lambda: NOW)
+
+    _deliver(_job(CHAT), "X" * 65, standalone_reply=STANDALONE_BLOCKED, execution_id="big")
+    _deliver(_job(CHAT), "X" * 64, standalone_reply=STANDALONE_BLOCKED, execution_id="fits")
+
+    assert store.load("big")["text"] is None
+    assert store.load("fits")["text"] == "X" * 64
+    big, fits = _history(store, "big", "fits")
+    assert big["resend"] == {"eligible": False, "reason": "output_expired", "attempts": []}
+    assert fits["resend"] == {"eligible": True, "reason": None, "attempts": []}
+
+
+def test_an_unreadable_stored_state_or_time_never_breaks_the_history(monkeypatch):
+    store = _store()
+    monkeypatch.setattr(store, "_clock", lambda: NOW)
+    for execution_id in ("odd-state", "odd-time", "plain"):
+        _deliver(_job(CHAT), "Numbers are up.", standalone_reply=STANDALONE_BLOCKED,
+                 execution_id=execution_id)
+    conn = sqlite3.connect(store._path())
+    try:
+        conn.execute("PRAGMA ignore_check_constraints = ON")
+        conn.execute("UPDATE targets SET state='bogus' WHERE execution_id='odd-state'")
+        conn.execute("UPDATE records SET created_at='not a time' WHERE execution_id='odd-time'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    odd_state, odd_time, plain = _history(store, "odd-state", "odd-time", "plain")
+
+    assert odd_state["state"] == "unknown"
+    assert odd_state["targets"][0]["state"] == "unknown"
+    assert odd_state["resend"]["eligible"] is False
+    assert odd_time["resend"] == {"eligible": False, "reason": "output_expired", "attempts": []}
+    assert plain["resend"] == {"eligible": True, "reason": None, "attempts": []}
+
+
+@pytest.fixture()
+def digits_route(tmp_path, monkeypatch):
+    """A satellite home whose one route is named with the routed chat id minus its sign."""
+    root = tmp_path / "root"
+    home = root / "profiles" / "reports"
+    home.mkdir(parents=True)
+    route = {"name": "Ops " + ROUTED_CHAT.lstrip("-"), "platform": "telegram",
+             "chat_id": ROUTED_CHAT, "profile": "reports"}
+    (root / "config.yaml").write_text(
+        yaml.safe_dump({"gateway": {"profile_routes": [route]}}), encoding="utf-8"
+    )
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
+    token = set_hermes_home_override(str(home))
+    try:
+        yield _primary_profile_routes_for_current_home()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_a_route_name_holding_the_chat_digits_is_not_shown(digits_route, live_loop):
+    store = _store()
+    fake = FakeTelegram()
+    _deliver(
+        _job(ROUTED_CHAT), "Numbers are up.",
+        adapters=SharedRouteAdapters({Platform.TELEGRAM: fake}, digits_route), loop=live_loop,
+    )
+    assert fake.sent == ["Numbers are up."]
+
+    [delivery] = store.history_deliveries([{"id": "exec-1", "status": "completed"}], now=None)
+
+    assert [target["label"] for target in delivery["targets"]] == ["Telegram"]
+    assert ROUTED_CHAT.lstrip("-") not in str(delivery)
