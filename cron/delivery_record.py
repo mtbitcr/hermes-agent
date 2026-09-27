@@ -22,11 +22,13 @@ import functools
 import inspect
 import json
 import logging
+import math
+import os
 import re
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
@@ -40,6 +42,8 @@ logger = logging.getLogger(__name__)
 RESEND_WINDOW_SECONDS = 7 * 86400
 # Records past the resend window are kept only while they are among the newest MAX_RECORDS.
 MAX_RECORDS = 1000
+# A text larger than this is not kept, so its run reads output_expired and is never re-sent.
+MAX_SAVED_TEXT_BYTES = 1024 * 1024
 # A target's outcome only moves up this order: a fallback the platform accepts turns an earlier
 # failure into delivered, and a send that may have happened keeps a later refusal unknown.
 _RANK = {"failed": 0, "unknown": 1, "delivered": 2}
@@ -88,10 +92,27 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _open(path: Path) -> sqlite3.Connection:
+    conn = open_ledger(path)
+    # The store holds report text and chat ids: owner-only, like the delivery queue and cron output.
+    # SQLite gives its -wal and -shm files the main file's mode.
+    for target, mode in ((path.parent, 0o700), (path, 0o600)):
+        with suppress(OSError):
+            os.chmod(target, mode)
+    return conn
+
+
 @contextmanager
 def _transaction(path: Path) -> Iterator[sqlite3.Connection]:
-    with ledger_transaction(_lock, lambda: open_ledger(path), _initialize_schema) as conn:
+    with ledger_transaction(_lock, lambda: _open(path), _initialize_schema) as conn:
         yield conn
+
+
+def _kept(text: Optional[str]) -> Optional[str]:
+    """``text`` as stored: None when it is larger than MAX_SAVED_TEXT_BYTES."""
+    if text is not None and len(text.encode("utf-8")) > MAX_SAVED_TEXT_BYTES:
+        return None
+    return text
 
 
 def _prune_unlocked(conn: sqlite3.Connection, now: float) -> None:
@@ -212,7 +233,7 @@ class _Recorder:
             conn.execute(
                 "INSERT OR REPLACE INTO records (execution_id, job_id, created_at, text, attachments) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (self.execution_id, self.job_id, now, text, json.dumps(attachments)),
+                (self.execution_id, self.job_id, now, _kept(text), json.dumps(attachments)),
             )
             conn.execute("DELETE FROM targets WHERE execution_id=?", (self.execution_id,))
             conn.executemany(
@@ -240,6 +261,10 @@ class _Recorder:
     def handing_over(self, text: str) -> None:
         """Keep the exact text about to be handed over when it is not the record's text."""
         sent_text = None if text == self._text else text
+        if sent_text is not None and _kept(sent_text) is None:
+            # Too large to keep: this run can no longer be re-sent as it was handed over.
+            self._write("UPDATE records SET text=NULL WHERE execution_id=?", (self.execution_id,))
+            sent_text = None
         if sent_text != self._sent_text:
             self._write(
                 "UPDATE targets SET sent_text=? WHERE execution_id=? AND position=?",
@@ -341,24 +366,31 @@ def active_recorder() -> _Recorder:
 
 # --- reading -------------------------------------------------------------------------------------
 
-def load_many(execution_ids: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
-    """This profile's records for ``execution_ids``; a target still pending reads
-    ``unknown``/``interrupted``."""
+def load_many(execution_ids: Iterable[Any], *, bodies: bool = True) -> Dict[str, Dict[str, Any]]:
+    """This profile's records for ``execution_ids``; a target still pending, or whose stored state
+    is not one this module writes, reads ``unknown``. With ``bodies=False`` each ``text`` is only
+    True when a text is kept (None otherwise), so a listing never loads the report bodies."""
     ids = list(dict.fromkeys(str(value) for value in execution_ids if value))
     path = _path()
     if not ids or not path.exists():
         return {}
     marks = ",".join("?" * len(ids))
+    text = "text" if bodies else "CASE WHEN text IS NULL THEN NULL ELSE 1 END AS text"
+    sent_text = "sent_text" if bodies else "CASE WHEN sent_text IS NULL THEN NULL ELSE 1 END AS sent_text"
     with _transaction(path) as conn:
-        records = conn.execute(f"SELECT * FROM records WHERE execution_id IN ({marks})", ids).fetchall()
+        records = conn.execute(
+            f"SELECT execution_id, job_id, created_at, {text}, attachments FROM records "
+            f"WHERE execution_id IN ({marks})", ids,
+        ).fetchall()
         targets = conn.execute(
-            f"SELECT * FROM targets WHERE execution_id IN ({marks}) ORDER BY execution_id, position", ids,
+            f"SELECT execution_id, platform, chat_id, thread_id, state, reason, {sent_text} FROM targets "
+            f"WHERE execution_id IN ({marks}) ORDER BY execution_id, position", ids,
         ).fetchall()
     loaded = {
         row["execution_id"]: {
             "job_id": row["job_id"],
             "created_at": row["created_at"],
-            "text": row["text"],
+            "text": row["text"] if bodies or row["text"] is None else True,
             "attachments": json.loads(row["attachments"] or "[]"),
             "targets": [],
         }
@@ -369,13 +401,15 @@ def load_many(execution_ids: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
         if record is None:
             continue
         pending = row["state"] == "pending"
+        known = row["state"] in _RANK
+        sent = row["sent_text"] if bodies or row["sent_text"] is None else True
         record["targets"].append({
             "platform": row["platform"],
             "chat_id": row["chat_id"],
             "thread_id": row["thread_id"],
-            "state": "unknown" if pending else row["state"],
-            "reason": "interrupted" if pending else row["reason"],
-            "text": row["sent_text"] if row["sent_text"] is not None else record["text"],
+            "state": row["state"] if known else "unknown",
+            "reason": "interrupted" if pending else (row["reason"] if known else None),
+            "text": sent if sent is not None else record["text"],
         })
     return loaded
 
@@ -397,7 +431,7 @@ def history_deliveries(
     else:
         now = float(now)
     try:
-        records = load_many(row.get("id") for row in rows)
+        records = load_many((row.get("id") for row in rows), bodies=False)
     except Exception:
         logger.warning("Cron delivery records could not be read", exc_info=True)
         records = {}
@@ -438,9 +472,20 @@ def _resend_refusal(row: Dict[str, Any], record: Dict[str, Any], now: float) -> 
     if not failed:
         unknown = any(target["state"] == "unknown" for target in record["targets"])
         return "outcome_unknown" if unknown else "already_delivered"
-    if now - record["created_at"] >= RESEND_WINDOW_SECONDS or any(t["text"] is None for t in failed):
+    created = record["created_at"]
+    if (
+        not isinstance(created, (int, float)) or isinstance(created, bool) or not math.isfinite(created)
+        or now - created >= RESEND_WINDOW_SECONDS or any(t["text"] is None for t in failed)
+    ):
         return "output_expired"
     return None
+
+
+def _names_id(name: str, value: Any) -> bool:
+    """Whether a route name shows an id, also written without its sign or separators."""
+    text = str(value)
+    digits = re.sub(r"\D", "", text)
+    return text in name or (len(digits) >= 5 and digits in re.sub(r"\D", "", name))
 
 
 def _labels(targets: List[Dict[str, Any]], routes: list) -> List[str]:
@@ -458,7 +503,7 @@ def _labels(targets: List[Dict[str, Any]], routes: list) -> List[str]:
                 continue
             name = str(getattr(route, "name", "") or "").strip()
             ids = (target["chat_id"], target["thread_id"], route.chat_id, route.thread_id, route.guild_id)
-            if name and not any(str(value) in name for value in ids if value):
+            if name and not any(_names_id(name, value) for value in ids if value):
                 label = f"{label} ({name})"
             break
         labels.append(label)
