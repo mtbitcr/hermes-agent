@@ -53,6 +53,11 @@ MAX_SAVED_TEXT_BYTES = 1024 * 1024
 # A target's outcome only moves up this order: a fallback the platform accepts turns an earlier
 # failure into delivered, and a send that may have happened keeps a later refusal unknown.
 _RANK = {"failed": 0, "unknown": 1, "delivered": 2}
+# Re-send attempts are bounded: a request id's length and the attempts one run may have.
+MAX_REQUEST_ID_CHARS = 128
+MAX_RESEND_ATTEMPTS = 5
+# The chat states a re-send attempt writes.
+_CHAT_STATES = frozenset({"in_progress", "failed", "unknown", "delivered"})
 # The reason codes a re-send attempt keeps for a chat; any other reason, such as error text, is dropped.
 _REASONS = frozenset({
     "route_refused", "no_connection", "settings_not_loaded", "platform_refused",
@@ -458,15 +463,36 @@ def _load_unlocked(conn: sqlite3.Connection, ids: List[str], bodies: bool) -> Di
 
 
 def _attempt(row: Any) -> Dict[str, Any]:
+    """An attempt as stored. Chats that cannot be read are None and the attempt reads unknown."""
+    chats = _chats(row["chats"])
     return {
         "attempt_id": row["attempt_id"],
         "request_id": row["request_id"],
         "requested_at": _iso(row["requested_at"]),
         "finished_at": _iso(row["finished_at"]),
-        "state": row["state"],
-        "chats": json.loads(row["chats"]),
-        "error": row["error"],
+        "state": row["state"] if chats is not None else "unknown",
+        "chats": chats,
+        "error": row["error"] if row["error"] in _REASONS else None,
     }
+
+
+def _chats(text: Any) -> Optional[List[Dict[str, Any]]]:
+    """An attempt's chats, or None when any of them is not what this module writes."""
+    try:
+        chats = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(chats, list):
+        return None
+    for chat in chats:
+        if (
+            not isinstance(chat, dict) or set(chat) != {"position", "state", "reason"}
+            or not isinstance(chat["position"], int) or isinstance(chat["position"], bool)
+            or chat["state"] not in _CHAT_STATES
+            or (chat["reason"] is not None and chat["reason"] not in _REASONS)
+        ):
+            return None
+    return chats
 
 
 def _iso(moment: Optional[float]) -> Optional[str]:
@@ -534,11 +560,16 @@ def _resend_refusal(row: Dict[str, Any], record: Dict[str, Any], now: float) -> 
         attempt["state"] == "in_progress" for attempt in record["attempts"]
     ):
         return "in_progress"
+    if any(attempt["chats"] is None for attempt in record["attempts"]):
+        # An attempt that cannot be read may have sent: never send again.
+        return "outcome_unknown"
     targets = _latest_targets(record)
     failed = [target for target in targets if target["state"] == "failed"]
     if not failed:
         unknown = any(target["state"] == "unknown" for target in targets)
         return "outcome_unknown" if unknown else "already_delivered"
+    if len(record["attempts"]) >= MAX_RESEND_ATTEMPTS:
+        return "too_many_attempts"
     created = record["created_at"]
     if (
         not isinstance(created, (int, float)) or isinstance(created, bool) or not math.isfinite(created)
@@ -549,12 +580,15 @@ def _resend_refusal(row: Dict[str, Any], record: Dict[str, Any], now: float) -> 
 
 
 def _latest_targets(record: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """The run's targets as its finished re-send attempts left them, the latest one last."""
-    targets = [dict(target) for target in record["targets"]]
+    """The run's targets as its finished re-send attempts left them, the latest one last. An attempt
+    changes only a target the run itself recorded as failed: the only chats a re-send may touch."""
+    recorded = record["targets"]
+    targets = [dict(target) for target in recorded]
     for attempt in record["attempts"]:
-        for chat in attempt["chats"]:
-            if 0 <= chat["position"] < len(targets):
-                targets[chat["position"]].update(state=chat["state"], reason=chat["reason"])
+        for chat in attempt["chats"] or ():
+            position = chat["position"]
+            if 0 <= position < len(targets) and recorded[position]["state"] == "failed":
+                targets[position].update(state=chat["state"], reason=chat["reason"])
     return targets
 
 
@@ -601,8 +635,8 @@ def claim_resend(row: Optional[Dict[str, Any]], request_id: Any) -> Dict[str, An
     first attempt and claims nothing. Returns ``{"claimed", "reason", "attempt"}``, where ``reason``
     is the view's refusal when nothing was claimed."""
     request_id = str(request_id or "")
-    if not request_id:
-        raise ValueError("a re-send claim needs a request id")
+    if not request_id or len(request_id) > MAX_REQUEST_ID_CHARS:
+        raise ValueError(f"a re-send claim needs a request id of 1 to {MAX_REQUEST_ID_CHARS} characters")
     row = row or {}
     execution_id = str(row.get("id") or "")
     path = _path()
@@ -617,7 +651,7 @@ def claim_resend(row: Optional[Dict[str, Any]], request_id: Any) -> Dict[str, An
             return {"claimed": False, "reason": "not_recorded", "attempt": None}
         for attempt in record["attempts"]:
             if attempt["request_id"] == request_id:
-                return {"claimed": False, "reason": None, "attempt": attempt}
+                return {"claimed": False, "reason": None, "attempt": _without_error(attempt)}
         reason = _resend_refusal(row, record, now)
         if reason is not None:
             return {"claimed": False, "reason": reason, "attempt": None}
@@ -634,21 +668,23 @@ def claim_resend(row: Optional[Dict[str, Any]], request_id: Any) -> Dict[str, An
         attempt = _attempt(
             conn.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
         )
-    return {"claimed": True, "reason": None, "attempt": attempt}
+    return {"claimed": True, "reason": None, "attempt": _without_error(attempt)}
+
+
+def _without_error(attempt: Dict[str, Any]) -> Dict[str, Any]:
+    """A claim's answer never carries an attempt's error."""
+    return {key: value for key, value in attempt.items() if key != "error"}
 
 
 def finish_resend(attempt_id: Any, results: Iterable[Dict[str, Any]], *, error: Any = None) -> bool:
     """Record how an attempt still in progress ended: each chat's ``state`` and ``reason`` from
-    ``results`` (``{"position", "state", "reason"}``), the finish time and ``error``, redacted. A
-    chat without a result reads ``unknown``/``interrupted``, a state that is not an outcome reads
-    ``unknown``, and a reason that is not a code is dropped. False, writing nothing, when the attempt
-    is not in progress."""
-    from agent.redact import redact_sensitive_text
-
+    ``results`` (``{"position", "state", "reason"}``), the finish time and ``error`` when it is a
+    reason code. Free error text is never stored: delivery errors name the chat. A chat without a
+    result reads ``unknown``/``interrupted``, a state that is not an outcome reads ``unknown``, and a
+    reason that is not a code is dropped. An attempt whose chats cannot be read ends ``unknown``.
+    False, writing nothing, when the attempt is not in progress."""
     given = {result.get("position"): result for result in results}
-    safe_error = (
-        redact_sensitive_text(str(error), force=True, redact_url_credentials=True) if error else None
-    )
+    safe_error = error if isinstance(error, str) and error in _REASONS else None
     path = _path()
     if not path.exists():
         return False
@@ -659,9 +695,14 @@ def finish_resend(attempt_id: Any, results: Iterable[Dict[str, Any]], *, error: 
         ).fetchone()
         if row is None:
             return False
-        chats = [
-            dict(chat, **_chat_result(given.get(chat["position"]))) for chat in json.loads(row["chats"])
-        ]
+        stored = _chats(row["chats"])
+        if stored is None:
+            cur = conn.execute(
+                "UPDATE attempts SET state='unknown', finished_at=? WHERE attempt_id=? AND state='in_progress'",
+                (_clock(), str(attempt_id)),
+            )
+            return cur.rowcount == 1
+        chats = [dict(chat, **_chat_result(given.get(chat["position"]))) for chat in stored]
         state = min((chat["state"] for chat in chats), key=_RANK.__getitem__, default="unknown")
         cur = conn.execute(
             "UPDATE attempts SET state=?, finished_at=?, chats=?, error=? "
@@ -694,9 +735,15 @@ def fence_resends() -> int:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute("SELECT attempt_id, chats FROM attempts WHERE state='in_progress'").fetchall()
         for row in rows:
-            chats = [
-                dict(chat, state="unknown", reason="interrupted") for chat in json.loads(row["chats"])
-            ]
+            stored = _chats(row["chats"])
+            if stored is None:
+                # Unreadable chats stay as they are; the attempt reads unknown and blocks the run.
+                fenced += conn.execute(
+                    "UPDATE attempts SET state='unknown', finished_at=? WHERE attempt_id=? AND state='in_progress'",
+                    (now, row["attempt_id"]),
+                ).rowcount
+                continue
+            chats = [dict(chat, state="unknown", reason="interrupted") for chat in stored]
             fenced += conn.execute(
                 "UPDATE attempts SET state='unknown', finished_at=?, chats=? "
                 "WHERE attempt_id=? AND state='in_progress'",
