@@ -4392,6 +4392,20 @@ def owner_title(value: Any) -> str:
     return title
 
 
+# Worker stop text carries shapes a title never does, so only
+# :func:`owner_stop_reason` checks these, on top of the title patterns: this
+# kernel's own task ids (``kanban_db._new_task_id``); a path of two or more
+# segments however it is punctuated or quoted (``/srv/x/y:``, ``'/srv/x/y'``),
+# but never a date or choice glued to a word (``12/05``, ``A/B``) or a URL's
+# path; a home path even one segment deep (``~/notes.txt``); a full commit id.
+_OWNER_PRIVATE_STOP_REASON_PATTERNS = (
+    re.compile(r"\bt_[0-9a-f]{8}\b"),
+    re.compile(r"(?<![\w/])(?:~|\.{1,2})?(?:/[A-Za-z0-9._-]+){2,}"),
+    re.compile(r"(?<![\w/])~/[A-Za-z0-9._-]"),
+    re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE),
+)
+
+
 def owner_stop_reason(
     value: Any,
     *,
@@ -4401,15 +4415,19 @@ def owner_stop_reason(
 
     Same egress contract as :func:`owner_title` — see
     :func:`_owner_display_text` — bounded at 500 code points. A reason that is
-    empty after cleaning, or that carries a private pattern in the cleaned OR
-    the raw text, is replaced whole by the fixed ``fallback`` sentence rather
-    than shown in part.
+    empty after cleaning, or that carries a private pattern (a title's, or one
+    of :data:`_OWNER_PRIVATE_STOP_REASON_PATTERNS`) in the cleaned OR the raw
+    text, is replaced whole by the fixed ``fallback`` sentence rather than
+    shown in part.
     """
     reason = _owner_display_text(value, limit=500)
     raw = str(value or "")
     if not reason or any(
         pattern.search(reason) or pattern.search(raw)
-        for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS
+        for pattern in (
+            *_OWNER_PRIVATE_WORK_ITEM_PATTERNS,
+            *_OWNER_PRIVATE_STOP_REASON_PATTERNS,
+        )
     ):
         return fallback
     return reason
