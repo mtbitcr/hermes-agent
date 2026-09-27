@@ -346,7 +346,7 @@ def test_simultaneous_claims_from_separate_processes_give_exactly_one_attempt(tm
 
 # --- finish ----------------------------------------------------------------------------------------
 
-def test_finish_records_each_chat_result_the_times_and_a_redacted_error(monkeypatch):
+def test_finish_records_each_chat_result_the_times_and_no_error_text(monkeypatch):
     store = _store()
     _at(monkeypatch, NOW)
     _run("exec-1", "delivered", "failed", "failed")
@@ -374,9 +374,10 @@ def test_finish_records_each_chat_result_the_times_and_a_redacted_error(monkeypa
     assert (stored["requested_at"], stored["finished_at"], stored["state"]) == (
         _iso(NOW + 60), _iso(NOW + 120), "failed",
     )
-    assert BLOCKED in stored["error"]
-    assert token not in stored["error"]
+    # Free error text is never stored: the scheduler's own errors name the chat.
+    assert stored["error"] is None
     assert token not in json.dumps(_attempt_rows())
+    assert "Forbidden" not in json.dumps(_attempt_rows())
     view = _view("exec-1")
     assert view["resend"] == {
         "eligible": True, "reason": None,
@@ -649,3 +650,114 @@ def test_attempts_are_pruned_only_with_their_record(monkeypatch):
 
     assert store.load("exec-old") is None
     assert [row["execution_id"] for row in _attempt_rows()] == ["exec-recent"]
+
+
+# --- security review of the record store (PR 121) -----------------------------------------------------
+
+def test_a_finished_attempt_keeps_a_reason_code_only_and_the_repeat_path_returns_no_error(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    _run("exec-code", "failed")
+    chat = _chat(0)
+    first = _claim("exec-code", "req-1")["attempt"]
+    # The scheduler's delivery errors embed platform:chat_id, and email addresses pass the redactor.
+    error = f"telegram:{chat}: {BLOCKED}; owner someone@example.test"
+    assert _finish(first, (0, "failed", "platform_refused"), error=error) is True
+    stored = json.dumps(_attempt_rows())
+    assert chat not in stored and "someone@example.test" not in stored and "Forbidden" not in stored
+    assert _attempt_rows()[0]["error"] is None
+
+    repeat = _claim("exec-code", "req-1")
+    assert (repeat["claimed"], repeat["reason"]) == (False, None)
+    assert "error" not in repeat["attempt"]
+    assert chat not in json.dumps(repeat)
+
+    second = _claim("exec-code", "req-2")["attempt"]
+    assert _finish(second, (0, "failed", "timeout"), error="timeout") is True
+    assert [row["error"] for row in _attempt_rows()] == [None, "timeout"]
+
+
+def test_a_request_id_longer_than_the_cap_is_refused_before_any_write(monkeypatch):
+    _at(monkeypatch, NOW)
+    _run("exec-long", "failed")
+    with pytest.raises(ValueError):
+        _claim("exec-long", "r" * 129)
+    assert _attempt_rows() == []
+    assert _claim("exec-long", "r" * 128)["claimed"] is True
+
+
+def test_a_run_stops_being_resendable_after_the_attempt_cap(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    _run("exec-cap", "failed")
+    for number in range(store.MAX_RESEND_ATTEMPTS):
+        claim = _claim("exec-cap", f"req-{number}")
+        assert claim["claimed"] is True
+        assert _finish(claim["attempt"], (0, "failed", "platform_refused")) is True
+
+    over = _claim("exec-cap", "req-over")
+    assert (over["claimed"], over["reason"], over["attempt"]) == (False, "too_many_attempts", None)
+    resend = _view("exec-cap")["resend"]
+    assert (resend["eligible"], resend["reason"]) == (False, "too_many_attempts")
+    assert len(_attempt_rows()) == store.MAX_RESEND_ATTEMPTS
+    # A request id the run already had still answers with its first attempt.
+    assert _claim("exec-cap", "req-0")["attempt"]["request_id"] == "req-0"
+
+
+def _forge_attempt(execution_id, state, chats, attempt_id="forged"):
+    conn = sqlite3.connect(_store()._path())
+    try:
+        conn.execute(
+            "INSERT INTO attempts (attempt_id, execution_id, request_id, requested_at, finished_at, state, chats) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (attempt_id, execution_id, f"req-{attempt_id}", NOW, None if state == "in_progress" else NOW, state,
+             chats),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_forged_attempt_never_makes_a_delivered_chat_resendable(monkeypatch):
+    _at(monkeypatch, NOW)
+    _run("exec-forged", "delivered", "failed")
+    first = _claim("exec-forged", "req-1")["attempt"]
+    assert _finish(first, (1, "delivered", None)) is True
+    assert _view("exec-forged")["resend"]["reason"] == "already_delivered"
+
+    # A well-formed row that marks the delivered chat 0 failed changes nothing.
+    _forge_attempt("exec-forged", "failed", json.dumps([
+        {"position": 0, "state": "failed", "reason": "platform_refused"},
+    ]), attempt_id="forged-delivered")
+    resend = _view("exec-forged")["resend"]
+    assert (resend["eligible"], resend["reason"]) == (False, "already_delivered")
+    claim = _claim("exec-forged", "req-2")
+    assert (claim["claimed"], claim["reason"]) == (False, "already_delivered")
+
+    # A row whose position is a bool cannot be read: the run is never sent again.
+    _forge_attempt("exec-forged", "failed", json.dumps([
+        {"position": True, "state": "failed", "reason": "platform_refused"},
+    ]), attempt_id="forged-bool")
+    resend = _view("exec-forged")["resend"]
+    assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
+    assert _claim("exec-forged", "req-3")["claimed"] is False
+
+
+def test_an_unreadable_attempt_reads_unknown_and_never_breaks_the_view_or_the_fence(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    _run("exec-bad", "failed")
+    _run("exec-good", "failed")
+    good = _claim("exec-good", "req-good")["attempt"]
+    _forge_attempt("exec-bad", "in_progress", "{not json")
+
+    resend = _view("exec-bad")["resend"]
+    assert resend["eligible"] is False
+    assert _claim("exec-bad", "req-new")["claimed"] is False
+
+    assert store.fence_resends() == 2
+    states = {row["attempt_id"]: row["state"] for row in _attempt_rows()}
+    assert states == {good["attempt_id"]: "unknown", "forged": "unknown"}
+    resend = _view("exec-bad")["resend"]
+    assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
+
