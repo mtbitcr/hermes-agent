@@ -2358,17 +2358,38 @@ class ResponseStore:
                 if isinstance(name, str)
                 and _OWNER_CONVERSATION_RE.fullmatch(name) is not None
             }
+            # The response an owner turn still holds is not an LRU entry
+            # either: a live reservation names it while the turn runs, and the
+            # owner page follows the turn through GET /v1/responses/{id}.
+            # Evicting it reported a running request as expired.
+            held_response_ids = {
+                held_response_id
+                for (held_response_id,) in self._conn.execute(
+                    "SELECT response_id FROM owner_conversation_reservations "
+                    "WHERE profile = ? AND expires_at > ?",
+                    (profile, time.time()),
+                ).fetchall()
+            }
+            # Only ordinary responses count against the cap. Counting the
+            # protected rows too meant a profile with more owner heads than
+            # the cap evicted every ordinary response on each write.
+            evictable_ids = [
+                candidate_id
+                for (candidate_id,) in self._conn.execute(
+                    "SELECT response_id FROM responses WHERE profile = ? "
+                    "ORDER BY accessed_at ASC",
+                    (profile,),
+                ).fetchall()
+                if candidate_id not in owner_response_ids
+                and candidate_id not in held_response_ids
+            ]
             evict_ids = []
-            for (candidate_id,) in self._conn.execute(
-                "SELECT response_id FROM responses WHERE profile = ? "
-                "ORDER BY accessed_at ASC",
-                (profile,),
-            ).fetchall():
-                if candidate_id == response_id or candidate_id in owner_response_ids:
+            for candidate_id in evictable_ids:
+                if len(evict_ids) >= len(evictable_ids) - self._max_size:
+                    break
+                if candidate_id == response_id:
                     continue
                 evict_ids.append(candidate_id)
-                if len(evict_ids) >= count - self._max_size:
-                    break
             if evict_ids:
                 placeholders = ",".join("?" for _ in evict_ids)
                 # Clear conversation mappings pointing to evicted responses
