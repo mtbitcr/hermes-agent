@@ -28920,6 +28920,105 @@ def task_stopped_work_states(
     return states
 
 
+def task_owner_waits(
+    conn: sqlite3.Connection,
+    task_ids: "Iterable[str]",
+) -> dict[str, dict]:
+    """Return each task that is waiting on the owner NOW, keyed by task id.
+
+    A task waits on the owner exactly when it is ``blocked``, its newest
+    block-transitioning event is a ``blocked`` event that no
+    :data:`_STOP_SUPERSEDING_EVENT_KINDS` event has superseded (compared by
+    event id), and that block asked the owner: ``block_kind`` is
+    ``needs_input`` or ``capability``. The capability case is decided by
+    :func:`_stopped_work_kind` itself and ``needs_input`` by the same rule, so
+    this can never disagree with :func:`task_stopped_work_states` or the owner
+    retry. A breaker stop (``gave_up``) never counts.
+
+    Each entry is ``{"kind": "needs_input" | "capability", "since":
+    <created_at of that blocked event>, "reason": <its payload reason or
+    None>}``; every other task is absent.
+
+    Batched and read-only: at most three queries per 500 ids, never one per
+    task, and no writes, so it runs on a read-only connection. A read that
+    fails returns an empty mapping.
+    """
+    ids = list(dict.fromkeys(str(task_id) for task_id in task_ids))
+    waits: dict[str, dict] = {}
+    try:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            task_rows = conn.execute(
+                "SELECT id, status, block_kind FROM tasks "
+                f"WHERE id IN ({placeholders}) AND status = 'blocked' "
+                "AND block_kind IN ('needs_input', 'capability')",
+                chunk,
+            ).fetchall()
+            if not task_rows:
+                continue
+            blocked_ids = [str(row["id"]) for row in task_rows]
+            placeholders = ",".join("?" for _ in blocked_ids)
+            kind_placeholders = ",".join("?" for _ in _STOP_TRANSITION_EVENT_KINDS)
+            stop_rows = conn.execute(
+                "SELECT task_id, id, kind, created_at, payload FROM task_events "
+                f"WHERE task_id IN ({placeholders}) AND kind IN ({kind_placeholders})",
+                (*blocked_ids, *_STOP_TRANSITION_EVENT_KINDS),
+            ).fetchall()
+            kind_placeholders = ",".join("?" for _ in _STOP_SUPERSEDING_EVENT_KINDS)
+            superseding_rows = conn.execute(
+                "SELECT task_id, MAX(id) AS latest FROM task_events "
+                f"WHERE task_id IN ({placeholders}) AND kind IN ({kind_placeholders}) "
+                "GROUP BY task_id",
+                (*blocked_ids, *_STOP_SUPERSEDING_EVENT_KINDS),
+            ).fetchall()
+            latest_stop: dict[str, sqlite3.Row] = {}
+            for row in stop_rows:
+                current = latest_stop.get(str(row["task_id"]))
+                if current is None or int(row["id"]) > int(current["id"]):
+                    latest_stop[str(row["task_id"])] = row
+            latest_superseding = {
+                str(row["task_id"]): int(row["latest"])
+                for row in superseding_rows if row["latest"] is not None
+            }
+            for row in task_rows:
+                task_id = str(row["id"])
+                stop = latest_stop.get(task_id)
+                if stop is None:
+                    continue
+                stop_event_id = int(stop["id"])
+                superseding = latest_superseding.get(task_id)
+                if row["block_kind"] == STOPPED_WORK_CAPABILITY:
+                    waiting = _stopped_work_kind(
+                        status=row["status"],
+                        block_kind=row["block_kind"],
+                        stop_kind=stop["kind"],
+                        stop_event_id=stop_event_id,
+                        superseding_event_id=superseding,
+                    ) == STOPPED_WORK_CAPABILITY
+                else:
+                    waiting = (
+                        row["status"] == "blocked"
+                        and stop["kind"] == "blocked"
+                        and not (superseding is not None and superseding > stop_event_id)
+                    )
+                if not waiting:
+                    continue
+                try:
+                    payload = json.loads(stop["payload"]) if stop["payload"] else {}
+                except (TypeError, ValueError):
+                    payload = {}
+                reason = payload.get("reason") if isinstance(payload, dict) else None
+                waits[task_id] = {
+                    "kind": str(row["block_kind"]),
+                    "since": int(stop["created_at"]),
+                    "reason": reason if isinstance(reason, str) else None,
+                }
+    except sqlite3.Error:
+        return {}
+    return waits
+
+
 def committed_owner_retry_event(
     conn: sqlite3.Connection,
     task_id: str,

@@ -2594,6 +2594,10 @@ OWNER_PROJECT_RUN_CONTEXT_CAPABILITY = "run_task_context"
 # planning. The ordinary snapshot keeps its historical closed schema; only a
 # reader naming this capability receives the bounded planning DTO below.
 OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY = "planning_context_v1"
+# A separately negotiated contour for what waits on the owner and why work
+# stopped. Without it the snapshot and Decisions keep today's shape and
+# selection exactly; only a reader naming it receives the waiting answers.
+OWNER_WAITING_CAPABILITY = "owner_waiting_v1"
 _OWNER_PROJECT_PLANNING_STATUSES = (
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
 )
@@ -2915,6 +2919,7 @@ def _owner_project_run_receipt(
     task_pin: Optional[OwnerTaskRoutePin],
     *,
     owner_retry_reason: Any = None,
+    owner_waiting: bool = False,
 ) -> dict:
     """Project one run for the owner.
 
@@ -2925,6 +2930,11 @@ def _owner_project_run_receipt(
     exists for this run: a run nobody retried carries no ``owner_retry`` block
     at all, so absent reads as absent and no reader inherits another run's
     reason.
+
+    ``owner_waiting`` is set only for a reader that named
+    ``OWNER_WAITING_CAPABILITY``: a review that asked for changes then reads
+    as rework rather than stopped work, and a blocked run carries the
+    owner-safe ``stop_reason`` its own summary recorded.
     """
     outcome = (run.outcome or run.status or "").strip().lower()
     if run.status == "running":
@@ -2961,6 +2971,15 @@ def _owner_project_run_receipt(
     ) if owner_retry_reason is not None else ""
     if retry_reason:
         receipt["owner_retry"] = {"state": "requested", "reason": retry_reason}
+    if owner_waiting:
+        if outcome == "changes_requested":
+            receipt["summary"] = (
+                "The review asked for changes; the work went back for rework."
+            )
+        elif outcome == "blocked":
+            receipt["stop_reason"] = owner_stop_reason(
+                run.summary, fallback="Work stopped and needs attention.",
+            )
     return receipt
 
 
@@ -2973,6 +2992,7 @@ def _owner_project_run_projection(
     retry_origin: str = kanban_db.RETRY_ORIGIN_UNATTRIBUTED,
     run_context: bool,
     owner_retry_reason: Any = None,
+    owner_waiting: bool = False,
 ) -> dict:
     """Project one run for the owner, carrying its retry fact but never its id.
 
@@ -3005,6 +3025,7 @@ def _owner_project_run_projection(
         "finished_at": _owner_timestamp(run.ended_at),
         "receipt": _owner_project_run_receipt(
             run, task_pin, owner_retry_reason=owner_retry_reason,
+            owner_waiting=owner_waiting,
         ),
     }
     if not run_context:
@@ -3254,6 +3275,7 @@ def read_project_snapshot(
     *,
     run_context: bool = False,
     planning_context: bool = False,
+    owner_waiting: bool = False,
 ) -> dict:
     """Return one bounded read-only surface for an exact receipt-owned Project.
 
@@ -3268,6 +3290,10 @@ def read_project_snapshot(
     It defaults off so the shape stays exactly what the oldest owner
     Workspace release accepts; see
     ``OWNER_PROJECT_RUN_CONTEXT_CAPABILITY``.
+
+    ``owner_waiting`` adds what waits on the owner and why work stopped; it
+    defaults off so the shape and selection stay exactly today's; see
+    ``OWNER_WAITING_CAPABILITY``.
     """
     try:
         project_slug = projects_db.normalize_slug(project_slug) or ""
@@ -3364,6 +3390,9 @@ def read_project_snapshot(
         # as stopped is exactly a card the retry would accept, and one it shows
         # as "none" is exactly one the retry would refuse.
         stopped_work = kanban_db.task_stopped_work_states(conn, tasks)
+        owner_waits = (
+            kanban_db.task_owner_waits(conn, task_ids) if owner_waiting else {}
+        )
 
         columns = {status: [] for status in _OWNER_PROJECT_COLUMNS}
         for task in tasks:
@@ -3386,6 +3415,12 @@ def read_project_snapshot(
                 "parent_ids": parent_map[task.id],
                 "child_ids": child_map[task.id],
             })
+            if owner_waiting and task.id in owner_waits:
+                wait = owner_waits[task.id]
+                columns[task.status][-1]["owner_wait"] = {
+                    "since": _owner_timestamp(wait["since"]),
+                    "reason": owner_stop_reason(wait["reason"]),
+                }
 
         worker_rows = kanban_db.verified_active_worker_rows(
             conn, project_id=project_id,
@@ -3456,6 +3491,7 @@ def read_project_snapshot(
                     ),
                     run_context=run_context,
                     owner_retry_reason=retry_reasons.get(int(row["id"])),
+                    owner_waiting=owner_waiting,
                 )
             )
             task_ids_with_newer_run.add(run_task_id)
@@ -3468,7 +3504,9 @@ def read_project_snapshot(
     finally:
         conn.close()
 
-    steward = project_steward_snapshot(project_id=project_id, lookback_days=7)
+    steward = project_steward_snapshot(
+        project_id=project_id, lookback_days=7, owner_waiting=owner_waiting,
+    )
 
     result = {
         "project": {
@@ -3664,7 +3702,7 @@ def _owner_decision_reason(value: Any, *, fallback: str) -> str:
     return text[:500] or fallback
 
 
-def list_owner_decisions(ctx: OwnerContext) -> dict:
+def list_owner_decisions(ctx: OwnerContext, *, owner_waiting: bool = False) -> dict:
     """Project pending native gates into one owner-safe read-only inbox.
 
     Returns ``{"data": [...], "truncated": bool}``. The window is bounded both
@@ -3680,6 +3718,13 @@ def list_owner_decisions(ctx: OwnerContext) -> dict:
     owner back to the authority-specific surface. Native ids, assignees,
     bodies, results, runs, provenance and private evidence never leave this
     boundary.
+
+    ``owner_waiting`` is set only for a reader that named
+    ``OWNER_WAITING_CAPABILITY``. A work card whose current stop is a
+    capability stop (see :func:`kanban_db.task_owner_waits`) then joins the
+    inbox as owner input, merged in each Project's own order before that
+    Project's window, and every owner-input item carries its own cleaned stop
+    reason and the time its wait began.
     """
     decisions: list[dict] = []
     truncated = False
@@ -3703,6 +3748,7 @@ def list_owner_decisions(ctx: OwnerContext) -> dict:
         else:
             board_path = kanban_db.board_dir(board_slug) / "kanban.db"
 
+        waits: dict[str, dict] = {}
         conn = _open_read_only_sqlite(board_path, label="kanban.db")
         try:
             columns = {
@@ -3730,6 +3776,29 @@ def list_owner_decisions(ctx: OwnerContext) -> dict:
                 "ORDER BY created_at DESC, id ASC LIMIT ?",
                 (project_id, _OWNER_DECISIONS_LIMIT + 1),
             ).fetchall()
+            if owner_waiting:
+                # Unbounded on purpose: only the CURRENT capability stops
+                # join, so the window below can be exact only if every
+                # candidate is read before the filter.
+                capability_rows = conn.execute(
+                    "SELECT id, title, status, created_at, task_kind, block_kind, "
+                    "review_policy, recommendation_label, recommendation_rationale, "
+                    "recommendation_decision FROM tasks WHERE project_id = ? "
+                    "AND task_kind = 'work' AND status = 'blocked' "
+                    "AND block_kind = 'capability' ORDER BY created_at DESC, id ASC",
+                    (project_id,),
+                ).fetchall()
+                waits = kanban_db.task_owner_waits(conn, [
+                    str(row["id"]) for row in (*rows, *capability_rows)
+                    if str(row["task_kind"]) == "work"
+                ])
+                rows = sorted(
+                    [
+                        *rows,
+                        *(row for row in capability_rows if str(row["id"]) in waits),
+                    ],
+                    key=lambda row: (-int(row["created_at"]), str(row["id"])),
+                )
         except sqlite3.Error as exc:
             raise OwnerWorkspaceError(
                 "snapshot_unavailable", "the Project decisions could not be read"
@@ -3757,6 +3826,11 @@ def list_owner_decisions(ctx: OwnerContext) -> dict:
                 kind = "owner_input"
                 title = owner_title(row["title"])
                 reason = "Raphael needs your answer before this work can continue."
+            elif owner_waiting and row["block_kind"] == "capability":
+                authority = "task"
+                kind = "owner_input"
+                title = owner_title(row["title"])
+                reason = "Raphael needs your answer before this work can continue."
             decisions.append({
                 "decision_ref": _owner_decision_ref(
                     ctx, authority=authority, native_id=str(row["id"])
@@ -3769,6 +3843,12 @@ def list_owner_decisions(ctx: OwnerContext) -> dict:
                 "reason": reason,
                 "created_at": _owner_timestamp(row["created_at"]),
             })
+            if owner_waiting and authority == "task" and str(row["id"]) in waits:
+                # The wait's own reason and start; a card with no current
+                # wait keeps the fixed sentence and its creation time.
+                wait = waits[str(row["id"])]
+                decisions[-1]["reason"] = owner_stop_reason(wait["reason"])
+                decisions[-1]["created_at"] = _owner_timestamp(wait["since"])
 
     authority_order = {"owner_input": 0, "capability": 1}
     decisions.sort(
@@ -4312,6 +4392,29 @@ def owner_title(value: Any) -> str:
     return title
 
 
+def owner_stop_reason(
+    value: Any,
+    *,
+    fallback: str = "Raphael needs your answer before this work can continue.",
+) -> str:
+    """Return the owner-safe reason a piece of work stopped, or ``fallback``.
+
+    Same egress contract as :func:`owner_title` — see
+    :func:`_owner_display_text` — bounded at 500 code points. A reason that is
+    empty after cleaning, or that carries a private pattern in the cleaned OR
+    the raw text, is replaced whole by the fixed ``fallback`` sentence rather
+    than shown in part.
+    """
+    reason = _owner_display_text(value, limit=500)
+    raw = str(value or "")
+    if not reason or any(
+        pattern.search(reason) or pattern.search(raw)
+        for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS
+    ):
+        return fallback
+    return reason
+
+
 def owner_project_name(value: Any) -> str:
     """Return the canonical owner-safe, single-line Project display name.
 
@@ -4449,8 +4552,32 @@ def _deleted_project_steward(
     }
 
 
+def _owner_rework_task_ids(conn: sqlite3.Connection, project_id: str) -> set[str]:
+    """Return the ids of the rework cards this Project's returned reviews opened.
+
+    A review that asks for changes records each follow-up card it opened as a
+    kernel-written ``review_followup_recorded`` event on the reviewed card;
+    those payloads are the only evidence read here, never a card's title.
+    One read-only query.
+    """
+    rework_ids: set[str] = set()
+    for row in conn.execute(
+        "SELECT e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
+        "WHERE t.project_id = ? AND e.kind = 'review_followup_recorded'",
+        (project_id,),
+    ).fetchall():
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, ValueError):
+            continue
+        followup_id = payload.get("followup_task_id") if isinstance(payload, dict) else None
+        if isinstance(followup_id, str) and followup_id:
+            rework_ids.add(followup_id)
+    return rework_ids
+
+
 def project_steward_snapshot(
-    *, project_id: str, lookback_days: int = 7
+    *, project_id: str, lookback_days: int = 7, owner_waiting: bool = False
 ) -> dict:
     """Return one bounded, owner-safe Project health snapshot without writes.
 
@@ -4459,6 +4586,13 @@ def project_steward_snapshot(
     owner-friendly states, and timestamps are projected: bodies, results,
     errors, assignees, paths, branches, task/run IDs, and raw events never
     cross this boundary.
+
+    ``owner_waiting`` is set only for a reader that named
+    ``OWNER_WAITING_CAPABILITY``. Then ``active_work`` lists only running,
+    review and ready work, in that order; rework a returned review opened is
+    neither progress nor attention; a current capability stop waits on the
+    owner; and each decision carries its stop reason and waiting start. The
+    execution state still counts every open status as active work.
     """
     project_id = _bounded_text(project_id, "project_id", limit=100)
     if (
@@ -4540,12 +4674,24 @@ def project_steward_snapshot(
             raise OwnerWorkspaceError(
                 "snapshot_unavailable", "kanban.db schema is unavailable"
             )
-        rows = kconn.execute(
-            "SELECT title, status, created_at, started_at, completed_at, block_kind "
-            "FROM tasks WHERE project_id = ? AND task_kind = 'work' "
-            "AND status != 'archived' ORDER BY created_at ASC",
-            (project_id,),
-        ).fetchall()
+        if owner_waiting:
+            rows = kconn.execute(
+                "SELECT id, title, status, created_at, started_at, completed_at, "
+                "block_kind FROM tasks WHERE project_id = ? AND task_kind = 'work' "
+                "AND status != 'archived' ORDER BY created_at ASC",
+                (project_id,),
+            ).fetchall()
+            rework_ids = _owner_rework_task_ids(kconn, project_id)
+            waits = kanban_db.task_owner_waits(
+                kconn, [str(row["id"]) for row in rows],
+            )
+        else:
+            rows = kconn.execute(
+                "SELECT title, status, created_at, started_at, completed_at, block_kind "
+                "FROM tasks WHERE project_id = ? AND task_kind = 'work' "
+                "AND status != 'archived' ORDER BY created_at ASC",
+                (project_id,),
+            ).fetchall()
     except sqlite3.Error as exc:
         raise OwnerWorkspaceError(
             "snapshot_unavailable", "the Project board could not be read"
@@ -4566,6 +4712,9 @@ def project_steward_snapshot(
         }
         for row in rows
     ]
+    if owner_waiting:
+        for item, row in zip(items, rows):
+            item["id"] = str(row["id"])
 
     progress_rows = sorted(
         (
@@ -4593,6 +4742,39 @@ def project_steward_snapshot(
         item for item in items
         if item["status"] in {"todo", "scheduled", "ready", "running", "review"}
     ]
+    shown_active_rows = active_rows
+    if owner_waiting:
+        # Rework a returned review opened is neither progress nor attention,
+        # and a current capability stop waits on the owner, not on Raphael.
+        def _capability_wait(item):
+            return waits.get(item["id"], {}).get("kind") == "capability"
+
+        progress_rows = [
+            item for item in progress_rows if item["id"] not in rework_ids
+        ]
+        attention_rows = [
+            item for item in attention_rows
+            if item["id"] not in rework_ids and not _capability_wait(item)
+        ]
+        decision_rows = [
+            item for item in items
+            if item["status"] == "blocked"
+            and (item["block_kind"] == "needs_input" or _capability_wait(item))
+        ]
+        # Only work that is moving is shown as active: running, then being
+        # checked, then ready; started work first, newest first. The old
+        # active set above still decides the execution state.
+        shown_order = {"running": 0, "review": 1, "ready": 2}
+        shown_active_rows = sorted(
+            (item for item in active_rows if item["status"] in shown_order),
+            key=lambda item: (
+                shown_order[item["status"]],
+                item["started_at"] is None,
+                -int(item["started_at"]) if item["started_at"] is not None else 0,
+                -int(item["created_at"]),
+                item["id"],
+            ),
+        )
     stale_rows = sorted(
         (
             item for item in items
@@ -4629,9 +4811,18 @@ def project_steward_snapshot(
         }
         for item in _bounded(decision_rows)
     ]
+    if owner_waiting:
+        # A card with no current wait keeps the fixed sentence and its
+        # creation time.
+        for entry, item in zip(decisions_needed, _bounded(decision_rows)):
+            wait = waits.get(item["id"])
+            entry["reason"] = owner_stop_reason(wait["reason"] if wait else None)
+            entry["waiting_since"] = _owner_timestamp(
+                wait["since"] if wait else item["created_at"]
+            )
     active_work = [
         {"title": item["title"], "state": _OWNER_STATE_LABELS[item["status"]]}
-        for item in _bounded(active_rows)
+        for item in _bounded(shown_active_rows)
     ]
     stale_candidates = [
         {
@@ -4711,7 +4902,7 @@ def project_steward_snapshot(
             "progress": len(progress_rows) > _PROJECT_STEWARD_LIMIT,
             "needs_attention": len(attention_rows) > _PROJECT_STEWARD_LIMIT,
             "decisions_needed": len(decision_rows) > _PROJECT_STEWARD_LIMIT,
-            "active_work": len(active_rows) > _PROJECT_STEWARD_LIMIT,
+            "active_work": len(shown_active_rows) > _PROJECT_STEWARD_LIMIT,
             "stale_candidates": len(stale_rows) > _PROJECT_STEWARD_LIMIT,
         },
     }
