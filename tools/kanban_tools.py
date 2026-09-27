@@ -1554,6 +1554,8 @@ KANBAN_RECEIPTS_SUMMARY_NO_PROFILE = "Profile not recorded"
 #: Stands in for a run's profile that is not a bounded identifier.
 KANBAN_RECEIPTS_SUMMARY_PROFILE_UNREADABLE = "Profile not readable"
 KANBAN_RECEIPTS_SUMMARY_NO_OUTCOME = "Outcome not recorded"
+#: Stands in for a run's stored outcome that is not a bounded identifier.
+KANBAN_RECEIPTS_SUMMARY_OUTCOME_UNREADABLE = "Outcome not readable"
 KANBAN_RECEIPTS_SUMMARY_NO_CARD = "Card not found"
 KANBAN_RECEIPTS_SUMMARY_NO_MODEL_PIN = "No model pinned on the card"
 KANBAN_RECEIPTS_SUMMARY_NO_EFFORT_PIN = "Effort not pinned on the card"
@@ -1718,8 +1720,9 @@ def _receipts_summary_add_run(boundaries: dict, row) -> None:
     verbatim, so any receipt there counts as missing; so does one on a run
     whose claim record event cleanup removed, which fails closed. Each run
     lands in exactly one cost bucket: known, unknown, or receipt missing.
-    The boundary name is checked like a receipt value, and one that fails
-    is counted under the unreadable label, never echoed.
+    The boundary name and the run's outcome are checked like a receipt
+    value, and one that fails is counted under its unreadable label, never
+    echoed.
     """
     name = str(row["profile"] or "").strip()
     if not name:
@@ -1744,7 +1747,15 @@ def _receipts_summary_add_run(boundaries: dict, row) -> None:
         },
     )
     totals["runs"] += 1
-    outcome = str(row["outcome"] or "").strip() or KANBAN_RECEIPTS_SUMMARY_NO_OUTCOME
+    outcome = str(row["outcome"] or "").strip()
+    if not outcome:
+        outcome = KANBAN_RECEIPTS_SUMMARY_NO_OUTCOME
+    else:
+        # Checked like the boundary name: a store can carry free text here
+        # (an imported board archive keeps its runs as they are).
+        outcome = (
+            _runtime_receipt_value(outcome) or KANBAN_RECEIPTS_SUMMARY_OUTCOME_UNREADABLE
+        )
     totals["outcomes"][outcome] += 1
     totals["requested_routes"][_receipts_summary_requested_route(row)] += 1
     elapsed = _receipts_summary_duration(row["started_at"], row["ended_at"])
