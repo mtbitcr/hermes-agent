@@ -2224,6 +2224,55 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+def _hand_saved_patch_to_review(
+    kb, conn, tid, patch_attachment_id, summary, metadata, run_id,
+) -> str:
+    """Hand the run's one saved patch to review through ``complete_task``.
+
+    ``complete_task`` takes no ``reviewer``: it parks the card for the
+    reviewer the policy resolves, so the tool's ``reviewer`` argument does
+    not apply here.
+    """
+    try:
+        ok = kb.complete_task(
+            conn, tid,
+            result=None, summary=summary, metadata=metadata,
+            created_cards=None,
+            patch_attachment_id=patch_attachment_id,
+            merge_parent_heads=False,
+            expected_run_id=run_id,
+        )
+    except kb.ArtifactPreservationError as artifact_err:
+        return tool_error(
+            "kanban_request_review could not preserve the declared artifacts: "
+            f"{artifact_err}. The saved patch (attachment id "
+            f"{patch_attachment_id}) was not handed over and your task is "
+            "still in-flight. Fix the artifact path or storage error, then "
+            "ask for review again."
+        )
+    except kb.WorktreeScopeError as scope_err:
+        return tool_error(
+            "kanban_request_review could not safely materialize or verify "
+            f"the scoped worktree: {scope_err}. The saved patch (attachment "
+            f"id {patch_attachment_id}) was not handed over and your task is "
+            "still in-flight. Correct the patch or scope and ask for review "
+            "again; do not work around the kernel check."
+        )
+    if not ok:
+        return tool_error(
+            f"could not request review for {tid}: the saved patch (attachment "
+            f"id {patch_attachment_id}) was not handed over"
+        )
+    run = kb.latest_run(conn, tid)
+    landed = kb.get_task(conn, tid)
+    return _ok(
+        task_id=tid,
+        run_id=run.id if run else None,
+        status=landed.status if landed else "review",
+        handed_over_patch_attachment_id=patch_attachment_id,
+    )
+
+
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
     delegated_err = _reject_delegated_child_mutation("kanban_request_review")
@@ -2273,12 +2322,28 @@ def _handle_request_review(args: dict, **kw) -> str:
                     "Provide acceptance evidence matching the card before "
                     "requesting review."
                 )
+            run_id = _worker_run_id(tid)
+            saved_patches = kb.saved_patch_ids_for_review(conn, tid, run_id)
+            if len(saved_patches) > 1:
+                ids = ", ".join(str(patch) for patch in saved_patches)
+                return tool_error(
+                    f"could not request review for {tid}: {len(saved_patches)} "
+                    "saved patches were found for this run (attachment ids "
+                    f"{ids}) and none was handed over, so no review was "
+                    "requested. Keep exactly one saved patch and ask for review "
+                    "again, or hand over the one you mean with kanban_complete "
+                    "and its patch_attachment_id."
+                )
+            if len(saved_patches) == 1:
+                return _hand_saved_patch_to_review(
+                    kb, conn, tid, saved_patches[0], summary, metadata, run_id,
+                )
             ok, fail_reason = kb.request_review(
                 conn, tid,
                 summary=summary,
                 metadata=metadata,
                 reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
                 with_reason=True,
             )
             if not ok:

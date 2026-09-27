@@ -34310,6 +34310,54 @@ _SAVED_PATCH_HANDOVER_SUMMARY = (
 )
 
 
+def _saved_patch_ids_for_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+) -> list[int]:
+    """The patch attachment ids a run saved for review, oldest first.
+
+    Only an implementer's run on a card that requires review qualifies: the
+    existing handover then parks the work in the review lane, so the kernel
+    never finishes a card on a worker's behalf. A run claimed from review is
+    the reviewer's own, and ``complete_task`` would read it as an approval.
+    Counted from the run's own agent ``attached`` receipts; with several
+    patches the kernel does not pick one.
+
+    This is the one copy of these rules: every other caller, inside the
+    kernel or out, takes its candidates from here.
+    """
+    if run_id is None:
+        return []
+    if run_claimed_from_review(conn, task_id, run_id):
+        return []
+    row = conn.execute(
+        "SELECT requires_review FROM tasks WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["requires_review"]:
+        return []
+    return [
+        receipt["attachment_id"]
+        for receipt in _run_agent_attachment_receipts(conn, task_id, run_id)
+        if str(receipt.get("filename") or "").lower().endswith(".patch")
+    ]
+
+
+def saved_patch_ids_for_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+) -> list[int]:
+    """A run's saved patch ids for review, for callers outside the kernel.
+
+    This is their entry point: it returns
+    :func:`_saved_patch_ids_for_review`'s list unchanged, oldest first. A
+    caller decides by the list's length alone and keeps no copy of the rules.
+    """
+    return _saved_patch_ids_for_review(conn, task_id, run_id)
+
+
 def _saved_patch_for_review_handover(
     conn: sqlite3.Connection,
     task_id: str,
@@ -34318,28 +34366,13 @@ def _saved_patch_for_review_handover(
 ) -> Optional[int]:
     """The one patch a quietly exited run saved for review, or ``None``.
 
-    Only an implementer's run on a card that requires review qualifies: the
-    existing handover then parks the work in the review lane, so the kernel
-    never finishes a card on a worker's behalf. A run claimed from review is
-    the reviewer's own, and ``complete_task`` would read it as an approval.
-    Counted from the run's own agent ``attached`` receipts; with several
-    patches the kernel does not pick one.
+    Applies the quiet-exit gate, takes its candidates from
+    :func:`_saved_patch_ids_for_review`, and with several patches does not
+    pick one.
     """
-    if unreported.get("evidence") != "deliverable_present" or run_id is None:
+    if unreported.get("evidence") != "deliverable_present":
         return None
-    if run_claimed_from_review(conn, task_id, run_id):
-        return None
-    row = conn.execute(
-        "SELECT requires_review FROM tasks WHERE id = ? AND task_kind = 'work'",
-        (task_id,),
-    ).fetchone()
-    if row is None or not row["requires_review"]:
-        return None
-    patches = [
-        receipt["attachment_id"]
-        for receipt in _run_agent_attachment_receipts(conn, task_id, run_id)
-        if str(receipt.get("filename") or "").lower().endswith(".patch")
-    ]
+    patches = _saved_patch_ids_for_review(conn, task_id, run_id)
     return patches[0] if len(patches) == 1 else None
 
 
