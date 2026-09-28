@@ -9,9 +9,11 @@ provider the card is then pinned onto, or under no known provider, still holds.
 That provider is the one the run actually used: the worker's own, else the one
 its runtime receipt names. Providers are compared by the id the worker resolves
 them to, so a card naming its provider by an alias or in another case holds, and
-its stops streak, as one naming it canonically; a card naming a custom endpoint
-by its name, slug or pool key, or Vertex by another of its names, holds on the
-reset its worker's pool or its runtime receipt gives. A reset the worker records
+its stops streak, as one naming it canonically; a card naming Vertex by another
+of its names holds on the reset its worker gives; and a reset on any custom
+endpoint, whatever name the card, the worker's pool or the receipt gives it, holds
+its card until the reset, even once the card moves: only a move between two known
+built-in providers ends a hold early. A reset the worker records
 goes through the worker's own path, under exactly the environment the dispatcher
 builds for the claimed run, onto a named board under the test root. The refusal
 exit is covered end to end in ``tests/cli/test_kanban_worker_refusal_exit.py``.
@@ -515,17 +517,18 @@ def test_a_reset_kept_without_a_known_provider_holds_on_a_card_that_names_one(co
 def test_reset_under_one_provider_stops_holding_after_the_card_is_moved_to_another(
     conn, clock, monkeypatch,
 ):
+    # Only a move between two known built-in providers ends a hold early.
     task_id = kb.create_task(
-        conn, title="moved card", assignee="worker", model_override="m-1", provider_override="prov-a",
+        conn, title="moved card", assignee="worker", model_override="m-1", provider_override="anthropic",
     )
     _start_worker(conn, task_id, 4900)
-    _record_as_worker(monkeypatch, conn, task_id, T0 + 3 * 3600, provider="prov-a")
+    _record_as_worker(monkeypatch, conn, task_id, T0 + 3 * 3600, provider="anthropic")
     _worker_exits(conn, 4900, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
 
     clock["t"] = T0 + 3600
-    kb.set_model_override(conn, task_id, "m-1", provider="prov-a")
+    kb.set_model_override(conn, task_id, "m-1", provider="anthropic")
     assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
-    kb.set_model_override(conn, task_id, "m-2", provider="prov-b")
+    kb.set_model_override(conn, task_id, "m-2", provider="openai-codex")
     assert kb.check_respawn_guard(conn, task_id) is None
 
 
@@ -685,7 +688,7 @@ def _stopped_after_worker_reset(monkeypatch, conn, task_id, pid, reset_at, *, po
     return run
 
 
-def test_a_reset_on_a_custom_endpoint_named_anthropic_stops_holding_once_the_card_moves_to_the_built_in(
+def test_a_reset_on_a_custom_endpoint_named_anthropic_holds_until_its_reset_even_once_the_card_moves_to_the_built_in(
     conn, clock, monkeypatch,
 ):
     pools = ("custom:anthropic", "anthropic")
@@ -702,17 +705,19 @@ def test_a_reset_on_a_custom_endpoint_named_anthropic_stops_holding_once_the_car
 
     kb.set_model_override(conn, moving, "m-1", provider="anthropic")
     clock["t"] = T0 + 3600
-    assert kb.check_respawn_guard(conn, moving) is None
     assert kb.get_run(conn, moved_run.id).metadata["rate_limit_reset_provider"] != "anthropic"
-    assert kb.check_respawn_guard(conn, staying) == "rate_limit_cooldown"
+    for task_id in (moving, staying):
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
     clock["t"] = reset_at - 1
-    assert kb.check_respawn_guard(conn, staying) == "rate_limit_cooldown"
+    for task_id in (moving, staying):
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
     clock["t"] = reset_at
-    assert kb.check_respawn_guard(conn, staying) is None
+    for task_id in (moving, staying):
+        assert kb.check_respawn_guard(conn, task_id) is None
 
 
 @pytest.mark.parametrize("moved_to", ["anthropic", "Other Box"])
-def test_a_reset_on_a_keyed_custom_endpoint_holds_its_card_until_it_passes_but_not_one_moved_off_it(
+def test_a_reset_on_a_keyed_custom_endpoint_holds_its_card_until_it_passes_even_one_moved_off_it(
     conn, clock, monkeypatch, moved_to,
 ):
     assert _worker_route(monkeypatch, "Local Box", config=_KEYED_ENDPOINTS, pools=_KEYED_POOLS) == (
@@ -731,11 +736,13 @@ def test_a_reset_on_a_keyed_custom_endpoint_holds_its_card_until_it_passes_but_n
     assert kb.check_respawn_guard(conn, staying) == "rate_limit_cooldown"
     assert kb.check_respawn_guard(conn, moving) == "rate_limit_cooldown"
     kb.set_model_override(conn, moving, "m-2", provider=moved_to)
-    assert kb.check_respawn_guard(conn, moving) is None
+    assert kb.check_respawn_guard(conn, moving) == "rate_limit_cooldown"
     clock["t"] = reset_at - 1
-    assert kb.check_respawn_guard(conn, staying) == "rate_limit_cooldown"
+    for task_id in (moving, staying):
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
     clock["t"] = reset_at
-    assert kb.check_respawn_guard(conn, staying) is None
+    for task_id in (moving, staying):
+        assert kb.check_respawn_guard(conn, task_id) is None
 
 
 def test_a_keyed_custom_endpoint_is_one_provider_whichever_of_its_names_the_card_gives(
@@ -794,7 +801,7 @@ def test_stops_on_a_keyed_custom_endpoint_streak_whether_its_pool_or_its_card_na
         ),
     ],
 )
-def test_a_reset_from_a_custom_endpoint_pool_keyed_like_a_built_in_holds_only_cards_on_that_endpoint(
+def test_a_reset_from_a_custom_endpoint_pool_keyed_like_a_built_in_holds_its_cards_until_the_reset(
     conn, clock, monkeypatch, config, named, pool,
 ):
     pools = (pool, "anthropic")
@@ -809,12 +816,14 @@ def test_a_reset_from_a_custom_endpoint_pool_keyed_like_a_built_in_holds_only_ca
     clock["t"] = T0 + 3600
     assert kb.check_respawn_guard(conn, moving) == "rate_limit_cooldown"
     kb.set_model_override(conn, moving, "m-1", provider="anthropic")
-    assert kb.check_respawn_guard(conn, moving) is None
-    assert kb.check_respawn_guard(conn, staying) == "rate_limit_cooldown"
+    for task_id in (moving, staying):
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
     clock["t"] = reset_at - 1
-    assert kb.check_respawn_guard(conn, staying) == "rate_limit_cooldown"
+    for task_id in (moving, staying):
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
     clock["t"] = reset_at
-    assert kb.check_respawn_guard(conn, staying) is None
+    for task_id in (moving, staying):
+        assert kb.check_respawn_guard(conn, task_id) is None
 
 
 # What a profiles dir under the worker's own home would say: that ``Local Box``
