@@ -59,6 +59,8 @@ _RANK = {"failed": 0, "unknown": 1, "delivered": 2}
 # Re-send attempts are bounded: a request id's length and the attempts one run may have.
 MAX_REQUEST_ID_CHARS = 128
 MAX_RESEND_ATTEMPTS = 5
+# A record dated further ahead than this is not believed: it is never re-sent and it is pruned.
+_CLOCK_SKEW_SECONDS = 86400
 # The chat states a re-send attempt writes.
 _CHAT_STATES = frozenset({"in_progress", "failed", "unknown", "delivered"})
 # The reason codes a re-send attempt keeps for a chat; any other reason, such as error text, is dropped.
@@ -137,13 +139,26 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 
 def _decoded(value: bytes) -> str:
-    return value.decode("utf-8", errors="replace")
+    # Lossless: text that is not valid UTF-8 keeps its bad bytes as lone surrogates, so _clean_text
+    # can refuse it instead of passing on a changed value.
+    return value.decode("utf-8", errors="surrogateescape")
+
+
+def _clean_text(value: Any) -> Optional[str]:
+    """``value`` when it is text that was stored as valid UTF-8, else None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return value
 
 
 def _open(path: Path) -> sqlite3.Connection:
     conn = open_ledger(path)
-    # Text that is not valid UTF-8 reads with replacement characters instead of failing the whole
-    # read; the readers below then refuse it as unreadable.
+    # Text that is not valid UTF-8 reads without failing the whole read; the readers below then
+    # refuse it as unreadable.
     conn.text_factory = _decoded
     # The store holds report text and chat ids: owner-only, like the delivery queue and cron output.
     # SQLite gives its -wal and -shm files the main file's mode.
@@ -170,9 +185,9 @@ def _prune_unlocked(conn: sqlite3.Connection, now: float) -> None:
     # A record whose time is not a finite number has no age to keep it by.
     conn.execute(
         "DELETE FROM records WHERE typeof(created_at) NOT IN ('integer', 'real') "
-        "OR created_at IN (9e999, -9e999) OR (created_at < ? AND execution_id NOT IN ("
+        "OR created_at IN (9e999, -9e999) OR created_at > ? OR (created_at < ? AND execution_id NOT IN ("
         "SELECT execution_id FROM records ORDER BY created_at DESC, execution_id DESC LIMIT ?))",
-        (now - RESEND_WINDOW_SECONDS, max(0, int(MAX_RECORDS))),
+        (now + _CLOCK_SKEW_SECONDS, now - RESEND_WINDOW_SECONDS, max(0, int(MAX_RECORDS))),
     )
     conn.execute("DELETE FROM targets WHERE execution_id NOT IN (SELECT execution_id FROM records)")
     conn.execute("DELETE FROM attempts WHERE execution_id NOT IN (SELECT execution_id FROM records)")
@@ -455,7 +470,7 @@ def _load_unlocked(conn: sqlite3.Connection, ids: List[str], bodies: bool) -> Di
     ).fetchall()
     loaded = {
         row["execution_id"]: {
-            "job_id": row["job_id"] if isinstance(row["job_id"], str) else None,
+            "job_id": _clean_text(row["job_id"]),
             "created_at": _stored_moment(row["created_at"]),
             "text": _stored_text(row["text"]) if bodies else (True if row["text"] is not None else None),
             "attachments": _stored_attachments(row["attachments"]),
@@ -507,8 +522,8 @@ def _readable_target(row: Any, index: int) -> bool:
     return (
         isinstance(position, int) and position == index
         and isinstance(platform, str) and platform in _platform_keys()
-        and isinstance(row["chat_id"], str)
-        and (row["thread_id"] is None or isinstance(row["thread_id"], str))
+        and _clean_text(row["chat_id"]) is not None
+        and (row["thread_id"] is None or _clean_text(row["thread_id"]) is not None)
         and (reason is None or (isinstance(reason, str) and reason in _REASONS))
     )
 
@@ -527,7 +542,7 @@ def _attempt(row: Any) -> Dict[str, Any]:
     ):
         chats = None
     return {
-        "attempt_id": attempt_id if isinstance(attempt_id, str) and _ATTEMPT_ID.fullmatch(attempt_id) else None,
+        "attempt_id": _listed_attempt_id(attempt_id),
         "request_id": request_id if isinstance(request_id, str) and _REQUEST_KEY.fullmatch(request_id) else None,
         "requested_at": requested_at,
         "finished_at": finished_at,
@@ -537,20 +552,31 @@ def _attempt(row: Any) -> Dict[str, Any]:
     }
 
 
+def _listed_attempt_id(value: Any) -> Optional[str]:
+    """An attempt id as this module writes it (a version 4 UUID in hex), or None."""
+    if not isinstance(value, str) or not _ATTEMPT_ID.fullmatch(value):
+        return None
+    parsed = uuid.UUID(value)
+    return value if parsed.version == 4 and parsed.hex == value else None
+
+
 def _stored_text(text: Any) -> Optional[str]:
-    """Saved report text, or None when it is not text (it then reads as expired)."""
-    return text if isinstance(text, str) else None
+    """Saved report text, or None when it is not valid text (it then reads as expired)."""
+    return _clean_text(text)
 
 
 def _stored_attachments(text: Any) -> Optional[List[Any]]:
     """The saved attachment list, or None when it cannot be read (the run is then never re-sent)."""
+    raw = _clean_text(text)
+    if not raw:
+        return None
     try:
-        attachments = json.loads(text or "[]")
+        attachments = json.loads(raw)
     except (TypeError, ValueError, RecursionError):
         return None
     if not isinstance(attachments, list) or not all(
         isinstance(entry, dict) and set(entry) == {"path", "is_voice"}
-        and isinstance(entry["path"], str) and isinstance(entry["is_voice"], bool)
+        and _clean_text(entry["path"]) is not None and isinstance(entry["is_voice"], bool)
         for entry in attachments
     ):
         return None
@@ -576,8 +602,11 @@ def _stored_iso(moment: Any) -> Optional[str]:
 
 def _chats(text: Any) -> Optional[List[Dict[str, Any]]]:
     """An attempt's chats, or None when any of them is not what this module writes."""
+    raw = _clean_text(text)
+    if raw is None:
+        return None
     try:
-        chats = json.loads(text)
+        chats = json.loads(raw)
     except (TypeError, ValueError, RecursionError):
         return None
     if not isinstance(chats, list):
@@ -671,6 +700,7 @@ def _resend_refusal(row: Dict[str, Any], record: Dict[str, Any], now: float) -> 
     created = record["created_at"]
     if (
         not isinstance(created, (int, float)) or isinstance(created, bool) or not math.isfinite(created)
+        or created > now + _CLOCK_SKEW_SECONDS
         or now - created >= RESEND_WINDOW_SECONDS or any(t["text"] is None for t in failed)
     ):
         return "output_expired"
@@ -754,7 +784,8 @@ def claim_resend(row: Optional[Dict[str, Any]], request_id: Any) -> Dict[str, An
     with _transaction(path) as conn:
         # Hold the write lock from the check to the insert, against other processes too.
         conn.execute("BEGIN IMMEDIATE")
-        record = _load_unlocked(conn, [execution_id], False).get(execution_id)
+        # This one run's texts are read in full, so text that cannot be read refuses the claim.
+        record = _load_unlocked(conn, [execution_id], True).get(execution_id)
         if not record or not record["targets"]:
             return {"claimed": False, "reason": "not_recorded", "attempt": None}
         for attempt in record["attempts"]:
