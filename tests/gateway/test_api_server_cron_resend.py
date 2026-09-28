@@ -427,7 +427,8 @@ async def test_send_outliving_the_request_answers_202_and_records_its_result(ada
         response = await _resend(cli, execution_id, "req-slow")
         body = await response.json()
         assert response.status == 202, body
-        assert body == {"request_id": "req-slow", "state": "in_progress"}
+        # A fixed status only: the caller's request id is never echoed back.
+        assert body == {"state": "in_progress"}
 
         chats.gate.set()
         attempts = await _settled(execution_id)
@@ -1089,6 +1090,29 @@ async def test_unavailable_gateway_answers_503_and_claims_nothing(adapter, chats
     assert body == {"detail": {"code": "gateway_unavailable"}}
     assert chats.sent == []
     assert _view(execution_id)["resend"] == {"eligible": True, "reason": None, "attempts": []}
+
+
+@pytest.mark.asyncio
+async def test_claim_that_raises_logs_neither_the_path_nor_the_request_id(adapter, chats, monkeypatch, caplog):
+    def unreadable(_execution_id):
+        raise OSError("placeholder: the run ledger cannot be read")
+
+    monkeypatch.setattr("cron.executions.get_execution", unreadable)
+    caplog.clear()
+    caplog.set_level(logging.DEBUG)
+
+    async with _client(adapter) as cli:
+        # Caller-controlled values shaped like chat addresses, in the path and in the body.
+        response = await _resend(cli, CHAT_BAD, OTHER_CHAT)
+        body = await response.json()
+
+    assert response.status == 503
+    assert body == {"detail": {"code": "gateway_unavailable"}}
+    # The route's own lines; the web server's access log of the request line is not this route's.
+    own = [record for record in caplog.records if record.name.startswith(("cron.", "gateway.platforms.api_server"))]
+    assert any("could not be claimed" in record.getMessage() for record in own)
+    _logs_nothing_private(own)
+    assert chats.sent == []
 
 
 @pytest.mark.asyncio

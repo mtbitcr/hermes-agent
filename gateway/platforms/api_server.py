@@ -11901,7 +11901,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({"detail": {"code": "gateway_unavailable"}}, status=503)
 
         def in_progress() -> "web.Response":
-            return web.json_response({"request_id": request_id, "state": "in_progress"}, status=202)
+            # A fixed status: the caller's request id and path values are never echoed.
+            return web.json_response({"state": "in_progress"}, status=202)
 
         with _reserve_pending_api_work(self) as reservation:
             try:
@@ -11915,9 +11916,8 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 claim = await asyncio.to_thread(claim_report_resend, execution_id, request_id)
             except Exception as exc:
-                logger.error(
-                    "cron re-send of run %s could not be claimed: %s", execution_id, type(exc).__name__
-                )
+                # The path's execution id is caller-controlled: never logged.
+                logger.error("cron re-send could not be claimed: %s", type(exc).__name__)
                 return web.json_response({"detail": {"code": "gateway_unavailable"}}, status=503)
             if claim is None:
                 return web.json_response({"detail": {"code": "not_found"}}, status=404)
@@ -11951,9 +11951,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 except asyncio.TimeoutError:
                     return in_progress()
                 except Exception as exc:
-                    logger.error(
-                        "cron re-send of run %s failed: %s", execution_id, type(exc).__name__
-                    )
+                    logger.error("cron re-send failed: %s", type(exc).__name__)
                     refusal = None
                 if refusal:
                     return web.json_response(
