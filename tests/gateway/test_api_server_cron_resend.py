@@ -734,6 +734,76 @@ async def test_fresh_thread_send_logs_no_chat_address_or_report_text(adapter, ch
     assert [(t["state"], t["reason"]) for t in body["targets"]] == [("unknown", "error_after_handover")]
 
 
+async def _run_whose_attachment_is_gone(chats, tmp_path, name):
+    """A failed run of CHAT_BAD saved with the attachment ``name``, deleted since. The chat's platform
+    was off for the run, so nothing was handed over; it is on again."""
+    attachment = tmp_path / name
+    attachment.write_text("placeholder attachment", encoding="utf-8")
+    chats.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=False)
+    _job_, execution_id, _first = await _failed_run(chats, CHAT_BAD, text=f"{REPORT}\nMEDIA:{attachment}")
+    assert [Path(item["path"]).name for item in delivery_record.load(execution_id)["attachments"]] == [name]
+    attachment.unlink()
+    chats.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=True)
+    return execution_id
+
+
+def _logs_nothing_private(records):
+    """No record carries a chat address, a key or report text: not in its message, its args or its
+    exception."""
+    formatter = logging.Formatter()
+    for record in records:
+        logged = " ".join((
+            record.getMessage(), repr(record.args), record.exc_text or "",
+            formatter.formatException(record.exc_info) if record.exc_info else "",
+        ))
+        for private in (CHAT_OK, CHAT_BAD, ROUTE_CHAT, OTHER_CHAT, KEY, FITNESS_KEY, "numbers are up"):
+            assert private not in logged, (record.name, record.lineno)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", [f"{CHAT_BAD}.txt", "placeholder.txt"], ids=["chat_address_in_name", "ordinary_name"])
+async def test_missing_attachment_refusal_logs_no_chat_address_or_report_text(
+    adapter, chats, tmp_path, caplog, name
+):
+    execution_id = await _run_whose_attachment_is_gone(chats, tmp_path, name)
+    caplog.clear()
+    caplog.set_level(logging.DEBUG)
+
+    async with _client(adapter) as cli:
+        response = await _resend(cli, execution_id, "req-1")
+        body = await response.json()
+
+    assert response.status == 409
+    assert body == {"detail": {"code": "not_eligible", "reason": "attachment_missing"}}
+    assert chats.sent == []
+    assert _view(execution_id)["resend"]["attempts"] == []
+    # The attachment check's own line was made and captured, as was every record any logger made.
+    assert any(record.name == "gateway.platforms.base" for record in caplog.records)
+    _logs_nothing_private(caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_claim_leaves_the_lines_its_thread_logs_afterwards_untouched(chats, tmp_path, caplog):
+    execution_id = await _run_whose_attachment_is_gone(chats, tmp_path, f"{CHAT_BAD}.txt")
+    caplog.clear()
+    caplog.set_level(logging.DEBUG)
+
+    # Claimed in this very thread, then two unrelated lines are logged in it.
+    claim = scheduler.claim_report_resend(execution_id, "req-1")
+    claimed = len(caplog.records)
+    logging.getLogger("placeholder.unrelated").warning("placeholder line about %s", "placeholder value")
+    scheduler.logger.info("placeholder scheduler line")
+
+    assert claim == {"claimed": False, "reason": "attachment_missing", "attempt": None}
+    assert _view(execution_id)["resend"]["attempts"] == []
+    # The claim's log policy ended with it: both lines keep their message and args.
+    later = [(record.name, record.msg, record.args) for record in caplog.records[claimed:]]
+    assert later == [
+        ("placeholder.unrelated", "placeholder line about %s", ("placeholder value",)),
+        ("cron.scheduler", "placeholder scheduler line", ()),
+    ]
+
+
 def _older_than_resend_window(monkeypatch):
     real = delivery_record._clock
     monkeypatch.setattr(delivery_record, "_clock", lambda: real() - 8 * DAY)
@@ -843,6 +913,51 @@ async def test_disabled_or_repointed_route_turns_chat_down_and_records_it(
     finally:
         reset_hermes_home_override(token)
     assert [(a["attempt_id"], a["state"]) for a in attempts] == [(body["attempt_id"], "failed")]
+
+
+@pytest.mark.asyncio
+async def test_resend_for_a_served_profile_logs_no_chat_address_a_launch_route_names(
+    adapter, chats, runner, home, monkeypatch, caplog
+):
+    fitness = _fitness_home(home)
+    _write_routes(home)
+    chats.answers = {ROUTE_CHAT: "failed"}
+    token = set_hermes_home_override(str(fitness))
+    try:
+        job = _job(ROUTE_CHAT, platform="discord")
+    finally:
+        reset_hermes_home_override(token)
+    execution_id = await asyncio.to_thread(_run, job, home=fitness)
+    chats.sent.clear()
+    chats.answers = {}
+    # The multiplex gateway serves the profile and lends it the live launch bot for the route's chat.
+    live = _LiveChat()
+    runner.adapters = {Platform.DISCORD: live}
+    runner.config.multiplex_profiles = True
+    monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex=True, profile_allowlist=None: [("default", home), ("fitness", fitness)],
+    )
+    # Another launch route names a chat as a number that can never match, which its parser quotes.
+    config = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    config["gateway"]["profile_routes"].append(
+        {"name": "other", "platform": "discord", "chat_id": float(OTHER_CHAT), "profile": "fitness"}
+    )
+    (home / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    caplog.clear()
+    caplog.set_level(logging.DEBUG)
+
+    async with _client(adapter) as cli:
+        response = await _resend(cli, execution_id, "req-1", profile="fitness", key=FITNESS_KEY)
+        body = await response.json()
+
+    assert response.status == 200, body
+    assert [(t["state"], t["reason"]) for t in body["targets"]] == [("delivered", None)]
+    assert [chat for chat, _message in live.sent] == [ROUTE_CHAT]
+    # The routes were read and captured, as was every record any logger made.
+    assert any(record.name == "gateway.profile_routing" for record in caplog.records)
+    _logs_nothing_private(caplog.records)
 
 
 @pytest.mark.asyncio

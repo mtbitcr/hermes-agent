@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import functools
 import hashlib
 import inspect
 import json
@@ -3263,8 +3264,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
 
 # --- sending a run's failed chats again ----------------------------------------------------------
 
-# Set while a re-send walks ``_deliver_result``, whose own lines name each chat and quote send
-# errors: a re-send logs its reason codes only (``resend_report``).
+# Set while a re-send is claimed, gets its adapters, walks ``_deliver_result`` and is answered:
+# ``_deliver_result``'s own lines name each chat and quote send errors, and the attachment check and
+# the launch routes read on the way log a path or a chat id. A re-send logs its reason codes only
+# (``claim_report_resend``, ``resend_adapters``, ``resend_report``, ``resend_answer``).
 _RESENDING: contextvars.ContextVar = contextvars.ContextVar("cron_resending", default=False)
 logger.addFilter(lambda _record: not _RESENDING.get())
 
@@ -3293,6 +3296,21 @@ def _install_resend_record_factory() -> None:
 
 
 _install_resend_record_factory()
+
+
+def _logs_reason_codes_only(step):
+    """``step`` under the re-send log policy, set for the whole call and reset as it returns or
+    raises: the lines its thread logs afterwards are untouched."""
+
+    @functools.wraps(step)
+    def run(*args, **kwargs):
+        token = _RESENDING.set(True)
+        try:
+            return step(*args, **kwargs)
+        finally:
+            _RESENDING.reset(token)
+
+    return run
 
 
 class _KeepsReplies:
@@ -3407,12 +3425,13 @@ def _resend_top_line(created_at: float) -> str:
     return f"Sent again because it did not arrive on {moment.date().isoformat()}."
 
 
+@_logs_reason_codes_only
 def claim_report_resend(execution_id: str, request_id: str) -> Optional[dict]:
     """Claim the re-send of the failed chats of one run of the current profile: None when the
     profile has no such run, else ``delivery_record.claim_resend``'s answer. A request id the run
     already had answers its first attempt, whatever has changed since. Otherwise a run the re-send
     view calls eligible whose saved attachment is gone is refused ``attachment_missing``, claiming
-    nothing."""
+    nothing. Logs carry reason codes only."""
     from cron.executions import get_execution
 
     row = get_execution(execution_id)
@@ -3427,6 +3446,15 @@ def claim_report_resend(execution_id: str, request_id: str) -> Optional[dict]:
     ):
         return {"claimed": False, "reason": "attachment_missing", "attempt": None}
     return delivery_record.claim_resend(row, request_id)
+
+
+@_logs_reason_codes_only
+def resend_adapters(runner: Any) -> Any:
+    """The adapter map ``resend_report`` sends through: the one scheduled fires of the profile being
+    served use (``served_profile_adapters``), or None. Logs carry reason codes only."""
+    from cron.scheduler_preflight import served_profile_adapters
+
+    return served_profile_adapters(runner) or None
 
 
 def _resend_chats(execution_id: str, attempt: dict, adapters, loop, results: List[dict]) -> Optional[str]:
@@ -3503,10 +3531,11 @@ def resend_report(execution_id: str, attempt: dict, *, adapters=None, loop=None)
     return refusal
 
 
+@_logs_reason_codes_only
 def resend_answer(execution_id: str, attempt_id: str) -> Optional[dict]:
     """The re-send route's answer for one finished attempt: its state, the label, state and reason
     of each chat it covered, and whether the run may be sent again now. None while it is still in
-    progress. Carries no chat address, error or report text."""
+    progress. Carries no chat address, error or report text; logs carry reason codes only."""
     from cron.executions import get_execution
 
     record = delivery_record.load(execution_id)

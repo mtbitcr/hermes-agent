@@ -11877,8 +11877,7 @@ class APIServerAdapter(BasePlatformAdapter):
         and log lines carry reason codes only: never a chat address, a key or report text.
         """
         from cron.delivery_record import MAX_REQUEST_ID_CHARS
-        from cron.scheduler import claim_report_resend, resend_answer, resend_report
-        from cron.scheduler_preflight import served_profile_adapters
+        from cron.scheduler import claim_report_resend, resend_adapters, resend_answer, resend_report
 
         auth_err = self._check_auth(request)
         if auth_err:
@@ -11933,7 +11932,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         resend_report,
                         execution_id,
                         attempt,
-                        adapters=served_profile_adapters(runner) or None,
+                        adapters=resend_adapters(runner),
                         loop=asyncio.get_running_loop(),
                     )
                 )
