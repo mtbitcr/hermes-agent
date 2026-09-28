@@ -4399,9 +4399,11 @@ def owner_title(value: Any) -> str:
 # but never a date or choice glued to a word (``12/05``, ``A/B``) or a URL's
 # path; a home path even one segment deep (``~/notes.txt``); a path written
 # without its leading slash, with ``/`` or ``\``, once it has three segments and
-# its first carries a letter (``srv/x/y``, ``srv\x\y``), or once it ends in a
-# file name with an extension (``config/settings.py``, ``./settings.py``), but
-# never a date, version or choice (``12/05/2026``, ``v1.2/v1.3``, ``yes/no``);
+# its first carries a letter (``srv/x/y``, ``srv\x\y``), or once its last part
+# holds a dot inside it (``config/settings.py``, ``config/.sample``,
+# ``config/archive.7z``, ``./settings.py``), but never a date, a version number
+# or a choice, even at the end of a sentence (``12/05/2026.``, ``v1.2/v1.3``,
+# ``yes/no.``);
 # a full commit id; a ``file:`` link; this platform's own Project ids
 # (``projects_db._new_project_id`` and ``_derive_id``). :func:`owner_stop_reason`
 # also checks each text with its doubled slashes collapsed (``//srv/x``,
@@ -4415,7 +4417,8 @@ _OWNER_PRIVATE_STOP_REASON_PATTERNS = (
     ),
     re.compile(
         r"(?<![\w/\\.~-])[A-Za-z0-9._-]+(?:[/\\]+[A-Za-z0-9._-]+)*[/\\]+"
-        r"[A-Za-z0-9_-]*[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z][A-Za-z0-9]*\b"
+        r"(?!v?\d+(?:\.\d+)+(?![\w.-]*[A-Za-z0-9_]))"
+        r"[A-Za-z0-9_-]*\.[A-Za-z0-9._-]*[A-Za-z0-9_]"
     ),
     re.compile(r"(?<![\w/])~/[A-Za-z0-9._-]"),
     re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE),
