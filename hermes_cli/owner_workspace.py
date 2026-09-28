@@ -4395,10 +4395,12 @@ def owner_title(value: Any) -> str:
 
 # Worker stop text carries shapes a title never does, so only
 # :func:`owner_stop_reason` checks these, on top of the title patterns: this
-# kernel's own task ids (``kanban_db._new_task_id``); a commit id, full or
-# short; a ``file:`` link; this platform's own Project ids
+# kernel's own task ids (``kanban_db._new_task_id``); a full commit id; a
+# ``file:`` link; this platform's own Project ids
 # (``projects_db._new_project_id`` and ``_derive_id``). Each is matched wherever
-# it sits, since an id wrapped in other characters is still an id. Paths are
+# it sits, since an id wrapped in other characters is still an id; a short
+# commit id is :func:`_names_a_commit`'s. Both the cleaned and the raw text are
+# checked, so nothing past the display cut escapes the check. Paths are
 # refused by the characters a reason may hold rather than by shape: a reason
 # reaches the owner only when every character is a letter, mark or digit of any
 # script, a space, or plain punctuation (:data:`_OWNER_STOP_REASON_PUNCTUATION`),
@@ -4407,7 +4409,6 @@ def owner_title(value: Any) -> str:
 _OWNER_PRIVATE_STOP_REASON_PATTERNS = (
     re.compile(r"t_[0-9a-f]{8}", re.IGNORECASE),
     re.compile(r"[0-9a-f]{40}", re.IGNORECASE),
-    re.compile(r"(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,}", re.IGNORECASE),
     re.compile(r"\bfile:/", re.IGNORECASE),
     re.compile(r"p_[0-9a-f]{8,}", re.IGNORECASE),
 )
@@ -4423,12 +4424,27 @@ def _plain_stop_text(text: str) -> bool:
     """Whether every character of ``text`` is one a stop reason may show the owner."""
     for char in text:
         category = unicodedata.category(char)
-        if char in _OWNER_STOP_REASON_PUNCTUATION or category[0] in "LN" or category == "Zs":
+        if char in _OWNER_STOP_REASON_PUNCTUATION or category[0] in "LN" or char.isspace():
             continue
         if category[0] == "M" and char not in _OWNER_STOP_REASON_REFUSED_MARKS:
             continue
         return False
     return True
+
+
+def _names_a_commit(text: str) -> bool:
+    """Whether ``text`` holds a commit id, full or short: seven or more hex
+    characters in any case that hold a digit, or that stand as a word of their
+    own (no letter or digit of any script beside them), so a word such as
+    "feedback" stays readable."""
+    for match in re.finditer(r"[0-9a-f]{7,}", text, re.IGNORECASE):
+        before = text[match.start() - 1] if match.start() else ""
+        after = text[match.end()] if match.end() < len(text) else ""
+        if any(char.isdigit() for char in match.group()) or not (
+            before.isalnum() or after.isalnum()
+        ):
+            return True
+    return False
 
 
 def owner_stop_reason(
@@ -4440,16 +4456,18 @@ def owner_stop_reason(
 
     Same egress contract as :func:`owner_title` — see
     :func:`_owner_display_text` — bounded at 500 code points. A reason that is
-    empty after cleaning, that holds a character :func:`_plain_stop_text`
-    refuses, or that carries a private pattern (a title's, or one of
-    :data:`_OWNER_PRIVATE_STOP_REASON_PATTERNS`) in the cleaned OR the raw
-    text, is replaced whole by the fixed ``fallback`` sentence rather than
-    shown in part.
+    empty after cleaning, whose cleaned or raw text holds a character
+    :func:`_plain_stop_text` refuses or a commit id, or that carries a private
+    pattern (a title's, or one of :data:`_OWNER_PRIVATE_STOP_REASON_PATTERNS`)
+    in the cleaned OR the raw text, is replaced whole by the fixed
+    ``fallback`` sentence rather than shown in part.
     """
     reason = _owner_display_text(value, limit=500)
     raw = str(value or "")
     texts = (reason, raw)
-    if not reason or not _plain_stop_text(reason) or any(
+    if not reason or not all(_plain_stop_text(text) for text in texts) or any(
+        _names_a_commit(text) for text in texts
+    ) or any(
         pattern.search(text)
         for text in texts
         for pattern in (
