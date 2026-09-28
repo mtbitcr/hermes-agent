@@ -461,7 +461,8 @@ def test_recorded_provider_reset_keeps_the_card_waiting_until_it_passes(
     rate_limit_exits, monkeypatch,
 ):
     """A reset two hours out outlasts the 300-second cooldown; without one
-    the cooldown alone decides, exactly as before."""
+    the kernel books its own reset past the cooldown, and the card waits
+    until then."""
     reset = int(time.time()) + 7200
     with kb.connect() as conn:
         waiting = kb.create_task(conn, title="limit with a known reset", assignee="a")
@@ -484,7 +485,11 @@ def test_recorded_provider_reset_keeps_the_card_waiting_until_it_passes(
 
         monkeypatch.setattr(kb.time, "time", lambda: plain_run.ended_at + 299)
         assert kb.check_respawn_guard(conn, plain) == "rate_limit_cooldown"
+        booked = kb.get_run(conn, plain_run.id).metadata[kb._RATE_LIMIT_RESET_KEY]
+        assert booked > plain_run.ended_at + 301
         monkeypatch.setattr(kb.time, "time", lambda: plain_run.ended_at + 301)
+        assert kb.check_respawn_guard(conn, plain) == "rate_limit_cooldown"
+        monkeypatch.setattr(kb.time, "time", lambda: booked)
         assert kb.check_respawn_guard(conn, plain) is None
 
         # An operator who disabled rate-limit waiting gets no wait at all.
@@ -844,12 +849,22 @@ def test_review_handback_does_not_override_rate_limit_cooldown(kanban_home, monk
 def test_review_handback_does_not_override_auth_blocker(kanban_home):
     """A handback must never punch through the auth/quota blocker: priority
     order (blocker_auth before active_pr) is unchanged by the supersession
-    rule."""
+    rule. The blocker is read from the latest run's own error, so here a
+    run that failed on the sign-in wall follows the handback."""
     with kb.connect() as conn:
         tid = _make_review_handback(conn, title="handback then auth blocked")
 
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
         conn.execute(
-            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            "UPDATE task_runs SET outcome='crashed', status='crashed', "
+            "ended_at=?, error=? WHERE id=?",
+            (int(time.time()) + 1, "401 unauthorized: invalid api key", run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
             ("401 unauthorized: invalid api key", tid),
         )
         conn.commit()
