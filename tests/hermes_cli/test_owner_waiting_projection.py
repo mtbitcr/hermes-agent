@@ -472,12 +472,20 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "double": "Cannot open A\u20ebB: permission denied",
     }
     hex_question = "Should the placeholder lunch start at noon?"
+    # A drive letter names a file without any slash, and a variation selector is
+    # not part of any script.
+    mark_leaks = {
+        "drive": "Cannot read C:placeholder.txt",
+        "selector": "Please confirm 1\ufe0f.",
+    }
+    mark_question = "Should the placeholder dinner start at seven?"
     for project_name, project_leaks, question_title, project_question in (
         ("Worker Text Pilot", leaks, "Choose the placeholder date", question),
         ("Worker Link Pilot", link_leaks, "Choose the placeholder file", link_question),
         ("Worker Path Pilot", path_leaks, "Choose the placeholder day", path_question),
         ("Worker Name Pilot", name_leaks, "Choose the placeholder hours", name_question),
         ("Worker Hex Pilot", hex_leaks, "Choose the placeholder lunch", hex_question),
+        ("Worker Mark Pilot", mark_leaks, "Choose the placeholder dinner", mark_question),
     ):
         worker_text = _project(owner, project_name)
         leaked = []
@@ -559,6 +567,9 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "Cannot open A\u0335B: permission denied",
         "Ask about A\u20dd first",
         "Cannot open A\U0001d167B: permission denied",
+        *mark_leaks.values(),
+        "Cannot read d:notes first",
+        "Please confirm A\U000e0100.",
     ):
         assert ow.owner_stop_reason(private) == _DECISION_FALLBACK
         assert ow.owner_stop_reason(
@@ -575,6 +586,8 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "Is 50% of the budget enough?", "Should R&D approve it first?",
         "Waiting for your feedback on the draft.",
         "Is the Cafe\u0301 booked for noon?",
+        "Meet at 12:30 in room A.", "Note: the placeholder plan is ready.",
+        "Is option A: yes or no?",
         "\u0915\u094d\u092f\u093e \u092f\u0939 \u0920\u0940\u0915 \u0939\u0948?",
         _DECISION_FALLBACK, _RECEIPT_FALLBACK,
     ):
