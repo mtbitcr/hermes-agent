@@ -463,40 +463,53 @@ def _load_unlocked(conn: sqlite3.Connection, ids: List[str], bodies: bool) -> Di
 
 
 def _attempt(row: Any) -> Dict[str, Any]:
-    """An attempt as stored. Chats that cannot be read are None and the attempt reads unknown."""
+    """An attempt as stored. An attempt whose chats or times cannot be read has chats None and reads
+    unknown."""
     chats = _chats(row["chats"])
+    requested_at = _stored_iso(row["requested_at"])
+    finished_at = None if row["finished_at"] is None else _stored_iso(row["finished_at"])
+    if requested_at is None or (row["finished_at"] is not None and finished_at is None):
+        chats = None
     return {
         "attempt_id": row["attempt_id"],
         "request_id": row["request_id"],
-        "requested_at": _iso(row["requested_at"]),
-        "finished_at": _iso(row["finished_at"]),
+        "requested_at": requested_at,
+        "finished_at": finished_at,
         "state": row["state"] if chats is not None else "unknown",
         "chats": chats,
         "error": row["error"] if row["error"] in _REASONS else None,
     }
 
 
+def _stored_iso(moment: Any) -> Optional[str]:
+    """A stored time as ISO text, or None when it is not a finite number in datetime range."""
+    if isinstance(moment, bool) or not isinstance(moment, (int, float)) or not math.isfinite(moment):
+        return None
+    try:
+        return datetime.fromtimestamp(moment, timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _chats(text: Any) -> Optional[List[Dict[str, Any]]]:
     """An attempt's chats, or None when any of them is not what this module writes."""
     try:
         chats = json.loads(text)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return None
     if not isinstance(chats, list):
         return None
     for chat in chats:
+        if not isinstance(chat, dict) or set(chat) != {"position", "state", "reason"}:
+            return None
+        position, state, reason = chat["position"], chat["state"], chat["reason"]
         if (
-            not isinstance(chat, dict) or set(chat) != {"position", "state", "reason"}
-            or not isinstance(chat["position"], int) or isinstance(chat["position"], bool)
-            or chat["state"] not in _CHAT_STATES
-            or (chat["reason"] is not None and chat["reason"] not in _REASONS)
+            not isinstance(position, int) or isinstance(position, bool)
+            or not isinstance(state, str) or state not in _CHAT_STATES
+            or (reason is not None and (not isinstance(reason, str) or reason not in _REASONS))
         ):
             return None
     return chats
-
-
-def _iso(moment: Optional[float]) -> Optional[str]:
-    return None if moment is None else datetime.fromtimestamp(moment, timezone.utc).isoformat()
 
 
 def load(execution_id: Any) -> Optional[Dict[str, Any]]:
@@ -580,14 +593,18 @@ def _resend_refusal(row: Dict[str, Any], record: Dict[str, Any], now: float) -> 
 
 
 def _latest_targets(record: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """The run's targets as its finished re-send attempts left them, the latest one last. An attempt
-    changes only a target the run itself recorded as failed: the only chats a re-send may touch."""
+    """The run's targets as its re-send attempts left them, the latest one last. An attempt changes
+    only a target the run itself recorded as failed and that no attempt has moved on from since: a
+    delivered, unknown or in-progress outcome is final."""
     recorded = record["targets"]
     targets = [dict(target) for target in recorded]
     for attempt in record["attempts"]:
         for chat in attempt["chats"] or ():
             position = chat["position"]
-            if 0 <= position < len(targets) and recorded[position]["state"] == "failed":
+            if (
+                0 <= position < len(targets) and recorded[position]["state"] == "failed"
+                and targets[position]["state"] == "failed"
+            ):
                 targets[position].update(state=chat["state"], reason=chat["reason"])
     return targets
 
