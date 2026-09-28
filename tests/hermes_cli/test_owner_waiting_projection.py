@@ -433,10 +433,13 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
     question = "Should we book it for the fifth or the nineteenth?"
     # A file: link and this platform's own Project id fall back the same way,
     # and a question about a file still comes through. They get a second
-    # Project because the steward lists at most 12 decisions per Project.
+    # Project because the steward lists at most 12 decisions per Project. So do
+    # an id wrapped in underscores and a separator look-alike.
     link_leaks = {
         "page": f"Cannot open {_FILE_LINK}: the browser is not available",
         "move": f"Should I move this into {_PROJECT_ID} first?",
+        "wrapped": f"Waiting for _{_KERNEL_TASK_ID}_ to finish first",
+        "operator": "Please check notes⧵draft.md",
     }
     link_question = "Which file: the first or the second?"
     # A path with a doubled slash, or one written without its leading slash,
@@ -526,6 +529,17 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "Cannot open A∕B: permission denied",
         "Cannot open A／B: permission denied",
         "The draft is in notes＼drafts",
+        # Only letters, marks and digits of any script, spaces and plain
+        # punctuation come through: no look-alike list to keep complete, and an
+        # id or commit wrapped in other characters is still an id.
+        "Cannot open A⫽B: permission denied",
+        "The draft is in notes⟍drafts",
+        "Cannot open A̸B: permission denied",
+        f"Project _{_PROJECT_ID}_ has no repository",
+        f"Rebuilt _{_COMMIT_ID}_ first",
+        "Rebased onto 0a1b2c3d first",
+        "Ask owner@example.test first",
+        "Should p_values be reported?",
     ):
         assert ow.owner_stop_reason(private) == _DECISION_FALLBACK
         assert ow.owner_stop_reason(
@@ -533,8 +547,13 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         ) == _RECEIPT_FALLBACK
     # Neither fixed sentence, nor an ordinary question, trips a pattern.
     for ordinary in (
-        reason, question, link_question, path_question, "Should p_values be reported?",
+        reason, question, link_question, path_question,
         "Is it yes or no?", "Book it for the fifth of December.",
+        "Можно ли перенести "
+        "встречу — «после "
+        "обеда»?",
+        "Ist der Termin für Montag geplant?",
+        "Is 50% of the budget enough?", "Should R&D approve it first?",
         _DECISION_FALLBACK, _RECEIPT_FALLBACK,
     ):
         for fallback in (_DECISION_FALLBACK, _RECEIPT_FALLBACK):
