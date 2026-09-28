@@ -2899,8 +2899,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                 # in particular Telegram's three-mode topic routing.  The
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
-                # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                # (#22773).  A re-send hands over its saved text as it is: trimming it would
+                # change the report.
+                text_to_send = cleaned_delivery_content if resend is not None else cleaned_delivery_content.strip()
                 recorder.handing_over(text_to_send)
                 adapter_ok = True
                 timed_out = False
@@ -3118,7 +3119,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
             except Exception as e:
-                recorder.live_error(e, cleaned_delivery_content.strip(), runtime_adapter, chat_id)
+                recorder.live_error(e, text_to_send, runtime_adapter, chat_id)
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)

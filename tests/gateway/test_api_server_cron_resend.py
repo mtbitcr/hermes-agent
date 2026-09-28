@@ -623,6 +623,39 @@ async def test_report_just_under_the_limit_reaches_a_non_splitting_chat_unchange
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["live", "standalone"])
+async def test_report_ending_in_spaces_and_newlines_is_sent_again_exactly_as_saved(
+    adapter, chats, runner, monkeypatch, transport
+):
+    monkeypatch.setattr("cron.scheduler.load_config", lambda *a, **k: {"cron": {"wrap_response": False}})
+    text = REPORT + "  \n\n"
+    # The run's chat was not reachable: nothing was handed over and the chat reads failed.
+    chats.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=False)
+    _job_, execution_id, _first = await _failed_run(chats, CHAT_BAD, text=text)
+    chats.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=True)
+    assert delivery_record.load(execution_id)["targets"][0]["text"] == text
+    # With the chat's live adapter the gateway sends it; without one, the standalone sender does.
+    live = _LiveChat()
+    if transport == "live":
+        runner.adapters = {Platform.TELEGRAM: live}
+
+    async with _client(adapter) as cli:
+        response = await _resend(cli, execution_id, "req-1")
+        body = await response.json()
+
+    assert response.status == 200, body
+    top = f"Sent again because it did not arrive on {_run_date(execution_id)}."
+    sent = {"live": live.sent, "standalone": chats.sent}
+    other = "standalone" if transport == "live" else "live"
+    # The saved text under the one top line, its trailing spaces and newlines kept, sent once.
+    assert sent[transport] == [(CHAT_BAD, f"{top}\n{text}")]
+    assert sent[other] == []
+    assert body["state"] == "delivered"
+    assert [(t["state"], t["reason"]) for t in body["targets"]] == [("delivered", None)]
+    assert [a["state"] for a in _view(execution_id)["resend"]["attempts"]] == ["delivered"]
+
+
+@pytest.mark.asyncio
 async def test_failing_real_adapter_send_logs_no_chat_address_or_report_text(
     adapter, chats, runner, monkeypatch, caplog
 ):
