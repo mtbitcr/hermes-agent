@@ -470,15 +470,16 @@ def _load_unlocked(conn: sqlite3.Connection, ids: List[str], bodies: bool) -> Di
 
 
 def _attempt(row: Any) -> Dict[str, Any]:
-    """An attempt as stored. An attempt whose ids, chats or times cannot be read has chats None and
-    reads unknown."""
+    """An attempt as stored. An attempt whose ids, state, chats or times cannot be read has chats None
+    and reads unknown."""
     chats = _chats(row["chats"])
-    attempt_id, request_id = row["attempt_id"], row["request_id"]
+    attempt_id, request_id, state = row["attempt_id"], row["request_id"], row["state"]
     requested_at = _stored_iso(row["requested_at"])
     finished_at = None if row["finished_at"] is None else _stored_iso(row["finished_at"])
     if (
         not isinstance(attempt_id, str) or not isinstance(request_id, str) or requested_at is None
         or (row["finished_at"] is not None and finished_at is None)
+        or not isinstance(state, str) or state not in _CHAT_STATES
     ):
         chats = None
     return {
@@ -486,7 +487,7 @@ def _attempt(row: Any) -> Dict[str, Any]:
         "request_id": request_id if isinstance(request_id, str) else None,
         "requested_at": requested_at,
         "finished_at": finished_at,
-        "state": row["state"] if chats is not None else "unknown",
+        "state": state if chats is not None else "unknown",
         "chats": chats,
         "error": row["error"] if row["error"] in _REASONS else None,
     }
