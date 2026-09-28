@@ -462,11 +462,20 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "choice": "Cannot open A/B: permission denied",
     }
     name_question = "Should the placeholder room be booked for two hours?"
+    # A short commit id may be all digits or all letters, and a path may sit
+    # past the point where the shown reason is cut.
+    hex_leaks = {
+        "digits": "Rebased onto 1234567 first",
+        "letters": "Rebased onto abcdefa first",
+        "tail": "Please confirm the placeholder plan. " * 14 + "Then open /srv/placeholder/x",
+    }
+    hex_question = "Should the placeholder lunch start at noon?"
     for project_name, project_leaks, question_title, project_question in (
         ("Worker Text Pilot", leaks, "Choose the placeholder date", question),
         ("Worker Link Pilot", link_leaks, "Choose the placeholder file", link_question),
         ("Worker Path Pilot", path_leaks, "Choose the placeholder day", path_question),
         ("Worker Name Pilot", name_leaks, "Choose the placeholder hours", name_question),
+        ("Worker Hex Pilot", hex_leaks, "Choose the placeholder lunch", hex_question),
     ):
         worker_text = _project(owner, project_name)
         leaked = []
@@ -540,6 +549,9 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "Rebased onto 0a1b2c3d first",
         "Ask owner@example.test first",
         "Should p_values be reported?",
+        *hex_leaks.values(),
+        "Waiting on ABCDEFA",
+        "Waiting on _abcdefa_",
     ):
         assert ow.owner_stop_reason(private) == _DECISION_FALLBACK
         assert ow.owner_stop_reason(
@@ -554,10 +566,15 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "обеда»?",
         "Ist der Termin für Montag geplant?",
         "Is 50% of the budget enough?", "Should R&D approve it first?",
+        "Waiting for your feedback on the draft.",
         _DECISION_FALLBACK, _RECEIPT_FALLBACK,
     ):
         for fallback in (_DECISION_FALLBACK, _RECEIPT_FALLBACK):
             assert ow.owner_stop_reason(ordinary, fallback=fallback) == ordinary
+    # A line break in what the worker wrote is shown as a space.
+    assert ow.owner_stop_reason("Please confirm\nthe placeholder plan.") == (
+        "Please confirm the placeholder plan."
+    )
 
 
 def test_a_stopped_run_receipt_carries_its_stop_reason(owner):
