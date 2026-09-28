@@ -565,6 +565,8 @@ def _attempt(row: Any) -> Dict[str, Any]:
         or not isinstance(state, str) or state not in _CHAT_STATES
     ):
         chats = None
+    if chats is not None and not _consistent_attempt(state, row["finished_at"], chats):
+        chats = None
     return {
         "attempt_id": _listed_attempt_id(attempt_id),
         "request_id": request_key,
@@ -574,6 +576,19 @@ def _attempt(row: Any) -> Dict[str, Any]:
         "chats": chats,
         "error": row["error"] if row["error"] in _REASONS else None,
     }
+
+
+def _consistent_attempt(state: str, finished_at: Any, chats: List[Dict[str, Any]]) -> bool:
+    """Whether an attempt's state, finish time and chats agree as this module writes them: in progress
+    has no finish time and every chat in progress; a finished attempt has a finish time, no chat in
+    progress, and the state of its worst chat outcome."""
+    states = [chat["state"] for chat in chats]
+    if state == "in_progress":
+        return finished_at is None and all(chat_state == "in_progress" for chat_state in states)
+    return (
+        finished_at is not None and bool(states) and "in_progress" not in states
+        and state == min(states, key=_RANK.__getitem__)
+    )
 
 
 def _listed_attempt_id(value: Any) -> Optional[str]:
