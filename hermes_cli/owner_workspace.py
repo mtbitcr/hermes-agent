@@ -4415,7 +4415,7 @@ _OWNER_PRIVATE_STOP_REASON_PATTERNS = (
     ),
     re.compile(
         r"(?<![\w/\\.~-])[A-Za-z0-9._-]+(?:[/\\]+[A-Za-z0-9._-]+)*[/\\]+"
-        r"[A-Za-z0-9_-]*[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z][A-Za-z0-9]{0,7}\b"
+        r"[A-Za-z0-9_-]*[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z][A-Za-z0-9]*\b"
     ),
     re.compile(r"(?<![\w/])~/[A-Za-z0-9._-]"),
     re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE),
