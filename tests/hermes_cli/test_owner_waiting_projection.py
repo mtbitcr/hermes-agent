@@ -439,9 +439,18 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "move": f"Should I move this into {_PROJECT_ID} first?",
     }
     link_question = "Which file: the first or the second?"
+    # A path with a doubled slash, or one written without its leading slash,
+    # falls back the same way; dates with two slashes still come through.
+    path_leaks = {
+        "share": "Cannot open //srv/placeholder/x for reading",
+        "doubled": "The upload failed (see /srv//placeholder/x)",
+        "relative": "Saved the list to srv/placeholder/list.txt, please check it",
+    }
+    path_question = "Should we book it for 12/05/2026 or 19/05/2026?"
     for project_name, project_leaks, question_title, project_question in (
         ("Worker Text Pilot", leaks, "Choose the placeholder date", question),
         ("Worker Link Pilot", link_leaks, "Choose the placeholder file", link_question),
+        ("Worker Path Pilot", path_leaks, "Choose the placeholder day", path_question),
     ):
         worker_text = _project(owner, project_name)
         leaked = []
@@ -486,6 +495,7 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
     for private in (
         *leaks.values(),
         *link_leaks.values(),
+        *path_leaks.values(),
         "Saved the placeholder list to ~/placeholder/list.txt, please check it",
         "The upload failed (see /srv/placeholder/x)",
         "Should I publish file:///srv/placeholder/draft.html as it is?",
@@ -497,7 +507,8 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         ) == _RECEIPT_FALLBACK
     # Neither fixed sentence, nor an ordinary question, trips a pattern.
     for ordinary in (
-        reason, question, link_question, "Should p_values be reported?",
+        reason, question, link_question, path_question, "Should p_values be reported?",
+        "See https://example.test/help/owner for the steps",
         _DECISION_FALLBACK, _RECEIPT_FALLBACK,
     ):
         for fallback in (_DECISION_FALLBACK, _RECEIPT_FALLBACK):
