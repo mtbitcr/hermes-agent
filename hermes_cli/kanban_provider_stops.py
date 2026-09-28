@@ -13,6 +13,8 @@ card. This module is what the kernel adds to that booking and that hold:
   else the one the run's runtime receipt names, else the card's. A reset kept for
   one provider no longer holds a card whose route now names another; one kept for
   no known provider, or stored before providers were kept, holds as today.
+  Providers compare by the canonical id a worker resolves its ``--provider`` to,
+  so a card naming its provider by an alias or in another case has not moved.
 * A held card gets one ``respawn_guarded`` event, not one per dispatcher tick.
 * Only a failed run's own error can name a sign-in problem.
 * A worker whose provider refused the work (a ``content_policy_blocked`` turn)
@@ -40,8 +42,8 @@ PROVIDER_REFUSED_OUTCOME = "provider_refused"
 RATE_LIMIT_HOLD_CAP_SECONDS = 6 * 3600
 
 # Kept on a rate-limited run's metadata beside ``rate_limit_reset_at``: the
-# provider the run actually used (``None`` when none is known), and
-# ``"kernel"`` when the kernel derived the reset itself.
+# canonical id of the provider the run actually used (``None`` when none is
+# known), and ``"kernel"`` when the kernel derived the reset itself.
 RATE_LIMIT_RESET_PROVIDER_KEY = "rate_limit_reset_provider"
 RATE_LIMIT_RESET_SOURCE_KEY = "rate_limit_reset_source"
 KERNEL_RESET_SOURCE = "kernel"
@@ -75,9 +77,18 @@ def _metadata(raw: Any) -> Optional[dict]:
 
 
 def _provider(value: Any) -> Optional[str]:
-    if value is None:
+    """The canonical id of the provider ``value`` names, as a worker resolves its ``--provider``.
+
+    Stripped, lowercased and mapped through the same aliases, so ``claude`` and
+    ``Anthropic`` are both ``anthropic``: the provider kept on a run, the one a
+    receipt names and the card's own compare as one id. ``None`` when none is named.
+    """
+    name = str(value).strip().lower() if value is not None else ""
+    if not name:
         return None
-    return str(value).strip() or None
+    from hermes_cli.auth import _plugin_aliases
+
+    return _plugin_aliases().get(name, name)
 
 
 def _card_provider(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
@@ -113,7 +124,10 @@ def latest_ended_run(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3
 def _consecutive_stops(
     conn: sqlite3.Connection, task_id: str, run_id: int, provider: Optional[str],
 ) -> int:
-    """Rate-limited runs in a row on ``provider``, ending with (and counting) ``run_id``."""
+    """Rate-limited runs in a row on ``provider``, ending with (and counting) ``run_id``.
+
+    ``provider`` is a canonical id, and each earlier run's kept provider is read as one.
+    """
     stops = 1
     for row in conn.execute(
         "SELECT outcome, metadata FROM task_runs "
@@ -134,11 +148,12 @@ def book_rate_limit_reset(conn: sqlite3.Connection, task_id: str, run_id: int) -
 
     Called inside the booking transaction, right after the run is closed. The
     provider is the worker's own, recorded beside its reset; else the one the
-    closed run's runtime receipt names; only then the card's. The worker's own
-    reset stays when it is believable; otherwise, while the cooldown is on, the
-    kernel writes ``ended_at + min(cooldown * 2**stops, cap)`` where ``stops``
-    counts the consecutive rate-limited runs on this provider, this one
-    included. Unreadable metadata is left as it is.
+    closed run's runtime receipt names; only then the card's; it is kept as its
+    canonical id (:func:`_provider`). The worker's own reset stays when it is
+    believable; otherwise, while the cooldown is on, the kernel writes
+    ``ended_at + min(cooldown * 2**stops, cap)`` where ``stops`` counts the
+    consecutive rate-limited runs on this provider, this one included.
+    Unreadable metadata is left as it is.
     """
     from hermes_cli import kanban_db as kb
 
@@ -183,7 +198,8 @@ def rate_limit_resume_at(
 
     ``run`` is the task's latest ended run (read when omitted). The hold lasts
     the cooldown, or until the run's recorded reset when that is later, unless
-    the reset was kept for one provider and the card now names another.
+    the reset was kept for one provider and the card now names another; both
+    are compared as canonical ids, so an alias or another case is no move.
     """
     from hermes_cli import kanban_db as kb
 

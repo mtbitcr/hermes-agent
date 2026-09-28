@@ -7,10 +7,12 @@ never read as a sign-in problem; and a reset recorded under one provider stops
 holding once the card's route moves to another, while one recorded under the
 provider the card is then pinned onto, or under no known provider, still holds.
 That provider is the one the run actually used: the worker's own, else the one
-its runtime receipt names. A reset the worker records goes through the worker's
-own path, under exactly the environment the dispatcher builds for the claimed
-run, onto a named board under the test root. The refusal exit is covered end to
-end in ``tests/cli/test_kanban_worker_refusal_exit.py``.
+its runtime receipt names. Providers are compared by the id the worker resolves
+them to, so a card naming its provider by an alias or in another case holds, and
+its stops streak, as one naming it canonically. A reset the worker records goes
+through the worker's own path, under exactly the environment the dispatcher
+builds for the claimed run, onto a named board under the test root. The refusal
+exit is covered end to end in ``tests/cli/test_kanban_worker_refusal_exit.py``.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import pytest
 import cli
 from agent.credential_pool import STATUS_EXHAUSTED, CredentialPool, PooledCredential
 from hermes_cli import kanban_db as kb
+from hermes_cli.auth import resolve_provider
 from plugins.dashboard_auth.raphael_workspace import model_policy
 
 BOARD = "stops"
@@ -192,6 +195,20 @@ def _pin_onto_the_builder_route(conn, task_id):
     assert pinned == [task_id]
     assert kb.get_task(conn, task_id).provider_override == route.provider
     return route.provider
+
+
+def _card_naming_anthropic_as(conn, named):
+    """A card whose route names the anthropic provider as ``named``: an alias, or another case.
+
+    The card keeps the name as it was entered; its worker, handed that name as
+    ``--provider``, resolves it and runs on anthropic's credential pool.
+    """
+    task_id = kb.create_task(
+        conn, title="aliased card", assignee="worker", model_override="m-1", provider_override=named,
+    )
+    assert kb.get_task(conn, task_id).provider_override == named
+    assert resolve_provider(named) == "anthropic"
+    return task_id
 
 
 def _resume_at(run):
@@ -441,3 +458,75 @@ def test_a_reset_stored_before_providers_were_kept_holds_as_today(conn, clock):
     assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
     clock["t"] = reset_at
     assert kb.check_respawn_guard(conn, task_id) is None
+
+
+@pytest.mark.parametrize("named", ["claude", "Anthropic"])
+def test_a_worker_reset_holds_a_card_that_names_its_provider_by_an_alias_or_in_another_case(
+    conn, clock, monkeypatch, named,
+):
+    task_id = _card_naming_anthropic_as(conn, named)
+    run_id = _start_worker(conn, task_id, 4910)
+    reset_at = T0 + 3 * 3600
+    _record_as_worker(monkeypatch, conn, task_id, reset_at, provider="anthropic")
+    _worker_exits(conn, 4910, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    run = kb.get_run(conn, run_id)
+    assert _resume_at(run) == reset_at
+
+    clock["t"] = run.ended_at + 3600
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = reset_at - 1
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = reset_at
+    assert kb.check_respawn_guard(conn, task_id) is None
+
+
+@pytest.mark.parametrize("named", ["claude", "Anthropic"])
+def test_a_kernel_reset_holds_a_card_that_names_its_provider_by_an_alias_or_in_another_case(
+    conn, clock, named,
+):
+    # The worker recorded no reset; the run's runtime receipt names the
+    # provider it ran on.
+    task_id = _card_naming_anthropic_as(conn, named)
+    run_id = _start_worker(conn, task_id, 4920)
+    _worker_session_on(conn, task_id, "anthropic")
+    _worker_exits(conn, 4920, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    run = kb.get_run(conn, run_id)
+    assert run.metadata["runtime_receipt"]["provider"] == "anthropic"
+    assert run.metadata["rate_limit_reset_source"] == "kernel"
+    assert _resume_at(run) == run.ended_at + 2 * COOLDOWN
+
+    clock["t"] = run.ended_at + COOLDOWN + 1
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = run.ended_at + 2 * COOLDOWN - 1
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = run.ended_at + 2 * COOLDOWN
+    assert kb.check_respawn_guard(conn, task_id) is None
+
+
+@pytest.mark.parametrize("named", ["claude", "Anthropic"])
+def test_stops_on_one_provider_written_two_ways_double_the_hold(conn, clock, named):
+    # The first stop knows its provider only from the card, the second from
+    # its runtime receipt: the same provider, written two ways.
+    task_id = _card_naming_anthropic_as(conn, named)
+    first = _rate_limited_stop(conn, task_id, pid=4930)
+    assert first.metadata["rate_limit_reset_source"] == "kernel"
+    assert _resume_at(first) == first.ended_at + 2 * COOLDOWN
+
+    clock["t"] = _resume_at(first)
+    run_id = _start_worker(conn, task_id, 4931)
+    _worker_session_on(conn, task_id, "anthropic")
+    _worker_exits(conn, 4931, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    second = kb.get_run(conn, run_id)
+    assert second.outcome == "rate_limited"
+    assert second.metadata["runtime_receipt"]["provider"] == "anthropic"
+    assert second.metadata["rate_limit_reset_source"] == "kernel"
+    assert _resume_at(second) == second.ended_at + 4 * COOLDOWN
+
+    clock["t"] = second.ended_at + 4 * COOLDOWN - 1
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = second.ended_at + 4 * COOLDOWN
+    assert kb.check_respawn_guard(conn, task_id) is None
+    # Both stops keep the one id, whichever way the provider was written.
+    assert [run.metadata["rate_limit_reset_provider"] for run in (first, second)] == [
+        "anthropic", "anthropic",
+    ]
