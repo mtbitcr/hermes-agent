@@ -4398,18 +4398,24 @@ def owner_title(value: Any) -> str:
 # segments however it is punctuated or quoted (``/srv/x/y:``, ``'/srv/x/y'``),
 # but never a date or choice glued to a word (``12/05``, ``A/B``) or a URL's
 # path; a home path even one segment deep (``~/notes.txt``); a path written
-# without its leading slash once it has three segments and its first carries a
-# letter (``srv/x/y``), but never a date (``12/05/2026``); a full commit id;
-# a ``file:`` link; this platform's own Project ids (``projects_db._new_project_id``
-# and ``_derive_id``). :func:`owner_stop_reason` also checks each text with its
-# doubled slashes collapsed (``//srv/x``, ``/srv//x``), never after a colon, so
-# a web link's ``://`` is left as it is.
+# without its leading slash, with ``/`` or ``\``, once it has three segments and
+# its first carries a letter (``srv/x/y``, ``srv\x\y``), or once it ends in a
+# file name with an extension (``config/settings.py``, ``./settings.py``), but
+# never a date, version or choice (``12/05/2026``, ``v1.2/v1.3``, ``yes/no``);
+# a full commit id; a ``file:`` link; this platform's own Project ids
+# (``projects_db._new_project_id`` and ``_derive_id``). :func:`owner_stop_reason`
+# also checks each text with its doubled slashes collapsed (``//srv/x``,
+# ``/srv//x``), never after a colon, so a web link's ``://`` is left as it is.
 _OWNER_PRIVATE_STOP_REASON_PATTERNS = (
     re.compile(r"\bt_[0-9a-f]{8}\b"),
     re.compile(r"(?<![\w/])(?:~|\.{1,2})?(?:/[A-Za-z0-9._-]+){2,}"),
     re.compile(
-        r"(?<![\w/.~-])(?=[A-Za-z0-9._-]*[A-Za-z_])"
-        r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+){2,}"
+        r"(?<![\w/\\.~-])(?=[A-Za-z0-9._-]*[A-Za-z_])"
+        r"[A-Za-z0-9._-]+(?:[/\\]+[A-Za-z0-9._-]+){2,}"
+    ),
+    re.compile(
+        r"(?<![\w/\\.~-])[A-Za-z0-9._-]+(?:[/\\]+[A-Za-z0-9._-]+)*[/\\]+"
+        r"[A-Za-z0-9_-]*[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z][A-Za-z0-9]{0,7}\b"
     ),
     re.compile(r"(?<![\w/])~/[A-Za-z0-9._-]"),
     re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE),
