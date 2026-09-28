@@ -78,8 +78,8 @@ class _Chats:
 
 class _LiveChat:
     """A live gateway adapter: keeps what it was handed and answers as scripted. ``unconfirmed`` is
-    a refusal that still carries a message id; ``hangs`` never confirms. A text longer than
-    ``limit`` is refused."""
+    a refusal that still carries a message id; ``hangs`` never confirms; an answer that is a reply
+    is returned as it is. A text longer than ``limit`` is refused."""
 
     def __init__(self, answer="delivered", *, splits_long_messages=True, limit=4096):
         self.answer = answer
@@ -91,6 +91,8 @@ class _LiveChat:
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         self.sent.append((str(chat_id), content))
         self.started.set()
+        if not isinstance(self.answer, str):
+            return self.answer
         if self.answer == "hangs":
             await asyncio.sleep(10)
         if self.answer == "raises":
@@ -102,6 +104,16 @@ class _LiveChat:
         if len(content) > self.MAX_MESSAGE_LENGTH:
             return SendResult(success=False, error="Bad Request: message is too long")
         return SendResult(success=True, message_id="m1")
+
+
+class _LiveRelay(_LiveChat):
+    """A live relay transport fronting Telegram: it is handed each chat through ``send_for_platform``."""
+
+    def fronts_platform(self, platform):
+        return platform == Platform.TELEGRAM
+
+    async def send_for_platform(self, platform, chat_id, content, metadata=None):
+        return await self.send(chat_id, content, metadata=metadata)
 
 
 def _confirmation_times_out(monkeypatch, live):
@@ -462,6 +474,76 @@ async def test_live_send_already_out_is_not_sent_again_another_way(
     assert [(t["state"], t["reason"]) for t in body["targets"]] == [("unknown", reason)]
     attempts = _view(execution_id)["resend"]["attempts"]
     assert [(a["attempt_id"], a["state"]) for a in attempts] == [(body["attempt_id"], "unknown")]
+    _carries_nothing_private(body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transport, reply",
+    [
+        ("native", SendResult(success=False, error=REFUSED, message_id="m7")),
+        ("native", SendResult(success=False, error=REFUSED, continuation_message_ids=("m6",))),
+        ("native", {"success": False, "error": REFUSED, "message_id": "m7"}),
+        ("native", {"success": False, "error": REFUSED, "message_ids": ["m6", "m7"]}),
+        ("relay", SendResult(success=False, error=REFUSED, message_id="m7")),
+    ],
+    ids=["message_id", "continuation_message_ids", "dict_message_id", "dict_message_ids", "relay_message_id"],
+)
+async def test_live_refusal_with_a_message_receipt_reads_unknown_and_is_never_sent_again(
+    adapter, chats, runner, transport, reply
+):
+    _job_, execution_id, _first = await _failed_run(chats, CHAT_BAD)
+    # The chat's live adapter now refuses it as a blocked chat, yet names a message it made.
+    live = _LiveChat(reply) if transport == "native" else _LiveRelay(reply)
+    runner.adapters = {Platform.TELEGRAM if transport == "native" else Platform.RELAY: live}
+
+    async with _client(adapter) as cli:
+        response = await _resend(cli, execution_id, "req-1")
+        body = await response.json()
+        view = _view(execution_id)
+        again = await _resend(cli, execution_id, "req-2")
+        again_body = await again.json()
+
+    assert response.status == 200, body
+    # A refusal that names a message is no proof nothing was sent: the report may have arrived.
+    assert body["state"] == "unknown"
+    assert [(t["state"], t["reason"]) for t in body["targets"]] == [("unknown", "error_after_handover")]
+    assert body["resend"] == {"eligible": False, "reason": "outcome_unknown"}
+    attempts = delivery_record.load(execution_id)["attempts"]
+    assert [(a["attempt_id"], a["state"]) for a in attempts] == [(body["attempt_id"], "unknown")]
+    assert attempts[0]["chats"] == [{"position": 0, "state": "unknown", "reason": "error_after_handover"}]
+    assert view["resend"]["eligible"] is False
+    # Another request id is turned down like any run that may not be sent again, and sends nothing.
+    assert again.status == 409
+    assert again_body == {"detail": {"code": "not_eligible", "reason": "outcome_unknown"}}
+    assert [chat for chat, _message in live.sent] == [CHAT_BAD]
+    assert chats.sent == []
+    _carries_nothing_private(body)
+
+
+@pytest.mark.asyncio
+async def test_live_refusal_without_a_message_receipt_still_reads_failed_and_stays_eligible(
+    adapter, chats, runner
+):
+    _job_, execution_id, _first = await _failed_run(chats, CHAT_BAD)
+    # The same refusal of the single-part report, naming no message: nothing of it was sent.
+    live = _LiveChat(SendResult(success=False, error=REFUSED))
+    runner.adapters = {Platform.TELEGRAM: live}
+
+    async with _client(adapter) as cli:
+        response = await _resend(cli, execution_id, "req-1")
+        body = await response.json()
+
+    assert response.status == 200, body
+    assert [chat for chat, _message in live.sent] == [CHAT_BAD]
+    assert chats.sent == []
+    assert body["state"] == "failed"
+    assert [(t["state"], t["reason"]) for t in body["targets"]] == [("failed", "platform_refused")]
+    assert body["resend"] == {"eligible": True, "reason": None}
+    attempts = delivery_record.load(execution_id)["attempts"]
+    assert [(a["attempt_id"], a["state"]) for a in attempts] == [(body["attempt_id"], "failed")]
+    assert attempts[0]["chats"] == [{"position": 0, "state": "failed", "reason": "platform_refused"}]
+    assert _view(execution_id)["resend"]["eligible"] is True
     _carries_nothing_private(body)
 
 

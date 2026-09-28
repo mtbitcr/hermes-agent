@@ -2911,6 +2911,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                     if resend is not None:
                         # A re-send hands over its exact text: never cut to size or given a footer.
                         router._cap_oversized_output = lambda _adapter, text, _job_id: text
+                        # The router drops a failed reply when it raises: the re-send keeps each one.
+                        router.adapters = resend.keeping_replies(router.adapters)
                     route_target = DeliveryTarget(
                         platform=platform,
                         chat_id=str(chat_id),
@@ -3292,9 +3294,52 @@ def _install_resend_record_factory() -> None:
 _install_resend_record_factory()
 
 
+class _KeepsReplies:
+    """A live adapter as a re-send's router holds it: every call reaches the adapter unchanged, and
+    each reply its sends return is also kept in ``replies``."""
+
+    def __init__(self, adapter: Any, replies: list) -> None:
+        self._adapter = adapter
+        self._replies = replies
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._adapter, name)
+
+    async def send(self, *args, **kwargs) -> Any:
+        reply = await self._adapter.send(*args, **kwargs)
+        self._replies.append(reply)
+        return reply
+
+    async def send_for_platform(self, *args, **kwargs) -> Any:
+        reply = await self._adapter.send_for_platform(*args, **kwargs)
+        self._replies.append(reply)
+        return reply
+
+
+def _carries_receipt(reply: Any) -> bool:
+    """Whether a live send's reply names a message the platform made: its message id or the ids of
+    the parts it continued in, or a dict reply's ``message_id`` or ``message_ids``."""
+    if isinstance(reply, dict):
+        return bool(reply.get("message_id") or reply.get("message_ids"))
+    return bool(getattr(reply, "message_id", None) or getattr(reply, "continuation_message_ids", None))
+
+
+def _raised_by_router(exc: BaseException) -> bool:
+    """Whether the live router raised ``exc`` itself, as it does on a failed reply, rather than an
+    adapter under it: the innermost frame is the router's own send."""
+    from gateway.delivery import DeliveryRouter
+
+    router_send = getattr(DeliveryRouter._deliver_to_platform, "__code__", None)
+    tb = exc.__traceback__
+    while tb is not None and tb.tb_next is not None:
+        tb = tb.tb_next
+    return tb is not None and tb.tb_frame.f_code is router_send
+
+
 class _ResendDelivery(delivery_record._Recorder):
     """The chats and attachments one re-send hands to ``_deliver_result``, and how each chat ended:
-    classified exactly as a run's delivery record classifies it, but kept in memory. The run's own
+    classified as a run's delivery record classifies it, except that a live send that raised is
+    read with the replies its adapter gave (``live_error``), and kept in memory. The run's own
     record is never rewritten; the attempt's outcome is recorded once, by ``finish_resend``."""
 
     def __init__(self, job_id: str, targets: List[dict], media_files: list) -> None:
@@ -3302,12 +3347,37 @@ class _ResendDelivery(delivery_record._Recorder):
         self.targets = targets
         self.media_files = media_files
         self.outcomes: dict = {}
+        self.replies: list = []  # what the live adapter answered the current chat's text send
 
     def begin(self, text: str, media_files, targets) -> None:
         self._text = text
 
     def settings_not_loaded(self) -> None:
         self.outcomes = {index: ("failed", "settings_not_loaded") for index in range(len(self.targets))}
+
+    def next_target(self) -> None:
+        super().next_target()
+        self.replies = []
+
+    def keeping_replies(self, adapters) -> dict:
+        """The live router's adapters, each keeping in ``replies`` the replies its sends return."""
+        return {
+            platform: adapter if adapter is None else _KeepsReplies(adapter, self.replies)
+            for platform, adapter in adapters.items()
+        }
+
+    @delivery_record._guarded
+    def live_error(self, exc: BaseException, text: str, adapter: Any, chat_id: Any) -> None:
+        """A live send raised. A refusal shows nothing was sent only when no reply names a message
+        and the router did not raise on a reply this re-send could not keep; otherwise the chat
+        reads unknown and is never sent again."""
+        if any(_carries_receipt(reply) for reply in self.replies) or (
+            not self.replies and _raised_by_router(exc)
+        ):
+            self._note("unknown", "error_after_handover")
+            self._settle()
+        else:
+            super().live_error(exc, text, adapter, chat_id)
 
     def _settle(self) -> None:
         if self._index >= 0 and self._outcome is not None:
