@@ -4397,12 +4397,16 @@ def owner_title(value: Any) -> str:
 # kernel's own task ids (``kanban_db._new_task_id``); a path of two or more
 # segments however it is punctuated or quoted (``/srv/x/y:``, ``'/srv/x/y'``),
 # but never a date or choice glued to a word (``12/05``, ``A/B``) or a URL's
-# path; a home path even one segment deep (``~/notes.txt``); a full commit id.
+# path; a home path even one segment deep (``~/notes.txt``); a full commit id;
+# a ``file:`` link; this platform's own Project ids (``projects_db._new_project_id``
+# and ``_derive_id``).
 _OWNER_PRIVATE_STOP_REASON_PATTERNS = (
     re.compile(r"\bt_[0-9a-f]{8}\b"),
     re.compile(r"(?<![\w/])(?:~|\.{1,2})?(?:/[A-Za-z0-9._-]+){2,}"),
     re.compile(r"(?<![\w/])~/[A-Za-z0-9._-]"),
     re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE),
+    re.compile(r"\bfile:/", re.IGNORECASE),
+    re.compile(r"\bp_[0-9a-f]{8,}\b"),
 )
 
 

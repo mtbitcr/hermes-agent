@@ -25,8 +25,10 @@ _WORKER = "raphael-worker"
 _REVIEWER = "raphael-reviewer"
 _SECRET = "sk-" + "a" * 24
 _PATH = "/srv/placeholder/config.yaml"
+_FILE_LINK = "file:///srv/placeholder/index.html"
 _INTERNAL_ID = "task_1234abcd"
 _KERNEL_TASK_ID = "t_0000abcd"
+_PROJECT_ID = "p_0000abcd"
 _HOME_PATH = "~/notes.txt"
 _COMMIT_ID = "0000abcd" * 5
 _DECISION_FALLBACK = "Raphael needs your answer before this work can continue."
@@ -429,57 +431,75 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "draft": f"Should I publish the draft at commit {_COMMIT_ID}?",
     }
     question = "Should we book it for 12/05 or 19/05?"
-    worker_text = _project(owner, "Worker Text Pilot")
-    leaked = []
-    with _board(worker_text) as conn:
-        for kind in ("capability", "needs_input"):
-            for name, leak in leaks.items():
-                title = f"Check the placeholder {name} ({kind.replace('_', ' ')})"
-                _stopped(conn, worker_text, title, kind=kind, reason=leak)
-                leaked.append(title)
-        _stopped(
-            conn, worker_text, "Choose the placeholder date", kind="needs_input",
-            reason=question,
-        )
-    shown = dict.fromkeys(leaked, _DECISION_FALLBACK) | {
-        "Choose the placeholder date": question,
+    # A file: link and this platform's own Project id fall back the same way,
+    # and a question about a file still comes through. They get a second
+    # Project because the steward lists at most 12 decisions per Project.
+    link_leaks = {
+        "page": f"Cannot open {_FILE_LINK}: the browser is not available",
+        "move": f"Should I move this into {_PROJECT_ID} first?",
     }
+    link_question = "Which file: the first or the second?"
+    for project_name, project_leaks, question_title, project_question in (
+        ("Worker Text Pilot", leaks, "Choose the placeholder date", question),
+        ("Worker Link Pilot", link_leaks, "Choose the placeholder file", link_question),
+    ):
+        worker_text = _project(owner, project_name)
+        leaked = []
+        with _board(worker_text) as conn:
+            for kind in ("capability", "needs_input"):
+                for name, leak in project_leaks.items():
+                    title = f"Check the placeholder {name} ({kind.replace('_', ' ')})"
+                    _stopped(conn, worker_text, title, kind=kind, reason=leak)
+                    leaked.append(title)
+            _stopped(
+                conn, worker_text, question_title, kind="needs_input",
+                reason=project_question,
+            )
+        shown = dict.fromkeys(leaked, _DECISION_FALLBACK) | {
+            question_title: project_question,
+        }
 
-    assert {
-        item["title"]: (item["kind"], item["reason"])
-        for item in _decisions_for(owner, worker_text, owner_waiting=True)
-    } == {title: ("owner_input", text) for title, text in shown.items()}
-    worker_steward = ow.project_steward_snapshot(
-        project_id=worker_text["project_id"], owner_waiting=True,
-    )
-    assert {
-        item["title"]: item["reason"] for item in worker_steward["decisions_needed"]
-    } == shown
-    worker_snapshot = ow.read_project_snapshot(
-        owner, worker_text["slug"], run_context=True, owner_waiting=True,
-    )
-    tasks = _tasks_by_title(worker_snapshot)
-    assert {title: tasks[title]["owner_wait"]["reason"] for title in shown} == shown
-    stop_reasons: dict[str, list] = {}
-    for run in worker_snapshot["runs"]:
-        stop_reasons.setdefault(run["task_title"], []).append(
-            run["receipt"].get("stop_reason")
+        assert {
+            item["title"]: (item["kind"], item["reason"])
+            for item in _decisions_for(owner, worker_text, owner_waiting=True)
+        } == {title: ("owner_input", text) for title, text in shown.items()}
+        worker_steward = ow.project_steward_snapshot(
+            project_id=worker_text["project_id"], owner_waiting=True,
         )
-    assert stop_reasons == {title: [_RECEIPT_FALLBACK] for title in leaked} | {
-        "Choose the placeholder date": [question],
-    }
+        assert {
+            item["title"]: item["reason"] for item in worker_steward["decisions_needed"]
+        } == shown
+        worker_snapshot = ow.read_project_snapshot(
+            owner, worker_text["slug"], run_context=True, owner_waiting=True,
+        )
+        tasks = _tasks_by_title(worker_snapshot)
+        assert {title: tasks[title]["owner_wait"]["reason"] for title in shown} == shown
+        stop_reasons: dict[str, list] = {}
+        for run in worker_snapshot["runs"]:
+            stop_reasons.setdefault(run["task_title"], []).append(
+                run["receipt"].get("stop_reason")
+            )
+        assert stop_reasons == {title: [_RECEIPT_FALLBACK] for title in leaked} | {
+            question_title: [project_question],
+        }
 
     for private in (
         *leaks.values(),
+        *link_leaks.values(),
         "Saved the placeholder list to ~/placeholder/list.txt, please check it",
         "The upload failed (see /srv/placeholder/x)",
+        "Should I publish file:///srv/placeholder/draft.html as it is?",
+        "Project p_0000abcd0000abcd0000abcd has no repository configured",
     ):
         assert ow.owner_stop_reason(private) == _DECISION_FALLBACK
         assert ow.owner_stop_reason(
             private, fallback=_RECEIPT_FALLBACK,
         ) == _RECEIPT_FALLBACK
     # Neither fixed sentence, nor an ordinary question, trips a pattern.
-    for ordinary in (reason, question, _DECISION_FALLBACK, _RECEIPT_FALLBACK):
+    for ordinary in (
+        reason, question, link_question, "Should p_values be reported?",
+        _DECISION_FALLBACK, _RECEIPT_FALLBACK,
+    ):
         for fallback in (_DECISION_FALLBACK, _RECEIPT_FALLBACK):
             assert ow.owner_stop_reason(ordinary, fallback=fallback) == ordinary
 
