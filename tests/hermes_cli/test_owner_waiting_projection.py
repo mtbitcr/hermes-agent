@@ -421,8 +421,8 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         ) == _RECEIPT_FALLBACK
 
     # The ids and error text workers really write, on both kinds of stop,
-    # fall back whole on every owner surface; a question with slashes in it
-    # still comes through.
+    # fall back whole on every owner surface; a question without them still
+    # comes through.
     leaks = {
         "approval": f"Waiting for the owner to approve {_KERNEL_TASK_ID} before booking",
         "settings": f"Cannot read {_PATH}: permission denied",
@@ -430,7 +430,7 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "notes": f"Cannot open {_HOME_PATH} for reading",
         "draft": f"Should I publish the draft at commit {_COMMIT_ID}?",
     }
-    question = "Should we book it for 12/05 or 19/05?"
+    question = "Should we book it for the fifth or the nineteenth?"
     # A file: link and this platform's own Project id fall back the same way,
     # and a question about a file still comes through. They get a second
     # Project because the steward lists at most 12 decisions per Project.
@@ -440,7 +440,7 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
     }
     link_question = "Which file: the first or the second?"
     # A path with a doubled slash, or one written without its leading slash,
-    # falls back the same way; dates with two slashes still come through.
+    # falls back the same way.
     path_leaks = {
         "share": "Cannot open //srv/placeholder/x for reading",
         "doubled": "The upload failed (see /srv//placeholder/x)",
@@ -448,13 +448,15 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "file": "Please check config/settings.py",
         "windows": "Cannot read config\\settings.py",
     }
-    path_question = "Should we book it for 12/05/2026 or 19/05/2026?"
-    # A file name's extension may be long, start with a digit, or be the whole name.
+    path_question = "Should we book it for next Monday or next Tuesday?"
+    # A file name's extension may be long, start with a digit, or be the whole
+    # name; a short relative path reads like a choice.
     name_leaks = {
         "long": "Please check config/application.properties",
         "hidden": "Please check config/.sample",
         "numeric": "Please check config/archive.7z",
         "spaced": "Please check config/my notes.py",
+        "choice": "Cannot open A/B: permission denied",
     }
     name_question = "Should the placeholder room be booked for two hours?"
     for project_name, project_leaks, question_title, project_question in (
@@ -516,6 +518,14 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "The upload failed (see /srv/placeholder/x)",
         "Should I publish file:///srv/placeholder/draft.html as it is?",
         "Project p_0000abcd0000abcd0000abcd has no repository configured",
+        # Any slash may be a path, so none is explained away: dates, versions,
+        # choices, and look-alikes of both separators fall back too.
+        "Should we book it for 12/05 or 19/05?",
+        "Book it for 12/05/2026.", "Python 3.11/3.12 both work", "Use v1.2/v1.3",
+        "Plan the A/B test", "Is it yes/no.", "Is it and/or.",
+        "Cannot open A∕B: permission denied",
+        "Cannot open A／B: permission denied",
+        "The draft is in notes＼drafts",
     ):
         assert ow.owner_stop_reason(private) == _DECISION_FALLBACK
         assert ow.owner_stop_reason(
@@ -524,8 +534,7 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
     # Neither fixed sentence, nor an ordinary question, trips a pattern.
     for ordinary in (
         reason, question, link_question, path_question, "Should p_values be reported?",
-        "Is it yes/no.", "Python 3.11/3.12 both work", "Use v1.2/v1.3", "Plan the A/B test",
-        "Book it for 12/05/2026.", "Is it and/or.",
+        "Is it yes or no?", "Book it for the fifth of December.",
         _DECISION_FALLBACK, _RECEIPT_FALLBACK,
     ):
         for fallback in (_DECISION_FALLBACK, _RECEIPT_FALLBACK):
