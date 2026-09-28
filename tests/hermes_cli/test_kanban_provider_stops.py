@@ -9,8 +9,10 @@ provider the card is then pinned onto, or under no known provider, still holds.
 That provider is the one the run actually used: the worker's own, else the one
 its runtime receipt names. Providers are compared by the id the worker resolves
 them to, so a card naming its provider by an alias or in another case holds, and
-its stops streak, as one naming it canonically. A reset the worker records goes
-through the worker's own path, under exactly the environment the dispatcher
+its stops streak, as one naming it canonically; a card naming a custom endpoint
+by its name, slug or pool key, or Vertex by another of its names, holds on the
+reset its worker's pool or its runtime receipt gives. A reset the worker records
+goes through the worker's own path, under exactly the environment the dispatcher
 builds for the claimed run, onto a named board under the test root. The refusal
 exit is covered end to end in ``tests/cli/test_kanban_worker_refusal_exit.py``.
 """
@@ -27,9 +29,11 @@ from types import SimpleNamespace
 import pytest
 
 import cli
+from agent import vertex_adapter
 from agent.credential_pool import STATUS_EXHAUSTED, CredentialPool, PooledCredential
 from hermes_cli import kanban_db as kb
 from hermes_cli.auth import resolve_provider
+from hermes_cli.runtime_provider import resolve_runtime_provider
 from plugins.dashboard_auth.raphael_workspace import model_policy
 
 BOARD = "stops"
@@ -208,6 +212,56 @@ def _card_naming_anthropic_as(conn, named):
     )
     assert kb.get_task(conn, task_id).provider_override == named
     assert resolve_provider(named) == "anthropic"
+    return task_id
+
+
+# Custom endpoints the worker's profile configures, each with a key in its own
+# credential pool: one named ``Local LLM``, one whose name itself starts with
+# ``custom:``.
+_CUSTOM_ENDPOINTS = """\
+custom_providers:
+  - name: Local LLM
+    base_url: http://127.0.0.1:9/v1
+  - name: "custom:box"
+    base_url: http://127.0.0.1:10/v1
+"""
+
+
+def _worker_route(monkeypatch, named):
+    """``(runtime provider, credential pool)`` a worker handed ``named`` as ``--provider`` runs on.
+
+    Resolved by the worker's own resolver under the assignee's profile home in
+    the test root, where :data:`_CUSTOM_ENDPOINTS` are configured; Vertex's
+    token is stubbed, never fetched. The runtime provider is the one the run's
+    runtime receipt names.
+    """
+    from hermes_cli.profiles import get_profile_dir
+
+    home = get_profile_dir("worker")
+    (home / "config.yaml").write_text(_CUSTOM_ENDPOINTS)
+    key = {
+        "id": "key-1", "label": "key-1", "auth_type": "api_key", "priority": 0,
+        "source": "manual", "access_token": "test-token", "last_status": "ok",
+    }
+    (home / "auth.json").write_text(json.dumps({
+        "version": 1, "credential_pool": {"custom:local-llm": [key], "custom:custom:box": [key]},
+    }))
+    with monkeypatch.context() as worker:
+        worker.setenv("HERMES_HOME", str(home))
+        worker.setattr(
+            vertex_adapter, "get_vertex_config",
+            lambda *_args, **_kwargs: ("vertex-token", "https://vertex.invalid/v1"),
+        )
+        runtime = resolve_runtime_provider(requested=named)
+    return runtime["provider"], getattr(runtime.get("credential_pool"), "provider", None)
+
+
+def _card_routed_to(conn, named):
+    """A card whose route names its provider as ``named``, kept as it was entered."""
+    task_id = kb.create_task(
+        conn, title="routed card", assignee="worker", model_override="m-1", provider_override=named,
+    )
+    assert kb.get_task(conn, task_id).provider_override == named
     return task_id
 
 
@@ -530,3 +584,57 @@ def test_stops_on_one_provider_written_two_ways_double_the_hold(conn, clock, nam
     assert [run.metadata["rate_limit_reset_provider"] for run in (first, second)] == [
         "anthropic", "anthropic",
     ]
+
+
+@pytest.mark.parametrize(
+    ("named", "pool", "receipt"),
+    [
+        ("custom:local-llm", "custom:local-llm", "custom"),
+        ("local-llm", "custom:local-llm", "custom"),
+        ("Local LLM", "custom:local-llm", "custom"),
+        # A custom endpoint whose own name starts with ``custom:``.
+        ("custom:box", "custom:custom:box", "custom"),
+        ("box", "custom:custom:box", "custom"),
+        # Another of Vertex's names: no pool, a receipt naming ``vertex``.
+        ("vertexai", None, "vertex"),
+    ],
+)
+def test_a_card_holds_until_its_reset_whatever_name_its_worker_and_receipt_give_its_provider(
+    conn, clock, monkeypatch, named, pool, receipt,
+):
+    # Handed the card's name as ``--provider``, the worker runs on ``pool`` and
+    # its runtime receipt names ``receipt``.
+    assert _worker_route(monkeypatch, named) == (receipt, pool)
+
+    if pool is not None:
+        task_id = _card_routed_to(conn, named)
+        run_id = _start_worker(conn, task_id, 4940)
+        reset_at = T0 + 3 * 3600
+        _record_as_worker(monkeypatch, conn, task_id, reset_at, provider=pool)
+        _worker_exits(conn, 4940, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        run = kb.get_run(conn, run_id)
+        assert _resume_at(run) == reset_at
+
+        clock["t"] = run.ended_at + 3600
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+        clock["t"] = reset_at - 1
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+        clock["t"] = reset_at
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+    # No worker reset: the kernel books its own, beside the receipt's provider.
+    task_id = _card_routed_to(conn, named)
+    run_id = _start_worker(conn, task_id, 4941)
+    _worker_session_on(conn, task_id, receipt)
+    _worker_exits(conn, 4941, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    run = kb.get_run(conn, run_id)
+    assert run.metadata["runtime_receipt"]["provider"] == receipt
+    assert run.metadata["rate_limit_reset_source"] == "kernel"
+    assert _resume_at(run) == run.ended_at + 2 * COOLDOWN
+
+    clock["t"] = run.ended_at + COOLDOWN + 1
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = run.ended_at + 2 * COOLDOWN - 1
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = run.ended_at + 2 * COOLDOWN
+    assert kb.check_respawn_guard(conn, task_id) is None

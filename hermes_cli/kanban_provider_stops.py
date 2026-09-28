@@ -14,7 +14,8 @@ card. This module is what the kernel adds to that booking and that hold:
   one provider no longer holds a card whose route now names another; one kept for
   no known provider, or stored before providers were kept, holds as today.
   Providers compare by the canonical id a worker resolves its ``--provider`` to,
-  so a card naming its provider by an alias or in another case has not moved.
+  so a card naming its provider by an alias or in another case, or a custom
+  endpoint by its name, slug or pool key, has not moved.
 * A held card gets one ``respawn_guarded`` event, not one per dispatcher tick.
 * Only a failed run's own error can name a sign-in problem.
 * A worker whose provider refused the work (a ``content_policy_blocked`` turn)
@@ -80,15 +81,22 @@ def _provider(value: Any) -> Optional[str]:
     """The canonical id of the provider ``value`` names, as a worker resolves its ``--provider``.
 
     Stripped, lowercased and mapped through the same aliases, so ``claude`` and
-    ``Anthropic`` are both ``anthropic``: the provider kept on a run, the one a
-    receipt names and the card's own compare as one id. ``None`` when none is named.
+    ``Anthropic`` are both ``anthropic`` and each of Vertex's names is ``vertex``:
+    the provider kept on a run, the one a receipt names and the card's own compare
+    as one id. One custom endpoint is one id: spaces become dashes and a leading
+    ``custom:`` is dropped, so its name (``Local LLM``), its slug and its pool key
+    (``custom:local-llm``) compare equal. ``None`` when none is named, and for the
+    bare runtime family ``custom`` a receipt names for every custom endpoint.
     """
-    name = str(value).strip().lower() if value is not None else ""
+    name = str(value).strip().lower().replace(" ", "-") if value is not None else ""
+    while name.startswith("custom:"):
+        name = name[len("custom:"):]
     if not name:
         return None
-    from hermes_cli.auth import _plugin_aliases
+    from hermes_cli.auth import _VERTEX_PROVIDER_IDS, _plugin_aliases
 
-    return _plugin_aliases().get(name, name)
+    name = "vertex" if name in _VERTEX_PROVIDER_IDS else _plugin_aliases().get(name, name)
+    return None if name == "custom" else name
 
 
 def _card_provider(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
