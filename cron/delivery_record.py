@@ -13,12 +13,20 @@ as it is known:
 When in doubt the outcome is ``unknown``. Raw error text is never stored. This is an audit record,
 not a retry queue: nothing here re-sends anything, and a recording error is logged and never changes
 delivery.
+
+Each attempt to send a run's failed chats again is recorded here too: claimed ``in_progress`` in one
+compare-and-set write, then finished with each chat's outcome, its times and its error, redacted. A
+request id is kept only as its SHA-256 digest. A chat an attempt leaves ``failed`` may be re-sent
+again; one it leaves ``delivered`` or ``unknown`` never is. An attempt still in progress at start-up
+was cut off and is fenced ``unknown``. A stored value outside the shape this module writes is read as
+unknown, never passed on.
 """
 
 from __future__ import annotations
 
 import contextvars
 import functools
+import hashlib
 import inspect
 import json
 import logging
@@ -28,8 +36,9 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager, suppress
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
@@ -47,6 +56,27 @@ MAX_SAVED_TEXT_BYTES = 1024 * 1024
 # A target's outcome only moves up this order: a fallback the platform accepts turns an earlier
 # failure into delivered, and a send that may have happened keeps a later refusal unknown.
 _RANK = {"failed": 0, "unknown": 1, "delivered": 2}
+# Re-send attempts are bounded: a request id's length and the attempts one run may have.
+MAX_REQUEST_ID_CHARS = 128
+MAX_RESEND_ATTEMPTS = 5
+# A record dated further ahead than this is not believed: it is never re-sent and it is pruned.
+_CLOCK_SKEW_SECONDS = 86400
+# The chat states a re-send attempt writes.
+_CHAT_STATES = frozenset({"in_progress", "failed", "unknown", "delivered"})
+# The reason codes a re-send attempt keeps for a chat; any other reason, such as error text, is dropped.
+_REASONS = frozenset({
+    "route_refused", "no_connection", "settings_not_loaded", "platform_refused",
+    "timeout", "error_after_handover", "partly_sent", "interrupted",
+})
+# The reasons a chat is refused with before it is handed over: nothing of it was sent.
+_BEFORE_HANDOVER = frozenset({"route_refused", "no_connection", "settings_not_loaded", "platform_refused"})
+# The shapes of the ids this module writes: an attempt id and a request id's digest.
+_ATTEMPT_ID = re.compile(r"[0-9a-f]{32}")
+_REQUEST_KEY = re.compile(r"[0-9a-f]{64}")
+# A target that cannot be read: never re-sent, labelled only as unknown.
+_UNREADABLE_TARGET = {
+    "platform": None, "chat_id": None, "thread_id": None, "state": "unknown", "reason": None, "text": None,
+}
 _lock = threading.RLock()
 _active = contextvars.ContextVar("cron_delivery_recorder", default=None)
 
@@ -90,10 +120,48 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              PRIMARY KEY (execution_id, position)
            )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS attempts (
+             attempt_id TEXT PRIMARY KEY,
+             execution_id TEXT NOT NULL,
+             request_id TEXT NOT NULL,
+             requested_at REAL NOT NULL,
+             finished_at REAL,
+             state TEXT NOT NULL CHECK(state IN ('in_progress','delivered','failed','unknown')),
+             chats TEXT NOT NULL,
+             error TEXT,
+             UNIQUE (execution_id, request_id)
+           )"""
+    )
+    # At most one attempt per run is in progress, whatever writes it.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_attempts_in_progress "
+        "ON attempts(execution_id) WHERE state='in_progress'"
+    )
+
+
+def _decoded(value: bytes) -> str:
+    # Lossless: text that is not valid UTF-8 keeps its bad bytes as lone surrogates, so _clean_text
+    # can refuse it instead of passing on a changed value.
+    return value.decode("utf-8", errors="surrogateescape")
+
+
+def _clean_text(value: Any) -> Optional[str]:
+    """``value`` when it is text that was stored as valid UTF-8, else None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return value
 
 
 def _open(path: Path) -> sqlite3.Connection:
     conn = open_ledger(path)
+    # Text that is not valid UTF-8 reads without failing the whole read; the readers below then
+    # refuse it as unreadable.
+    conn.text_factory = _decoded
     # The store holds report text and chat ids: owner-only, like the delivery queue and cron output.
     # SQLite gives its -wal and -shm files the main file's mode.
     for target, mode in ((path.parent, 0o700), (path, 0o600)):
@@ -116,12 +184,15 @@ def _kept(text: Optional[str]) -> Optional[str]:
 
 
 def _prune_unlocked(conn: sqlite3.Connection, now: float) -> None:
+    # A record whose time is not a finite number has no age to keep it by.
     conn.execute(
-        "DELETE FROM records WHERE created_at < ? AND execution_id NOT IN ("
-        "SELECT execution_id FROM records ORDER BY created_at DESC, execution_id DESC LIMIT ?)",
-        (now - RESEND_WINDOW_SECONDS, max(0, int(MAX_RECORDS))),
+        "DELETE FROM records WHERE typeof(created_at) NOT IN ('integer', 'real') "
+        "OR created_at IN (9e999, -9e999) OR created_at > ? OR (created_at < ? AND execution_id NOT IN ("
+        "SELECT execution_id FROM records ORDER BY created_at DESC, execution_id DESC LIMIT ?))",
+        (now + _CLOCK_SKEW_SECONDS, now - RESEND_WINDOW_SECONDS, max(0, int(MAX_RECORDS))),
     )
     conn.execute("DELETE FROM targets WHERE execution_id NOT IN (SELECT execution_id FROM records)")
+    conn.execute("DELETE FROM attempts WHERE execution_id NOT IN (SELECT execution_id FROM records)")
 
 
 # --- recording -----------------------------------------------------------------------------------
@@ -367,32 +438,46 @@ def active_recorder() -> _Recorder:
 # --- reading -------------------------------------------------------------------------------------
 
 def load_many(execution_ids: Iterable[Any], *, bodies: bool = True) -> Dict[str, Dict[str, Any]]:
-    """This profile's records for ``execution_ids``; a target still pending, or whose stored state
-    is not one this module writes, reads ``unknown``. With ``bodies=False`` each ``text`` is only
-    True when a text is kept (None otherwise), so a listing never loads the report bodies."""
+    """This profile's records for ``execution_ids``, each with its re-send attempts oldest first; a
+    target still pending, or whose stored state is not one this module writes, reads ``unknown``.
+    With ``bodies=False`` each ``text`` is only True when a text is kept (None otherwise), so a
+    listing never loads the report bodies."""
     ids = list(dict.fromkeys(str(value) for value in execution_ids if value))
     path = _path()
     if not ids or not path.exists():
         return {}
-    marks = ",".join("?" * len(ids))
-    text = "text" if bodies else "CASE WHEN text IS NULL THEN NULL ELSE 1 END AS text"
-    sent_text = "sent_text" if bodies else "CASE WHEN sent_text IS NULL THEN NULL ELSE 1 END AS sent_text"
+    _platform_keys()  # imported before the store is locked, never while holding it
     with _transaction(path) as conn:
-        records = conn.execute(
-            f"SELECT execution_id, job_id, created_at, {text}, attachments FROM records "
-            f"WHERE execution_id IN ({marks})", ids,
-        ).fetchall()
-        targets = conn.execute(
-            f"SELECT execution_id, platform, chat_id, thread_id, state, reason, {sent_text} FROM targets "
-            f"WHERE execution_id IN ({marks}) ORDER BY execution_id, position", ids,
-        ).fetchall()
+        return _load_unlocked(conn, ids, bodies)
+
+
+def _load_unlocked(conn: sqlite3.Connection, ids: List[str], bodies: bool) -> Dict[str, Dict[str, Any]]:
+    marks = ",".join("?" * len(ids))
+    # Without bodies, a text is present only when it is stored as text; a sent text that is stored
+    # but is not text reads 0, and its target then has no text to re-send.
+    text = "text" if bodies else "CASE WHEN typeof(text) = 'text' THEN 1 END AS text"
+    sent_text = "sent_text" if bodies else (
+        "CASE WHEN sent_text IS NULL THEN NULL WHEN typeof(sent_text) = 'text' THEN 1 ELSE 0 END AS sent_text"
+    )
+    records = conn.execute(
+        f"SELECT execution_id, job_id, created_at, {text}, attachments FROM records "
+        f"WHERE execution_id IN ({marks})", ids,
+    ).fetchall()
+    targets = conn.execute(
+        f"SELECT execution_id, position, platform, chat_id, thread_id, state, reason, {sent_text} FROM targets "
+        f"WHERE execution_id IN ({marks}) ORDER BY execution_id, position", ids,
+    ).fetchall()
+    attempts = conn.execute(
+        f"SELECT * FROM attempts WHERE execution_id IN ({marks}) ORDER BY rowid", ids
+    ).fetchall()
     loaded = {
         row["execution_id"]: {
-            "job_id": row["job_id"],
-            "created_at": row["created_at"],
-            "text": row["text"] if bodies or row["text"] is None else True,
-            "attachments": json.loads(row["attachments"] or "[]"),
+            "job_id": _clean_text(row["job_id"]),
+            "created_at": _stored_moment(row["created_at"]),
+            "text": _stored_text(row["text"]) if bodies else (True if row["text"] is not None else None),
+            "attachments": _stored_attachments(row["attachments"]),
             "targets": [],
+            "attempts": [],
         }
         for row in records
     }
@@ -400,18 +485,194 @@ def load_many(execution_ids: Iterable[Any], *, bodies: bool = True) -> Dict[str,
         record = loaded.get(row["execution_id"])
         if record is None:
             continue
+        if not _readable_target(row, len(record["targets"])):
+            record["targets"].append(dict(_UNREADABLE_TARGET))
+            continue
         pending = row["state"] == "pending"
         known = row["state"] in _RANK
-        sent = row["sent_text"] if bodies or row["sent_text"] is None else True
+        if row["sent_text"] is None:
+            text = record["text"]
+        elif bodies:
+            text = _stored_text(row["sent_text"])
+        else:
+            text = True if row["sent_text"] == 1 else None
         record["targets"].append({
             "platform": row["platform"],
             "chat_id": row["chat_id"],
             "thread_id": row["thread_id"],
             "state": row["state"] if known else "unknown",
             "reason": "interrupted" if pending else (row["reason"] if known else None),
-            "text": sent if sent is not None else record["text"],
+            "text": text,
         })
+    for row in attempts:
+        record = loaded.get(row["execution_id"])
+        if record is not None:
+            record["attempts"].append(_attempt(row))
+    for record in loaded.values():
+        _reconcile_attempts(record)
     return loaded
+
+
+def _reconcile_attempts(record: Dict[str, Any]) -> None:
+    """An attempt must name each chat still failed when it was claimed exactly once, and no other
+    chat; otherwise it cannot be read (chats None, state unknown) and its run is never re-sent."""
+    recorded = record["targets"]
+    targets = [dict(target) for target in recorded]
+    for attempt in record["attempts"]:
+        chats = attempt["chats"]
+        if chats is None:
+            continue
+        positions = [chat["position"] for chat in chats]
+        claimed = {
+            index for index, target in enumerate(targets)
+            if target["state"] == "failed" and recorded[index]["state"] == "failed"
+        }
+        if not positions or len(set(positions)) != len(positions) or set(positions) != claimed:
+            attempt.update(chats=None, state="unknown")
+            continue
+        for chat in chats:
+            targets[chat["position"]].update(state=chat["state"], reason=chat["reason"])
+
+
+@functools.lru_cache(maxsize=1)
+def _platform_keys() -> frozenset:
+    from gateway.config import Platform
+
+    return frozenset(platform.value for platform in Platform)
+
+
+def _readable_target(row: Any, index: int) -> bool:
+    """Whether a stored target has the shape the recorder writes, at its place in the order."""
+    position, platform, reason = row["position"], row["platform"], row["reason"]
+    return (
+        isinstance(position, int) and position == index
+        and isinstance(platform, str) and platform in _platform_keys()
+        and _clean_text(row["chat_id"]) is not None
+        and (row["thread_id"] is None or _clean_text(row["thread_id"]) is not None)
+        and (reason is None or (isinstance(reason, str) and reason in _REASONS))
+        and _agrees(row["state"], reason)
+    )
+
+
+def _attempt(row: Any) -> Dict[str, Any]:
+    """An attempt as stored. An attempt whose ids, state, chats or times are not what this module writes
+    has chats None and reads unknown."""
+    chats = _chats(row["chats"])
+    attempt_id, request_id, state = row["attempt_id"], row["request_id"], row["state"]
+    requested_at = _stored_iso(row["requested_at"])
+    finished_at = None if row["finished_at"] is None else _stored_iso(row["finished_at"])
+    request_key = request_id if isinstance(request_id, str) and _REQUEST_KEY.fullmatch(request_id) else None
+    if (
+        _listed_attempt_id(attempt_id) is None or request_key is None or requested_at is None
+        or (row["finished_at"] is not None and finished_at is None)
+        or not isinstance(state, str) or state not in _CHAT_STATES
+    ):
+        chats = None
+    if chats is not None and not _consistent_attempt(state, row["finished_at"], chats):
+        chats = None
+    return {
+        "attempt_id": _listed_attempt_id(attempt_id),
+        "request_id": request_key,
+        "requested_at": requested_at,
+        "finished_at": finished_at,
+        "state": state if chats is not None else "unknown",
+        "chats": chats,
+        "error": row["error"] if row["error"] in _REASONS else None,
+    }
+
+
+def _consistent_attempt(state: str, finished_at: Any, chats: List[Dict[str, Any]]) -> bool:
+    """Whether an attempt's state, finish time and chats agree as this module writes them: in progress
+    has no finish time and every chat in progress; a finished attempt has a finish time, no chat in
+    progress, and the state of its worst chat outcome."""
+    states = [chat["state"] for chat in chats]
+    if state == "in_progress":
+        return finished_at is None and all(chat_state == "in_progress" for chat_state in states)
+    return (
+        finished_at is not None and bool(states) and "in_progress" not in states
+        and state == min(states, key=_RANK.__getitem__)
+    )
+
+
+def _listed_attempt_id(value: Any) -> Optional[str]:
+    """An attempt id as this module writes it (a version 4 UUID in hex), or None."""
+    if not isinstance(value, str) or not _ATTEMPT_ID.fullmatch(value):
+        return None
+    parsed = uuid.UUID(value)
+    return value if parsed.version == 4 and parsed.hex == value else None
+
+
+def _stored_text(text: Any) -> Optional[str]:
+    """Saved report text, or None when it is not valid text (it then reads as expired)."""
+    return _clean_text(text)
+
+
+def _stored_attachments(text: Any) -> Optional[List[Any]]:
+    """The saved attachment list, or None when it cannot be read (the run is then never re-sent)."""
+    raw = _clean_text(text)
+    if not raw:
+        return None
+    try:
+        attachments = json.loads(raw)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if not isinstance(attachments, list) or not all(
+        isinstance(entry, dict) and set(entry) == {"path", "is_voice"}
+        and _clean_text(entry["path"]) is not None and isinstance(entry["is_voice"], bool)
+        for entry in attachments
+    ):
+        return None
+    return attachments
+
+
+def _stored_moment(moment: Any) -> Optional[float]:
+    """A stored time, or None when it is not a finite number."""
+    if isinstance(moment, bool) or not isinstance(moment, (int, float)) or not math.isfinite(moment):
+        return None
+    return moment
+
+
+def _stored_iso(moment: Any) -> Optional[str]:
+    """A stored time as ISO text, or None when it is not a finite number in datetime range."""
+    if isinstance(moment, bool) or not isinstance(moment, (int, float)) or not math.isfinite(moment):
+        return None
+    try:
+        return datetime.fromtimestamp(moment, timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _chats(text: Any) -> Optional[List[Dict[str, Any]]]:
+    """An attempt's chats, or None when any of them is not what this module writes."""
+    raw = _clean_text(text)
+    if raw is None:
+        return None
+    try:
+        chats = json.loads(raw)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if not isinstance(chats, list):
+        return None
+    for chat in chats:
+        if not isinstance(chat, dict) or set(chat) != {"position", "state", "reason"}:
+            return None
+        position, state, reason = chat["position"], chat["state"], chat["reason"]
+        if (
+            not isinstance(position, int) or isinstance(position, bool)
+            or not isinstance(state, str) or state not in _CHAT_STATES
+            or (reason is not None and (not isinstance(reason, str) or reason not in _REASONS))
+            or not _agrees(state, reason)
+        ):
+            return None
+    return chats
+
+
+def _agrees(state: Any, reason: Optional[str]) -> bool:
+    """Whether a state and its reason can come from this module together: a failure names a reason
+    from before the hand-over, and a chat sent or in progress names no reason."""
+    if state == "failed":
+        return reason in _BEFORE_HANDOVER
+    return reason is None or state not in ("delivered", "in_progress")
 
 
 def load(execution_id: Any) -> Optional[Dict[str, Any]]:
@@ -455,30 +716,63 @@ def history_deliveries(
                 {"label": label, "state": target["state"], "reason": target["reason"]}
                 for label, target in zip(_labels(targets, routes), targets)
             ],
-            "resend": _resend(_resend_refusal(row, record, now)),
+            "resend": _resend(_resend_refusal(row, record, now), record["attempts"]),
         })
     return deliveries
 
 
-def _resend(reason: Optional[str]) -> Dict[str, Any]:
-    return {"eligible": reason is None, "reason": reason, "attempts": []}
+def _resend(reason: Optional[str], attempts: Iterable[Dict[str, Any]] = ()) -> Dict[str, Any]:
+    listed = ("attempt_id", "request_id", "requested_at", "finished_at", "state")
+    return {
+        "eligible": reason is None,
+        "reason": reason,
+        "attempts": [{key: attempt[key] for key in listed} for attempt in attempts],
+    }
 
 
 def _resend_refusal(row: Dict[str, Any], record: Dict[str, Any], now: float) -> Optional[str]:
     """Why the failed chats of this run may not be re-sent, or None when they may be."""
-    if row.get("status") in ("claimed", "running"):
+    if row.get("status") in ("claimed", "running") or any(
+        attempt["state"] == "in_progress" for attempt in record["attempts"]
+    ):
         return "in_progress"
-    failed = [target for target in record["targets"] if target["state"] == "failed"]
+    if any(attempt["chats"] is None for attempt in record["attempts"]):
+        # An attempt that cannot be read may have sent: never send again.
+        return "outcome_unknown"
+    targets = _latest_targets(record)
+    failed = [target for target in targets if target["state"] == "failed"]
     if not failed:
-        unknown = any(target["state"] == "unknown" for target in record["targets"])
+        unknown = any(target["state"] == "unknown" for target in targets)
         return "outcome_unknown" if unknown else "already_delivered"
+    if len(record["attempts"]) >= MAX_RESEND_ATTEMPTS:
+        return "too_many_attempts"
+    if record["attachments"] is None:
+        return "attachment_missing"
     created = record["created_at"]
     if (
         not isinstance(created, (int, float)) or isinstance(created, bool) or not math.isfinite(created)
+        or created > now + _CLOCK_SKEW_SECONDS
         or now - created >= RESEND_WINDOW_SECONDS or any(t["text"] is None for t in failed)
     ):
         return "output_expired"
     return None
+
+
+def _latest_targets(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The run's targets as its re-send attempts left them, the latest one last. An attempt changes
+    only a target the run itself recorded as failed and that no attempt has moved on from since: a
+    delivered, unknown or in-progress outcome is final."""
+    recorded = record["targets"]
+    targets = [dict(target) for target in recorded]
+    for attempt in record["attempts"]:
+        for chat in attempt["chats"] or ():
+            position = chat["position"]
+            if (
+                0 <= position < len(targets) and recorded[position]["state"] == "failed"
+                and targets[position]["state"] == "failed"
+            ):
+                targets[position].update(state=chat["state"], reason=chat["reason"])
+    return targets
 
 
 def _names_id(name: str, value: Any) -> bool:
@@ -496,6 +790,9 @@ def _labels(targets: List[Dict[str, Any]], routes: list) -> List[str]:
     labels = []
     for target in targets:
         key = target["platform"]
+        if key is None:
+            labels.append("Unknown")
+            continue
         label = re.sub(r"^\W+", "", platform_label(key, default="")).strip() or key.replace("_", " ").title()
         chat = {"chat_id": target["chat_id"], "thread_id": target["thread_id"]}
         for route in routes:
@@ -513,3 +810,143 @@ def _labels(targets: List[Dict[str, Any]], routes: list) -> List[str]:
         seen[label] = seen.get(label, 0) + 1
         numbered.append(label if seen[label] == 1 else f"{label} {seen[label]}")
     return numbered
+
+
+# --- re-send attempts ----------------------------------------------------------------------------
+
+def claim_resend(row: Optional[Dict[str, Any]], request_id: Any) -> Dict[str, Any]:
+    """Claim the re-send of an execution row's failed chats. Only when the re-send view calls the run
+    eligible, one compare-and-set write adds an attempt whose ``chats`` are those positions of
+    ``load(...)["targets"]``, each ``in_progress``. A request id this run already had returns its
+    first attempt and claims nothing. Returns ``{"claimed", "reason", "attempt"}``, where ``reason``
+    is the view's refusal when nothing was claimed."""
+    request_id = str(request_id or "")
+    if not request_id or len(request_id) > MAX_REQUEST_ID_CHARS:
+        raise ValueError(f"a re-send claim needs a request id of 1 to {MAX_REQUEST_ID_CHARS} characters")
+    # Only a digest is kept, compared and returned: a caller may put a chat id or other text in the id.
+    request_key = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+    row = row or {}
+    execution_id = str(row.get("id") or "")
+    path = _path()
+    if not execution_id or not path.exists():
+        return {"claimed": False, "reason": "not_recorded", "attempt": None}
+    now = _clock()
+    _platform_keys()  # imported before the write lock is taken, never while holding it
+    with _transaction(path) as conn:
+        # Hold the write lock from the check to the insert, against other processes too.
+        conn.execute("BEGIN IMMEDIATE")
+        # This one run's texts are read in full, so text that cannot be read refuses the claim.
+        record = _load_unlocked(conn, [execution_id], True).get(execution_id)
+        if not record or not record["targets"]:
+            return {"claimed": False, "reason": "not_recorded", "attempt": None}
+        for attempt in record["attempts"]:
+            if attempt["request_id"] == request_key:
+                return {"claimed": False, "reason": None, "attempt": _without_error(attempt)}
+        reason = _resend_refusal(row, record, now)
+        if reason is not None:
+            return {"claimed": False, "reason": reason, "attempt": None}
+        chats = [
+            {"position": position, "state": "in_progress", "reason": None}
+            for position, target in enumerate(_latest_targets(record)) if target["state"] == "failed"
+        ]
+        attempt_id = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO attempts (attempt_id, execution_id, request_id, requested_at, state, chats) "
+            "VALUES (?, ?, ?, ?, 'in_progress', ?)",
+            (attempt_id, execution_id, request_key, now, json.dumps(chats)),
+        )
+        attempt = _attempt(
+            conn.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        )
+    return {"claimed": True, "reason": None, "attempt": _without_error(attempt)}
+
+
+def _without_error(attempt: Dict[str, Any]) -> Dict[str, Any]:
+    """A claim's answer never carries an attempt's error."""
+    return {key: value for key, value in attempt.items() if key != "error"}
+
+
+def finish_resend(attempt_id: Any, results: Iterable[Dict[str, Any]], *, error: Any = None) -> bool:
+    """Record how an attempt still in progress ended: each chat's ``state`` and ``reason`` from
+    ``results`` (``{"position", "state", "reason"}``), the finish time and ``error`` when it is a
+    reason code. Free error text is never stored: delivery errors name the chat. A chat without a
+    result reads ``unknown``/``interrupted``, a state that is not an outcome reads ``unknown``, and a
+    reason that is not a code is dropped; a failure that names no reason from before the hand-over
+    reads ``unknown``, and so does a chat given two different results. A result without a plain int
+    position is ignored. An attempt whose chats cannot be read ends ``unknown``.
+    False, writing nothing, when the attempt is not in progress."""
+    given: Dict[int, Dict[str, Any]] = {}
+    for result in results:
+        position = result.get("position") if isinstance(result, dict) else None
+        if isinstance(position, int) and not isinstance(position, bool):
+            # Two different results for one chat say nothing certain about it.
+            given[position] = result if given.get(position, result) == result else {"state": "unknown"}
+    safe_error = error if isinstance(error, str) and error in _REASONS else None
+    path = _path()
+    if not path.exists():
+        return False
+    with _transaction(path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT chats FROM attempts WHERE attempt_id=? AND state='in_progress'", (str(attempt_id),)
+        ).fetchone()
+        if row is None:
+            return False
+        stored = _chats(row["chats"])
+        if stored is None:
+            cur = conn.execute(
+                "UPDATE attempts SET state='unknown', finished_at=? WHERE attempt_id=? AND state='in_progress'",
+                (_clock(), str(attempt_id)),
+            )
+            return cur.rowcount == 1
+        chats = [dict(chat, **_chat_result(given.get(chat["position"]))) for chat in stored]
+        state = min((chat["state"] for chat in chats), key=_RANK.__getitem__, default="unknown")
+        cur = conn.execute(
+            "UPDATE attempts SET state=?, finished_at=?, chats=?, error=? "
+            "WHERE attempt_id=? AND state='in_progress'",
+            (state, _clock(), json.dumps(chats), safe_error, str(attempt_id)),
+        )
+    return cur.rowcount == 1
+
+
+def _chat_result(result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if result is None:
+        return {"state": "unknown", "reason": "interrupted"}
+    state = result.get("state")
+    if not isinstance(state, str) or state not in _RANK:
+        return {"state": "unknown", "reason": None}
+    reason = result.get("reason")
+    reason = reason if state != "delivered" and isinstance(reason, str) and reason in _REASONS else None
+    # A failure that names no refusal from before the hand-over may have sent: it is kept unknown.
+    return {"state": state if _agrees(state, reason) else "unknown", "reason": reason}
+
+
+def fence_resends() -> int:
+    """Start-up fence, to run before any re-send can be claimed: an attempt still in progress was cut
+    off mid-send, so it and each of its chats read ``unknown`` (``interrupted``) and its run is never
+    re-sent. Returns how many attempts were fenced."""
+    path = _path()
+    if not path.exists():
+        return 0
+    now = _clock()
+    fenced = 0
+    with _transaction(path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        # By rowid: an id that is not valid text reads back changed and would match no row.
+        rows = conn.execute("SELECT rowid, chats FROM attempts WHERE state='in_progress'").fetchall()
+        for row in rows:
+            stored = _chats(row["chats"])
+            if stored is None:
+                # Unreadable chats stay as they are; the attempt reads unknown and blocks the run.
+                fenced += conn.execute(
+                    "UPDATE attempts SET state='unknown', finished_at=? WHERE rowid=? AND state='in_progress'",
+                    (now, row["rowid"]),
+                ).rowcount
+                continue
+            chats = [dict(chat, state="unknown", reason="interrupted") for chat in stored]
+            fenced += conn.execute(
+                "UPDATE attempts SET state='unknown', finished_at=?, chats=? "
+                "WHERE rowid=? AND state='in_progress'",
+                (now, json.dumps(chats), row["rowid"]),
+            ).rowcount
+    return fenced
