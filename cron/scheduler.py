@@ -2477,7 +2477,7 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -2486,9 +2486,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
 
+    ``resend`` (a ``_ResendDelivery``) sends ``content`` as given to its chats and attachments
+    only: nothing is wrapped, extracted or mirrored, and its outcome is kept by ``resend`` instead
+    of the run's delivery record.
+
     Returns None on success, or an error string on failure.
     """
-    targets = _resolve_delivery_targets(job)
+    targets = resend.targets if resend is not None else _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
@@ -2524,7 +2528,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
+    if wrap_response and resend is None:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
         delivery_content = (
@@ -2539,19 +2543,24 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    if resend is not None:
+        # The saved text is already as first handed over; extracting again could change it.
+        media_files, cleaned_delivery_content = list(resend.media_files), delivery_content
+    else:
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     # Inert unless this is a run's recorded report delivery: saves the exact text and attachments
     # with every target pending before anything is handed over.
-    recorder = delivery_record.active_recorder()
+    recorder = resend if resend is not None else delivery_record.active_recorder()
     recorder.begin(cleaned_delivery_content, media_files, targets)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
     # transcript so a user reply in that chat sees the cron output in context.
     # Mirror the CLEAN, unwrapped output (not the cron header/footer).
+    # A re-send only sends: it opens no thread and seeds or mirrors no session.
     try:
-        mirror_enabled = _cron_mirror_delivery_enabled(job, user_cfg)
+        mirror_enabled = resend is None and _cron_mirror_delivery_enabled(job, user_cfg)
     except Exception:
         mirror_enabled = False
     mirror_text = ""
@@ -3221,6 +3230,179 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if delivery_errors:
         return "; ".join(delivery_errors)
     return None
+
+
+# --- sending a run's failed chats again ----------------------------------------------------------
+
+# Set while a re-send walks ``_deliver_result``, whose own lines name each chat and quote send
+# errors: a re-send logs its reason codes only (``resend_report``).
+_RESENDING: contextvars.ContextVar = contextvars.ContextVar("cron_resending", default=False)
+logger.addFilter(lambda _record: not _RESENDING.get())
+
+
+class _ResendDelivery(delivery_record._Recorder):
+    """The chats and attachments one re-send hands to ``_deliver_result``, and how each chat ended:
+    classified exactly as a run's delivery record classifies it, but kept in memory. The run's own
+    record is never rewritten; the attempt's outcome is recorded once, by ``finish_resend``."""
+
+    def __init__(self, job_id: str, targets: List[dict], media_files: list) -> None:
+        super().__init__("resend", job_id)
+        self.targets = targets
+        self.media_files = media_files
+        self.outcomes: dict = {}
+
+    def begin(self, text: str, media_files, targets) -> None:
+        self._text = text
+
+    def settings_not_loaded(self) -> None:
+        self.outcomes = {index: ("failed", "settings_not_loaded") for index in range(len(self.targets))}
+
+    def _settle(self) -> None:
+        if self._index >= 0 and self._outcome is not None:
+            self.outcomes[self._index] = self._outcome
+
+
+def _resend_media(record: Optional[dict]) -> Optional[list]:
+    """A run's saved attachments as ``_deliver_result`` takes them, or None when one is gone."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    saved = [(item["path"], item["is_voice"]) for item in (record or {}).get("attachments") or ()]
+    kept = BasePlatformAdapter.filter_media_delivery_paths(saved)
+    if len(kept) != len(saved) or not all(os.path.isfile(path) for path, _is_voice in kept):
+        return None
+    return kept
+
+
+def _resend_top_line(created_at: float) -> str:
+    """The one line a re-sent report gets on top: the run's date in the owner's time zone."""
+    from hermes_time import get_timezone
+
+    zone = get_timezone()
+    moment = datetime.fromtimestamp(created_at, zone) if zone is not None else (
+        datetime.fromtimestamp(created_at).astimezone()
+    )
+    return f"Sent again because it did not arrive on {moment.date().isoformat()}."
+
+
+def claim_report_resend(execution_id: str, request_id: str) -> Optional[dict]:
+    """Claim the re-send of the failed chats of one run of the current profile: None when the
+    profile has no such run, else ``delivery_record.claim_resend``'s answer. A run the re-send view
+    calls eligible whose saved attachment is gone is refused ``attachment_missing``, claiming
+    nothing."""
+    from cron.executions import get_execution
+
+    row = get_execution(execution_id)
+    if row is None:
+        return None
+    if delivery_record.history_deliveries([row])[0]["resend"]["eligible"] and (
+        _resend_media(delivery_record.load(execution_id)) is None
+    ):
+        return {"claimed": False, "reason": "attachment_missing", "attempt": None}
+    return delivery_record.claim_resend(row, request_id)
+
+
+def _resend_chats(execution_id: str, attempt: dict, adapters, loop, results: List[dict]) -> Optional[str]:
+    from cron.jobs import get_job
+
+    def key(platform, chat_id, thread_id):
+        return str(platform).lower(), str(chat_id), str(thread_id) if thread_id else None
+
+    record = delivery_record.load(execution_id)
+    job = get_job(record["job_id"]) if record else None
+    targeted = {
+        key(target["platform"], target["chat_id"], target.get("thread_id")): target
+        for target in (_resolve_delivery_targets(job) if job else ())
+    }
+    claimed = [chat["position"] for chat in attempt.get("chats") or ()]
+    media_files = _resend_media(record)
+    if media_files is None:
+        # Nothing is sent, but the claim is already made: the chats read unknown, never failed.
+        results.extend({"position": position, "state": "unknown", "reason": None} for position in claimed)
+        return "attachment_missing"
+    chats = []
+    for position in claimed:
+        saved = record["targets"][position]
+        target = targeted.get(key(saved["platform"], saved["chat_id"], saved["thread_id"]))
+        if target is None:
+            # The job no longer targets this chat: turned down, never sent anywhere else.
+            results.append({"position": position, "state": "failed", "reason": "route_refused"})
+        else:
+            chats.append((position, target, saved["text"]))
+    top_line = _resend_top_line(record["created_at"])
+    for position, target, text in chats:
+        delivery = _ResendDelivery(record["job_id"], [target], media_files)
+        try:
+            _deliver_result(job, f"{top_line}\n{text}", adapters=adapters, loop=loop, resend=delivery)
+        finally:
+            delivery.finish()
+            state, reason = delivery.outcomes.get(0, ("unknown", "error_after_handover"))
+            results.append({"position": position, "state": state, "reason": reason})
+    return None
+
+
+def resend_report(execution_id: str, attempt: dict, *, adapters=None, loop=None) -> Optional[str]:
+    """Send one run's saved report again to the failed chats ``attempt`` claimed, through
+    ``_deliver_result`` with the adapter map scheduled fires use, then record how each chat ended
+    with ``delivery_record.finish_resend``. The job never runs and no run is created.
+
+    Each chat gets the text first handed over to it, under one top line. A chat the job no longer
+    targets is turned down (``route_refused``); the route rule inside ``_deliver_result`` re-checks
+    every other one, so no chat is redirected. A missing attachment stops the whole re-send.
+    Returns None once every claimed chat has its outcome, or ``attachment_missing`` when nothing
+    was sent. Logs carry reason codes only."""
+    results: List[dict] = []
+    refusal = error = None
+    token = _RESENDING.set(True)
+    try:
+        refusal = _resend_chats(execution_id, attempt, adapters, loop, results)
+    except Exception as exc:
+        error = type(exc).__name__
+    finally:
+        _RESENDING.reset(token)
+        # A claimed chat without a result reads unknown: it may have been sent.
+        finished = delivery_record.finish_resend(attempt["attempt_id"], results)
+    logger.info(
+        "Cron re-send %s of run %s: %s%s%s",
+        attempt["attempt_id"], execution_id,
+        ", ".join(f"{result['state']}/{result['reason'] or '-'}" for result in results) or "nothing sent",
+        f" ({refusal})" if refusal else "", f" (stopped by {error})" if error else "",
+    )
+    if not finished:
+        logger.warning(
+            "Cron re-send %s of run %s was no longer in progress; its result was not recorded",
+            attempt["attempt_id"], execution_id,
+        )
+    return refusal
+
+
+def resend_answer(execution_id: str, attempt_id: str) -> Optional[dict]:
+    """The re-send route's answer for one finished attempt: its state, the label, state and reason
+    of each chat it covered, and whether the run may be sent again now. None while it is still in
+    progress. Carries no chat address, error or report text."""
+    from cron.executions import get_execution
+
+    record = delivery_record.load(execution_id)
+    attempt = next(
+        (item for item in (record or {}).get("attempts") or () if item["attempt_id"] == attempt_id), None
+    )
+    if attempt is None or attempt["state"] == "in_progress":
+        return None
+    view = delivery_record.history_deliveries([get_execution(execution_id) or {"id": execution_id}])[0]
+    labels = [target["label"] for target in view["targets"]]
+    return {
+        "execution_id": execution_id,
+        "attempt_id": attempt_id,
+        "state": attempt["state"],
+        "targets": [
+            {
+                "label": labels[chat["position"]] if 0 <= chat["position"] < len(labels) else "Unknown",
+                "state": chat["state"],
+                "reason": chat["reason"],
+            }
+            for chat in attempt["chats"] or ()
+        ],
+        "resend": {"eligible": view["resend"]["eligible"], "reason": view["resend"]["reason"]},
+    }
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)

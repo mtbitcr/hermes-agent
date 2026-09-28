@@ -1683,6 +1683,38 @@ def _cron_tick_profile_homes(config: object) -> list[tuple[str, "Path"]]:
         return homes
 
 
+def _fence_cron_resends(config: object) -> None:
+    """Once at start, before the API server can claim a re-send: an attempt a restart cut off
+    mid-send reads unknown and is never sent again. Under multiplex this gateway claims for every
+    served profile, so each profile's own store is fenced, not only the launch home's."""
+    from cron.delivery_record import fence_resends
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    homes = [("launch", get_hermes_home())]
+    if getattr(config, "multiplex_profiles", False):
+        try:
+            homes += _cron_tick_profile_homes(config)
+        except Exception as exc:
+            # An unfenced attempt stays in progress, so its run stays blocked: never sent twice.
+            logger.warning("Cron re-send fence could not list the served profiles: %s", type(exc).__name__)
+    seen = set()
+    for name, home in homes:
+        resolved = Path(home).resolve() if home is not None else None
+        if resolved is None or resolved in seen:
+            continue
+        seen.add(resolved)
+        token = set_hermes_home_override(str(home))
+        try:
+            fenced = fence_resends()
+        except Exception as exc:
+            logger.warning("Cron re-send fence failed for profile %s: %s", name, type(exc).__name__)
+            continue
+        finally:
+            reset_hermes_home_override(token)
+        if fenced:
+            logger.info("Cron re-send fence: %d interrupted attempt(s) in profile %s now read unknown", fenced, name)
+
+
 def _enable_multiplex_log_routing(config: object) -> bool:
     """Route agent.log/errors.log/gateway.log records to their owning profile (inert single-profile).
     ``setup_logging(mode="gateway")`` binds file handlers to the launch home, so under multiplexing
@@ -5324,6 +5356,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
     _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
+    # After the PID claim (a --replace loser must not fence a live gateway's attempts) and before
+    # runner.start() opens the API server, the only place a re-send is claimed.
+    _fence_cron_resends(runner.config)
     _ensure_windows_gateway_venv_imports()
 
     # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
