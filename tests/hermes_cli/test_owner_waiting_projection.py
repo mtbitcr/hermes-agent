@@ -445,6 +445,8 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "share": "Cannot open //srv/placeholder/x for reading",
         "doubled": "The upload failed (see /srv//placeholder/x)",
         "relative": "Saved the list to srv/placeholder/list.txt, please check it",
+        "file": "Please check config/settings.py",
+        "windows": "Cannot read config\\settings.py",
     }
     path_question = "Should we book it for 12/05/2026 or 19/05/2026?"
     for project_name, project_leaks, question_title, project_question in (
@@ -496,6 +498,9 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         *leaks.values(),
         *link_leaks.values(),
         *path_leaks.values(),
+        "Open ./settings.py first",
+        "The draft is in notes\\placeholder\\drafts",
+        "Saved it as 'notes/list.txt' for you",
         "Saved the placeholder list to ~/placeholder/list.txt, please check it",
         "The upload failed (see /srv/placeholder/x)",
         "Should I publish file:///srv/placeholder/draft.html as it is?",
@@ -509,6 +514,7 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
     for ordinary in (
         reason, question, link_question, path_question, "Should p_values be reported?",
         "See https://example.test/help/owner for the steps",
+        "Is it yes/no.", "Python 3.11/3.12 both work", "Use v1.2/v1.3", "Plan the A/B test",
         _DECISION_FALLBACK, _RECEIPT_FALLBACK,
     ):
         for fallback in (_DECISION_FALLBACK, _RECEIPT_FALLBACK):
