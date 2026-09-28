@@ -1028,3 +1028,56 @@ def test_record_fields_are_checked_and_corrupt_rows_are_pruned_or_fenced(monkeyp
     assert _attempt_states() == [("exec-job", "unknown")]
     _run("exec-later", "failed")  # a new recording prunes the store
     assert store.load("exec-time") is None
+
+
+def test_malformed_utf8_text_reads_unreadable_and_is_never_claimed(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    for execution_id in ("exec-bad-body", "exec-bad-chat", "exec-bad-job"):
+        _run(execution_id, "failed")
+    _forge_unchecked("UPDATE records SET text=CAST(X'FF' AS TEXT) WHERE execution_id=?", ("exec-bad-body",))
+    _forge_unchecked("UPDATE targets SET chat_id=CAST(X'FF' AS TEXT) WHERE execution_id=?", ("exec-bad-chat",))
+    _forge_unchecked("UPDATE records SET job_id=CAST(X'FF' AS TEXT) WHERE execution_id=?", ("exec-bad-job",))
+
+    assert store.load("exec-bad-body")["text"] is None
+    assert _claim("exec-bad-body", "req-1") == {"claimed": False, "reason": "output_expired", "attempt": None}
+    assert store.load("exec-bad-chat")["targets"][0]["state"] == "unknown"
+    assert _claim("exec-bad-chat", "req-1")["claimed"] is False
+    assert store.load("exec-bad-job")["job_id"] is None
+
+
+def test_json_columns_must_be_stored_as_text(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    _run("exec-blob-attachments", "failed")
+    _run("exec-blob-chats", "failed")
+    _forge_unchecked("UPDATE records SET attachments=X'5B5D' WHERE execution_id=?", ("exec-blob-attachments",))
+    _forge_attempt("exec-blob-chats", "failed", sqlite3.Binary(json.dumps(
+        [{"position": 0, "state": "failed", "reason": None}]).encode("utf-8")))
+
+    assert _view("exec-blob-attachments")["resend"]["reason"] == "attachment_missing"
+    assert _claim("exec-blob-attachments", "req-1")["reason"] == "attachment_missing"
+    assert _view("exec-blob-chats")["resend"]["reason"] == "outcome_unknown"
+
+
+def test_a_record_dated_in_the_future_is_never_eligible_and_is_pruned(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    _run("exec-future", "failed")
+    _forge_unchecked("UPDATE records SET created_at=? WHERE execution_id=?", (1e300, "exec-future"))
+
+    assert _view("exec-future")["resend"]["reason"] == "output_expired"
+    assert _claim("exec-future", "req-1")["claimed"] is False
+    _run("exec-later", "failed")  # a new recording prunes the store
+    assert store.load("exec-future") is None
+
+
+def test_only_a_version_4_attempt_id_is_listed(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    _run("exec-digits", "failed")
+    _forge_attempt("exec-digits", "failed", json.dumps([{"position": 0, "state": "failed", "reason": None}]),
+                   attempt_id="1009999999999" + "0" * 19)
+
+    listed = [attempt["attempt_id"] for attempt in store.history_deliveries([_row("exec-digits")])[0]["resend"]["attempts"]]
+    assert listed == [None]
