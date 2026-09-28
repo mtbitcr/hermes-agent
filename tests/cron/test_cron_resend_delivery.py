@@ -838,3 +838,59 @@ def test_rows_of_any_other_shape_read_unknown_beside_healthy_runs(monkeypatch):
     assert states[busy["attempt_id"]] == "unknown"
     assert {states[key] for key in ("deep", "text-time", "inf-time")} == {"unknown"}
 
+
+def _forge_sql(sql, params=()):
+    conn = sqlite3.connect(_store()._path())
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _attempt_states():
+    """(execution_id, state) of every attempt, read without decoding the other columns."""
+    conn = sqlite3.connect(_store()._path())
+    try:
+        return sorted(conn.execute("SELECT execution_id, state FROM attempts").fetchall())
+    finally:
+        conn.close()
+
+
+def test_undecodable_or_binary_values_read_unknown_beside_healthy_runs(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    runs = ("exec-healthy", "exec-busy", "exec-bad-text", "exec-blob-id", "exec-bad-attachments")
+    for execution_id in runs:
+        _run(execution_id, "failed")
+    _claim("exec-busy", "req-busy")
+    # Text that is not valid UTF-8 in every free column, and binary ids.
+    _forge_sql(
+        "INSERT INTO attempts (attempt_id, execution_id, request_id, requested_at, state, chats, error) "
+        "VALUES ('bad-text', 'exec-bad-text', CAST(X'FF' AS TEXT), ?, 'in_progress', CAST(X'FF' AS TEXT), "
+        "CAST(X'FF' AS TEXT))",
+        (NOW,),
+    )
+    _forge_sql(
+        "INSERT INTO attempts (attempt_id, execution_id, request_id, requested_at, state, chats) "
+        "VALUES (X'0102', 'exec-blob-id', X'0304', ?, 'in_progress', '[]')",
+        (NOW,),
+    )
+    _forge_sql("UPDATE records SET attachments = 'not json' WHERE execution_id = 'exec-bad-attachments'")
+
+    views = store.history_deliveries([_row(execution_id) for execution_id in runs])
+    json.dumps(views)  # the history route encodes exactly this
+    assert views[0]["resend"] == {"eligible": True, "reason": None, "attempts": []}
+    assert views[1]["resend"]["reason"] == "in_progress"
+    for view in views[2:4]:
+        assert (view["resend"]["eligible"], view["resend"]["reason"]) == (False, "outcome_unknown")
+    assert (views[4]["resend"]["eligible"], views[4]["resend"]["reason"]) == (False, "attachment_missing")
+    for execution_id in runs[2:]:
+        assert _claim(execution_id, "req-new")["claimed"] is False
+    assert store.finish_resend("bad-text", [{"position": 0, "state": "delivered", "reason": None}]) is True
+
+    assert store.fence_resends() == 2
+    assert _attempt_states() == [
+        ("exec-bad-text", "unknown"), ("exec-blob-id", "unknown"), ("exec-busy", "unknown"),
+    ]
+
