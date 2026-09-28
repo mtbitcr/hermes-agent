@@ -82,6 +82,7 @@ import secrets
 import sqlite3
 import stat
 import time
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -4394,22 +4395,40 @@ def owner_title(value: Any) -> str:
 
 # Worker stop text carries shapes a title never does, so only
 # :func:`owner_stop_reason` checks these, on top of the title patterns: this
-# kernel's own task ids (``kanban_db._new_task_id``); a full commit id; a
-# ``file:`` link; this platform's own Project ids (``projects_db._new_project_id``
-# and ``_derive_id``). Paths are refused by default rather than by shape: any
-# word holding a separator may name a path, so text holding ``/``, ``\`` or a
-# look-alike of either (:data:`_OWNER_STOP_REASON_SEPARATORS`) falls back whole,
-# and no path in any spelling, spacing or script, and no web link, reaches the
-# owner. Dates, versions and choices written with a slash fall back too.
+# kernel's own task ids (``kanban_db._new_task_id``); a commit id, full or
+# short; a ``file:`` link; this platform's own Project ids
+# (``projects_db._new_project_id`` and ``_derive_id``). Each is matched wherever
+# it sits, since an id wrapped in other characters is still an id. Paths are
+# refused by the characters a reason may hold rather than by shape: a reason
+# reaches the owner only when every character is a letter, mark or digit of any
+# script, a space, or plain punctuation (:data:`_OWNER_STOP_REASON_PUNCTUATION`),
+# so ``/``, ``\\``, every look-alike of either and every other symbol makes the
+# whole reason fall back. The two combining solidus overlays are the marks refused.
 _OWNER_PRIVATE_STOP_REASON_PATTERNS = (
-    re.compile(r"\bt_[0-9a-f]{8}\b"),
-    re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE),
+    re.compile(r"t_[0-9a-f]{8}", re.IGNORECASE),
+    re.compile(r"[0-9a-f]{40}", re.IGNORECASE),
+    re.compile(r"(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,}", re.IGNORECASE),
     re.compile(r"\bfile:/", re.IGNORECASE),
-    re.compile(r"\bp_[0-9a-f]{8,}\b"),
+    re.compile(r"p_[0-9a-f]{8,}", re.IGNORECASE),
 )
-_OWNER_STOP_REASON_SEPARATORS = frozenset(
-    "/\\⁄∕∖╱╲⧸⧹﹨／＼"
+_OWNER_STOP_REASON_PUNCTUATION = frozenset(
+    ".,;:!?'\"()-%&"
+    "\u00ab\u00bb\u2013\u2014\u2018\u2019\u201c\u201d\u2026"
+    "\u3001\u3002\uff01\uff08\uff09\uff0c\uff1a\uff1b\uff1f"
 )
+_OWNER_STOP_REASON_REFUSED_MARKS = frozenset("\u0337\u0338")
+
+
+def _plain_stop_text(text: str) -> bool:
+    """Whether every character of ``text`` is one a stop reason may show the owner."""
+    for char in text:
+        category = unicodedata.category(char)
+        if char in _OWNER_STOP_REASON_PUNCTUATION or category[0] in "LN" or category == "Zs":
+            continue
+        if category[0] == "M" and char not in _OWNER_STOP_REASON_REFUSED_MARKS:
+            continue
+        return False
+    return True
 
 
 def owner_stop_reason(
@@ -4421,17 +4440,16 @@ def owner_stop_reason(
 
     Same egress contract as :func:`owner_title` — see
     :func:`_owner_display_text` — bounded at 500 code points. A reason that is
-    empty after cleaning, or that carries a private pattern (a title's, or one
-    of :data:`_OWNER_PRIVATE_STOP_REASON_PATTERNS`) in the cleaned OR the raw
+    empty after cleaning, that holds a character :func:`_plain_stop_text`
+    refuses, or that carries a private pattern (a title's, or one of
+    :data:`_OWNER_PRIVATE_STOP_REASON_PATTERNS`) in the cleaned OR the raw
     text, is replaced whole by the fixed ``fallback`` sentence rather than
     shown in part.
     """
     reason = _owner_display_text(value, limit=500)
     raw = str(value or "")
     texts = (reason, raw)
-    if not reason or any(
-        not _OWNER_STOP_REASON_SEPARATORS.isdisjoint(text) for text in texts
-    ) or any(
+    if not reason or not _plain_stop_text(reason) or any(
         pattern.search(text)
         for text in texts
         for pattern in (
