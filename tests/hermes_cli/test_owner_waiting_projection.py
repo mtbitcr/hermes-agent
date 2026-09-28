@@ -449,8 +449,12 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "windows": "Cannot read config\\settings.py",
     }
     path_question = "Should we book it for 12/05/2026 or 19/05/2026?"
-    # A file name's extension may be long.
-    name_leaks = {"long": "Please check config/application.properties"}
+    # A file name's extension may be long, start with a digit, or be the whole name.
+    name_leaks = {
+        "long": "Please check config/application.properties",
+        "hidden": "Please check config/.sample",
+        "numeric": "Please check config/archive.7z",
+    }
     name_question = "Should the placeholder room be booked for two hours?"
     for project_name, project_leaks, question_title, project_question in (
         ("Worker Text Pilot", leaks, "Choose the placeholder date", question),
@@ -519,6 +523,7 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         reason, question, link_question, path_question, "Should p_values be reported?",
         "See https://example.test/help/owner for the steps",
         "Is it yes/no.", "Python 3.11/3.12 both work", "Use v1.2/v1.3", "Plan the A/B test",
+        "Book it for 12/05/2026.", "Is it and/or.",
         _DECISION_FALLBACK, _RECEIPT_FALLBACK,
     ):
         for fallback in (_DECISION_FALLBACK, _RECEIPT_FALLBACK):
