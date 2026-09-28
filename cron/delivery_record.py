@@ -68,6 +68,8 @@ _REASONS = frozenset({
     "route_refused", "no_connection", "settings_not_loaded", "platform_refused",
     "timeout", "error_after_handover", "partly_sent", "interrupted",
 })
+# The reasons from after a chat was handed over: that chat may have been sent.
+_AFTER_HANDOVER = frozenset({"timeout", "error_after_handover", "partly_sent", "interrupted"})
 # The shapes of the ids this module writes: an attempt id and a request id's digest.
 _ATTEMPT_ID = re.compile(r"[0-9a-f]{32}")
 _REQUEST_KEY = re.compile(r"[0-9a-f]{64}")
@@ -548,6 +550,7 @@ def _readable_target(row: Any, index: int) -> bool:
         and _clean_text(row["chat_id"]) is not None
         and (row["thread_id"] is None or _clean_text(row["thread_id"]) is not None)
         and (reason is None or (isinstance(reason, str) and reason in _REASONS))
+        and _agrees(row["state"], reason)
     )
 
 
@@ -658,9 +661,18 @@ def _chats(text: Any) -> Optional[List[Dict[str, Any]]]:
             not isinstance(position, int) or isinstance(position, bool)
             or not isinstance(state, str) or state not in _CHAT_STATES
             or (reason is not None and (not isinstance(reason, str) or reason not in _REASONS))
+            or not _agrees(state, reason)
         ):
             return None
     return chats
+
+
+def _agrees(state: Any, reason: Optional[str]) -> bool:
+    """Whether a state and its reason can come from this module together: a failure never names a
+    reason from after the hand-over, and a chat sent or in progress names no reason."""
+    if state == "failed":
+        return reason not in _AFTER_HANDOVER
+    return reason is None or state not in ("delivered", "in_progress")
 
 
 def load(execution_id: Any) -> Optional[Dict[str, Any]]:
@@ -859,7 +871,8 @@ def finish_resend(attempt_id: Any, results: Iterable[Dict[str, Any]], *, error: 
     ``results`` (``{"position", "state", "reason"}``), the finish time and ``error`` when it is a
     reason code. Free error text is never stored: delivery errors name the chat. A chat without a
     result reads ``unknown``/``interrupted``, a state that is not an outcome reads ``unknown``, and a
-    reason that is not a code is dropped. An attempt whose chats cannot be read ends ``unknown``.
+    reason that is not a code is dropped; a failure named by a reason from after the hand-over reads
+    ``unknown``. An attempt whose chats cannot be read ends ``unknown``.
     False, writing nothing, when the attempt is not in progress."""
     given = {result.get("position"): result for result in results}
     safe_error = error if isinstance(error, str) and error in _REASONS else None
@@ -897,7 +910,9 @@ def _chat_result(result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if state not in _RANK:
         return {"state": "unknown", "reason": None}
     reason = result.get("reason")
-    return {"state": state, "reason": reason if state != "delivered" and reason in _REASONS else None}
+    reason = reason if state != "delivered" and reason in _REASONS else None
+    # A failure named by a reason from after the hand-over may have sent: it is kept unknown.
+    return {"state": state if _agrees(state, reason) else "unknown", "reason": reason}
 
 
 def fence_resends() -> int:
