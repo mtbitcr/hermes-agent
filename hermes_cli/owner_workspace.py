@@ -4396,20 +4396,23 @@ def owner_title(value: Any) -> str:
 # Worker stop text carries shapes a title never does, so only
 # :func:`owner_stop_reason` checks these, on top of the title patterns: this
 # kernel's own task ids (``kanban_db._new_task_id``); a full commit id; a
-# ``file:`` link; this platform's own Project ids
-# (``projects_db._new_project_id`` and ``_derive_id``). Each is matched wherever
-# it sits, since an id wrapped in other characters is still an id; a short
-# commit id is :func:`_names_a_commit`'s. Both the cleaned and the raw text are
-# checked, so nothing past the display cut escapes the check. Paths are
+# ``file:`` link; a drive-relative Windows path (a single letter starting a
+# word, a colon and no space after it, as in ``C:notes.txt``); this platform's
+# own Project ids (``projects_db._new_project_id`` and ``_derive_id``). Each is
+# matched wherever it sits, since an id wrapped in other characters is still an
+# id; a short commit id is :func:`_names_a_commit`'s. Both the cleaned and the
+# raw text are checked, so nothing past the display cut escapes the check. Paths are
 # refused by the characters a reason may hold rather than by shape: a reason
 # reaches the owner only when every character is a letter, mark or digit of any
 # script, a space, or plain punctuation (:data:`_OWNER_STOP_REASON_PUNCTUATION`),
 # so ``/``, ``\\``, every look-alike of either and every other symbol makes the
-# whole reason fall back. A mark counts only as part of a script's own writing.
+# whole reason fall back. A mark counts as text unless its Unicode name says
+# COMBINING or VARIATION SELECTOR, or it encloses what precedes it.
 _OWNER_PRIVATE_STOP_REASON_PATTERNS = (
     re.compile(r"t_[0-9a-f]{8}", re.IGNORECASE),
     re.compile(r"[0-9a-f]{40}", re.IGNORECASE),
     re.compile(r"\bfile:/", re.IGNORECASE),
+    re.compile(r"(?<!\w)[A-Za-z]:(?=\S)"),
     re.compile(r"p_[0-9a-f]{8,}", re.IGNORECASE),
 )
 _OWNER_STOP_REASON_PUNCTUATION = frozenset(
@@ -4417,18 +4420,22 @@ _OWNER_STOP_REASON_PUNCTUATION = frozenset(
     "\u00ab\u00bb\u2013\u2014\u2018\u2019\u201c\u201d\u2026"
     "\u3001\u3002\uff01\uff08\uff09\uff0c\uff1a\uff1b\uff1f"
 )
+
+
 def _plain_stop_text(text: str) -> bool:
     """Whether every character of ``text`` is one a stop reason may show the owner.
 
     Accents are composed into their letters first (NFC); a mark that remains
-    counts only as a script's own writing, so an enclosing mark or a generic
-    one (its Unicode name says COMBINING, which covers every overlay) is refused.
+    is refused when it encloses what precedes it or when its Unicode name says
+    COMBINING (every overlay) or VARIATION SELECTOR, so what stays is a
+    script's own vowel signs and the like.
     """
     for char in unicodedata.normalize("NFC", text):
         category = unicodedata.category(char)
         if char in _OWNER_STOP_REASON_PUNCTUATION or category[0] in "LN" or char.isspace():
             continue
-        if category in ("Mn", "Mc") and "COMBINING" not in unicodedata.name(char, "COMBINING"):
+        name = unicodedata.name(char, "COMBINING")
+        if category in ("Mn", "Mc") and "COMBINING" not in name and "VARIATION SELECTOR" not in name:
             continue
         return False
     return True
