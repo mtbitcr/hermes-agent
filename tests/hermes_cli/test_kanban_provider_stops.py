@@ -766,11 +766,13 @@ def test_a_keyed_custom_endpoint_is_one_provider_whichever_of_its_names_the_card
     assert kb.check_respawn_guard(conn, task_id) is None
 
 
-def test_stops_on_a_keyed_custom_endpoint_streak_whether_its_pool_or_its_card_names_it(
+def test_stops_on_a_keyed_custom_endpoint_streak_only_under_one_name_for_it(
     conn, clock, monkeypatch,
 ):
     # The first stop knows its provider from the worker's pool (``my-box``);
-    # the second, with a receipt naming only ``custom``, from the card.
+    # the second, with a receipt naming only ``custom``, from the card
+    # (``Local Box``). Without the profile's configuration the two names are
+    # two endpoints, so the second stop starts a streak of its own.
     assert _worker_route(monkeypatch, "Local Box", config=_KEYED_ENDPOINTS, pools=_KEYED_POOLS) == (
         "custom", "my-box",
     )
@@ -785,8 +787,8 @@ def test_stops_on_a_keyed_custom_endpoint_streak_whether_its_pool_or_its_card_na
     assert second.outcome == "rate_limited"
     assert second.metadata["runtime_receipt"]["provider"] == "custom"
     assert second.metadata["rate_limit_reset_source"] == "kernel"
-    assert _resume_at(second) == second.ended_at + 4 * COOLDOWN
-    assert second.metadata["rate_limit_reset_provider"] == first.metadata["rate_limit_reset_provider"]
+    assert _resume_at(second) == second.ended_at + 2 * COOLDOWN
+    assert second.metadata["rate_limit_reset_provider"] != first.metadata["rate_limit_reset_provider"]
 
 
 @pytest.mark.parametrize(
@@ -868,7 +870,7 @@ def test_booking_and_the_guard_under_the_worker_env_read_the_assignee_profile_un
     assert sorted(path.name for path in decoy.iterdir()) == ["config.yaml"]
 
 
-def test_a_reset_holds_its_card_when_the_assignee_profile_config_cannot_be_read(
+def test_a_custom_endpoint_reset_keeps_no_endpoint_name_and_holds_whatever_the_config_says(
     conn, clock, monkeypatch,
 ):
     from hermes_cli.profiles import get_profile_dir
@@ -878,7 +880,8 @@ def test_a_reset_holds_its_card_when_the_assignee_profile_config_cannot_be_read(
     config = get_profile_dir("worker") / "config.yaml"
     config.write_text("providers: [not, closed\n")
     run = _stopped_after_worker_reset(monkeypatch, conn, task_id, 4970, reset_at, pool="my-box")
-    assert run.metadata["rate_limit_reset_provider"] is None
+    kept = run.metadata["rate_limit_reset_provider"]
+    assert kept and "my-box" not in kept and "box" not in kept
 
     clock["t"] = T0 + 3600
     kb.set_model_override(conn, task_id, "m-2", provider="prov-b")
@@ -887,3 +890,50 @@ def test_a_reset_holds_its_card_when_the_assignee_profile_config_cannot_be_read(
     assert kb.check_respawn_guard(conn, task_id) is None
     assert config.read_text() == "providers: [not, closed\n"
     assert sorted(path.name for path in config.parent.iterdir() if path.name.startswith("config")) == ["config.yaml"]
+
+
+def test_a_provider_a_plugin_registers_holds_like_a_custom_endpoint(conn, clock, monkeypatch):
+    from hermes_cli import auth
+
+    # A provider a model-provider plugin adds to the registry is no built-in.
+    monkeypatch.setitem(auth.PROVIDER_REGISTRY, "placeholder-plugin", auth.PROVIDER_REGISTRY["anthropic"])
+    reset_at = T0 + 3 * 3600
+    task_id = _card_routed_to(conn, "placeholder-plugin")
+    run_id = _start_worker(conn, task_id, 4980)
+    _record_as_worker(monkeypatch, conn, task_id, reset_at, provider="placeholder-plugin")
+    _worker_exits(conn, 4980, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    assert kb.get_run(conn, run_id).outcome == "rate_limited"
+
+    kb.set_model_override(conn, task_id, "m-2", provider="anthropic")
+    clock["t"] = T0 + 3600
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = reset_at
+    assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_the_later_of_two_runs_ending_in_one_second_is_the_latest(conn, clock):
+    task_id = kb.create_task(conn, title="tied card", assignee="worker")
+    _start_worker(conn, task_id, 4985)
+    _worker_exits(conn, 4985, 1)
+    stop = _rate_limited_stop(conn, task_id, pid=4986)
+    crashed = min(kb.list_runs(conn, task_id), key=lambda run: run.id)
+    assert crashed.outcome == "crashed" and crashed.ended_at == stop.ended_at
+
+    clock["t"] = stop.ended_at + COOLDOWN + 1
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+
+
+def test_a_stop_streak_counts_one_named_endpoint_and_never_merges_two(conn, clock):
+    same = _card_routed_to(conn, "custom:local-llm")
+    first = _rate_limited_stop(conn, same, pid=4991)
+    assert _resume_at(first) == first.ended_at + 2 * COOLDOWN
+    clock["t"] = _resume_at(first)
+    second = _rate_limited_stop(conn, same, pid=4992)
+    assert _resume_at(second) == second.ended_at + 4 * COOLDOWN
+
+    moved = _card_routed_to(conn, "custom:local-llm")
+    third = _rate_limited_stop(conn, moved, pid=4993)
+    clock["t"] = _resume_at(third)
+    kb.set_model_override(conn, moved, "m-1", provider="custom:box")
+    fourth = _rate_limited_stop(conn, moved, pid=4994)
+    assert _resume_at(fourth) == fourth.ended_at + 2 * COOLDOWN
