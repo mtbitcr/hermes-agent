@@ -4086,12 +4086,22 @@ _KANBAN_USAGE_LIMIT_REASONS = frozenset({"rate_limit", "billing", "overloaded"})
 
 
 def _single_query_exit_code(result, *, default: int) -> int:
-    """Automation exit code of a one-shot turn: ``default``, except for a kanban usage-limit stop.
+    """Automation exit code of a one-shot turn: ``default``, except for a kanban provider stop.
 
     A kanban worker whose turn still failed at the provider's usage limit after its retries exits
     with the EX_TEMPFAIL sentinel, so the dispatcher releases the task without counting a failure
-    (a quota window must not trip the breaker) and starts it again by itself.
+    (a quota window must not trip the breaker) and starts it again by itself. One whose provider
+    refused the work (a ``content_policy_blocked`` turn) exits with its own code, so the dispatcher
+    parks the card instead of starting it again unchanged.
     """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        try:
+            from hermes_cli.kanban_provider_stops import KANBAN_PROVIDER_REFUSED_EXIT_CODE, is_provider_refusal
+        except Exception:
+            pass
+        else:
+            if is_provider_refusal(result):
+                return KANBAN_PROVIDER_REFUSED_EXIT_CODE
     if not (
         os.environ.get("HERMES_KANBAN_TASK") and isinstance(result, dict) and result.get("failed")
         and result.get("failure_reason") in _KANBAN_USAGE_LIMIT_REASONS

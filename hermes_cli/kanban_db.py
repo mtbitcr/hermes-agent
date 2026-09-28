@@ -93,6 +93,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
+from hermes_cli import kanban_provider_stops as _provider_stops
 from hermes_cli.sqlite_util import (
     InitLockDirectoryAbsent,
     InitLockUnavailable,
@@ -33075,6 +33076,14 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
+# Exit kinds of the worker exit codes that are not a plain nonzero exit.
+_WORKER_EXIT_KINDS = {
+    0: "clean_exit",
+    KANBAN_RATE_LIMIT_EXIT_CODE: "rate_limited",
+    _provider_stops.KANBAN_PROVIDER_REFUSED_EXIT_CODE: "provider_refused",
+}
+
+
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
@@ -33089,6 +33098,10 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"provider_refused"`` — ``WIFEXITED`` with status
+      ``KANBAN_PROVIDER_REFUSED_EXIT_CODE``. The provider refused the work
+      as worded; ``detect_crashed_workers`` parks the card without counting a
+      failure, so it is never retried unchanged.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -33096,8 +33109,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
-    for ``unknown``.
+    ``provider_refused`` / ``nonzero_exit``) or the signal number (for
+    ``signaled``), or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -33106,11 +33119,7 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     try:
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
-            if code == 0:
-                return ("clean_exit", 0)
-            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
-                return ("rate_limited", code)
-            return ("nonzero_exit", code)
+            return (_WORKER_EXIT_KINDS.get(code, "nonzero_exit"), code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
     except Exception:
@@ -34694,10 +34703,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
     provider quota wall, NOT a task failure. Such tasks are released back
     to its source phase WITHOUT counting a failure (so a long quota window can't
-    trip the breaker) and stamped with a quota-blocker error so
+    trip the breaker) and their run is given a resume time
+    (:func:`hermes_cli.kanban_provider_stops.book_rate_limit_reset`) so
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    When it shows the provider-refused exit
+    (``KANBAN_PROVIDER_REFUSED_EXIT_CODE``), the run closes
+    ``provider_refused`` and the card is parked blocked as a capability wall,
+    without counting a failure, so it is never retried unchanged.
 
     A clean exit whose run saved exactly one patch of its own, on a card that
     requires review, is handed to review through :func:`complete_task` -- the
@@ -34775,6 +34790,24 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 kind, code = "clean_exit", 0
             else:
                 kind, code = _classify_worker_exit(pid)
+            if kind == "provider_refused":
+                # The provider refused the work as worded: retrying it
+                # unchanged meets the same refusal, so park the card instead,
+                # without counting a failure.
+                exited = _provider_stops.park_provider_refusal(
+                    conn,
+                    task_id=row["id"],
+                    assignee=row["assignee"],
+                    pid=pid,
+                    claim_lock=row["claim_lock"],
+                    run_id=open_run_id,
+                    exit_code=code,
+                    evidence=identity,
+                    source_status=_retry_status_for_run(conn, row["id"]),
+                )
+                if exited is not None:
+                    exited_hook_payloads.append(exited)
+                continue
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -34814,7 +34847,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 protocol_violation = False
                 rate_limited_exit = True
                 error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
+                    f"pid {pid} exited rate-limited — "
                     f"requeued without counting a failure"
                 )
                 event_kind = "rate_limited"
@@ -34943,6 +34976,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error=error_text,
                     metadata=run_metadata,
                 )
+                if rate_limited_exit and run_id is not None:
+                    _provider_stops.book_rate_limit_reset(
+                        conn, row["id"], run_id,
+                    )
                 _append_event(
                     conn, row["id"], event_kind,
                     event_payload,
@@ -34959,9 +34996,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "retry_status": retry_status,
                 })
                 if rate_limited_exit:
-                    # Stamp the failure-error column so ``check_respawn_guard``
-                    # recognizes this as a quota blocker and defers the
-                    # respawn until the window clears — WITHOUT touching
+                    # Stamp the failure-error column, with no quota wording:
+                    # ``check_respawn_guard`` holds the card on the run's
+                    # resume time, never on this text — WITHOUT touching
                     # ``consecutive_failures`` (that's the whole point: no
                     # breaker trip on a throttle).
                     conn.execute(
@@ -35472,18 +35509,17 @@ def check_respawn_guard(
         (a worker bailed on a provider quota wall via the EX_TEMPFAIL
         sentinel) within ``_resolve_rate_limit_cooldown_seconds()``. The
         quota almost certainly hasn't reset yet, so defer the respawn until
-        the cooldown elapses — or until the provider reset the worker
-        recorded on that run (:func:`record_run_rate_limit_reset`), when
-        that is later — then allow a cheap probe. This is checked
-        BEFORE ``blocker_auth`` because the rate-limit requeue stamps a
-        quota-flavored ``last_failure_error`` that would otherwise match the
-        auth-blocker regex and park the task forever (the rate-limit path
-        never increments ``consecutive_failures``, so the breaker can't free
-        it). Once the cooldown elapses the task falls through and respawns.
+        the cooldown elapses — or until the provider reset recorded on that
+        run (by the worker, :func:`record_run_rate_limit_reset`, or else by
+        the kernel when it booked the run), when that is later and was
+        recorded for the card's current provider — then allow a cheap probe.
+        Once that time passes the task respawns; a rate-limit stop is never
+        read as ``blocker_auth``.
 
     ``"blocker_auth"``
-        The task's last failure error matches a quota / authentication
-        pattern. Retrying immediately is unlikely to help (rate limits
+        The task's latest ended run failed, with an error matching a
+        quota / authentication pattern, and the task's last failure error
+        is still set. Retrying immediately is unlikely to help (rate limits
         reset on a timer; auth needs human action), so we defer to the
         next tick. The existing ``consecutive_failures`` counter still
         trips the auto-block circuit breaker after ``failure_limit``
@@ -35528,55 +35564,37 @@ def check_respawn_guard(
 
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a
-    #    cheap probe. Must run BEFORE the blocker_auth regex check, because a
-    #    rate-limit requeue stamps a quota-flavored last_failure_error that
-    #    the regex would otherwise match → defer forever (no failure counter
-    #    increment on this path means the breaker can never free it).
+    #    cheap probe.
     #
     #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
     #    newer crash/completion superseded the rate-limit run, this guard
     #    no longer applies and the normal paths take over.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
-    latest_run = conn.execute(
-        "SELECT outcome, ended_at, metadata FROM task_runs "
-        "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
+    latest_run = _provider_stops.latest_ended_run(conn, task_id)
     if (
         latest_run is not None
         and latest_run["outcome"] == "rate_limited"
     ):
-        if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, and skip the
-            # blocker_auth regex so the stamped rate-limit text doesn't
-            # re-trap the task.
-            return None
-        ended_at = latest_run["ended_at"]
-        if ended_at is not None:
-            # When the worker recorded the provider's reset on this run and
-            # it is later than the cooldown, probing sooner only hits the
-            # same wall: wait for the reset instead.
-            try:
-                run_metadata = json.loads(latest_run["metadata"] or "{}")
-            except (TypeError, ValueError):
-                run_metadata = None
-            wait_until = int(ended_at) + rl_cooldown
-            reset = recorded_rate_limit_reset(run_metadata, anchor=int(ended_at))
-            if reset is not None:
-                wait_until = max(wait_until, reset)
-            if now < wait_until:
-                return "rate_limit_cooldown"
-        # Cooldown elapsed — allow the respawn. Return early so the
-        # blocker_auth check below doesn't catch the rate-limit text we
-        # stamped on the task; this path intentionally retries forever
-        # (cheaply, spaced by the cooldown) until quota returns or a real
-        # crash/completion supersedes it.
+        # Wait until the run's resume time: the cooldown, or the reset
+        # recorded on the run when that is later and was recorded for the
+        # card's current provider — probing sooner only hits the same wall.
+        # None when the cooldown is disabled: respawn immediately.
+        resume_at = _provider_stops.rate_limit_resume_at(
+            conn, task_id, latest_run, cooldown=rl_cooldown,
+        )
+        if resume_at is not None and now < resume_at:
+            return "rate_limit_cooldown"
+        # Cooldown elapsed — allow the respawn. Return early: a rate-limit
+        # stop is never a sign-in blocker; this path intentionally retries
+        # forever (cheaply, spaced by the cooldown) until quota returns or a
+        # real crash/completion supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
-    err = row["last_failure_error"]
-    if err and _RESPAWN_BLOCKER_RE.search(err):
+    # 2. Quota / auth blocker: retrying immediately will not help. Only the
+    #    latest ended run's own error counts, and only when that run failed.
+    if _provider_stops.names_sign_in_blocker(
+        latest_run, row["last_failure_error"], _RESPAWN_BLOCKER_RE,
+    ):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR
@@ -36431,11 +36449,11 @@ def _dispatch_once_locked(
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
+            # Once per hold, not once per tick.
             if not dry_run:
                 with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
+                    _provider_stops.record_respawn_guarded(
+                        conn, row["id"], guard_reason,
                     )
             continue
         # Route authority, proved per task and BEFORE the claim. The claim
@@ -36600,9 +36618,8 @@ def _dispatch_once_locked(
             result.respawn_guarded.append((row["id"], guard_reason))
             if not dry_run:
                 with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
+                    _provider_stops.record_respawn_guarded(
+                        conn, row["id"], guard_reason,
                     )
             continue
         route_error = route_authority_error(conn, row["id"])
