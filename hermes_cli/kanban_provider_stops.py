@@ -13,10 +13,11 @@ card. This module is what the kernel adds to that booking and that hold:
   else the one the run's runtime receipt names, else the card's. A reset kept for
   one provider no longer holds a card whose route now names another; one kept for
   no known provider, or stored before providers were kept, holds as today.
-  Only a built-in provider has an id: its own name, or the one its alias stands
-  for, so a card naming its provider by an alias or in another case has not
-  moved. A custom endpoint, whatever it is called, and any other name have none:
-  a reset kept for one holds its card until it passes, even after the card moves.
+  Only a platform built-in provider has an id: its own name, or the one its alias
+  stands for, so a card naming its provider by an alias or in another case has
+  not moved. A custom endpoint, a provider a plugin adds, and any other name have
+  none: a reset kept for one holds its card until it passes, even after the card
+  moves. A stop streak counts one name at a time, so two endpoints never share one.
 * A held card gets one ``respawn_guarded`` event, not one per dispatcher tick.
 * Only a failed run's own error can name a sign-in problem.
 * A worker whose provider refused the work (a ``content_policy_blocked`` turn)
@@ -26,6 +27,8 @@ card. This module is what the kernel adds to that booking and that hold:
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import json
 import sqlite3
 from typing import Any, Optional
@@ -44,7 +47,8 @@ PROVIDER_REFUSED_OUTCOME = "provider_refused"
 RATE_LIMIT_HOLD_CAP_SECONDS = 6 * 3600
 
 # Kept on a rate-limited run's metadata beside ``rate_limit_reset_at``: the
-# canonical id of the provider the run actually used (``None`` when none is
+# stop's streak identity (:func:`_identity`: the built-in id of the provider the
+# run actually used, else a short digest of its name, ``None`` when none is
 # known), and ``"kernel"`` when the kernel derived the reset itself.
 RATE_LIMIT_RESET_PROVIDER_KEY = "rate_limit_reset_provider"
 RATE_LIMIT_RESET_SOURCE_KEY = "rate_limit_reset_source"
@@ -56,6 +60,7 @@ FAILED_RUN_OUTCOMES = frozenset({"crashed", "timed_out", "spawn_failed", "gave_u
 
 # How many earlier runs a streak is counted over; the cap is reached long before.
 _STREAK_SCAN_LIMIT = 32
+
 
 def is_provider_refusal(result: Any) -> bool:
     """True for a failed turn result whose error says the provider refused the work."""
@@ -89,17 +94,38 @@ def _provider(value: Any) -> Optional[str]:
     ``anthropic``; each of Vertex's names is ``vertex``), in any case. ``None`` for
     no name, for the custom family (``custom``, a ``custom:`` name, an alias for
     it) and for any other name, so a reset kept for a custom endpoint never reads
-    as a move.
+    as a move. A provider or alias a plugin registers is no built-in.
     """
     name = _normalized(value)
     if not name or name == "custom" or name.startswith("custom:"):
         return None
-    from hermes_cli.auth import PROVIDER_REGISTRY, _VERTEX_PROVIDER_IDS, _plugin_aliases
+    from hermes_cli.auth import _PROVIDER_ALIASES, _VERTEX_PROVIDER_IDS
 
     if name in _VERTEX_PROVIDER_IDS:
         return "vertex"
-    alias = _plugin_aliases().get(name, name)
-    return alias if alias in ("moa", "openrouter") or alias in PROVIDER_REGISTRY else None
+    alias = _PROVIDER_ALIASES.get(name, name)
+    return alias if alias in _built_ins() else None
+
+
+@functools.lru_cache(maxsize=1)
+def _built_ins() -> frozenset:
+    """The platform's own provider ids: the registry's declared rows, never one a plugin adds."""
+    from hermes_cli.auth import _REGISTRY_ROWS, ProviderConfig
+
+    return frozenset(
+        {row.id if isinstance(row, ProviderConfig) else row[0] for row in _REGISTRY_ROWS}
+        | {"moa", "openrouter"}
+    )
+
+
+def _identity(value: Any) -> Optional[str]:
+    """A stop streak's identity for the provider ``value`` names: its built-in id, else a
+    short digest of the name as written, so two custom endpoints never share a streak
+    and no endpoint name is kept; ``None`` for no name."""
+    name = _normalized(value)
+    if not name:
+        return None
+    return _provider(name) or "custom#" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
 
 
 def _card_route(conn: sqlite3.Connection, task_id: str) -> Any:
@@ -108,10 +134,10 @@ def _card_route(conn: sqlite3.Connection, task_id: str) -> Any:
     return row["provider_override"] if row is not None else None
 
 
-def _receipt_provider(metadata: dict) -> Optional[str]:
-    """The provider a closed run's runtime receipt names, if any."""
+def _receipt_provider(metadata: dict) -> Any:
+    """The provider a closed run's runtime receipt names, as written, if any."""
     receipt = metadata.get("runtime_receipt")
-    return _provider(receipt.get("provider")) if isinstance(receipt, dict) else None
+    return receipt.get("provider") if isinstance(receipt, dict) else None
 
 
 def _recorded_for(metadata: Any) -> tuple[bool, Optional[str]]:
@@ -126,18 +152,18 @@ def latest_ended_run(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3
     return conn.execute(
         "SELECT outcome, ended_at, metadata, error FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
 
 
 def _consecutive_stops(
-    conn: sqlite3.Connection, task_id: str, run_id: int, provider: Optional[str],
+    conn: sqlite3.Connection, task_id: str, run_id: int, identity: Optional[str],
 ) -> int:
-    """Rate-limited runs in a row on ``provider``, ending with (and counting) ``run_id``.
+    """Rate-limited runs in a row kept under ``identity``, ending with (and counting) ``run_id``.
 
-    ``provider`` is an id (:func:`_provider`), and each earlier run's kept provider is
-    read as one.
+    ``identity`` is a streak identity (:func:`_identity`), compared with the one each
+    earlier run kept.
     """
     stops = 1
     for row in conn.execute(
@@ -148,7 +174,8 @@ def _consecutive_stops(
     ):
         if row["outcome"] != "rate_limited":
             break
-        if _recorded_for(_metadata(row["metadata"])) != (True, provider):
+        kept = _metadata(row["metadata"])
+        if not isinstance(kept, dict) or kept.get(RATE_LIMIT_RESET_PROVIDER_KEY, ...) != identity:
             break
         stops += 1
     return stops
@@ -159,11 +186,12 @@ def book_rate_limit_reset(conn: sqlite3.Connection, task_id: str, run_id: int) -
 
     Called inside the booking transaction, right after the run is closed. The
     provider is the worker's own, recorded beside its reset; else the one the
-    closed run's runtime receipt names; only then the card's; it is kept as its
-    built-in id, or ``None`` for any other provider (:func:`_provider`). The worker's own
-    reset stays when it is believable; otherwise, while the cooldown is on, the
-    kernel writes ``ended_at + min(cooldown * 2**stops, cap)`` where ``stops``
-    counts the consecutive rate-limited runs on this provider, this one included.
+    closed run's runtime receipt names, unless it names only the custom family;
+    only then the card's; it is kept as its streak identity (:func:`_identity`).
+    The worker's own reset stays when it is believable; otherwise, while the
+    cooldown is on, the kernel writes ``ended_at + min(cooldown * 2**stops, cap)``
+    where ``stops`` counts the consecutive rate-limited runs kept under the same
+    identity, this one included.
     Unreadable metadata is left as it is.
     """
     from hermes_cli import kanban_db as kb
@@ -178,16 +206,22 @@ def book_rate_limit_reset(conn: sqlite3.Connection, task_id: str, run_id: int) -
     if metadata is None:
         return
     ended_at = int(run["ended_at"])
-    provider = (
-        _provider(metadata.get(RATE_LIMIT_RESET_PROVIDER_KEY))
-        or _receipt_provider(metadata)
-        or _provider(_card_route(conn, task_id))
+    named = next(
+        (
+            value for value in (
+                metadata.get(RATE_LIMIT_RESET_PROVIDER_KEY), _receipt_provider(metadata),
+                _card_route(conn, task_id),
+            )
+            if _normalized(value) not in ("", "custom")
+        ),
+        None,
     )
-    metadata[RATE_LIMIT_RESET_PROVIDER_KEY] = provider
+    identity = _identity(named)
+    metadata[RATE_LIMIT_RESET_PROVIDER_KEY] = identity
     if kb.recorded_rate_limit_reset(metadata, anchor=ended_at) is None:
         cooldown = kb._resolve_rate_limit_cooldown_seconds()
         if cooldown > 0:
-            stops = _consecutive_stops(conn, task_id, run_id, provider)
+            stops = _consecutive_stops(conn, task_id, run_id, identity)
             metadata[kb._RATE_LIMIT_RESET_KEY] = ended_at + min(
                 cooldown * 2 ** stops, RATE_LIMIT_HOLD_CAP_SECONDS,
             )
