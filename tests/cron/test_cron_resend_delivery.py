@@ -1239,3 +1239,31 @@ def test_a_failure_without_a_reason_from_before_the_hand_over_reads_unknown(monk
     assert [target["state"] for target in view["targets"]] == ["unknown"]
     assert (view["resend"]["eligible"], view["resend"]["reason"]) == (False, "outcome_unknown")
     assert _claim("exec-forged", "req-1")["claimed"] is False
+
+
+def test_conflicting_or_malformed_finish_results_never_make_a_chat_eligible_again(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    _run("exec-1", "failed", "failed", "failed", "failed")
+    first = _claim("exec-1", "req-1")["attempt"]
+
+    assert store.finish_resend(first["attempt_id"], [
+        {"position": 0, "state": "delivered", "reason": None},
+        {"position": 0, "state": "failed", "reason": "route_refused"},  # a second, different result
+        {"position": 1, "state": "failed", "reason": "route_refused"},
+        {"position": 1, "state": "failed", "reason": "route_refused"},  # the same result twice
+        {"position": True, "state": "failed", "reason": "platform_refused"},  # not a position
+        "placeholder free text",  # not a result
+        {"position": 2, "state": ["failed"], "reason": "route_refused"},
+        {"position": 3, "state": "failed", "reason": ["route_refused"]},
+    ]) is True
+
+    [stored] = store.load("exec-1")["attempts"]
+    assert stored["chats"] == [
+        {"position": 0, "state": "unknown", "reason": None},
+        {"position": 1, "state": "failed", "reason": "route_refused"},
+        {"position": 2, "state": "unknown", "reason": None},
+        {"position": 3, "state": "unknown", "reason": None},
+    ]
+    second = _claim("exec-1", "req-2")["attempt"]
+    assert second["chats"] == [{"position": 1, "state": "in_progress", "reason": None}]
