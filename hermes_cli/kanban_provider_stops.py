@@ -7,11 +7,12 @@ card. This module is what the kernel adds to that booking and that hold:
 
 * Every such run carries a resume time. A believable reset the worker recorded
   wins; otherwise the kernel derives one: the run's end plus the cooldown,
-  doubled for each consecutive rate-limited run on the card's provider, capped at
+  doubled for each consecutive rate-limited run on the same provider, capped at
   six hours, and marked as kernel-derived.
-* The card's provider is kept beside the reset, and a reset recorded for another
-  provider than the card's current route no longer holds it. A reset stored
-  before providers were kept keeps today's behaviour.
+* The provider the run actually used is kept beside the reset: the worker's own,
+  else the one the run's runtime receipt names, else the card's. A reset kept for
+  one provider no longer holds a card whose route now names another; one kept for
+  no known provider, or stored before providers were kept, holds as today.
 * A held card gets one ``respawn_guarded`` event, not one per dispatcher tick.
 * Only a failed run's own error can name a sign-in problem.
 * A worker whose provider refused the work (a ``content_policy_blocked`` turn)
@@ -39,8 +40,8 @@ PROVIDER_REFUSED_OUTCOME = "provider_refused"
 RATE_LIMIT_HOLD_CAP_SECONDS = 6 * 3600
 
 # Kept on a rate-limited run's metadata beside ``rate_limit_reset_at``: the
-# card's provider when the stop was booked (``None`` when the card named none),
-# and ``"kernel"`` when the kernel derived the reset itself.
+# provider the run actually used (``None`` when none is known), and
+# ``"kernel"`` when the kernel derived the reset itself.
 RATE_LIMIT_RESET_PROVIDER_KEY = "rate_limit_reset_provider"
 RATE_LIMIT_RESET_SOURCE_KEY = "rate_limit_reset_source"
 KERNEL_RESET_SOURCE = "kernel"
@@ -86,6 +87,12 @@ def _card_provider(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     return _provider(row["provider_override"]) if row is not None else None
 
 
+def _receipt_provider(metadata: dict) -> Optional[str]:
+    """The provider a closed run's runtime receipt names, if any."""
+    receipt = metadata.get("runtime_receipt")
+    return _provider(receipt.get("provider")) if isinstance(receipt, dict) else None
+
+
 def _recorded_for(metadata: Any) -> tuple[bool, Optional[str]]:
     """``(kept, provider)``: whether a provider was kept beside the run's reset, and which."""
     if not isinstance(metadata, dict) or RATE_LIMIT_RESET_PROVIDER_KEY not in metadata:
@@ -123,13 +130,15 @@ def _consecutive_stops(
 
 
 def book_rate_limit_reset(conn: sqlite3.Connection, task_id: str, run_id: int) -> None:
-    """Give a just-closed rate-limited run its resume time and the card's provider.
+    """Give a just-closed rate-limited run its resume time and the provider it used.
 
     Called inside the booking transaction, right after the run is closed. The
-    worker's own reset stays when it is believable; otherwise, while the
-    cooldown is on, the kernel writes ``ended_at + min(cooldown * 2**stops, cap)``
-    where ``stops`` counts the consecutive rate-limited runs on this provider,
-    this one included. Unreadable metadata is left as it is.
+    provider is the worker's own, recorded beside its reset; else the one the
+    closed run's runtime receipt names; only then the card's. The worker's own
+    reset stays when it is believable; otherwise, while the cooldown is on, the
+    kernel writes ``ended_at + min(cooldown * 2**stops, cap)`` where ``stops``
+    counts the consecutive rate-limited runs on this provider, this one
+    included. Unreadable metadata is left as it is.
     """
     from hermes_cli import kanban_db as kb
 
@@ -143,7 +152,11 @@ def book_rate_limit_reset(conn: sqlite3.Connection, task_id: str, run_id: int) -
     if metadata is None:
         return
     ended_at = int(run["ended_at"])
-    provider = _card_provider(conn, task_id)
+    provider = (
+        _provider(metadata.get(RATE_LIMIT_RESET_PROVIDER_KEY))
+        or _receipt_provider(metadata)
+        or _card_provider(conn, task_id)
+    )
     metadata[RATE_LIMIT_RESET_PROVIDER_KEY] = provider
     if kb.recorded_rate_limit_reset(metadata, anchor=ended_at) is None:
         cooldown = kb._resolve_rate_limit_cooldown_seconds()
@@ -170,7 +183,7 @@ def rate_limit_resume_at(
 
     ``run`` is the task's latest ended run (read when omitted). The hold lasts
     the cooldown, or until the run's recorded reset when that is later, unless
-    the reset was kept for another provider than the card's current one.
+    the reset was kept for one provider and the card now names another.
     """
     from hermes_cli import kanban_db as kb
 
@@ -187,8 +200,8 @@ def rate_limit_resume_at(
     resume_at = ended_at + cooldown
     reset = kb.recorded_rate_limit_reset(metadata, anchor=ended_at)
     if reset is not None:
-        kept, provider = _recorded_for(metadata)
-        if not kept or provider == _card_provider(conn, task_id):
+        provider, current = _recorded_for(metadata)[1], _card_provider(conn, task_id)
+        if provider is None or current is None or provider == current:
             resume_at = max(resume_at, reset)
     return resume_at
 

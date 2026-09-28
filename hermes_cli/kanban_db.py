@@ -23505,15 +23505,17 @@ def _stamp_run_receipt(
     is left absent rather than invented.
 
     A provider reset the worker recorded on the run
-    (:func:`record_run_rate_limit_reset`) is carried forward too: the
-    closing caller builds its metadata from scratch, and the respawn guard
-    reads the reset off the closed run.
+    (:func:`record_run_rate_limit_reset`), and the provider it recorded
+    beside it, are carried forward too: the closing caller builds its
+    metadata from scratch, and the respawn guard reads both off the closed
+    run.
     """
     persisted, profile = _persisted_run_metadata(conn, run_id)
     stamped = dict(metadata) if isinstance(metadata, dict) else {}
     stamped.pop("runtime_receipt", None)
-    if _RATE_LIMIT_RESET_KEY in persisted:
-        stamped.setdefault(_RATE_LIMIT_RESET_KEY, persisted[_RATE_LIMIT_RESET_KEY])
+    for key in (_RATE_LIMIT_RESET_KEY, _provider_stops.RATE_LIMIT_RESET_PROVIDER_KEY):
+        if key in persisted:
+            stamped.setdefault(key, persisted[key])
     session_id = None
     for candidate in (
         stamped.get("worker_session_id"),
@@ -23542,6 +23544,7 @@ def record_run_rate_limit_reset(
     run_id: int,
     reset_at: Any,
     now: Optional[int] = None,
+    provider: Optional[str] = None,
 ) -> bool:
     """Record on a worker's own run when the provider's usage limit lifts.
 
@@ -23549,7 +23552,8 @@ def record_run_rate_limit_reset(
     ``KANBAN_RATE_LIMIT_EXIT_CODE``, so :func:`check_respawn_guard` keeps the
     card waiting until then instead of probing again after every fixed
     cooldown. Stored as int epoch seconds under ``rate_limit_reset_at`` in
-    the run's own metadata; every other key there is kept.
+    the run's own metadata, with ``provider``, the provider the worker ran
+    on, beside it when given; every other key there is kept.
 
     Returns False and writes nothing unless ``reset_at`` is a real number
     after ``now`` and at most ``RATE_LIMIT_RESET_MAX_WAIT_SECONDS`` later,
@@ -23574,6 +23578,8 @@ def record_run_rate_limit_reset(
             return False
         persisted, _profile = _persisted_run_metadata(conn, run_id)
         persisted[_RATE_LIMIT_RESET_KEY] = math.ceil(reset_at)
+        if isinstance(provider, str) and provider.strip():
+            persisted[_provider_stops.RATE_LIMIT_RESET_PROVIDER_KEY] = provider.strip()
         conn.execute(
             "UPDATE task_runs SET metadata = ? WHERE id = ?",
             (json.dumps(persisted, ensure_ascii=False), run_id),
@@ -35511,8 +35517,9 @@ def check_respawn_guard(
         quota almost certainly hasn't reset yet, so defer the respawn until
         the cooldown elapses — or until the provider reset recorded on that
         run (by the worker, :func:`record_run_rate_limit_reset`, or else by
-        the kernel when it booked the run), when that is later and was
-        recorded for the card's current provider — then allow a cheap probe.
+        the kernel when it booked the run), when that is later and was not
+        recorded for another provider than the one the card now names — then
+        allow a cheap probe.
         Once that time passes the task respawns; a rate-limit stop is never
         read as ``blocker_auth``.
 
@@ -35576,8 +35583,9 @@ def check_respawn_guard(
         and latest_run["outcome"] == "rate_limited"
     ):
         # Wait until the run's resume time: the cooldown, or the reset
-        # recorded on the run when that is later and was recorded for the
-        # card's current provider — probing sooner only hits the same wall.
+        # recorded on the run when that is later and was not recorded for
+        # another provider than the one the card now names — probing sooner
+        # only hits the same wall.
         # None when the cooldown is disabled: respawn immediately.
         resume_at = _provider_stops.rate_limit_resume_at(
             conn, task_id, latest_run, cooldown=rl_cooldown,

@@ -4,10 +4,13 @@ A rate-limited run the worker left without a reset still holds its card past the
 five-minute cooldown, because the kernel books a resume time of its own; a held
 card writes one ``respawn_guarded`` event instead of one per tick; a quota stop is
 never read as a sign-in problem; and a reset recorded under one provider stops
-holding once the card's route moves to another. A reset the worker records goes
-through the worker's own path, under exactly the environment the dispatcher
-builds for the claimed run, onto a named board under the test root. The refusal
-exit is covered end to end in ``tests/cli/test_kanban_worker_refusal_exit.py``.
+holding once the card's route moves to another, while one recorded under the
+provider the card is then pinned onto, or under no known provider, still holds.
+That provider is the one the run actually used: the worker's own, else the one
+its runtime receipt names. A reset the worker records goes through the worker's
+own path, under exactly the environment the dispatcher builds for the claimed
+run, onto a named board under the test root. The refusal exit is covered end to
+end in ``tests/cli/test_kanban_worker_refusal_exit.py``.
 """
 
 from __future__ import annotations
@@ -150,6 +153,47 @@ def _record_as_worker(monkeypatch, conn, task_id, reset_at, *, provider):
             ).fetchone()[0] == 0
 
 
+def _worker_session_on(conn, task_id, provider):
+    """The claimed run's worker session, linked by its first heartbeat, served by ``provider``.
+
+    The session lives in the assignee profile's own store under the test root,
+    where the kernel reads the run's runtime receipt when it closes the run.
+    """
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_state import SessionDB
+
+    task = kb.get_task(conn, task_id)
+    session_id = f"worker-session-{task.current_run_id}"
+    db = SessionDB(db_path=get_profile_dir(task.assignee) / "state.db")
+    try:
+        db.create_session(session_id, source="kanban", model="served-model")
+        db.update_token_counts(
+            session_id, input_tokens=10, output_tokens=4, model="served-model",
+            billing_provider=provider, api_call_count=1,
+        )
+    finally:
+        db.close()
+    assert kb.heartbeat_worker(conn, task_id, session_id=session_id)
+
+
+def _pin_onto_the_builder_route(conn, task_id):
+    """Pin an unpinned builder card onto its role's policy route, as the owner workspace does.
+
+    The card is classified first, as rows from older builds were; returns the
+    provider it was pinned onto.
+    """
+    conn.execute("UPDATE tasks SET execution_tier = 'deep' WHERE id = ?", (task_id,))
+    conn.commit()
+    route = model_policy.task_assignment_for("raphael-builder", "anthropic", "deep")
+    pinned = kb.pin_effective_task_routes(
+        conn, task_ids=[task_id], model=route.model, provider=route.provider,
+        reasoning_effort=route.reasoning_effort,
+    )
+    assert pinned == [task_id]
+    assert kb.get_task(conn, task_id).provider_override == route.provider
+    return route.provider
+
+
 def _resume_at(run):
     return kb.recorded_rate_limit_reset(run.metadata, anchor=run.ended_at)
 
@@ -287,25 +331,79 @@ def test_reset_under_one_provider_stops_holding_after_pin_effective_task_routes_
     conn, clock, monkeypatch,
 ):
     # An owner card that ran on its role's former route before it was
-    # classified, as rows from older builds did; the owner workspace pins such
-    # rows onto the policy route.
+    # classified, as rows from older builds did: its worker's credential pool
+    # was openrouter's. The owner workspace pins such rows onto the policy
+    # route, which names another provider.
     task_id = kb.create_task(conn, title="builder card", assignee="raphael-builder")
     _start_worker(conn, task_id, 4800)
     _record_as_worker(monkeypatch, conn, task_id, T0 + 3 * 3600, provider="openrouter")
     _worker_exits(conn, 4800, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
-    conn.execute("UPDATE tasks SET execution_tier = 'deep' WHERE id = ?", (task_id,))
-    conn.commit()
 
     clock["t"] = T0 + 3600
     assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    assert _pin_onto_the_builder_route(conn, task_id) == "anthropic"
+    assert kb.check_respawn_guard(conn, task_id) is None
 
-    route = model_policy.task_assignment_for("raphael-builder", "anthropic", "deep")
-    pinned = kb.pin_effective_task_routes(
-        conn, task_ids=[task_id], model=route.model, provider=route.provider,
-        reasoning_effort=route.reasoning_effort,
-    )
-    assert pinned == [task_id]
-    assert kb.get_task(conn, task_id).provider_override == "anthropic"
+
+def test_a_worker_reset_keeps_holding_after_pin_effective_task_routes_pins_the_provider_it_ran_on(
+    conn, clock, monkeypatch,
+):
+    # Before a role's route changes, the owner workspace pins every unpinned
+    # held card onto the role's current route: the provider the card ran on.
+    task_id = kb.create_task(conn, title="builder card", assignee="raphael-builder")
+    run_id = _start_worker(conn, task_id, 4810)
+    reset_at = T0 + 3 * 3600
+    _record_as_worker(monkeypatch, conn, task_id, reset_at, provider="anthropic")
+    _worker_exits(conn, 4810, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+
+    clock["t"] = T0 + 3600
+    assert _pin_onto_the_builder_route(conn, task_id) == "anthropic"
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = reset_at - 1
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = reset_at
+    assert kb.check_respawn_guard(conn, task_id) is None
+    assert kb.get_run(conn, run_id).metadata["rate_limit_reset_provider"] == "anthropic"
+
+
+def test_a_kernel_reset_keeps_holding_after_the_card_is_pinned_onto_the_provider_its_receipt_names(
+    conn, clock,
+):
+    # The worker recorded no reset, and the card named no provider: the run's
+    # runtime receipt is what says which provider it ran on.
+    task_id = kb.create_task(conn, title="builder card", assignee="raphael-builder")
+    run_id = _start_worker(conn, task_id, 4820)
+    _worker_session_on(conn, task_id, "anthropic")
+    _worker_exits(conn, 4820, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    run = kb.get_run(conn, run_id)
+    assert run.metadata["runtime_receipt"]["provider"] == "anthropic"
+    assert run.metadata["rate_limit_reset_source"] == "kernel"
+    resume_at = _resume_at(run)
+    assert resume_at > run.ended_at + COOLDOWN
+
+    clock["t"] = run.ended_at + COOLDOWN + 1
+    assert _pin_onto_the_builder_route(conn, task_id) == "anthropic"
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = resume_at
+    assert kb.check_respawn_guard(conn, task_id) is None
+    assert run.metadata["rate_limit_reset_provider"] == "anthropic"
+
+
+def test_a_reset_kept_without_a_known_provider_holds_on_a_card_that_names_one(conn, clock):
+    # No worker reset, no runtime receipt and no provider on the card: the
+    # kernel's reset is kept, but for no known provider.
+    task_id = kb.create_task(conn, title="unrouted card", assignee="worker")
+    run = _rate_limited_stop(conn, task_id, pid=5200)
+    assert run.metadata["rate_limit_reset_source"] == "kernel"
+    assert "rate_limit_reset_provider" in run.metadata
+    assert run.metadata["rate_limit_reset_provider"] is None
+    resume_at = _resume_at(run)
+    assert resume_at > run.ended_at + COOLDOWN
+
+    kb.set_model_override(conn, task_id, "m-1", provider="prov-a")
+    clock["t"] = run.ended_at + COOLDOWN + 1
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = resume_at
     assert kb.check_respawn_guard(conn, task_id) is None
 
 

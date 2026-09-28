@@ -4008,17 +4008,18 @@ def _interrupt_agent_for_signal(agent, signum) -> None:
 
 
 class _KanbanUsageLimitStop(Exception):
-    """A kanban goal-mode continuation turn stopped at the provider's usage limit.
+    """A kanban goal-mode continuation turn ended in a usage-limit or provider-refusal stop.
 
     ``goals.run_kanban_goal_loop`` ends on any ``run_turn`` error without judging or blocking,
-    so raising this stops the loop before either can see the turn; the worker then exits for a requeue.
+    so raising this stops the loop before either can see the turn; the worker then exits with that
+    stop's code, a requeue after a usage limit and a parked card after a refusal.
     """
 
 
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> "dict | None":
     """Drive a kanban goal_mode worker through ``goals.run_kanban_goal_loop`` after its first turn.
 
-    Returns the continuation turn result that stopped at the provider's usage limit, if any.
+    Returns the continuation turn result that ended in a usage-limit or provider-refusal stop, if any.
     The caller swallows all errors: a broken loop must never wedge a worker.
     """
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
@@ -4052,8 +4053,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> "dict | No
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
-        # A usage-limit turn must reach neither the judge nor the turn budget (whose block is
-        # sticky): stop the loop here and hand the result back for the requeue exit.
+        # A usage-limit or provider-refusal stop must reach neither the judge nor the turn budget
+        # (whose block is sticky): stop the loop here and hand the result back for that stop's exit.
         if _single_query_exit_code(result, default=0):
             limited = result
             raise _KanbanUsageLimitStop(result.get("failure_reason"))
@@ -4138,9 +4139,10 @@ def _exhausted_pool_reset_at(pool, now: float) -> Optional[float]:
 def _record_kanban_rate_limit_reset(cli, exit_code: int) -> None:
     """Before a usage-limit exit, record on this worker's own run when the provider's limit lifts.
 
-    The dispatcher then keeps the card waiting until that time instead of probing again after
-    each fixed cooldown. Best-effort: never raises and never changes the exit code; with nothing
-    recorded, the plain cooldown applies.
+    The provider this worker ran on (its credential pool's, else its agent's) is recorded beside
+    it when known. The dispatcher then keeps the card waiting until that time instead of probing
+    again after each fixed cooldown. Best-effort: never raises and never changes the exit code;
+    with nothing recorded, the plain cooldown applies.
     """
     try:
         import math
@@ -4150,15 +4152,20 @@ def _record_kanban_rate_limit_reset(cli, exit_code: int) -> None:
             return
         task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
         run_id = _int_or(os.environ.get("HERMES_KANBAN_RUN_ID"), None)
-        pool = getattr(getattr(cli, "agent", None), "_credential_pool", None)
+        agent = getattr(cli, "agent", None)
+        pool = getattr(agent, "_credential_pool", None)
         if not task_id or run_id is None or pool is None:
             return
         now = time.time()
         reset = _exhausted_pool_reset_at(pool, now)
         if reset is None or reset > now + _kb.RATE_LIMIT_RESET_MAX_WAIT_SECONDS:
             return
+        provider = getattr(pool, "provider", None) or getattr(agent, "provider", None)
+        provider_kwargs = {"provider": provider} if provider else {}
         with _kb.connect_closing() as conn:
-            _kb.record_run_rate_limit_reset(conn, task_id, run_id=run_id, reset_at=math.ceil(reset))
+            _kb.record_run_rate_limit_reset(
+                conn, task_id, run_id=run_id, reset_at=math.ceil(reset), **provider_kwargs,
+            )
     except Exception:
         logger.debug("could not record the provider reset on this kanban run", exc_info=True)
 

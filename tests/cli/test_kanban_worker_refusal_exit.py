@@ -5,7 +5,8 @@ through ``_default_spawn`` (only ``Popen`` is faked); the worker's one-shot entr
 runs under exactly the environment that spawn built. The kernel books the exit on the
 claimed board: the run ends ``provider_refused``, no failure is counted, and the card is
 parked blocked as a capability problem, so it is never started again unchanged and
-today's owner retry accepts it.
+today's owner retry accepts it. A goal-mode worker refused on a later turn leaves with
+the same code, before its goal loop's judge or turn budget sees that turn.
 """
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ import pytest
 
 import cli
 from agent.turn_author import TURN_AUTHOR_ENV
+from hermes_cli import goals
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_provider_stops import KANBAN_PROVIDER_REFUSED_EXIT_CODE
 
 BOARD = "refusals"
 WORKER_PID = 51515
@@ -104,6 +107,18 @@ class _Worker:
     def _run_conversation(self, **_kwargs):
         self.calls.append("run")
         return self.result
+
+
+class _GoalWorker(_Worker):
+    """A goal-mode worker whose model calls answer with ``turns`` in order, one per call."""
+
+    def __init__(self, *turns):
+        super().__init__(None)
+        self.turns = list(turns)
+
+    def _run_conversation(self, **_kwargs):
+        self.calls.append("run")
+        return self.turns.pop(0)
 
 
 def _as_spawned_worker(monkeypatch, env):
@@ -206,6 +221,47 @@ def test_both_one_shot_paths_give_the_refusal_code(root, spawns, monkeypatch, qu
         ordinary = _worker_exit_code(_Worker(other), task_id, quiet=quiet)
     assert refused not in (0, 1, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
     assert ordinary != refused
+
+
+def test_goal_mode_worker_refused_on_a_later_turn_exits_with_the_refusal_code(root, spawns, monkeypatch):
+    """The refused continuation is never judged and the goal loop never blocks the card itself."""
+    conn = kb.connect(board=BOARD)
+    try:
+        task_id = kb.create_task(
+            conn, title="goal card", body="Acceptance: the parser tests pass.", assignee="worker",
+            goal_mode=True, goal_max_turns=2,
+        )
+        kb.dispatch_once(conn, board=BOARD)
+        assert len(spawns) == 1
+        run_id = kb.get_task(conn, task_id).current_run_id
+    finally:
+        conn.close()
+    env = spawns[0]["env"]
+    assert env["HERMES_KANBAN_GOAL_MODE"] == "1"
+    assert env["HERMES_KANBAN_TASK"] == task_id
+    assert env["HERMES_KANBAN_RUN_ID"] == str(run_id)
+    assert env["HERMES_KANBAN_DB"] == str(kb.kanban_db_path(board=BOARD))
+    assert "-Q" in spawns[0]["cmd"]  # goal-mode workers take the quiet one-shot path
+
+    judged = []
+
+    def judge_goal(_goal, last_response, **_kwargs):
+        judged.append(last_response)
+        return "continue", "scripted continue", False, None, False
+
+    monkeypatch.setattr(goals, "judge_goal", judge_goal)
+    worker = _GoalWorker({"final_response": "first pass", "completed": True}, REFUSED)
+    with monkeypatch.context() as worker_process:
+        _as_spawned_worker(worker_process, env)
+        code = _worker_exit_code(worker, task_id, quiet=True)
+
+    assert code == KANBAN_PROVIDER_REFUSED_EXIT_CODE
+    assert judged == ["first pass"]  # only the first turn was judged
+    assert worker.calls == ["run", "run", "finalize"]
+    with closing(kb.connect(board=BOARD)) as conn:
+        task = kb.get_task(conn, task_id)
+        assert (task.status, task.current_run_id) == ("running", run_id)
+        assert [event for event in kb.list_events(conn, task_id) if event.kind == "blocked"] == []
 
 
 @pytest.mark.parametrize("quiet", [False, True])
