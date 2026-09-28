@@ -468,6 +468,8 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "digits": "Rebased onto 1234567 first",
         "letters": "Rebased onto abcdefa first",
         "tail": "Please confirm the placeholder plan. " * 14 + "Then open /srv/placeholder/x",
+        "overlay": "Cannot open A\u20e5B: permission denied",
+        "double": "Cannot open A\u20ebB: permission denied",
     }
     hex_question = "Should the placeholder lunch start at noon?"
     for project_name, project_leaks, question_title, project_question in (
@@ -552,6 +554,11 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         *hex_leaks.values(),
         "Waiting on ABCDEFA",
         "Waiting on _abcdefa_",
+        # A mark counts only as part of a script's writing: overlays and other
+        # generic combining or enclosing marks fall back.
+        "Cannot open A\u0335B: permission denied",
+        "Ask about A\u20dd first",
+        "Cannot open A\U0001d167B: permission denied",
     ):
         assert ow.owner_stop_reason(private) == _DECISION_FALLBACK
         assert ow.owner_stop_reason(
@@ -567,6 +574,8 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "Ist der Termin für Montag geplant?",
         "Is 50% of the budget enough?", "Should R&D approve it first?",
         "Waiting for your feedback on the draft.",
+        "Is the Cafe\u0301 booked for noon?",
+        "\u0915\u094d\u092f\u093e \u092f\u0939 \u0920\u0940\u0915 \u0939\u0948?",
         _DECISION_FALLBACK, _RECEIPT_FALLBACK,
     ):
         for fallback in (_DECISION_FALLBACK, _RECEIPT_FALLBACK):
