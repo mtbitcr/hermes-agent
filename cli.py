@@ -4140,9 +4140,11 @@ def _record_kanban_rate_limit_reset(cli, exit_code: int) -> None:
     """Before a usage-limit exit, record on this worker's own run when the provider's limit lifts.
 
     The provider this worker ran on (its credential pool's, else its agent's) is recorded beside
-    it when known. The dispatcher then keeps the card waiting until that time instead of probing
-    again after each fixed cooldown. Best-effort: never raises and never changes the exit code;
-    with nothing recorded, the plain cooldown applies.
+    it when known; a custom endpoint's pool key is recorded in the ``custom:`` namespace, since a
+    bare one (``claude`` of ``providers.claude``) would read as a built-in. The dispatcher then
+    keeps the card waiting until that time instead of probing again after each fixed cooldown.
+    Best-effort: never raises and never changes the exit code; with nothing recorded, the plain
+    cooldown applies.
     """
     try:
         import math
@@ -4160,7 +4162,10 @@ def _record_kanban_rate_limit_reset(cli, exit_code: int) -> None:
         reset = _exhausted_pool_reset_at(pool, now)
         if reset is None or reset > now + _kb.RATE_LIMIT_RESET_MAX_WAIT_SECONDS:
             return
-        provider = getattr(pool, "provider", None) or getattr(agent, "provider", None)
+        pool_key, runtime = getattr(pool, "provider", None), getattr(agent, "provider", None)
+        provider = pool_key or runtime
+        if pool_key and runtime == "custom" and not str(pool_key).lower().startswith("custom:"):
+            provider = f"custom:{pool_key}"
         provider_kwargs = {"provider": provider} if provider else {}
         with _kb.connect_closing() as conn:
             _kb.record_run_rate_limit_reset(

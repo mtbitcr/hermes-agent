@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -124,12 +124,24 @@ def _dispatcher_env(monkeypatch, conn, task_id):
     return launched[0]
 
 
-def _record_as_worker(monkeypatch, conn, task_id, reset_at, *, provider):
+@contextmanager
+def _as_worker_process(monkeypatch, env):
+    """Run the block with exactly ``env`` as the process environment, as the worker does."""
+    with monkeypatch.context() as worker_process:
+        for key in [key for key in os.environ if key not in env]:
+            worker_process.delenv(key)
+        for key, value in env.items():
+            worker_process.setenv(key, value)
+        yield
+
+
+def _record_as_worker(monkeypatch, conn, task_id, reset_at, *, provider, runtime=None):
     """The claimed run's worker records when its provider's limit lifts, as it does before exiting.
 
     The worker's own recording path runs under exactly the environment the
-    dispatcher builds for that run, its credential pool exhausted until
-    ``reset_at``; the reset must land on the claimed board's run.
+    dispatcher builds for that run, its credential pool (``provider``, the
+    pool's key) exhausted until ``reset_at``; ``runtime`` is its agent's
+    runtime provider, when given. The reset must land on the claimed board's run.
     """
     env = _dispatcher_env(monkeypatch, conn, task_id)
     assert env["HERMES_HOME"] == str(Path(os.environ["HERMES_HOME"]) / "profiles" / kb.get_task(conn, task_id).assignee)
@@ -142,12 +154,11 @@ def _record_as_worker(monkeypatch, conn, task_id, reset_at, *, provider):
         source="test", access_token="test-token",
         last_status=STATUS_EXHAUSTED, last_error_reset_at=float(reset_at),
     )
-    worker = SimpleNamespace(agent=SimpleNamespace(_credential_pool=CredentialPool(provider, [credential])))
-    with monkeypatch.context() as worker_process:
-        for key in [key for key in os.environ if key not in env]:
-            worker_process.delenv(key)
-        for key, value in env.items():
-            worker_process.setenv(key, value)
+    agent = SimpleNamespace(_credential_pool=CredentialPool(provider, [credential]))
+    if runtime is not None:
+        agent.provider = runtime
+    worker = SimpleNamespace(agent=agent)
+    with _as_worker_process(monkeypatch, env):
         cli._record_kanban_rate_limit_reset(worker, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
 
     assert (kb.get_run(conn, run_id).metadata or {}).get("rate_limit_reset_at") == reset_at
@@ -227,24 +238,47 @@ custom_providers:
 """
 
 
-def _worker_route(monkeypatch, named):
+# A legacy endpoint named like the built-in ``anthropic``: ``custom:anthropic``
+# routes to it, bare ``anthropic`` to the built-in.
+_ENDPOINT_NAMED_ANTHROPIC = """\
+custom_providers:
+  - name: anthropic
+    base_url: http://127.0.0.1:11/v1
+"""
+
+# Keyed endpoints whose display names differ from their keys; the worker's pool
+# for each is its key.
+_KEYED_ENDPOINTS = """\
+providers:
+  my-box:
+    name: Local Box
+    base_url: http://127.0.0.1:12/v1
+  other-box:
+    name: Other Box
+    base_url: http://127.0.0.1:13/v1
+"""
+_KEYED_POOLS = ("my-box", "other-box", "anthropic")
+
+
+def _worker_route(monkeypatch, named, *, config=_CUSTOM_ENDPOINTS, pools=("custom:local-llm", "custom:custom:box")):
     """``(runtime provider, credential pool)`` a worker handed ``named`` as ``--provider`` runs on.
 
     Resolved by the worker's own resolver under the assignee's profile home in
-    the test root, where :data:`_CUSTOM_ENDPOINTS` are configured; Vertex's
-    token is stubbed, never fetched. The runtime provider is the one the run's
-    runtime receipt names.
+    the test root, where ``config`` (by default :data:`_CUSTOM_ENDPOINTS`) is
+    configured and each of ``pools`` holds a placeholder key; Vertex's token is
+    stubbed, never fetched. The runtime provider is the one the run's runtime
+    receipt names.
     """
     from hermes_cli.profiles import get_profile_dir
 
     home = get_profile_dir("worker")
-    (home / "config.yaml").write_text(_CUSTOM_ENDPOINTS)
+    (home / "config.yaml").write_text(config)
     key = {
         "id": "key-1", "label": "key-1", "auth_type": "api_key", "priority": 0,
         "source": "manual", "access_token": "test-token", "last_status": "ok",
     }
     (home / "auth.json").write_text(json.dumps({
-        "version": 1, "credential_pool": {"custom:local-llm": [key], "custom:custom:box": [key]},
+        "version": 1, "credential_pool": {pool: [key] for pool in pools},
     }))
     with monkeypatch.context() as worker:
         worker.setenv("HERMES_HOME", str(home))
@@ -638,3 +672,209 @@ def test_a_card_holds_until_its_reset_whatever_name_its_worker_and_receipt_give_
     assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
     clock["t"] = run.ended_at + 2 * COOLDOWN
     assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def _stopped_after_worker_reset(monkeypatch, conn, task_id, pid, reset_at, *, pool):
+    """A rate-limited run of the card whose custom-endpoint worker recorded ``reset_at`` on ``pool``."""
+    run_id = _start_worker(conn, task_id, pid)
+    _record_as_worker(monkeypatch, conn, task_id, reset_at, provider=pool, runtime="custom")
+    _worker_exits(conn, pid, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    run = kb.get_run(conn, run_id)
+    assert run.outcome == "rate_limited"
+    assert _resume_at(run) == reset_at
+    return run
+
+
+def test_a_reset_on_a_custom_endpoint_named_anthropic_stops_holding_once_the_card_moves_to_the_built_in(
+    conn, clock, monkeypatch,
+):
+    pools = ("custom:anthropic", "anthropic")
+    route = {
+        named: _worker_route(monkeypatch, named, config=_ENDPOINT_NAMED_ANTHROPIC, pools=pools)
+        for named in ("custom:anthropic", "anthropic")
+    }
+    assert route == {"custom:anthropic": ("custom", "custom:anthropic"), "anthropic": ("anthropic", "anthropic")}
+
+    reset_at = T0 + 3 * 3600
+    moving, staying = _card_routed_to(conn, "custom:anthropic"), _card_routed_to(conn, "custom:anthropic")
+    moved_run = _stopped_after_worker_reset(monkeypatch, conn, moving, 4960, reset_at, pool="custom:anthropic")
+    _stopped_after_worker_reset(monkeypatch, conn, staying, 4961, reset_at, pool="custom:anthropic")
+
+    kb.set_model_override(conn, moving, "m-1", provider="anthropic")
+    clock["t"] = T0 + 3600
+    assert kb.check_respawn_guard(conn, moving) is None
+    assert kb.get_run(conn, moved_run.id).metadata["rate_limit_reset_provider"] != "anthropic"
+    assert kb.check_respawn_guard(conn, staying) == "rate_limit_cooldown"
+    clock["t"] = reset_at - 1
+    assert kb.check_respawn_guard(conn, staying) == "rate_limit_cooldown"
+    clock["t"] = reset_at
+    assert kb.check_respawn_guard(conn, staying) is None
+
+
+@pytest.mark.parametrize("moved_to", ["anthropic", "Other Box"])
+def test_a_reset_on_a_keyed_custom_endpoint_holds_its_card_until_it_passes_but_not_one_moved_off_it(
+    conn, clock, monkeypatch, moved_to,
+):
+    assert _worker_route(monkeypatch, "Local Box", config=_KEYED_ENDPOINTS, pools=_KEYED_POOLS) == (
+        "custom", "my-box",
+    )
+    assert _worker_route(monkeypatch, "Other Box", config=_KEYED_ENDPOINTS, pools=_KEYED_POOLS) == (
+        "custom", "other-box",
+    )
+
+    reset_at = T0 + 3 * 3600
+    staying, moving = _card_routed_to(conn, "Local Box"), _card_routed_to(conn, "Local Box")
+    _stopped_after_worker_reset(monkeypatch, conn, staying, 4962, reset_at, pool="my-box")
+    _stopped_after_worker_reset(monkeypatch, conn, moving, 4963, reset_at, pool="my-box")
+
+    clock["t"] = T0 + 3600
+    assert kb.check_respawn_guard(conn, staying) == "rate_limit_cooldown"
+    assert kb.check_respawn_guard(conn, moving) == "rate_limit_cooldown"
+    kb.set_model_override(conn, moving, "m-2", provider=moved_to)
+    assert kb.check_respawn_guard(conn, moving) is None
+    clock["t"] = reset_at - 1
+    assert kb.check_respawn_guard(conn, staying) == "rate_limit_cooldown"
+    clock["t"] = reset_at
+    assert kb.check_respawn_guard(conn, staying) is None
+
+
+def test_a_keyed_custom_endpoint_is_one_provider_whichever_of_its_names_the_card_gives(
+    conn, clock, monkeypatch,
+):
+    names = ("Local Box", "local-box", "my-box", "custom:my-box", "custom:local-box")
+    for named in names:
+        assert _worker_route(monkeypatch, named, config=_KEYED_ENDPOINTS, pools=_KEYED_POOLS) == (
+            "custom", "my-box",
+        ), named
+
+    reset_at = T0 + 3 * 3600
+    task_id = _card_routed_to(conn, "my-box")
+    _stopped_after_worker_reset(monkeypatch, conn, task_id, 4964, reset_at, pool="my-box")
+
+    clock["t"] = T0 + 3600
+    for named in names:
+        kb.set_model_override(conn, task_id, "m-1", provider=named)
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown", named
+    clock["t"] = reset_at
+    assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_stops_on_a_keyed_custom_endpoint_streak_whether_its_pool_or_its_card_names_it(
+    conn, clock, monkeypatch,
+):
+    # The first stop knows its provider from the worker's pool (``my-box``);
+    # the second, with a receipt naming only ``custom``, from the card.
+    assert _worker_route(monkeypatch, "Local Box", config=_KEYED_ENDPOINTS, pools=_KEYED_POOLS) == (
+        "custom", "my-box",
+    )
+    task_id = _card_routed_to(conn, "Local Box")
+    first = _stopped_after_worker_reset(monkeypatch, conn, task_id, 4965, T0 + 3600, pool="my-box")
+
+    clock["t"] = T0 + 3600
+    run_id = _start_worker(conn, task_id, 4966)
+    _worker_session_on(conn, task_id, "custom")
+    _worker_exits(conn, 4966, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    second = kb.get_run(conn, run_id)
+    assert second.outcome == "rate_limited"
+    assert second.metadata["runtime_receipt"]["provider"] == "custom"
+    assert second.metadata["rate_limit_reset_source"] == "kernel"
+    assert _resume_at(second) == second.ended_at + 4 * COOLDOWN
+    assert second.metadata["rate_limit_reset_provider"] == first.metadata["rate_limit_reset_provider"]
+
+
+@pytest.mark.parametrize(
+    ("config", "named", "pool"),
+    [
+        # A key the alias table reads as the built-in ``anthropic``.
+        ("providers:\n  claude:\n    base_url: http://127.0.0.1:14/v1\n", "claude", "claude"),
+        # A key that is the built-in's own id, on an endpoint named otherwise.
+        (
+            "providers:\n  anthropic:\n    name: Work Proxy\n    base_url: http://127.0.0.1:15/v1\n",
+            "Work Proxy", "anthropic",
+        ),
+    ],
+)
+def test_a_reset_from_a_custom_endpoint_pool_keyed_like_a_built_in_holds_only_cards_on_that_endpoint(
+    conn, clock, monkeypatch, config, named, pool,
+):
+    pools = (pool, "anthropic")
+    assert _worker_route(monkeypatch, named, config=config, pools=pools) == ("custom", pool)
+    assert _worker_route(monkeypatch, "anthropic", config=config, pools=pools) == ("anthropic", "anthropic")
+
+    reset_at = T0 + 3 * 3600
+    staying, moving = _card_routed_to(conn, named), _card_routed_to(conn, named)
+    _stopped_after_worker_reset(monkeypatch, conn, staying, 4967, reset_at, pool=pool)
+    _stopped_after_worker_reset(monkeypatch, conn, moving, 4968, reset_at, pool=pool)
+
+    clock["t"] = T0 + 3600
+    assert kb.check_respawn_guard(conn, moving) == "rate_limit_cooldown"
+    kb.set_model_override(conn, moving, "m-1", provider="anthropic")
+    assert kb.check_respawn_guard(conn, moving) is None
+    assert kb.check_respawn_guard(conn, staying) == "rate_limit_cooldown"
+    clock["t"] = reset_at - 1
+    assert kb.check_respawn_guard(conn, staying) == "rate_limit_cooldown"
+    clock["t"] = reset_at
+    assert kb.check_respawn_guard(conn, staying) is None
+
+
+# What a profiles dir under the worker's own home would say: that ``Local Box``
+# is another endpoint. The assignee's profile is the one under the root.
+_DECOY_ENDPOINTS = """\
+providers:
+  decoy-box:
+    name: Local Box
+    base_url: http://127.0.0.1:16/v1
+"""
+
+
+def test_booking_and_the_guard_under_the_worker_env_read_the_assignee_profile_under_the_root(
+    conn, clock, monkeypatch,
+):
+    assert _worker_route(monkeypatch, "Local Box", config=_KEYED_ENDPOINTS, pools=_KEYED_POOLS) == (
+        "custom", "my-box",
+    )
+    task_id = _card_routed_to(conn, "Local Box")
+    run_id = _start_worker(conn, task_id, 4969)
+    env = _dispatcher_env(monkeypatch, conn, task_id)
+    root = Path(os.environ["HERMES_HOME"])
+    assert env["HERMES_HOME"] == str(root / "profiles" / "worker")
+    assert env["HERMES_KANBAN_TASK"] == task_id
+    assert env["HERMES_KANBAN_DB"] == str(kb.kanban_db_path(board=BOARD))
+    assert env["HERMES_KANBAN_BOARD"] == BOARD
+    decoy = Path(env["HERMES_HOME"]) / "profiles" / "worker"
+    decoy.mkdir(parents=True)
+    (decoy / "config.yaml").write_text(_DECOY_ENDPOINTS)
+
+    reset_at = T0 + 3 * 3600
+    _record_as_worker(monkeypatch, conn, task_id, reset_at, provider="my-box", runtime="custom")
+    with _as_worker_process(monkeypatch, env):
+        _worker_exits(conn, 4969, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        run = kb.get_run(conn, run_id)
+        assert run.outcome == "rate_limited"
+        assert _resume_at(run) == reset_at
+        clock["t"] = T0 + 3600
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+        clock["t"] = reset_at
+        assert kb.check_respawn_guard(conn, task_id) is None
+    assert sorted(path.name for path in decoy.iterdir()) == ["config.yaml"]
+
+
+def test_a_reset_holds_its_card_when_the_assignee_profile_config_cannot_be_read(
+    conn, clock, monkeypatch,
+):
+    from hermes_cli.profiles import get_profile_dir
+
+    task_id = _card_routed_to(conn, "Local Box")
+    reset_at = T0 + 3 * 3600
+    config = get_profile_dir("worker") / "config.yaml"
+    config.write_text("providers: [not, closed\n")
+    run = _stopped_after_worker_reset(monkeypatch, conn, task_id, 4970, reset_at, pool="my-box")
+    assert run.metadata["rate_limit_reset_provider"] is None
+
+    clock["t"] = T0 + 3600
+    kb.set_model_override(conn, task_id, "m-2", provider="prov-b")
+    assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    clock["t"] = reset_at
+    assert kb.check_respawn_guard(conn, task_id) is None
+    assert config.read_text() == "providers: [not, closed\n"
+    assert sorted(path.name for path in config.parent.iterdir() if path.name.startswith("config")) == ["config.yaml"]
