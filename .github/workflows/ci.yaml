@@ -224,8 +224,9 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when some deps were skipped. ``failure`` and
+  # ``cancelled`` results cause it to fail; ``skipped`` is treated as
+  # success only when ``detect`` succeeded.
   #
   # Branch protection should require ONLY this check.
   #
