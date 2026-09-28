@@ -1167,3 +1167,53 @@ def test_an_attempt_whose_state_disagrees_with_its_chats_reads_unknown(monkeypat
         resend = _view(execution_id)["resend"]
         assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
         assert _claim(execution_id, "req-2")["claimed"] is False
+
+
+def test_a_failure_named_after_the_hand_over_is_kept_unknown_and_never_claimed_again(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    _run("exec-1", "failed", "failed", "failed", "failed", "failed")
+    first = _claim("exec-1", "req-1")["attempt"]
+
+    # A reason from after the hand-over says the chat may have been sent: that is no failure.
+    assert _finish(
+        first,
+        (0, "failed", "timeout"), (1, "failed", "error_after_handover"), (2, "failed", "partly_sent"),
+        (3, "failed", "interrupted"), (4, "failed", "route_refused"),
+    ) is True
+
+    [stored] = store.load("exec-1")["attempts"]
+    assert stored["chats"] == [
+        {"position": 0, "state": "unknown", "reason": "timeout"},
+        {"position": 1, "state": "unknown", "reason": "error_after_handover"},
+        {"position": 2, "state": "unknown", "reason": "partly_sent"},
+        {"position": 3, "state": "unknown", "reason": "interrupted"},
+        {"position": 4, "state": "failed", "reason": "route_refused"},
+    ]
+    second = _claim("exec-1", "req-2")["attempt"]
+    assert second["chats"] == [{"position": 4, "state": "in_progress", "reason": None}]
+
+
+def test_a_stored_state_whose_reason_disagrees_reads_unknown(monkeypatch):
+    _at(monkeypatch, NOW)
+    _run("exec-healthy", "failed")
+    _run("exec-target", "failed")
+    _forge_sql("UPDATE targets SET reason='timeout' WHERE execution_id=?", ("exec-target",))
+    _run("exec-attempt", "failed")
+    failed = _claim("exec-attempt", "req-1")["attempt"]
+    assert _finish(failed, (0, "failed", "platform_refused")) is True
+    _forge_sql("UPDATE attempts SET chats=? WHERE attempt_id=?",
+               (json.dumps([{"position": 0, "state": "failed", "reason": "timeout"}]), failed["attempt_id"]))
+    _run("exec-sent", "failed")
+    sent = _claim("exec-sent", "req-1")["attempt"]
+    assert _finish(sent, (0, "delivered", None)) is True
+    _forge_sql("UPDATE attempts SET chats=? WHERE attempt_id=?",
+               (json.dumps([{"position": 0, "state": "delivered", "reason": "platform_refused"}]),
+                sent["attempt_id"]))
+
+    assert _view("exec-healthy")["resend"] == {"eligible": True, "reason": None, "attempts": []}
+    assert [target["state"] for target in _view("exec-target")["targets"]] == ["unknown"]
+    for execution_id in ("exec-target", "exec-attempt", "exec-sent"):
+        resend = _view(execution_id)["resend"]
+        assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
+        assert _claim(execution_id, "req-2")["claimed"] is False
