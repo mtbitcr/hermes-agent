@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -2725,6 +2726,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
             and getattr(loop, "is_running", lambda: False)()
         )
         delivered = False
+        live_dispatched = False  # the live text send was handed to the gateway loop
         target_errors = []
 
         # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
@@ -2905,6 +2907,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                     from agent.async_utils import safe_schedule_threadsafe
 
                     router = DeliveryRouter(router_config, target_adapters)
+                    if resend is not None:
+                        # A re-send hands over its exact text: never cut to size or given a footer.
+                        router._cap_oversized_output = lambda _adapter, text, _job_id: text
                     route_target = DeliveryTarget(
                         platform=platform,
                         chat_id=str(chat_id),
@@ -2929,6 +2934,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                         adapter_ok = False
                         target_errors.append("live adapter event loop scheduling failed")
                     else:
+                        live_dispatched = True
                         send_result = None
                         timeout_handled = False
                         try:
@@ -3134,6 +3140,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                 if not live_adapter_ready:
                     recorder.note_failed("no_connection")
                 continue
+            if resend is not None and live_dispatched:
+                # A re-send sends each chat once. The live send was handed over, so an unconfirmed,
+                # raised or timed-out one may have reached the chat (a cancelled wait proves
+                # nothing): no other path sends it again, and it keeps the outcome recorded above.
+                delivery_errors.extend(target_errors)
+                continue
             # If the interpreter is finalizing (gateway SIGTERM / restart /
             # OOM), scheduling any new delivery is futile — asyncio.run and a
             # fresh ThreadPoolExecutor both raise "cannot schedule new futures
@@ -3286,16 +3298,21 @@ def _resend_top_line(created_at: float) -> str:
 
 def claim_report_resend(execution_id: str, request_id: str) -> Optional[dict]:
     """Claim the re-send of the failed chats of one run of the current profile: None when the
-    profile has no such run, else ``delivery_record.claim_resend``'s answer. A run the re-send view
-    calls eligible whose saved attachment is gone is refused ``attachment_missing``, claiming
+    profile has no such run, else ``delivery_record.claim_resend``'s answer. A request id the run
+    already had answers its first attempt, whatever has changed since. Otherwise a run the re-send
+    view calls eligible whose saved attachment is gone is refused ``attachment_missing``, claiming
     nothing."""
     from cron.executions import get_execution
 
     row = get_execution(execution_id)
     if row is None:
         return None
-    if delivery_record.history_deliveries([row])[0]["resend"]["eligible"] and (
-        _resend_media(delivery_record.load(execution_id)) is None
+    record = delivery_record.load(execution_id)
+    # The store keeps a request id as its digest only, the way claim_resend compares it.
+    request_key = hashlib.sha256(str(request_id or "").encode("utf-8")).hexdigest()
+    known = any(attempt["request_id"] == request_key for attempt in (record or {}).get("attempts") or ())
+    if not known and delivery_record.history_deliveries([row])[0]["resend"]["eligible"] and (
+        _resend_media(record) is None
     ):
         return {"claimed": False, "reason": "attachment_missing", "attempt": None}
     return delivery_record.claim_resend(row, request_id)

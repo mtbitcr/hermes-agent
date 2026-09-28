@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -31,6 +31,7 @@ from cron.executions import create_execution, finish_execution, list_executions
 from cron.jobs import create_job, update_job
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
+from gateway.platforms.base import SendResult
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 KEY = "3f9c1e7a5b2d4c6e8f0a1b3c5d7e9f21"
@@ -69,6 +70,59 @@ class _Chats:
 
     def to(self, chat_id):
         return [message for chat, message in self.sent if chat == chat_id]
+
+
+class _LiveChat:
+    """A live gateway adapter: keeps what it was handed and answers as scripted. ``unconfirmed`` is
+    a refusal that still carries a message id; ``hangs`` never confirms. A text longer than
+    ``limit`` is refused."""
+
+    def __init__(self, answer="delivered", *, splits_long_messages=True, limit=4096):
+        self.answer = answer
+        self.splits_long_messages = splits_long_messages
+        self.MAX_MESSAGE_LENGTH = limit
+        self.sent = []
+        self.started = threading.Event()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.sent.append((str(chat_id), content))
+        self.started.set()
+        if self.answer == "hangs":
+            await asyncio.sleep(10)
+        if self.answer == "raises":
+            raise ConnectionResetError("placeholder connection reset")
+        if self.answer == "no_answer":
+            return None
+        if self.answer == "unconfirmed":
+            return SendResult(success=False, error="confirmation lost", message_id="m7")
+        if len(content) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(success=False, error="Bad Request: message is too long")
+        return SendResult(success=True, message_id="m1")
+
+
+def _confirmation_times_out(monkeypatch, live):
+    """The live text send starts, but its confirmation does not come back within the wait."""
+    from agent import async_utils
+
+    real = async_utils.safe_schedule_threadsafe
+
+    class _Unconfirmed:
+        def __init__(self, future):
+            self._future = future
+
+        def result(self, timeout=None):
+            assert live.started.wait(5)
+            return self._future.result(timeout=0.05)
+
+        def cancel(self):
+            return self._future.cancel()
+
+    def schedule(coro, loop, **kwargs):
+        routed = getattr(getattr(coro, "cr_code", None), "co_name", "") == "_deliver_to_platform"
+        future = real(coro, loop, **kwargs)
+        return _Unconfirmed(future) if routed and future is not None else future
+
+    monkeypatch.setattr(async_utils, "safe_schedule_threadsafe", schedule)
 
 
 @pytest.fixture(autouse=True)
@@ -262,6 +316,32 @@ async def test_repeated_request_id_returns_first_attempt_without_sending(adapter
 
 
 @pytest.mark.asyncio
+async def test_repeated_request_id_after_its_attachment_is_gone_returns_first_attempt(adapter, chats, tmp_path):
+    chart = tmp_path / "placeholder-chart.txt"
+    chart.write_text("placeholder chart", encoding="utf-8")
+    # The chat's platform stays off, for the run and the first re-send: nothing is ever handed over.
+    chats.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=False)
+    _job_, execution_id, _first = await _failed_run(chats, CHAT_BAD, text=f"{REPORT}\nMEDIA:{chart}")
+    assert delivery_record.load(execution_id)["attachments"]
+
+    async with _client(adapter) as cli:
+        first = await _resend(cli, execution_id, "same")
+        first_body = await first.json()
+        chart.unlink()
+        again = await _resend(cli, execution_id, "same")
+        again_body = await again.json()
+
+    assert first.status == 200, first_body
+    assert [(t["state"], t["reason"]) for t in first_body["targets"]] == [("failed", "no_connection")]
+    assert again.status == 200, again_body
+    assert again_body["attempt_id"] == first_body["attempt_id"]
+    assert again_body["state"] == first_body["state"] == "failed"
+    assert again_body["targets"] == first_body["targets"]
+    assert chats.sent == []
+    assert len(_view(execution_id)["resend"]["attempts"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_two_simultaneous_requests_send_once(adapter, chats):
     _job_, execution_id, _first = await _failed_run(chats, CHAT_BAD)
     chats.gate = threading.Event()
@@ -307,6 +387,108 @@ async def test_send_outliving_the_request_answers_202_and_records_its_result(ada
     assert again_body["attempt_id"] == attempts[0]["attempt_id"]
     assert again_body["state"] == "delivered"
     assert len(chats.to(CHAT_BAD)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer, reason",
+    [
+        ("unconfirmed", "error_after_handover"),
+        ("no_answer", "error_after_handover"),
+        ("raises", "error_after_handover"),
+        ("hangs", "timeout"),
+    ],
+)
+async def test_live_send_already_out_is_not_sent_again_another_way(
+    adapter, chats, runner, monkeypatch, answer, reason
+):
+    _job_, execution_id, _first = await _failed_run(chats, CHAT_BAD)
+    live = _LiveChat(answer)
+    runner.adapters = {Platform.TELEGRAM: live}
+    if answer == "hangs":
+        _confirmation_times_out(monkeypatch, live)
+
+    async with _client(adapter) as cli:
+        response = await _resend(cli, execution_id, "req-1")
+        body = await response.json()
+
+    assert response.status == 200, body
+    # The live send was handed the chat once and may have reached it: nothing sends it again.
+    assert [chat for chat, _message in live.sent] == [CHAT_BAD]
+    assert chats.sent == []
+    assert body["state"] == "unknown"
+    assert [(t["state"], t["reason"]) for t in body["targets"]] == [("unknown", reason)]
+    attempts = _view(execution_id)["resend"]["attempts"]
+    assert [(a["attempt_id"], a["state"]) for a in attempts] == [(body["attempt_id"], "unknown")]
+    _carries_nothing_private(body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fits", [True, False])
+async def test_report_just_under_the_limit_reaches_a_non_splitting_chat_unchanged(
+    adapter, chats, runner, monkeypatch, fits
+):
+    monkeypatch.setattr("cron.scheduler.load_config", lambda *a, **k: {"cron": {"wrap_response": False}})
+    text = ("placeholder report text " * 170)[:3979] + "."
+    # The run's chat was not reachable: nothing was handed over and the chat reads failed.
+    chats.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=False)
+    _job_, execution_id, _first = await _failed_run(chats, CHAT_BAD, text=text)
+    chats.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=True)
+    assert delivery_record.load(execution_id)["targets"][0]["text"] == text
+    # A chat that takes one message of at most ``limit`` characters and never splits one.
+    live = _LiveChat(splits_long_messages=False, limit=4096 if fits else 4000)
+    runner.adapters = {Platform.TELEGRAM: live}
+
+    async with _client(adapter) as cli:
+        response = await _resend(cli, execution_id, "req-1")
+        body = await response.json()
+
+    assert response.status == 200, body
+    top = f"Sent again because it did not arrive on {_run_date(execution_id)}."
+    assert live.sent == [(CHAT_BAD, f"{top}\n{text}")]
+    assert chats.sent == []
+    state = "delivered" if fits else "unknown"
+    assert body["state"] == state
+    assert [t["state"] for t in body["targets"]] == [state]
+    assert [a["state"] for a in _view(execution_id)["resend"]["attempts"]] == [state]
+
+
+@pytest.mark.asyncio
+async def test_failing_real_adapter_send_logs_no_chat_address_or_report_text(
+    adapter, chats, runner, monkeypatch, caplog
+):
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    _job_, execution_id, _first = await _failed_run(chats, CHAT_BAD)
+    bot = TelegramAdapter(PlatformConfig(enabled=True, token="placeholder-token", extra={}))
+    bot._bot = MagicMock()
+    bot._bot.send_chat_action = AsyncMock()
+
+    async def refused(chat_id, chunk, *_args, **_kwargs):
+        raise RuntimeError(f"placeholder refusal of {chunk!r} for chat {chat_id}")
+
+    monkeypatch.setattr(bot, "_should_attempt_rich", lambda *_a, **_k: False)
+    monkeypatch.setattr(bot, "_send_chunk_with_retries", refused)
+    runner.adapters = {Platform.TELEGRAM: bot}
+    caplog.clear()
+    caplog.set_level(logging.DEBUG)
+
+    async with _client(adapter) as cli:
+        response = await _resend(cli, execution_id, "req-1")
+        body = await response.json()
+
+    assert response.status == 200, body
+    # Every record any logger made, from the route down to the adapter's own send.
+    formatter = logging.Formatter()
+    assert any("Cron re-send" in record.getMessage() for record in caplog.records)
+    for record in caplog.records:
+        logged = " ".join((
+            record.getMessage(), repr(record.args), record.exc_text or "",
+            formatter.formatException(record.exc_info) if record.exc_info else "",
+        ))
+        for private in (CHAT_BAD, "numbers are up"):
+            assert private not in logged, (record.name, record.lineno)
+    assert [(t["state"], t["reason"]) for t in body["targets"]] == [("unknown", "error_after_handover")]
 
 
 def _older_than_resend_window(monkeypatch):
