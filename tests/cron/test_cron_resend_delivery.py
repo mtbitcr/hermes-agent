@@ -6,6 +6,7 @@ through ``cron.delivery_record`` and read back through the re-send view of the r
 here sends a report again: this is only the record-store half of the re-send.
 """
 
+import hashlib
 import importlib
 import json
 import os
@@ -108,6 +109,11 @@ def _listed(attempt, *, finished_at=None, state="in_progress"):
     }
 
 
+def _key(request_id):
+    """How a request id is kept: its SHA-256 digest only."""
+    return hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+
+
 def _attempt_rows():
     conn = sqlite3.connect(_store()._path())
     conn.row_factory = sqlite3.Row
@@ -132,7 +138,7 @@ def test_claim_marks_only_the_failed_chats_of_an_eligible_run_in_progress(monkey
     assert (claim["claimed"], claim["reason"]) == (True, None)
     assert attempt["attempt_id"]
     assert (attempt["request_id"], attempt["requested_at"], attempt["finished_at"], attempt["state"]) == (
-        "req-1", "2026-09-21T14:14:20+00:00", None, "in_progress",
+        _key("req-1"), "2026-09-21T14:14:20+00:00", None, "in_progress",
     )
     assert attempt["chats"] == [{"position": 1, "state": "in_progress", "reason": None}]
     after = _view("exec-1")
@@ -219,7 +225,7 @@ def test_a_repeated_request_id_returns_its_first_attempt_without_claiming_again(
     assert (repeated["claimed"], repeated["reason"]) == (False, None)
     assert (repeated["attempt"]["attempt_id"], repeated["attempt"]["state"]) == (second["attempt_id"], "delivered")
     assert _claim("exec-1", "req-3") == {"claimed": False, "reason": "already_delivered", "attempt": None}
-    assert [row["request_id"] for row in _attempt_rows()] == ["req-1", "req-2"]
+    assert [row["request_id"] for row in _attempt_rows()] == [_key("req-1"), _key("req-2")]
 
 
 # --- concurrency -----------------------------------------------------------------------------------
@@ -632,7 +638,7 @@ def test_resend_records_never_change_what_the_store_already_holds(monkeypatch):
     assert store.fence_resends() == 1
 
     assert _held(path) == held
-    assert [row["request_id"] for row in _attempt_rows()] == ["req-1", "req-2"]
+    assert [row["request_id"] for row in _attempt_rows()] == [_key("req-1"), _key("req-2")]
 
 
 def test_attempts_are_pruned_only_with_their_record(monkeypatch):
@@ -701,7 +707,7 @@ def test_a_run_stops_being_resendable_after_the_attempt_cap(monkeypatch):
     assert (resend["eligible"], resend["reason"]) == (False, "too_many_attempts")
     assert len(_attempt_rows()) == store.MAX_RESEND_ATTEMPTS
     # A request id the run already had still answers with its first attempt.
-    assert _claim("exec-cap", "req-0")["attempt"]["request_id"] == "req-0"
+    assert _claim("exec-cap", "req-0")["attempt"]["request_id"] == _key("req-0")
 
 
 def _forge_attempt(execution_id, state, chats, attempt_id="forged"):
@@ -921,7 +927,7 @@ def test_a_stored_attempt_state_outside_the_written_states_reads_unknown(monkeyp
         _forge_unchecked(
             "INSERT INTO attempts (attempt_id, execution_id, request_id, requested_at, finished_at, state, chats) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (attempt_id, execution_id, f"req-{attempt_id}", NOW, NOW, state, chats),
+            (attempt_id, execution_id, _key(f"req-{attempt_id}"), NOW, NOW, state, chats),
         )
 
     views = store.history_deliveries([_row(execution_id) for execution_id in runs])

@@ -16,14 +16,17 @@ delivery.
 
 Each attempt to send a run's failed chats again is recorded here too: claimed ``in_progress`` in one
 compare-and-set write, then finished with each chat's outcome, its times and its error, redacted. A
-chat an attempt leaves ``failed`` may be re-sent again; one it leaves ``delivered`` or ``unknown``
-never is. An attempt still in progress at start-up was cut off and is fenced ``unknown``.
+request id is kept only as its SHA-256 digest. A chat an attempt leaves ``failed`` may be re-sent
+again; one it leaves ``delivered`` or ``unknown`` never is. An attempt still in progress at start-up
+was cut off and is fenced ``unknown``. A stored value outside the shape this module writes is read as
+unknown, never passed on.
 """
 
 from __future__ import annotations
 
 import contextvars
 import functools
+import hashlib
 import inspect
 import json
 import logging
@@ -63,6 +66,13 @@ _REASONS = frozenset({
     "route_refused", "no_connection", "settings_not_loaded", "platform_refused",
     "timeout", "error_after_handover", "partly_sent", "interrupted",
 })
+# The shapes of the ids this module writes: an attempt id and a request id's digest.
+_ATTEMPT_ID = re.compile(r"[0-9a-f]{32}")
+_REQUEST_KEY = re.compile(r"[0-9a-f]{64}")
+# A target that cannot be read: never re-sent, labelled only as unknown.
+_UNREADABLE_TARGET = {
+    "platform": None, "chat_id": None, "thread_id": None, "state": "unknown", "reason": None, "text": None,
+}
 _lock = threading.RLock()
 _active = contextvars.ContextVar("cron_delivery_recorder", default=None)
 
@@ -157,9 +167,11 @@ def _kept(text: Optional[str]) -> Optional[str]:
 
 
 def _prune_unlocked(conn: sqlite3.Connection, now: float) -> None:
+    # A record whose time is not a finite number has no age to keep it by.
     conn.execute(
-        "DELETE FROM records WHERE created_at < ? AND execution_id NOT IN ("
-        "SELECT execution_id FROM records ORDER BY created_at DESC, execution_id DESC LIMIT ?)",
+        "DELETE FROM records WHERE typeof(created_at) NOT IN ('integer', 'real') "
+        "OR created_at IN (9e999, -9e999) OR (created_at < ? AND execution_id NOT IN ("
+        "SELECT execution_id FROM records ORDER BY created_at DESC, execution_id DESC LIMIT ?))",
         (now - RESEND_WINDOW_SECONDS, max(0, int(MAX_RECORDS))),
     )
     conn.execute("DELETE FROM targets WHERE execution_id NOT IN (SELECT execution_id FROM records)")
@@ -417,20 +429,25 @@ def load_many(execution_ids: Iterable[Any], *, bodies: bool = True) -> Dict[str,
     path = _path()
     if not ids or not path.exists():
         return {}
+    _platform_keys()  # imported before the store is locked, never while holding it
     with _transaction(path) as conn:
         return _load_unlocked(conn, ids, bodies)
 
 
 def _load_unlocked(conn: sqlite3.Connection, ids: List[str], bodies: bool) -> Dict[str, Dict[str, Any]]:
     marks = ",".join("?" * len(ids))
-    text = "text" if bodies else "CASE WHEN text IS NULL THEN NULL ELSE 1 END AS text"
-    sent_text = "sent_text" if bodies else "CASE WHEN sent_text IS NULL THEN NULL ELSE 1 END AS sent_text"
+    # Without bodies, a text is present only when it is stored as text; a sent text that is stored
+    # but is not text reads 0, and its target then has no text to re-send.
+    text = "text" if bodies else "CASE WHEN typeof(text) = 'text' THEN 1 END AS text"
+    sent_text = "sent_text" if bodies else (
+        "CASE WHEN sent_text IS NULL THEN NULL WHEN typeof(sent_text) = 'text' THEN 1 ELSE 0 END AS sent_text"
+    )
     records = conn.execute(
         f"SELECT execution_id, job_id, created_at, {text}, attachments FROM records "
         f"WHERE execution_id IN ({marks})", ids,
     ).fetchall()
     targets = conn.execute(
-        f"SELECT execution_id, platform, chat_id, thread_id, state, reason, {sent_text} FROM targets "
+        f"SELECT execution_id, position, platform, chat_id, thread_id, state, reason, {sent_text} FROM targets "
         f"WHERE execution_id IN ({marks}) ORDER BY execution_id, position", ids,
     ).fetchall()
     attempts = conn.execute(
@@ -438,9 +455,9 @@ def _load_unlocked(conn: sqlite3.Connection, ids: List[str], bodies: bool) -> Di
     ).fetchall()
     loaded = {
         row["execution_id"]: {
-            "job_id": row["job_id"],
-            "created_at": row["created_at"],
-            "text": _stored_text(row["text"]) if bodies or row["text"] is None else True,
+            "job_id": row["job_id"] if isinstance(row["job_id"], str) else None,
+            "created_at": _stored_moment(row["created_at"]),
+            "text": _stored_text(row["text"]) if bodies else (True if row["text"] is not None else None),
             "attachments": _stored_attachments(row["attachments"]),
             "targets": [],
             "attempts": [],
@@ -451,22 +468,49 @@ def _load_unlocked(conn: sqlite3.Connection, ids: List[str], bodies: bool) -> Di
         record = loaded.get(row["execution_id"])
         if record is None:
             continue
+        if not _readable_target(row, len(record["targets"])):
+            record["targets"].append(dict(_UNREADABLE_TARGET))
+            continue
         pending = row["state"] == "pending"
         known = row["state"] in _RANK
-        sent = _stored_text(row["sent_text"]) if bodies or row["sent_text"] is None else True
+        if row["sent_text"] is None:
+            text = record["text"]
+        elif bodies:
+            text = _stored_text(row["sent_text"])
+        else:
+            text = True if row["sent_text"] == 1 else None
         record["targets"].append({
             "platform": row["platform"],
             "chat_id": row["chat_id"],
             "thread_id": row["thread_id"],
             "state": row["state"] if known else "unknown",
             "reason": "interrupted" if pending else (row["reason"] if known else None),
-            "text": sent if sent is not None else record["text"],
+            "text": text,
         })
     for row in attempts:
         record = loaded.get(row["execution_id"])
         if record is not None:
             record["attempts"].append(_attempt(row))
     return loaded
+
+
+@functools.lru_cache(maxsize=1)
+def _platform_keys() -> frozenset:
+    from gateway.config import Platform
+
+    return frozenset(platform.value for platform in Platform)
+
+
+def _readable_target(row: Any, index: int) -> bool:
+    """Whether a stored target has the shape the recorder writes, at its place in the order."""
+    position, platform, reason = row["position"], row["platform"], row["reason"]
+    return (
+        isinstance(position, int) and position == index
+        and isinstance(platform, str) and platform in _platform_keys()
+        and isinstance(row["chat_id"], str)
+        and (row["thread_id"] is None or isinstance(row["thread_id"], str))
+        and (reason is None or (isinstance(reason, str) and reason in _REASONS))
+    )
 
 
 def _attempt(row: Any) -> Dict[str, Any]:
@@ -483,8 +527,8 @@ def _attempt(row: Any) -> Dict[str, Any]:
     ):
         chats = None
     return {
-        "attempt_id": attempt_id if isinstance(attempt_id, str) else None,
-        "request_id": request_id if isinstance(request_id, str) else None,
+        "attempt_id": attempt_id if isinstance(attempt_id, str) and _ATTEMPT_ID.fullmatch(attempt_id) else None,
+        "request_id": request_id if isinstance(request_id, str) and _REQUEST_KEY.fullmatch(request_id) else None,
         "requested_at": requested_at,
         "finished_at": finished_at,
         "state": state if chats is not None else "unknown",
@@ -504,7 +548,20 @@ def _stored_attachments(text: Any) -> Optional[List[Any]]:
         attachments = json.loads(text or "[]")
     except (TypeError, ValueError, RecursionError):
         return None
-    return attachments if isinstance(attachments, list) else None
+    if not isinstance(attachments, list) or not all(
+        isinstance(entry, dict) and set(entry) == {"path", "is_voice"}
+        and isinstance(entry["path"], str) and isinstance(entry["is_voice"], bool)
+        for entry in attachments
+    ):
+        return None
+    return attachments
+
+
+def _stored_moment(moment: Any) -> Optional[float]:
+    """A stored time, or None when it is not a finite number."""
+    if isinstance(moment, bool) or not isinstance(moment, (int, float)) or not math.isfinite(moment):
+        return None
+    return moment
 
 
 def _stored_iso(moment: Any) -> Optional[str]:
@@ -652,6 +709,9 @@ def _labels(targets: List[Dict[str, Any]], routes: list) -> List[str]:
     labels = []
     for target in targets:
         key = target["platform"]
+        if key is None:
+            labels.append("Unknown")
+            continue
         label = re.sub(r"^\W+", "", platform_label(key, default="")).strip() or key.replace("_", " ").title()
         chat = {"chat_id": target["chat_id"], "thread_id": target["thread_id"]}
         for route in routes:
@@ -682,12 +742,15 @@ def claim_resend(row: Optional[Dict[str, Any]], request_id: Any) -> Dict[str, An
     request_id = str(request_id or "")
     if not request_id or len(request_id) > MAX_REQUEST_ID_CHARS:
         raise ValueError(f"a re-send claim needs a request id of 1 to {MAX_REQUEST_ID_CHARS} characters")
+    # Only a digest is kept, compared and returned: a caller may put a chat id or other text in the id.
+    request_key = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
     row = row or {}
     execution_id = str(row.get("id") or "")
     path = _path()
     if not execution_id or not path.exists():
         return {"claimed": False, "reason": "not_recorded", "attempt": None}
     now = _clock()
+    _platform_keys()  # imported before the write lock is taken, never while holding it
     with _transaction(path) as conn:
         # Hold the write lock from the check to the insert, against other processes too.
         conn.execute("BEGIN IMMEDIATE")
@@ -695,7 +758,7 @@ def claim_resend(row: Optional[Dict[str, Any]], request_id: Any) -> Dict[str, An
         if not record or not record["targets"]:
             return {"claimed": False, "reason": "not_recorded", "attempt": None}
         for attempt in record["attempts"]:
-            if attempt["request_id"] == request_id:
+            if attempt["request_id"] == request_key:
                 return {"claimed": False, "reason": None, "attempt": _without_error(attempt)}
         reason = _resend_refusal(row, record, now)
         if reason is not None:
@@ -708,7 +771,7 @@ def claim_resend(row: Optional[Dict[str, Any]], request_id: Any) -> Dict[str, An
         conn.execute(
             "INSERT INTO attempts (attempt_id, execution_id, request_id, requested_at, state, chats) "
             "VALUES (?, ?, ?, ?, 'in_progress', ?)",
-            (attempt_id, execution_id, request_id, now, json.dumps(chats)),
+            (attempt_id, execution_id, request_key, now, json.dumps(chats)),
         )
         attempt = _attempt(
             conn.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
@@ -778,20 +841,21 @@ def fence_resends() -> int:
     fenced = 0
     with _transaction(path) as conn:
         conn.execute("BEGIN IMMEDIATE")
-        rows = conn.execute("SELECT attempt_id, chats FROM attempts WHERE state='in_progress'").fetchall()
+        # By rowid: an id that is not valid text reads back changed and would match no row.
+        rows = conn.execute("SELECT rowid, chats FROM attempts WHERE state='in_progress'").fetchall()
         for row in rows:
             stored = _chats(row["chats"])
             if stored is None:
                 # Unreadable chats stay as they are; the attempt reads unknown and blocks the run.
                 fenced += conn.execute(
-                    "UPDATE attempts SET state='unknown', finished_at=? WHERE attempt_id=? AND state='in_progress'",
-                    (now, row["attempt_id"]),
+                    "UPDATE attempts SET state='unknown', finished_at=? WHERE rowid=? AND state='in_progress'",
+                    (now, row["rowid"]),
                 ).rowcount
                 continue
             chats = [dict(chat, state="unknown", reason="interrupted") for chat in stored]
             fenced += conn.execute(
                 "UPDATE attempts SET state='unknown', finished_at=?, chats=? "
-                "WHERE attempt_id=? AND state='in_progress'",
-                (now, json.dumps(chats), row["attempt_id"]),
+                "WHERE rowid=? AND state='in_progress'",
+                (now, json.dumps(chats), row["rowid"]),
             ).rowcount
     return fenced
