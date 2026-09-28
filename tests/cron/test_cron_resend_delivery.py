@@ -761,3 +761,80 @@ def test_an_unreadable_attempt_reads_unknown_and_never_breaks_the_view_or_the_fe
     resend = _view("exec-bad")["resend"]
     assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
 
+
+def test_a_later_row_never_reopens_a_chat_already_delivered_or_unknown(monkeypatch):
+    _at(monkeypatch, NOW)
+    _run("exec-delivered", "failed")
+    first = _claim("exec-delivered", "req-1")["attempt"]
+    assert _finish(first, (0, "delivered", None)) is True
+    _forge_attempt("exec-delivered", "failed", json.dumps([
+        {"position": 0, "state": "failed", "reason": "platform_refused"},
+    ]), attempt_id="later-failed")
+    resend = _view("exec-delivered")["resend"]
+    assert (resend["eligible"], resend["reason"]) == (False, "already_delivered")
+    assert _claim("exec-delivered", "req-2")["claimed"] is False
+
+    _run("exec-unknown", "failed")
+    first = _claim("exec-unknown", "req-1")["attempt"]
+    assert _finish(first, (0, "unknown", "timeout")) is True
+    _forge_attempt("exec-unknown", "failed", json.dumps([
+        {"position": 0, "state": "failed", "reason": "platform_refused"},
+    ]), attempt_id="later-failed-2")
+    resend = _view("exec-unknown")["resend"]
+    assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
+    assert _claim("exec-unknown", "req-2")["claimed"] is False
+
+    # Inside one row too, the first outcome for a chat is final.
+    _run("exec-duplicate", "failed")
+    _forge_attempt("exec-duplicate", "failed", json.dumps([
+        {"position": 0, "state": "delivered", "reason": None},
+        {"position": 0, "state": "failed", "reason": "platform_refused"},
+    ]), attempt_id="duplicate")
+    resend = _view("exec-duplicate")["resend"]
+    assert (resend["eligible"], resend["reason"]) == (False, "already_delivered")
+
+
+def _forge_row(execution_id, attempt_id, *, state="in_progress", chats="[]", requested_at=NOW):
+    conn = sqlite3.connect(_store()._path())
+    try:
+        conn.execute(
+            "INSERT INTO attempts (attempt_id, execution_id, request_id, requested_at, finished_at, state, chats) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (attempt_id, execution_id, f"req-{attempt_id}", requested_at,
+             None if state == "in_progress" else NOW, state, chats),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_rows_of_any_other_shape_read_unknown_beside_healthy_runs(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    for execution_id in ("exec-healthy", "exec-busy", "exec-list", "exec-deep", "exec-text-time", "exec-inf-time"):
+        _run(execution_id, "failed")
+    busy = _claim("exec-busy", "req-busy")["attempt"]
+    _forge_row("exec-list", "list-state", chats=json.dumps([{"position": 0, "state": ["failed"], "reason": None}]))
+    _forge_row("exec-deep", "deep", chats="[" * 100000 + "]" * 100000)
+    _forge_row("exec-text-time", "text-time", chats=json.dumps([{"position": 0, "state": "in_progress", "reason": None}]),
+               requested_at="not a time")
+    _forge_row("exec-inf-time", "inf-time", chats=json.dumps([{"position": 0, "state": "in_progress", "reason": None}]),
+               requested_at=float("inf"))
+
+    rows = [_row(execution_id) for execution_id in
+            ("exec-healthy", "exec-busy", "exec-list", "exec-deep", "exec-text-time", "exec-inf-time")]
+    views = store.history_deliveries(rows)
+    assert views[0]["resend"] == {"eligible": True, "reason": None, "attempts": []}
+    assert [view["state"] for view in views] == ["failed"] * 6
+    assert views[1]["resend"]["reason"] == "in_progress"
+    for view in views[2:]:
+        assert (view["resend"]["eligible"], view["resend"]["reason"]) == (False, "outcome_unknown")
+    for execution_id in ("exec-list", "exec-deep", "exec-text-time", "exec-inf-time"):
+        assert _claim(execution_id, "req-new")["claimed"] is False
+    assert store.finish_resend("list-state", [{"position": 0, "state": "delivered", "reason": None}]) is True
+
+    assert store.fence_resends() == 4
+    states = {row["attempt_id"]: row["state"] for row in _attempt_rows()}
+    assert states[busy["attempt_id"]] == "unknown"
+    assert {states[key] for key in ("deep", "text-time", "inf-time")} == {"unknown"}
+
