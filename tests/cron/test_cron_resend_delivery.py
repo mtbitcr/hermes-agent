@@ -1133,3 +1133,37 @@ def test_a_stored_request_id_that_is_not_a_digest_makes_its_attempt_unreadable(m
     again = _claim("exec-1", "req-1")
     assert (again["claimed"], again["reason"]) == (False, "outcome_unknown")
     assert len(_attempt_rows()) == 1
+
+
+def test_an_attempt_whose_finish_time_disagrees_with_its_state_reads_unknown(monkeypatch):
+    _at(monkeypatch, NOW)
+    _run("exec-unfinished", "failed")
+    first = _claim("exec-unfinished", "req-1")["attempt"]
+    assert _finish(first, (0, "failed", "platform_refused")) is True
+    _forge_sql("UPDATE attempts SET finished_at=NULL WHERE attempt_id=?", (first["attempt_id"],))
+    _run("exec-early-end", "failed")
+    busy = _claim("exec-early-end", "req-1")["attempt"]
+    _forge_sql("UPDATE attempts SET finished_at=? WHERE attempt_id=?", (NOW, busy["attempt_id"]))
+
+    for execution_id in ("exec-unfinished", "exec-early-end"):
+        resend = _view(execution_id)["resend"]
+        assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
+        assert _claim(execution_id, "req-2")["claimed"] is False
+
+
+def test_an_attempt_whose_state_disagrees_with_its_chats_reads_unknown(monkeypatch):
+    _at(monkeypatch, NOW)
+    _run("exec-delivered", "failed")
+    first = _claim("exec-delivered", "req-1")["attempt"]
+    assert _finish(first, (0, "delivered", None)) is True
+    _forge_sql("UPDATE attempts SET chats=? WHERE attempt_id=?",
+               (json.dumps([{"position": 0, "state": "failed", "reason": None}]), first["attempt_id"]))
+    _run("exec-mixed", "failed")
+    busy = _claim("exec-mixed", "req-1")["attempt"]
+    _forge_sql("UPDATE attempts SET chats=? WHERE attempt_id=?",
+               (json.dumps([{"position": 0, "state": "failed", "reason": None}]), busy["attempt_id"]))
+
+    for execution_id in ("exec-delivered", "exec-mixed"):
+        resend = _view(execution_id)["resend"]
+        assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
+        assert _claim(execution_id, "req-2")["claimed"] is False
