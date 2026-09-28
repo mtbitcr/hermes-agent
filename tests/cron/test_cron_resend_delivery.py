@@ -408,24 +408,19 @@ def test_a_chat_without_a_clear_result_reads_unknown_and_is_never_claimed_again(
     # Raw error text is no reason code, "sent" is no outcome, and chat 2 has no result at all.
     assert _finish(first, (0, "failed", BLOCKED), (1, "sent", "timeout")) is True
 
+    # A failure that names no reason from before the hand-over may have sent: it reads unknown too.
     [stored] = store.load("exec-1")["attempts"]
     assert stored["chats"] == [
-        {"position": 0, "state": "failed", "reason": None},
+        {"position": 0, "state": "unknown", "reason": None},
         {"position": 1, "state": "unknown", "reason": None},
         {"position": 2, "state": "unknown", "reason": "interrupted"},
     ]
-    assert stored["state"] == "failed"
-    second = _claim("exec-1", "req-2")["attempt"]
-    assert second["chats"] == [{"position": 0, "state": "in_progress", "reason": None}]
-    assert _finish(second, (0, "delivered", None)) is True
+    assert stored["state"] == "unknown"
     assert _view("exec-1")["resend"] == {
         "eligible": False, "reason": "outcome_unknown",
-        "attempts": [
-            _listed(first, finished_at=_iso(NOW), state="failed"),
-            _listed(second, finished_at=_iso(NOW), state="delivered"),
-        ],
+        "attempts": [_listed(first, finished_at=_iso(NOW), state="unknown")],
     }
-    assert _claim("exec-1", "req-3") == {"claimed": False, "reason": "outcome_unknown", "attempt": None}
+    assert _claim("exec-1", "req-2") == {"claimed": False, "reason": "outcome_unknown", "attempt": None}
 
 
 def test_once_every_failed_chat_is_delivered_the_run_reads_already_delivered(monkeypatch):
@@ -1217,3 +1212,30 @@ def test_a_stored_state_whose_reason_disagrees_reads_unknown(monkeypatch):
         resend = _view(execution_id)["resend"]
         assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
         assert _claim(execution_id, "req-2")["claimed"] is False
+
+
+def test_a_failure_without_a_reason_from_before_the_hand_over_reads_unknown(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    _run("exec-1", "failed", "failed", "failed")
+    first = _claim("exec-1", "req-1")["attempt"]
+
+    assert _finish(
+        first, (0, "failed", None), (1, "failed", "placeholder free text"), (2, "failed", "platform_refused"),
+    ) is True
+
+    [stored] = store.load("exec-1")["attempts"]
+    assert stored["chats"] == [
+        {"position": 0, "state": "unknown", "reason": None},
+        {"position": 1, "state": "unknown", "reason": None},
+        {"position": 2, "state": "failed", "reason": "platform_refused"},
+    ]
+    second = _claim("exec-1", "req-2")["attempt"]
+    assert second["chats"] == [{"position": 2, "state": "in_progress", "reason": None}]
+
+    _run("exec-forged", "failed")
+    _forge_sql("UPDATE targets SET reason=NULL WHERE execution_id=?", ("exec-forged",))
+    view = _view("exec-forged")
+    assert [target["state"] for target in view["targets"]] == ["unknown"]
+    assert (view["resend"]["eligible"], view["resend"]["reason"]) == (False, "outcome_unknown")
+    assert _claim("exec-forged", "req-1")["claimed"] is False
