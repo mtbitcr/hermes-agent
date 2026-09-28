@@ -935,3 +935,90 @@ def test_a_stored_attempt_state_outside_the_written_states_reads_unknown(monkeyp
         repeated = _claim(execution_id, f"req-{attempt_id}")
         json.dumps(repeated)  # a repeated claim is answered exactly as returned
         assert (repeated["claimed"], repeated["attempt"]["state"]) == (False, "unknown")
+
+
+def test_stored_target_fields_outside_what_the_recorder_writes_read_unknown(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    runs = ("exec-healthy", "exec-blob-reason", "exec-text-reason", "exec-blob-platform",
+            "exec-text-platform", "exec-blob-chat", "exec-shifted")
+    for execution_id in runs:
+        _run(execution_id, "failed")
+    for sql, execution_id in (
+        ("UPDATE targets SET reason=X'FF' WHERE execution_id=?", "exec-blob-reason"),
+        ("UPDATE targets SET reason='placeholder free text' WHERE execution_id=?", "exec-text-reason"),
+        ("UPDATE targets SET platform=X'FF' WHERE execution_id=?", "exec-blob-platform"),
+        ("UPDATE targets SET platform='chat -1009999999999' WHERE execution_id=?", "exec-text-platform"),
+        ("UPDATE targets SET chat_id=X'FF' WHERE execution_id=?", "exec-blob-chat"),
+        ("UPDATE targets SET position=7 WHERE execution_id=?", "exec-shifted"),
+    ):
+        _forge_unchecked(sql, (execution_id,))
+
+    views = store.history_deliveries([_row(execution_id) for execution_id in runs])
+    encoded = json.dumps(views)  # the history route encodes exactly this
+    assert "placeholder free text" not in encoded and "1009999999999" not in encoded
+    assert views[0]["resend"] == {"eligible": True, "reason": None, "attempts": []}
+    for view in views[1:]:
+        assert [target["state"] for target in view["targets"]] == ["unknown"]
+        assert (view["resend"]["eligible"], view["resend"]["reason"]) == (False, "outcome_unknown")
+    for execution_id in runs[1:]:
+        assert _claim(execution_id, "req-new")["claimed"] is False
+
+
+def test_a_request_id_is_kept_only_as_a_digest_and_other_attempt_ids_are_not_listed(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    _run("exec-1", "failed")
+    _run("exec-2", "failed")
+    claim = _claim("exec-1", "-1009999999999")
+    again = _claim("exec-1", "-1009999999999")
+    assert claim["claimed"] is True
+    assert (again["claimed"], again["attempt"]["attempt_id"]) == (False, claim["attempt"]["attempt_id"])
+    _forge_attempt("exec-2", "failed", json.dumps([{"position": 0, "state": "failed", "reason": None}]),
+                   attempt_id="placeholder-credential-text")
+
+    views = store.history_deliveries([_row("exec-1"), _row("exec-2")])
+    stored = [row["request_id"] for row in _attempt_rows() if row["execution_id"] == "exec-1"]
+    assert "1009999999999" not in json.dumps([views, claim, again, stored])
+    assert "placeholder-credential-text" not in json.dumps(views)
+    assert [attempt["attempt_id"] for attempt in views[1]["resend"]["attempts"]] == [None]
+
+
+def test_report_text_that_is_not_text_reads_expired_on_every_path(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    _run("exec-blob-text", "failed")
+    _run("exec-blob-sent", "failed")
+    _forge_unchecked("UPDATE records SET text=X'FF' WHERE execution_id=?", ("exec-blob-text",))
+    _forge_unchecked("UPDATE targets SET sent_text=X'FF' WHERE execution_id=?", ("exec-blob-sent",))
+
+    for execution_id in ("exec-blob-text", "exec-blob-sent"):
+        assert (_view(execution_id)["resend"]["eligible"], _view(execution_id)["resend"]["reason"]) == (
+            False, "output_expired",
+        )
+        assert _claim(execution_id, "req-1") == {"claimed": False, "reason": "output_expired", "attempt": None}
+    assert store.load("exec-blob-sent")["targets"][0]["text"] is None
+
+
+def test_record_fields_are_checked_and_corrupt_rows_are_pruned_or_fenced(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    for execution_id in ("exec-job", "exec-attachments", "exec-time"):
+        _run(execution_id, "failed")
+    _forge_unchecked("UPDATE records SET job_id=X'FF' WHERE execution_id=?", ("exec-job",))
+    _forge_unchecked(
+        "UPDATE records SET attachments=? WHERE execution_id=?", (json.dumps([{"path": 1}]), "exec-attachments"),
+    )
+    _forge_unchecked("UPDATE records SET created_at='not a time' WHERE execution_id=?", ("exec-time",))
+    _forge_sql(
+        "INSERT INTO attempts (attempt_id, execution_id, request_id, requested_at, state, chats) "
+        "VALUES (CAST(X'FF' AS TEXT), 'exec-job', 'req-undecodable', ?, 'in_progress', '[]')",
+        (NOW,),
+    )
+
+    assert store.load("exec-job")["job_id"] is None
+    assert _view("exec-attachments")["resend"]["reason"] == "attachment_missing"
+    assert store.fence_resends() == 1
+    assert _attempt_states() == [("exec-job", "unknown")]
+    _run("exec-later", "failed")  # a new recording prunes the store
+    assert store.load("exec-time") is None
