@@ -126,8 +126,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _decoded(value: bytes) -> str:
+    return value.decode("utf-8", errors="replace")
+
+
 def _open(path: Path) -> sqlite3.Connection:
     conn = open_ledger(path)
+    # Text that is not valid UTF-8 reads with replacement characters instead of failing the whole
+    # read; the readers below then refuse it as unreadable.
+    conn.text_factory = _decoded
     # The store holds report text and chat ids: owner-only, like the delivery queue and cron output.
     # SQLite gives its -wal and -shm files the main file's mode.
     for target, mode in ((path.parent, 0o700), (path, 0o600)):
@@ -433,8 +440,8 @@ def _load_unlocked(conn: sqlite3.Connection, ids: List[str], bodies: bool) -> Di
         row["execution_id"]: {
             "job_id": row["job_id"],
             "created_at": row["created_at"],
-            "text": row["text"] if bodies or row["text"] is None else True,
-            "attachments": json.loads(row["attachments"] or "[]"),
+            "text": _stored_text(row["text"]) if bodies or row["text"] is None else True,
+            "attachments": _stored_attachments(row["attachments"]),
             "targets": [],
             "attempts": [],
         }
@@ -446,7 +453,7 @@ def _load_unlocked(conn: sqlite3.Connection, ids: List[str], bodies: bool) -> Di
             continue
         pending = row["state"] == "pending"
         known = row["state"] in _RANK
-        sent = row["sent_text"] if bodies or row["sent_text"] is None else True
+        sent = _stored_text(row["sent_text"]) if bodies or row["sent_text"] is None else True
         record["targets"].append({
             "platform": row["platform"],
             "chat_id": row["chat_id"],
@@ -463,22 +470,40 @@ def _load_unlocked(conn: sqlite3.Connection, ids: List[str], bodies: bool) -> Di
 
 
 def _attempt(row: Any) -> Dict[str, Any]:
-    """An attempt as stored. An attempt whose chats or times cannot be read has chats None and reads
-    unknown."""
+    """An attempt as stored. An attempt whose ids, chats or times cannot be read has chats None and
+    reads unknown."""
     chats = _chats(row["chats"])
+    attempt_id, request_id = row["attempt_id"], row["request_id"]
     requested_at = _stored_iso(row["requested_at"])
     finished_at = None if row["finished_at"] is None else _stored_iso(row["finished_at"])
-    if requested_at is None or (row["finished_at"] is not None and finished_at is None):
+    if (
+        not isinstance(attempt_id, str) or not isinstance(request_id, str) or requested_at is None
+        or (row["finished_at"] is not None and finished_at is None)
+    ):
         chats = None
     return {
-        "attempt_id": row["attempt_id"],
-        "request_id": row["request_id"],
+        "attempt_id": attempt_id if isinstance(attempt_id, str) else None,
+        "request_id": request_id if isinstance(request_id, str) else None,
         "requested_at": requested_at,
         "finished_at": finished_at,
         "state": row["state"] if chats is not None else "unknown",
         "chats": chats,
         "error": row["error"] if row["error"] in _REASONS else None,
     }
+
+
+def _stored_text(text: Any) -> Optional[str]:
+    """Saved report text, or None when it is not text (it then reads as expired)."""
+    return text if isinstance(text, str) else None
+
+
+def _stored_attachments(text: Any) -> Optional[List[Any]]:
+    """The saved attachment list, or None when it cannot be read (the run is then never re-sent)."""
+    try:
+        attachments = json.loads(text or "[]")
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return attachments if isinstance(attachments, list) else None
 
 
 def _stored_iso(moment: Any) -> Optional[str]:
@@ -583,6 +608,8 @@ def _resend_refusal(row: Dict[str, Any], record: Dict[str, Any], now: float) -> 
         return "outcome_unknown" if unknown else "already_delivered"
     if len(record["attempts"]) >= MAX_RESEND_ATTEMPTS:
         return "too_many_attempts"
+    if record["attachments"] is None:
+        return "attachment_missing"
     created = record["created_at"]
     if (
         not isinstance(created, (int, float)) or isinstance(created, bool) or not math.isfinite(created)
