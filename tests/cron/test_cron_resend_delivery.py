@@ -114,6 +114,13 @@ def _key(request_id):
     return hashlib.sha256(request_id.encode("utf-8")).hexdigest()
 
 
+def _aid(label):
+    """A well-formed attempt id (a version 4 UUID in hex) standing for ``label`` in a forged row."""
+    import uuid
+
+    return uuid.UUID(bytes=hashlib.sha256(label.encode("utf-8")).digest()[:16], version=4).hex
+
+
 def _attempt_rows():
     conn = sqlite3.connect(_store()._path())
     conn.row_factory = sqlite3.Row
@@ -710,14 +717,15 @@ def test_a_run_stops_being_resendable_after_the_attempt_cap(monkeypatch):
     assert _claim("exec-cap", "req-0")["attempt"]["request_id"] == _key("req-0")
 
 
-def _forge_attempt(execution_id, state, chats, attempt_id="forged"):
+def _forge_attempt(execution_id, state, chats, attempt_id="forged", *, raw_id=False):
+    """A forged attempt row with well-formed ids (``raw_id`` keeps ``attempt_id`` exactly as given)."""
     conn = sqlite3.connect(_store()._path())
     try:
         conn.execute(
             "INSERT INTO attempts (attempt_id, execution_id, request_id, requested_at, finished_at, state, chats) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (attempt_id, execution_id, f"req-{attempt_id}", NOW, None if state == "in_progress" else NOW, state,
-             chats),
+            (attempt_id if raw_id else _aid(attempt_id), execution_id, _key(f"req-{attempt_id}"), NOW,
+             None if state == "in_progress" else NOW, state, chats),
         )
         conn.commit()
     finally:
@@ -735,10 +743,11 @@ def test_a_forged_attempt_never_makes_a_delivered_chat_resendable(monkeypatch):
     _forge_attempt("exec-forged", "failed", json.dumps([
         {"position": 0, "state": "failed", "reason": "platform_refused"},
     ]), attempt_id="forged-delivered")
+    # A row naming a chat the run had no failed claim on cannot be read: never sent again.
     resend = _view("exec-forged")["resend"]
-    assert (resend["eligible"], resend["reason"]) == (False, "already_delivered")
+    assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
     claim = _claim("exec-forged", "req-2")
-    assert (claim["claimed"], claim["reason"]) == (False, "already_delivered")
+    assert (claim["claimed"], claim["reason"]) == (False, "outcome_unknown")
 
     # A row whose position is a bool cannot be read: the run is never sent again.
     _forge_attempt("exec-forged", "failed", json.dumps([
@@ -763,7 +772,7 @@ def test_an_unreadable_attempt_reads_unknown_and_never_breaks_the_view_or_the_fe
 
     assert store.fence_resends() == 2
     states = {row["attempt_id"]: row["state"] for row in _attempt_rows()}
-    assert states == {good["attempt_id"]: "unknown", "forged": "unknown"}
+    assert states == {good["attempt_id"]: "unknown", _aid("forged"): "unknown"}
     resend = _view("exec-bad")["resend"]
     assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
 
@@ -777,7 +786,7 @@ def test_a_later_row_never_reopens_a_chat_already_delivered_or_unknown(monkeypat
         {"position": 0, "state": "failed", "reason": "platform_refused"},
     ]), attempt_id="later-failed")
     resend = _view("exec-delivered")["resend"]
-    assert (resend["eligible"], resend["reason"]) == (False, "already_delivered")
+    assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
     assert _claim("exec-delivered", "req-2")["claimed"] is False
 
     _run("exec-unknown", "failed")
@@ -790,14 +799,14 @@ def test_a_later_row_never_reopens_a_chat_already_delivered_or_unknown(monkeypat
     assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
     assert _claim("exec-unknown", "req-2")["claimed"] is False
 
-    # Inside one row too, the first outcome for a chat is final.
+    # A row naming one chat twice cannot be read either.
     _run("exec-duplicate", "failed")
     _forge_attempt("exec-duplicate", "failed", json.dumps([
         {"position": 0, "state": "delivered", "reason": None},
         {"position": 0, "state": "failed", "reason": "platform_refused"},
     ]), attempt_id="duplicate")
     resend = _view("exec-duplicate")["resend"]
-    assert (resend["eligible"], resend["reason"]) == (False, "already_delivered")
+    assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
 
 
 def _forge_row(execution_id, attempt_id, *, state="in_progress", chats="[]", requested_at=NOW):
@@ -806,7 +815,7 @@ def _forge_row(execution_id, attempt_id, *, state="in_progress", chats="[]", req
         conn.execute(
             "INSERT INTO attempts (attempt_id, execution_id, request_id, requested_at, finished_at, state, chats) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (attempt_id, execution_id, f"req-{attempt_id}", requested_at,
+            (_aid(attempt_id), execution_id, _key(f"req-{attempt_id}"), requested_at,
              None if state == "in_progress" else NOW, state, chats),
         )
         conn.commit()
@@ -837,12 +846,12 @@ def test_rows_of_any_other_shape_read_unknown_beside_healthy_runs(monkeypatch):
         assert (view["resend"]["eligible"], view["resend"]["reason"]) == (False, "outcome_unknown")
     for execution_id in ("exec-list", "exec-deep", "exec-text-time", "exec-inf-time"):
         assert _claim(execution_id, "req-new")["claimed"] is False
-    assert store.finish_resend("list-state", [{"position": 0, "state": "delivered", "reason": None}]) is True
+    assert store.finish_resend(_aid("list-state"), [{"position": 0, "state": "delivered", "reason": None}]) is True
 
     assert store.fence_resends() == 4
     states = {row["attempt_id"]: row["state"] for row in _attempt_rows()}
     assert states[busy["attempt_id"]] == "unknown"
-    assert {states[key] for key in ("deep", "text-time", "inf-time")} == {"unknown"}
+    assert {states[_aid(key)] for key in ("deep", "text-time", "inf-time")} == {"unknown"}
 
 
 def _forge_sql(sql, params=()):
@@ -981,7 +990,7 @@ def test_a_request_id_is_kept_only_as_a_digest_and_other_attempt_ids_are_not_lis
     assert claim["claimed"] is True
     assert (again["claimed"], again["attempt"]["attempt_id"]) == (False, claim["attempt"]["attempt_id"])
     _forge_attempt("exec-2", "failed", json.dumps([{"position": 0, "state": "failed", "reason": None}]),
-                   attempt_id="placeholder-credential-text")
+                   attempt_id="placeholder-credential-text", raw_id=True)
 
     views = store.history_deliveries([_row("exec-1"), _row("exec-2")])
     stored = [row["request_id"] for row in _attempt_rows() if row["execution_id"] == "exec-1"]
@@ -1077,7 +1086,50 @@ def test_only_a_version_4_attempt_id_is_listed(monkeypatch):
     _at(monkeypatch, NOW)
     _run("exec-digits", "failed")
     _forge_attempt("exec-digits", "failed", json.dumps([{"position": 0, "state": "failed", "reason": None}]),
-                   attempt_id="1009999999999" + "0" * 19)
+                   attempt_id="1009999999999" + "0" * 19, raw_id=True)
 
     listed = [attempt["attempt_id"] for attempt in store.history_deliveries([_row("exec-digits")])[0]["resend"]["attempts"]]
     assert listed == [None]
+
+
+def test_an_attempt_must_name_exactly_the_chats_it_claimed(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    cases = {
+        "exec-emptied": lambda chats: [],
+        "exec-omitted": lambda chats: chats[:1],
+        "exec-doubled": lambda chats: chats + chats[:1],
+        "exec-foreign": lambda chats: chats + [{"position": 7, "state": "in_progress", "reason": None}],
+    }
+    for execution_id in cases:
+        _run(execution_id, "failed", "failed")
+        claimed = _claim(execution_id, "req-1")["attempt"]
+        chats = json.loads(_forge_chats(claimed["attempt_id"]))
+        _forge_sql("UPDATE attempts SET chats=? WHERE attempt_id=?",
+                   (json.dumps(cases[execution_id](chats)), claimed["attempt_id"]))
+
+    assert store.fence_resends() == len(cases)
+    for execution_id in cases:
+        resend = _view(execution_id)["resend"]
+        assert (resend["eligible"], resend["reason"]) == (False, "outcome_unknown")
+        assert _claim(execution_id, "req-2")["claimed"] is False
+
+
+def _forge_chats(attempt_id):
+    conn = sqlite3.connect(_store()._path())
+    try:
+        return conn.execute("SELECT chats FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_a_stored_request_id_that_is_not_a_digest_makes_its_attempt_unreadable(monkeypatch):
+    _at(monkeypatch, NOW)
+    _run("exec-1", "failed")
+    first = _claim("exec-1", "req-1")["attempt"]
+    assert _finish(first, (0, "failed", "platform_refused")) is True
+    _forge_sql("UPDATE attempts SET request_id='bad' WHERE attempt_id=?", (first["attempt_id"],))
+
+    again = _claim("exec-1", "req-1")
+    assert (again["claimed"], again["reason"]) == (False, "outcome_unknown")
+    assert len(_attempt_rows()) == 1
