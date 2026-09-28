@@ -13,10 +13,10 @@ card. This module is what the kernel adds to that booking and that hold:
   else the one the run's runtime receipt names, else the card's. A reset kept for
   one provider no longer holds a card whose route now names another; one kept for
   no known provider, or stored before providers were kept, holds as today.
-  Providers compare by one id each, resolved as the card's worker resolves its
-  ``--provider`` under its assignee profile's config: a card naming its provider
-  by an alias or in another case, or a configured custom endpoint by its name,
-  slug, key or pool key, has not moved; a custom endpoint is never a built-in.
+  Only a built-in provider has an id: its own name, or the one its alias stands
+  for, so a card naming its provider by an alias or in another case has not
+  moved. A custom endpoint, whatever it is called, and any other name have none:
+  a reset kept for one holds its card until it passes, even after the card moves.
 * A held card gets one ``respawn_guarded`` event, not one per dispatcher tick.
 * Only a failed run's own error can name a sign-in problem.
 * A worker whose provider refused the work (a ``content_policy_blocked`` turn)
@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from pathlib import Path
 from typing import Any, Optional
 
 # Exit code of a kanban worker whose provider refused the work. Unused by any
@@ -58,11 +57,6 @@ FAILED_RUN_OUTCOMES = frozenset({"crashed", "timed_out", "spawn_failed", "gave_u
 # How many earlier runs a streak is counted over; the cap is reached long before.
 _STREAK_SCAN_LIMIT = 32
 
-# The custom endpoints of each assignee profile's config.yaml, by its path, as
-# ``((mtime_ns, size), endpoints)``: the guard parses a config only when it changes.
-_ENDPOINTS_CACHE: dict = {}
-
-
 def is_provider_refusal(result: Any) -> bool:
     """True for a failed turn result whose error says the provider refused the work."""
     return (
@@ -88,132 +82,43 @@ def _normalized(value: Any) -> str:
     return str(value).strip().lower().replace(" ", "-") if value is not None else ""
 
 
-def _endpoints_in(path: Path) -> Optional[tuple]:
-    """``(aliases, id)`` of each custom endpoint the config.yaml at ``path`` configures.
+def _provider(value: Any) -> Optional[str]:
+    """The built-in provider ``value`` names, as the card's worker resolves its ``--provider``.
 
-    In the order a worker matches its ``--provider`` against them: the enabled
-    ``providers:`` entries with a URL, then the list the legacy ``custom_providers:``
-    entries share with them. ``aliases`` are the names the worker accepts for the
-    endpoint; ``id`` is ``custom:`` and its key, else its name. The file is only read;
-    ``None`` when it holds no mapping.
-    """
-    from hermes_cli.config import get_compatible_custom_providers, is_provider_enabled
-    from hermes_cli.providers import custom_provider_aliases
-    from utils import fast_safe_load
-
-    with open(path, encoding="utf-8") as stream:
-        config = fast_safe_load(stream) or {}
-    if not isinstance(config, dict):
-        return None
-    endpoints = []
-    providers = config.get("providers")
-    if isinstance(providers, dict):
-        for key, entry in providers.items():
-            if isinstance(entry, dict) and is_provider_enabled(entry) and (
-                entry.get("api") or entry.get("url") or entry.get("base_url")
-            ):
-                aliases = custom_provider_aliases(str(entry.get("name", "") or key), str(key))
-                endpoints.append((aliases, f"custom:{_normalized(key)}"))
-    for entry in get_compatible_custom_providers(config):
-        name, key = entry.get("name"), str(entry.get("provider_key", "") or "").strip()
-        if isinstance(name, str) and isinstance(entry.get("base_url"), str):
-            aliases = custom_provider_aliases(name, key)
-            endpoints.append((aliases, f"custom:{_normalized(key or name)}"))
-    return tuple(endpoints)
-
-
-def _configured_endpoints(assignee: Any) -> Optional[tuple]:
-    """The custom endpoints of the assignee profile's config.yaml (:func:`_endpoints_in`).
-
-    The profile's home is the one the dispatcher gives the card's worker. ``()`` when
-    it has no config.yaml; ``None`` when there is no such profile or its config cannot
-    be read, so every provider reads as unknown.
-    """
-    if not assignee:
-        return None
-    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
-
-    try:
-        path = Path(resolve_profile_env(normalize_profile_name(assignee))) / "config.yaml"
-    except Exception:
-        return None
-    try:
-        stat = path.stat()
-    except FileNotFoundError:
-        return ()
-    except OSError:
-        return None
-    signature = (stat.st_mtime_ns, stat.st_size)
-    cached = _ENDPOINTS_CACHE.get(str(path))
-    if cached is not None and cached[0] == signature:
-        return cached[1]
-    try:
-        endpoints = _endpoints_in(path)
-    except Exception:
-        endpoints = None
-    _ENDPOINTS_CACHE[str(path)] = (signature, endpoints)
-    return endpoints
-
-
-def _provider(value: Any, endpoints: Optional[tuple]) -> Optional[str]:
-    """The id of the provider ``value`` names, as the card's worker resolves its ``--provider``.
-
-    ``endpoints`` are its assignee profile's custom endpoints (:func:`_configured_endpoints`),
-    matched in the worker's order. A built-in's own name (``anthropic``, ``moa``, each
-    of Vertex's, which are all ``vertex``) is that built-in, even beside an endpoint
-    named like it. Any other name an endpoint answers to is that endpoint's id, so its
-    name (``Local Box``), slug, key (``my-box``) and pool key compare equal. A name no
-    endpoint answers to keeps its alias (``claude`` is ``anthropic``), or its ``custom:``
-    namespace, so an endpoint is never read as a built-in. ``None`` when none is named,
-    when the profile's config cannot be read, and for the bare runtime family ``custom``
-    (and the aliases for it) a receipt names for every custom endpoint.
+    A built-in's own name, or the one its alias stands for (``claude`` is
+    ``anthropic``; each of Vertex's names is ``vertex``), in any case. ``None`` for
+    no name, for the custom family (``custom``, a ``custom:`` name, an alias for
+    it) and for any other name, so a reset kept for a custom endpoint never reads
+    as a move.
     """
     name = _normalized(value)
-    if not name or endpoints is None:
+    if not name or name == "custom" or name.startswith("custom:"):
         return None
     from hermes_cli.auth import PROVIDER_REGISTRY, _VERTEX_PROVIDER_IDS, _plugin_aliases
 
     if name in _VERTEX_PROVIDER_IDS:
         return "vertex"
     alias = _plugin_aliases().get(name, name)
-    if alias == "custom":
-        return None
-    custom = name.startswith("custom:")
-    built_in = name == "moa" or (
-        alias == name and (name == "openrouter" or name in PROVIDER_REGISTRY)
-    )
-    if built_in and not custom:
-        return name
-    if name != "auto":
-        for aliases, endpoint in endpoints:
-            if name in aliases:
-                return endpoint
-    if custom:
-        return name if name != "custom:" else None
-    return alias
+    return alias if alias in ("moa", "openrouter") or alias in PROVIDER_REGISTRY else None
 
 
-def _card_route(conn: sqlite3.Connection, task_id: str) -> tuple[Any, Optional[tuple]]:
-    """The provider the card names, and its assignee profile's custom endpoints."""
-    row = conn.execute(
-        "SELECT provider_override, assignee FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    if row is None:
-        return None, None
-    return row["provider_override"], _configured_endpoints(row["assignee"])
+def _card_route(conn: sqlite3.Connection, task_id: str) -> Any:
+    """The provider the card names, as it was entered."""
+    row = conn.execute("SELECT provider_override FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return row["provider_override"] if row is not None else None
 
 
-def _receipt_provider(metadata: dict, endpoints: Optional[tuple]) -> Optional[str]:
+def _receipt_provider(metadata: dict) -> Optional[str]:
     """The provider a closed run's runtime receipt names, if any."""
     receipt = metadata.get("runtime_receipt")
-    return _provider(receipt.get("provider"), endpoints) if isinstance(receipt, dict) else None
+    return _provider(receipt.get("provider")) if isinstance(receipt, dict) else None
 
 
-def _recorded_for(metadata: Any, endpoints: Optional[tuple]) -> tuple[bool, Optional[str]]:
+def _recorded_for(metadata: Any) -> tuple[bool, Optional[str]]:
     """``(kept, provider)``: whether a provider was kept beside the run's reset, and which."""
     if not isinstance(metadata, dict) or RATE_LIMIT_RESET_PROVIDER_KEY not in metadata:
         return False, None
-    return True, _provider(metadata[RATE_LIMIT_RESET_PROVIDER_KEY], endpoints)
+    return True, _provider(metadata[RATE_LIMIT_RESET_PROVIDER_KEY])
 
 
 def latest_ended_run(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
@@ -228,12 +133,11 @@ def latest_ended_run(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3
 
 def _consecutive_stops(
     conn: sqlite3.Connection, task_id: str, run_id: int, provider: Optional[str],
-    endpoints: Optional[tuple],
 ) -> int:
     """Rate-limited runs in a row on ``provider``, ending with (and counting) ``run_id``.
 
     ``provider`` is an id (:func:`_provider`), and each earlier run's kept provider is
-    read as one against the same ``endpoints``.
+    read as one.
     """
     stops = 1
     for row in conn.execute(
@@ -244,7 +148,7 @@ def _consecutive_stops(
     ):
         if row["outcome"] != "rate_limited":
             break
-        if _recorded_for(_metadata(row["metadata"]), endpoints) != (True, provider):
+        if _recorded_for(_metadata(row["metadata"])) != (True, provider):
             break
         stops += 1
     return stops
@@ -256,7 +160,7 @@ def book_rate_limit_reset(conn: sqlite3.Connection, task_id: str, run_id: int) -
     Called inside the booking transaction, right after the run is closed. The
     provider is the worker's own, recorded beside its reset; else the one the
     closed run's runtime receipt names; only then the card's; it is kept as its
-    id under the assignee profile's config (:func:`_provider`). The worker's own
+    built-in id, or ``None`` for any other provider (:func:`_provider`). The worker's own
     reset stays when it is believable; otherwise, while the cooldown is on, the
     kernel writes ``ended_at + min(cooldown * 2**stops, cap)`` where ``stops``
     counts the consecutive rate-limited runs on this provider, this one included.
@@ -274,17 +178,16 @@ def book_rate_limit_reset(conn: sqlite3.Connection, task_id: str, run_id: int) -
     if metadata is None:
         return
     ended_at = int(run["ended_at"])
-    named, endpoints = _card_route(conn, task_id)
     provider = (
-        _provider(metadata.get(RATE_LIMIT_RESET_PROVIDER_KEY), endpoints)
-        or _receipt_provider(metadata, endpoints)
-        or _provider(named, endpoints)
+        _provider(metadata.get(RATE_LIMIT_RESET_PROVIDER_KEY))
+        or _receipt_provider(metadata)
+        or _provider(_card_route(conn, task_id))
     )
     metadata[RATE_LIMIT_RESET_PROVIDER_KEY] = provider
     if kb.recorded_rate_limit_reset(metadata, anchor=ended_at) is None:
         cooldown = kb._resolve_rate_limit_cooldown_seconds()
         if cooldown > 0:
-            stops = _consecutive_stops(conn, task_id, run_id, provider, endpoints)
+            stops = _consecutive_stops(conn, task_id, run_id, provider)
             metadata[kb._RATE_LIMIT_RESET_KEY] = ended_at + min(
                 cooldown * 2 ** stops, RATE_LIMIT_HOLD_CAP_SECONDS,
             )
@@ -306,9 +209,9 @@ def rate_limit_resume_at(
 
     ``run`` is the task's latest ended run (read when omitted). The hold lasts
     the cooldown, or until the run's recorded reset when that is later, unless
-    the reset was kept for one provider and the card now names another; both
-    are compared as ids under its assignee profile's config (:func:`_provider`),
-    so an alias, another case or another name of one custom endpoint is no move.
+    the reset was kept for one built-in provider and the card now names another
+    built-in; both are compared as ids (:func:`_provider`), so an alias or another
+    case is no move, and a custom endpoint or any other name never ends the hold.
     """
     from hermes_cli import kanban_db as kb
 
@@ -325,8 +228,7 @@ def rate_limit_resume_at(
     resume_at = ended_at + cooldown
     reset = kb.recorded_rate_limit_reset(metadata, anchor=ended_at)
     if reset is not None:
-        named, endpoints = _card_route(conn, task_id)
-        provider, current = _recorded_for(metadata, endpoints)[1], _provider(named, endpoints)
+        provider, current = _recorded_for(metadata)[1], _provider(_card_route(conn, task_id))
         if provider is None or current is None or provider == current:
             resume_at = max(resume_at, reset)
     return resume_at
