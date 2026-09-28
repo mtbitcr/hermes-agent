@@ -4405,7 +4405,7 @@ def owner_title(value: Any) -> str:
 # reaches the owner only when every character is a letter, mark or digit of any
 # script, a space, or plain punctuation (:data:`_OWNER_STOP_REASON_PUNCTUATION`),
 # so ``/``, ``\\``, every look-alike of either and every other symbol makes the
-# whole reason fall back. The two combining solidus overlays are the marks refused.
+# whole reason fall back. A mark counts only as part of a script's own writing.
 _OWNER_PRIVATE_STOP_REASON_PATTERNS = (
     re.compile(r"t_[0-9a-f]{8}", re.IGNORECASE),
     re.compile(r"[0-9a-f]{40}", re.IGNORECASE),
@@ -4417,16 +4417,18 @@ _OWNER_STOP_REASON_PUNCTUATION = frozenset(
     "\u00ab\u00bb\u2013\u2014\u2018\u2019\u201c\u201d\u2026"
     "\u3001\u3002\uff01\uff08\uff09\uff0c\uff1a\uff1b\uff1f"
 )
-_OWNER_STOP_REASON_REFUSED_MARKS = frozenset("\u0337\u0338")
-
-
 def _plain_stop_text(text: str) -> bool:
-    """Whether every character of ``text`` is one a stop reason may show the owner."""
-    for char in text:
+    """Whether every character of ``text`` is one a stop reason may show the owner.
+
+    Accents are composed into their letters first (NFC); a mark that remains
+    counts only as a script's own writing, so an enclosing mark or a generic
+    one (its Unicode name says COMBINING, which covers every overlay) is refused.
+    """
+    for char in unicodedata.normalize("NFC", text):
         category = unicodedata.category(char)
         if char in _OWNER_STOP_REASON_PUNCTUATION or category[0] in "LN" or char.isspace():
             continue
-        if category[0] == "M" and char not in _OWNER_STOP_REASON_REFUSED_MARKS:
+        if category in ("Mn", "Mc") and "COMBINING" not in unicodedata.name(char, "COMBINING"):
             continue
         return False
     return True
