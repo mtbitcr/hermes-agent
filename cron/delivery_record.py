@@ -506,7 +506,30 @@ def _load_unlocked(conn: sqlite3.Connection, ids: List[str], bodies: bool) -> Di
         record = loaded.get(row["execution_id"])
         if record is not None:
             record["attempts"].append(_attempt(row))
+    for record in loaded.values():
+        _reconcile_attempts(record)
     return loaded
+
+
+def _reconcile_attempts(record: Dict[str, Any]) -> None:
+    """An attempt must name each chat still failed when it was claimed exactly once, and no other
+    chat; otherwise it cannot be read (chats None, state unknown) and its run is never re-sent."""
+    recorded = record["targets"]
+    targets = [dict(target) for target in recorded]
+    for attempt in record["attempts"]:
+        chats = attempt["chats"]
+        if chats is None:
+            continue
+        positions = [chat["position"] for chat in chats]
+        claimed = {
+            index for index, target in enumerate(targets)
+            if target["state"] == "failed" and recorded[index]["state"] == "failed"
+        }
+        if not positions or len(set(positions)) != len(positions) or set(positions) != claimed:
+            attempt.update(chats=None, state="unknown")
+            continue
+        for chat in chats:
+            targets[chat["position"]].update(state=chat["state"], reason=chat["reason"])
 
 
 @functools.lru_cache(maxsize=1)
@@ -529,21 +552,22 @@ def _readable_target(row: Any, index: int) -> bool:
 
 
 def _attempt(row: Any) -> Dict[str, Any]:
-    """An attempt as stored. An attempt whose ids, state, chats or times cannot be read has chats None
-    and reads unknown."""
+    """An attempt as stored. An attempt whose ids, state, chats or times are not what this module writes
+    has chats None and reads unknown."""
     chats = _chats(row["chats"])
     attempt_id, request_id, state = row["attempt_id"], row["request_id"], row["state"]
     requested_at = _stored_iso(row["requested_at"])
     finished_at = None if row["finished_at"] is None else _stored_iso(row["finished_at"])
+    request_key = request_id if isinstance(request_id, str) and _REQUEST_KEY.fullmatch(request_id) else None
     if (
-        not isinstance(attempt_id, str) or not isinstance(request_id, str) or requested_at is None
+        _listed_attempt_id(attempt_id) is None or request_key is None or requested_at is None
         or (row["finished_at"] is not None and finished_at is None)
         or not isinstance(state, str) or state not in _CHAT_STATES
     ):
         chats = None
     return {
         "attempt_id": _listed_attempt_id(attempt_id),
-        "request_id": request_id if isinstance(request_id, str) and _REQUEST_KEY.fullmatch(request_id) else None,
+        "request_id": request_key,
         "requested_at": requested_at,
         "finished_at": finished_at,
         "state": state if chats is not None else "unknown",
