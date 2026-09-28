@@ -454,6 +454,7 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "long": "Please check config/application.properties",
         "hidden": "Please check config/.sample",
         "numeric": "Please check config/archive.7z",
+        "spaced": "Please check config/my notes.py",
     }
     name_question = "Should the placeholder room be booked for two hours?"
     for project_name, project_leaks, question_title, project_question in (
@@ -509,6 +510,8 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "Open ./settings.py first",
         "The draft is in notes\\placeholder\\drafts",
         "Saved it as 'notes/list.txt' for you",
+        "Look in \u043a\u043e\u043d\u0444\u0438\u0433/\u0444\u0430\u0439\u043b for it",
+        "See https://example.test/help/owner for the steps",
         "Saved the placeholder list to ~/placeholder/list.txt, please check it",
         "The upload failed (see /srv/placeholder/x)",
         "Should I publish file:///srv/placeholder/draft.html as it is?",
@@ -521,7 +524,6 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
     # Neither fixed sentence, nor an ordinary question, trips a pattern.
     for ordinary in (
         reason, question, link_question, path_question, "Should p_values be reported?",
-        "See https://example.test/help/owner for the steps",
         "Is it yes/no.", "Python 3.11/3.12 both work", "Use v1.2/v1.3", "Plan the A/B test",
         "Book it for 12/05/2026.", "Is it and/or.",
         _DECISION_FALLBACK, _RECEIPT_FALLBACK,
