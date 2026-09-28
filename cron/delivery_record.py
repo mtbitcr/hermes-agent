@@ -872,9 +872,15 @@ def finish_resend(attempt_id: Any, results: Iterable[Dict[str, Any]], *, error: 
     reason code. Free error text is never stored: delivery errors name the chat. A chat without a
     result reads ``unknown``/``interrupted``, a state that is not an outcome reads ``unknown``, and a
     reason that is not a code is dropped; a failure that names no reason from before the hand-over
-    reads ``unknown``. An attempt whose chats cannot be read ends ``unknown``.
+    reads ``unknown``, and so does a chat given two different results. A result without a plain int
+    position is ignored. An attempt whose chats cannot be read ends ``unknown``.
     False, writing nothing, when the attempt is not in progress."""
-    given = {result.get("position"): result for result in results}
+    given: Dict[int, Dict[str, Any]] = {}
+    for result in results:
+        position = result.get("position") if isinstance(result, dict) else None
+        if isinstance(position, int) and not isinstance(position, bool):
+            # Two different results for one chat say nothing certain about it.
+            given[position] = result if given.get(position, result) == result else {"state": "unknown"}
     safe_error = error if isinstance(error, str) and error in _REASONS else None
     path = _path()
     if not path.exists():
@@ -907,10 +913,10 @@ def _chat_result(result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if result is None:
         return {"state": "unknown", "reason": "interrupted"}
     state = result.get("state")
-    if state not in _RANK:
+    if not isinstance(state, str) or state not in _RANK:
         return {"state": "unknown", "reason": None}
     reason = result.get("reason")
-    reason = reason if state != "delivered" and reason in _REASONS else None
+    reason = reason if state != "delivered" and isinstance(reason, str) and reason in _REASONS else None
     # A failure that names no refusal from before the hand-over may have sent: it is kept unknown.
     return {"state": state if _agrees(state, reason) else "unknown", "reason": reason}
 
