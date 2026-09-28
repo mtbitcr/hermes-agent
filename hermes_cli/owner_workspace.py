@@ -4396,32 +4396,20 @@ def owner_title(value: Any) -> str:
 # :func:`owner_stop_reason` checks these, on top of the title patterns: this
 # kernel's own task ids (``kanban_db._new_task_id``); a full commit id; a
 # ``file:`` link; this platform's own Project ids (``projects_db._new_project_id``
-# and ``_derive_id``). Paths are refused by default rather than by shape: a word
-# holding a ``/`` or ``\`` falls back unless it is a date, a list of version
-# numbers, a one-letter choice, ``and/or``, ``yes/no`` or ``on/off``
-# (:data:`_OWNER_STOP_REASON_SLASH_WORDS`), so no path in any spelling, spacing or
-# script, and no web link, reaches the owner.
+# and ``_derive_id``). Paths are refused by default rather than by shape: any
+# word holding a separator may name a path, so text holding ``/``, ``\`` or a
+# look-alike of either (:data:`_OWNER_STOP_REASON_SEPARATORS`) falls back whole,
+# and no path in any spelling, spacing or script, and no web link, reaches the
+# owner. Dates, versions and choices written with a slash fall back too.
 _OWNER_PRIVATE_STOP_REASON_PATTERNS = (
     re.compile(r"\bt_[0-9a-f]{8}\b"),
     re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE),
     re.compile(r"\bfile:/", re.IGNORECASE),
     re.compile(r"\bp_[0-9a-f]{8,}\b"),
 )
-_OWNER_STOP_REASON_SLASH_WORDS = re.compile(
-    r"\d{1,4}(?:/\d{1,4}){1,2}"
-    r"|v?\d+(?:\.\d+)*(?:/v?\d+(?:\.\d+)*)+"
-    r"|[A-Za-z]/[A-Za-z]"
-    r"|(?i:and/or|yes/no|on/off)"
+_OWNER_STOP_REASON_SEPARATORS = frozenset(
+    "/\\⁄∕∖╱╲⧸⧹﹨／＼"
 )
-
-
-def _names_a_path(text: str) -> bool:
-    """Whether a word of ``text`` holds a slash or backslash that no allowed word explains."""
-    for word in text.split():
-        word = word.strip("()[]{}<>\"'`.,;:!?")
-        if ("/" in word or "\\" in word) and not _OWNER_STOP_REASON_SLASH_WORDS.fullmatch(word):
-            return True
-    return False
 
 
 def owner_stop_reason(
@@ -4441,7 +4429,9 @@ def owner_stop_reason(
     reason = _owner_display_text(value, limit=500)
     raw = str(value or "")
     texts = (reason, raw)
-    if not reason or any(_names_a_path(text) for text in texts) or any(
+    if not reason or any(
+        not _OWNER_STOP_REASON_SEPARATORS.isdisjoint(text) for text in texts
+    ) or any(
         pattern.search(text)
         for text in texts
         for pattern in (
