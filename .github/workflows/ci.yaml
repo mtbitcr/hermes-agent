@@ -279,12 +279,21 @@ jobs:
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
           failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          # Cancelled jobs did not finish. Skipped test jobs pass only if detect succeeded.
+          cancelled = [name for name, info in needs.items() if info['result'] == 'cancelled']
+          detect = needs['detect']['result']
+          skipped = [name for name, info in needs.items() if detect != 'success' and name != 'detect' and info['result'] == 'skipped']
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
               print(f'{icon} {name}: {result}')
           if failed:
               print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+          if cancelled:
+              print(f'::error::{len(cancelled)} job(s) cancelled: {\", \".join(cancelled)}')
+          if skipped:
+              print(f'::error::detect did not succeed ({detect}); {len(skipped)} job(s) skipped: {\", \".join(skipped)}')
+          if failed or cancelled or skipped:
               sys.exit(1)
           print('All checks passed (or were skipped)')
           "
