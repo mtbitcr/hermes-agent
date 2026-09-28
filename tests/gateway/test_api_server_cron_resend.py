@@ -33,6 +33,10 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.base import SendResult
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from tools import send_message_tool
+
+# The real standalone sender, kept before the ``chats`` fixture replaces it.
+REAL_SEND_TO_PLATFORM = send_message_tool._send_to_platform
 
 KEY = "3f9c1e7a5b2d4c6e8f0a1b3c5d7e9f21"
 FITNESS_KEY = "8d2b4f6a1c3e5a7b9d0f2e4c6a8b1d3f"
@@ -123,6 +127,44 @@ def _confirmation_times_out(monkeypatch, live):
         return _Unconfirmed(future) if routed and future is not None else future
 
     monkeypatch.setattr(async_utils, "safe_schedule_threadsafe", schedule)
+
+
+class _Transport:
+    """The Telegram transport under the real standalone sender: keeps each call with the thread it
+    ran in, raises the scripted errors in turn, then succeeds."""
+
+    def __init__(self, *errors):
+        self.errors = list(errors)
+        self.calls = []
+
+    async def send(self, token, chat_id, message, **_kwargs):
+        self.calls.append((str(chat_id), threading.get_ident()))
+        if self.errors:
+            raise self.errors.pop(0)
+        return {"success": True, "message_id": "m1", "chat_id": chat_id}
+
+
+def _standalone_transport(monkeypatch, send):
+    """The re-send goes through the real standalone sender, whose Telegram transport is ``send``."""
+    monkeypatch.setattr(send_message_tool, "_send_to_platform", REAL_SEND_TO_PLATFORM)
+    monkeypatch.setattr(send_message_tool, "_send_telegram", send)
+
+
+def _first_run_refused(monkeypatch):
+    """The first ``asyncio.run`` handed the standalone send raises before it starts it, as it does
+    in a thread where a loop already runs; every other call runs as usual. The idents of the
+    threads it refused in."""
+    real = asyncio.run
+    refused = []
+
+    def run(main, **kwargs):
+        if not refused and getattr(getattr(main, "cr_code", None), "co_name", "") == "_send_to_platform":
+            refused.append(threading.get_ident())
+            raise RuntimeError("asyncio.run() cannot be called from a running event loop")
+        return real(main, **kwargs)
+
+    monkeypatch.setattr(asyncio, "run", run)
+    return refused
 
 
 @pytest.fixture(autouse=True)
@@ -424,6 +466,51 @@ async def test_live_send_already_out_is_not_sent_again_another_way(
 
 
 @pytest.mark.asyncio
+async def test_standalone_send_that_raised_once_started_is_not_sent_again(adapter, chats, monkeypatch):
+    _job_, execution_id, _first = await _failed_run(chats, CHAT_BAD)
+    # No live adapter: the real standalone sender runs, and its transport raises once it is called.
+    transport = _Transport(RuntimeError("placeholder transport failure"))
+    _standalone_transport(monkeypatch, transport.send)
+
+    async with _client(adapter) as cli:
+        response = await _resend(cli, execution_id, "req-1")
+        body = await response.json()
+
+    assert response.status == 200, body
+    # The send started and may have reached the chat: no fresh thread sends it again.
+    assert [chat for chat, _thread in transport.calls] == [CHAT_BAD]
+    assert body["state"] == "unknown"
+    assert [(t["state"], t["reason"]) for t in body["targets"]] == [("unknown", "error_after_handover")]
+    attempts = _view(execution_id)["resend"]["attempts"]
+    assert [(a["attempt_id"], a["state"]) for a in attempts] == [(body["attempt_id"], "unknown")]
+    _carries_nothing_private(body)
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_that_never_started_is_sent_once_from_a_fresh_thread(
+    adapter, chats, monkeypatch
+):
+    _job_, execution_id, _first = await _failed_run(chats, CHAT_BAD)
+    refused = _first_run_refused(monkeypatch)
+    transport = _Transport()
+    _standalone_transport(monkeypatch, transport.send)
+
+    async with _client(adapter) as cli:
+        response = await _resend(cli, execution_id, "req-1")
+        body = await response.json()
+
+    assert response.status == 200, body
+    # The first run never started the send, so the fresh-thread fallback sends it, once.
+    assert len(refused) == 1
+    assert [chat for chat, _thread in transport.calls] == [CHAT_BAD]
+    assert transport.calls[0][1] != refused[0]
+    assert body["state"] == "delivered"
+    assert [(t["state"], t["reason"]) for t in body["targets"]] == [("delivered", None)]
+    attempts = _view(execution_id)["resend"]["attempts"]
+    assert [(a["attempt_id"], a["state"]) for a in attempts] == [(body["attempt_id"], "delivered")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fits", [True, False])
 async def test_report_just_under_the_limit_reaches_a_non_splitting_chat_unchanged(
     adapter, chats, runner, monkeypatch, fits
@@ -479,6 +566,47 @@ async def test_failing_real_adapter_send_logs_no_chat_address_or_report_text(
 
     assert response.status == 200, body
     # Every record any logger made, from the route down to the adapter's own send.
+    formatter = logging.Formatter()
+    assert any("Cron re-send" in record.getMessage() for record in caplog.records)
+    for record in caplog.records:
+        logged = " ".join((
+            record.getMessage(), repr(record.args), record.exc_text or "",
+            formatter.formatException(record.exc_info) if record.exc_info else "",
+        ))
+        for private in (CHAT_BAD, "numbers are up"):
+            assert private not in logged, (record.name, record.lineno)
+    assert [(t["state"], t["reason"]) for t in body["targets"]] == [("unknown", "error_after_handover")]
+
+
+@pytest.mark.asyncio
+async def test_fresh_thread_send_logs_no_chat_address_or_report_text(adapter, chats, monkeypatch, caplog):
+    _job_, execution_id, _first = await _failed_run(chats, CHAT_BAD)
+    refused = _first_run_refused(monkeypatch)
+    calls = []
+
+    async def logs_then_fails(token, chat_id, message, **_kwargs):
+        calls.append(threading.get_ident())
+        try:
+            raise ConnectionError(f"placeholder refusal of {message!r} for chat {chat_id}")
+        except ConnectionError:
+            logging.getLogger("tools.send_message_senders").exception(
+                "placeholder send of %r to chat %s failed", message, chat_id
+            )
+            raise
+
+    _standalone_transport(monkeypatch, logs_then_fails)
+    caplog.clear()
+    caplog.set_level(logging.DEBUG)
+
+    async with _client(adapter) as cli:
+        response = await _resend(cli, execution_id, "req-1")
+        body = await response.json()
+
+    assert response.status == 200, body
+    # Sent once, by the fresh-thread fallback, whose own logger line was made and captured.
+    assert len(refused) == len(calls) == 1 and calls[0] != refused[0]
+    assert any(record.name == "tools.send_message_senders" for record in caplog.records)
+    # Every record any logger made, the fresh thread's included.
     formatter = logging.Formatter()
     assert any("Cron re-send" in record.getMessage() for record in caplog.records)
     for record in caplog.records:

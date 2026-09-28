@@ -15,6 +15,7 @@ import contextlib
 import contextvars
 import errno
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -3169,6 +3170,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                 # when it raises, the original coro was never started — close it to
                 # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
                 # fresh thread that has no running loop.
+                unstarted = inspect.iscoroutine(coro) and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED
                 recorder.standalone_started(coro)
                 coro.close()
                 # If the RuntimeError is the interpreter-finalization signal,
@@ -3179,6 +3181,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                     msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
                     logger.warning("Job '%s': %s", job["id"], msg)
                     target_errors.append(msg)
+                    delivery_errors.extend(target_errors)
+                    continue
+                if resend is not None and not unstarted:
+                    # A re-send sends each chat once. This RuntimeError came from the send itself,
+                    # after it started, so it may have reached the chat: no fresh thread sends it
+                    # again, and it keeps the unknown outcome recorded above.
+                    target_errors.append(f"standalone delivery to {platform_name} failed after it started")
                     delivery_errors.extend(target_errors)
                     continue
                 # The thread-pool fallback can itself raise (SMTP ConnectionError,
@@ -3192,7 +3201,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        send = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+                        if resend is None:
+                            future = pool.submit(asyncio.run, send)
+                        else:
+                            # The re-send's log policy (``_RESENDING``) holds in the fresh thread too.
+                            future = pool.submit(contextvars.copy_context().run, asyncio.run, send)
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -3250,6 +3264,32 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
 # errors: a re-send logs its reason codes only (``resend_report``).
 _RESENDING: contextvars.ContextVar = contextvars.ContextVar("cron_resending", default=False)
 logger.addFilter(lambda _record: not _RESENDING.get())
+
+# The routers, adapters and senders a re-send passes through log the chat and the error as well,
+# from its thread, the tasks it starts and the fresh thread it may send from, which all carry
+# ``_RESENDING``. A record made there keeps only its logger, level and place; one made anywhere
+# else is untouched.
+_RESEND_WITHHELD = "(withheld: a cron re-send logs reason codes only)"
+
+
+def _install_resend_record_factory() -> None:
+    """Wrap the process's log record factory once, keeping the one it had (hermes_logging's)."""
+    current = logging.getLogRecordFactory()
+    if getattr(current, "_cron_resend_scrubber", False):
+        return
+
+    def factory(*args, **kwargs):
+        record = current(*args, **kwargs)
+        if _RESENDING.get():
+            record.msg, record.args = _RESEND_WITHHELD, ()
+            record.exc_info = record.exc_text = record.stack_info = None
+        return record
+
+    factory._cron_resend_scrubber = True  # type: ignore[attr-defined]
+    logging.setLogRecordFactory(factory)
+
+
+_install_resend_record_factory()
 
 
 class _ResendDelivery(delivery_record._Recorder):
