@@ -12846,10 +12846,20 @@ class APIServerAdapter(BasePlatformAdapter):
             from hermes_cli.owner_workspace import (
                 OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY,
                 OWNER_PROJECT_RUN_CONTEXT_CAPABILITY,
+                OWNER_WAITING_CAPABILITY,
                 read_project_snapshot,
                 resolve_owner_context,
             )
 
+            # Only a reader that asks for owner_waiting_v1 gets the keyword, so
+            # every other request makes exactly today's kernel call.
+            waiting = (
+                {"owner_waiting": True}
+                if _owner_workspace_capability_requested(
+                    request, OWNER_WAITING_CAPABILITY
+                )
+                else {}
+            )
             snapshot = read_project_snapshot(
                 resolve_owner_context(),
                 request.match_info.get("project_slug", ""),
@@ -12859,6 +12869,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 planning_context=_owner_workspace_capability_requested(
                     request, OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY
                 ),
+                **waiting,
             )
         except OwnerWorkspaceError as exc:
             if exc.code == "project_not_found":
@@ -12981,12 +12992,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
             from hermes_cli.owner_workspace import (
+                OWNER_WAITING_CAPABILITY,
                 list_owner_decisions,
                 resolve_owner_context,
             )
 
+            # Only a reader that asks for owner_waiting_v1 gets the keyword, so
+            # every other request makes exactly today's kernel call.
+            waiting = (
+                {"owner_waiting": True}
+                if _owner_workspace_capability_requested(
+                    request, OWNER_WAITING_CAPABILITY
+                )
+                else {}
+            )
             owner = resolve_owner_context()
-            projected = list_owner_decisions(owner)
+            projected = list_owner_decisions(owner, **waiting)
             decisions = list(projected["data"])
             truncated = bool(projected["truncated"])
             owner_profile = str(owner.profile)
