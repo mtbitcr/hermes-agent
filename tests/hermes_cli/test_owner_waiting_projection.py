@@ -449,10 +449,14 @@ def test_a_capability_stop_is_an_owner_decision_with_its_cleaned_reason(owner):
         "windows": "Cannot read config\\settings.py",
     }
     path_question = "Should we book it for 12/05/2026 or 19/05/2026?"
+    # A file name's extension may be long.
+    name_leaks = {"long": "Please check config/application.properties"}
+    name_question = "Should the placeholder room be booked for two hours?"
     for project_name, project_leaks, question_title, project_question in (
         ("Worker Text Pilot", leaks, "Choose the placeholder date", question),
         ("Worker Link Pilot", link_leaks, "Choose the placeholder file", link_question),
         ("Worker Path Pilot", path_leaks, "Choose the placeholder day", path_question),
+        ("Worker Name Pilot", name_leaks, "Choose the placeholder hours", name_question),
     ):
         worker_text = _project(owner, project_name)
         leaked = []
