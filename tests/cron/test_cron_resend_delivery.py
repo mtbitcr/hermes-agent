@@ -894,3 +894,44 @@ def test_undecodable_or_binary_values_read_unknown_beside_healthy_runs(monkeypat
         ("exec-bad-text", "unknown"), ("exec-blob-id", "unknown"), ("exec-busy", "unknown"),
     ]
 
+
+
+def _forge_unchecked(sql, params=()):
+    """Write with the table's CHECK constraints off, as a writer that bypasses them could."""
+    conn = sqlite3.connect(_store()._path())
+    try:
+        conn.execute("PRAGMA ignore_check_constraints=ON")
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_stored_attempt_state_outside_the_written_states_reads_unknown(monkeypatch):
+    store = _store()
+    _at(monkeypatch, NOW)
+    runs = ("exec-healthy", "exec-blob-state", "exec-text-state")
+    for execution_id in runs:
+        _run(execution_id, "failed")
+    chats = json.dumps([{"position": 0, "state": "failed", "reason": None}])
+    for attempt_id, execution_id, state in (
+        ("blob-state", "exec-blob-state", sqlite3.Binary(b"\xff")),
+        ("text-state", "exec-text-state", "placeholder free text"),
+    ):
+        _forge_unchecked(
+            "INSERT INTO attempts (attempt_id, execution_id, request_id, requested_at, finished_at, state, chats) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (attempt_id, execution_id, f"req-{attempt_id}", NOW, NOW, state, chats),
+        )
+
+    views = store.history_deliveries([_row(execution_id) for execution_id in runs])
+    encoded = json.dumps(views)  # the history route encodes exactly this
+    assert "placeholder free text" not in encoded
+    assert views[0]["resend"] == {"eligible": True, "reason": None, "attempts": []}
+    for view in views[1:]:
+        assert (view["resend"]["eligible"], view["resend"]["reason"]) == (False, "outcome_unknown")
+        assert [attempt["state"] for attempt in view["resend"]["attempts"]] == ["unknown"]
+    for execution_id, attempt_id in (("exec-blob-state", "blob-state"), ("exec-text-state", "text-state")):
+        repeated = _claim(execution_id, f"req-{attempt_id}")
+        json.dumps(repeated)  # a repeated claim is answered exactly as returned
+        assert (repeated["claimed"], repeated["attempt"]["state"]) == (False, "unknown")
