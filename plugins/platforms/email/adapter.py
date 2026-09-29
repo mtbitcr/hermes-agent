@@ -4,6 +4,7 @@ receives, SMTP sends. Configured via EMAIL_* env vars or ``platforms.email`` in 
 import asyncio
 import email as email_lib
 from contextlib import contextmanager, suppress
+import contextvars
 import imaplib
 import logging
 import os
@@ -653,7 +654,7 @@ class EmailAdapter(BasePlatformAdapter):
     async def _run_send(self, fn, args: tuple, log_fmt: str, *log_args) -> SendResult:
         """Run a blocking SMTP sender in the executor; wrap its Message-ID in a SendResult."""
         try:
-            return SendResult(success=True, message_id=await asyncio.get_running_loop().run_in_executor(None, fn, *args))
+            return SendResult(success=True, message_id=await asyncio.get_running_loop().run_in_executor(None, contextvars.copy_context().run, fn, *args))
         except Exception as e:
             logger.error(log_fmt, *log_args, e)
             return SendResult(success=False, error=str(e))

@@ -1377,7 +1377,7 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _run_blocking(self, func, *args):
         """Run a blocking Feishu SDK call on the adapter-owned thread pool."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._get_sdk_executor(), func, *args)
+        return await loop.run_in_executor(self._get_sdk_executor(), contextvars.copy_context().run, func, *args)
 
     def _shutdown_sdk_executor(self) -> None:
         """Stop the adapter-owned SDK executor without touching the loop default."""
