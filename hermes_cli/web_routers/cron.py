@@ -13,7 +13,7 @@ import logging
 from typing import Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Request  # noqa: F401
-from fastapi.responses import JSONResponse  # noqa: F401
+from fastapi.responses import JSONResponse, Response  # noqa: F401
 
 from hermes_cli.dashboard_auth.audit import AuditEvent, AuditWriteError, audit_log
 from hermes_cli.dashboard_auth.token_auth import (
@@ -49,6 +49,7 @@ _AUTOMATIONS_LITERAL_ROUTES = (
 _AUTOMATIONS_TEMPLATE_ROUTES = (
     ("POST", "/api/cron/jobs/{job_id}/pause"),
     ("POST", "/api/cron/jobs/{job_id}/resume"),
+    ("POST", "/api/cron/executions/{execution_id}/resend"),
 )
 
 def _register_automations_machine_routes() -> None:
@@ -121,6 +122,8 @@ _delete_cron_job_sync = late("_delete_cron_job_sync")
 _find_cron_job_profile = late("_find_cron_job_profile")
 _fire_cron_job_for_profile = late("_fire_cron_job_for_profile")
 _forward_cron_fire_to_gateway = late("_forward_cron_fire_to_gateway")
+_forward_cron_resend_to_gateway = late("_forward_cron_resend_to_gateway")
+_cron_profile_home = late("_cron_profile_home")
 _gateway_intentionally_stopped = late("_gateway_intentionally_stopped")
 _notify_cron_provider_for_profile = late("_notify_cron_provider_for_profile")
 _call_cron_for_profile = late("_call_cron_for_profile")
@@ -238,6 +241,41 @@ async def resume_cron_job_route(
     result = await resume_cron_job(job_id, profile)
     _audit_automations_machine_success(request, action="resume", job_id=job_id)
     return result
+
+
+@router.post("/api/cron/executions/{execution_id}/resend")
+async def resend_cron_execution_route(
+    request: Request, execution_id: str, profile: Optional[str] = None
+):
+    """Owner re-send of one run's failed chats, decided and done by the gateway.
+
+    The request id travels to the profile's own gateway as-is (the gateway
+    validates it) and the gateway's answer comes back unchanged. 503
+    ``gateway_unavailable`` means the gateway was never reached, so nothing
+    was claimed.
+    """
+    # Unknown or invalid profile answers 400/404 before anything is audited or sent.
+    profile_name, _home = await _run_cron_dashboard_io(_cron_profile_home, profile)
+    # Audited before forwarding: an audit failure must stop the send.
+    _audit_automations_machine_success(request, action="resend")
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    request_id = body.get("request_id") if isinstance(body, dict) else None
+    forwarded = await _forward_cron_resend_to_gateway(
+        profile_name, execution_id, request_id
+    )
+    if forwarded is None:
+        return JSONResponse(
+            status_code=503, content={"detail": {"code": "gateway_unavailable"}}
+        )
+    status_code, content, content_type = forwarded
+    return Response(
+        content=content,
+        status_code=status_code,
+        headers={"content-type": content_type} if content_type else None,
+    )
 
 
 @router.post("/api/cron/jobs/{job_id}/trigger")

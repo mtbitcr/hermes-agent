@@ -13360,6 +13360,119 @@ async def _forward_cron_fire_to_gateway(
     return resp.status_code, body
 
 
+def _gateway_api_key(profile: str, home: Path) -> str:
+    """Resolve the TARGET profile's own gateway api_server key.
+
+    Load order mirrors the port in :func:`_gateway_fire_endpoint` (and the
+    adapter's ``extra.get("key", API_SERVER_KEY)``): ``platforms.api_server.
+    extra.key`` in the profile's config.yaml, then ``API_SERVER_KEY`` (process
+    env for the active profile, the profile's own .env otherwise). Empty when
+    none is configured.
+    """
+    import os as _os
+
+    key = ""
+    try:
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        token = set_hermes_home_override(str(home))
+        try:
+            profile_cfg = load_config()
+        finally:
+            reset_hermes_home_override(token)
+        raw = cfg_get(
+            profile_cfg, "platforms", "api_server", "extra", "key", default=None
+        )
+        if raw:
+            key = str(raw).strip()
+    except Exception:
+        key = ""
+    if not key:
+        key = (
+            _os.getenv("API_SERVER_KEY", "")
+            if profile == _cron_default_profile()
+            else _profile_env_value(home, "API_SERVER_KEY")
+        ).strip()
+    return key
+
+
+_CRON_RESEND_IN_PROGRESS = (
+    202,
+    json.dumps({"state": "in_progress"}).encode("utf-8"),
+    "application/json; charset=utf-8",
+)
+
+
+async def _forward_cron_resend_to_gateway(
+    profile: str, execution_id: str, request_id: Any
+) -> Optional[Tuple[int, bytes, Optional[str]]]:
+    """Forward an owner re-send to the profile's gateway api_server on loopback.
+
+    The gateway owns the delivery record and the live adapters, so it decides
+    eligibility and runs the re-send; the dashboard only carries the request
+    id there with the TARGET profile's own API_SERVER_KEY and hands the answer
+    back unchanged.
+
+    Returns ``(status_code, body_bytes, content_type)`` from the gateway, or
+    ``None`` when the request cannot have reached it (nothing claimed — the
+    caller answers 503). Once connected with no answer the gateway may already
+    own the attempt, so that is reported as in progress, never as 503.
+    """
+    name, home = _cron_profile_home(profile)
+    fire_url = _gateway_fire_endpoint(name, home)
+    # One path segment whatever the id holds: "/", "?", "#" and "%" are
+    # percent-encoded, and dots too so "." / ".." cannot be normalized away.
+    segment = urllib.parse.quote(str(execution_id), safe="").replace(".", "%2E")
+    url = (
+        fire_url[: -len("/api/cron/fire")]
+        + f"/api/cron/executions/{segment}/resend"
+    )
+    key = _gateway_api_key(name, home)
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    import httpx
+
+    # Log lines carry the exception class only: never the URL, the ids, the
+    # key or the gateway's words.
+    async with httpx.AsyncClient(
+        trust_env=False,
+        follow_redirects=False,
+        timeout=httpx.Timeout(45.0, connect=5.0),
+    ) as client:
+        try:
+            request = client.build_request(
+                "POST", url, json={"request_id": request_id}, headers=headers
+            )
+        except Exception as exc:
+            _log.warning(
+                "cron re-send forward could not reach the gateway (%s)",
+                type(exc).__name__,
+            )
+            return None
+        try:
+            resp = await client.send(request)
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+            httpx.UnsupportedProtocol,
+        ) as exc:
+            _log.warning(
+                "cron re-send forward could not reach the gateway (%s)",
+                type(exc).__name__,
+            )
+            return None
+        except Exception as exc:
+            _log.warning(
+                "cron re-send forward got no answer from the gateway (%s)",
+                type(exc).__name__,
+            )
+            return _CRON_RESEND_IN_PROGRESS
+    return resp.status_code, resp.content, resp.headers.get("content-type")
+
+
 def _gateway_intentionally_stopped(profile: Optional[str]) -> bool:
     """True when the profile's gateway is stopped BY OPERATOR INTENT.
 
