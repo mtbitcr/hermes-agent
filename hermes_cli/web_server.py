@@ -12864,6 +12864,10 @@ def _list_cron_executions_for_profile(profile: str, limit: int) -> List[Dict[str
         deliveries = history_deliveries(rows)
     finally:
         reset_hermes_home_override(token)
+    for row, delivery in zip(rows, deliveries):
+        # Only a run that may be sent again is named, by the id its re-send route takes.
+        if delivery["resend"]["eligible"]:
+            delivery["resend"]["execution_id"] = str(row["id"])
     return [
         {
             "job_id": str(row.get("job_id") or ""),

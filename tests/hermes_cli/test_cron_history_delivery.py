@@ -8,6 +8,7 @@ the real cron router with machine-token auth.
 import asyncio
 import importlib
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,6 +29,14 @@ NOT_RECORDED = {
     "targets": [],
     "resend": {"eligible": False, "reason": "not_recorded", "attempts": []},
 }
+ROW_KEYS = {"job_id", "status", "claimed_at", "started_at", "finished_at", "delivery_outcome", "delivery"}
+# Placeholder execution ids: none is contained in another or in any other value of a history
+# response, so a text search for one cannot match by accident.
+RUN_ELIGIBLE = "run-placeholder-eligible"
+RUN_DELIVERED = "run-placeholder-delivered"
+RUN_UNKNOWN = "run-placeholder-unknown"
+RUN_NOT_RECORDED = "run-placeholder-not-recorded"
+RUN_EXPIRING = "run-placeholder-expiring"
 
 
 @pytest.fixture()
@@ -176,6 +185,14 @@ def _deliver_new_run(home, loop, replies, *, finish=True, job_id="job-weekly"):
     return execution_id
 
 
+def _next_run_ids(monkeypatch, *run_ids):
+    """Give the runs created next these placeholder execution ids, in order."""
+    from cron import executions
+
+    ids = iter(run_ids)
+    monkeypatch.setattr(executions, "uuid", SimpleNamespace(uuid4=lambda: SimpleNamespace(hex=next(ids))))
+
+
 def _history_at(home, execution_id, now):
     from cron.delivery_record import history_deliveries
     from cron.executions import get_execution
@@ -236,9 +253,10 @@ def test_new_rows_carry_delivery_state_targets_and_resend(profiles_home, history
             {"label": "Telegram", "state": "failed", "reason": "platform_refused"},
             {"label": "Telegram 2", "state": "unknown", "reason": "error_after_handover"},
         ],
-        "resend": {"eligible": True, "reason": None, "attempts": []},
+        "resend": {"eligible": True, "reason": None, "attempts": [], "execution_id": execution_id},
     }
-    for secret in (CHAT_ROUTED, CHAT_REFUSING, CHAT_RESET, execution_id, REPORT, "Forbidden", "Connection reset"):
+    assert response.text.count(execution_id) == 1
+    for secret in (CHAT_ROUTED, CHAT_REFUSING, CHAT_RESET, REPORT, "Forbidden", "Connection reset"):
         assert secret not in response.text
 
 
@@ -293,3 +311,106 @@ def test_running_and_delivered_runs_are_not_resent(profiles_home, live_loop):
         "targets": [{"label": "Telegram (Ops room)", "state": "delivered", "reason": None}],
         "resend": {"eligible": False, "reason": "already_delivered", "attempts": []},
     }
+
+
+def test_eligible_row_names_its_run_for_resend(profiles_home, history_client, live_loop, monkeypatch):
+    _next_run_ids(monkeypatch, RUN_ELIGIBLE)
+    execution_id = _deliver_new_run(profiles_home["worker_alpha"], live_loop, {
+        CHAT_REFUSING: SendResult(success=False, error=BLOCKED),
+    })
+
+    response = history_client("worker_alpha")
+
+    assert execution_id == RUN_ELIGIBLE
+    body = response.json()
+    assert set(body) == {"executions", "limit"}
+    assert body["limit"] == 100
+    [row] = body["executions"]
+    assert set(row) == ROW_KEYS
+    assert (row["job_id"], row["status"], row["delivery_outcome"]) == ("job-weekly", "completed", "failed")
+    assert row["delivery"] == {
+        "state": "failed",
+        "targets": [{"label": "Telegram", "state": "failed", "reason": "platform_refused"}],
+        "resend": {"eligible": True, "reason": None, "attempts": [], "execution_id": RUN_ELIGIBLE},
+    }
+    # The run's id is in the response only where the owner app reads it.
+    assert response.text.count(RUN_ELIGIBLE) == 1
+
+
+def test_rows_that_may_not_be_resent_carry_no_execution_id(
+    profiles_home, history_client, live_loop, monkeypatch
+):
+    from cron.executions import create_execution, finish_execution
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = profiles_home["worker_alpha"]
+    _next_run_ids(monkeypatch, RUN_DELIVERED, RUN_UNKNOWN, RUN_NOT_RECORDED)
+    _deliver_new_run(home, live_loop, {
+        CHAT_ROUTED: SendResult(success=True, message_id="m1"),
+    }, job_id="job-delivered")
+    _deliver_new_run(home, live_loop, {
+        CHAT_RESET: ConnectionResetError("Connection reset by peer"),
+    }, job_id="job-unknown")
+    token = set_hermes_home_override(str(home))
+    try:
+        execution = create_execution("job-unrecorded", source="test")
+        finish_execution(execution["id"], success=True, delivery_outcome="failed")
+    finally:
+        reset_hermes_home_override(token)
+
+    response = history_client("worker_alpha")
+
+    body = response.json()
+    assert set(body) == {"executions", "limit"}
+    assert body["limit"] == 100
+    by_job = {row["job_id"]: row for row in body["executions"]}
+    assert set(by_job) == {"job-delivered", "job-unknown", "job-unrecorded"}
+    for row in by_job.values():
+        assert set(row) == ROW_KEYS
+    assert by_job["job-delivered"]["delivery"] == {
+        "state": "delivered",
+        "targets": [{"label": "Telegram (Ops room)", "state": "delivered", "reason": None}],
+        "resend": {"eligible": False, "reason": "already_delivered", "attempts": []},
+    }
+    assert by_job["job-unknown"]["delivery"] == {
+        "state": "unknown",
+        "targets": [{"label": "Telegram", "state": "unknown", "reason": "error_after_handover"}],
+        "resend": {"eligible": False, "reason": "outcome_unknown", "attempts": []},
+    }
+    assert by_job["job-unrecorded"]["delivery"] == NOT_RECORDED
+    # Not even an empty or null execution_id: the key is absent, and so is every run's id.
+    assert "execution_id" not in response.text
+    for execution_id in (RUN_DELIVERED, RUN_UNKNOWN, RUN_NOT_RECORDED):
+        assert execution_id not in response.text
+
+
+def test_run_past_resend_window_carries_no_execution_id(
+    profiles_home, history_client, live_loop, monkeypatch
+):
+    store = importlib.import_module("cron.delivery_record")
+    monkeypatch.setattr(store, "_clock", lambda: T)
+    _next_run_ids(monkeypatch, RUN_EXPIRING)
+    _deliver_new_run(profiles_home["worker_alpha"], live_loop, {
+        CHAT_REFUSING: SendResult(success=False, error=BLOCKED),
+    })
+
+    monkeypatch.setattr(store, "_clock", lambda: T + 7 * DAY - 1)
+    inside = history_client("worker_alpha")
+    monkeypatch.setattr(store, "_clock", lambda: T + 7 * DAY)
+    expired = history_client("worker_alpha")
+
+    [inside_row] = inside.json()["executions"]
+    assert inside_row["delivery"]["resend"] == {
+        "eligible": True, "reason": None, "attempts": [], "execution_id": RUN_EXPIRING,
+    }
+    body = expired.json()
+    assert set(body) == {"executions", "limit"}
+    [row] = body["executions"]
+    assert set(row) == ROW_KEYS
+    assert row["delivery"] == {
+        "state": "failed",
+        "targets": [{"label": "Telegram", "state": "failed", "reason": "platform_refused"}],
+        "resend": {"eligible": False, "reason": "output_expired", "attempts": []},
+    }
+    assert "execution_id" not in expired.text
+    assert RUN_EXPIRING not in expired.text
