@@ -13408,6 +13408,7 @@ os.environ.update(request["environ"])
 os.environ["HERMES_HOME"] = request["home"]
 answer, sys.stdout = sys.stdout, sys.stderr
 
+import yaml
 from hermes_cli import managed_scope
 
 managed_dir = request["managed_dir"]
@@ -13416,12 +13417,21 @@ managed_scope.get_managed_dir = lambda: None if managed_dir is None else Path(ma
 from gateway import config_loader
 from gateway.config import Platform, load_gateway_config
 
-# The loader reads a malformed or unreadable gateway.json or config.yaml as
-# absent, which must not pass for settings confirmed absent.
+# The loader reads a malformed or unreadable gateway.json, config.yaml or
+# managed config.yaml, and a managed one that is not a mapping, as absent,
+# which must not pass for settings confirmed absent.
 gateway_json = Path(request["home"]) / "gateway.json"
 if gateway_json.exists():
     with open(gateway_json, encoding="utf-8") as f:
         json.load(f)
+if managed_dir is not None:
+    try:
+        with open(Path(managed_dir) / "config.yaml", encoding="utf-8") as f:
+            managed = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        managed = {}
+    if not isinstance(managed, dict):
+        raise TypeError("managed config.yaml is not a mapping")
 load_yaml_layer = config_loader.load_yaml_layer
 yaml_failed = []
 
@@ -13461,8 +13471,9 @@ def _load_gateway_settings(home: Path, environ: Dict[str, str]) -> Dict[str, Any
     This process's ``os.environ`` is only read, never changed, so no other
     thread can see another profile's values in it: the loader's own
     environment writes stay in the child. The managed scope is the one this
-    process resolves. Raises when the child fails, or when gateway.json or
-    config.yaml cannot be read or parsed, which the loader only logs.
+    process resolves. Raises when the child fails, or when gateway.json,
+    config.yaml or the managed config.yaml cannot be read or parsed, or the
+    managed one is not a mapping, which the loader only logs or ignores.
     """
     from hermes_cli import managed_scope
 

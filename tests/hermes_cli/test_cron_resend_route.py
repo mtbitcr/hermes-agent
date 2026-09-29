@@ -1066,6 +1066,67 @@ def test_settings_that_cannot_be_read_or_parsed_are_refused_instead_of_using_864
     _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
 
 
+def _point_worker_beta_at_the_managed_scope_only(dashboard):
+    """worker_beta: only a usable key in its own .env, no port of its own anywhere."""
+    _write_config(dashboard.homes["worker_beta"], {})
+    (dashboard.homes["worker_beta"] / ".env").write_text(f"API_SERVER_KEY={BETA_KEY}\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("damage", ["malformed", "unreadable", "not-a-mapping"])
+def test_managed_config_that_cannot_be_read_or_parsed_to_a_mapping_is_refused_instead_of_using_8642(
+    dashboard, stubs, monkeypatch, managed_dir, outgoing, claims, damage
+):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    pinned = stubs()  # where the administrator's managed config puts worker_beta's gateway
+    _point_worker_beta_at_the_managed_scope_only(dashboard)
+    if damage == "not-a-mapping":
+        managed = [{"gateway": {"api_server": {"port": pinned.port}}}]
+        (managed_dir / "config.yaml").write_text(yaml.safe_dump(managed), encoding="utf-8")
+    else:
+        _break_settings_file(managed_dir, "config.yaml", damage, pinned.port)
+
+    response = _post(dashboard, "owner", profile="worker_beta")
+
+    _assert_refused_before_anything_was_claimed_or_sent(
+        response, dashboard, [pinned, *gateways.values()], outgoing, claims
+    )
+
+
+@pytest.mark.parametrize(
+    "managed_config,reaches_pinned",
+    [
+        pytest.param(
+            lambda port: yaml.safe_dump({"gateway": {"api_server": {"port": port}}}), True, id="managed-literal-port"
+        ),
+        pytest.param(None, False, id="no-managed-config"),
+        pytest.param(lambda port: "", False, id="empty-managed-config"),
+    ],
+)
+def test_managed_config_that_loads_is_honored_and_an_absent_port_still_means_8642(
+    dashboard, stubs, monkeypatch, managed_dir, scopes_after_key, request, managed_config, reaches_pinned
+):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    pinned = stubs()
+    _point_worker_beta_at_the_managed_scope_only(dashboard)
+    if managed_config is not None:
+        (managed_dir / "config.yaml").write_text(managed_config(pinned.port), encoding="utf-8")
+    outgoing = None if reaches_pinned else request.getfixturevalue("outgoing")  # 8642 is captured, never reached
+
+    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
+
+    if reaches_pinned:
+        assert response.status_code == 200
+        assert len(pinned.requests) == 1
+        sent = pinned.requests[0]
+        assert sent["method"] == "POST" and sent["target"] == RESEND_PATH
+        assert sent["headers"]["authorization"] == f"Bearer {BETA_KEY}"
+    else:
+        assert response.status_code == 503
+        assert outgoing == [("POST", 8642, RESEND_PATH)]
+        assert pinned.requests == []
+    assert all(stub.requests == [] for stub in gateways.values())
+
+
 @pytest.mark.parametrize(
     "key_line",
     [
