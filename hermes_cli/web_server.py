@@ -13237,6 +13237,43 @@ def _profile_env_value(home: Path, key: str) -> str:
     return ""
 
 
+def _port_in_profile_env(loaded: Any, home: Path) -> Any:
+    """Another profile's config port with ``${...}`` expanded in its own env.
+
+    ``load_config`` expands a reference from this dashboard process's
+    environment, and ``API_SERVER_PORT`` (a process-global name in
+    agent.secret_scope) from ``os.environ`` even under a secret scope. That
+    profile's gateway runs with its own .env instead, so the raw template is
+    expanded against the profile's own secrets (``build_profile_secret_scope``:
+    its .env plus external sources); a name they lack stays an unresolved
+    reference, which counts as no usable port. A value without a reference,
+    or one the managed scope pins, is returned as loaded. Call under the
+    profile's HERMES_HOME override so ``read_raw_config`` reads that
+    profile's config.yaml.
+    """
+    from hermes_cli.config import _ENV_REF_RE, _env_ref_var_name
+
+    template = cfg_get(
+        read_raw_config(), "platforms", "api_server", "extra", "port", default=None
+    )
+    if not isinstance(template, str) or not _ENV_REF_RE.search(template):
+        return loaded
+    from hermes_cli import managed_scope
+
+    if managed_scope.is_key_managed("platforms.api_server.extra.port"):
+        return loaded
+    from agent.secret_scope import build_profile_secret_scope
+
+    secrets = build_profile_secret_scope(home)
+
+    def expand(match):
+        name = _env_ref_var_name(match.group(1))
+        value = secrets.get(name) if name else None
+        return match.group(0) if value is None else str(value)
+
+    return _ENV_REF_RE.sub(expand, template)
+
+
 def _gateway_fire_endpoint(profile: str, home: Path) -> str:
     """Resolve the loopback URL of the gateway api_server's cron-fire route.
 
@@ -13252,9 +13289,28 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
     mirrors under ``/p/<profile>/…``, so a non-default profile routes through
     the default gateway's port with that prefix; per-profile-gateway mode
     (each profile its own process/port) uses the bare path on the profile's
-    own port.
+    own port, and a ``${...}`` reference in another profile's config port
+    expands in that profile's own environment (:func:`_port_in_profile_env`),
+    never this process's.
     """
     import os as _os
+
+    multiplex = False
+    try:
+        cfg = load_config()
+        multiplex = bool(cfg_get(cfg, "gateway", "multiplex_profiles", default=False))
+        env_flag = _os.getenv("GATEWAY_MULTIPLEX_PROFILES", "").strip().lower()
+        if env_flag in {"1", "true", "yes", "on"}:
+            multiplex = True
+        elif env_flag in {"0", "false", "no", "off"}:
+            multiplex = False
+    except Exception:
+        pass
+    # Another profile's own gateway (per-profile mode) runs in that profile's
+    # environment; the dashboard's own profile shares this process's, and
+    # multiplex routing stays as it is. Decided before the HERMES_HOME
+    # override, under which the active profile would read as the target.
+    in_target_env = not multiplex and profile != _cron_default_profile()
 
     port = 0
     try:
@@ -13272,11 +13328,13 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
         token = set_hermes_home_override(str(home))
         try:
             profile_cfg = load_config()
+            raw = cfg_get(
+                profile_cfg, "platforms", "api_server", "extra", "port", default=None
+            )
+            if in_target_env:
+                raw = _port_in_profile_env(raw, home)
         finally:
             reset_hermes_home_override(token)
-        raw = cfg_get(
-            profile_cfg, "platforms", "api_server", "extra", "port", default=None
-        )
         if raw:
             port = int(raw)
     except Exception:
@@ -13293,18 +13351,6 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
             port = 0
     if not port:
         port = 8642
-
-    multiplex = False
-    try:
-        cfg = load_config()
-        multiplex = bool(cfg_get(cfg, "gateway", "multiplex_profiles", default=False))
-        env_flag = _os.getenv("GATEWAY_MULTIPLEX_PROFILES", "").strip().lower()
-        if env_flag in {"1", "true", "yes", "on"}:
-            multiplex = True
-        elif env_flag in {"0", "false", "no", "off"}:
-            multiplex = False
-    except Exception:
-        pass
 
     if multiplex and profile != "default":
         return f"http://127.0.0.1:{port}/p/{profile}/api/cron/fire"

@@ -696,6 +696,60 @@ def test_missing_target_reference_falls_back_to_the_target_profiles_own_env_key(
     assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
 
 
+PORT_REF_NAME = "PLACEHOLDER_GATEWAY_PORT_REF"
+PORT_REFS = [
+    pytest.param("${API_SERVER_PORT}", "API_SERVER_PORT", id="bare-ref"),
+    pytest.param("${env:" + PORT_REF_NAME + "}", PORT_REF_NAME, id="env-ref"),
+]
+
+
+def _point_worker_beta_port_ref(homes, ref, dotenv):
+    """worker_beta: port in config.yaml as a ``${...}`` reference beside its key, and its own .env."""
+    config = {
+        "model": "test-model",
+        "platforms": {"api_server": {"extra": {"port": ref, "key": BETA_KEY}}},
+    }
+    (homes["worker_beta"] / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    (homes["worker_beta"] / ".env").write_text(dotenv, encoding="utf-8")
+
+
+@pytest.mark.parametrize("ref,name", PORT_REFS)
+def test_port_reference_resolves_from_the_target_profiles_own_env(
+    dashboard, stubs, monkeypatch, scopes_after_key, ref, name
+):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    monkeypatch.setenv(name, str(gateways["default"].port))
+    _point_worker_beta_port_ref(dashboard.homes, ref, f"{name}={gateways['worker_beta'].port}\n")
+
+    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
+
+    assert response.status_code == 200
+    assert len(gateways["worker_beta"].requests) == 1
+    sent = gateways["worker_beta"].requests[0]
+    assert sent["method"] == "POST" and sent["target"] == RESEND_PATH
+    assert sent["headers"]["authorization"] == f"Bearer {BETA_KEY}"
+    assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
+
+
+def test_missing_port_reference_falls_back_to_the_target_profiles_own_env_port(
+    dashboard, stubs, monkeypatch, scopes_after_key
+):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    monkeypatch.setenv(PORT_REF_NAME, str(gateways["default"].port))
+    _point_worker_beta_port_ref(
+        dashboard.homes,
+        "${env:" + PORT_REF_NAME + "}",
+        f"API_SERVER_PORT={gateways['worker_beta'].port}\n",
+    )
+
+    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
+
+    assert response.status_code == 200
+    assert len(gateways["worker_beta"].requests) == 1
+    assert gateways["worker_beta"].requests[0]["headers"]["authorization"] == f"Bearer {BETA_KEY}"
+    assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
+
+
 @pytest.mark.parametrize(
     "key_line",
     [
