@@ -17,7 +17,6 @@ import atexit
 import base64
 import binascii
 import concurrent.futures
-import contextvars
 import functools
 from collections import deque
 from dataclasses import dataclass
@@ -13393,179 +13392,6 @@ async def _forward_cron_fire_to_gateway(
     return resp.status_code, body
 
 
-# Run by ``_load_gateway_settings`` in a fresh interpreter: loads one
-# profile's gateway config over the environment given on stdin and writes its
-# api_server settings as one JSON line. Nothing else reaches stdout.
-_GATEWAY_SETTINGS_PROBE = r"""
-import json
-import os
-import sys
-from pathlib import Path
-
-request = json.load(sys.stdin)
-sys.path[:] = request["path"]
-os.environ.update(request["environ"])
-os.environ["HERMES_HOME"] = request["home"]
-answer, sys.stdout = sys.stdout, sys.stderr
-
-import yaml
-from hermes_cli import managed_scope
-
-managed_dir = request["managed_dir"]
-managed_scope.get_managed_dir = lambda: None if managed_dir is None else Path(managed_dir)
-
-from gateway import config_loader
-from gateway.config import Platform, load_gateway_config
-
-# The loader reads a malformed or unreadable gateway.json, config.yaml or
-# managed config.yaml, and a managed one that is not a mapping, as absent,
-# which must not pass for settings confirmed absent.
-gateway_json = Path(request["home"]) / "gateway.json"
-if gateway_json.exists():
-    with open(gateway_json, encoding="utf-8") as f:
-        json.load(f)
-if managed_dir is not None:
-    try:
-        with open(Path(managed_dir) / "config.yaml", encoding="utf-8") as f:
-            managed = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        managed = {}
-    if not isinstance(managed, dict):
-        raise TypeError("managed config.yaml is not a mapping")
-load_yaml_layer = config_loader.load_yaml_layer
-yaml_failed = []
-
-
-def load_yaml_layer_noting_failure(*args):
-    try:
-        return load_yaml_layer(*args)
-    except Exception:
-        yaml_failed.append(True)
-        raise
-
-
-config_loader.load_yaml_layer = load_yaml_layer_noting_failure
-config = load_gateway_config()
-platform = config.platforms.get(Platform.API_SERVER)
-extra = platform.extra if platform is not None else {}
-answer.write(json.dumps({
-    "loaded": not yaml_failed,
-    "multiplex": bool(config.multiplex_profiles),
-    "extra": {name: extra[name] for name in ("port", "key") if name in extra},
-}, default=str) + "\n")
-"""
-
-# What the fresh interpreter needs from this process to start and find its
-# user's home; none of them is a gateway setting or a secret.
-_GATEWAY_PROBE_PROCESS_ENV = ("PATH", "HOME", "USERPROFILE", "LOCALAPPDATA", "SYSTEMROOT")
-
-# Settings already loaded in this re-send, keyed by (profile, home).
-_GATEWAY_SETTINGS_LOADED: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar(
-    "_gateway_settings_loaded", default=None
-)
-
-
-def _load_gateway_settings(home: Path, environ: Dict[str, str]) -> Dict[str, Any]:
-    """``load_gateway_config()`` for ``home`` over ``environ``, in a fresh interpreter.
-
-    This process's ``os.environ`` is only read, never changed, so no other
-    thread can see another profile's values in it: the loader's own
-    environment writes stay in the child. The managed scope is the one this
-    process resolves. Raises when the child fails, or when gateway.json,
-    config.yaml or the managed config.yaml cannot be read or parsed, or the
-    managed one is not a mapping, which the loader only logs or ignores.
-    """
-    from hermes_cli import managed_scope
-
-    managed_dir = managed_scope.get_managed_dir()
-    request = {
-        "path": list(sys.path),
-        "home": str(home),
-        "environ": environ,
-        "managed_dir": None if managed_dir is None else str(managed_dir),
-    }
-    done = subprocess.run(
-        [sys.executable, "-I", "-c", _GATEWAY_SETTINGS_PROBE],
-        input=json.dumps(request),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,  # the loader's log lines may carry settings
-        env={name: os.environ[name] for name in _GATEWAY_PROBE_PROCESS_ENV if name in os.environ},
-        text=True,
-        encoding="utf-8",
-        timeout=60,
-        check=True,
-        creationflags=windows_hide_flags(),
-    )
-    settings = json.loads(done.stdout.splitlines()[-1])
-    if not settings["loaded"]:
-        raise RuntimeError("config.yaml could not be read or parsed")
-    return settings
-
-
-def _require_readable_dotenv(home: Path) -> None:
-    """Raise when ``home``'s .env exists but cannot be read.
-
-    ``load_env_file`` reads such a file as empty, which would pass for
-    settings confirmed absent.
-    """
-    try:
-        (home / ".env").read_text(encoding="utf-8-sig")
-    except FileNotFoundError:
-        pass
-
-
-def _managed_api_server_reference(leaf: str) -> bool:
-    """True when the managed scope sets an api_server ``leaf`` as a ``${...}`` reference.
-
-    ``apply_managed_overlay`` expands those from the process environment, which
-    for another profile is this dashboard's, never that profile's own.
-    """
-    from hermes_cli import managed_scope
-    from hermes_cli.config import _ENV_REF_RE
-
-    stack = [(managed_scope.load_managed_config(), False)]
-    while stack:
-        node, in_api_server = stack.pop()
-        for name, value in node.items():
-            if isinstance(value, dict):
-                stack.append((value, in_api_server or name == "api_server"))
-            elif in_api_server and name == leaf and isinstance(value, str):
-                if _ENV_REF_RE.search(value):
-                    return True
-    return False
-
-
-def _managed_dotenv() -> Dict[str, str]:
-    """The managed scope's .env, which every gateway loads last with override
-    (``env_loader._apply_managed_env``); empty when there is none.
-
-    Only read here, never rewritten. Raises when it exists but cannot be
-    read, or when it sets the api_server key or port or
-    GATEWAY_MULTIPLEX_PROFILES as a ``${...}`` reference: python-dotenv
-    expands those from the gateway's own process environment, which this
-    dashboard cannot see.
-    """
-    import io
-
-    from dotenv import dotenv_values
-
-    from hermes_cli import managed_scope
-
-    managed_dir = managed_scope.get_managed_dir()
-    if managed_dir is None:
-        return {}
-    try:
-        text = (managed_dir / ".env").read_text(encoding="utf-8-sig")
-    except FileNotFoundError:
-        return {}
-    values = dotenv_values(stream=io.StringIO(text), interpolate=False)
-    managed = {name: value for name, value in values.items() if value is not None}
-    for name in ("API_SERVER_KEY", "API_SERVER_PORT", "GATEWAY_MULTIPLEX_PROFILES"):
-        if "${" in managed.get(name, ""):
-            raise ValueError(f"the managed .env sets {name} as a reference")
-    return managed
-
-
 def _listen_port(raw: Any) -> Optional[int]:
     """``raw`` as a TCP port, or None when it is not an integer port."""
     if isinstance(raw, bool) or not isinstance(raw, (int, str)):
@@ -13577,153 +13403,66 @@ def _listen_port(raw: Any) -> Optional[int]:
     return port if 0 < port < 65536 else None
 
 
-def _gateway_api_server(
-    profile: str, home: Path
-) -> Tuple[bool, Optional[int], Optional[str]]:
-    """``(multiplex, port, key)`` as ``profile``'s own gateway resolves its api_server.
+def _own_gateway_api_server() -> Tuple[Optional[int], Any]:
+    """``(port, key)`` of this dashboard's own gateway listener.
 
-    Loaded through ``gateway.config.load_gateway_config()`` for the profile's
-    HERMES_HOME in a fresh interpreter (``_load_gateway_settings``). This
-    dashboard's own profile loads over this process's environment.
-    Another profile loads over only its own secrets
-    (``build_profile_secret_scope``: its .env, GATEWAY_MULTIPLEX_PROFILES
-    included, and its secret sources), then the managed .env over them as
-    its gateway loads it (``_managed_dotenv``), with its key held back, so
-    ``config_env._api_server`` never applies an override there; that override
-    is then applied from those same layers, as in its gateway. Raises when
-    the profile's settings or the managed .env cannot be read or parsed.
-    The port is None when given but not resolvable (not an integer, or a
-    managed reference for another profile); 8642 only when none is
-    configured anywhere. The key is None when not resolvable (an unexpanded
-    reference, or a managed one) and empty when none is set.
+    Loaded in this process through ``gateway.config.load_gateway_config()``,
+    as its gateway loads them at startup: config.yaml (``gateway.api_server``
+    included), legacy gateway.json and this process's environment. The port
+    falls back as the adapter does (``API_SERVER_PORT``, then 8642) and is
+    None when given but not an integer port. Raises when config.yaml or
+    gateway.json exists but cannot be read or parsed, which the loader only
+    logs.
     """
-    import os as _os
+    from gateway import config_loader
+    from gateway.config import Platform, load_gateway_config
 
-    from agent.secret_scope import build_profile_secret_scope, load_env_file
-    from gateway.config import _has_usable_api_server_key
-
-    own_profile = profile == _cron_default_profile()
-    if own_profile:
-        secrets = dotenv = {}
-        environ = dict(_os.environ)
-    else:
-        _require_readable_dotenv(home)
-        managed = _managed_dotenv()
-        secrets = {**build_profile_secret_scope(home), **managed}
-        dotenv = {**load_env_file(home / ".env"), **managed}
-        environ = {name: value for name, value in secrets.items() if name != "API_SERVER_KEY"}
-    settings = _load_gateway_settings(home, environ)
-
-    extra = dict(settings["extra"])
-    port_from_env = key_from_env = own_profile
-    if not own_profile and _has_usable_api_server_key(secrets.get("API_SERVER_KEY")):
-        # config_env._api_server: a usable key enables it, then API_SERVER_PORT
-        # replaces the configured port when it parses as an int.
-        extra["key"] = secrets["API_SERVER_KEY"]
-        key_from_env = True
-        if dotenv.get("API_SERVER_PORT"):
-            try:
-                extra["port"] = int(dotenv["API_SERVER_PORT"])
-                port_from_env = True
-            except ValueError:
-                pass
-
+    home = get_hermes_home()
+    config_loader.read_yaml_layers(home)
+    gateway_json = home / "gateway.json"
+    if gateway_json.exists():
+        with open(gateway_json, encoding="utf-8") as f:
+            json.load(f)
+    platform = load_gateway_config().platforms.get(Platform.API_SERVER)
+    extra = platform.extra if platform is not None else {}
     raw_port = extra.get("port")
     if raw_port is None:
-        # The adapter's own fallback: API_SERVER_PORT in its environment.
-        raw_port = (
-            _os.environ.get("API_SERVER_PORT") if own_profile else dotenv.get("API_SERVER_PORT")
-        ) or None
-    if raw_port is None:
-        port: Optional[int] = 8642
-    elif not port_from_env and _managed_api_server_reference("port"):
-        port = None
-    else:
-        port = _listen_port(raw_port)
-
-    if "key" in extra:
-        raw_key = extra["key"]
-    else:
-        raw_key = (
-            _os.environ.get("API_SERVER_KEY") if own_profile else secrets.get("API_SERVER_KEY")
-        )
-    key: Optional[str] = str(raw_key or "").strip()
-    if "${" in key or (not key_from_env and _managed_api_server_reference("key")):
-        key = None  # never sent as the bearer
-    return bool(settings["multiplex"]), port, key
-
-
-def _loaded_gateway_api_server(
-    profile: str, home: Path
-) -> Tuple[bool, Optional[int], Optional[str]]:
-    """``_gateway_api_server``, loaded at most once per re-send."""
-    loaded = _GATEWAY_SETTINGS_LOADED.get()
-    if loaded is None:
-        return _gateway_api_server(profile, home)
-    if (profile, str(home)) not in loaded:
-        loaded[(profile, str(home))] = _gateway_api_server(profile, home)
-    resolved = loaded[(profile, str(home))]
-    if isinstance(resolved, concurrent.futures.Future):
-        return resolved.result()  # its failure counts only here, where it is used
-    return resolved
-
-
-def _gateway_multiplexed() -> bool:
-    """Whether one gateway serves every profile: the default profile's own setting."""
-    _name, default_home = _cron_profile_home("default")
-    return _loaded_gateway_api_server("default", default_home)[0]
-
-
-def _gateway_api_key(profile: str, home: Path) -> Optional[str]:
-    """The key ``profile``'s gateway expects on its re-send route, or None to refuse.
-
-    A multiplexed gateway checks a ``/p/<profile>/`` request against that
-    profile's own scoped ``API_SERVER_KEY`` (``_expected_api_key``), and
-    only the default profile's against the listener's key. Otherwise it is
-    the key the profile's own gateway resolves. Empty when none is set.
-    """
-    if profile != "default" and _gateway_multiplexed():
-        from agent.secret_scope import build_profile_secret_scope
-        from gateway.config import _has_usable_api_server_key
-
-        _require_readable_dotenv(home)
-        key = str(build_profile_secret_scope(home).get("API_SERVER_KEY") or "").strip()
-        if "${" in key:
-            return None  # an unexpanded reference is never sent as the bearer
-        return key if _has_usable_api_server_key(key) else ""
-    return _loaded_gateway_api_server(profile, home)[2]
-
-
-def _gateway_resend_base(profile: str, home: Path) -> Optional[str]:
-    """Loopback base URL of the gateway serving ``profile``, or None to refuse.
-
-    Multiplexed: the default profile's listener, under ``/p/<profile>`` for
-    any other profile. Otherwise the profile's own listener.
-    """
-    if _gateway_multiplexed():
-        _name, default_home = _cron_profile_home("default")
-        port = _loaded_gateway_api_server("default", default_home)[1]
-        prefix = "" if profile == "default" else f"/p/{profile}"
-    else:
-        port = _loaded_gateway_api_server(profile, home)[1]
-        prefix = ""
-    if port is None:
-        return None
-    return f"http://127.0.0.1:{port}{prefix}"
+        raw_port = os.environ.get("API_SERVER_PORT") or None
+    port = 8642 if raw_port is None else _listen_port(raw_port)
+    return port, extra.get("key", os.environ.get("API_SERVER_KEY", ""))
 
 
 def _gateway_resend_target(profile: str, home: Path) -> Tuple[Optional[str], Optional[str]]:
-    """``(base, key)`` for one re-send, each profile's settings loaded once.
+    """``(base, key)`` for one re-send, or ``(None, None)`` to refuse it.
 
-    Another profile's own settings load alongside the default profile's,
-    which decide whether they are used at all.
+    Only the production shape: this dashboard runs as the default profile
+    and re-sends through its own gateway listener. Another profile goes
+    there under ``/p/<profile>`` only when the live default gateway records
+    it as served, with that profile's own API_SERVER_KEY, which is what the
+    gateway checks there (``_expected_api_key``). Nothing is sent without a
+    key that passes ``has_usable_secret(min_length=16)``.
     """
-    loaded: dict = {}
-    _GATEWAY_SETTINGS_LOADED.set(loaded)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        if profile != "default":
-            loaded[(profile, str(home))] = pool.submit(_gateway_api_server, profile, home)
-        return _gateway_resend_base(profile, home), _gateway_api_key(profile, home)
+    from hermes_cli.auth import has_usable_secret
+
+    if _cron_default_profile() != "default":
+        return None, None
+    if profile == "default":
+        port, key = _own_gateway_api_server()
+        prefix = ""
+    else:
+        from hermes_cli.gateway_multiplex_served import recorded_served_profiles
+
+        served = recorded_served_profiles()
+        if served is None or profile not in served:
+            return None, None
+        from gateway.run import _load_profile_secret_scope
+
+        port = _own_gateway_api_server()[0]
+        key = _load_profile_secret_scope(home).get("API_SERVER_KEY")
+        prefix = f"/p/{profile}"
+    if port is None or not has_usable_secret(key, min_length=16):
+        return None, None
+    return f"http://127.0.0.1:{port}{prefix}", key.strip()
 
 
 _CRON_RESEND_IN_PROGRESS = (
@@ -13736,12 +13475,13 @@ _CRON_RESEND_IN_PROGRESS = (
 async def _forward_cron_resend_to_gateway(
     profile: str, execution_id: str, request_id: Any
 ) -> Optional[Tuple[int, bytes, Optional[str]]]:
-    """Forward an owner re-send to the profile's gateway api_server on loopback.
+    """Forward an owner re-send to the gateway serving the profile, on loopback.
 
     The gateway owns the delivery record and the live adapters, so it decides
     eligibility and runs the re-send; the dashboard only carries the request
-    id there with the TARGET profile's own API_SERVER_KEY and hands the answer
-    back unchanged.
+    id to its own gateway listener (under ``/p/<profile>`` for another
+    profile that gateway serves, with that profile's own API_SERVER_KEY) and
+    hands the answer back unchanged.
 
     Returns ``(status_code, body_bytes, content_type)`` from the gateway, or
     ``None`` when the request cannot have reached it (nothing claimed — the
@@ -13750,21 +13490,23 @@ async def _forward_cron_resend_to_gateway(
     """
     name, home = _cron_profile_home(profile)
     try:
-        # Off the event loop: each profile's settings load in a fresh interpreter.
+        # Off the event loop: it reads config files and a profile's secrets.
         base, key = await asyncio.to_thread(_gateway_resend_target, name, home)
     except Exception as exc:
         base = key = None
         _log.debug("cron re-send gateway settings failed to load (%s)", type(exc).__name__)
     if base is None or key is None:
-        # A port or key given but not resolvable in its owner's own scope:
-        # nothing is sent, so nothing can be claimed.
-        _log.warning("cron re-send refused: the gateway's api_server port or key is unresolved")
+        # Not a supported shape, or its port or key is unresolved: nothing is
+        # sent, so nothing can be claimed.
+        _log.warning(
+            "cron re-send refused: no supported gateway listener with a resolved port and key"
+        )
         return None
     # One path segment whatever the id holds: "/", "?", "#" and "%" are
     # percent-encoded, and dots too so "." / ".." cannot be normalized away.
     segment = urllib.parse.quote(str(execution_id), safe="").replace(".", "%2E")
     url = base + f"/api/cron/executions/{segment}/resend"
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    headers = {"Authorization": f"Bearer {key}"}
     import httpx
 
     # Log lines carry the exception class only: never the URL, the ids, the

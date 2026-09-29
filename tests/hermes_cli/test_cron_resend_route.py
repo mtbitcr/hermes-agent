@@ -1,9 +1,11 @@
 """Owner re-send route: POST /api/cron/executions/{execution_id}/resend on the dashboard.
 
 The dashboard admits the owner the way pause/resume do, forwards the request id
-over loopback to the target profile's own gateway with that profile's own
-API_SERVER_KEY, and hands the gateway's answer back unchanged.  Every gateway
-here is a local stub; every key and id is a placeholder.
+over loopback to the default profile's own gateway listener (under
+``/p/<profile>/`` with that profile's own API_SERVER_KEY for a profile the live
+default gateway records as served), and hands the gateway's answer back
+unchanged.  Every other shape is refused with 503 before anything is sent.
+Every gateway here is a local stub; every key and id is a placeholder.
 """
 
 import asyncio
@@ -196,6 +198,21 @@ def _point_worker_beta(homes, port):
     (homes["worker_beta"] / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
 
 
+def _record_served(homes, *profiles):
+    """The live default gateway's record: this test process's pid, serving ``profiles``."""
+    (homes["default"] / "gateway.pid").write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    (homes["default"] / "gateway_state.json").write_text(
+        json.dumps({"served_profiles": list(profiles)}), encoding="utf-8"
+    )
+
+
+def _serve_worker_alpha(homes, port):
+    """worker_alpha served by the default gateway: that listener on ``port``, worker_alpha's key in its own .env."""
+    _write_config(homes["default"], {"platforms": {"api_server": {"extra": {"port": port}}}})
+    (homes["worker_alpha"] / ".env").write_text(f"API_SERVER_KEY={WORKER_KEY}\n", encoding="utf-8")
+    _record_served(homes, "worker_alpha")
+
+
 @pytest.fixture()
 def stubs():
     made = []
@@ -211,7 +228,22 @@ def stubs():
 
 
 @pytest.fixture()
-def dashboard(profiles_home, tmp_path):
+def gateway_run_imported(profiles_home):
+    """gateway.run imported, as in the gateway process the dashboard runs in, os.environ as before.
+
+    Its first import writes process-wide settings into os.environ; that is not
+    a re-send's doing, so it happens here, before any test takes a snapshot.
+    """
+    before = dict(os.environ)
+    import gateway.run  # noqa: F401
+
+    for name in set(os.environ) - set(before):
+        del os.environ[name]
+    os.environ.update(before)
+
+
+@pytest.fixture()
+def dashboard(profiles_home, tmp_path, gateway_run_imported):
     """The real dashboard app with an owner session and an automations machine token."""
     from fastapi.testclient import TestClient
 
@@ -347,7 +379,7 @@ PASS_THROUGH = [
 @pytest.mark.parametrize("status,body,content_type", PASS_THROUGH)
 def test_gateway_answer_passes_through_unchanged(dashboard, stubs, status, body, content_type):
     stub = stubs(status=status, body=body, content_type=content_type)
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
 
     response = _post(dashboard, "owner")
 
@@ -361,7 +393,7 @@ def test_gateway_answer_passes_through_unchanged(dashboard, stubs, status, body,
 @pytest.mark.parametrize("who", ["owner", "automations"])
 def test_allowlist_refusal_passes_through_for_every_admitted_caller(dashboard, stubs, who):
     stub = stubs(status=403, body=_aiohttp_bytes(ROUTE_NOT_ALLOWED))
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
 
     response = _post(dashboard, who)
 
@@ -371,7 +403,7 @@ def test_allowlist_refusal_passes_through_for_every_admitted_caller(dashboard, s
 
 
 def test_gateway_down_answers_503_gateway_unavailable(dashboard):
-    _point_worker_alpha(dashboard.homes, _free_port())
+    _serve_worker_alpha(dashboard.homes, _free_port())
 
     response = _post(dashboard, "owner")
 
@@ -381,7 +413,7 @@ def test_gateway_down_answers_503_gateway_unavailable(dashboard):
 
 def test_connected_but_no_answer_is_in_progress_never_503(dashboard, stubs):
     stub = stubs(drop=True)
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
 
     response = _post(dashboard, "owner")
 
@@ -392,7 +424,7 @@ def test_connected_but_no_answer_is_in_progress_never_503(dashboard, stubs):
 
 def test_owner_and_automations_token_are_admitted_like_pause_resume(dashboard, stubs):
     stub = stubs()
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
 
     for who in ("owner", "automations"):
         response = _post(dashboard, who)
@@ -413,7 +445,7 @@ def test_machine_token_without_automations_scope_is_refused(dashboard, stubs):
     from plugins.dashboard_auth.raphael_workspace.model_policy import register_models_machine_routes
 
     stub = stubs()
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
     response = _post(dashboard, "automations")
     assert response.status_code == 200
     assert len(stub.requests) == 1
@@ -437,7 +469,7 @@ def test_machine_token_without_automations_scope_is_refused(dashboard, stubs):
 
 def test_machine_success_is_audited_once_as_resend(dashboard, stubs):
     stub = stubs()
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
 
     response = _post(dashboard, "automations")
 
@@ -452,7 +484,7 @@ def test_machine_success_is_audited_once_as_resend(dashboard, stubs):
 
 
 def test_audit_is_written_before_forwarding_even_when_gateway_is_down(dashboard):
-    _point_worker_alpha(dashboard.homes, _free_port())
+    _serve_worker_alpha(dashboard.homes, _free_port())
 
     response = _post(dashboard, "automations")
 
@@ -465,7 +497,7 @@ def test_audit_failure_answers_503_and_sends_nothing(dashboard, stubs, tmp_path,
     from hermes_cli.dashboard_auth import audit as audit_mod
 
     stub = stubs()
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
     assert _post(dashboard, "automations").status_code == 200
     assert len(stub.requests) == 1
 
@@ -481,7 +513,7 @@ def test_audit_failure_answers_503_and_sends_nothing(dashboard, stubs, tmp_path,
 
 def test_owner_session_is_not_machine_audited(dashboard, stubs):
     stub = stubs()
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
 
     response = _post(dashboard, "owner")
 
@@ -491,31 +523,31 @@ def test_owner_session_is_not_machine_audited(dashboard, stubs):
 
 
 @pytest.mark.parametrize(
-    "profile,expected_key",
+    "profile,expected_key,prefix",
     [
-        pytest.param(None, DEFAULT_KEY, id="profile-omitted"),
-        pytest.param("default", DEFAULT_KEY, id="default-env-key"),
-        pytest.param("worker_alpha", WORKER_KEY, id="profile-dotenv-key"),
-        pytest.param("worker_beta", BETA_KEY, id="profile-config-key"),
+        pytest.param(None, DEFAULT_KEY, "", id="profile-omitted"),
+        pytest.param("default", DEFAULT_KEY, "", id="default-env-key"),
+        pytest.param("worker_alpha", WORKER_KEY, "/p/worker_alpha", id="profile-dotenv-key"),
     ],
 )
-def test_forward_goes_to_the_profiles_own_gateway_with_its_own_key(
-    dashboard, stubs, monkeypatch, profile, expected_key
+def test_forward_goes_to_the_gateway_serving_the_profile_with_the_profiles_own_key(
+    dashboard, stubs, monkeypatch, profile, expected_key, prefix
 ):
     gateways = {name: stubs() for name in ("default", "worker_alpha", "worker_beta")}
     _point_default(dashboard.homes, monkeypatch, gateways["default"].port)
     _point_worker_alpha(dashboard.homes, gateways["worker_alpha"].port)
     _point_worker_beta(dashboard.homes, gateways["worker_beta"].port)
+    _record_served(dashboard.homes, "worker_alpha", "worker_beta")
     body = {"request_id": REQUEST_ID, "note": "placeholder-note", "profile": "worker_beta"}
 
     response = _post(dashboard, "owner", profile=profile, json=body)
 
     assert response.status_code == 200
-    target = gateways[profile or "default"]
+    target = gateways["default"]
     assert len(target.requests) == 1
     sent = target.requests[0]
     assert sent["method"] == "POST"
-    assert sent["target"] == RESEND_PATH
+    assert sent["target"] == prefix + RESEND_PATH
     assert sent["client"] == "127.0.0.1"
     assert sent["headers"]["host"] == f"127.0.0.1:{target.port}"
     assert sent["headers"]["authorization"] == f"Bearer {expected_key}"
@@ -541,7 +573,7 @@ def test_forward_goes_to_the_profiles_own_gateway_with_its_own_key(
 )
 def test_forwarded_body_is_only_the_request_id(dashboard, stubs, kwargs, forwarded):
     stub = stubs()
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
     extra = kwargs.pop("headers_extra", None)
     if extra:
         dashboard.headers["owner"] = {**dashboard.headers["owner"], **extra}
@@ -559,7 +591,7 @@ def test_multiplexed_resend_reaches_the_default_port_with_the_profile_prefix_and
     listener, own = stubs(), stubs()
     _point_default(dashboard.homes, monkeypatch, listener.port)
     _point_worker_alpha(dashboard.homes, own.port)
-    monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "1")
+    _record_served(dashboard.homes, "worker_alpha")
 
     response = _post(dashboard, "owner")
 
@@ -570,23 +602,35 @@ def test_multiplexed_resend_reaches_the_default_port_with_the_profile_prefix_and
     assert own.requests == []
 
 
-def test_no_key_means_no_authorization_header_and_gateway_401_passes(dashboard, stubs):
-    stub = stubs(status=401, body=_aiohttp_bytes(GATEWAY_AUTH_FAILED))
-    (dashboard.homes["worker_alpha"] / ".env").write_text(f"API_SERVER_PORT={stub.port}\n", encoding="utf-8")
-
-    response = _post(dashboard, "owner")
-
-    assert response.status_code == 401
-    assert response.json() == GATEWAY_AUTH_FAILED
-    assert len(stub.requests) == 1
-    assert "authorization" not in stub.requests[0]["headers"]
+UNUSABLE_KEY = "placeholder-key"  # 15 characters: has_usable_secret(min_length=16) rejects it
 
 
-KEY_REF_NAME = "PLACEHOLDER_GATEWAY_KEY_REF"
-KEY_REFS = [
-    pytest.param("${API_SERVER_KEY}", "API_SERVER_KEY", id="bare-ref"),
-    pytest.param("${env:" + KEY_REF_NAME + "}", KEY_REF_NAME, id="env-ref"),
-]
+@pytest.mark.parametrize(
+    "profile,key",
+    [
+        pytest.param("default", None, id="default-no-key"),
+        pytest.param("default", UNUSABLE_KEY, id="default-unusable-key"),
+        pytest.param("worker_alpha", None, id="served-profile-no-key"),
+        pytest.param("worker_alpha", UNUSABLE_KEY, id="served-profile-unusable-key"),
+    ],
+)
+def test_missing_or_unusable_key_is_refused_instead_of_sending_no_key(
+    dashboard, stubs, monkeypatch, outgoing, claims, profile, key
+):
+    listener = stubs(status=401, body=_aiohttp_bytes(GATEWAY_AUTH_FAILED))
+    _write_config(dashboard.homes["default"], {"platforms": {"api_server": {"extra": {"port": listener.port}}}})
+    _record_served(dashboard.homes, "worker_alpha")
+    if profile == "default":
+        if key is not None:
+            monkeypatch.setenv("API_SERVER_KEY", key)
+    else:
+        monkeypatch.setenv("API_SERVER_KEY", DEFAULT_KEY)  # the listener's own key is never lent to a profile
+        if key is not None:
+            (dashboard.homes["worker_alpha"] / ".env").write_text(f"API_SERVER_KEY={key}\n", encoding="utf-8")
+
+    response = _post(dashboard, "owner", profile=profile)
+
+    _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, [listener], outgoing, claims)
 
 
 def _point_every_gateway(dashboard, stubs, monkeypatch, **beta_stub):
@@ -598,30 +642,20 @@ def _point_every_gateway(dashboard, stubs, monkeypatch, **beta_stub):
     return gateways
 
 
-def _point_worker_beta_key_ref(homes, port, ref, dotenv):
-    """worker_beta: port in config.yaml, key there as a ``${...}`` reference, and its own .env."""
-    config = {
-        "model": "test-model",
-        "platforms": {"api_server": {"extra": {"port": port, "key": ref}}},
-    }
-    (homes["worker_beta"] / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
-    (homes["worker_beta"] / ".env").write_text(dotenv, encoding="utf-8")
-
-
 @pytest.fixture()
 def scopes_after_key(dashboard, monkeypatch):
     """The secret scope left in the forwarder's own context after each key resolution."""
     from agent.secret_scope import current_secret_scope
 
-    resolve = dashboard.web_server._gateway_api_key
+    resolve = dashboard.web_server._gateway_resend_target
     seen = []
 
     def resolve_and_record(profile, home):
-        key = resolve(profile, home)
+        target = resolve(profile, home)
         seen.append(current_secret_scope())
-        return key
+        return target
 
-    monkeypatch.setattr(dashboard.web_server, "_gateway_api_key", resolve_and_record)
+    monkeypatch.setattr(dashboard.web_server, "_gateway_resend_target", resolve_and_record)
     return seen
 
 
@@ -687,81 +721,7 @@ def _write_config(home, config):
     (home / "config.yaml").write_text(yaml.safe_dump({"model": "test-model", **config}), encoding="utf-8")
 
 
-@pytest.mark.parametrize("ref,name", [KEY_REFS[0]])
-def test_config_key_reference_resolves_from_the_target_profiles_own_secrets(
-    dashboard, stubs, monkeypatch, scopes_after_key, ref, name
-):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    monkeypatch.setenv(name, DEFAULT_KEY)
-    _point_worker_beta_key_ref(dashboard.homes, gateways["worker_beta"].port, ref, f"{name}={BETA_KEY}\n")
-
-    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
-
-    assert response.status_code == 200
-    assert len(gateways["worker_beta"].requests) == 1
-    assert gateways["worker_beta"].requests[0]["headers"]["authorization"] == f"Bearer {BETA_KEY}"
-    assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
-
-
-def test_config_key_env_reference_the_gateway_leaves_unexpanded_is_refused(
-    dashboard, stubs, monkeypatch, scopes_after_key, outgoing, claims
-):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    monkeypatch.setenv(KEY_REF_NAME, DEFAULT_KEY)
-    _point_worker_beta_key_ref(
-        dashboard.homes,
-        gateways["worker_beta"].port,
-        "${env:" + KEY_REF_NAME + "}",
-        f"{KEY_REF_NAME}={BETA_KEY}\n",
-    )
-
-    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
-
-    _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
-
-
-@pytest.mark.parametrize("ref,name", KEY_REFS)
-def test_missing_target_key_reference_is_refused_instead_of_sending_no_key(
-    dashboard, stubs, monkeypatch, scopes_after_key, outgoing, claims, ref, name
-):
-    gateways = _point_every_gateway(
-        dashboard, stubs, monkeypatch, status=401, body=_aiohttp_bytes(GATEWAY_AUTH_FAILED)
-    )
-    monkeypatch.setenv(name, DEFAULT_KEY)
-    _point_worker_beta_key_ref(
-        dashboard.homes, gateways["worker_beta"].port, ref, "PLACEHOLDER_UNRELATED=placeholder-value\n"
-    )
-
-    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
-
-    _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
-
-
-def test_missing_target_reference_falls_back_to_the_target_profiles_own_env_key(
-    dashboard, stubs, monkeypatch, scopes_after_key
-):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    monkeypatch.setenv(KEY_REF_NAME, DEFAULT_KEY)
-    _point_worker_beta_key_ref(
-        dashboard.homes,
-        gateways["worker_beta"].port,
-        "${env:" + KEY_REF_NAME + "}",
-        f"API_SERVER_KEY={BETA_KEY}\n",
-    )
-
-    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
-
-    assert response.status_code == 200
-    assert len(gateways["worker_beta"].requests) == 1
-    assert gateways["worker_beta"].requests[0]["headers"]["authorization"] == f"Bearer {BETA_KEY}"
-    assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
-
-
 PORT_REF_NAME = "PLACEHOLDER_GATEWAY_PORT_REF"
-PORT_REFS = [
-    pytest.param("${API_SERVER_PORT}", "API_SERVER_PORT", id="bare-ref"),
-    pytest.param("${env:" + PORT_REF_NAME + "}", PORT_REF_NAME, id="env-ref"),
-]
 
 
 def _point_worker_beta_port_ref(homes, ref, dotenv):
@@ -772,35 +732,6 @@ def _point_worker_beta_port_ref(homes, ref, dotenv):
     }
     (homes["worker_beta"] / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     (homes["worker_beta"] / ".env").write_text(dotenv, encoding="utf-8")
-
-
-@pytest.mark.parametrize("ref,name", PORT_REFS)
-def test_port_reference_the_gateway_leaves_unexpanded_is_refused(
-    dashboard, stubs, monkeypatch, scopes_after_key, outgoing, claims, ref, name
-):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    monkeypatch.setenv(name, str(gateways["default"].port))
-    _point_worker_beta_port_ref(dashboard.homes, ref, f"{name}={gateways['worker_beta'].port}\n")
-
-    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
-
-    _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
-
-
-def test_missing_port_reference_is_refused_instead_of_falling_back_to_the_env_port(
-    dashboard, stubs, monkeypatch, scopes_after_key, outgoing, claims
-):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    monkeypatch.setenv(PORT_REF_NAME, str(gateways["default"].port))
-    _point_worker_beta_port_ref(
-        dashboard.homes,
-        "${env:" + PORT_REF_NAME + "}",
-        f"API_SERVER_PORT={gateways['worker_beta'].port}\n",
-    )
-
-    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
-
-    _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
 
 
 def _make_planning_profile(dashboard):
@@ -824,6 +755,7 @@ def test_production_multiplexed_resend_reaches_the_default_port_under_the_planni
     (planning / ".env").write_text(
         f"API_SERVER_PORT={planning_own.port}\nAPI_SERVER_KEY={PLANNING_KEY}\n", encoding="utf-8"
     )
+    _record_served(dashboard.homes, "planning")
 
     response = _post_leaving_no_trace(dashboard, scopes_after_key, "planning")
 
@@ -838,21 +770,23 @@ def test_production_multiplexed_resend_reaches_the_default_port_under_the_planni
     assert planning_own.requests == []
 
 
-def test_per_profile_gateway_api_server_port_reaches_that_profiles_gateway_with_its_own_key(
-    dashboard, stubs, monkeypatch, scopes_after_key
+@pytest.mark.parametrize("profile", [pytest.param(None, id="profile-omitted"), pytest.param("default", id="default")])
+def test_default_resend_reaches_the_listener_port_set_under_gateway_api_server(
+    dashboard, stubs, monkeypatch, scopes_after_key, profile
 ):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    _write_config(dashboard.homes["worker_beta"], {"gateway": {"api_server": {"port": gateways["worker_beta"].port}}})
-    (dashboard.homes["worker_beta"] / ".env").write_text(f"API_SERVER_KEY={BETA_KEY}\n", encoding="utf-8")
+    listener = stubs()
+    _write_config(dashboard.homes["default"], {"gateway": {"api_server": {"port": listener.port}}})
+    monkeypatch.setenv("API_SERVER_KEY", DEFAULT_KEY)
 
-    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
+    response = _post_leaving_no_trace(dashboard, scopes_after_key, profile)
 
     assert response.status_code == 200
-    assert len(gateways["worker_beta"].requests) == 1
-    sent = gateways["worker_beta"].requests[0]
+    assert response.json() == PER_CHAT_RESULT
+    assert len(listener.requests) == 1
+    sent = listener.requests[0]
     assert sent["method"] == "POST" and sent["target"] == RESEND_PATH
-    assert sent["headers"]["authorization"] == f"Bearer {BETA_KEY}"
-    assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
+    assert sent["headers"]["host"] == f"127.0.0.1:{listener.port}"
+    assert sent["headers"]["authorization"] == f"Bearer {DEFAULT_KEY}"
 
 
 def test_multiplexed_target_port_reference_never_moves_the_resend_off_the_default_port(
@@ -860,7 +794,7 @@ def test_multiplexed_target_port_reference_never_moves_the_resend_off_the_defaul
 ):
     gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
     decoy = stubs()
-    monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "1")
+    _record_served(dashboard.homes, "worker_beta")
     monkeypatch.setenv(PORT_REF_NAME, str(decoy.port))
     _point_worker_beta_port_ref(dashboard.homes, "${env:" + PORT_REF_NAME + "}", f"API_SERVER_KEY={BETA_KEY}\n")
 
@@ -875,25 +809,80 @@ def test_multiplexed_target_port_reference_never_moves_the_resend_off_the_defaul
     assert gateways["worker_alpha"].requests == [] and gateways["worker_beta"].requests == []
 
 
-def test_named_profile_dashboard_never_lends_its_multiplex_flag_to_the_default_profile(
-    dashboard, stubs, monkeypatch, scopes_after_key
+@pytest.mark.parametrize(
+    "profile",
+    [
+        pytest.param(None, id="profile-omitted"),
+        pytest.param("default", id="default"),
+        pytest.param("worker_alpha", id="own-profile"),
+        pytest.param("worker_beta", id="served-profile"),
+    ],
+)
+def test_named_profile_dashboard_refuses_every_resend_before_sending(
+    dashboard, stubs, monkeypatch, scopes_after_key, outgoing, claims, profile
 ):
     gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    (dashboard.homes["worker_beta"] / ".env").write_text(f"API_SERVER_KEY={BETA_KEY}\n", encoding="utf-8")
+    _record_served(dashboard.homes, "worker_alpha", "worker_beta")
     monkeypatch.setenv("HERMES_HOME", str(dashboard.homes["worker_alpha"]))  # the dashboard runs as worker_alpha
-    monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "1")  # worker_alpha's environment, not the default's
     assert dashboard.web_server._cron_default_profile() == "worker_alpha"
 
-    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
+    response = _post_leaving_no_trace(dashboard, scopes_after_key, profile)
 
-    assert response.status_code == 200
-    assert len(gateways["worker_beta"].requests) == 1
-    sent = gateways["worker_beta"].requests[0]
-    assert sent["target"] == RESEND_PATH
-    assert sent["headers"]["authorization"] == f"Bearer {BETA_KEY}"
-    assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
+    _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
 
 
-MANAGED_REF_NAME = "PLACEHOLDER_MANAGED_REF"
+def _multiplex_default_listener(dashboard, gateways):
+    """The default config opts into multiplexing, its listener on the default stub."""
+    _write_config(
+        dashboard.homes["default"],
+        {"gateway": {"multiplex_profiles": True, "api_server": {"port": gateways["default"].port}}},
+    )
+
+
+@pytest.mark.parametrize(
+    "served,profile",
+    [
+        pytest.param(["worker_alpha"], "worker_beta", id="another-profile-listed"),
+        pytest.param([], "worker_alpha", id="none-listed"),
+    ],
+)
+def test_profile_the_live_gateway_does_not_list_as_served_is_refused_before_sending(
+    dashboard, stubs, monkeypatch, scopes_after_key, outgoing, claims, served, profile
+):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    _multiplex_default_listener(dashboard, gateways)
+    for name, key in (("worker_alpha", WORKER_KEY), ("worker_beta", BETA_KEY)):
+        (dashboard.homes[name] / ".env").write_text(f"API_SERVER_KEY={key}\n", encoding="utf-8")
+    _record_served(dashboard.homes, *served)
+
+    response = _post_leaving_no_trace(dashboard, scopes_after_key, profile)
+
+    _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
+
+
+@pytest.mark.parametrize("record", ["no-live-pid", "no-served-profiles"])
+def test_no_served_profiles_record_is_refused_before_sending(
+    dashboard, stubs, monkeypatch, scopes_after_key, outgoing, claims, record
+):
+    from hermes_cli.gateway_multiplex_served import recorded_served_profiles
+
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    _multiplex_default_listener(dashboard, gateways)
+    monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "1")  # neither the config nor this stands in for the record
+    (dashboard.homes["worker_alpha"] / ".env").write_text(f"API_SERVER_KEY={WORKER_KEY}\n", encoding="utf-8")
+    _record_served(dashboard.homes, "worker_alpha")
+    if record == "no-live-pid":
+        (dashboard.homes["default"] / "gateway.pid").unlink()
+    else:
+        (dashboard.homes["default"] / "gateway_state.json").write_text(
+            json.dumps({"gateway_state": "running"}), encoding="utf-8"
+        )
+    assert recorded_served_profiles() is None
+
+    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_alpha")
+
+    _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
 
 
 @pytest.fixture()
@@ -909,27 +898,21 @@ def managed_dir(tmp_path, monkeypatch):
     managed_scope.invalidate_managed_cache()
 
 
-@pytest.mark.parametrize(
-    "leaf,dotenv",
-    [
-        pytest.param("port", f"API_SERVER_KEY={BETA_KEY}\n", id="managed-port-ref"),
-        pytest.param("key", "PLACEHOLDER_UNRELATED=placeholder-value\n", id="managed-key-ref"),
-    ],
-)
-def test_managed_reference_for_another_profile_is_refused(
-    dashboard, stubs, monkeypatch, managed_dir, scopes_after_key, outgoing, claims, leaf, dotenv
+def test_profile_op_env_listener_outside_multiplex_is_refused_before_reaching_either_listener(
+    dashboard, stubs, monkeypatch, managed_dir, outgoing, claims
 ):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    decoy = stubs()
-    managed = {"platforms": {"api_server": {"extra": {leaf: "${" + MANAGED_REF_NAME + "}"}}}}
-    (managed_dir / "config.yaml").write_text(yaml.safe_dump(managed), encoding="utf-8")
-    monkeypatch.setenv(MANAGED_REF_NAME, str(decoy.port) if leaf == "port" else DEFAULT_KEY)
-    (dashboard.homes["worker_beta"] / ".env").write_text(dotenv, encoding="utf-8")
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)  # worker_beta: config.yaml port and BETA_KEY
+    moved = stubs()  # where worker_beta's .op.env would move its own listener
+    (dashboard.homes["worker_beta"] / ".op.env").write_text(
+        f"API_SERVER_PORT={moved.port}\nAPI_SERVER_KEY={WORKER_KEY}\n", encoding="utf-8"
+    )
+    assert not (dashboard.homes["worker_beta"] / ".env").exists()
+    assert not any(managed_dir.iterdir())
 
-    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
+    response = _post(dashboard, "owner", profile="worker_beta")
 
     _assert_refused_before_anything_was_claimed_or_sent(
-        response, dashboard, [decoy, *gateways.values()], outgoing, claims
+        response, dashboard, [moved, *gateways.values()], outgoing, claims
     )
 
 
@@ -937,28 +920,21 @@ NOT_A_PORT = "placeholder-not-a-port"
 
 
 @pytest.mark.parametrize(
-    "default_config,beta_config",
+    "profile",
     [
-        pytest.param(None, {"platforms": {"api_server": {"extra": {"port": NOT_A_PORT}}}}, id="target-extra-port"),
-        pytest.param(None, {"gateway": {"api_server": {"port": NOT_A_PORT}}}, id="target-gateway-port"),
-        pytest.param(
-            {"gateway": {"multiplex_profiles": True, "api_server": {"port": NOT_A_PORT}}},
-            None,
-            id="multiplexed-default-port",
-        ),
+        pytest.param("worker_beta", id="multiplexed-default-port"),
+        pytest.param("default", id="default-profile-port"),
     ],
 )
 def test_explicit_port_that_is_not_an_integer_is_refused_instead_of_using_8642(
-    dashboard, stubs, monkeypatch, scopes_after_key, outgoing, claims, default_config, beta_config
+    dashboard, stubs, monkeypatch, scopes_after_key, outgoing, claims, profile
 ):
     gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    if default_config is not None:
-        _write_config(dashboard.homes["default"], default_config)
-    if beta_config is not None:
-        _write_config(dashboard.homes["worker_beta"], beta_config)
+    _write_config(dashboard.homes["default"], {"gateway": {"multiplex_profiles": True, "api_server": {"port": NOT_A_PORT}}})
     (dashboard.homes["worker_beta"] / ".env").write_text(f"API_SERVER_KEY={BETA_KEY}\n", encoding="utf-8")
+    _record_served(dashboard.homes, "worker_beta")
 
-    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
+    response = _post_leaving_no_trace(dashboard, scopes_after_key, profile)
 
     _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
 
@@ -966,29 +942,34 @@ def test_explicit_port_that_is_not_an_integer_is_refused_instead_of_using_8642(
 def test_resolving_another_profile_never_changes_the_dashboard_environment_other_threads_see(
     dashboard, stubs, monkeypatch
 ):
-    import gateway.config as gateway_config
-    from hermes_constants import get_hermes_home
+    from agent import secret_scope
 
     gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
     monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "0")
-    (dashboard.homes["worker_beta"] / ".env").write_text("GATEWAY_MULTIPLEX_PROFILES=1\n", encoding="utf-8")
+    (dashboard.homes["worker_beta"] / ".env").write_text(
+        f"GATEWAY_MULTIPLEX_PROFILES=1\nAPI_SERVER_KEY={BETA_KEY}\n", encoding="utf-8"
+    )
+    _record_served(dashboard.homes, "worker_beta")
     beta_in_flight, other_thread_done = threading.Event(), threading.Event()
-    validate = gateway_config._validate_gateway_config
+    load_env_file = secret_scope.load_env_file
+    paused = []
 
-    def validate_then_pause_while_loading_worker_beta(config):
-        validate(config)
-        if get_hermes_home() == dashboard.homes["worker_beta"]:
+    def load_then_pause_while_loading_worker_beta(path):
+        values = load_env_file(path)
+        if path.parent == dashboard.homes["worker_beta"]:
+            paused.append(path.name)
             beta_in_flight.set()
             assert other_thread_done.wait(timeout=60)
+        return values
 
-    monkeypatch.setattr(gateway_config, "_validate_gateway_config", validate_then_pause_while_loading_worker_beta)
+    monkeypatch.setattr(secret_scope, "load_env_file", load_then_pause_while_loading_worker_beta)
     answer = []
 
     def resend():
         try:
             answer.append(_post(dashboard, "owner", profile="worker_beta"))
         finally:
-            beta_in_flight.set()  # the resolver never loaded worker_beta in this process
+            beta_in_flight.set()  # never left waiting when worker_beta's secrets were not loaded
 
     request = threading.Thread(target=resend)
     request.start()
@@ -999,30 +980,15 @@ def test_resolving_another_profile_never_changes_the_dashboard_environment_other
     request.join(timeout=60)
 
     assert not request.is_alive()
+    assert paused  # the other thread looked while worker_beta's secrets were loading in this process
     assert (seen_by_other_thread, os.environ.get("PLACEHOLDER_CONCURRENT_UPDATE")) == ("0", "placeholder-update")
     assert os.environ.get("GATEWAY_MULTIPLEX_PROFILES") == "0"
     assert answer[0].status_code == 200
-    assert len(gateways["worker_beta"].requests) == 1
-    sent = gateways["worker_beta"].requests[0]
-    assert sent["target"] == RESEND_PATH
+    assert len(gateways["default"].requests) == 1
+    sent = gateways["default"].requests[0]
+    assert sent["target"] == f"/p/worker_beta{RESEND_PATH}"
     assert sent["headers"]["authorization"] == f"Bearer {BETA_KEY}"
-    assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
-
-
-def test_multiplexed_profile_key_reference_the_gateway_leaves_unexpanded_is_refused(
-    dashboard, stubs, monkeypatch, scopes_after_key, outgoing, claims
-):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "1")
-    monkeypatch.delenv("PLACEHOLDER_MISSING_SECRET", raising=False)
-    (dashboard.homes["worker_alpha"] / ".env").write_text(
-        f"API_SERVER_PORT={gateways['worker_alpha'].port}\nAPI_SERVER_KEY=${{env:PLACEHOLDER_MISSING_SECRET}}\n",
-        encoding="utf-8",
-    )
-
-    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_alpha")
-
-    _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
+    assert gateways["worker_alpha"].requests == [] and gateways["worker_beta"].requests == []
 
 
 def _break_settings_file(home, name, damage, port):
@@ -1037,148 +1003,28 @@ def _break_settings_file(home, name, damage, port):
 
 
 @pytest.mark.parametrize(
-    "profile,name,damage,multiplexed",
+    "profile,name,damage",
     [
-        pytest.param("worker_alpha", "config.yaml", "malformed", False, id="malformed-target-config"),
-        pytest.param("worker_alpha", "config.yaml", "unreadable", False, id="unreadable-target-config"),
-        pytest.param("worker_alpha", "gateway.json", "malformed", False, id="malformed-target-gateway-json"),
-        pytest.param("worker_alpha", ".env", "unreadable", False, id="unreadable-target-dotenv"),
-        pytest.param("worker_alpha", ".env", "unreadable", True, id="unreadable-multiplexed-target-dotenv"),
-        pytest.param("default", "config.yaml", "malformed", False, id="malformed-own-config"),
-        pytest.param("default", "config.yaml", "unreadable", False, id="unreadable-own-config"),
+        pytest.param("worker_alpha", ".env", "unreadable", id="unreadable-multiplexed-target-dotenv"),
+        pytest.param("default", "config.yaml", "malformed", id="malformed-own-config"),
+        pytest.param("default", "config.yaml", "unreadable", id="unreadable-own-config"),
+        pytest.param("default", "gateway.json", "malformed", id="malformed-own-gateway-json"),
+        pytest.param("default", "gateway.json", "unreadable", id="unreadable-own-gateway-json"),
     ],
 )
 def test_settings_that_cannot_be_read_or_parsed_are_refused_instead_of_using_8642(
-    dashboard, stubs, monkeypatch, outgoing, claims, profile, name, damage, multiplexed
+    dashboard, stubs, monkeypatch, outgoing, claims, profile, name, damage
 ):
     gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    if multiplexed:
-        monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "1")
+    _record_served(dashboard.homes, "worker_alpha")
     home = dashboard.homes[profile]
-    if profile == "worker_alpha" and name != ".env":
-        (home / ".env").write_text(f"API_SERVER_KEY={WORKER_KEY}\n", encoding="utf-8")
-    elif profile == "worker_alpha":
+    if profile == "worker_alpha":
         _write_config(home, {"platforms": {"api_server": {"extra": {"key": WORKER_KEY}}}})
     _break_settings_file(home, name, damage, gateways[profile].port)
 
     response = _post(dashboard, "owner", profile=profile)
 
     _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
-
-
-def _point_worker_beta_at_the_managed_scope_only(dashboard):
-    """worker_beta: only a usable key in its own .env, no port of its own anywhere."""
-    _write_config(dashboard.homes["worker_beta"], {})
-    (dashboard.homes["worker_beta"] / ".env").write_text(f"API_SERVER_KEY={BETA_KEY}\n", encoding="utf-8")
-
-
-@pytest.mark.parametrize("damage", ["malformed", "unreadable", "not-a-mapping"])
-def test_managed_config_that_cannot_be_read_or_parsed_to_a_mapping_is_refused_instead_of_using_8642(
-    dashboard, stubs, monkeypatch, managed_dir, outgoing, claims, damage
-):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    pinned = stubs()  # where the administrator's managed config puts worker_beta's gateway
-    _point_worker_beta_at_the_managed_scope_only(dashboard)
-    if damage == "not-a-mapping":
-        managed = [{"gateway": {"api_server": {"port": pinned.port}}}]
-        (managed_dir / "config.yaml").write_text(yaml.safe_dump(managed), encoding="utf-8")
-    else:
-        _break_settings_file(managed_dir, "config.yaml", damage, pinned.port)
-
-    response = _post(dashboard, "owner", profile="worker_beta")
-
-    _assert_refused_before_anything_was_claimed_or_sent(
-        response, dashboard, [pinned, *gateways.values()], outgoing, claims
-    )
-
-
-@pytest.mark.parametrize(
-    "managed_config,reaches_pinned",
-    [
-        pytest.param(
-            lambda port: yaml.safe_dump({"gateway": {"api_server": {"port": port}}}), True, id="managed-literal-port"
-        ),
-        pytest.param(None, False, id="no-managed-config"),
-        pytest.param(lambda port: "", False, id="empty-managed-config"),
-    ],
-)
-def test_managed_config_that_loads_is_honored_and_an_absent_port_still_means_8642(
-    dashboard, stubs, monkeypatch, managed_dir, scopes_after_key, request, managed_config, reaches_pinned
-):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    pinned = stubs()
-    _point_worker_beta_at_the_managed_scope_only(dashboard)
-    if managed_config is not None:
-        (managed_dir / "config.yaml").write_text(managed_config(pinned.port), encoding="utf-8")
-    outgoing = None if reaches_pinned else request.getfixturevalue("outgoing")  # 8642 is captured, never reached
-
-    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
-
-    if reaches_pinned:
-        assert response.status_code == 200
-        assert len(pinned.requests) == 1
-        sent = pinned.requests[0]
-        assert sent["method"] == "POST" and sent["target"] == RESEND_PATH
-        assert sent["headers"]["authorization"] == f"Bearer {BETA_KEY}"
-    else:
-        assert response.status_code == 503
-        assert outgoing == [("POST", 8642, RESEND_PATH)]
-        assert pinned.requests == []
-    assert all(stub.requests == [] for stub in gateways.values())
-
-
-def test_managed_dotenv_moves_another_profiles_listener_as_its_gateway_startup_does(
-    dashboard, stubs, monkeypatch, managed_dir, scopes_after_key
-):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    local = gateways["worker_beta"]  # worker_beta's own config.yaml: this port and BETA_KEY
-    pinned = stubs()  # where the administrator's managed .env moves worker_beta's gateway
-    managed_dotenv = f"API_SERVER_PORT={pinned.port}\nAPI_SERVER_KEY={BETA_KEY}\n"
-
-    # The control first (no managed .env), then the same profile with it: only that layer differs.
-    for dotenv, reached, idle in ((None, local, pinned), (managed_dotenv, pinned, local)):
-        if dotenv is not None:
-            (managed_dir / ".env").write_text(dotenv, encoding="utf-8")
-        scopes_after_key.clear()
-
-        response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
-
-        assert response.status_code == 200
-        assert len(reached.requests) == 1
-        sent = reached.requests.pop()
-        assert sent["method"] == "POST" and sent["target"] == RESEND_PATH
-        assert sent["headers"]["authorization"] == f"Bearer {BETA_KEY}"
-        assert idle.requests == []
-        assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
-
-
-@pytest.mark.parametrize(
-    "leaf,managed_dotenv",
-    [
-        pytest.param(
-            "port", "API_SERVER_PORT=${" + MANAGED_REF_NAME + "}\nAPI_SERVER_KEY=" + BETA_KEY + "\n",
-            id="managed-port-ref",
-        ),
-        pytest.param("key", "API_SERVER_KEY=${" + MANAGED_REF_NAME + "}\n", id="managed-key-ref"),
-        pytest.param(None, None, id="unreadable-managed-dotenv"),
-    ],
-)
-def test_managed_dotenv_that_cannot_be_resolved_as_the_gateway_does_is_refused(
-    dashboard, stubs, monkeypatch, managed_dir, outgoing, claims, leaf, managed_dotenv
-):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    decoy = stubs()  # what this dashboard's own environment would expand the reference to
-    monkeypatch.setenv(MANAGED_REF_NAME, str(decoy.port) if leaf == "port" else DEFAULT_KEY)
-    if managed_dotenv is None:
-        _break_settings_file(managed_dir, ".env", "unreadable", decoy.port)
-    else:
-        (managed_dir / ".env").write_text(managed_dotenv, encoding="utf-8")
-
-    response = _post(dashboard, "owner", profile="worker_beta")
-
-    _assert_refused_before_anything_was_claimed_or_sent(
-        response, dashboard, [decoy, *gateways.values()], outgoing, claims
-    )
 
 
 @pytest.mark.parametrize(
@@ -1192,6 +1038,7 @@ def test_managed_dotenv_that_cannot_be_resolved_as_the_gateway_does_is_refused(
 )
 def test_profile_dotenv_key_in_valid_dotenv_syntax_is_the_bearer(dashboard, stubs, monkeypatch, key_line):
     gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    _record_served(dashboard.homes, "worker_alpha")
     (dashboard.homes["worker_alpha"] / ".env").write_text(
         f"API_SERVER_PORT={gateways['worker_alpha'].port}\n{key_line}\n", encoding="utf-8"
     )
@@ -1199,42 +1046,16 @@ def test_profile_dotenv_key_in_valid_dotenv_syntax_is_the_bearer(dashboard, stub
     response = _post(dashboard, "owner", profile="worker_alpha")
 
     assert response.status_code == 200
-    assert len(gateways["worker_alpha"].requests) == 1
-    assert gateways["worker_alpha"].requests[0]["headers"]["authorization"] == f"Bearer {WORKER_KEY}"
-    assert gateways["default"].requests == [] and gateways["worker_beta"].requests == []
-
-
-@pytest.mark.parametrize(
-    "port_lines",
-    [
-        pytest.param("export API_SERVER_PORT={port}", id="exported"),
-        pytest.param("API_SERVER_PORT={port} # placeholder port", id="unquoted-comment"),
-        pytest.param('API_SERVER_PORT="{port}" # placeholder port', id="double-quoted-comment"),
-        pytest.param("API_SERVER_PORT={default_port}\nAPI_SERVER_PORT={port}", id="last-assignment-wins"),
-    ],
-)
-def test_profile_dotenv_port_in_valid_dotenv_syntax_reaches_only_its_own_gateway(
-    dashboard, stubs, monkeypatch, port_lines
-):
-    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
-    port_lines = port_lines.format(port=gateways["worker_alpha"].port, default_port=gateways["default"].port)
-    (dashboard.homes["worker_alpha"] / ".env").write_text(
-        f"{port_lines}\nAPI_SERVER_KEY={WORKER_KEY}\n", encoding="utf-8"
-    )
-
-    response = _post(dashboard, "owner", profile="worker_alpha")
-
-    assert response.status_code == 200
-    assert len(gateways["worker_alpha"].requests) == 1
-    sent = gateways["worker_alpha"].requests[0]
-    assert sent["method"] == "POST" and sent["target"] == RESEND_PATH
+    assert len(gateways["default"].requests) == 1
+    sent = gateways["default"].requests[0]
+    assert sent["target"] == f"/p/worker_alpha{RESEND_PATH}"
     assert sent["headers"]["authorization"] == f"Bearer {WORKER_KEY}"
-    assert gateways["default"].requests == [] and gateways["worker_beta"].requests == []
+    assert gateways["worker_alpha"].requests == [] and gateways["worker_beta"].requests == []
 
 
 def test_key_never_appears_in_any_answer_or_log_line(dashboard, stubs, every_log_line):
     stub = stubs()
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
     answers = []
 
     answers.append(_post(dashboard, "owner"))
@@ -1250,7 +1071,7 @@ def test_key_never_appears_in_any_answer_or_log_line(dashboard, stubs, every_log
     answers.append(_post(dashboard, "owner"))
     assert answers[-1].status_code == 202
 
-    _point_worker_alpha(dashboard.homes, _free_port())
+    _serve_worker_alpha(dashboard.homes, _free_port())
     answers.append(_post(dashboard, "owner"))
     assert answers[-1].status_code == 503
 
@@ -1279,7 +1100,7 @@ def test_key_never_appears_in_any_answer_or_log_line(dashboard, stubs, every_log
 )
 def test_execution_id_stays_one_path_segment(dashboard, stubs, execution_id):
     stub = stubs()
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
     forwarder = dashboard.web_server._forward_cron_resend_to_gateway
 
     loop = asyncio.new_event_loop()
@@ -1292,7 +1113,7 @@ def test_execution_id_stays_one_path_segment(dashboard, stubs, execution_id):
     assert result[0] == 200
     assert len(stub.requests) == 1
     target = stub.requests[0]["target"]
-    prefix, suffix = "/api/cron/executions/", "/resend"
+    prefix, suffix = "/p/worker_alpha/api/cron/executions/", "/resend"
     assert target.startswith(prefix) and target.endswith(suffix)
     assert "?" not in target and "#" not in target
     segment = target[len(prefix) : -len(suffix)]
@@ -1314,15 +1135,15 @@ def test_execution_id_stays_one_path_segment(dashboard, stubs, execution_id):
 )
 def test_encoded_ids_through_the_route_stay_one_segment(dashboard, stubs, raw_segment, execution_id):
     stub = stubs()
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
 
     response = _post(dashboard, "owner", path=f"/api/cron/executions/{raw_segment}/resend")
 
     assert response.status_code == 200
     assert len(stub.requests) == 1
     target = stub.requests[0]["target"]
-    assert target.startswith("/api/cron/executions/") and target.endswith("/resend")
-    segment = target[len("/api/cron/executions/") : -len("/resend")]
+    assert target.startswith("/p/worker_alpha/api/cron/executions/") and target.endswith("/resend")
+    segment = target[len("/p/worker_alpha/api/cron/executions/") : -len("/resend")]
     assert "/" not in segment and "?" not in target and "#" not in target
     assert segment not in (".", "..")
     assert unquote(segment) == execution_id
@@ -1330,7 +1151,7 @@ def test_encoded_ids_through_the_route_stay_one_segment(dashboard, stubs, raw_se
 
 def test_unknown_profile_is_404_before_anything_is_sent_or_audited(dashboard, stubs):
     stub = stubs()
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
 
     response = _post(dashboard, "automations", profile="ghost")
 
@@ -1342,7 +1163,7 @@ def test_unknown_profile_is_404_before_anything_is_sent_or_audited(dashboard, st
 
 def test_invalid_profile_name_is_400_before_anything_is_sent_or_audited(dashboard, stubs):
     stub = stubs()
-    _point_worker_alpha(dashboard.homes, stub.port)
+    _serve_worker_alpha(dashboard.homes, stub.port)
 
     response = _post(dashboard, "automations", profile="Bad Name!")
 
