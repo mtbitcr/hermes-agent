@@ -13219,24 +13219,6 @@ def _fire_cron_job_for_profile(
         reset_hermes_home_override(token)
 
 
-def _profile_env_value(home: Path, key: str) -> str:
-    """Best-effort read of one KEY=VALUE line from a profile's .env file."""
-    try:
-        env_path = home / ".env"
-        if not env_path.is_file():
-            return ""
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            if k.strip() == key:
-                return v.strip().strip('"').strip("'")
-    except Exception:
-        pass
-    return ""
-
-
 def _port_in_profile_env(loaded: Any, home: Path) -> Any:
     """Another profile's config port with ``${...}`` expanded in its own env.
 
@@ -13340,10 +13322,14 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
     except Exception:
         port = 0
     if not port:
+        # Another profile's .env is parsed the way its gateway loads it (export
+        # prefix, inline comments, quotes; the last assignment wins).
+        from agent.secret_scope import load_env_file
+
         raw = (
             _os.getenv("API_SERVER_PORT", "")
             if profile == _cron_default_profile()
-            else _profile_env_value(home, "API_SERVER_PORT")
+            else load_env_file(home / ".env").get("API_SERVER_PORT", "")
         )
         try:
             port = int(raw) if raw else 0

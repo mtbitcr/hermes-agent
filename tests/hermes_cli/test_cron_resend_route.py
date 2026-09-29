@@ -773,6 +773,34 @@ def test_profile_dotenv_key_in_valid_dotenv_syntax_is_the_bearer(dashboard, stub
     assert gateways["default"].requests == [] and gateways["worker_beta"].requests == []
 
 
+@pytest.mark.parametrize(
+    "port_lines",
+    [
+        pytest.param("export API_SERVER_PORT={port}", id="exported"),
+        pytest.param("API_SERVER_PORT={port} # placeholder port", id="unquoted-comment"),
+        pytest.param('API_SERVER_PORT="{port}" # placeholder port', id="double-quoted-comment"),
+        pytest.param("API_SERVER_PORT={default_port}\nAPI_SERVER_PORT={port}", id="last-assignment-wins"),
+    ],
+)
+def test_profile_dotenv_port_in_valid_dotenv_syntax_reaches_only_its_own_gateway(
+    dashboard, stubs, monkeypatch, port_lines
+):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    port_lines = port_lines.format(port=gateways["worker_alpha"].port, default_port=gateways["default"].port)
+    (dashboard.homes["worker_alpha"] / ".env").write_text(
+        f"{port_lines}\nAPI_SERVER_KEY={WORKER_KEY}\n", encoding="utf-8"
+    )
+
+    response = _post(dashboard, "owner", profile="worker_alpha")
+
+    assert response.status_code == 200
+    assert len(gateways["worker_alpha"].requests) == 1
+    sent = gateways["worker_alpha"].requests[0]
+    assert sent["method"] == "POST" and sent["target"] == RESEND_PATH
+    assert sent["headers"]["authorization"] == f"Bearer {WORKER_KEY}"
+    assert gateways["default"].requests == [] and gateways["worker_beta"].requests == []
+
+
 def test_key_never_appears_in_any_answer_or_log_line(dashboard, stubs, every_log_line):
     stub = stubs()
     _point_worker_alpha(dashboard.homes, stub.port)
