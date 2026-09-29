@@ -9,6 +9,7 @@ here is a local stub; every key and id is a placeholder.
 import asyncio
 import json
 import logging
+import os
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -574,6 +575,148 @@ def test_no_key_means_no_authorization_header_and_gateway_401_passes(dashboard, 
     assert response.json() == GATEWAY_AUTH_FAILED
     assert len(stub.requests) == 1
     assert "authorization" not in stub.requests[0]["headers"]
+
+
+KEY_REF_NAME = "PLACEHOLDER_GATEWAY_KEY_REF"
+KEY_REFS = [
+    pytest.param("${API_SERVER_KEY}", "API_SERVER_KEY", id="bare-ref"),
+    pytest.param("${env:" + KEY_REF_NAME + "}", KEY_REF_NAME, id="env-ref"),
+]
+
+
+def _point_every_gateway(dashboard, stubs, monkeypatch, **beta_stub):
+    """Every profile on its own stub, as in the own-key test; the dashboard env holds DEFAULT_KEY."""
+    gateways = {"default": stubs(), "worker_alpha": stubs(), "worker_beta": stubs(**beta_stub)}
+    _point_default(dashboard.homes, monkeypatch, gateways["default"].port)
+    _point_worker_alpha(dashboard.homes, gateways["worker_alpha"].port)
+    _point_worker_beta(dashboard.homes, gateways["worker_beta"].port)
+    return gateways
+
+
+def _point_worker_beta_key_ref(homes, port, ref, dotenv):
+    """worker_beta: port in config.yaml, key there as a ``${...}`` reference, and its own .env."""
+    config = {
+        "model": "test-model",
+        "platforms": {"api_server": {"extra": {"port": port, "key": ref}}},
+    }
+    (homes["worker_beta"] / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    (homes["worker_beta"] / ".env").write_text(dotenv, encoding="utf-8")
+
+
+@pytest.fixture()
+def scopes_after_key(dashboard, monkeypatch):
+    """The secret scope left in the forwarder's own context after each key resolution."""
+    from agent.secret_scope import current_secret_scope
+
+    resolve = dashboard.web_server._gateway_api_key
+    seen = []
+
+    def resolve_and_record(profile, home):
+        key = resolve(profile, home)
+        seen.append(current_secret_scope())
+        return key
+
+    monkeypatch.setattr(dashboard.web_server, "_gateway_api_key", resolve_and_record)
+    return seen
+
+
+def _post_leaving_no_trace(dashboard, scopes_after_key, profile):
+    """Post as the owner; the request must change no environment and leave no secret scope."""
+    from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+    environ = dict(os.environ)
+    assert not is_multiplex_active()
+
+    response = _post(dashboard, "owner", profile=profile)
+
+    assert dict(os.environ) == environ
+    assert not is_multiplex_active()
+    assert current_secret_scope() is None
+    assert scopes_after_key == [None]
+    return response
+
+
+@pytest.mark.parametrize("ref,name", KEY_REFS)
+def test_config_key_reference_resolves_from_the_target_profiles_own_secrets(
+    dashboard, stubs, monkeypatch, scopes_after_key, ref, name
+):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    monkeypatch.setenv(name, DEFAULT_KEY)
+    _point_worker_beta_key_ref(dashboard.homes, gateways["worker_beta"].port, ref, f"{name}={BETA_KEY}\n")
+
+    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
+
+    assert response.status_code == 200
+    assert len(gateways["worker_beta"].requests) == 1
+    assert gateways["worker_beta"].requests[0]["headers"]["authorization"] == f"Bearer {BETA_KEY}"
+    assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
+
+
+@pytest.mark.parametrize("ref,name", KEY_REFS)
+def test_missing_target_reference_sends_no_key_and_the_gateway_401_passes(
+    dashboard, stubs, monkeypatch, scopes_after_key, ref, name
+):
+    gateways = _point_every_gateway(
+        dashboard, stubs, monkeypatch, status=401, body=_aiohttp_bytes(GATEWAY_AUTH_FAILED)
+    )
+    monkeypatch.setenv(name, DEFAULT_KEY)
+    _point_worker_beta_key_ref(
+        dashboard.homes, gateways["worker_beta"].port, ref, "PLACEHOLDER_UNRELATED=placeholder-value\n"
+    )
+
+    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
+
+    assert response.status_code == 401
+    assert response.content == _aiohttp_bytes(GATEWAY_AUTH_FAILED)
+    assert response.headers["content-type"] == JSON_TYPE
+    assert len(gateways["worker_beta"].requests) == 1
+    sent = gateways["worker_beta"].requests[0]
+    assert "authorization" not in sent["headers"]
+    assert DEFAULT_KEY not in repr(sent) and "${" not in repr(sent)
+    assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
+
+
+def test_missing_target_reference_falls_back_to_the_target_profiles_own_env_key(
+    dashboard, stubs, monkeypatch, scopes_after_key
+):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    monkeypatch.setenv(KEY_REF_NAME, DEFAULT_KEY)
+    _point_worker_beta_key_ref(
+        dashboard.homes,
+        gateways["worker_beta"].port,
+        "${env:" + KEY_REF_NAME + "}",
+        f"API_SERVER_KEY={BETA_KEY}\n",
+    )
+
+    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
+
+    assert response.status_code == 200
+    assert len(gateways["worker_beta"].requests) == 1
+    assert gateways["worker_beta"].requests[0]["headers"]["authorization"] == f"Bearer {BETA_KEY}"
+    assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
+
+
+@pytest.mark.parametrize(
+    "key_line",
+    [
+        pytest.param(f"export API_SERVER_KEY={WORKER_KEY}", id="exported"),
+        pytest.param(f'API_SERVER_KEY="{WORKER_KEY}" # placeholder comment', id="double-quoted-comment"),
+        pytest.param(f"API_SERVER_KEY='{WORKER_KEY}'  # placeholder comment", id="single-quoted-comment"),
+        pytest.param(f"API_SERVER_KEY={WORKER_KEY} # placeholder comment", id="unquoted-comment"),
+    ],
+)
+def test_profile_dotenv_key_in_valid_dotenv_syntax_is_the_bearer(dashboard, stubs, monkeypatch, key_line):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    (dashboard.homes["worker_alpha"] / ".env").write_text(
+        f"API_SERVER_PORT={gateways['worker_alpha'].port}\n{key_line}\n", encoding="utf-8"
+    )
+
+    response = _post(dashboard, "owner", profile="worker_alpha")
+
+    assert response.status_code == 200
+    assert len(gateways["worker_alpha"].requests) == 1
+    assert gateways["worker_alpha"].requests[0]["headers"]["authorization"] == f"Bearer {WORKER_KEY}"
+    assert gateways["default"].requests == [] and gateways["worker_beta"].requests == []
 
 
 def test_key_never_appears_in_any_answer_or_log_line(dashboard, stubs, every_log_line):

@@ -13360,41 +13360,74 @@ async def _forward_cron_fire_to_gateway(
     return resp.status_code, body
 
 
+class _TargetProfileSecretScope(dict):
+    """Another profile's secret scope that fails closed with multiplexing off.
+
+    ``get_secret`` falls back to ``os.environ`` when an installed scope lacks
+    a name, which would expand a ``${VAR}`` in the target's config with the
+    dashboard's own value. A name the target lacks reads back as its own
+    unresolved ``${NAME}`` placeholder instead.
+    """
+
+    def get(self, name, default=None):
+        value = super().get(name)
+        return "${%s}" % name if value is None else value
+
+
 def _gateway_api_key(profile: str, home: Path) -> str:
     """Resolve the TARGET profile's own gateway api_server key.
 
     Load order mirrors the port in :func:`_gateway_fire_endpoint` (and the
     adapter's ``extra.get("key", API_SERVER_KEY)``): ``platforms.api_server.
-    extra.key`` in the profile's config.yaml, then ``API_SERVER_KEY`` (process
-    env for the active profile, the profile's own .env otherwise). Empty when
-    none is configured.
+    extra.key`` in the profile's config.yaml, then ``API_SERVER_KEY``. The
+    active profile reads both from the process env; any other profile only
+    from its own secrets (``build_profile_secret_scope``: its .env and
+    external sources), where a config reference they lack counts as no
+    config key. Empty when none is configured.
     """
     import os as _os
 
+    own_profile = profile == _cron_default_profile()
+    secrets: Dict[str, str] = {}
     key = ""
     try:
+        from agent.secret_scope import (
+            build_profile_secret_scope,
+            reset_secret_scope,
+            set_secret_scope,
+        )
         from hermes_constants import (
             reset_hermes_home_override,
             set_hermes_home_override,
         )
 
-        token = set_hermes_home_override(str(home))
+        scope_token = None
+        if not own_profile:
+            secrets = build_profile_secret_scope(home)
+            scope_token = set_secret_scope(_TargetProfileSecretScope(secrets))
         try:
-            profile_cfg = load_config()
+            token = set_hermes_home_override(str(home))
+            try:
+                profile_cfg = load_config()
+            finally:
+                reset_hermes_home_override(token)
         finally:
-            reset_hermes_home_override(token)
+            if scope_token is not None:
+                reset_secret_scope(scope_token)
         raw = cfg_get(
             profile_cfg, "platforms", "api_server", "extra", "key", default=None
         )
         if raw:
             key = str(raw).strip()
+        if not own_profile and "${" in key:
+            key = ""  # an unresolved reference is never sent as the bearer
     except Exception:
         key = ""
     if not key:
         key = (
             _os.getenv("API_SERVER_KEY", "")
-            if profile == _cron_default_profile()
-            else _profile_env_value(home, "API_SERVER_KEY")
+            if own_profile
+            else str(secrets.get("API_SERVER_KEY") or "")
         ).strip()
     return key
 
