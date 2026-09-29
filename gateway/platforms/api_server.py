@@ -5908,6 +5908,11 @@ except ImportError:
         pass
 
 
+# How long a cron re-send request waits for its sends before answering 202; the sends carry on
+# and record their own result, which the run history shows.
+CRON_RESEND_WAIT_SECONDS = 25.0
+
+
 def _notify_cron_provider_jobs_changed() -> None:
     """Tell the active cron scheduler provider the job set changed after a REST
     mutation (no-op for the built-in). Best-effort — never breaks the handler."""
@@ -6846,6 +6851,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
+            routes.append(
+                ("POST", "/api/cron/executions/{execution_id}/resend", self._handle_cron_resend)
+            )
         return routes
 
     # ------------------------------------------------------------------
@@ -11857,6 +11865,101 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
             return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
+
+    async def _handle_cron_resend(self, request: "web.Request") -> "web.Response":
+        """POST /api/cron/executions/{execution_id}/resend — send a run's failed chats again.
+
+        Authenticated by the URL-selected profile's API_SERVER_KEY, and closed without one. One
+        compare-and-set write claims the run's failed chats (``claim_report_resend``); the saved
+        text then goes through the live delivery function with the adapter map scheduled fires use
+        (``resend_report``). The job never runs. 200 carries the attempt's result; 202 means the
+        sends outlast CRON_RESEND_WAIT_SECONDS and carry on, recording their own result. Answers
+        and log lines carry reason codes only: never a chat address, a key or report text.
+        """
+        from cron.delivery_record import MAX_REQUEST_ID_CHARS
+        from cron.scheduler import claim_report_resend, resend_adapters, resend_answer, resend_report
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._expected_api_key():
+            # _check_auth admits a keyless default listener for local wiring; a route that sends
+            # to chats never does.
+            return web.json_response(
+                {"error": {"message": "Invalid gateway API key (API_SERVER_KEY)", "type": "gateway_auth_error", "code": "gateway_auth_failed"}},
+                status=401,
+            )
+        runner = self.gateway_runner or request.app.get("gateway_runner")
+        if runner is None:
+            from gateway.run import _gateway_runner_ref
+
+            runner = _gateway_runner_ref()
+        if runner is None or getattr(runner, "_draining", False) or getattr(
+            runner, "_external_drain_active", False
+        ):
+            # Only a running gateway holds the live connections: nothing is claimed or sent.
+            return web.json_response({"detail": {"code": "gateway_unavailable"}}, status=503)
+
+        def in_progress() -> "web.Response":
+            # A fixed status: the caller's request id and path values are never echoed.
+            return web.json_response({"state": "in_progress"}, status=202)
+
+        with _reserve_pending_api_work(self) as reservation:
+            try:
+                body = await request.json()
+            except Exception:
+                body = None
+            request_id = body.get("request_id") if isinstance(body, dict) else None
+            if not isinstance(request_id, str) or not 0 < len(request_id) <= MAX_REQUEST_ID_CHARS:
+                return web.json_response({"detail": {"code": "invalid_request_id"}}, status=400)
+            execution_id = request.match_info["execution_id"]
+            try:
+                claim = await asyncio.to_thread(claim_report_resend, execution_id, request_id)
+            except Exception as exc:
+                # The path's execution id is caller-controlled: never logged.
+                logger.error("cron re-send could not be claimed: %s", type(exc).__name__)
+                return web.json_response({"detail": {"code": "gateway_unavailable"}}, status=503)
+            if claim is None:
+                return web.json_response({"detail": {"code": "not_found"}}, status=404)
+            attempt = claim["attempt"]
+            if attempt is None:
+                return web.json_response(
+                    {"detail": {"code": "not_eligible", "reason": claim["reason"]}}, status=409
+                )
+            if claim["claimed"]:
+                task = asyncio.create_task(
+                    asyncio.to_thread(
+                        resend_report,
+                        execution_id,
+                        attempt,
+                        adapters=resend_adapters(runner),
+                        loop=asyncio.get_running_loop(),
+                    )
+                )
+                reservation["detached"] = True
+                task.add_done_callback(
+                    lambda _task: _release_pending_api_work(self, reservation)
+                )
+                try:
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                except (TypeError, AttributeError):
+                    pass
+                try:
+                    # Shielded: the sends outlive this request, never cut off mid-send.
+                    refusal = await asyncio.wait_for(asyncio.shield(task), CRON_RESEND_WAIT_SECONDS)
+                except asyncio.TimeoutError:
+                    return in_progress()
+                except Exception as exc:
+                    logger.error("cron re-send failed: %s", type(exc).__name__)
+                    refusal = None
+                if refusal:
+                    return web.json_response(
+                        {"detail": {"code": "not_eligible", "reason": refusal}}, status=409
+                    )
+            # A repeated request id gets its first attempt, and never a second send.
+            answer = await asyncio.to_thread(resend_answer, execution_id, attempt["attempt_id"])
+            return web.json_response(answer) if answer is not None else in_progress()
 
 
     # ------------------------------------------------------------------
