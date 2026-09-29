@@ -13392,76 +13392,187 @@ async def _forward_cron_fire_to_gateway(
     return resp.status_code, body
 
 
-class _TargetProfileSecretScope(dict):
-    """Another profile's secret scope that fails closed with multiplexing off.
+class _ProfileOwnSecrets(dict):
+    """Another profile's own secrets, installed as its scope while its config loads.
 
     ``get_secret`` falls back to ``os.environ`` when an installed scope lacks
-    a name, which would expand a ``${VAR}`` in the target's config with the
-    dashboard's own value. A name the target lacks reads back as its own
-    unresolved ``${NAME}`` placeholder instead.
+    a name, which would hand that profile this dashboard's own value. A name
+    the profile lacks reads back as empty instead.
     """
 
     def get(self, name, default=None):
         value = super().get(name)
-        return "${%s}" % name if value is None else value
+        return "" if value is None else value
 
 
-def _gateway_api_key(profile: str, home: Path) -> str:
-    """Resolve the TARGET profile's own gateway api_server key.
+def _managed_api_server_reference(leaf: str) -> bool:
+    """True when the managed scope sets an api_server ``leaf`` as a ``${...}`` reference.
 
-    Load order mirrors the port in :func:`_gateway_fire_endpoint` (and the
-    adapter's ``extra.get("key", API_SERVER_KEY)``): ``platforms.api_server.
-    extra.key`` in the profile's config.yaml, then ``API_SERVER_KEY``. The
-    active profile reads both from the process env; any other profile only
-    from its own secrets (``build_profile_secret_scope``: its .env and
-    external sources), where a config reference they lack counts as no
-    config key. Empty when none is configured.
+    ``apply_managed_overlay`` expands those from the process environment, which
+    for another profile is this dashboard's, never that profile's own.
+    """
+    from hermes_cli import managed_scope
+    from hermes_cli.config import _ENV_REF_RE
+
+    stack = [(managed_scope.load_managed_config(), False)]
+    while stack:
+        node, in_api_server = stack.pop()
+        for name, value in node.items():
+            if isinstance(value, dict):
+                stack.append((value, in_api_server or name == "api_server"))
+            elif in_api_server and name == leaf and isinstance(value, str):
+                if _ENV_REF_RE.search(value):
+                    return True
+    return False
+
+
+def _listen_port(raw: Any) -> Optional[int]:
+    """``raw`` as a TCP port, or None when it is not an integer port."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        return None
+    try:
+        port = int(raw)
+    except ValueError:
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def _gateway_api_server(
+    profile: str, home: Path
+) -> Tuple[bool, Optional[int], Optional[str]]:
+    """``(multiplex, port, key)`` as ``profile``'s own gateway resolves its api_server.
+
+    Loaded through ``gateway.config.load_gateway_config()`` under the profile's
+    HERMES_HOME override. Another profile loads inside its own secret scope
+    (``build_profile_secret_scope``, where a missing name reads as empty) with
+    its key held back, so ``config_env._api_server`` never reads the
+    process-global ``API_SERVER_PORT`` from this process; that override is
+    then applied from the profile's own secrets and .env, as in its gateway.
+    ``os.environ`` is left as it was: GATEWAY_MULTIPLEX_PROFILES is that
+    profile's own .env value during the load, and the loader's YAML-to-env
+    writes are undone. The port is None when given but not resolvable (not
+    an integer, or a managed reference for another profile); 8642 only when
+    none is configured anywhere. The key is None when not resolvable (an
+    unexpanded reference, or a managed one) and empty when none is set.
     """
     import os as _os
 
-    own_profile = profile == _cron_default_profile()
-    secrets: Dict[str, str] = {}
-    key = ""
-    try:
-        from agent.secret_scope import (
-            build_profile_secret_scope,
-            reset_secret_scope,
-            set_secret_scope,
-        )
-        from hermes_constants import (
-            reset_hermes_home_override,
-            set_hermes_home_override,
-        )
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        load_env_file,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from gateway.config import Platform, _has_usable_api_server_key, load_gateway_config
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-        scope_token = None
+    own_profile = profile == _cron_default_profile()
+    secrets = {} if own_profile else build_profile_secret_scope(home)
+    dotenv = {} if own_profile else load_env_file(home / ".env")
+    environ = dict(_os.environ)
+    scope_token = home_token = None
+    try:
         if not own_profile:
-            secrets = build_profile_secret_scope(home)
-            scope_token = set_secret_scope(_TargetProfileSecretScope(secrets))
-        try:
-            token = set_hermes_home_override(str(home))
+            scope_token = set_secret_scope(
+                _ProfileOwnSecrets(
+                    (name, value) for name, value in secrets.items() if name != "API_SERVER_KEY"
+                )
+            )
+            _os.environ.pop("GATEWAY_MULTIPLEX_PROFILES", None)
+            if dotenv.get("GATEWAY_MULTIPLEX_PROFILES"):
+                _os.environ["GATEWAY_MULTIPLEX_PROFILES"] = dotenv["GATEWAY_MULTIPLEX_PROFILES"]
+        home_token = set_hermes_home_override(str(home))
+        config = load_gateway_config()
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+        if scope_token is not None:
+            reset_secret_scope(scope_token)
+        for name in set(_os.environ) - set(environ):
+            _os.environ.pop(name, None)
+        for name, value in environ.items():
+            if _os.environ.get(name) != value:
+                _os.environ[name] = value
+
+    platform = config.platforms.get(Platform.API_SERVER)
+    extra = dict(platform.extra) if platform is not None else {}
+    port_from_env = key_from_env = own_profile
+    if not own_profile and _has_usable_api_server_key(secrets.get("API_SERVER_KEY")):
+        # config_env._api_server: a usable key enables it, then API_SERVER_PORT
+        # replaces the configured port when it parses as an int.
+        extra["key"] = secrets["API_SERVER_KEY"]
+        key_from_env = True
+        if dotenv.get("API_SERVER_PORT"):
             try:
-                profile_cfg = load_config()
-            finally:
-                reset_hermes_home_override(token)
-        finally:
-            if scope_token is not None:
-                reset_secret_scope(scope_token)
-        raw = cfg_get(
-            profile_cfg, "platforms", "api_server", "extra", "key", default=None
+                extra["port"] = int(dotenv["API_SERVER_PORT"])
+                port_from_env = True
+            except ValueError:
+                pass
+
+    raw_port = extra.get("port")
+    if raw_port is None:
+        # The adapter's own fallback: API_SERVER_PORT in its environment.
+        raw_port = (
+            _os.environ.get("API_SERVER_PORT") if own_profile else dotenv.get("API_SERVER_PORT")
+        ) or None
+    if raw_port is None:
+        port: Optional[int] = 8642
+    elif not port_from_env and _managed_api_server_reference("port"):
+        port = None
+    else:
+        port = _listen_port(raw_port)
+
+    if "key" in extra:
+        raw_key = extra["key"]
+    else:
+        raw_key = (
+            _os.environ.get("API_SERVER_KEY") if own_profile else secrets.get("API_SERVER_KEY")
         )
-        if raw:
-            key = str(raw).strip()
-        if not own_profile and "${" in key:
-            key = ""  # an unresolved reference is never sent as the bearer
-    except Exception:
-        key = ""
-    if not key:
-        key = (
-            _os.getenv("API_SERVER_KEY", "")
-            if own_profile
-            else str(secrets.get("API_SERVER_KEY") or "")
-        ).strip()
-    return key
+    key: Optional[str] = str(raw_key or "").strip()
+    if "${" in key or (not key_from_env and _managed_api_server_reference("key")):
+        key = None  # never sent as the bearer
+    return bool(config.multiplex_profiles), port, key
+
+
+def _gateway_multiplexed() -> bool:
+    """Whether one gateway serves every profile: the default profile's own setting."""
+    _name, default_home = _cron_profile_home("default")
+    return _gateway_api_server("default", default_home)[0]
+
+
+def _gateway_api_key(profile: str, home: Path) -> Optional[str]:
+    """The key ``profile``'s gateway expects on its re-send route, or None to refuse.
+
+    A multiplexed gateway checks a ``/p/<profile>/`` request against that
+    profile's own scoped ``API_SERVER_KEY`` (``_expected_api_key``), and
+    only the default profile's against the listener's key. Otherwise it is
+    the key the profile's own gateway resolves. Empty when none is set.
+    """
+    if profile != "default" and _gateway_multiplexed():
+        from agent.secret_scope import build_profile_secret_scope
+        from gateway.config import _has_usable_api_server_key
+
+        key = str(build_profile_secret_scope(home).get("API_SERVER_KEY") or "").strip()
+        return key if _has_usable_api_server_key(key) else ""
+    return _gateway_api_server(profile, home)[2]
+
+
+def _gateway_resend_base(profile: str, home: Path) -> Optional[str]:
+    """Loopback base URL of the gateway serving ``profile``, or None to refuse.
+
+    Multiplexed: the default profile's listener, under ``/p/<profile>`` for
+    any other profile. Otherwise the profile's own listener.
+    """
+    if _gateway_multiplexed():
+        _name, default_home = _cron_profile_home("default")
+        port = _gateway_api_server("default", default_home)[1]
+        prefix = "" if profile == "default" else f"/p/{profile}"
+    else:
+        port = _gateway_api_server(profile, home)[1]
+        prefix = ""
+    if port is None:
+        return None
+    return f"http://127.0.0.1:{port}{prefix}"
 
 
 _CRON_RESEND_IN_PROGRESS = (
@@ -13487,15 +13598,21 @@ async def _forward_cron_resend_to_gateway(
     own the attempt, so that is reported as in progress, never as 503.
     """
     name, home = _cron_profile_home(profile)
-    fire_url = _gateway_fire_endpoint(name, home)
+    try:
+        base = _gateway_resend_base(name, home)
+        key = _gateway_api_key(name, home)
+    except Exception as exc:
+        base = key = None
+        _log.debug("cron re-send gateway settings failed to load (%s)", type(exc).__name__)
+    if base is None or key is None:
+        # A port or key given but not resolvable in its owner's own scope:
+        # nothing is sent, so nothing can be claimed.
+        _log.warning("cron re-send refused: the gateway's api_server port or key is unresolved")
+        return None
     # One path segment whatever the id holds: "/", "?", "#" and "%" are
     # percent-encoded, and dots too so "." / ".." cannot be normalized away.
     segment = urllib.parse.quote(str(execution_id), safe="").replace(".", "%2E")
-    url = (
-        fire_url[: -len("/api/cron/fire")]
-        + f"/api/cron/executions/{segment}/resend"
-    )
-    key = _gateway_api_key(name, home)
+    url = base + f"/api/cron/executions/{segment}/resend"
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     import httpx
 
