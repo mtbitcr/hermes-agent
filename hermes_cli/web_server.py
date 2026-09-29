@@ -12864,6 +12864,10 @@ def _list_cron_executions_for_profile(profile: str, limit: int) -> List[Dict[str
         deliveries = history_deliveries(rows)
     finally:
         reset_hermes_home_override(token)
+    for row, delivery in zip(rows, deliveries):
+        # Only a run that may be sent again is named, by the id its re-send route takes.
+        if delivery["resend"]["eligible"]:
+            delivery["resend"]["execution_id"] = str(row["id"])
     return [
         {
             "job_id": str(row.get("job_id") or ""),
@@ -13219,22 +13223,41 @@ def _fire_cron_job_for_profile(
         reset_hermes_home_override(token)
 
 
-def _profile_env_value(home: Path, key: str) -> str:
-    """Best-effort read of one KEY=VALUE line from a profile's .env file."""
-    try:
-        env_path = home / ".env"
-        if not env_path.is_file():
-            return ""
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            if k.strip() == key:
-                return v.strip().strip('"').strip("'")
-    except Exception:
-        pass
-    return ""
+def _port_in_profile_env(loaded: Any, home: Path) -> Any:
+    """Another profile's config port with ``${...}`` expanded in its own env.
+
+    ``load_config`` expands a reference from this dashboard process's
+    environment, and ``API_SERVER_PORT`` (a process-global name in
+    agent.secret_scope) from ``os.environ`` even under a secret scope. That
+    profile's gateway runs with its own .env instead, so the raw template is
+    expanded against the profile's own secrets (``build_profile_secret_scope``:
+    its .env plus external sources); a name they lack stays an unresolved
+    reference, which counts as no usable port. A value without a reference,
+    or one the managed scope pins, is returned as loaded. Call under the
+    profile's HERMES_HOME override so ``read_raw_config`` reads that
+    profile's config.yaml.
+    """
+    from hermes_cli.config import _ENV_REF_RE, _env_ref_var_name
+
+    template = cfg_get(
+        read_raw_config(), "platforms", "api_server", "extra", "port", default=None
+    )
+    if not isinstance(template, str) or not _ENV_REF_RE.search(template):
+        return loaded
+    from hermes_cli import managed_scope
+
+    if managed_scope.is_key_managed("platforms.api_server.extra.port"):
+        return loaded
+    from agent.secret_scope import build_profile_secret_scope
+
+    secrets = build_profile_secret_scope(home)
+
+    def expand(match):
+        name = _env_ref_var_name(match.group(1))
+        value = secrets.get(name) if name else None
+        return match.group(0) if value is None else str(value)
+
+    return _ENV_REF_RE.sub(expand, template)
 
 
 def _gateway_fire_endpoint(profile: str, home: Path) -> str:
@@ -13252,9 +13275,28 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
     mirrors under ``/p/<profile>/…``, so a non-default profile routes through
     the default gateway's port with that prefix; per-profile-gateway mode
     (each profile its own process/port) uses the bare path on the profile's
-    own port.
+    own port, and a ``${...}`` reference in another profile's config port
+    expands in that profile's own environment (:func:`_port_in_profile_env`),
+    never this process's.
     """
     import os as _os
+
+    multiplex = False
+    try:
+        cfg = load_config()
+        multiplex = bool(cfg_get(cfg, "gateway", "multiplex_profiles", default=False))
+        env_flag = _os.getenv("GATEWAY_MULTIPLEX_PROFILES", "").strip().lower()
+        if env_flag in {"1", "true", "yes", "on"}:
+            multiplex = True
+        elif env_flag in {"0", "false", "no", "off"}:
+            multiplex = False
+    except Exception:
+        pass
+    # Another profile's own gateway (per-profile mode) runs in that profile's
+    # environment; the dashboard's own profile shares this process's, and
+    # multiplex routing stays as it is. Decided before the HERMES_HOME
+    # override, under which the active profile would read as the target.
+    in_target_env = not multiplex and profile != _cron_default_profile()
 
     port = 0
     try:
@@ -13272,20 +13314,26 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
         token = set_hermes_home_override(str(home))
         try:
             profile_cfg = load_config()
+            raw = cfg_get(
+                profile_cfg, "platforms", "api_server", "extra", "port", default=None
+            )
+            if in_target_env:
+                raw = _port_in_profile_env(raw, home)
         finally:
             reset_hermes_home_override(token)
-        raw = cfg_get(
-            profile_cfg, "platforms", "api_server", "extra", "port", default=None
-        )
         if raw:
             port = int(raw)
     except Exception:
         port = 0
     if not port:
+        # Another profile's .env is parsed the way its gateway loads it (export
+        # prefix, inline comments, quotes; the last assignment wins).
+        from agent.secret_scope import load_env_file
+
         raw = (
             _os.getenv("API_SERVER_PORT", "")
             if profile == _cron_default_profile()
-            else _profile_env_value(home, "API_SERVER_PORT")
+            else load_env_file(home / ".env").get("API_SERVER_PORT", "")
         )
         try:
             port = int(raw) if raw else 0
@@ -13293,18 +13341,6 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
             port = 0
     if not port:
         port = 8642
-
-    multiplex = False
-    try:
-        cfg = load_config()
-        multiplex = bool(cfg_get(cfg, "gateway", "multiplex_profiles", default=False))
-        env_flag = _os.getenv("GATEWAY_MULTIPLEX_PROFILES", "").strip().lower()
-        if env_flag in {"1", "true", "yes", "on"}:
-            multiplex = True
-        elif env_flag in {"0", "false", "no", "off"}:
-            multiplex = False
-    except Exception:
-        pass
 
     if multiplex and profile != "default":
         return f"http://127.0.0.1:{port}/p/{profile}/api/cron/fire"
@@ -13358,6 +13394,162 @@ async def _forward_cron_fire_to_gateway(
     if not isinstance(body, dict):
         body = {"raw": body}
     return resp.status_code, body
+
+
+def _listen_port(raw: Any) -> Optional[int]:
+    """``raw`` as a TCP port, or None when it is not an integer port."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        return None
+    try:
+        port = int(raw)
+    except ValueError:
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def _own_gateway_api_server() -> Tuple[Optional[int], Any]:
+    """``(port, key)`` of this dashboard's own gateway listener.
+
+    Loaded in this process through ``gateway.config.load_gateway_config()``,
+    as its gateway loads them at startup: config.yaml (``gateway.api_server``
+    included), legacy gateway.json and this process's environment. The port
+    falls back as the adapter does (``API_SERVER_PORT``, then 8642) and is
+    None when given but not an integer port. Raises when config.yaml or
+    gateway.json exists but cannot be read or parsed, which the loader only
+    logs.
+    """
+    from gateway import config_loader
+    from gateway.config import Platform, load_gateway_config
+
+    home = get_hermes_home()
+    config_loader.read_yaml_layers(home)
+    gateway_json = home / "gateway.json"
+    if gateway_json.exists():
+        with open(gateway_json, encoding="utf-8") as f:
+            json.load(f)
+    platform = load_gateway_config().platforms.get(Platform.API_SERVER)
+    extra = platform.extra if platform is not None else {}
+    raw_port = extra.get("port")
+    if raw_port is None:
+        raw_port = os.environ.get("API_SERVER_PORT") or None
+    port = 8642 if raw_port is None else _listen_port(raw_port)
+    return port, extra.get("key", os.environ.get("API_SERVER_KEY", ""))
+
+
+def _gateway_resend_target(profile: str, home: Path) -> Tuple[Optional[str], Optional[str]]:
+    """``(base, key)`` for one re-send, or ``(None, None)`` to refuse it.
+
+    Only the production shape: this dashboard runs as the default profile
+    and re-sends through its own gateway listener. Another profile goes
+    there under ``/p/<profile>`` only when the live default gateway records
+    it as served, with that profile's own API_SERVER_KEY, which is what the
+    gateway checks there (``_expected_api_key``). Nothing is sent without a
+    key that passes ``has_usable_secret(min_length=16)``.
+    """
+    from hermes_cli.auth import has_usable_secret
+
+    if _cron_default_profile() != "default":
+        return None, None
+    if profile == "default":
+        port, key = _own_gateway_api_server()
+        prefix = ""
+    else:
+        from hermes_cli.gateway_multiplex_served import recorded_served_profiles
+
+        served = recorded_served_profiles()
+        if served is None or profile not in served:
+            return None, None
+        from gateway.run import _load_profile_secret_scope
+
+        port = _own_gateway_api_server()[0]
+        key = _load_profile_secret_scope(home).get("API_SERVER_KEY")
+        prefix = f"/p/{profile}"
+    if port is None or not has_usable_secret(key, min_length=16):
+        return None, None
+    return f"http://127.0.0.1:{port}{prefix}", key.strip()
+
+
+_CRON_RESEND_IN_PROGRESS = (
+    202,
+    json.dumps({"state": "in_progress"}).encode("utf-8"),
+    "application/json; charset=utf-8",
+)
+
+
+async def _forward_cron_resend_to_gateway(
+    profile: str, execution_id: str, request_id: Any
+) -> Optional[Tuple[int, bytes, Optional[str]]]:
+    """Forward an owner re-send to the gateway serving the profile, on loopback.
+
+    The gateway owns the delivery record and the live adapters, so it decides
+    eligibility and runs the re-send; the dashboard only carries the request
+    id to its own gateway listener (under ``/p/<profile>`` for another
+    profile that gateway serves, with that profile's own API_SERVER_KEY) and
+    hands the answer back unchanged.
+
+    Returns ``(status_code, body_bytes, content_type)`` from the gateway, or
+    ``None`` when the request cannot have reached it (nothing claimed — the
+    caller answers 503). Once connected with no answer the gateway may already
+    own the attempt, so that is reported as in progress, never as 503.
+    """
+    name, home = _cron_profile_home(profile)
+    try:
+        # Off the event loop: it reads config files and a profile's secrets.
+        base, key = await asyncio.to_thread(_gateway_resend_target, name, home)
+    except Exception as exc:
+        base = key = None
+        _log.debug("cron re-send gateway settings failed to load (%s)", type(exc).__name__)
+    if base is None or key is None:
+        # Not a supported shape, or its port or key is unresolved: nothing is
+        # sent, so nothing can be claimed.
+        _log.warning(
+            "cron re-send refused: no supported gateway listener with a resolved port and key"
+        )
+        return None
+    # One path segment whatever the id holds: "/", "?", "#" and "%" are
+    # percent-encoded, and dots too so "." / ".." cannot be normalized away.
+    segment = urllib.parse.quote(str(execution_id), safe="").replace(".", "%2E")
+    url = base + f"/api/cron/executions/{segment}/resend"
+    headers = {"Authorization": f"Bearer {key}"}
+    import httpx
+
+    # Log lines carry the exception class only: never the URL, the ids, the
+    # key or the gateway's words.
+    async with httpx.AsyncClient(
+        trust_env=False,
+        follow_redirects=False,
+        timeout=httpx.Timeout(45.0, connect=5.0),
+    ) as client:
+        try:
+            request = client.build_request(
+                "POST", url, json={"request_id": request_id}, headers=headers
+            )
+        except Exception as exc:
+            _log.warning(
+                "cron re-send forward could not reach the gateway (%s)",
+                type(exc).__name__,
+            )
+            return None
+        try:
+            resp = await client.send(request)
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+            httpx.UnsupportedProtocol,
+        ) as exc:
+            _log.warning(
+                "cron re-send forward could not reach the gateway (%s)",
+                type(exc).__name__,
+            )
+            return None
+        except Exception as exc:
+            _log.warning(
+                "cron re-send forward got no answer from the gateway (%s)",
+                type(exc).__name__,
+            )
+            return _CRON_RESEND_IN_PROGRESS
+    return resp.status_code, resp.content, resp.headers.get("content-type")
 
 
 def _gateway_intentionally_stopped(profile: Optional[str]) -> bool:
