@@ -963,6 +963,109 @@ def test_explicit_port_that_is_not_an_integer_is_refused_instead_of_using_8642(
     _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
 
 
+def test_resolving_another_profile_never_changes_the_dashboard_environment_other_threads_see(
+    dashboard, stubs, monkeypatch
+):
+    import gateway.config as gateway_config
+    from hermes_constants import get_hermes_home
+
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "0")
+    (dashboard.homes["worker_beta"] / ".env").write_text("GATEWAY_MULTIPLEX_PROFILES=1\n", encoding="utf-8")
+    beta_in_flight, other_thread_done = threading.Event(), threading.Event()
+    validate = gateway_config._validate_gateway_config
+
+    def validate_then_pause_while_loading_worker_beta(config):
+        validate(config)
+        if get_hermes_home() == dashboard.homes["worker_beta"]:
+            beta_in_flight.set()
+            assert other_thread_done.wait(timeout=60)
+
+    monkeypatch.setattr(gateway_config, "_validate_gateway_config", validate_then_pause_while_loading_worker_beta)
+    answer = []
+
+    def resend():
+        try:
+            answer.append(_post(dashboard, "owner", profile="worker_beta"))
+        finally:
+            beta_in_flight.set()  # the resolver never loaded worker_beta in this process
+
+    request = threading.Thread(target=resend)
+    request.start()
+    assert beta_in_flight.wait(timeout=60)
+    seen_by_other_thread = os.environ.get("GATEWAY_MULTIPLEX_PROFILES")
+    monkeypatch.setenv("PLACEHOLDER_CONCURRENT_UPDATE", "placeholder-update")
+    other_thread_done.set()
+    request.join(timeout=60)
+
+    assert not request.is_alive()
+    assert (seen_by_other_thread, os.environ.get("PLACEHOLDER_CONCURRENT_UPDATE")) == ("0", "placeholder-update")
+    assert os.environ.get("GATEWAY_MULTIPLEX_PROFILES") == "0"
+    assert answer[0].status_code == 200
+    assert len(gateways["worker_beta"].requests) == 1
+    sent = gateways["worker_beta"].requests[0]
+    assert sent["target"] == RESEND_PATH
+    assert sent["headers"]["authorization"] == f"Bearer {BETA_KEY}"
+    assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
+
+
+def test_multiplexed_profile_key_reference_the_gateway_leaves_unexpanded_is_refused(
+    dashboard, stubs, monkeypatch, scopes_after_key, outgoing, claims
+):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "1")
+    monkeypatch.delenv("PLACEHOLDER_MISSING_SECRET", raising=False)
+    (dashboard.homes["worker_alpha"] / ".env").write_text(
+        f"API_SERVER_PORT={gateways['worker_alpha'].port}\nAPI_SERVER_KEY=${{env:PLACEHOLDER_MISSING_SECRET}}\n",
+        encoding="utf-8",
+    )
+
+    response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_alpha")
+
+    _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
+
+
+def _break_settings_file(home, name, damage, port):
+    path = home / name
+    path.unlink(missing_ok=True)
+    if damage == "unreadable":  # chmod cannot stop root reading a file, but nobody can read a directory as a file
+        path.mkdir()
+    elif name == "gateway.json":
+        path.write_text('{"platforms": {"api_server": {"extra": {"port": %d}}}\n' % port, encoding="utf-8")
+    else:
+        path.write_text(f"gateway: {{api_server: {{port: {port}}}\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "profile,name,damage,multiplexed",
+    [
+        pytest.param("worker_alpha", "config.yaml", "malformed", False, id="malformed-target-config"),
+        pytest.param("worker_alpha", "config.yaml", "unreadable", False, id="unreadable-target-config"),
+        pytest.param("worker_alpha", "gateway.json", "malformed", False, id="malformed-target-gateway-json"),
+        pytest.param("worker_alpha", ".env", "unreadable", False, id="unreadable-target-dotenv"),
+        pytest.param("worker_alpha", ".env", "unreadable", True, id="unreadable-multiplexed-target-dotenv"),
+        pytest.param("default", "config.yaml", "malformed", False, id="malformed-own-config"),
+        pytest.param("default", "config.yaml", "unreadable", False, id="unreadable-own-config"),
+    ],
+)
+def test_settings_that_cannot_be_read_or_parsed_are_refused_instead_of_using_8642(
+    dashboard, stubs, monkeypatch, outgoing, claims, profile, name, damage, multiplexed
+):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    if multiplexed:
+        monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "1")
+    home = dashboard.homes[profile]
+    if profile == "worker_alpha" and name != ".env":
+        (home / ".env").write_text(f"API_SERVER_KEY={WORKER_KEY}\n", encoding="utf-8")
+    elif profile == "worker_alpha":
+        _write_config(home, {"platforms": {"api_server": {"extra": {"key": WORKER_KEY}}}})
+    _break_settings_file(home, name, damage, gateways[profile].port)
+
+    response = _post(dashboard, "owner", profile=profile)
+
+    _assert_refused_before_anything_was_claimed_or_sent(response, dashboard, gateways.values(), outgoing, claims)
+
+
 @pytest.mark.parametrize(
     "key_line",
     [
