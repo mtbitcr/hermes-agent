@@ -1127,6 +1127,60 @@ def test_managed_config_that_loads_is_honored_and_an_absent_port_still_means_864
     assert all(stub.requests == [] for stub in gateways.values())
 
 
+def test_managed_dotenv_moves_another_profiles_listener_as_its_gateway_startup_does(
+    dashboard, stubs, monkeypatch, managed_dir, scopes_after_key
+):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    local = gateways["worker_beta"]  # worker_beta's own config.yaml: this port and BETA_KEY
+    pinned = stubs()  # where the administrator's managed .env moves worker_beta's gateway
+    managed_dotenv = f"API_SERVER_PORT={pinned.port}\nAPI_SERVER_KEY={BETA_KEY}\n"
+
+    # The control first (no managed .env), then the same profile with it: only that layer differs.
+    for dotenv, reached, idle in ((None, local, pinned), (managed_dotenv, pinned, local)):
+        if dotenv is not None:
+            (managed_dir / ".env").write_text(dotenv, encoding="utf-8")
+        scopes_after_key.clear()
+
+        response = _post_leaving_no_trace(dashboard, scopes_after_key, "worker_beta")
+
+        assert response.status_code == 200
+        assert len(reached.requests) == 1
+        sent = reached.requests.pop()
+        assert sent["method"] == "POST" and sent["target"] == RESEND_PATH
+        assert sent["headers"]["authorization"] == f"Bearer {BETA_KEY}"
+        assert idle.requests == []
+        assert gateways["default"].requests == [] and gateways["worker_alpha"].requests == []
+
+
+@pytest.mark.parametrize(
+    "leaf,managed_dotenv",
+    [
+        pytest.param(
+            "port", "API_SERVER_PORT=${" + MANAGED_REF_NAME + "}\nAPI_SERVER_KEY=" + BETA_KEY + "\n",
+            id="managed-port-ref",
+        ),
+        pytest.param("key", "API_SERVER_KEY=${" + MANAGED_REF_NAME + "}\n", id="managed-key-ref"),
+        pytest.param(None, None, id="unreadable-managed-dotenv"),
+    ],
+)
+def test_managed_dotenv_that_cannot_be_resolved_as_the_gateway_does_is_refused(
+    dashboard, stubs, monkeypatch, managed_dir, outgoing, claims, leaf, managed_dotenv
+):
+    gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
+    decoy = stubs()  # what this dashboard's own environment would expand the reference to
+    monkeypatch.setenv(MANAGED_REF_NAME, str(decoy.port) if leaf == "port" else DEFAULT_KEY)
+    if managed_dotenv is None:
+        _break_settings_file(managed_dir, ".env", "unreadable", decoy.port)
+    else:
+        (managed_dir / ".env").write_text(managed_dotenv, encoding="utf-8")
+
+    response = _post(dashboard, "owner", profile="worker_beta")
+
+    _assert_refused_before_anything_was_claimed_or_sent(
+        response, dashboard, [decoy, *gateways.values()], outgoing, claims
+    )
+
+
 @pytest.mark.parametrize(
     "key_line",
     [

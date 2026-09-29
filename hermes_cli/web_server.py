@@ -13535,6 +13535,37 @@ def _managed_api_server_reference(leaf: str) -> bool:
     return False
 
 
+def _managed_dotenv() -> Dict[str, str]:
+    """The managed scope's .env, which every gateway loads last with override
+    (``env_loader._apply_managed_env``); empty when there is none.
+
+    Only read here, never rewritten. Raises when it exists but cannot be
+    read, or when it sets the api_server key or port or
+    GATEWAY_MULTIPLEX_PROFILES as a ``${...}`` reference: python-dotenv
+    expands those from the gateway's own process environment, which this
+    dashboard cannot see.
+    """
+    import io
+
+    from dotenv import dotenv_values
+
+    from hermes_cli import managed_scope
+
+    managed_dir = managed_scope.get_managed_dir()
+    if managed_dir is None:
+        return {}
+    try:
+        text = (managed_dir / ".env").read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return {}
+    values = dotenv_values(stream=io.StringIO(text), interpolate=False)
+    managed = {name: value for name, value in values.items() if value is not None}
+    for name in ("API_SERVER_KEY", "API_SERVER_PORT", "GATEWAY_MULTIPLEX_PROFILES"):
+        if "${" in managed.get(name, ""):
+            raise ValueError(f"the managed .env sets {name} as a reference")
+    return managed
+
+
 def _listen_port(raw: Any) -> Optional[int]:
     """``raw`` as a TCP port, or None when it is not an integer port."""
     if isinstance(raw, bool) or not isinstance(raw, (int, str)):
@@ -13556,10 +13587,11 @@ def _gateway_api_server(
     dashboard's own profile loads over this process's environment.
     Another profile loads over only its own secrets
     (``build_profile_secret_scope``: its .env, GATEWAY_MULTIPLEX_PROFILES
-    included, and its secret sources) with its key held back, so
+    included, and its secret sources), then the managed .env over them as
+    its gateway loads it (``_managed_dotenv``), with its key held back, so
     ``config_env._api_server`` never applies an override there; that override
-    is then applied from the profile's own secrets and .env, as in its
-    gateway. Raises when the profile's settings cannot be read or parsed.
+    is then applied from those same layers, as in its gateway. Raises when
+    the profile's settings or the managed .env cannot be read or parsed.
     The port is None when given but not resolvable (not an integer, or a
     managed reference for another profile); 8642 only when none is
     configured anywhere. The key is None when not resolvable (an unexpanded
@@ -13576,8 +13608,9 @@ def _gateway_api_server(
         environ = dict(_os.environ)
     else:
         _require_readable_dotenv(home)
-        secrets = build_profile_secret_scope(home)
-        dotenv = load_env_file(home / ".env")
+        managed = _managed_dotenv()
+        secrets = {**build_profile_secret_scope(home), **managed}
+        dotenv = {**load_env_file(home / ".env"), **managed}
         environ = {name: value for name, value in secrets.items() if name != "API_SERVER_KEY"}
     settings = _load_gateway_settings(home, environ)
 
