@@ -35635,7 +35635,9 @@ def check_respawn_guard(
         recorded for another provider than the one the card now names — then
         allow a cheap probe.
         Once that time passes the task respawns; a rate-limit stop is never
-        read as ``blocker_auth``.
+        read as ``blocker_auth``. An ``owner_retry`` event recorded against
+        that very run ends the hold early, and only the hold: the checks
+        below still apply.
 
     ``"blocker_auth"``
         The task's latest ended run failed, with an error matching a
@@ -35704,13 +35706,24 @@ def check_respawn_guard(
         resume_at = _provider_stops.rate_limit_resume_at(
             conn, task_id, latest_run, cooldown=rl_cooldown,
         )
-        if resume_at is not None and now < resume_at:
+        if resume_at is None or now >= resume_at:
+            # Cooldown elapsed — allow the respawn. Return early: a rate-limit
+            # stop is never a sign-in blocker; this path intentionally retries
+            # forever (cheaply, spaced by the cooldown) until quota returns or
+            # a real crash/completion supersedes it.
+            return None
+        # The owner asked to try this very run's work again now: that ends
+        # the provider hold, and only it — every check below still applies.
+        # A retry recorded against an earlier run never ends a later hold.
+        owner_retried = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+            "AND run_id = (SELECT id FROM task_runs WHERE task_id = ? "
+            "AND ended_at IS NOT NULL ORDER BY ended_at DESC, id DESC LIMIT 1) "
+            "LIMIT 1",
+            (task_id, OWNER_RETRY_EVENT_KIND, task_id),
+        ).fetchone()
+        if owner_retried is None:
             return "rate_limit_cooldown"
-        # Cooldown elapsed — allow the respawn. Return early: a rate-limit
-        # stop is never a sign-in blocker; this path intentionally retries
-        # forever (cheaply, spaced by the cooldown) until quota returns or a
-        # real crash/completion supersedes it.
-        return None
 
     # 2. Quota / auth blocker: retrying immediately will not help. Only the
     #    latest ended run's own error counts, and only when that run failed.

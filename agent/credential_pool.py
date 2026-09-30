@@ -1084,6 +1084,49 @@ class CredentialPool(CredentialPoolAdminMixin):
 
     # ---- exhaustion --------------------------------------------------------
 
+    @staticmethod
+    def clear_profile_provider_exhaustion(profile: Optional[str], provider: Optional[str]) -> int:
+        """Clear *provider*'s exhaustion marks in *profile*'s own pool only.
+
+        The profile home is resolved the way the kanban dispatcher sets a
+        worker's HERMES_HOME, never from the caller's own home. Nothing is
+        cleared (and nothing written) when no provider is given, when the
+        profile has no pool or entry of its own for it, or when its pool is
+        the root pool itself; there is no fallback to any other pool. Returns
+        how many entries were cleared; no credential value is returned or
+        logged.
+        """
+        key = provider.strip().lower() if isinstance(provider, str) else ""
+        if not key or not isinstance(profile, str) or not profile.strip():
+            return 0
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        try:
+            home = Path(resolve_profile_env(normalize_profile_name(profile)))
+            root = Path(resolve_profile_env("default"))
+        except (FileNotFoundError, ValueError):
+            return 0
+        path = home / "auth.json"
+        if path.resolve() == (root / "auth.json").resolve() or not path.is_file():
+            return 0
+        try:
+            with _auth_store_lock(target_path=path):
+                store = _load_auth_store(path)
+                pool = store.get("credential_pool")
+                entries = pool.get(key) if isinstance(pool, dict) else None
+                cleared = 0
+                for entry in entries if isinstance(entries, list) else ():
+                    if isinstance(entry, dict) and entry.get("last_status") == STATUS_EXHAUSTED:
+                        entry.update(_CLEAR_STATUS)
+                        entry.pop("failure_reason", None)
+                        cleared += 1
+                if cleared:
+                    _save_auth_store(store, target_path=path)
+                return cleared
+        except (OSError, RuntimeError, TimeoutError):
+            logger.warning("credential pool: could not clear a profile's exhaustion marks")
+            return 0
+
     def _is_terminal_auth_failure(
         self,
         status_code: Optional[int],
