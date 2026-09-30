@@ -212,7 +212,28 @@ CASES = {
     # real failures, so it keeps the conservative full lane set.
     "test runner script → python_prod stays on": (
         ["scripts/run_tests_parallel.py"],
-        _lanes(python=True, scan=True),
+        _lanes(python=True, scan=True, ci_review=True),
+    ),
+    # Files that choose which lanes and test files CI runs need the label.
+    "per-slice test runner → ci_review": (
+        ["scripts/run_tests.sh"],
+        _lanes(python=True, ci_review=True),
+    ),
+    "change classifier → ci_review": (
+        ["scripts/ci/classify_changes.py"],
+        _lanes(python=True, scan=True, ci_review=True),
+    ),
+    "os-marked test lister → ci_review": (
+        ["scripts/ci/list_os_marked_tests.py"],
+        _lanes(python=True, scan=True, ci_review=True),
+    ),
+    "dormant-list check → ci_review": (
+        ["scripts/ci/check_dormant_changed.py"],
+        _lanes(python=True, scan=True, ci_review=True),
+    ),
+    "dormant skip list → ci_review": (
+        ["tests/fork_dormant_skips.txt"],
+        _lanes(python=True, python_prod=False, ci_review=True),
     ),
     # Supply-chain lanes
     ".pth file → scan": (["evil.pth"], _lanes(python=True, scan=True)),
@@ -338,6 +359,23 @@ def test_ci_review_files_returns_only_sensitive_paths_sorted_and_unique():
     ]) == [
         ".github/workflows/ci.yml",
         "apps/desktop/eslint.config.mjs",
+    ]
+
+
+def test_ci_review_files_names_the_files_that_choose_which_tests_run():
+    assert ci_review_files([
+        "tests/tools/test_example.py",
+        "scripts/ci/classify_changes.py",
+        "tests/fork_dormant_skips.txt",
+        "scripts/run_tests_parallel.py",
+        "scripts/run_tests.sh",
+        "scripts/ci/list_os_marked_tests.py",
+    ]) == [
+        "scripts/ci/classify_changes.py",
+        "scripts/ci/list_os_marked_tests.py",
+        "scripts/run_tests.sh",
+        "scripts/run_tests_parallel.py",
+        "tests/fork_dormant_skips.txt",
     ]
 
 
