@@ -33086,7 +33086,8 @@ class DispatchResult:
     available) from "correctly idle" (nothing spawnable in the queue)."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
-    ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
+    ``kanban.max_in_progress_per_profile`` (#21582), or at its own entry in
+    ``kanban.max_in_progress_by_profile``. Each entry is
     ``(task_id, assignee, current_running_count)``. NOT an
     operator-actionable failure — the task will be picked up on a
     subsequent tick when the assignee has capacity. Separate bucket so
@@ -35826,7 +35827,9 @@ def check_respawn_guard(
     return None
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+def has_spawnable_ready(
+    conn: sqlite3.Connection, exclude_ids: Iterable[str] = (),
+) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
@@ -35835,6 +35838,9 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     work waiting) or a "correctly idle" condition (only control-plane
     lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
     that pull tasks via ``claim_task`` directly).
+
+    ``exclude_ids`` leaves those tasks out — the gateway passes the ones a
+    full per-profile cap held this tick, which are waiting, not stuck.
 
     Falls back to "any ready+assigned" if ``profile_exists`` is not
     importable (e.g. partial install) — preserves the old behavior so
@@ -35845,6 +35851,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL AND task_kind = 'work' ORDER BY id"
     ).fetchall()
+    excluded = set(exclude_ids)
+    rows = [row for row in rows if row["id"] not in excluded]
     if not rows:
         return False
     try:
@@ -35860,7 +35868,9 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return False
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
+def has_spawnable_review(
+    conn: sqlite3.Connection, exclude_ids: Iterable[str] = (),
+) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
@@ -35873,6 +35883,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL AND task_kind = 'work' ORDER BY id"
     ).fetchall()
+    excluded = set(exclude_ids)
+    rows = [row for row in rows if row["id"] not in excluded]
     if not rows:
         return False
     try:
@@ -36032,6 +36044,20 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def count_running_by_assignee(conn: sqlite3.Connection) -> dict[str, int]:
+    """Running work tasks per assignee on this board — the count the
+    per-profile caps (``kanban.max_in_progress_per_profile`` and
+    ``kanban.max_in_progress_by_profile``) are checked against."""
+    return {
+        row["assignee"]: int(row["n"])
+        for row in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "AND task_kind = 'work' GROUP BY assignee"
+        ).fetchall()
+    }
+
+
 def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     """Total ``running`` tasks across every board EXCEPT ``board``.
 
@@ -36114,6 +36140,8 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     require_board_activation: bool = False,
+    max_in_progress_by_profile: Optional[Mapping[str, int]] = None,
+    profile_running_all_boards: Optional[dict[str, int]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -36153,6 +36181,8 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            max_in_progress_by_profile=max_in_progress_by_profile,
+            profile_running_all_boards=profile_running_all_boards,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -36188,6 +36218,8 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                max_in_progress_by_profile=max_in_progress_by_profile,
+                profile_running_all_boards=profile_running_all_boards,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -36215,6 +36247,8 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    max_in_progress_by_profile: Optional[Mapping[str, int]] = None,
+    profile_running_all_boards: Optional[dict[str, int]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -36246,6 +36280,13 @@ def _dispatch_once_locked(
     memory, so a per-board interpretation would multiply the cap by the
     number of active boards. ``max_spawn`` retains its historical per-board
     semantics.
+
+    ``max_in_progress_by_profile`` maps a profile to its own cap, which
+    replaces ``max_in_progress_per_profile`` for that assignee. The gateway
+    passes ``profile_running_all_boards`` — those profiles' running counts
+    across every board it dispatches, read once per tick — and this tick
+    increments it in place as it spawns. Without it a listed profile is
+    counted on this board only, like the shared per-profile cap.
 
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
@@ -36401,14 +36442,44 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
+    # A profile listed in max_in_progress_by_profile uses its own cap, counted
+    # in profile_running_all_boards when the caller passes the cross-board
+    # counts, instead of the shared cap above.
+    _own_caps: dict[str, int] = {}
+    if isinstance(max_in_progress_by_profile, Mapping):
+        _own_caps = {
+            name: cap for name, cap in max_in_progress_by_profile.items()
+            if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0
+        }
     _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "AND task_kind = 'work' GROUP BY assignee"
-        ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
+    if _per_profile_cap is not None or _own_caps:
+        _per_profile_running = count_running_by_assignee(conn)
+
+    def _profile_cap(assignee):
+        """``(cap, running)`` for this assignee, or None when uncapped."""
+        if assignee in _own_caps:
+            counts = (
+                profile_running_all_boards
+                if profile_running_all_boards is not None
+                else _per_profile_running
+            )
+            return _own_caps[assignee], counts.get(assignee, 0)
+        if _per_profile_cap is not None:
+            return _per_profile_cap, _per_profile_running.get(assignee, 0)
+        return None
+
+    def _count_profile_spawn(assignee):
+        if not assignee:
+            return
+        if _per_profile_cap is not None or _own_caps:
+            _per_profile_running[assignee] = (
+                _per_profile_running.get(assignee, 0) + 1
+            )
+        if assignee in _own_caps and profile_running_all_boards is not None:
+            profile_running_all_boards[assignee] = (
+                profile_running_all_boards.get(assignee, 0) + 1
+            )
+
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -36526,9 +36597,10 @@ def _dispatch_once_locked(
         # quota / browser pool from being overwhelmed by a fan-out
         # while the global max_in_progress / max_spawn caps still allow
         # work on OTHER profiles.
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
+        profile_cap = _profile_cap(row_assignee)
+        if profile_cap is not None:
+            cap, current = profile_cap
+            if current >= cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
@@ -36580,10 +36652,7 @@ def _dispatch_once_locked(
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
             # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
-                _per_profile_running[row_assignee] = (
-                    _per_profile_running.get(row_assignee, 0) + 1
-                )
+            _count_profile_spawn(row_assignee)
             continue
         try:
             claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
@@ -36659,10 +36728,7 @@ def _dispatch_once_locked(
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
             # (#21582). Subsequent ticks re-query from the DB.
-            if _per_profile_cap is not None and claimed.assignee:
-                _per_profile_running[claimed.assignee] = (
-                    _per_profile_running.get(claimed.assignee, 0) + 1
-                )
+            _count_profile_spawn(claimed.assignee)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -36704,9 +36770,10 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(row["assignee"], 0)
-            if current >= _per_profile_cap:
+        profile_cap = _profile_cap(row["assignee"])
+        if profile_cap is not None:
+            cap, current = profile_cap
+            if current >= cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row["assignee"], current)
                 )
@@ -36739,10 +36806,7 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
-            if _per_profile_cap is not None:
-                _per_profile_running[row["assignee"]] = (
-                    _per_profile_running.get(row["assignee"], 0) + 1
-                )
+            _count_profile_spawn(row["assignee"])
             continue
         try:
             claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
@@ -36816,10 +36880,7 @@ def _dispatch_once_locked(
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
-            if _per_profile_cap is not None and claimed.assignee:
-                _per_profile_running[claimed.assignee] = (
-                    _per_profile_running.get(claimed.assignee, 0) + 1
-                )
+            _count_profile_spawn(claimed.assignee)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),

@@ -1758,6 +1758,11 @@ DEFAULT_CONFIG = {
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Per-profile caps by name, e.g. {<profile>: 1}: a listed profile never runs more than its own N
+        # tasks at once, counted across every board the gateway dispatches; profiles not listed keep
+        # max_in_progress_per_profile. An entry that is not a whole number >= 1 is ignored with a
+        # warning. None = no per-profile overrides.
+        "max_in_progress_by_profile": None,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,
