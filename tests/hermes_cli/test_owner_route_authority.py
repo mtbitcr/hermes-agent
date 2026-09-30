@@ -41,7 +41,7 @@ _OWNER_ROUTE = {
 # Claude one, so neither can stand in for this.
 _NAMED_ROLE = "raphael-planner"
 _NAMED_ROLE_ROUTE = {
-    "model": {"provider": "openai-codex", "default": "gpt-6-sol"},
+    "model": {"provider": "openai-codex", "default": "gpt-6.1-sol"},
     "agent": {"reasoning_effort": "max"},
     "fallback_providers": [],
 }
@@ -229,14 +229,14 @@ def test_named_role_route_change_fences_default_receipt_owned_work(bootstrapped)
         pinned = kanban_db.get_task(conn, task_id)
     # Frozen on the route it was already approved for, not the new selection.
     assert (pinned.provider_override, pinned.model_override) == (
-        "openai-codex", "gpt-6-sol",
+        "openai-codex", "gpt-6.1-sol",
     )
     assert pinned.model_policy_lock
     assert kanban_db.policy_lock_error(
         pinned.model_policy_lock,
         _NAMED_ROLE,
         "openai-codex",
-        "gpt-6-sol",
+        "gpt-6.1-sol",
         "max",
         "routine",
     ) is None

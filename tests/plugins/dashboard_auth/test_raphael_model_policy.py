@@ -47,10 +47,10 @@ from plugins.dashboard_auth.raphael_workspace.model_policy import (
             "Claude Opus 5.5 + Claude Code", "max",
         ),
         ("raphael-builder", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"),
-        ("raphael-verifier", "openai-codex", "gpt-6-sol", "GPT-6 Sol", "max"),
+        ("raphael-verifier", "openai-codex", "gpt-6.1-sol", "GPT-6.1 Sol", "max"),
         ("raphael-verifier", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"),
-        ("raphael-planner", "openai-codex", "gpt-6-sol", "GPT-6 Sol", "max"),
-        ("default", "openai-codex", "gpt-6-sol", "GPT-6 Sol", "max"),
+        ("raphael-planner", "openai-codex", "gpt-6.1-sol", "GPT-6.1 Sol", "max"),
+        ("default", "openai-codex", "gpt-6.1-sol", "GPT-6.1 Sol", "max"),
         ("raphael-business", "openai-codex", "gpt-5.6-terra", "GPT-5.6 Terra", "max"),
     ],
 )
@@ -93,9 +93,13 @@ def test_admitted_assignment_is_role_bound(profile, provider, model, label, effo
         ("default", "anthropic", "claude-opus-5", "max", True),
         ("default", "openai-codex", "gpt-5.6-sol", "max", True),
         ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max", True),
+        ("default", "openai-codex", "gpt-6-sol", "max", True),
+        ("raphael-planner", "openai-codex", "gpt-6-sol", "max", True),
+        ("raphael-verifier", "openai-codex", "gpt-6-sol", "max", True),
         ("raphael-builder", "anthropic", "claude-sonnet-5", "max", True),
-        # The deep-only Astra lane is not a base route, and business routine
-        # keeps its owner-approved effort rather than drifting up to max.
+        # The superseded deep-only Astra lane was never a base route, and
+        # business routine keeps its owner-approved effort rather than
+        # drifting up to max.
         ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh", True),
         ("raphael-business", "anthropic", "claude-sonnet-5", "max", True),
         ("raphael-business", "openai-codex", "gpt-6-sol", "max", True),
@@ -118,7 +122,7 @@ def test_unadmitted_or_fallback_capable_assignment_fails_closed(
 # (model, model_label, reasoning_effort).
 _OPUS_55 = ("claude-opus-5-5", "Claude Opus 5.5", "max")
 _OPUS_55_WORKER = ("claude-opus-5-5", "Claude Opus 5.5 + Claude Code", "max")
-_SOL_6 = ("gpt-6-sol", "GPT-6 Sol", "max")
+_SOL_61 = ("gpt-6.1-sol", "GPT-6.1 Sol", "max")
 _APPROVED_ROUTES = {
     ("default", "anthropic"): (_OPUS_55, _OPUS_55),
     ("raphael-planner", "anthropic"): (_OPUS_55, _OPUS_55),
@@ -128,12 +132,10 @@ _APPROVED_ROUTES = {
     ("raphael-business", "anthropic"): (
         ("claude-sonnet-5", "Claude Sonnet 5", "high"), _OPUS_55,
     ),
-    ("raphael-verifier", "openai-codex"): (
-        _SOL_6, ("gpt-6-astra", "GPT-6 Astra", "xhigh"),
-    ),
+    ("raphael-verifier", "openai-codex"): (_SOL_61, _SOL_61),
     ("raphael-verifier", "anthropic"): (_OPUS_55, _OPUS_55),
-    ("default", "openai-codex"): (_SOL_6, _SOL_6),
-    ("raphael-planner", "openai-codex"): (_SOL_6, _SOL_6),
+    ("default", "openai-codex"): (_SOL_61, _SOL_61),
+    ("raphael-planner", "openai-codex"): (_SOL_61, _SOL_61),
     ("raphael-business", "openai-codex"): (
         ("gpt-5.6-terra", "GPT-5.6 Terra", "max"),
         ("gpt-5.6-terra", "GPT-5.6 Terra", "max"),
@@ -200,15 +202,12 @@ def test_task_route_uses_opus_max_only_for_deep_anthropic_work():
     )
     assert (deep.model, deep.reasoning_effort) == ("claude-opus-5-5", "max")
     assert deep.model_label == "Claude Opus 5.5 + Claude Code"
-    # The OpenAI family has exactly one deep lane: the verifier's Astra route.
-    # Every other OpenAI pair keeps its base route for deep work.
-    for profile in ("default", "raphael-planner", "raphael-business"):
+    # The OpenAI family has no deep lane: every OpenAI pair, the verifier's
+    # included, keeps its base route for deep work.
+    for profile in ("default", "raphael-planner", "raphael-business", "raphael-verifier"):
         assert task_assignment_for(
             profile, "openai-codex", "deep"
         ) == assignment_for(profile, "openai-codex")
-    assert task_assignment_for(
-        "raphael-verifier", "openai-codex", "deep"
-    ) != assignment_for("raphael-verifier", "openai-codex")
 
 
 @pytest.mark.parametrize("tier", ["routine", "deep"])
@@ -225,6 +224,7 @@ def test_no_builder_lane_leaves_the_claude_family(tier):
         task_assignment_for("raphael-builder", "openai-codex", tier)
     for model, effort in (
         ("gpt-5.6-terra", "max"),
+        ("gpt-6.1-sol", "max"),
         ("gpt-6-sol", "max"),
         ("gpt-6-astra", "xhigh"),
     ):
@@ -246,8 +246,8 @@ def test_no_builder_lane_leaves_the_claude_family(tier):
 def test_independent_review_recommends_openai_and_admits_only_the_claude_security_lane(tier):
     """The verifier stays independent of the builder's lane.
 
-    The OpenAI route remains the recommended one (GPT-6 Sol / max for routine
-    work, GPT-6 Astra / xhigh for deep work); the named Claude Security lane
+    The OpenAI route remains the recommended one (GPT-6.1 Sol / max for routine
+    and deep work alike); the named Claude Security lane
     resolves to Claude Opus 5.5 / max on every tier and is never presented as
     recommended, and a Sonnet lane is refused.
     """
@@ -263,10 +263,7 @@ def test_independent_review_recommends_openai_and_admits_only_the_claude_securit
         model_policy.mint_policy_lock(
             "raphael-verifier", "anthropic", "claude-sonnet-5", "max", tier,
         )
-    expected = {
-        "routine": ("gpt-6-sol", "max"),
-        "deep": ("gpt-6-astra", "xhigh"),
-    }[tier]
+    expected = ("gpt-6.1-sol", "max")
     verifier = task_assignment_for("raphael-verifier", "openai-codex", tier)
     assert verifier.recommended is True
     assert (verifier.provider, verifier.model, verifier.reasoning_effort) == (
@@ -275,12 +272,12 @@ def test_independent_review_recommends_openai_and_admits_only_the_claude_securit
     assert model_policy.mint_policy_lock(
         "raphael-verifier", "openai-codex", *expected, tier,
     ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
-    # Each OpenAI verifier lane belongs to its own tier only.
-    other = {"routine": "deep", "deep": "routine"}[tier]
-    with pytest.raises(ValueError):
-        model_policy.mint_policy_lock(
-            "raphael-verifier", "openai-codex", *expected, other,
-        )
+    # The superseded OpenAI verifier routes mint on no tier.
+    for superseded in (("gpt-6-sol", "max"), ("gpt-6-astra", "xhigh")):
+        with pytest.raises(ValueError):
+            model_policy.mint_policy_lock(
+                "raphael-verifier", "openai-codex", *superseded, tier,
+            )
 
 
 def _sealed(
@@ -311,9 +308,9 @@ def _sealed(
     return f"{authority}:v{version}:{digest}"
 
 
-# Routes minted under the previous matrix (Opus 5, the changed-profile Sonnet 5
-# lanes, and every Sol 5.6 lane), each on the role/provider/tier it was
-# admitted for.
+# Routes minted under the previous matrices (Opus 5, the changed-profile Sonnet 5
+# lanes, every Sol 5.6 lane, every GPT-6 Sol lane and the verifier's GPT-6 Astra
+# deep lane), each on the role/provider/tier it was admitted for.
 _HISTORICAL_ROUTES = [
     ("default", "anthropic", "claude-opus-5", "max", "routine"),
     ("default", "anthropic", "claude-opus-5", "max", "deep"),
@@ -330,6 +327,12 @@ _HISTORICAL_ROUTES = [
     ("raphael-planner", "openai-codex", "gpt-5.6-sol", "max", "deep"),
     ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max", "routine"),
     ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max", "deep"),
+    ("default", "openai-codex", "gpt-6-sol", "max", "routine"),
+    ("default", "openai-codex", "gpt-6-sol", "max", "deep"),
+    ("raphael-planner", "openai-codex", "gpt-6-sol", "max", "routine"),
+    ("raphael-planner", "openai-codex", "gpt-6-sol", "max", "deep"),
+    ("raphael-verifier", "openai-codex", "gpt-6-sol", "max", "routine"),
+    ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh", "deep"),
 ]
 
 
@@ -346,7 +349,7 @@ def test_a_historical_seal_still_verifies_but_can_no_longer_be_minted(route):
 @pytest.mark.parametrize("route", [
     ("raphael-business", "anthropic", "claude-sonnet-5", "high", "routine"),
     ("raphael-business", "openai-codex", "gpt-5.6-terra", "max", "deep"),
-    ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh", "deep"),
+    ("raphael-verifier", "openai-codex", "gpt-6.1-sol", "max", "deep"),
     ("raphael-builder", "anthropic", "claude-opus-5-5", "max", "routine"),
 ])
 def test_a_current_route_mints_the_same_seal_it_validates(route):
@@ -393,9 +396,11 @@ def test_a_tampered_or_foreign_seal_still_fails_closed():
     # A historical route on a tier it was never admitted on.
     ("raphael-business", "anthropic", "claude-opus-5", "max", "routine"),
     ("raphael-claude-worker", "anthropic", "claude-sonnet-5", "max", "deep"),
-    # The verifier's Astra lane is deep-only, and deep-only for the verifier.
+    # The verifier's superseded Astra lane was deep-only, and the verifier's
+    # only; its GPT-6 Sol lane was never its deep route.
     ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh", "routine"),
     ("raphael-planner", "openai-codex", "gpt-6-astra", "xhigh", "deep"),
+    ("raphael-verifier", "openai-codex", "gpt-6-sol", "max", "deep"),
     # Superseded model at an effort it never had.
     ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "xhigh", "routine"),
 ])
@@ -445,7 +450,8 @@ def test_removed_lanes_are_not_exposed_as_selectable_options():
                 "slug": "openai-codex",
                 "authenticated": True,
                 "models": [
-                    "gpt-5.6-sol", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-terra",
+                    "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra",
+                    "gpt-5.6-terra",
                 ],
             },
         ]
@@ -464,11 +470,11 @@ def test_removed_lanes_are_not_exposed_as_selectable_options():
     assert by_slug["anthropic"]["assignment"]["recommended"] is False
     assert by_slug["anthropic"]["models"] == ["claude-opus-5-5"]
     assert by_slug["openai-codex"]["assignment"]["recommended"] is True
-    assert by_slug["openai-codex"]["models"] == ["gpt-6-sol", "gpt-6-astra"]
-    assert by_slug["openai-codex"]["task_routes"]["routine"]["model"] == "gpt-6-sol"
-    assert by_slug["openai-codex"]["task_routes"]["deep"]["model"] == "gpt-6-astra"
+    assert by_slug["openai-codex"]["models"] == ["gpt-6.1-sol"]
+    assert by_slug["openai-codex"]["task_routes"]["routine"]["model"] == "gpt-6.1-sol"
+    assert by_slug["openai-codex"]["task_routes"]["deep"]["model"] == "gpt-6.1-sol"
     assert (
-        by_slug["openai-codex"]["task_routes"]["deep"]["reasoning_effort"] == "xhigh"
+        by_slug["openai-codex"]["task_routes"]["deep"]["reasoning_effort"] == "max"
     )
 
 
@@ -497,6 +503,7 @@ def test_task_route_rejects_invented_tiers_and_forbidden_runtime_choices():
         ("raphael-claude-worker", "anthropic", "claude-opus-5"),
         ("raphael-claude-worker", "anthropic", "claude-sonnet-5"),
         ("raphael-verifier", "openai-codex", "gpt-5.6-sol"),
+        ("raphael-verifier", "openai-codex", "gpt-6-sol"),
     ):
         assert validate_runtime_assignment(
             profile, provider, model, "max", disable_fallbacks=True,
@@ -572,7 +579,7 @@ def test_new_work_uses_the_provider_currently_selected_for_its_role(
         lambda: {
             "model": {
                 "provider": "openai-codex",
-                "default": "gpt-6-sol",
+                "default": "gpt-6.1-sol",
             },
             "agent": {"reasoning_effort": "max"},
             "fallback_providers": [],
@@ -591,14 +598,14 @@ def test_new_work_uses_the_provider_currently_selected_for_its_role(
     assert configured.provider == "openai-codex"
     assert (deep.provider, deep.model, deep.reasoning_effort) == (
         "openai-codex",
-        "gpt-6-sol",
+        "gpt-6.1-sol",
         "max",
     )
-    # The verifier's deep work on the same provider moves to its Astra lane.
+    # The verifier's deep work on the same provider stays on the same route.
     verifier_deep = resolve_task_assignment("raphael-verifier", "deep")
     assert (
         verifier_deep.provider, verifier_deep.model, verifier_deep.reasoning_effort
-    ) == ("openai-codex", "gpt-6-astra", "xhigh")
+    ) == ("openai-codex", "gpt-6.1-sol", "max")
 
 
 def _on_disk_route(
@@ -642,6 +649,9 @@ _SUPERSEDED_CONFIGURED_ROUTES = [
     ("raphael-builder", "anthropic", "claude-sonnet-5", "max"),
     ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max"),
     ("raphael-verifier", "anthropic", "claude-opus-5", "max"),
+    ("default", "openai-codex", "gpt-6-sol", "max"),
+    ("raphael-planner", "openai-codex", "gpt-6-sol", "max"),
+    ("raphael-verifier", "openai-codex", "gpt-6-sol", "max"),
 ]
 
 
@@ -690,7 +700,7 @@ def test_a_superseded_configured_route_is_readable_but_grants_no_new_authority(
     # A superseded model at an effort it never had.
     ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "xhigh"),
     ("default", "anthropic", "claude-opus-5", "high"),
-    # A current deep-only lane is still not a base route.
+    # A superseded deep-only lane was never a base route.
     ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh"),
     # No lane on this provider at all, then or now.
     ("raphael-builder", "openai-codex", "gpt-5.6-sol", "max"),
@@ -761,12 +771,14 @@ _SUPERSEDED_ROUTINE_RUNTIME_ROUTES = [
     ("default", "anthropic", "claude-opus-5", "max"),
     ("raphael-planner", "anthropic", "claude-sonnet-5", "max"),
     ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "max"),
+    ("raphael-verifier", "openai-codex", "gpt-6-sol", "max"),
 ]
 _SUPERSEDED_DEEP_RUNTIME_ROUTES = [
     ("raphael-planner", "anthropic", "claude-opus-5", "max"),
     ("raphael-business", "anthropic", "claude-opus-5", "max"),
     ("raphael-builder", "anthropic", "claude-opus-5", "max"),
     ("raphael-claude-worker", "anthropic", "claude-opus-5", "max"),
+    ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh"),
 ]
 _SUPERSEDED_RUNTIME_ROUTES = (
     _SUPERSEDED_ROUTINE_RUNTIME_ROUTES + _SUPERSEDED_DEEP_RUNTIME_ROUTES
@@ -1144,7 +1156,7 @@ async def test_stale_and_exact_expected_revision_behave_as_a_compare_and_swap(
     second = await profile_routes.update_profile_model_endpoint(
         "default",
         ProfileModelUpdate(
-            provider="openai-codex", model="gpt-6-sol",
+            provider="openai-codex", model="gpt-6.1-sol",
             reasoning_effort="max", disable_fallbacks=True,
             expected_revision=first["revision"],
         ),
@@ -1207,7 +1219,7 @@ async def test_a_post_write_failure_restores_config_and_enrollment(
         await profile_routes.update_profile_model_endpoint(
             "default",
             ProfileModelUpdate(
-                provider="openai-codex", model="gpt-6-sol",
+                provider="openai-codex", model="gpt-6.1-sol",
                 reasoning_effort="max", disable_fallbacks=True,
                 expected_revision=first["revision"],
             ),
@@ -2059,7 +2071,7 @@ def test_a_concurrent_batch_rollback_never_erases_the_other_batch(
 _ROOT_ACCOUNT_TOKEN = "root-shared-codex-access"
 _OTHER_ACCOUNT_TOKEN = "profile-own-codex-access"
 _ACCOUNT_CATALOGS = {
-    _ROOT_ACCOUNT_TOKEN: ["gpt-6-sol", "gpt-6-astra", "gpt-5.6-terra"],
+    _ROOT_ACCOUNT_TOKEN: ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra", "gpt-5.6-terra"],
     _OTHER_ACCOUNT_TOKEN: ["gpt-5.6-terra"],
 }
 
@@ -2133,7 +2145,7 @@ def codex_accounts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         home.mkdir(parents=True, exist_ok=True)
         (home / "config.yaml").write_text(
             yaml.safe_dump({
-                "model": {"provider": "openai-codex", "default": "gpt-6-sol"},
+                "model": {"provider": "openai-codex", "default": "gpt-6.1-sol"},
                 "agent": {"reasoning_effort": "max"},
                 "fallback_providers": [],
             }),
@@ -2172,8 +2184,8 @@ def _codex_models(payload: dict) -> list:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("profile", "expected"), [
-    ("raphael-verifier", {"gpt-6-sol", "gpt-6-astra"}),
-    ("raphael-planner", {"gpt-6-sol"}),
+    ("raphael-verifier", {"gpt-6.1-sol"}),
+    ("raphael-planner", {"gpt-6.1-sol"}),
 ])
 async def test_owner_models_read_lists_the_shared_account_it_actually_runs_on(
     codex_accounts, profile, expected
@@ -2246,7 +2258,7 @@ async def test_a_role_with_its_own_grant_never_reads_the_root_account(codex_acco
     # Only the role's own account was asked, and it lists no GPT-6 lane.
     assert _ROOT_ACCOUNT_TOKEN not in codex_accounts.asked_with
     assert "gpt-6-astra" not in _codex_models(role_read)
-    assert "gpt-6-sol" not in _codex_models(role_read)
+    assert "gpt-6.1-sol" not in _codex_models(role_read)
     assert own_auth.read_bytes() == own_bytes
 
 

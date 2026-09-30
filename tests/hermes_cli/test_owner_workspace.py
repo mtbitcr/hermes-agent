@@ -1844,18 +1844,18 @@ def test_task_route_pin_distinguishes_unlocked_from_invalid():
     locked = {
         "assignee": "raphael-verifier",
         "provider_override": "openai-codex",
-        "model_override": "gpt-6-sol",
+        "model_override": "gpt-6.1-sol",
         "reasoning_effort": "MAX",
         "execution_tier": "routine",
         "model_policy_lock": kanban_db.mint_policy_lock(
-            "raphael-verifier", "openai-codex", "gpt-6-sol", "max", "routine",
+            "raphael-verifier", "openai-codex", "gpt-6.1-sol", "max", "routine",
         ),
     }
     assert ow.owner_task_route_pin(locked) == ow.OwnerTaskRoutePin(
         valid=True,
         profile="raphael-verifier",
         provider="openai-codex",
-        model="gpt-6-sol",
+        model="gpt-6.1-sol",
         reasoning_effort="max",
     )
     # An unlocked (manual / pre-lock) task has no pin and keeps the older

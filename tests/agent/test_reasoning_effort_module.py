@@ -194,6 +194,19 @@ class TestCodexVocabulary:
         assert clamp_effort("max", codex_supported_efforts(model)) == "max"
         assert is_astra_model("gpt-6-sol") is False
 
+    @pytest.mark.parametrize("model", ["gpt-6.1-sol", "openai/gpt-6.1-sol", "GPT-6.1-Sol"])
+    def test_gpt61_sol_keeps_max_and_has_no_disable_level(self, model):
+        """GPT-6.1 Sol's model page (2026-09-29) lists low, medium, high, xhigh
+        and max, and rejects none and minimal: max stays max, and a disable
+        request floors at low instead of reaching the wire."""
+        from agent.reasoning_effort import codex_supported_efforts, is_astra_model
+
+        assert codex_supported_efforts(model) == ("low", "medium", "high", "xhigh", "max")
+        assert clamp_effort("max", codex_supported_efforts(model)) == "max"
+        assert clamp_effort("none", codex_supported_efforts(model)) == "low"
+        assert clamp_effort("minimal", codex_supported_efforts(model)) == "low"
+        assert is_astra_model(model) is False
+
     @pytest.mark.parametrize(
         "model", ["gpt-5.5", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-6-astra-pro", None]
     )

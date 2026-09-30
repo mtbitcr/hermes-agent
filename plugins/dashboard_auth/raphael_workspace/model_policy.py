@@ -109,10 +109,10 @@ _ASSIGNMENTS = {
         "default", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"
     ),
     ("raphael-planner", "openai-codex"): _assignment(
-        "raphael-planner", "openai-codex", "gpt-6-sol", "GPT-6 Sol", "max"
+        "raphael-planner", "openai-codex", "gpt-6.1-sol", "GPT-6.1 Sol", "max"
     ),
     ("default", "openai-codex"): _assignment(
-        "default", "openai-codex", "gpt-6-sol", "GPT-6 Sol", "max"
+        "default", "openai-codex", "gpt-6.1-sol", "GPT-6.1 Sol", "max"
     ),
     ("raphael-business", "anthropic"): _assignment(
         "raphael-business", "anthropic", "claude-sonnet-5", "Claude Sonnet 5", "high"
@@ -136,12 +136,12 @@ _ASSIGNMENTS = {
     # ``task_assignment_for(builder, openai-codex, 'deep')`` fall through to
     # that provider's base route, which is not a qualified deep coding lane.
     ("raphael-verifier", "openai-codex"): _assignment(
-        "raphael-verifier", "openai-codex", "gpt-6-sol", "GPT-6 Sol", "max"
+        "raphael-verifier", "openai-codex", "gpt-6.1-sol", "GPT-6.1 Sol", "max"
     ),
     # Independent verification exists to be independent OF the implementation
     # family: Claude writes the code, so a Claude verifier is the same family
-    # reviewing itself, and the OpenAI GPT-6 Sol / max lane (GPT-6 Astra /
-    # xhigh for deep work) stays the only recommended verifier route. The
+    # reviewing itself, and the OpenAI GPT-6.1 Sol / max lane (deep work
+    # included) stays the only recommended verifier route. The
     # Anthropic entry below is the named, non-recommended "Claude Security"
     # lane: security analysis runs on two explicitly identified lanes (Codex
     # Security on the recommended route, Claude Security on this one), so a
@@ -176,7 +176,6 @@ _DEEP_ROUTES: dict[tuple[str, str], tuple[str, str, str]] = {
         )
         for profile in _CLAUDE_DEEP_PROFILES
     },
-    ("raphael-verifier", "openai-codex"): ("gpt-6-astra", "GPT-6 Astra", "xhigh"),
 }
 
 _EXECUTION_TIERS = frozenset({"routine", "deep"})
@@ -225,11 +224,10 @@ def task_assignment_for(
 
     The planner may classify work as ``routine`` or ``deep`` but never chooses a
     provider, model id, or effort.  Deep Claude planning, business, coding, and
-    delivery work moves to the currently qualified Opus lane, and deep
-    verification on the OpenAI family moves to GPT-6 Astra (see
-    ``_DEEP_ROUTES``).  Every other provider choice retains its admitted
-    profile assignment until that provider has a separately qualified deep
-    lane.
+    delivery work moves to the currently qualified Opus lane (see
+    ``_DEEP_ROUTES``).  Every other provider choice, OpenAI verification
+    included, retains its admitted profile assignment until that provider has
+    a separately qualified deep lane.
     """
     tier = normalize_execution_tier(execution_tier)
     base = assignment_for(profile, provider)
@@ -457,16 +455,18 @@ _FORBIDDEN_EFFORTS = frozenset({"ultra"})
 _OPUS_5_MAX = ("claude-opus-5", "max")
 _SONNET_5_MAX = ("claude-sonnet-5", "max")
 _SOL_56_MAX = ("gpt-5.6-sol", "max")
+_SOL_6_MAX = ("gpt-6-sol", "max")
+_ASTRA_6_XHIGH = ("gpt-6-astra", "xhigh")
 
 _SUPERSEDED_ROUTES: Mapping[tuple[str, str, str], frozenset[tuple[str, str]]] = {
     ("default", "anthropic", "routine"): frozenset({_OPUS_5_MAX}),
     ("default", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
-    ("default", "openai-codex", "routine"): frozenset({_SOL_56_MAX}),
-    ("default", "openai-codex", "deep"): frozenset({_SOL_56_MAX}),
+    ("default", "openai-codex", "routine"): frozenset({_SOL_56_MAX, _SOL_6_MAX}),
+    ("default", "openai-codex", "deep"): frozenset({_SOL_56_MAX, _SOL_6_MAX}),
     ("raphael-planner", "anthropic", "routine"): frozenset({_SONNET_5_MAX}),
     ("raphael-planner", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
-    ("raphael-planner", "openai-codex", "routine"): frozenset({_SOL_56_MAX}),
-    ("raphael-planner", "openai-codex", "deep"): frozenset({_SOL_56_MAX}),
+    ("raphael-planner", "openai-codex", "routine"): frozenset({_SOL_56_MAX, _SOL_6_MAX}),
+    ("raphael-planner", "openai-codex", "deep"): frozenset({_SOL_56_MAX, _SOL_6_MAX}),
     ("raphael-business", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
     ("raphael-designer", "anthropic", "routine"): frozenset({_OPUS_5_MAX}),
     ("raphael-designer", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
@@ -474,8 +474,8 @@ _SUPERSEDED_ROUTES: Mapping[tuple[str, str, str], frozenset[tuple[str, str]]] = 
     ("raphael-claude-worker", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
     ("raphael-builder", "anthropic", "routine"): frozenset({_SONNET_5_MAX}),
     ("raphael-builder", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
-    ("raphael-verifier", "openai-codex", "routine"): frozenset({_SOL_56_MAX}),
-    ("raphael-verifier", "openai-codex", "deep"): frozenset({_SOL_56_MAX}),
+    ("raphael-verifier", "openai-codex", "routine"): frozenset({_SOL_56_MAX, _SOL_6_MAX}),
+    ("raphael-verifier", "openai-codex", "deep"): frozenset({_SOL_56_MAX, _ASTRA_6_XHIGH}),
     ("raphael-verifier", "anthropic", "routine"): frozenset({_OPUS_5_MAX}),
     ("raphael-verifier", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
 }

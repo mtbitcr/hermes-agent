@@ -34,7 +34,7 @@ _ADMITTED = {
     "fallback_providers": [],
 }
 _VERIFIER_ADMITTED = {
-    "model": {"provider": "openai-codex", "default": "gpt-6-sol"},
+    "model": {"provider": "openai-codex", "default": "gpt-6.1-sol"},
     "agent": {"reasoning_effort": "max"},
     "fallback_providers": [],
 }
@@ -126,7 +126,7 @@ def test_an_enrolled_profile_stays_governed_even_when_it_has_drifted():
         )
     # An admitted route is still accepted, which is how a drifted role recovers.
     _scoped_save("raphael-verifier", _VERIFIER_ADMITTED)
-    assert _written("raphael-verifier")["model"]["default"] == "gpt-6-sol"
+    assert _written("raphael-verifier")["model"]["default"] == "gpt-6.1-sol"
 
 
 def test_an_unenrolled_default_profile_on_the_same_model_stays_native():
@@ -172,57 +172,67 @@ def test_unadmitted_route_is_refused_at_the_shared_boundary(override):
     with pytest.raises(ValueError, match="unadmitted Raphael model assignment"):
         _scoped_save("raphael-verifier", {**_VERIFIER_ADMITTED, **override})
     # The admitted route survived; nothing half-applied.
-    assert _written("raphael-verifier")["model"]["default"] == "gpt-6-sol"
+    assert _written("raphael-verifier")["model"]["default"] == "gpt-6.1-sol"
 
 
 def test_a_deep_task_lane_is_not_a_valid_base_route():
     """Base configs use validate_assignment; deep lanes are task authority only.
 
-    ``raphael-verifier``/openai-codex admits ``gpt-6-sol`` / max as its BASE
-    route and ``gpt-6-astra`` / xhigh only as its deep TASK lane. Accepting the
-    deep lane as a base route would erase the routine/deep separation. (This
-    pair is used because the current matrix really does give it a deep lane
-    that differs from its base route; ``raphael-builder``'s base and deep lanes
-    are now the same Opus 5.5 / max route, so it can no longer show this.)
+    ``raphael-business``/anthropic admits ``claude-sonnet-5`` / high as its
+    BASE route and ``claude-opus-5-5`` / max only as its deep TASK lane.
+    Accepting the deep lane as a base route would erase the routine/deep
+    separation. (This pair is used because the current matrix really does give
+    it a deep lane that differs from its base route; the verifier's OpenAI deep
+    work now stays on its base GPT-6.1 Sol / max route, so it can no longer
+    show this.)
     """
-    base = dict(_VERIFIER_ADMITTED)
-    _scoped_save("raphael-verifier", base)
-    model_policy.enroll_profile("raphael-verifier")
-    routine = model_policy.task_assignment_for(
-        "raphael-verifier", "openai-codex", "routine",
-    )
-    deep = model_policy.task_assignment_for("raphael-verifier", "openai-codex", "deep")
-    assert (routine.model, routine.reasoning_effort) == ("gpt-6-sol", "max")
-    assert (deep.model, deep.reasoning_effort) == ("gpt-6-astra", "xhigh")
+    base = {
+        "model": {"provider": "anthropic", "default": "claude-sonnet-5"},
+        "agent": {"reasoning_effort": "high"},
+        "fallback_providers": [],
+    }
+    _scoped_save("raphael-business", base)
+    model_policy.enroll_profile("raphael-business")
+    routine = model_policy.task_assignment_for("raphael-business", "anthropic", "routine")
+    deep = model_policy.task_assignment_for("raphael-business", "anthropic", "deep")
+    assert (routine.model, routine.reasoning_effort) == ("claude-sonnet-5", "high")
+    assert (deep.model, deep.reasoning_effort) == ("claude-opus-5-5", "max")
     # Neither the deep model alone nor the exact deep lane is a base route.
     for deep_route in (
-        {**base, "model": {"provider": "openai-codex", "default": deep.model}},
+        {**base, "model": {"provider": "anthropic", "default": deep.model}},
         {
             **base,
-            "model": {"provider": "openai-codex", "default": deep.model},
+            "model": {"provider": "anthropic", "default": deep.model},
             "agent": {"reasoning_effort": deep.reasoning_effort},
         },
     ):
         with pytest.raises(ValueError, match="unadmitted Raphael model assignment"):
-            _scoped_save("raphael-verifier", deep_route)
-        assert _written("raphael-verifier")["model"]["default"] == "gpt-6-sol"
-        assert _written("raphael-verifier")["agent"]["reasoning_effort"] == "max"
+            _scoped_save("raphael-business", deep_route)
+        assert _written("raphael-business")["model"]["default"] == "claude-sonnet-5"
+        assert _written("raphael-business")["agent"]["reasoning_effort"] == "high"
     # The same route IS admitted as a task pin.
     assert model_policy.validate_runtime_assignment(
-        "raphael-verifier", "openai-codex", deep.model, deep.reasoning_effort,
+        "raphael-business", "anthropic", deep.model, deep.reasoning_effort,
         disable_fallbacks=True,
     ) == deep
-    # Lineage never widens the base-route boundary either: the superseded
-    # routine route still reads back as history, but cannot be written.
-    assert model_policy.validate_runtime_assignment(
-        "raphael-verifier", "openai-codex", "gpt-5.6-sol", "max",
-        disable_fallbacks=True,
-    ).recommended is False
-    with pytest.raises(ValueError, match="unadmitted Raphael model assignment"):
-        _scoped_save("raphael-verifier", {
-            **base, "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
-        })
-    assert _written("raphael-verifier")["model"]["default"] == "gpt-6-sol"
+    # Lineage never widens the base-route boundary either: the verifier's
+    # superseded routes still read back as history, but none can be written.
+    _scoped_save("raphael-verifier", _VERIFIER_ADMITTED)
+    model_policy.enroll_profile("raphael-verifier")
+    for model, effort in (
+        ("gpt-5.6-sol", "max"), ("gpt-6-sol", "max"), ("gpt-6-astra", "xhigh"),
+    ):
+        assert model_policy.validate_runtime_assignment(
+            "raphael-verifier", "openai-codex", model, effort,
+            disable_fallbacks=True,
+        ).recommended is False
+        with pytest.raises(ValueError, match="unadmitted Raphael model assignment"):
+            _scoped_save("raphael-verifier", {
+                **_VERIFIER_ADMITTED,
+                "model": {"provider": "openai-codex", "default": model},
+                "agent": {"reasoning_effort": effort},
+            })
+        assert _written("raphael-verifier")["model"]["default"] == "gpt-6.1-sol"
 
 
 def test_unrelated_config_writes_do_not_enter_the_guard(monkeypatch):
@@ -255,7 +265,7 @@ def test_route_change_fences_existing_owner_work_before_writing(monkeypatch):
     monkeypatch.setattr(ow, "fence_effective_task_routes", _boom)
     with pytest.raises(ow.OwnerWorkspaceError):
         _scoped_save("default", {
-            "model": {"provider": "openai-codex", "default": "gpt-6-sol"},
+            "model": {"provider": "openai-codex", "default": "gpt-6.1-sol"},
             "agent": {"reasoning_effort": "max"},
             "fallback_providers": [],
         })
@@ -280,7 +290,7 @@ def test_single_key_writers_reach_the_same_boundary(round_trip):
         hermes_config.save_shared_config_key(
             path, "model.default", "gpt-5.6-terra", round_trip=round_trip,
         )
-    assert _written("raphael-verifier")["model"]["default"] == "gpt-6-sol"
+    assert _written("raphael-verifier")["model"]["default"] == "gpt-6.1-sol"
     # An unrelated key still writes normally.
     hermes_config.save_shared_config_key(
         path, "display.timestamps", True, round_trip=round_trip,
@@ -306,7 +316,7 @@ def test_config_set_reaches_the_boundary(monkeypatch):
             hermes_config.set_config_value("model.default", "gpt-5.6-terra")
     finally:
         reset_hermes_home_override(token)
-    assert _written("raphael-verifier")["model"]["default"] == "gpt-6-sol"
+    assert _written("raphael-verifier")["model"]["default"] == "gpt-6.1-sol"
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +462,7 @@ def test_fence_pins_owner_work_before_a_real_route_change(monkeypatch):
     )
 
     _scoped_save(profile, {
-        "model": {"provider": "openai-codex", "default": "gpt-6-sol"},
+        "model": {"provider": "openai-codex", "default": "gpt-6.1-sol"},
         "agent": {"reasoning_effort": "max"},
         "fallback_providers": [],
     })
