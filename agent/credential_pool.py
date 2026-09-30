@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import random
+import stat
 import threading
 import time
 import uuid
@@ -797,6 +798,32 @@ def _borrowed_single_use_pool_root() -> Optional[Path]:
         return None
 
 
+def _is_canonical_own_pool(root: Path, name: str, path: Path) -> bool:
+    """True when *path* is profile *name*'s own pool file, owned by no other pool.
+
+    It must be a regular file with one link (a symlink or a hard link could
+    make it another store), its real path must be ``profiles/<name>/auth.json``
+    under the real *root* (so no home alias leads elsewhere), and neither the
+    root pool nor any other profile's pool may resolve to it. A missing pool
+    is simply not one.
+    """
+    try:
+        status = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+        return False
+    real = Path(os.path.realpath(path))
+    if real != Path(os.path.realpath(root)) / "profiles" / name / "auth.json":
+        return False
+    others = [root / "auth.json"] + [
+        root / "profiles" / entry / "auth.json"
+        for entry in os.listdir(root / "profiles")
+        if entry != name
+    ]
+    return all(Path(os.path.realpath(other)) != real for other in others)
+
+
 def _update_root_pool_rows(
     provider: str, payloads: List[Dict[str, Any]], global_path: Path,
     *, status_cleared_ids: Optional[Iterable[str]] = None,
@@ -1087,36 +1114,47 @@ class CredentialPool(CredentialPoolAdminMixin):
 
     @staticmethod
     def clear_profile_provider_exhaustion(profile: Optional[str], provider: Optional[str]) -> int:
-        """Clear *provider*'s exhaustion marks in *profile*'s own pool only.
+        """Clear a built-in *provider*'s exhaustion marks in *profile*'s own pool only.
 
-        The profile home is resolved the way the kanban dispatcher sets a
-        worker's HERMES_HOME, never from the caller's own home. Nothing is
-        cleared (and nothing written) when no provider is given, when the
-        profile has no pool or entry of its own for it, when its pool is
-        the root pool itself, or when its pool path cannot be resolved or
-        its store cannot be read or parsed or is not an object; there is no
-        fallback to any other pool. The store is read as it is on disk:
-        beside those marks only the save's own ``version`` and
-        ``updated_at`` stamp change. Returns how many entries were cleared;
-        no credential value is returned or logged.
+        *provider* must be a built-in provider's own id: a custom provider,
+        by any name or pool key, is never cleared. The profile home is
+        resolved the way the kanban dispatcher sets a worker's HERMES_HOME,
+        never from the caller's own home, and its pool counts only as the
+        canonical ``profiles/<profile>/auth.json`` under the real root: a
+        regular file that no symlink, hard link, home alias, other
+        profile's pool or the root pool shares. A provider that is not
+        built in, or a pool that is not that, returns 0 before the lock, so
+        nothing is written (no lock, temporary file or save); the pool is
+        checked again under the lock, and the save skipped unless it still
+        holds. Nothing is cleared either when the profile has no pool or
+        entry of its own for the provider, or when its store cannot be read
+        or parsed or is not an object; there is no fallback to any other
+        pool. The store is read as it is on disk: beside those marks only
+        the save's own ``version`` and ``updated_at`` stamp change. Returns
+        how many entries were cleared; no credential value is returned or
+        logged.
 
         The clear is one best-effort step inside one failure boundary:
-        locating the profile home, resolving and checking its pool path,
-        the lock, the read, the parse and the save all happen inside it.
-        Any failure there logs one warning naming the provider and nothing
-        else (no path, profile, exception text or traceback) and returns 0;
-        it never reaches the caller.
+        the built-in check, locating the profile home, checking its pool
+        path, the lock, the read, the parse and the save all happen inside
+        it. Any failure there logs one warning naming the provider and
+        nothing else (no path, profile, exception text or traceback) and
+        returns 0; it never reaches the caller.
         """
         key = provider.strip().lower() if isinstance(provider, str) else ""
         if not key or not isinstance(profile, str) or not profile.strip():
             return 0
         try:
+            from hermes_cli.kanban_provider_stops import _provider
             from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
-            home = Path(resolve_profile_env(normalize_profile_name(profile)))
+            if _provider(key) != key:
+                return 0
+            name = normalize_profile_name(profile)
             root = Path(resolve_profile_env("default"))
+            home = Path(resolve_profile_env(name))
             path = home / "auth.json"
-            if path.resolve() == (root / "auth.json").resolve() or not path.is_file():
+            if not _is_canonical_own_pool(root, name, path):
                 return 0
             with _auth_store_lock(target_path=path):
                 # Not _load_auth_store: it migrates other providers' state,
@@ -1130,8 +1168,9 @@ class CredentialPool(CredentialPoolAdminMixin):
                         entry.update(_CLEAR_STATUS)
                         entry.pop("failure_reason", None)
                         cleared += 1
-                if cleared:
-                    _save_auth_store(store, target_path=path)
+                if not cleared or not _is_canonical_own_pool(root, name, path):
+                    return 0
+                _save_auth_store(store, target_path=path)
                 return cleared
         except Exception:
             logger.warning("credential pool: could not clear a profile's %s exhaustion marks", key)

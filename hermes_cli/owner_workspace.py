@@ -6920,21 +6920,23 @@ def _retry_provider_wait(
 
 
 def _provider_wait_pool_key(held: sqlite3.Row) -> Optional[str]:
-    """The pool key of the provider a held run was limited on, from its own record or the card's.
+    """The built-in provider a held run was limited on, from its own record or the card's.
 
     The run keeps the provider it used as its stop identity: a built-in id is
     that provider's pool key. Any other identity is a digest, so it counts only
     through a name whose identity it is: the provider the run's runtime receipt
     names, then the card's own. With no identity kept, the receipt's provider
     counts, else the card's. A bare ``custom`` names no endpoint and is
-    skipped, as when the run was booked. None when no name is left.
+    skipped, as when the run was booked. Whatever is found counts only as a
+    built-in id: a custom identity, a custom or ``custom:`` name and any name
+    that is not built in give None, as does no name at all.
     """
     from hermes_cli import kanban_provider_stops
 
     metadata = kanban_provider_stops._metadata(held["metadata"]) or {}
     recorded = metadata.get(kanban_provider_stops.RATE_LIMIT_RESET_PROVIDER_KEY)
     if isinstance(recorded, str) and recorded and not recorded.startswith("custom#"):
-        return recorded
+        return kanban_provider_stops._provider(recorded)
     names = [
         name
         for name in (
@@ -6945,7 +6947,7 @@ def _provider_wait_pool_key(held: sqlite3.Row) -> Optional[str]:
     ]
     if not names:
         return None
-    return kanban_provider_stops._provider(names[0]) or str(names[0]).strip().lower()
+    return kanban_provider_stops._provider(names[0])
 
 
 def retry_task(
@@ -6980,10 +6982,12 @@ def retry_task(
     It also accepts a ready or review card whose latest ended run the AI
     provider limited (``rate_limited``). That card keeps its status: the
     ``owner_retry`` event, bound to that run, is the only board write, and it
-    ends that run's hold (``kanban_db.check_respawn_guard``). Then the
-    assignee profile's own pool forgets that provider's exhaustion
-    (``CredentialPool.clear_profile_provider_exhaustion``); clearing nothing
-    there never stops the retry.
+    ends that run's hold (``kanban_db.check_respawn_guard``). Then, for a
+    built-in provider, the assignee profile's canonical own pool forgets
+    that provider's exhaustion
+    (``CredentialPool.clear_profile_provider_exhaustion``); a custom
+    provider, a pool path another profile or the root shares, or clearing
+    nothing there leaves every pool as it was and never stops the retry.
 
     ``reason`` is required and is the owner's own account of why this work
     deserves another attempt. It is recorded twice, both times durably: as an

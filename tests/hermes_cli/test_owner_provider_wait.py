@@ -1,11 +1,13 @@
 """The owner can try work that waits for the AI provider again now.
 
 A ready card held after a rate-limited run is accepted by the owner retry,
-which records ``owner_retry`` against that exact run and clears the provider's
-exhaustion mark in the assignee profile's own pool only; the next tick may
-spawn it, and a limit that still holds books a new reset and a new hold
-without counting a failure. A reader that names ``provider_wait_v1`` is told
-plainly why stopped work waits; one that does not gets today's payload,
+which records ``owner_retry`` against that exact run and clears a built-in
+provider's exhaustion mark in the assignee profile's canonical own pool only;
+the next tick may spawn it, and a limit that still holds books a new reset and
+a new hold without counting a failure. A pool path shared with another profile
+or the root, and a custom provider, leave every store byte for byte as it was,
+and the retry still goes ahead. A reader that names ``provider_wait_v1`` is
+told plainly why stopped work waits; one that does not gets today's payload,
 compared whole against the one captured at the start commit. A card reads as
 waiting only while the dispatcher still holds it, and the pool clear finds the
 provider the card or its run records.
@@ -14,7 +16,8 @@ Every stop is booked through the real reap path (the dispatcher spawns the
 card, its worker exits, the sweep books the run), and every owner call runs
 under exactly the environment the dispatcher builds for a claimed worker. The
 root, each profile home, each pool and each board live in the test's own
-temporary folder; every card, profile, provider, key and time is made up.
+temporary folder; every card, profile, custom provider, key, token and time is
+made up. A built-in provider is named by its real id: a name, not a credential.
 """
 
 from __future__ import annotations
@@ -30,7 +33,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
+from agent import credential_pool
 from agent.credential_pool import CredentialPool
 from hermes_cli import auth, auth_nous
 from hermes_cli import kanban_db as kb, kanban_provider_stops, owner_workspace as ow
@@ -39,8 +44,15 @@ from hermes_cli.kanban_provider_stops import KANBAN_PROVIDER_REFUSED_EXIT_CODE
 ASSIGNEE = "worker"
 STEWARD = "steward"
 OTHER = "other"
+# Made up, so a custom provider: a pool the clear never reaches.
 PROVIDER = "placeholder-alpha"
-SECOND_PROVIDER = "placeholder-beta"
+# Two built-in providers, by their real ids: the only pools the clear reaches.
+BUILT_IN = "deepseek"
+SECOND_PROVIDER = "zai"
+# A named custom provider and the legacy pool key its worker draws from.
+VENDOR = "placeholder-vendor"
+VENDOR_POOL = "custom:placeholder-vendor"
+VENDOR_URL = "https://vendor.placeholder.invalid/v1"
 COOLDOWN = 300
 T0 = 1_900_000_000
 REASON = "The placeholder quota was raised, so please try again now."
@@ -103,10 +115,10 @@ def _board(board: str):
     return contextlib.closing(kb.connect(board=board))
 
 
-def _card(conn, project: dict, title: str) -> str:
+def _card(conn, project: dict, title: str, *, provider: str = PROVIDER) -> str:
     return kb.create_task(
         conn, title=title, assignee=ASSIGNEE, project_id=project["project_id"],
-        provider_override=PROVIDER, model_override="placeholder-model",
+        provider_override=provider, model_override="placeholder-model",
     )
 
 
@@ -308,16 +320,16 @@ def test_the_pool_clear_reaches_only_the_assignees_own_pool_for_that_provider(
     project = _project(owner, "Pool Pilot")
     board = project["board"]
     with _board(board) as conn:
-        task_id = _card(conn, project, "Draft the placeholder letter")
+        task_id = _card(conn, project, "Draft the placeholder letter", provider=BUILT_IN)
         run = _held(conn, board, task_id, 4401)
         clock["t"] = run.ended_at + 60
 
-    root_pool = _write_pool(root, {PROVIDER: [_exhausted("root-a")]})
+    root_pool = _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
     own_pool = _write_pool(root / "profiles" / ASSIGNEE, {
-        PROVIDER: [_exhausted("own-a")],
+        BUILT_IN: [_exhausted("own-a")],
         SECOND_PROVIDER: [_exhausted("own-b")],
     })
-    other_pool = _write_pool(root / "profiles" / STEWARD, {PROVIDER: [_exhausted("other-a")]})
+    other_pool = _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("other-a")]})
     untouched = {path: path.read_bytes() for path in (root_pool, other_pool)}
 
     env = _steward_env(root, board)
@@ -332,7 +344,7 @@ def test_the_pool_clear_reaches_only_the_assignees_own_pool_for_that_provider(
     cleared = dict(_exhausted("own-a"))
     cleared.pop("failure_reason")
     cleared.update({key: None for key in _STATUS_KEYS})
-    assert pool[PROVIDER] == [cleared]
+    assert pool[BUILT_IN] == [cleared]
     assert pool[SECOND_PROVIDER] == [_exhausted("own-b")]
 
     with _board(board) as conn:
@@ -342,14 +354,22 @@ def test_the_pool_clear_reaches_only_the_assignees_own_pool_for_that_provider(
 
 
 def test_the_pool_clear_writes_nothing_without_a_provider_an_own_entry_or_off_the_root(root):
-    root_pool = _write_pool(root, {PROVIDER: [_exhausted("root-a")]})
-    own_pool = _write_pool(root / "profiles" / ASSIGNEE, {SECOND_PROVIDER: [_exhausted("own-b")]})
+    root_pool = _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
+    own_pool = _write_pool(root / "profiles" / ASSIGNEE, {
+        SECOND_PROVIDER: [_exhausted("own-b")],
+        VENDOR: [_exhausted("own-v")],
+        VENDOR_POOL: [_exhausted("own-c")],
+    })
     before = {path: path.read_bytes() for path in (root_pool, own_pool)}
 
     assert CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, None) == 0
-    assert CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, PROVIDER) == 0
-    assert CredentialPool.clear_profile_provider_exhaustion(OTHER, PROVIDER) == 0
-    assert CredentialPool.clear_profile_provider_exhaustion("default", PROVIDER) == 0
+    assert CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, BUILT_IN) == 0
+    assert CredentialPool.clear_profile_provider_exhaustion(OTHER, BUILT_IN) == 0
+    assert CredentialPool.clear_profile_provider_exhaustion("default", BUILT_IN) == 0
+    # A custom provider, by its name or by its legacy pool key, is never cleared,
+    # though the assignee's own pool holds exhausted entries at both.
+    assert CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, VENDOR) == 0
+    assert CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, VENDOR_POOL) == 0
 
     for path, raw in before.items():
         assert path.read_bytes() == raw
@@ -385,21 +405,21 @@ def test_the_pool_clear_keeps_another_providers_legacy_state_and_logs_no_credent
     project = _project(owner, "Legacy Pilot")
     board = project["board"]
     with _board(board) as conn:
-        task_id = _card(conn, project, "Draft the placeholder note")
+        task_id = _card(conn, project, "Draft the placeholder note", provider=BUILT_IN)
         run = _held(conn, board, task_id, 4801)
         clock["t"] = run.ended_at + 60
 
     # The shared loader would move the portal URL kept for this host, and log it.
     monkeypatch.setattr(auth_nous, "_NOUS_STALE_PORTAL_HOSTS", frozenset({_LEGACY_HOST}))
     monkeypatch.setattr(auth_nous, "DEFAULT_NOUS_PORTAL_URL", _PORTAL)
-    root_pool = _write_pool(root, {PROVIDER: [_exhausted("root-a")]})
+    root_pool = _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
     own_pool = root / "profiles" / ASSIGNEE / "auth.json"
     own_pool.write_text(json.dumps(_legacy_store({
-        PROVIDER: [_exhausted("own-a")],
+        BUILT_IN: [_exhausted("own-a")],
         SECOND_PROVIDER: [_exhausted("own-b")],
     }), indent=2) + "\n")
-    steward_pool = _write_pool(root / "profiles" / STEWARD, {PROVIDER: [_exhausted("steward-a")]})
-    other_pool = _write_pool(root / "profiles" / OTHER, {PROVIDER: [_exhausted("other-a")]})
+    steward_pool = _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("steward-a")]})
+    other_pool = _write_pool(root / "profiles" / OTHER, {BUILT_IN: [_exhausted("other-a")]})
     pools = (root_pool, own_pool, steward_pool, other_pool)
     untouched = {path: path.read_bytes() for path in (root_pool, steward_pool, other_pool)}
     before = _exhausted_entries(pools)
@@ -416,7 +436,7 @@ def test_the_pool_clear_keeps_another_providers_legacy_state_and_logs_no_credent
     cleared = dict(_exhausted("own-a"))
     cleared.pop("failure_reason")
     cleared.update({key: None for key in _STATUS_KEYS})
-    expected = _legacy_store({PROVIDER: [cleared], SECOND_PROVIDER: [_exhausted("own-b")]})
+    expected = _legacy_store({BUILT_IN: [cleared], SECOND_PROVIDER: [_exhausted("own-b")]})
     stored = json.loads(own_pool.read_text())
     assert {key: value for key, value in stored.items() if key not in _STAMPS} == {
         key: value for key, value in expected.items() if key not in _STAMPS
@@ -443,7 +463,7 @@ def test_the_pool_clear_keeps_another_providers_legacy_state_and_logs_no_credent
 
 def _unparsed_store(shape: str) -> bytes:
     """The assignee's own store, holding an exhausted entry, in a shape no store is read from."""
-    store = {"version": 1, "credential_pool": {PROVIDER: [_exhausted("own-a")]}}
+    store = {"version": 1, "credential_pool": {BUILT_IN: [_exhausted("own-a")]}}
     text = json.dumps(store, indent=2)
     return {
         "truncated": text[: len(text) // 2].encode(),
@@ -459,7 +479,7 @@ def test_the_retry_goes_ahead_and_writes_nothing_beside_an_own_store_that_does_n
     project = _project(owner, "Broken Store")
     board = project["board"]
     with _board(board) as conn:
-        task_id = _card(conn, project, "Draft the placeholder card")
+        task_id = _card(conn, project, "Draft the placeholder card", provider=BUILT_IN)
         run = _held(conn, board, task_id, 4901)
         clock["t"] = run.ended_at + 60
 
@@ -493,13 +513,13 @@ def test_the_retry_goes_ahead_and_changes_no_pool_when_the_own_pool_path_is_unus
     project = _project(owner, "Unusable Pool")
     board = project["board"]
     with _board(board) as conn:
-        task_id = _card(conn, project, "Draft the placeholder report")
+        task_id = _card(conn, project, "Draft the placeholder report", provider=BUILT_IN)
         run = _held(conn, board, task_id, 5001)
         clock["t"] = run.ended_at + 60
 
-    root_pool = _write_pool(root, {PROVIDER: [_exhausted("root-a")]})
-    steward_pool = _write_pool(root / "profiles" / STEWARD, {PROVIDER: [_exhausted("steward-a")]})
-    other_pool = _write_pool(root / "profiles" / OTHER, {PROVIDER: [_exhausted("other-a")]})
+    root_pool = _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
+    steward_pool = _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("steward-a")]})
+    other_pool = _write_pool(root / "profiles" / OTHER, {BUILT_IN: [_exhausted("other-a")]})
     pools = (root_pool, steward_pool, other_pool)
     untouched = {path: path.read_bytes() for path in pools}
     before = _exhausted_entries(pools)
@@ -509,7 +529,7 @@ def test_the_retry_goes_ahead_and_changes_no_pool_when_the_own_pool_path_is_unus
     if state == "unreadable":
         # A valid store holding an exhausted entry that no one, root included,
         # may read: only this exact path is refused, every other read is real.
-        _write_pool(home, {PROVIDER: [_exhausted("own-a")]})
+        _write_pool(home, {BUILT_IN: [_exhausted("own-a")]})
         read_text = Path.read_text
 
         def refused(path, *args, **kwargs):
@@ -552,7 +572,7 @@ def test_the_retry_goes_ahead_and_changes_no_pool_when_the_own_pool_path_is_unus
         # Refused on every Python version. A link to itself makes resolve()
         # raise only on some, so that case is not required to be heard.
         [warning] = [record for record in records if record.levelno == logging.WARNING]
-        assert PROVIDER in warning.getMessage()
+        assert BUILT_IN in warning.getMessage()
     logged = "\n".join(logging.Formatter().format(record) for record in records)
     for leaked in (json.dumps(retried), events, logged):
         for value in ("placeholder-token", str(own_pool), str(home)):
@@ -973,7 +993,7 @@ def _booked_before_the_card_named_its_provider(conn, board: str, project: dict, 
     )
     run = _held(conn, board, task_id, 4601)
     assert run.metadata[kanban_provider_stops.RATE_LIMIT_RESET_PROVIDER_KEY] is None
-    assert kb.set_model_override(conn, task_id, "placeholder-model", provider=PROVIDER)
+    assert kb.set_model_override(conn, task_id, "placeholder-model", provider=BUILT_IN)
     return task_id, run
 
 
@@ -994,7 +1014,7 @@ def _booked_on_a_receipt_naming_its_provider(conn, board: str, project: dict, mo
     assert kb.heartbeat_worker(conn, task_id, expected_run_id=run_id, session_id=_SESSION)
     receipt = {
         "schema_version": 3, "engine": "hermes", "profile": ASSIGNEE,
-        "provider": PROVIDER, "model": "placeholder-model",
+        "provider": BUILT_IN, "model": "placeholder-model",
         "reasoning_effort": "provider-default", "route_evidence": "session-row",
     }
     with monkeypatch.context() as accounting:
@@ -1008,9 +1028,9 @@ def _booked_on_a_receipt_naming_its_provider(conn, board: str, project: dict, mo
     assert run.outcome == "rate_limited"
     assert kb.get_task(conn, task_id).status == "ready"
     assert kb.get_task(conn, task_id).provider_override is None
-    assert run.metadata["runtime_receipt"]["provider"] == PROVIDER
+    assert run.metadata["runtime_receipt"]["provider"] == BUILT_IN
     assert run.metadata[kanban_provider_stops.RATE_LIMIT_RESET_PROVIDER_KEY] == (
-        kanban_provider_stops._identity(PROVIDER)
+        kanban_provider_stops._identity(BUILT_IN)
     )
     return task_id, run
 
@@ -1040,13 +1060,13 @@ def test_the_retry_clears_the_assignees_own_entry_for_the_provider_the_card_or_i
         clock["t"] = run.ended_at + 60
         assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
 
-    root_pool = _write_pool(root, {PROVIDER: [_exhausted("root-a")]})
+    root_pool = _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
     own_pool = _write_pool(root / "profiles" / ASSIGNEE, {
-        PROVIDER: [_exhausted("own-a")],
+        BUILT_IN: [_exhausted("own-a")],
         SECOND_PROVIDER: [_exhausted("own-b")],
     })
-    steward_pool = _write_pool(root / "profiles" / STEWARD, {PROVIDER: [_exhausted("steward-a")]})
-    other_pool = _write_pool(root / "profiles" / OTHER, {PROVIDER: [_exhausted("other-a")]})
+    steward_pool = _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("steward-a")]})
+    other_pool = _write_pool(root / "profiles" / OTHER, {BUILT_IN: [_exhausted("other-a")]})
     pools = (root_pool, own_pool, steward_pool, other_pool)
     untouched = {path: path.read_bytes() for path in (root_pool, steward_pool, other_pool)}
     before = _exhausted_entries(pools)
@@ -1063,7 +1083,7 @@ def test_the_retry_clears_the_assignees_own_entry_for_the_provider_the_card_or_i
     cleared.pop("failure_reason")
     cleared.update({key: None for key in _STATUS_KEYS})
     assert json.loads(own_pool.read_text())["credential_pool"] == {
-        PROVIDER: [cleared], SECOND_PROVIDER: [_exhausted("own-b")],
+        BUILT_IN: [cleared], SECOND_PROVIDER: [_exhausted("own-b")],
     }
     assert _exhausted_entries(pools) == before - 1
 
@@ -1073,3 +1093,160 @@ def test_the_retry_clears_the_assignees_own_entry_for_the_provider_the_card_or_i
         events = json.dumps([event.payload for event in kb.list_events(conn, task_id)])
     for leaked in (json.dumps(retried), events, caplog.text):
         assert "placeholder-token" not in leaked
+
+
+def _stores(root: Path) -> list:
+    """The root pool and each profile's pool, spelled the way its worker's home names it."""
+    return [root / "auth.json"] + [
+        root / "profiles" / profile / "auth.json" for profile in (ASSIGNEE, STEWARD, OTHER)
+    ]
+
+
+def _retried_changing_no_store(root, owner, project: dict, task_id: str, run, monkeypatch, caplog):
+    """The retry goes ahead under a claimed worker's env; no store changes and no file appears."""
+    board = project["board"]
+    env = _steward_env(root, board)
+    stores = _stores(root)
+    folders = (root, root / "profiles" / ASSIGNEE, root / "profiles" / OTHER)
+    raw = {path: path.read_bytes() for path in stores}
+    names = {folder: set(os.listdir(folder)) for folder in folders}
+
+    caplog.set_level("DEBUG")
+    with _as_worker(monkeypatch, env):
+        retried = _retry(owner, project, task_id, "retry-changes-no-store")
+    assert retried["ok"] is True, retried
+
+    for path in stores:
+        assert path.read_bytes() == raw[path], path
+    # No lock, no temporary file, no copy: nothing was written beside any pool.
+    for folder in folders:
+        assert set(os.listdir(folder)) == names[folder], folder
+
+    with _board(board) as conn:
+        [event] = _events(conn, task_id, "owner_retry")
+        assert retried == {
+            "ok": True, "task_id": task_id, "status": "ready",
+            "revision": event.id, "retry_reason": REASON,
+        }
+        assert event.run_id == run.id
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.check_respawn_guard(conn, task_id) is None
+        events = json.dumps([event.payload for event in kb.list_events(conn, task_id)])
+    # The independent count, straight from the Project board's own rows.
+    path = kb.board_dir(board) / "kanban.db"
+    with contextlib.closing(kb.connect(db_path=path)) as conn:
+        bound = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id = ? AND kind = 'owner_retry' AND run_id = ?",
+            (task_id, run.id),
+        ).fetchone()["n"]
+    assert bound == 1
+    spelled = {str(path) for path in stores} | {os.path.realpath(path) for path in stores}
+    for leaked in (json.dumps(retried), events, caplog.text):
+        for value in ("placeholder-token", *spelled):
+            assert value not in leaked
+
+
+def _alias_the_own_pool(root: Path, alias: str) -> None:
+    """Make the assignee's pool path reach a store it does not own alone.
+
+    Every store path the test reads then holds an exhausted built-in entry.
+    """
+    own_home, other_home = root / "profiles" / ASSIGNEE, root / "profiles" / OTHER
+    own_pool, other_pool = own_home / "auth.json", other_home / "auth.json"
+    if alias == "another_home_links_to_the_own_home":
+        _write_pool(own_home, {BUILT_IN: [_exhausted("own-a")]})
+        other_home.rmdir()
+        other_home.symlink_to(own_home, target_is_directory=True)
+        return
+    _write_pool(other_home, {BUILT_IN: [_exhausted("other-a")]})
+    if alias == "own_home_links_to_another_home":
+        own_home.rmdir()
+        own_home.symlink_to(other_home, target_is_directory=True)
+    elif alias == "own_pool_links_to_another_pool":
+        own_pool.symlink_to(other_pool)
+    elif alias == "own_pool_links_to_the_root_pool":
+        own_pool.symlink_to(root / "auth.json")
+    else:
+        os.link(other_pool, own_pool)
+
+
+@pytest.mark.parametrize("alias", [
+    "own_home_links_to_another_home",
+    "own_pool_links_to_another_pool",
+    "own_pool_links_to_the_root_pool",
+    "another_home_links_to_the_own_home",
+    "own_pool_hard_links_another_pool",
+])
+def test_the_retry_goes_ahead_and_changes_no_store_when_the_own_pool_path_aliases_another(
+    alias, root, owner, clock, monkeypatch, caplog,
+):
+    project = _project(owner, "Aliased Pool")
+    board = project["board"]
+    with _board(board) as conn:
+        task_id = _card(conn, project, "Draft the placeholder plan", provider=BUILT_IN)
+        run = _held(conn, board, task_id, 5101)
+        clock["t"] = run.ended_at + 60
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+
+    _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
+    _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("steward-a")]})
+    _alias_the_own_pool(root, alias)
+    assert _exhausted_entries(_stores(root)) == len(_stores(root))
+
+    _retried_changing_no_store(root, owner, project, task_id, run, monkeypatch, caplog)
+
+
+@pytest.mark.parametrize("named", [VENDOR, VENDOR_POOL], ids=["custom_name", "custom_pool_key"])
+def test_the_retry_goes_ahead_and_changes_no_store_for_a_custom_provider(
+    named, root, owner, clock, monkeypatch, caplog,
+):
+    project = _project(owner, "Vendor Route")
+    board = project["board"]
+    with _board(board) as conn:
+        task_id = _card(conn, project, "Draft the placeholder quote", provider=named)
+        run = _held(conn, board, task_id, 5201)
+        clock["t"] = run.ended_at + 60
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+
+    # The assignee's own config names the vendor, so its worker draws from the
+    # legacy pool keyed ``custom:<name>``; that pool is the assignee's own.
+    config = root / "profiles" / ASSIGNEE / "config.yaml"
+    config.write_text(f"custom_providers:\n  - name: {VENDOR}\n    base_url: {VENDOR_URL}\n")
+    [(name, entry)] = credential_pool._iter_custom_providers(yaml.safe_load(config.read_text()))
+    assert credential_pool._pool_keys_for_custom_entry(name, entry) == [VENDOR_POOL]
+    for path, label in zip(_stores(root), ("root", "own", "steward", "other")):
+        _write_pool(path.parent, {
+            VENDOR: [_exhausted(f"{label}-v")],
+            VENDOR_POOL: [_exhausted(f"{label}-c")],
+            BUILT_IN: [_exhausted(f"{label}-a")],
+        })
+
+    _retried_changing_no_store(root, owner, project, task_id, run, monkeypatch, caplog)
+
+
+def test_the_pool_clear_still_clears_the_own_pool_when_the_whole_root_is_reached_through_a_link(
+    root, tmp_path, monkeypatch,
+):
+    root_pool = _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
+    own_pool = _write_pool(root / "profiles" / ASSIGNEE, {
+        BUILT_IN: [_exhausted("own-a")],
+        SECOND_PROVIDER: [_exhausted("own-b")],
+    })
+    steward_pool = _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("steward-a")]})
+    other_pool = _write_pool(root / "profiles" / OTHER, {BUILT_IN: [_exhausted("other-a")]})
+    untouched = {path: path.read_bytes() for path in (root_pool, steward_pool, other_pool)}
+    linked = tmp_path / "linked-root"
+    linked.symlink_to(root, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(linked / "profiles" / STEWARD))
+
+    assert CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, BUILT_IN) == 1
+
+    for path, raw in untouched.items():
+        assert path.read_bytes() == raw
+    cleared = dict(_exhausted("own-a"))
+    cleared.pop("failure_reason")
+    cleared.update({key: None for key in _STATUS_KEYS})
+    assert json.loads(own_pool.read_text())["credential_pool"] == {
+        BUILT_IN: [cleared], SECOND_PROVIDER: [_exhausted("own-b")],
+    }
