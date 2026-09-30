@@ -2940,7 +2940,8 @@ def _owner_project_run_receipt(
     ``PROVIDER_WAIT_CAPABILITY``: a provider-refused run then says so, and the
     run a card waits on after a provider limit reads ``waiting`` until
     ``provider_resume_at``, the moment its hold ends. The caller passes that
-    moment only for such a run.
+    moment only for such a run while the dispatcher still holds it; any other
+    run reads as it does today.
 
     ``owner_retry_reason`` is the reason the owner gave for retrying THIS
     exact run — resolved by the caller from an ``owner_retry`` event bound to
@@ -3326,10 +3327,11 @@ def read_project_snapshot(
     defaults off so the shape and selection stay exactly today's; see
     ``OWNER_WAITING_CAPABILITY``.
 
-    ``provider_wait`` shows work that waits for the AI provider: a card held
-    after a provider limit reads ``provider_wait`` and the run it waits on
-    reads ``waiting``; it defaults off so every payload stays exactly today's;
-    see ``PROVIDER_WAIT_CAPABILITY``.
+    ``provider_wait`` shows work that waits for the AI provider: a card the
+    dispatcher still holds after a provider limit reads ``provider_wait`` and
+    the run it waits on reads ``waiting``; once that hold ends (an owner retry,
+    the hold running out, or no cooldown) both read as today; it defaults off
+    so every payload stays exactly today's; see ``PROVIDER_WAIT_CAPABILITY``.
     """
     try:
         project_slug = projects_db.normalize_slug(project_slug) or ""
@@ -3430,11 +3432,13 @@ def read_project_snapshot(
             kanban_db.task_owner_waits(conn, task_ids) if owner_waiting else {}
         )
         # Only ready and review cards are held, and the kernel's states name
-        # only blocked ones, so this never hides one of those states.
-        provider_held = (
-            _owner_provider_held_runs(conn, task_ids) if provider_wait else {}
+        # only blocked ones, so this never hides one of those states. Only a
+        # hold the dispatcher still keeps reads as waiting: a card whose hold
+        # has ended keeps today's state here, though the retry still takes it.
+        provider_waits = (
+            _owner_provider_waits(conn, task_ids) if provider_wait else {}
         )
-        for task_id in provider_held:
+        for task_id in provider_waits:
             stopped_work[task_id] = _OWNER_STOPPED_WORK_PROVIDER_WAIT
 
         columns = {status: [] for status in _OWNER_PROJECT_COLUMNS}
@@ -3519,12 +3523,13 @@ def read_project_snapshot(
             if run_context
             else {}
         )
-        provider_resume_times = (
-            _owner_provider_resume_times(
+        # Keyed by the held run's id: only that run of a card still held waits.
+        provider_resume_times = dict(
+            _owner_provider_waits(
                 conn, {str(run.task_id) for run in bounded_run_objects},
-            )
+            ).values()
             if provider_wait
-            else {}
+            else ()
         )
         runs: list[dict] = []
         task_ids_with_newer_run: set[str] = set()
@@ -6829,8 +6834,10 @@ def _owner_provider_held_runs(
 
     That is the card's latest ended run, read in the respawn guard's own order,
     when it ended ``rate_limited``; keyed by task id. Batched and read-only.
-    The snapshot's ``provider_wait`` state and the owner retry both read this,
-    so a card shown as waiting is exactly a card that retry accepts.
+    The owner retry accepts exactly these cards. The snapshot shows as waiting
+    only those the dispatcher still holds (:func:`_owner_provider_waits`), so
+    every card shown as waiting is one that retry accepts, but a card whose
+    hold has ended is accepted without being shown as waiting.
     """
     ids = sorted({str(task_id) for task_id in task_ids})
     if not ids:
@@ -6851,21 +6858,31 @@ def _owner_provider_held_runs(
     return {str(row["task_id"]): row for row in rows}
 
 
-def _owner_provider_resume_times(
+def _owner_provider_waits(
     conn: sqlite3.Connection, task_ids: Any,
-) -> dict[int, int]:
-    """When each held run's hold ends, as ``check_respawn_guard`` reads it; keyed by run id."""
+) -> dict[str, tuple[int, int]]:
+    """Each card the dispatcher holds for the AI provider now: its held run's id and the hold's end.
+
+    A card the retry accepts (:func:`_owner_provider_held_runs`) counts only
+    while ``kanban_db.check_respawn_guard``, asked for the card's own column as
+    the dispatcher asks it, answers ``rate_limit_cooldown``: an ``owner_retry``
+    bound to that run, a hold that has run out and a disabled cooldown each
+    end it. The end is the moment that check uses. Keyed by task id; read-only.
+    """
     from hermes_cli import kanban_provider_stops
 
     cooldown = kanban_db._resolve_rate_limit_cooldown_seconds()
-    resume_times: dict[int, int] = {}
+    waits: dict[str, tuple[int, int]] = {}
     for task_id, held in _owner_provider_held_runs(conn, task_ids).items():
+        guard = kanban_db.check_respawn_guard(conn, task_id, lane=held["status"])
+        if guard != "rate_limit_cooldown":
+            continue
         resume_at = kanban_provider_stops.rate_limit_resume_at(
             conn, task_id, held, cooldown=cooldown,
         )
         if resume_at is not None:
-            resume_times[int(held["id"])] = resume_at
-    return resume_times
+            waits[task_id] = (int(held["id"]), resume_at)
+    return waits
 
 
 def _provider_held_run(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
@@ -6906,9 +6923,11 @@ def _provider_wait_pool_key(held: sqlite3.Row) -> Optional[str]:
     """The pool key of the provider a held run was limited on, from its own record or the card's.
 
     The run keeps the provider it used as its stop identity: a built-in id is
-    that provider's pool key. Any other identity is a digest, so the card's own
-    provider counts only when it is the one the run kept. None when neither
-    names it.
+    that provider's pool key. Any other identity is a digest, so it counts only
+    through a name whose identity it is: the provider the run's runtime receipt
+    names, then the card's own. With no identity kept, the receipt's provider
+    counts, else the card's. A bare ``custom`` names no endpoint and is
+    skipped, as when the run was booked. None when no name is left.
     """
     from hermes_cli import kanban_provider_stops
 
@@ -6916,10 +6935,17 @@ def _provider_wait_pool_key(held: sqlite3.Row) -> Optional[str]:
     recorded = metadata.get(kanban_provider_stops.RATE_LIMIT_RESET_PROVIDER_KEY)
     if isinstance(recorded, str) and recorded and not recorded.startswith("custom#"):
         return recorded
-    card = held["provider_override"]
-    if recorded is not None and kanban_provider_stops._identity(card) == recorded:
-        return str(card).strip().lower()
-    return None
+    names = [
+        name
+        for name in (
+            kanban_provider_stops._receipt_provider(metadata), held["provider_override"],
+        )
+        if kanban_provider_stops._normalized(name) not in ("", "custom")
+        and (recorded is None or kanban_provider_stops._identity(name) == recorded)
+    ]
+    if not names:
+        return None
+    return kanban_provider_stops._provider(names[0]) or str(names[0]).strip().lower()
 
 
 def retry_task(

@@ -6,7 +6,9 @@ exhaustion mark in the assignee profile's own pool only; the next tick may
 spawn it, and a limit that still holds books a new reset and a new hold
 without counting a failure. A reader that names ``provider_wait_v1`` is told
 plainly why stopped work waits; one that does not gets today's payload,
-compared whole against the one captured at the start commit.
+compared whole against the one captured at the start commit. A card reads as
+waiting only while the dispatcher still holds it, and the pool clear finds the
+provider the card or its run records.
 
 Every stop is booked through the real reap path (the dispatcher spawns the
 card, its worker exits, the sweep books the run), and every owner call runs
@@ -28,7 +30,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.credential_pool import CredentialPool
-from hermes_cli import kanban_db as kb, owner_workspace as ow
+from hermes_cli import kanban_db as kb, kanban_provider_stops, owner_workspace as ow
 from hermes_cli.kanban_provider_stops import KANBAN_PROVIDER_REFUSED_EXIT_CODE
 
 ASSIGNEE = "worker"
@@ -650,3 +652,183 @@ def test_without_the_capability_the_snapshot_is_unchanged(root, owner, clock, mo
     with _as_worker(monkeypatch, scene["env"]):
         snapshot = ow.read_project_snapshot(owner, scene["project"]["slug"])
     assert _normalized(snapshot, scene) == json.loads(_SNAPSHOT_AT_START)
+
+
+def _task(snapshot: dict, task_id: str) -> dict:
+    return next(
+        task for column in snapshot["columns"] for task in column["tasks"]
+        if task["id"] == task_id
+    )
+
+
+@pytest.mark.parametrize("ended_by", ["owner_retry", "expiry", "disabled_cooldown"])
+def test_with_the_capability_a_card_whose_hold_has_ended_reads_exactly_as_without_it(
+    ended_by, root, owner, clock, monkeypatch,
+):
+    scene = _waiting_and_refused(root, owner)
+    project, held, waiting = scene["project"], scene["held"], scene["waiting"]
+    board, env = project["board"], scene["env"]
+    clock["t"] = held.ended_at + 60
+    with _board(board) as conn:
+        assert kb.check_respawn_guard(conn, waiting) == "rate_limit_cooldown"
+    if ended_by == "owner_retry":
+        with _as_worker(monkeypatch, _steward_env(root, board)):
+            retried = _retry(owner, project, waiting, "retry-ends-the-hold")
+        assert retried["ok"] is True, retried
+    elif ended_by == "expiry":
+        with _board(board) as conn:
+            clock["t"] = _resume_at(held) - 1
+            assert kb.check_respawn_guard(conn, waiting) == "rate_limit_cooldown"
+        clock["t"] = _resume_at(held)
+    else:
+        # Booked while the cooldown was on; the dispatcher now runs with it off.
+        monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+        env = _steward_env(root, "steward-desk")
+        assert env["HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS"] == "0"
+
+    with _as_worker(monkeypatch, env):
+        snapshot = ow.read_project_snapshot(owner, project["slug"], provider_wait=True)
+        plain = ow.read_project_snapshot(owner, project["slug"])
+
+    # The card and the run it waited on read exactly as they do without the capability.
+    [at] = [
+        index for index, run in enumerate(plain["runs"])
+        if run["receipt"]["outcome"] == "attention"
+    ]
+    assert (_task(snapshot, waiting), snapshot["runs"][at]) == (
+        _task(plain, waiting), plain["runs"][at],
+    )
+    assert _task(snapshot, waiting)["stopped_work"] == "none"
+
+    # The independent count, straight from the Project board's own rows: the
+    # dispatcher holds nothing, so nothing reads as waiting.
+    path = kb.board_dir(board) / "kanban.db"
+    with contextlib.closing(kb.connect(db_path=path)) as conn:
+        held_now = [
+            task_id for task_id in (waiting, scene["refused"])
+            if kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+        ]
+        retries = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id = ? AND kind = 'owner_retry' AND run_id = ?",
+            (waiting, held.id),
+        ).fetchone()["n"]
+    assert held_now == []
+    assert retries == (1 if ended_by == "owner_retry" else 0)
+    stopped = plain_stopped(snapshot)
+    receipts = [run["receipt"] for run in snapshot["runs"]]
+    assert sum(state == "provider_wait" for state in stopped.values()) == len(held_now)
+    assert sum(receipt["outcome"] == "waiting" for receipt in receipts) == len(held_now)
+
+
+_SESSION = "placeholder-session-0001"
+
+
+def _booked_before_the_card_named_its_provider(conn, board: str, project: dict, _monkeypatch):
+    """Nothing named a provider when the stop was booked; the card names one afterwards."""
+    task_id = kb.create_task(
+        conn, title="Draft the placeholder memo", assignee=ASSIGNEE,
+        project_id=project["project_id"],
+    )
+    run = _held(conn, board, task_id, 4601)
+    assert run.metadata[kanban_provider_stops.RATE_LIMIT_RESET_PROVIDER_KEY] is None
+    assert kb.set_model_override(conn, task_id, "placeholder-model", provider=PROVIDER)
+    return task_id, run
+
+
+def _booked_on_a_receipt_naming_its_provider(conn, board: str, project: dict, monkeypatch):
+    """The card names no provider; the run's own accounting names the one it used.
+
+    The worker links its session the way it does at its first heartbeat; only
+    the kernel's receipt source is stubbed, so the real closing path stamps the
+    receipt and the real booking keeps the provider's identity.
+    """
+    task_id = kb.create_task(
+        conn, title="Draft the placeholder digest", assignee=ASSIGNEE,
+        project_id=project["project_id"],
+    )
+    _result, spawned = _tick(conn, board, {task_id: 4701})
+    assert spawned == [task_id]
+    run_id = kb.get_task(conn, task_id).current_run_id
+    assert kb.heartbeat_worker(conn, task_id, expected_run_id=run_id, session_id=_SESSION)
+    receipt = {
+        "schema_version": 3, "engine": "hermes", "profile": ASSIGNEE,
+        "provider": PROVIDER, "model": "placeholder-model",
+        "reasoning_effort": "provider-default", "route_evidence": "session-row",
+    }
+    with monkeypatch.context() as accounting:
+        accounting.setattr(
+            kb, "_trusted_runtime_receipt",
+            lambda session_id, _profile: dict(receipt) if session_id == _SESSION else None,
+        )
+        kb._record_worker_exit(4701, kb.KANBAN_RATE_LIMIT_EXIT_CODE << 8)
+        kb.detect_crashed_workers(conn)
+    run = kb.get_run(conn, run_id)
+    assert run.outcome == "rate_limited"
+    assert kb.get_task(conn, task_id).status == "ready"
+    assert kb.get_task(conn, task_id).provider_override is None
+    assert run.metadata["runtime_receipt"]["provider"] == PROVIDER
+    assert run.metadata[kanban_provider_stops.RATE_LIMIT_RESET_PROVIDER_KEY] == (
+        kanban_provider_stops._identity(PROVIDER)
+    )
+    return task_id, run
+
+
+def _exhausted_entries(paths) -> int:
+    """Exhausted entries across ``paths``, counted straight from the files."""
+    return sum(
+        entry.get("last_status") == "exhausted"
+        for path in paths
+        for entries in json.loads(path.read_text())["credential_pool"].values()
+        for entry in entries
+    )
+
+
+@pytest.mark.parametrize(
+    "book",
+    [_booked_before_the_card_named_its_provider, _booked_on_a_receipt_naming_its_provider],
+    ids=["card_provider", "run_receipt_provider"],
+)
+def test_the_retry_clears_the_assignees_own_entry_for_the_provider_the_card_or_its_run_records(
+    book, root, owner, clock, monkeypatch, caplog,
+):
+    project = _project(owner, "Recorded Route")
+    board = project["board"]
+    with _board(board) as conn:
+        task_id, run = book(conn, board, project, monkeypatch)
+        clock["t"] = run.ended_at + 60
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+
+    root_pool = _write_pool(root, {PROVIDER: [_exhausted("root-a")]})
+    own_pool = _write_pool(root / "profiles" / ASSIGNEE, {
+        PROVIDER: [_exhausted("own-a")],
+        SECOND_PROVIDER: [_exhausted("own-b")],
+    })
+    steward_pool = _write_pool(root / "profiles" / STEWARD, {PROVIDER: [_exhausted("steward-a")]})
+    other_pool = _write_pool(root / "profiles" / OTHER, {PROVIDER: [_exhausted("other-a")]})
+    pools = (root_pool, own_pool, steward_pool, other_pool)
+    untouched = {path: path.read_bytes() for path in (root_pool, steward_pool, other_pool)}
+    before = _exhausted_entries(pools)
+
+    env = _steward_env(root, board)
+    caplog.set_level("DEBUG")
+    with _as_worker(monkeypatch, env):
+        retried = _retry(owner, project, task_id, "retry-recorded-route")
+    assert retried["ok"] is True, retried
+
+    for path, raw in untouched.items():
+        assert path.read_bytes() == raw
+    cleared = dict(_exhausted("own-a"))
+    cleared.pop("failure_reason")
+    cleared.update({key: None for key in _STATUS_KEYS})
+    assert json.loads(own_pool.read_text())["credential_pool"] == {
+        PROVIDER: [cleared], SECOND_PROVIDER: [_exhausted("own-b")],
+    }
+    assert _exhausted_entries(pools) == before - 1
+
+    with _board(board) as conn:
+        [event] = _events(conn, task_id, "owner_retry")
+        assert event.run_id == run.id
+        events = json.dumps([event.payload for event in kb.list_events(conn, task_id)])
+    for leaked in (json.dumps(retried), events, caplog.text):
+        assert "placeholder-token" not in leaked
