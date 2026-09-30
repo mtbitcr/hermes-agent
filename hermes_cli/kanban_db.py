@@ -24239,11 +24239,14 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``ready`` status). With
+    ``expected_assignee`` the claim also requires the task to still belong
+    to that assignee, so a capacity check made for it holds for the claim.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
@@ -24326,6 +24329,10 @@ def claim_task(
         # authoritative epoch" test are one statement, so no ordering of
         # events can grant a reservation on a fenced board.
         gate_sql, gate_params = fence_cas_conjunct(conn)
+        assignee_sql = (
+            "\n               AND assignee IS ?" if expected_assignee is not None else ""
+        )
+        assignee_params = (expected_assignee,) if expected_assignee is not None else ()
         cur = conn.execute(
             f"""
             UPDATE tasks
@@ -24336,9 +24343,9 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
-               AND task_kind = 'work'{gate_sql}
+               AND task_kind = 'work'{assignee_sql}{gate_sql}
             """,
-            (lock, expires, now, task_id, *gate_params),
+            (lock, expires, now, task_id, *assignee_params, *gate_params),
         )
         if cur.rowcount != 1:
             return None
@@ -36299,7 +36306,9 @@ def _dispatch_once_locked(
     increments it in place as it spawns. Without it a listed profile is
     counted on this board only, like the shared per-profile cap.
     ``profile_running_unknown`` means some board's count could not be read
-    this tick: every listed profile is then held in both lanes.
+    this tick: every listed profile's ready work is then held. The mapping
+    never holds the review lane, which keeps the shared per-profile cap only;
+    a review a listed profile starts still counts in its cross-board total.
 
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
@@ -36466,17 +36475,32 @@ def _dispatch_once_locked(
             return current
         return None
 
-    def _count_profile_spawn(assignee):
+    def _integer_capped_running(assignee):
+        """Like ``_capped_running`` for the review lane, which the mapping
+        never holds: only the shared per-profile cap applies there."""
+        if _per_profile_cap is None:
+            return None
+        current = _per_profile_running.get(assignee, 0)
+        return current if current >= _per_profile_cap else None
+
+    def _reserve_listed(assignee):
+        """Count a listed profile's claim in the cross-board total at once,
+        before its workspace or spawn can fail, so a failure later in this
+        board's tick cannot hide it from the boards ticked after it."""
+        if assignee in _own_caps and profile_running_all_boards is not None:
+            profile_running_all_boards[assignee] = (
+                profile_running_all_boards.get(assignee, 0) + 1
+            )
+
+    def _count_profile_spawn(assignee, *, reserved=False):
         if not assignee:
             return
         if _per_profile_cap is not None or _own_caps:
             _per_profile_running[assignee] = (
                 _per_profile_running.get(assignee, 0) + 1
             )
-        if assignee in _own_caps and profile_running_all_boards is not None:
-            profile_running_all_boards[assignee] = (
-                profile_running_all_boards.get(assignee, 0) + 1
-            )
+        if not reserved:
+            _reserve_listed(assignee)
 
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
@@ -36488,12 +36512,7 @@ def _dispatch_once_locked(
     # spawnable review work (or no cap at all) the ready loop keeps the
     # full budget. "Spawnable" mirrors the review loop's own gate
     # (assigned + real profile) so a review column full of human-pulled
-    # control-plane lanes doesn't permanently tax ready throughput. A
-    # reviewer listed in max_in_progress_by_profile that its own cap holds
-    # cannot start either, so it holds no slot back from other profiles.
-    def _held_by_own_cap(assignee) -> bool:
-        return assignee in _own_caps and _capped_running(assignee) is not None
-
+    # control-plane lanes doesn't permanently tax ready throughput.
     def _any_spawnable_review() -> bool:
         if not review_rows:
             return False
@@ -36502,14 +36521,9 @@ def _dispatch_once_locked(
         except Exception:
             # Profiles module unavailable (test stubs, exotic envs) —
             # assume spawnable, matching the review loop's own fallback.
-            return any(
-                row["assignee"] and not _held_by_own_cap(row["assignee"])
-                for row in review_rows
-            )
+            return any(row["assignee"] for row in review_rows)
         return any(
-            row["assignee"] and _rpe(row["assignee"])
-            and not _held_by_own_cap(row["assignee"])
-            for row in review_rows
+            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
         )
 
     ready_budget = spawn_budget
@@ -36711,7 +36725,13 @@ def _dispatch_once_locked(
             _count_profile_spawn(row_assignee)
             continue
         try:
-            claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+            # With the mapping set, the claim must still find the assignee
+            # whose capacity was checked above; a card reassigned in between
+            # waits for the next tick instead of starting unchecked.
+            claim_kwargs = {"expected_assignee": row_assignee} if _own_caps else {}
+            claimed = claim_task(
+                conn, row["id"], ttl_seconds=ttl_seconds, **claim_kwargs
+            )
         except RuntimeError as exc:
             # A route the screen above could not see (a concurrent edit, a
             # schema this build cannot validate). One task's problem stays one
@@ -36720,6 +36740,7 @@ def _dispatch_once_locked(
             continue
         if claimed is None:
             continue
+        _reserve_listed(claimed.assignee)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -36783,8 +36804,9 @@ def _dispatch_once_locked(
             spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
-            # (#21582). Subsequent ticks re-query from the DB.
-            _count_profile_spawn(claimed.assignee)
+            # (#21582). Subsequent ticks re-query from the DB. The
+            # cross-board total already counted this claim.
+            _count_profile_spawn(claimed.assignee, reserved=True)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -36826,7 +36848,7 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
-        current = _capped_running(row["assignee"])
+        current = _integer_capped_running(row["assignee"])
         if current is not None:
             result.skipped_per_profile_capped.append(
                 (row["id"], row["assignee"], current)
@@ -36869,6 +36891,7 @@ def _dispatch_once_locked(
             continue
         if claimed is None:
             continue
+        _reserve_listed(claimed.assignee)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -36934,7 +36957,7 @@ def _dispatch_once_locked(
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
-            _count_profile_spawn(claimed.assignee)
+            _count_profile_spawn(claimed.assignee, reserved=True)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),

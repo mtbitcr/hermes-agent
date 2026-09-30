@@ -1407,9 +1407,8 @@ class GatewayKanbanWatchersMixin:
         max_in_progress_by_profile: dict[str, int] = {}
         if raw_by_profile is not None and not isinstance(raw_by_profile, dict):
             logger.warning(
-                "kanban dispatcher: kanban.max_in_progress_by_profile=%r is not a "
+                "kanban dispatcher: kanban.max_in_progress_by_profile is not a "
                 "mapping of profile name to cap; ignoring",
-                raw_by_profile,
             )
         elif raw_by_profile:
             for profile_name, raw_cap in raw_by_profile.items():
@@ -1421,11 +1420,10 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_by_profile[str(profile_name)] = raw_cap
                 else:
                     logger.warning(
-                        "kanban dispatcher: kanban.max_in_progress_by_profile[%r]=%r "
+                        "kanban dispatcher: kanban.max_in_progress_by_profile[%r] "
                         "is not a whole number of at least 1; ignoring (the profile "
                         "keeps kanban.max_in_progress_per_profile)",
                         profile_name,
-                        raw_cap,
                     )
             if max_in_progress_by_profile:
                 logger.info(
@@ -1605,8 +1603,9 @@ class GatewayKanbanWatchersMixin:
                     for name, n in _kb.count_running_by_assignee(conn).items():
                         if name in counts:
                             counts[name] += n
-                except Exception as exc:
-                    unreadable.append(f"{slug} ({exc})")
+                except Exception:
+                    # The board's name only: the error text can carry paths.
+                    unreadable.append(b.get("slug") or _kb.DEFAULT_BOARD)
                     continue
                 finally:
                     if conn is not None:
