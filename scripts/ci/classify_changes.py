@@ -95,6 +95,9 @@ _PY_RELEVANT_SITE = (
 # CI-sensitive files: eslint config, workflow files, composite actions.
 # Changes here can influence what code the autofix job executes and pushes to
 # main, so they require explicit maintainer review (ci-reviewed label).
+# The CI scripts (this classifier among them), the two test runners and the
+# dormant skip list are listed too: they choose which lanes and test files
+# run, so a change to them could switch tests off without that review.
 #
 # package.json is deliberately NOT listed here: npm scripts only execute on the
 # unprivileged generate-patch runner (contents: read), never on the privileged
@@ -102,8 +105,11 @@ _PY_RELEVANT_SITE = (
 # can't get push access — it runs on an ephemeral runner with zero write perms.
 _CI_REVIEW_FILES = {
     ".prettierrc",
+    "scripts/run_tests.sh",
+    "scripts/run_tests_parallel.py",
+    "tests/fork_dormant_skips.txt",
 }
-_CI_REVIEW_PATHS = (".github/workflows/", ".github/actions/")
+_CI_REVIEW_PATHS = (".github/workflows/", ".github/actions/", "scripts/ci/")
 
 # Supply-chain scan: files that can execute code at install/import time.
 _SCAN_EXTS = (".py", ".pth")
