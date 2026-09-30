@@ -33093,6 +33093,13 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    unreached_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """Ready tasks the ready loop never reached this tick because its spawn
+    budget ran out (e.g. the slot held back for the review lane) and whose
+    assignee was already at its per-profile cap at that point, as the same
+    ``(task_id, assignee, current_running_count)`` entries. Recorded without
+    touching the task, so health telemetry counts it as held by the cap
+    rather than as stuck work."""
     skipped_file_scope_conflict: list[tuple[str, list[str]]] = field(default_factory=list)
     """Tasks deferred because a running task in the same Project owns an
     overlapping repository path (or either task lacks an explicit safe
@@ -36142,6 +36149,7 @@ def dispatch_once(
     require_board_activation: bool = False,
     max_in_progress_by_profile: Optional[Mapping[str, int]] = None,
     profile_running_all_boards: Optional[dict[str, int]] = None,
+    profile_running_unknown: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -36183,6 +36191,7 @@ def dispatch_once(
             reconcile_orphans=reconcile_orphans,
             max_in_progress_by_profile=max_in_progress_by_profile,
             profile_running_all_boards=profile_running_all_boards,
+            profile_running_unknown=profile_running_unknown,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -36220,6 +36229,7 @@ def dispatch_once(
                 reconcile_orphans=reconcile_orphans,
                 max_in_progress_by_profile=max_in_progress_by_profile,
                 profile_running_all_boards=profile_running_all_boards,
+                profile_running_unknown=profile_running_unknown,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -36249,6 +36259,7 @@ def _dispatch_once_locked(
     reconcile_orphans: bool = True,
     max_in_progress_by_profile: Optional[Mapping[str, int]] = None,
     profile_running_all_boards: Optional[dict[str, int]] = None,
+    profile_running_unknown: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -36287,6 +36298,8 @@ def _dispatch_once_locked(
     across every board it dispatches, read once per tick — and this tick
     increments it in place as it spawns. Without it a listed profile is
     counted on this board only, like the shared per-profile cap.
+    ``profile_running_unknown`` means some board's count could not be read
+    this tick: every listed profile is then held in both lanes.
 
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
@@ -36402,34 +36415,6 @@ def _dispatch_once_locked(
             "WHERE status = 'review' AND claim_lock IS NULL AND task_kind = 'work' "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
-    # Review-lane reservation (OOF-30 review finding): the ready loop runs
-    # first and used to consume the ENTIRE shared budget, so a sustained
-    # ready backlog permanently starved autonomous reviews — completed work
-    # sat in 'review' forever while new work kept spawning. When spawnable
-    # review work exists and the tick has any budget, hold one slot back
-    # from the ready loop so the review lane always gets a spawn
-    # opportunity. The reservation is per-tick and self-releasing: with no
-    # spawnable review work (or no cap at all) the ready loop keeps the
-    # full budget. "Spawnable" mirrors the review loop's own gate
-    # (assigned + real profile) so a review column full of human-pulled
-    # control-plane lanes doesn't permanently tax ready throughput.
-    def _any_spawnable_review() -> bool:
-        if not review_rows:
-            return False
-        try:
-            from hermes_cli.profiles import profile_exists as _rpe
-        except Exception:
-            # Profiles module unavailable (test stubs, exotic envs) —
-            # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
-        )
-
-    ready_budget = spawn_budget
-    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
-        ready_budget = max(spawn_budget - 1, 0)
-    spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -36468,6 +36453,19 @@ def _dispatch_once_locked(
             return _per_profile_cap, _per_profile_running.get(assignee, 0)
         return None
 
+    def _capped_running(assignee):
+        """The running count to record when this assignee's per-profile cap
+        holds its next task, or None when it has room. A listed profile
+        whose cross-board count is unknown this tick
+        (``profile_running_unknown``) is held, never given room."""
+        profile_cap = _profile_cap(assignee)
+        if profile_cap is None:
+            return None
+        cap, current = profile_cap
+        if current >= cap or (profile_running_unknown and assignee in _own_caps):
+            return current
+        return None
+
     def _count_profile_spawn(assignee):
         if not assignee:
             return
@@ -36479,6 +36477,65 @@ def _dispatch_once_locked(
             profile_running_all_boards[assignee] = (
                 profile_running_all_boards.get(assignee, 0) + 1
             )
+
+    # Review-lane reservation (OOF-30 review finding): the ready loop runs
+    # first and used to consume the ENTIRE shared budget, so a sustained
+    # ready backlog permanently starved autonomous reviews — completed work
+    # sat in 'review' forever while new work kept spawning. When spawnable
+    # review work exists and the tick has any budget, hold one slot back
+    # from the ready loop so the review lane always gets a spawn
+    # opportunity. The reservation is per-tick and self-releasing: with no
+    # spawnable review work (or no cap at all) the ready loop keeps the
+    # full budget. "Spawnable" mirrors the review loop's own gate
+    # (assigned + real profile) so a review column full of human-pulled
+    # control-plane lanes doesn't permanently tax ready throughput. A
+    # reviewer listed in max_in_progress_by_profile that its own cap holds
+    # cannot start either, so it holds no slot back from other profiles.
+    def _held_by_own_cap(assignee) -> bool:
+        return assignee in _own_caps and _capped_running(assignee) is not None
+
+    def _any_spawnable_review() -> bool:
+        if not review_rows:
+            return False
+        try:
+            from hermes_cli.profiles import profile_exists as _rpe
+        except Exception:
+            # Profiles module unavailable (test stubs, exotic envs) —
+            # assume spawnable, matching the review loop's own fallback.
+            return any(
+                row["assignee"] and not _held_by_own_cap(row["assignee"])
+                for row in review_rows
+            )
+        return any(
+            row["assignee"] and _rpe(row["assignee"])
+            and not _held_by_own_cap(row["assignee"])
+            for row in review_rows
+        )
+
+    ready_budget = spawn_budget
+    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
+        ready_budget = max(spawn_budget - 1, 0)
+    spawned = 0
+
+    def _record_unreached_capped(rows):
+        """Record, without touching them, the ready tasks the budget kept
+        the loop below from reaching whose assignee is at its per-profile
+        cap, so telemetry counts them as held rather than stuck. As in the
+        loop, an assignee that is not a real profile is never capped;
+        unassigned tasks are skipped (no default assignee is written)."""
+        if _per_profile_cap is None and not _own_caps:
+            return
+        try:
+            from hermes_cli.profiles import profile_exists as _upe
+        except Exception:
+            _upe = None
+        for row in rows:
+            assignee = row["assignee"]
+            current = _capped_running(assignee) if assignee else None
+            if current is not None and (_upe is None or _upe(assignee)):
+                result.unreached_per_profile_capped.append(
+                    (row["id"], assignee, current)
+                )
 
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
@@ -36496,8 +36553,9 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
-    for row in ready_rows:
+    for position, row in enumerate(ready_rows):
         if ready_budget is not None and spawned >= ready_budget:
+            _record_unreached_capped(ready_rows[position:])
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -36597,14 +36655,12 @@ def _dispatch_once_locked(
         # quota / browser pool from being overwhelmed by a fan-out
         # while the global max_in_progress / max_spawn caps still allow
         # work on OTHER profiles.
-        profile_cap = _profile_cap(row_assignee)
-        if profile_cap is not None:
-            cap, current = profile_cap
-            if current >= cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row_assignee, current)
-                )
-                continue
+        current = _capped_running(row_assignee)
+        if current is not None:
+            result.skipped_per_profile_capped.append(
+                (row["id"], row_assignee, current)
+            )
+            continue
         scope_conflicts = file_scope_conflicts(conn, row["id"])
         if scope_conflicts:
             result.skipped_file_scope_conflict.append((row["id"], scope_conflicts))
@@ -36770,14 +36826,12 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
-        profile_cap = _profile_cap(row["assignee"])
-        if profile_cap is not None:
-            cap, current = profile_cap
-            if current >= cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row["assignee"], current)
-                )
-                continue
+        current = _capped_running(row["assignee"])
+        if current is not None:
+            result.skipped_per_profile_capped.append(
+                (row["id"], row["assignee"], current)
+            )
+            continue
         scope_conflicts = file_scope_conflicts(conn, row["id"])
         if scope_conflicts:
             result.skipped_file_scope_conflict.append((row["id"], scope_conflicts))

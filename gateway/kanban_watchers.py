@@ -1483,6 +1483,7 @@ class GatewayKanbanWatchersMixin:
 
         def _tick_once_for_board(
             slug: str, profile_running: "Optional[dict[str, int]]" = None,
+            profile_running_unknown: bool = False,
         ) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
@@ -1492,7 +1493,8 @@ class GatewayKanbanWatchersMixin:
             opened explicitly so concurrent boards never share a
             connection handle or accidentally claim across each other.
             `profile_running` is this tick's cross-board count for the
-            profiles in max_in_progress_by_profile (see `_tick_once`).
+            profiles in max_in_progress_by_profile (see `_tick_once`);
+            `profile_running_unknown` says a board could not be counted.
             """
             conn = None
             fingerprint = _board_db_fingerprint(slug)
@@ -1539,6 +1541,7 @@ class GatewayKanbanWatchersMixin:
                     require_board_activation=require_board_activation,
                     max_in_progress_by_profile=max_in_progress_by_profile or None,
                     profile_running_all_boards=profile_running,
+                    profile_running_unknown=profile_running_unknown,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1577,14 +1580,19 @@ class GatewayKanbanWatchersMixin:
                     except Exception:
                         pass
 
-        def _listed_profiles_running(boards: list) -> "dict[str, int]":
+        def _listed_profiles_running(
+            boards: list,
+        ) -> "tuple[dict[str, int], list[str]]":
             """Running tasks of each profile in max_in_progress_by_profile,
-            summed over the boards this tick dispatches. A board that
-            cannot be read counts 0; boards sharing one DB count once."""
+            summed over the boards this tick dispatches (boards sharing one
+            DB count once), and the boards that could not be read. While
+            that list is non-empty the sum is incomplete: unknown, not 0."""
             counts = dict.fromkeys(max_in_progress_by_profile, 0)
+            unreadable: list[str] = []
             seen_dbs: set[str] = set()
             for b in boards:
                 conn = None
+                slug = None
                 try:
                     if not _board_is_dispatchable(b):
                         continue
@@ -1597,7 +1605,8 @@ class GatewayKanbanWatchersMixin:
                     for name, n in _kb.count_running_by_assignee(conn).items():
                         if name in counts:
                             counts[name] += n
-                except Exception:
+                except Exception as exc:
+                    unreadable.append(f"{slug} ({exc})")
                     continue
                 finally:
                     if conn is not None:
@@ -1605,7 +1614,7 @@ class GatewayKanbanWatchersMixin:
                             conn.close()
                         except Exception:
                             pass
-            return counts
+            return counts, unreadable
 
         def _tick_once() -> "list[tuple[str, Optional[object]]]":
             """Run one dispatch_once per board. Returns (slug, result) pairs.
@@ -1620,17 +1629,30 @@ class GatewayKanbanWatchersMixin:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             # A listed profile's cap spans every board: count its running
             # tasks once before the boards tick; each board's dispatch_once
-            # adds its spawns to the same dict.
-            profile_running = (
-                _listed_profiles_running(boards)
-                if max_in_progress_by_profile else None
-            )
+            # adds its spawns to the same dict. A board that cannot be read
+            # leaves the count unknown: every listed profile waits this tick.
+            profile_running = None
+            profile_running_unknown = False
+            if max_in_progress_by_profile:
+                profile_running, unreadable = _listed_profiles_running(boards)
+                if unreadable:
+                    profile_running_unknown = True
+                    logger.warning(
+                        "kanban dispatcher: could not read running tasks on "
+                        "board %s; the profiles in "
+                        "kanban.max_in_progress_by_profile (%s) start nothing "
+                        "on any board this tick",
+                        ", ".join(unreadable),
+                        ", ".join(sorted(max_in_progress_by_profile)),
+                    )
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 if not _board_is_dispatchable(b):
                     continue
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug, profile_running)))
+                out.append((slug, _tick_once_for_board(
+                    slug, profile_running, profile_running_unknown,
+                )))
             return out
 
         def _ready_nonempty(
@@ -1817,12 +1839,14 @@ class GatewayKanbanWatchersMixin:
                         await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                     results = await asyncio.to_thread(_tick_once)
                     any_spawned = False
-                    # Tasks a full per-profile cap held this tick, by board.
+                    # Tasks a full per-profile cap held this tick, by board,
+                    # in either lane or left unreached by the ready lane.
                     cap_held: dict[str, set[str]] = {}
                     held_profiles = set()
                     for slug, res in (results or []):
                         for task_id, assignee, _n in (
-                            getattr(res, "skipped_per_profile_capped", None) or []
+                            *(getattr(res, "skipped_per_profile_capped", None) or []),
+                            *(getattr(res, "unreached_per_profile_capped", None) or []),
                         ):
                             cap_held.setdefault(slug, set()).add(task_id)
                             held_profiles.add(assignee)

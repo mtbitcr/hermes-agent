@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,34 @@ def spawns(kb, monkeypatch):
     return calls
 
 
+class _LockedReads:
+    """Stands in for ``count_running_by_assignee``. After ``fail_next(board)``
+    the next read of that board's running counts raises ``database is
+    locked`` once, as a transient lock would; every other read is real."""
+
+    def __init__(self, kb):
+        self._kb = kb
+        self._count = kb.count_running_by_assignee
+        self._pending = []
+
+    def fail_next(self, board):
+        self._pending.append(self._kb.kanban_db_path(board=board).resolve())
+
+    def __call__(self, conn):
+        db = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+        if db in self._pending:
+            self._pending.remove(db)
+            raise sqlite3.OperationalError("database is locked")
+        return self._count(conn)
+
+
+@pytest.fixture
+def locked_reads(kb, monkeypatch):
+    reads = _LockedReads(kb)
+    monkeypatch.setattr(kb, "count_running_by_assignee", reads)
+    return reads
+
+
 def _ready(kb, assignee, *, board=None):
     with kb.connect_closing(board=board or kb.DEFAULT_BOARD) as conn:
         return kb.create_task(conn, title=f"{assignee} work", assignee=assignee)
@@ -72,6 +101,16 @@ def _running(kb, assignee, *, board=None):
     task_id = _ready(kb, assignee, board=board)
     with kb.connect_closing(board=board or kb.DEFAULT_BOARD) as conn:
         assert kb.claim_task(conn, task_id) is not None
+    return task_id
+
+
+def _in_review(kb, assignee, *, board=None):
+    """A card parked in the review lane, waiting for a reviewer spawn."""
+    task_id = _ready(kb, assignee, board=board)
+    with kb.connect_closing(board=board or kb.DEFAULT_BOARD) as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,)
+        )
     return task_id
 
 
@@ -115,6 +154,17 @@ def _run_dispatcher(monkeypatch, kanban_cfg, *, ticks):
         asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=60.0)
     )
     assert done["ticks"] == ticks
+
+
+def _cap_info_lines(caplog, named_cap):
+    """Info lines saying ``CAPPED`` waited only because ``named_cap`` is full."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.INFO
+        and named_cap in r.getMessage()
+        and CAPPED in r.getMessage()
+        and "full" in r.getMessage()
+    ]
 
 
 # a. listed profile at its own cap waits; another profile starts same tick
@@ -230,6 +280,140 @@ def test_cap_held_ticks_are_not_stuck_but_a_stuck_queue_is(
     assert _status(kb, capped_next) == "ready"
 
     # Same held card, plus a card that waits for another reason: stuck.
+    spawns.failing.add(OTHER)
+    _ready(kb, OTHER)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        _run_dispatcher(monkeypatch, cfg, ticks=7)
+
+    assert any(STUCK_LINE in r.getMessage() for r in caplog.records)
+    assert spawns == []
+
+
+# F1. a board whose running count cannot be read holds listed profiles on
+# every board for that tick only; profiles not listed start as usual
+def test_unreadable_running_count_holds_listed_profile_for_that_tick(
+    kb, spawns, locked_reads, monkeypatch, caplog
+):
+    busy = _running(kb, CAPPED, board=SECOND_BOARD)
+    capped_next = _ready(kb, CAPPED)
+    other_next = _ready(kb, OTHER)
+    cfg = {"max_in_progress_by_profile": {CAPPED: 1}}
+
+    locked_reads.fail_next(SECOND_BOARD)
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        _run_dispatcher(monkeypatch, cfg, ticks=1)
+
+    assert [(a, t) for _, a, t in spawns] == [(OTHER, other_next)]
+    assert _status(kb, capped_next) == "ready"
+    naming_board = [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING and SECOND_BOARD in r.getMessage()
+    ]
+    assert len(naming_board) == 1, naming_board
+
+    # Profile-a runs nowhere now. A tick whose read fails still holds its
+    # card; the next tick reads every board again and starts it.
+    with kb.connect_closing(board=SECOND_BOARD) as conn:
+        assert kb.archive_task(conn, busy)
+    spawns.clear()
+    locked_reads.fail_next(SECOND_BOARD)
+    _run_dispatcher(monkeypatch, cfg, ticks=1)
+    assert spawns == []
+    assert _status(kb, capped_next) == "ready"
+
+    locked_reads.fail_next(SECOND_BOARD)
+    _run_dispatcher(monkeypatch, cfg, ticks=2)
+    assert [(a, t) for _, a, t in spawns] == [(CAPPED, capped_next)]
+
+
+# F2. a reviewer its own cap holds leaves the review slot to another profile
+def test_capped_reviewer_leaves_review_slot_to_another_profile(
+    kb, spawns, monkeypatch
+):
+    _running(kb, CAPPED, board=SECOND_BOARD)
+    _in_review(kb, CAPPED)
+    other_next = _ready(kb, OTHER)
+
+    _run_dispatcher(
+        monkeypatch,
+        {
+            "review_dispatch": True,
+            "max_spawn": 1,
+            "max_in_progress": 10,
+            "max_in_progress_by_profile": {CAPPED: 1},
+        },
+        ticks=1,
+    )
+
+    assert [(a, t) for _, a, t in spawns] == [(OTHER, other_next)]
+
+
+# F3. ready and review cards all held by a full cap are not stuck
+def test_all_cap_held_ready_and_review_cards_are_not_stuck(
+    kb, spawns, monkeypatch, caplog
+):
+    _running(kb, CAPPED, board=SECOND_BOARD)
+    _in_review(kb, CAPPED)
+    capped_next = _ready(kb, CAPPED)
+    cfg = {
+        "review_dispatch": True,
+        "max_spawn": 1,
+        "max_in_progress": 10,
+        "max_in_progress_by_profile": {CAPPED: 1},
+        "failure_limit": 100,
+    }
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        _run_dispatcher(monkeypatch, cfg, ticks=7)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any(STUCK_LINE in m for m in messages)
+    cap_lines = _cap_info_lines(caplog, "kanban.max_in_progress_by_profile")
+    assert len(cap_lines) == 1, messages
+    assert spawns == []
+    assert _status(kb, capped_next) == "ready"
+
+    # Same held cards, plus a card that waits for another reason: stuck.
+    spawns.failing.add(OTHER)
+    _ready(kb, OTHER)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        _run_dispatcher(monkeypatch, cfg, ticks=7)
+
+    assert any(STUCK_LINE in r.getMessage() for r in caplog.records)
+    assert spawns == []
+
+
+# F4. mapping unset: a ready card the review reservation keeps the ready
+# lane from reaching, whose profile is at the integer cap, is not stuck.
+# max_spawn is 2, not 1: at 1 the running card already fills the board and
+# the tick returns before the reservation or either lane.
+def test_integer_capped_card_behind_review_reservation_is_not_stuck(
+    kb, spawns, monkeypatch, caplog
+):
+    _running(kb, CAPPED)
+    _in_review(kb, CAPPED)
+    capped_next = _ready(kb, CAPPED)
+    cfg = {
+        "review_dispatch": True,
+        "max_spawn": 2,
+        "max_in_progress": 10,
+        "max_in_progress_per_profile": 1,
+        "failure_limit": 100,
+    }
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        _run_dispatcher(monkeypatch, cfg, ticks=7)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any(STUCK_LINE in m for m in messages)
+    cap_lines = _cap_info_lines(caplog, "kanban.max_in_progress_per_profile")
+    assert len(cap_lines) == 1, messages
+    assert spawns == []
+    assert _status(kb, capped_next) == "ready"
+
+    # Same held cards, plus a card that waits for another reason: stuck.
     spawns.failing.add(OTHER)
     _ready(kb, OTHER)
     caplog.clear()
