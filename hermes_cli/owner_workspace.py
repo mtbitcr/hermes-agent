@@ -2968,7 +2968,7 @@ def _owner_project_run_receipt(
     elif outcome == "rate_limited" and provider_resume_at is not None:
         owner_outcome, summary = "waiting", _OWNER_PROVIDER_WAITING_SUMMARY.format(
             time=datetime.fromtimestamp(provider_resume_at, timezone.utc).strftime(
-                "%Y-%m-%d %H:%M"
+                "%Y-%m-%d %H:%M:%S"
             ),
         )
     elif outcome == "rate_limited":

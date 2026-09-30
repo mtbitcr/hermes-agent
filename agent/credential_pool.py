@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from agent.credential_pool_admin import CredentialPoolAdminMixin
 
+import json
 import logging
 import os
 import random
@@ -1091,10 +1092,12 @@ class CredentialPool(CredentialPoolAdminMixin):
         The profile home is resolved the way the kanban dispatcher sets a
         worker's HERMES_HOME, never from the caller's own home. Nothing is
         cleared (and nothing written) when no provider is given, when the
-        profile has no pool or entry of its own for it, or when its pool is
-        the root pool itself; there is no fallback to any other pool. Returns
-        how many entries were cleared; no credential value is returned or
-        logged.
+        profile has no pool or entry of its own for it, when its pool is
+        the root pool itself, or when its store cannot be read or parsed or
+        is not an object; there is no fallback to any other pool. The store
+        is read as it is on disk: beside those marks only the save's own
+        ``version`` and ``updated_at`` stamp change. Returns how many entries
+        were cleared; no credential value is returned or logged.
         """
         key = provider.strip().lower() if isinstance(provider, str) else ""
         if not key or not isinstance(profile, str) or not profile.strip():
@@ -1111,8 +1114,10 @@ class CredentialPool(CredentialPoolAdminMixin):
             return 0
         try:
             with _auth_store_lock(target_path=path):
-                store = _load_auth_store(path)
-                pool = store.get("credential_pool")
+                # Not _load_auth_store: it migrates other providers' state,
+                # logs stored values and copies an unparseable store aside.
+                store = json.loads(path.read_text(encoding="utf-8-sig"))
+                pool = store.get("credential_pool") if isinstance(store, dict) else None
                 entries = pool.get(key) if isinstance(pool, dict) else None
                 cleared = 0
                 for entry in entries if isinstance(entries, list) else ():
@@ -1123,7 +1128,7 @@ class CredentialPool(CredentialPoolAdminMixin):
                 if cleared:
                     _save_auth_store(store, target_path=path)
                 return cleared
-        except (OSError, RuntimeError, TimeoutError):
+        except (OSError, RuntimeError, TimeoutError, ValueError):
             logger.warning("credential pool: could not clear a profile's exhaustion marks")
             return 0
 

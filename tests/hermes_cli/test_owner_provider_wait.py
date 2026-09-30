@@ -30,6 +30,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.credential_pool import CredentialPool
+from hermes_cli import auth, auth_nous
 from hermes_cli import kanban_db as kb, kanban_provider_stops, owner_workspace as ow
 from hermes_cli.kanban_provider_stops import KANBAN_PROVIDER_REFUSED_EXIT_CODE
 
@@ -353,6 +354,136 @@ def test_the_pool_clear_writes_nothing_without_a_provider_an_own_entry_or_off_th
     assert not (root / "profiles" / OTHER / "auth.json").exists()
 
 
+_LEGACY_USER = "placeholder-user"
+_LEGACY_PASSWORD = "placeholder-pass"
+_LEGACY_HOST = "legacy.placeholder.invalid"
+_PORTAL = "https://portal.placeholder.invalid"
+_STAMPS = ("version", "updated_at")
+
+
+def _legacy_store(pool: dict) -> dict:
+    """A store whose other provider keeps legacy state the shared loader migrates and logs."""
+    return {
+        "version": 1,
+        "active_provider": "nous",
+        "updated_at": "2030-03-17T17:00:00+00:00",
+        "providers": {
+            "nous": {
+                "portal_base_url": f"https://{_LEGACY_USER}:{_LEGACY_PASSWORD}@{_LEGACY_HOST}/",
+                "access_token": "placeholder-token-nous",
+            },
+        },
+        "credential_pool": pool,
+    }
+
+
+def test_the_pool_clear_keeps_another_providers_legacy_state_and_logs_no_credential(
+    root, owner, clock, monkeypatch, caplog, tmp_path,
+):
+    project = _project(owner, "Legacy Pilot")
+    board = project["board"]
+    with _board(board) as conn:
+        task_id = _card(conn, project, "Draft the placeholder note")
+        run = _held(conn, board, task_id, 4801)
+        clock["t"] = run.ended_at + 60
+
+    # The shared loader would move the portal URL kept for this host, and log it.
+    monkeypatch.setattr(auth_nous, "_NOUS_STALE_PORTAL_HOSTS", frozenset({_LEGACY_HOST}))
+    monkeypatch.setattr(auth_nous, "DEFAULT_NOUS_PORTAL_URL", _PORTAL)
+    root_pool = _write_pool(root, {PROVIDER: [_exhausted("root-a")]})
+    own_pool = root / "profiles" / ASSIGNEE / "auth.json"
+    own_pool.write_text(json.dumps(_legacy_store({
+        PROVIDER: [_exhausted("own-a")],
+        SECOND_PROVIDER: [_exhausted("own-b")],
+    }), indent=2) + "\n")
+    steward_pool = _write_pool(root / "profiles" / STEWARD, {PROVIDER: [_exhausted("steward-a")]})
+    other_pool = _write_pool(root / "profiles" / OTHER, {PROVIDER: [_exhausted("other-a")]})
+    pools = (root_pool, own_pool, steward_pool, other_pool)
+    untouched = {path: path.read_bytes() for path in (root_pool, steward_pool, other_pool)}
+    before = _exhausted_entries(pools)
+
+    env = _steward_env(root, board)
+    caplog.set_level("DEBUG")
+    caplog.set_level("DEBUG", logger="hermes_cli.auth")
+    with _as_worker(monkeypatch, env):
+        retried = _retry(owner, project, task_id, "retry-legacy-state")
+    assert retried["ok"] is True, retried
+
+    for path, raw in untouched.items():
+        assert path.read_bytes() == raw
+    cleared = dict(_exhausted("own-a"))
+    cleared.pop("failure_reason")
+    cleared.update({key: None for key in _STATUS_KEYS})
+    expected = _legacy_store({PROVIDER: [cleared], SECOND_PROVIDER: [_exhausted("own-b")]})
+    stored = json.loads(own_pool.read_text())
+    assert {key: value for key, value in stored.items() if key not in _STAMPS} == {
+        key: value for key, value in expected.items() if key not in _STAMPS
+    }
+    assert _exhausted_entries(pools) == before - 1
+
+    # The capture is live: it hears the shared loader move a URL on that host.
+    probe = tmp_path / "probe.json"
+    probe.write_text(json.dumps({
+        "providers": {"nous": {"portal_base_url": f"https://{_LEGACY_HOST}/"}},
+    }))
+    heard = len(caplog.records)
+    assert auth._load_auth_store(probe)["providers"]["nous"]["portal_base_url"] == _PORTAL
+    assert "hermes_cli.auth" in {record.name for record in caplog.records[heard:]}
+
+    with _board(board) as conn:
+        [event] = _events(conn, task_id, "owner_retry")
+        assert event.run_id == run.id
+        events = json.dumps([event.payload for event in kb.list_events(conn, task_id)])
+    for leaked in (json.dumps(retried), events, caplog.text):
+        for secret in (_LEGACY_USER, _LEGACY_PASSWORD, "placeholder-token"):
+            assert secret not in leaked
+
+
+def _unparsed_store(shape: str) -> bytes:
+    """The assignee's own store, holding an exhausted entry, in a shape no store is read from."""
+    store = {"version": 1, "credential_pool": {PROVIDER: [_exhausted("own-a")]}}
+    text = json.dumps(store, indent=2)
+    return {
+        "truncated": text[: len(text) // 2].encode(),
+        "not_utf8": b"\xff" + text.encode(),
+        "not_an_object": json.dumps([store], indent=2).encode(),
+    }[shape]
+
+
+@pytest.mark.parametrize("shape", ["truncated", "not_utf8", "not_an_object"])
+def test_the_retry_goes_ahead_and_writes_nothing_beside_an_own_store_that_does_not_parse(
+    shape, root, owner, clock, monkeypatch, caplog,
+):
+    project = _project(owner, "Broken Store")
+    board = project["board"]
+    with _board(board) as conn:
+        task_id = _card(conn, project, "Draft the placeholder card")
+        run = _held(conn, board, task_id, 4901)
+        clock["t"] = run.ended_at + 60
+
+    home = root / "profiles" / ASSIGNEE
+    own_pool = home / "auth.json"
+    own_pool.write_bytes(_unparsed_store(shape))
+    raw, names = own_pool.read_bytes(), set(os.listdir(home))
+
+    env = _steward_env(root, board)
+    caplog.set_level("DEBUG")
+    with _as_worker(monkeypatch, env):
+        retried = _retry(owner, project, task_id, "retry-broken-store")
+    assert retried["ok"] is True, retried
+
+    assert own_pool.read_bytes() == raw
+    # Only the lock the clear reads under may leave its file: no copy, no temporary file.
+    assert set(os.listdir(home)) - names <= {own_pool.with_suffix(".lock").name}
+    with _board(board) as conn:
+        [event] = _events(conn, task_id, "owner_retry")
+        assert event.run_id == run.id
+        assert kb.check_respawn_guard(conn, task_id) is None
+        events = json.dumps([event.payload for event in kb.list_events(conn, task_id)])
+    for leaked in (json.dumps(retried), events, caplog.text):
+        assert "placeholder-token" not in leaked
+
+
 def _waiting_and_refused(root: Path, owner: ow.OwnerContext) -> dict:
     """A Project with one card held at the provider's limit and one it refused.
 
@@ -414,7 +545,7 @@ def test_with_the_capability_one_receipt_carries_the_time_and_another_the_refuse
         entry = kb.get_register_entry(project["board"])
         assert entry is not None and entry.lifecycle is kb.BoardLifecycle.LIVE
 
-    when = datetime.fromtimestamp(resume_at, timezone.utc).strftime("%Y-%m-%d %H:%M")
+    when = datetime.fromtimestamp(resume_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     receipts = [run["receipt"] for run in snapshot["runs"]]
     assert {"outcome": "waiting", "summary": WAITING_LINE.format(time=when)} in [
         {"outcome": receipt["outcome"], "summary": receipt["summary"]} for receipt in receipts
@@ -451,6 +582,41 @@ def plain_stopped(snapshot: dict) -> dict:
         task["id"]: task["stopped_work"]
         for column in snapshot["columns"] for task in column["tasks"]
     }
+
+
+def test_with_the_capability_the_waiting_time_is_the_instant_the_guard_releases_the_card(
+    root, owner, clock, monkeypatch,
+):
+    scene = _waiting_and_refused(root, owner)
+    project, held, waiting = scene["project"], scene["held"], scene["waiting"]
+    clock["t"] = held.ended_at + 60
+    with _board(project["board"]) as conn:
+        assert kb.check_respawn_guard(conn, waiting) == "rate_limit_cooldown"
+    with _as_worker(monkeypatch, scene["env"]):
+        snapshot = ow.read_project_snapshot(owner, project["slug"], provider_wait=True)
+
+    [summary] = [
+        run["receipt"]["summary"] for run in snapshot["runs"]
+        if run["receipt"]["outcome"] == "waiting"
+    ]
+    lead, tail = WAITING_LINE.split("{time}")
+    assert summary.startswith(lead) and summary.endswith(tail), summary
+    shown = datetime.fromisoformat(summary[len(lead):-len(tail)]).replace(tzinfo=timezone.utc)
+
+    # The guard's own release instant, read straight from the Project board's rows.
+    path = kb.board_dir(project["board"]) / "kanban.db"
+    with contextlib.closing(kb.connect(db_path=path)) as conn:
+        row = conn.execute(
+            "SELECT outcome, ended_at, metadata FROM task_runs WHERE id = ? AND task_id = ?",
+            (held.id, waiting),
+        ).fetchone()
+        release = kanban_provider_stops.rate_limit_resume_at(conn, waiting, row)
+        assert release is not None and release % 60 != 0
+        assert shown.timestamp() == release
+        clock["t"] = release - 1
+        assert kb.check_respawn_guard(conn, waiting) == "rate_limit_cooldown"
+        clock["t"] = release
+        assert kb.check_respawn_guard(conn, waiting) is None
 
 
 # The whole snapshot served without ``provider_wait_v1``, captured at the start
