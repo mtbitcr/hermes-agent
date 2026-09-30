@@ -51,12 +51,40 @@ def _named(out):
     return [line.split(":", 1)[0] for line in lines]
 
 
+def _refused(repo, monkeypatch, capsys, base, head, reason):
+    """Run the check for explicit refs: it must exit 2, say why on stderr and never print a clean result."""
+    monkeypatch.chdir(repo)
+    rc = _load().main(["--base", base, "--head", head])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert reason in captured.err
+    assert "no changed test file is listed" not in captured.out
+
+
 def test_changed_listed_test_file_fails_and_is_named(tmp_path, monkeypatch, capsys):
     _commit(tmp_path, {"tests/test_placeholder_a.py": "def test_a(): ...\n", LIST: "tests/test_placeholder_a.py\n"})
     _commit(tmp_path, {"tests/test_placeholder_a.py": "def test_a(): assert 1\n"})
     rc, out = _run(tmp_path, monkeypatch, capsys)
     assert rc == 1
     assert _named(out) == ["tests/test_placeholder_a.py"]
+
+
+def test_a_missing_base_ref_is_refused_not_reported_clean(tmp_path, monkeypatch, capsys):
+    _commit(tmp_path, {"tests/test_placeholder_a.py": "def test_a(): ...\n", LIST: "tests/test_placeholder_a.py\n"})
+    _refused(tmp_path, monkeypatch, capsys, "refs/heads/placeholder-missing", "HEAD", "cannot resolve ref")
+
+
+def test_a_missing_head_ref_is_refused_not_reported_clean(tmp_path, monkeypatch, capsys):
+    _commit(tmp_path, {"tests/test_placeholder_a.py": "def test_a(): ...\n", LIST: "tests/test_placeholder_a.py\n"})
+    _refused(tmp_path, monkeypatch, capsys, "HEAD", "refs/heads/placeholder-missing", "cannot resolve ref")
+
+
+def test_unrelated_history_is_refused_not_reported_clean(tmp_path, monkeypatch, capsys):
+    """Without a merge-base the diff would compare unrelated trees, so the check refuses instead."""
+    _commit(tmp_path, {"tests/test_placeholder_a.py": "def test_a(): ...\n", LIST: "tests/test_placeholder_a.py\n"})
+    _git(tmp_path, "checkout", "-q", "--orphan", "placeholder-unrelated")
+    _commit(tmp_path, {"tests/test_placeholder_a.py": "def test_a(): assert 1\n"})
+    _refused(tmp_path, monkeypatch, capsys, "main", "placeholder-unrelated", "no merge-base")
 
 
 def test_changed_unlisted_test_file_passes(tmp_path, monkeypatch, capsys):
