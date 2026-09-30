@@ -212,3 +212,19 @@ jobs:
             git fetch --no-tags --deepen=1000 origin "${{ github.base_ref }}" "$PR_HEAD"
           done
           python scripts/ci/check_public_surface.py --base "origin/${{ github.base_ref }}" --head origin/pr-head
+
+      # Blocking: CI never runs a test file listed in tests/fork_dormant_skips.txt (sharded discovery and
+      # conftest collect_ignore both drop it), so a PR that adds or changes one looks tested when it is not.
+      # Prints one line per such file; the fix is to unlist it in the same PR or to leave it unchanged.
+      # Reuses the refs the advisory step above fetched and deepens (at most 3 times) only while no merge-base
+      # is reachable; without one the script exits 2 rather than report a clean result.
+      - name: Changed test files vs dormant-skip list (blocking)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_HEAD: "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
+        run: |
+          for i in 1 2 3; do
+            git merge-base "origin/${{ github.base_ref }}" origin/pr-head >/dev/null 2>&1 && break
+            git fetch --no-tags --deepen=1000 origin "${{ github.base_ref }}" "$PR_HEAD"
+          done
+          python scripts/ci/check_dormant_changed.py --base "origin/${{ github.base_ref }}" --head origin/pr-head
