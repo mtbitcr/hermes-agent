@@ -1400,6 +1400,37 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # Read kanban.max_in_progress_by_profile — a profile's own cap,
+        # counted across every board this dispatcher ticks. Profiles not
+        # listed (and entries ignored here) keep max_in_progress_per_profile.
+        raw_by_profile = kanban_cfg.get("max_in_progress_by_profile", None)
+        max_in_progress_by_profile: dict[str, int] = {}
+        if raw_by_profile is not None and not isinstance(raw_by_profile, dict):
+            logger.warning(
+                "kanban dispatcher: kanban.max_in_progress_by_profile is not a "
+                "mapping of profile name to cap; ignoring",
+            )
+        elif raw_by_profile:
+            for profile_name, raw_cap in raw_by_profile.items():
+                if (
+                    isinstance(raw_cap, int)
+                    and not isinstance(raw_cap, bool)
+                    and raw_cap >= 1
+                ):
+                    max_in_progress_by_profile[str(profile_name)] = raw_cap
+                else:
+                    logger.warning(
+                        "kanban dispatcher: kanban.max_in_progress_by_profile[%r] "
+                        "is not a whole number of at least 1; ignoring (the profile "
+                        "keeps kanban.max_in_progress_per_profile)",
+                        profile_name,
+                    )
+            if max_in_progress_by_profile:
+                logger.info(
+                    "kanban dispatcher: max_in_progress_by_profile=%s",
+                    max_in_progress_by_profile,
+                )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1411,6 +1442,11 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        # Ticks whose waiting work was held only by a full per-profile cap:
+        # not stuck, reported with an info line instead of the warning.
+        cap_held_ticks = 0
+        last_cap_info_at = 0
+        held_profiles: set[str] = set()
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1443,7 +1479,10 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str) -> "Optional[object]":
+        def _tick_once_for_board(
+            slug: str, profile_running: "Optional[dict[str, int]]" = None,
+            profile_running_unknown: bool = False,
+        ) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -1451,6 +1490,9 @@ class GatewayKanbanWatchersMixin:
             `_default_spawn` see the right paths. The per-board DB is
             opened explicitly so concurrent boards never share a
             connection handle or accidentally claim across each other.
+            `profile_running` is this tick's cross-board count for the
+            profiles in max_in_progress_by_profile (see `_tick_once`);
+            `profile_running_unknown` says a board could not be counted.
             """
             conn = None
             fingerprint = _board_db_fingerprint(slug)
@@ -1495,6 +1537,9 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
                     require_board_activation=require_board_activation,
+                    max_in_progress_by_profile=max_in_progress_by_profile or None,
+                    profile_running_all_boards=profile_running,
+                    profile_running_unknown=profile_running_unknown,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1533,6 +1578,43 @@ class GatewayKanbanWatchersMixin:
                     except Exception:
                         pass
 
+        def _listed_profiles_running(
+            boards: list,
+        ) -> "tuple[dict[str, int], list[str]]":
+            """Running tasks of each profile in max_in_progress_by_profile,
+            summed over the boards this tick dispatches (boards sharing one
+            DB count once), and the boards that could not be read. While
+            that list is non-empty the sum is incomplete: unknown, not 0."""
+            counts = dict.fromkeys(max_in_progress_by_profile, 0)
+            unreadable: list[str] = []
+            seen_dbs: set[str] = set()
+            for b in boards:
+                conn = None
+                slug = None
+                try:
+                    if not _board_is_dispatchable(b):
+                        continue
+                    slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    db = _board_db_fingerprint(slug)[0]
+                    if db in seen_dbs:
+                        continue
+                    seen_dbs.add(db)
+                    conn = _kb.connect(board=slug)
+                    for name, n in _kb.count_running_by_assignee(conn).items():
+                        if name in counts:
+                            counts[name] += n
+                except Exception:
+                    # The board's name only: the error text can carry paths.
+                    unreadable.append(b.get("slug") or _kb.DEFAULT_BOARD)
+                    continue
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+            return counts, unreadable
+
         def _tick_once() -> "list[tuple[str, Optional[object]]]":
             """Run one dispatch_once per board. Returns (slug, result) pairs.
 
@@ -1544,15 +1626,37 @@ class GatewayKanbanWatchersMixin:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            # A listed profile's cap spans every board: count its running
+            # tasks once before the boards tick; each board's dispatch_once
+            # adds its spawns to the same dict. A board that cannot be read
+            # leaves the count unknown: every listed profile waits this tick.
+            profile_running = None
+            profile_running_unknown = False
+            if max_in_progress_by_profile:
+                profile_running, unreadable = _listed_profiles_running(boards)
+                if unreadable:
+                    profile_running_unknown = True
+                    logger.warning(
+                        "kanban dispatcher: could not read running tasks on "
+                        "board %s; the profiles in "
+                        "kanban.max_in_progress_by_profile (%s) start nothing "
+                        "on any board this tick",
+                        ", ".join(unreadable),
+                        ", ".join(sorted(max_in_progress_by_profile)),
+                    )
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 if not _board_is_dispatchable(b):
                     continue
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug)))
+                out.append((slug, _tick_once_for_board(
+                    slug, profile_running, profile_running_unknown,
+                )))
             return out
 
-        def _ready_nonempty() -> bool:
+        def _ready_nonempty(
+            cap_held: "Optional[dict[str, set[str]]]" = None,
+        ) -> bool:
             """Cheap probe: is there at least one ready+assigned+unclaimed
             task on ANY board whose assignee maps to a real Hermes profile
             (i.e. one the dispatcher would actually spawn for)?
@@ -1563,6 +1667,9 @@ class GatewayKanbanWatchersMixin:
             of those is "correctly idle", not "stuck". Filtering them out
             here keeps the stuck-warn fire only on real failures (broken
             PATH, missing venv, credential loss for a real Hermes profile).
+
+            ``cap_held`` maps a board to the tasks a full per-profile cap
+            held this tick; they are waiting, not stuck, so they are left out.
             """
             # Only probe the review column when autonomous review dispatch is
             # actually on. With ``review_dispatch`` off (the default — no
@@ -1579,12 +1686,15 @@ class GatewayKanbanWatchersMixin:
                 if not _board_is_dispatchable(b):
                     continue
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                held = (cap_held or {}).get(slug) or ()
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
+                    if _kb.has_spawnable_ready(conn, exclude_ids=held):
                         return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
+                    if _review_probe and _kb.has_spawnable_review(
+                        conn, exclude_ids=held,
+                    ):
                         return True
                 except Exception:
                     continue
@@ -1718,6 +1828,7 @@ class GatewayKanbanWatchersMixin:
                 if not _kanban_dispatch_allowed():
                     ready_pending = False
                     bad_ticks = 0
+                    cap_held_ticks = 0
                 else:
                     # Re-read the auto-decompose toggle live each tick so a user
                     # flipping kanban.auto_decompose=false to STOP runaway fan-out
@@ -1727,7 +1838,17 @@ class GatewayKanbanWatchersMixin:
                         await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                     results = await asyncio.to_thread(_tick_once)
                     any_spawned = False
+                    # Tasks a full per-profile cap held this tick, by board,
+                    # in either lane or left unreached by the ready lane.
+                    cap_held: dict[str, set[str]] = {}
+                    held_profiles = set()
                     for slug, res in (results or []):
+                        for task_id, assignee, _n in (
+                            *(getattr(res, "skipped_per_profile_capped", None) or []),
+                            *(getattr(res, "unreached_per_profile_capped", None) or []),
+                        ):
+                            cap_held.setdefault(slug, set()).add(task_id)
+                            held_profiles.add(assignee)
                         if res is not None and getattr(res, "spawned", None):
                             any_spawned = True
                             # Quiet by default — only log when something actually
@@ -1743,12 +1864,19 @@ class GatewayKanbanWatchersMixin:
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
-                    # Health telemetry (aggregate across boards)
-                    ready_pending = await asyncio.to_thread(_ready_nonempty)
+                    # Health telemetry (aggregate across boards). Work held
+                    # by a full per-profile cap is left out of the probe: the
+                    # tick is stuck only if some other spawnable task waited.
+                    ready_pending = await asyncio.to_thread(_ready_nonempty, cap_held)
                     if ready_pending and not any_spawned:
                         bad_ticks += 1
+                        cap_held_ticks = 0
+                    elif cap_held and not any_spawned:
+                        bad_ticks = 0
+                        cap_held_ticks += 1
                     else:
                         bad_ticks = 0
+                        cap_held_ticks = 0
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
@@ -1760,6 +1888,25 @@ class GatewayKanbanWatchersMixin:
                             bad_ticks,
                         )
                         last_warn_at = now
+                elif cap_held_ticks >= HEALTH_WINDOW:
+                    now = int(time.time())
+                    if now - last_cap_info_at >= 300:
+                        full_caps = ", ".join(
+                            f"{name} at kanban.max_in_progress_by_profile.{name}="
+                            f"{max_in_progress_by_profile[name]}"
+                            if name in max_in_progress_by_profile
+                            else f"{name} at kanban.max_in_progress_per_profile="
+                            f"{max_in_progress_per_profile}"
+                            for name in sorted(held_profiles)
+                        )
+                        logger.info(
+                            "kanban dispatcher: ready queue non-empty for %d "
+                            "consecutive ticks with 0 workers spawned only "
+                            "because a per-profile cap is full (%s); not stuck.",
+                            cap_held_ticks,
+                            full_caps,
+                        )
+                        last_cap_info_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()
