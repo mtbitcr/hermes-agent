@@ -38,6 +38,9 @@ _CODEX_MAX_EFFORT_MARKERS: tuple[str, ...] = ("gpt-5.6", "gpt-6-sol")
 # wire level; callers normalize those requests to ``low`` at the transport boundary.
 CODEX_ASTRA_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 ASTRA_MODEL_IDS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6-astra-900k"})
+# GPT-6.1 Sol speaks Astra's wire vocabulary: its model page (2026-09-29) accepts low..max and
+# rejects none and minimal, so a disable request floors at low instead of reaching the wire.
+_CODEX_NO_DISABLE_MODEL_IDS: frozenset[str] = frozenset({"gpt-6.1-sol"})
 
 #: xAI Responses — Grok 4.6+ accepts xhigh; older Grok tops out at high.
 XAI_GROK46_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
@@ -94,7 +97,7 @@ def is_astra_model(model: Optional[str]) -> bool:
 
 def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set for an OpenAI/Codex Responses model."""
-    if is_astra_model(model):
+    if is_astra_model(model) or (model or "").strip().lower().rsplit("/", 1)[-1] in _CODEX_NO_DISABLE_MODEL_IDS:
         return CODEX_ASTRA_EFFORTS
     m = (model or "").lower()
     return CODEX_GPT56_EFFORTS if any(marker in m for marker in _CODEX_MAX_EFFORT_MARKERS) else CODEX_LEGACY_EFFORTS
