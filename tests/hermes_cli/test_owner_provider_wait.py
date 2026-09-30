@@ -1250,3 +1250,155 @@ def test_the_pool_clear_still_clears_the_own_pool_when_the_whole_root_is_reached
     assert json.loads(own_pool.read_text())["credential_pool"] == {
         BUILT_IN: [cleared], SECOND_PROVIDER: [_exhausted("own-b")],
     }
+
+
+_FILE_SYNC, _FOLDER_SYNC = "file", "folder"
+
+
+@contextlib.contextmanager
+def _failing_sync(monkeypatch, pool: Path, fails):
+    """``os.fsync`` raises EIO for one kind of descriptor of ``pool``'s own save only.
+
+    ``os.open`` notes each descriptor opened for ``pool``'s temporary file or
+    for its folder with its ``os.fstat`` identity, so a reused number never
+    matches; only a noted descriptor of the kind ``fails`` names raises, and
+    every other sync, the board's included, is forwarded unchanged. Yields the
+    kinds synced for that save, in order.
+    """
+    real_open, real_fsync = os.open, os.fsync
+    folder = os.path.realpath(pool.parent)
+    noted, synced = {}, []
+
+    def identity(fd: int) -> tuple:
+        status = os.fstat(fd)
+        return fd, status.st_dev, status.st_ino
+
+    def opening(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        name = os.fsdecode(path)
+        if os.path.realpath(name) == folder:
+            noted[identity(fd)] = _FOLDER_SYNC
+        elif (
+            os.path.realpath(os.path.dirname(name)) == folder
+            and os.path.basename(name).startswith(pool.name + ".tmp.")
+        ):
+            noted[identity(fd)] = _FILE_SYNC
+        return fd
+
+    def syncing(fd):
+        kind = noted.get(identity(fd if isinstance(fd, int) else fd.fileno()))
+        if kind is not None:
+            synced.append(kind)
+            if kind == fails:
+                raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return real_fsync(fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", opening)
+        patch.setattr(os, "fsync", syncing)
+        yield synced
+
+
+@pytest.mark.parametrize("via", ["direct_call", "owner_retry"])
+@pytest.mark.parametrize(
+    "fails", [_FOLDER_SYNC, _FILE_SYNC, None],
+    ids=["folder_sync_fails_after_the_replace", "file_sync_fails_before_the_replace", "no_sync_fails"],
+)
+def test_the_clear_counts_once_the_save_replaced_the_store_and_the_retry_goes_ahead_whichever_sync_fails(
+    fails, via, root, owner, clock, monkeypatch, caplog,
+):
+    project = _project(owner, "Synced Pool")
+    board = project["board"]
+    with _board(board) as conn:
+        task_id = _card(conn, project, "Draft the placeholder ledger", provider=BUILT_IN)
+        run = _held(conn, board, task_id, 5301)
+        clock["t"] = run.ended_at + 60
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+
+    home = root / "profiles" / ASSIGNEE
+    own_pool = _write_pool(home, {
+        BUILT_IN: [_exhausted("own-a")],
+        SECOND_PROVIDER: [_exhausted("own-b")],
+    })
+    others = (
+        _write_pool(root, {BUILT_IN: [_exhausted("root-a")]}),
+        _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("steward-a")]}),
+        _write_pool(root / "profiles" / OTHER, {BUILT_IN: [_exhausted("other-a")]}),
+    )
+    pools = (own_pool, *others)
+    raw = {path: path.read_bytes() for path in pools}
+    before, names = _exhausted_entries(pools), set(os.listdir(home))
+    # Only a save that replaced the store clears: the folder syncs after the replace.
+    expected = 0 if fails == _FILE_SYNC else 1
+
+    env = _steward_env(root, board)
+    caplog.set_level("DEBUG")
+    with _as_worker(monkeypatch, env), _failing_sync(monkeypatch, own_pool, fails) as synced:
+        if via == "direct_call":
+            result = CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, BUILT_IN)
+        else:
+            result = _retry(owner, project, task_id, "retry-synced-pool")
+        # Pinned to its own board, the worker still reaches the root registry.
+        assert kb.kanban_home() == root
+        assert kb.register_db_path() == root / "kanban" / "board_register.db"
+        entry = kb.get_register_entry(board)
+        assert entry is not None and entry.lifecycle is kb.BoardLifecycle.LIVE
+
+    assert synced == ([_FILE_SYNC] if fails == _FILE_SYNC else [_FILE_SYNC, _FOLDER_SYNC])
+    if via == "direct_call":
+        assert result == expected
+    for path in others:
+        assert path.read_bytes() == raw[path], path
+    if expected:
+        cleared = dict(_exhausted("own-a"))
+        cleared.pop("failure_reason")
+        cleared.update({key: None for key in _STATUS_KEYS})
+        stored = json.loads(own_pool.read_text())
+        assert {key: value for key, value in stored.items() if key not in _STAMPS} == {
+            "credential_pool": {BUILT_IN: [cleared], SECOND_PROVIDER: [_exhausted("own-b")]},
+        }
+    else:
+        assert own_pool.read_bytes() == raw[own_pool]
+    # The independent count, straight from the files.
+    assert _exhausted_entries(pools) == before - expected
+    # No temporary file remains: only the lock the clear saves under may appear.
+    assert set(os.listdir(home)) - names <= {own_pool.with_suffix(".lock").name}
+
+    records = [record for record in caplog.records if record.name == "agent.credential_pool"]
+    warnings = [record for record in records if record.levelno >= logging.WARNING]
+    if fails is None:
+        assert warnings == []
+    else:
+        [warning] = warnings
+        message = warning.getMessage()
+        assert BUILT_IN in message
+        assert ("may not be durable yet" in message) is bool(expected)
+        assert ("could not clear" in message) is not bool(expected)
+        assert warning.exc_info is None
+        shown = logging.Formatter().format(warning)
+        for value in (
+            str(root), os.path.realpath(root), own_pool.name, ASSIGNEE, STEWARD, OTHER,
+            os.strerror(errno.EIO), "Errno", "placeholder-token",
+        ):
+            assert value not in shown
+
+    if via == "direct_call":
+        return
+    with _board(board) as conn:
+        [event] = _events(conn, task_id, "owner_retry")
+        assert result == {
+            "ok": True, "task_id": task_id, "status": "ready",
+            "revision": event.id, "retry_reason": REASON,
+        }
+        assert event.run_id == run.id
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.check_respawn_guard(conn, task_id) is None
+    # The independent count, straight from the Project board's own rows.
+    path = kb.board_dir(board) / "kanban.db"
+    with contextlib.closing(kb.connect(db_path=path)) as conn:
+        bound = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id = ? AND kind = 'owner_retry' AND run_id = ?",
+            (task_id, run.id),
+        ).fetchone()["n"]
+    assert bound == 1

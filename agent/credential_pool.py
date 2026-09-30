@@ -1139,7 +1139,15 @@ class CredentialPool(CredentialPoolAdminMixin):
         path, the lock, the read, the parse and the save all happen inside
         it. Any failure there logs one warning naming the provider and
         nothing else (no path, profile, exception text or traceback) and
-        returns 0; it never reaches the caller.
+        returns 0; it never reaches the caller. A failure before the save
+        replaces the store leaves every pool byte for byte as it was. The
+        save replaces the store and only then syncs its folder, so an error
+        it raises when the store, read back under the same lock, is the one
+        saved (its fresh ``updated_at`` stamp included) came after the
+        replacement: the store holds exactly the cleared marks and the clear
+        is complete. That logs one warning, naming only the provider, that
+        the change may not be durable yet, and returns the count; nothing is
+        restored or saved again.
         """
         key = provider.strip().lower() if isinstance(provider, str) else ""
         if not key or not isinstance(profile, str) or not profile.strip():
@@ -1170,7 +1178,20 @@ class CredentialPool(CredentialPoolAdminMixin):
                         cleared += 1
                 if not cleared or not _is_canonical_own_pool(root, name, path):
                     return 0
-                _save_auth_store(store, target_path=path)
+                try:
+                    _save_auth_store(store, target_path=path)
+                except Exception:
+                    # The save stamps a fresh ``updated_at`` into ``store``,
+                    # replaces the file, then syncs its folder: only a store
+                    # it replaced reads back as the one saved. Compared as
+                    # JSON text, so a NaN the store keeps still reads equal.
+                    on_disk = json.loads(path.read_text(encoding="utf-8-sig"))
+                    if json.dumps(on_disk) != json.dumps(store):
+                        raise
+                    logger.warning(
+                        "credential pool: cleared a profile's %s exhaustion marks, "
+                        "but the change may not be durable yet", key,
+                    )
                 return cleared
         except Exception:
             logger.warning("credential pool: could not clear a profile's %s exhaustion marks", key)
