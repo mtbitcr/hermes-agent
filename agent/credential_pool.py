@@ -1093,26 +1093,31 @@ class CredentialPool(CredentialPoolAdminMixin):
         worker's HERMES_HOME, never from the caller's own home. Nothing is
         cleared (and nothing written) when no provider is given, when the
         profile has no pool or entry of its own for it, when its pool is
-        the root pool itself, or when its store cannot be read or parsed or
-        is not an object; there is no fallback to any other pool. The store
-        is read as it is on disk: beside those marks only the save's own
-        ``version`` and ``updated_at`` stamp change. Returns how many entries
-        were cleared; no credential value is returned or logged.
+        the root pool itself, or when its pool path cannot be resolved or
+        its store cannot be read or parsed or is not an object; there is no
+        fallback to any other pool. The store is read as it is on disk:
+        beside those marks only the save's own ``version`` and
+        ``updated_at`` stamp change. Returns how many entries were cleared;
+        no credential value is returned or logged.
+
+        The clear is one best-effort step inside one failure boundary:
+        locating the profile home, resolving and checking its pool path,
+        the lock, the read, the parse and the save all happen inside it.
+        Any failure there logs one warning naming the provider and nothing
+        else (no path, profile, exception text or traceback) and returns 0;
+        it never reaches the caller.
         """
         key = provider.strip().lower() if isinstance(provider, str) else ""
         if not key or not isinstance(profile, str) or not profile.strip():
             return 0
-        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
-
         try:
+            from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
             home = Path(resolve_profile_env(normalize_profile_name(profile)))
             root = Path(resolve_profile_env("default"))
-        except (FileNotFoundError, ValueError):
-            return 0
-        path = home / "auth.json"
-        if path.resolve() == (root / "auth.json").resolve() or not path.is_file():
-            return 0
-        try:
+            path = home / "auth.json"
+            if path.resolve() == (root / "auth.json").resolve() or not path.is_file():
+                return 0
             with _auth_store_lock(target_path=path):
                 # Not _load_auth_store: it migrates other providers' state,
                 # logs stored values and copies an unparseable store aside.
@@ -1128,8 +1133,8 @@ class CredentialPool(CredentialPoolAdminMixin):
                 if cleared:
                     _save_auth_store(store, target_path=path)
                 return cleared
-        except (OSError, RuntimeError, TimeoutError, ValueError):
-            logger.warning("credential pool: could not clear a profile's exhaustion marks")
+        except Exception:
+            logger.warning("credential pool: could not clear a profile's %s exhaustion marks", key)
             return 0
 
     def _is_terminal_auth_failure(

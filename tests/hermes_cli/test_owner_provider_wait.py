@@ -20,7 +20,9 @@ temporary folder; every card, profile, provider, key and time is made up.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
+import logging
 import os
 import subprocess
 from datetime import datetime, timezone
@@ -482,6 +484,79 @@ def test_the_retry_goes_ahead_and_writes_nothing_beside_an_own_store_that_does_n
         events = json.dumps([event.payload for event in kb.list_events(conn, task_id)])
     for leaked in (json.dumps(retried), events, caplog.text):
         assert "placeholder-token" not in leaked
+
+
+@pytest.mark.parametrize("state", ["missing", "unreadable", "self_referential"])
+def test_the_retry_goes_ahead_and_changes_no_pool_when_the_own_pool_path_is_unusable(
+    state, root, owner, clock, monkeypatch, caplog,
+):
+    project = _project(owner, "Unusable Pool")
+    board = project["board"]
+    with _board(board) as conn:
+        task_id = _card(conn, project, "Draft the placeholder report")
+        run = _held(conn, board, task_id, 5001)
+        clock["t"] = run.ended_at + 60
+
+    root_pool = _write_pool(root, {PROVIDER: [_exhausted("root-a")]})
+    steward_pool = _write_pool(root / "profiles" / STEWARD, {PROVIDER: [_exhausted("steward-a")]})
+    other_pool = _write_pool(root / "profiles" / OTHER, {PROVIDER: [_exhausted("other-a")]})
+    pools = (root_pool, steward_pool, other_pool)
+    untouched = {path: path.read_bytes() for path in pools}
+    before = _exhausted_entries(pools)
+
+    home = root / "profiles" / ASSIGNEE
+    own_pool = home / "auth.json"
+    if state == "unreadable":
+        # A valid store holding an exhausted entry that no one, root included,
+        # may read: only this exact path is refused, every other read is real.
+        _write_pool(home, {PROVIDER: [_exhausted("own-a")]})
+        read_text = Path.read_text
+
+        def refused(path, *args, **kwargs):
+            if path == own_pool:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path))
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", refused)
+    elif state == "self_referential":
+        own_pool.symlink_to(own_pool.name)
+    own_raw = own_pool.read_bytes() if state == "unreadable" else None
+    names = set(os.listdir(home))
+
+    env = _steward_env(root, board)
+    caplog.set_level("DEBUG")
+    with _as_worker(monkeypatch, env):
+        retried = _retry(owner, project, task_id, "retry-unusable-pool")
+    assert retried["ok"] is True, retried
+
+    for path, raw in untouched.items():
+        assert path.read_bytes() == raw
+    assert _exhausted_entries(pools) == before
+    if state == "missing":
+        assert not os.path.lexists(own_pool)
+    elif state == "unreadable":
+        assert own_pool.read_bytes() == own_raw
+    else:
+        assert os.readlink(own_pool) == own_pool.name
+    # Only the lock the clear reads under may leave its file: no copy, no temporary file.
+    assert set(os.listdir(home)) - names <= {own_pool.with_suffix(".lock").name}
+
+    with _board(board) as conn:
+        [event] = _events(conn, task_id, "owner_retry")
+        assert event.run_id == run.id
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.check_respawn_guard(conn, task_id) is None
+        events = json.dumps([event.payload for event in kb.list_events(conn, task_id)])
+    records = [record for record in caplog.records if record.name == "agent.credential_pool"]
+    if state == "unreadable":
+        # Refused on every Python version. A link to itself makes resolve()
+        # raise only on some, so that case is not required to be heard.
+        [warning] = [record for record in records if record.levelno == logging.WARNING]
+        assert PROVIDER in warning.getMessage()
+    logged = "\n".join(logging.Formatter().format(record) for record in records)
+    for leaked in (json.dumps(retried), events, logged):
+        for value in ("placeholder-token", str(own_pool), str(home)):
+            assert value not in leaked
 
 
 def _waiting_and_refused(root: Path, owner: ow.OwnerContext) -> dict:
