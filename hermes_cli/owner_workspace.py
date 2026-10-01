@@ -3495,7 +3495,7 @@ def read_project_snapshot(
             "SELECT a.id, a.filename, a.content_type, a.size, a.created_at, a.source_attachment_id "
             "FROM task_attachments a JOIN tasks t ON t.id = a.task_id "
             "WHERE t.project_id = ? AND t.task_kind = 'work' "
-            "ORDER BY a.created_at ASC, a.id ASC LIMIT ?",
+            "ORDER BY a.created_at DESC, a.id DESC LIMIT ?",
             (project_id, _OWNER_PROJECT_MAX_ATTACHMENTS + 1),
         ).fetchall()
         attachments = [
