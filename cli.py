@@ -4175,31 +4175,43 @@ def _record_kanban_rate_limit_reset(cli, exit_code: int) -> None:
         logger.debug("could not record the provider reset on this kanban run", exc_info=True)
 
 
-def _kanban_worker_provider(cli) -> tuple[str, bool]:
-    """The provider this worker's runtime resolution is about to use, and whether it is built-in.
+def _kanban_worker_at_anthropic_default_url(cli, provider: str) -> bool:
+    """Whether this worker's first model request goes to ``anthropic`` at its default base URL.
 
-    A named custom endpoint (``custom_providers`` / ``providers:``) gives its own name; a request
-    with an explicit API key or base URL, or for ``custom`` / ``custom:<name>``, stays as asked.
-    None of those is built-in. Otherwise the provider ``auth.resolve_provider`` gives for the
-    request, built-in only when it is ``openrouter`` or a ``PROVIDER_REGISTRY`` key.
+    Only a request for ``anthropic`` itself, with no API key or base URL on the command line and
+    no base URL in the environment or in config, whose rows are the profile's own and name no
+    other base URL; then only when ``resolve_runtime_provider``, called as that first request
+    calls it, gives the provider's default base URL from ``PROVIDER_REGISTRY``. Anything else is
+    False.
     """
-    from agent.credential_pool import CUSTOM_POOL_PREFIX
-    from hermes_cli.auth import PROVIDER_REGISTRY, resolve_provider
-    from hermes_cli.runtime_provider import _get_named_custom_provider, resolve_requested_provider
+    from agent.credential_pool import get_env_prefer_dotenv
+    from hermes_cli.auth import PROVIDER_REGISTRY, _load_auth_store
+    from hermes_cli.config import load_config
+    from hermes_cli.runtime_provider import resolve_runtime_provider
 
-    requested = resolve_requested_provider(cli.requested_provider)
-    custom = _get_named_custom_provider(requested)
-    if custom:
-        return str(custom.get("name") or requested), False
-    if (
-        cli._explicit_api_key or cli._explicit_base_url
-        or requested == "custom" or requested.startswith(CUSTOM_POOL_PREFIX)
+    if provider != "anthropic" or cli._explicit_api_key or cli._explicit_base_url:
+        return False
+    anthropic = PROVIDER_REGISTRY[provider]
+    model_cfg = load_config().get("model")
+    if get_env_prefer_dotenv(anthropic.base_url_env_var) or (
+        isinstance(model_cfg, dict) and str(model_cfg.get("base_url") or "").strip()
     ):
-        return requested, False
-    provider = resolve_provider(requested)
-    # Plugin providers and their aliases join PROVIDER_REGISTRY unchecked, so a custom id is ruled out here too.
-    custom_id = provider == "custom" or provider.startswith(CUSTOM_POOL_PREFIX)
-    return provider, not custom_id and (provider == "openrouter" or provider in PROVIDER_REGISTRY)
+        return False
+    # Read first: an unreadable own store raises here, before the resolution can write anything.
+    pool = _load_auth_store().get("credential_pool")
+    rows = pool.get(provider) if isinstance(pool, dict) else None
+    # Resolving rows the profile borrows from the root heals them, which may write the root; and a
+    # row naming another endpoint could serve the first request once its limit is cleared.
+    if not isinstance(rows, list) or not rows or any(
+        not isinstance(row, dict) or str(row.get("base_url") or "").strip() not in ("", anthropic.inference_base_url)
+        for row in rows
+    ):
+        return False
+    runtime = resolve_runtime_provider(
+        requested=cli.requested_provider, explicit_api_key=cli._explicit_api_key,
+        explicit_base_url=cli._explicit_base_url,
+    )
+    return runtime.get("provider") == provider and runtime.get("base_url") == anthropic.inference_base_url
 
 
 def _clear_owner_retried_provider_limit(cli) -> None:
@@ -4209,9 +4221,10 @@ def _clear_owner_retried_provider_limit(cli) -> None:
     Silent unless the task's latest ended run ended ``rate_limited`` and an owner retry is bound to
     that very run (``kanban_db.owner_retried_provider_limit``); the owner's process never writes a
     pool. It clears only when this process is the task's current running run, served from its
-    assignee's profile home, the provider about to be used is built-in, and that provider's rows
-    are the profile's own with none read from the root store; else one line says nothing was
-    cleared. Every line names only the provider; any failure logs one warning and the start goes on.
+    assignee's profile home, the first request goes to ``anthropic`` at its default base URL
+    (``_kanban_worker_at_anthropic_default_url``), and that provider's rows are the profile's own
+    with none read from the root store; else one line says nothing was cleared. Every line names
+    only the provider; any failure logs one warning and the start goes on.
     """
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
@@ -4228,13 +4241,13 @@ def _clear_owner_retried_provider_limit(cli) -> None:
         if not retried:
             return
         cleared = 0
-        if assignee and (os.environ.get("HERMES_HOME") or "").strip() and profile_matches_home(assignee):
-            provider, built_in = _kanban_worker_provider(cli)
-            # Loading a pool the profile borrows from the root heals it, which may write the root.
-            if built_in and _profile_owns_pool_provider(provider):
-                pool = load_pool(provider)
-                if not pool._borrowed_root_ids and _profile_owns_pool_provider(provider):
-                    cleared = pool.reset_statuses()
+        if (
+            assignee and (os.environ.get("HERMES_HOME") or "").strip() and profile_matches_home(assignee)
+            and _kanban_worker_at_anthropic_default_url(cli, provider)
+        ):
+            pool = load_pool(provider)
+            if not pool._borrowed_root_ids and _profile_owns_pool_provider(provider):
+                cleared = pool.reset_statuses()
         if cleared:
             logger.info("cleared the %s provider limit after an owner retry", provider)
         else:
