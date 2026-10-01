@@ -12995,6 +12995,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY,
                 OWNER_PROJECT_RUN_CONTEXT_CAPABILITY,
                 OWNER_WAITING_CAPABILITY,
+                PROVIDER_WAIT_CAPABILITY,
                 read_project_snapshot,
                 resolve_owner_context,
             )
@@ -13008,6 +13009,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 else {}
             )
+            # The same for provider_wait_v1.
+            if _owner_workspace_capability_requested(
+                request, PROVIDER_WAIT_CAPABILITY
+            ):
+                waiting["provider_wait"] = True
             snapshot = read_project_snapshot(
                 resolve_owner_context(),
                 request.match_info.get("project_slug", ""),

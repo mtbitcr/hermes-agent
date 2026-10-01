@@ -2599,6 +2599,16 @@ OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY = "planning_context_v1"
 # stopped. Without it the snapshot and Decisions keep today's shape and
 # selection exactly; only a reader naming it receives the waiting answers.
 OWNER_WAITING_CAPABILITY = "owner_waiting_v1"
+# A separately negotiated contour for work that waits for the AI provider.
+# Without it every payload and sentence keeps today's shape exactly.
+PROVIDER_WAIT_CAPABILITY = "provider_wait_v1"
+_OWNER_STOPPED_WORK_PROVIDER_WAIT = "provider_wait"
+_OWNER_PROVIDER_WAITING_SUMMARY = (
+    "Waiting for the AI provider. Work resumes by itself after {time} UTC."
+)
+_OWNER_PROVIDER_REFUSED_SUMMARY = (
+    "The AI provider declined this work as worded. It waits for you."
+)
 _OWNER_PROJECT_PLANNING_STATUSES = (
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
 )
@@ -2921,8 +2931,17 @@ def _owner_project_run_receipt(
     *,
     owner_retry_reason: Any = None,
     owner_waiting: bool = False,
+    provider_wait: bool = False,
+    provider_resume_at: Optional[int] = None,
 ) -> dict:
     """Project one run for the owner.
+
+    ``provider_wait`` is set only for a reader that named
+    ``PROVIDER_WAIT_CAPABILITY``: a provider-refused run then says so, and the
+    run a card waits on after a provider limit reads ``waiting`` until
+    ``provider_resume_at``, the moment its hold ends. The caller passes that
+    moment only for such a run while the dispatcher still holds it; any other
+    run reads as it does today.
 
     ``owner_retry_reason`` is the reason the owner gave for retrying THIS
     exact run — resolved by the caller from an ``owner_retry`` event bound to
@@ -2946,8 +2965,16 @@ def _owner_project_run_receipt(
         owner_outcome, summary = "completed", "Work finished and is awaiting review."
     elif outcome == "scheduled":
         owner_outcome, summary = "unknown", "Work is scheduled for later."
+    elif outcome == "rate_limited" and provider_resume_at is not None:
+        owner_outcome, summary = "waiting", _OWNER_PROVIDER_WAITING_SUMMARY.format(
+            time=datetime.fromtimestamp(provider_resume_at, timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+        )
     elif outcome == "rate_limited":
         owner_outcome, summary = "attention", _owner_rate_limited_summary(run)
+    elif provider_wait and outcome == "provider_refused":
+        owner_outcome, summary = "unknown", _OWNER_PROVIDER_REFUSED_SUMMARY
     elif outcome in {
         "blocked", "changes_requested", "crashed", "gave_up",
         "reclaimed", "spawn_failed", "stale", "timed_out",
@@ -2994,6 +3021,8 @@ def _owner_project_run_projection(
     run_context: bool,
     owner_retry_reason: Any = None,
     owner_waiting: bool = False,
+    provider_wait: bool = False,
+    provider_resume_at: Optional[int] = None,
 ) -> dict:
     """Project one run for the owner, carrying its retry fact but never its id.
 
@@ -3026,7 +3055,8 @@ def _owner_project_run_projection(
         "finished_at": _owner_timestamp(run.ended_at),
         "receipt": _owner_project_run_receipt(
             run, task_pin, owner_retry_reason=owner_retry_reason,
-            owner_waiting=owner_waiting,
+            owner_waiting=owner_waiting, provider_wait=provider_wait,
+            provider_resume_at=provider_resume_at,
         ),
     }
     if not run_context:
@@ -3277,6 +3307,7 @@ def read_project_snapshot(
     run_context: bool = False,
     planning_context: bool = False,
     owner_waiting: bool = False,
+    provider_wait: bool = False,
 ) -> dict:
     """Return one bounded read-only surface for an exact receipt-owned Project.
 
@@ -3295,6 +3326,12 @@ def read_project_snapshot(
     ``owner_waiting`` adds what waits on the owner and why work stopped; it
     defaults off so the shape and selection stay exactly today's; see
     ``OWNER_WAITING_CAPABILITY``.
+
+    ``provider_wait`` shows work that waits for the AI provider: a card the
+    dispatcher still holds after a provider limit reads ``provider_wait`` and
+    the run it waits on reads ``waiting``; once that hold ends (an owner retry,
+    the hold running out, or no cooldown) both read as today; it defaults off
+    so every payload stays exactly today's; see ``PROVIDER_WAIT_CAPABILITY``.
     """
     try:
         project_slug = projects_db.normalize_slug(project_slug) or ""
@@ -3394,6 +3431,15 @@ def read_project_snapshot(
         owner_waits = (
             kanban_db.task_owner_waits(conn, task_ids) if owner_waiting else {}
         )
+        # Only ready and review cards are held, and the kernel's states name
+        # only blocked ones, so this never hides one of those states. Only a
+        # hold the dispatcher still keeps reads as waiting: a card whose hold
+        # has ended keeps today's state here, though the retry still takes it.
+        provider_waits = (
+            _owner_provider_waits(conn, task_ids) if provider_wait else {}
+        )
+        for task_id in provider_waits:
+            stopped_work[task_id] = _OWNER_STOPPED_WORK_PROVIDER_WAIT
 
         columns = {status: [] for status in _OWNER_PROJECT_COLUMNS}
         for task in tasks:
@@ -3477,6 +3523,14 @@ def read_project_snapshot(
             if run_context
             else {}
         )
+        # Keyed by the held run's id: only that run of a card still held waits.
+        provider_resume_times = dict(
+            _owner_provider_waits(
+                conn, {str(run.task_id) for run in bounded_run_objects},
+            ).values()
+            if provider_wait
+            else ()
+        )
         runs: list[dict] = []
         task_ids_with_newer_run: set[str] = set()
         for row, run in zip(run_rows[:_OWNER_PROJECT_MAX_RUNS], bounded_run_objects):
@@ -3493,6 +3547,8 @@ def read_project_snapshot(
                     run_context=run_context,
                     owner_retry_reason=retry_reasons.get(int(row["id"])),
                     owner_waiting=owner_waiting,
+                    provider_wait=provider_wait,
+                    provider_resume_at=provider_resume_times.get(int(row["id"])),
                 )
             )
             task_ids_with_newer_run.add(run_task_id)
@@ -6771,6 +6827,98 @@ def _retry_refusal_reason(task: kanban_db.Task) -> str:
     return f"This work is {state} and has not stopped. " + retryable
 
 
+def _owner_provider_held_runs(
+    conn: sqlite3.Connection, task_ids: Any,
+) -> dict[str, sqlite3.Row]:
+    """Each ready or review card's run it waits on because the AI provider limited it.
+
+    That is the card's latest ended run, read in the respawn guard's own order,
+    when it ended ``rate_limited``; keyed by task id. Batched and read-only.
+    The owner retry accepts exactly these cards. The snapshot shows as waiting
+    only those the dispatcher still holds (:func:`_owner_provider_waits`), so
+    every card shown as waiting is one that retry accepts, but a card whose
+    hold has ended is accepted without being shown as waiting.
+    """
+    ids = sorted({str(task_id) for task_id in task_ids})
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        "SELECT r.id AS id, r.task_id AS task_id, r.outcome AS outcome, "
+        "r.ended_at AS ended_at, r.metadata AS metadata, "
+        "t.status AS status, t.assignee AS assignee, "
+        "t.provider_override AS provider_override "
+        "FROM tasks t JOIN task_runs r ON r.id = ("
+        "SELECT lr.id FROM task_runs lr WHERE lr.task_id = t.id "
+        "AND lr.ended_at IS NOT NULL ORDER BY lr.ended_at DESC, lr.id DESC LIMIT 1) "
+        f"WHERE t.id IN ({placeholders}) AND t.task_kind = 'work' "
+        "AND t.status IN ('ready', 'review') AND r.outcome = 'rate_limited'",
+        ids,
+    ).fetchall()
+    return {str(row["task_id"]): row for row in rows}
+
+
+def _owner_provider_waits(
+    conn: sqlite3.Connection, task_ids: Any,
+) -> dict[str, tuple[int, int]]:
+    """Each card the dispatcher holds for the AI provider now: its held run's id and the hold's end.
+
+    A card the retry accepts (:func:`_owner_provider_held_runs`) counts only
+    while ``kanban_db.check_respawn_guard``, asked for the card's own column as
+    the dispatcher asks it, answers ``rate_limit_cooldown``: an ``owner_retry``
+    bound to that run, a hold that has run out and a disabled cooldown each
+    end it. The end is the moment that check uses. Keyed by task id; read-only.
+    """
+    from hermes_cli import kanban_provider_stops
+
+    cooldown = kanban_db._resolve_rate_limit_cooldown_seconds()
+    waits: dict[str, tuple[int, int]] = {}
+    for task_id, held in _owner_provider_held_runs(conn, task_ids).items():
+        guard = kanban_db.check_respawn_guard(conn, task_id, lane=held["status"])
+        if guard != "rate_limit_cooldown":
+            continue
+        resume_at = kanban_provider_stops.rate_limit_resume_at(
+            conn, task_id, held, cooldown=cooldown,
+        )
+        if resume_at is not None:
+            waits[task_id] = (int(held["id"]), resume_at)
+    return waits
+
+
+def _provider_held_run(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
+    """The run a ready or review card waits on because the AI provider limited it, else None."""
+    return _owner_provider_held_runs(conn, [task_id]).get(str(task_id))
+
+
+def _retry_provider_wait(
+    conn: sqlite3.Connection, task_id: str, *, owner_retry: dict,
+) -> Optional[sqlite3.Row]:
+    """Record the owner's retry against the run a card waits on; the card keeps its status.
+
+    The card must still be waiting inside this transaction; the ``owner_retry``
+    event, bound to that run, is then the only write, and it is what ends the
+    run's hold (``kanban_db.check_respawn_guard``). Returns the held run, or
+    None having written nothing.
+    """
+    with kanban_db.write_txn(conn):
+        held = _provider_held_run(conn, task_id)
+        if held is None:
+            return None
+        kanban_db._append_event(
+            conn, task_id, kanban_db.OWNER_RETRY_EVENT_KIND,
+            {
+                "reason": owner_retry.get("reason"),
+                "actor": owner_retry.get("actor"),
+                "profile": owner_retry.get("profile"),
+                "idempotency_key": owner_retry.get("idempotency_key"),
+                "stopped_because": _OWNER_STOPPED_WORK_PROVIDER_WAIT,
+                "status": held["status"],
+            },
+            run_id=int(held["id"]),
+        )
+    return held
+
+
 def retry_task(
     ctx: OwnerContext,
     *,
@@ -6799,6 +6947,14 @@ def retry_task(
     blocked for owner input, a dependency or a transient problem, is refused
     as a normal returned result that says which state it is in and why that
     one cannot be retried.
+
+    It also accepts a ready or review card whose latest ended run the AI
+    provider limited (``rate_limited``). That card keeps its status: the
+    ``owner_retry`` event, bound to that run, is the only board write, and it
+    ends that run's hold (``kanban_db.check_respawn_guard``). The owner's
+    process never writes any profile's credential pool: the card's own worker,
+    when it next starts, clears its own pool's limit for the provider it is
+    about to use (``kanban_db.owner_retried_provider_limit``).
 
     ``reason`` is required and is the owner's own account of why this work
     deserves another attempt. It is recorded twice, both times durably: as an
@@ -6952,7 +7108,31 @@ def retry_task(
                             evidence = kanban_db.stopped_work_retry_evidence(
                                 kconn, task_id,
                             )
-                            if evidence is None:
+                            if (
+                                evidence is None
+                                and _provider_held_run(kconn, task_id) is not None
+                            ):
+                                held = _retry_provider_wait(
+                                    kconn, task_id,
+                                    owner_retry={
+                                        "reason": reason,
+                                        "actor": ctx.actor,
+                                        "profile": ctx.profile,
+                                        "idempotency_key": idempotency_key,
+                                    },
+                                )
+                                if held is None:
+                                    refusal = (
+                                        "This work changed while you were "
+                                        "confirming, so nothing was retried."
+                                    )
+                                else:
+                                    retried = kanban_db.committed_owner_retry_event(
+                                        kconn, task_id,
+                                        actor=ctx.actor, profile=ctx.profile,
+                                        idempotency_key=idempotency_key,
+                                    )
+                            elif evidence is None:
                                 refusal = _retry_refusal_reason(current_task)
                             elif kanban_db.unblock_task(
                                 kconn, task_id,

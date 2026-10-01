@@ -4175,6 +4175,70 @@ def _record_kanban_rate_limit_reset(cli, exit_code: int) -> None:
         logger.debug("could not record the provider reset on this kanban run", exc_info=True)
 
 
+def _kanban_worker_owns_anthropic_rows(provider: str) -> bool:
+    """Whether the request is for ``anthropic`` and this profile's own store holds its rows.
+
+    Which endpoint the request calls is not checked: the reset only lets it try again, and a limit
+    that still holds marks the rows again. The store is read here directly, silently and without
+    repair, so an unreadable or unparseable store raises to the caller's one warning and nothing
+    beside it is logged or written. Anything else is False.
+    """
+    from hermes_cli.auth import _auth_file_path
+
+    if provider != "anthropic":
+        return False
+    store_path = _auth_file_path()
+    if not store_path.exists():
+        return False
+    # Read first: a bad own store raises here, before loading the pool can log or write anything.
+    store = json.loads(store_path.read_text(encoding="utf-8-sig"))
+    pool = store.get("credential_pool") if isinstance(store, dict) else None
+    rows = pool.get(provider) if isinstance(pool, dict) else None
+    return isinstance(rows, list) and bool(rows)
+
+
+def _clear_owner_retried_provider_limit(cli) -> None:
+    """At a kanban worker's start, before its first model request: when the owner retried this
+    task's run held at the provider's limit, clear the limit in this worker's own pool.
+
+    Silent unless the task's latest ended run ended ``rate_limited`` and an owner retry is bound to
+    that very run (``kanban_db.owner_retried_provider_limit``); the owner's process never writes a
+    pool. It clears only when this process is the task's current running run, served from its
+    assignee's profile home, the request is for ``anthropic`` and that provider's rows are the
+    profile's own (``_kanban_worker_owns_anthropic_rows``) with none read from the root store,
+    whichever endpoint the request calls; else one line says nothing was cleared. Every line names
+    only the provider; any failure logs one warning and the start goes on.
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return
+    provider = str(getattr(cli, "requested_provider", "") or "").strip().lower() or "auto"
+    try:
+        from agent.credential_pool import _profile_owns_pool_provider, load_pool
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli.profiles import profile_matches_home
+
+        run_id = _int_or(os.environ.get("HERMES_KANBAN_RUN_ID"), None)
+        with _kb.connect_closing() as conn:
+            retried, assignee = _kb.owner_retried_provider_limit(conn, task_id, run_id)
+        if not retried:
+            return
+        cleared = 0
+        if (
+            assignee and (os.environ.get("HERMES_HOME") or "").strip() and profile_matches_home(assignee)
+            and _kanban_worker_owns_anthropic_rows(provider)
+        ):
+            pool = load_pool(provider)
+            if not pool._borrowed_root_ids and _profile_owns_pool_provider(provider):
+                cleared = pool.reset_statuses()
+        if cleared:
+            logger.info("cleared the %s provider limit after an owner retry", provider)
+        else:
+            logger.info("nothing was cleared for the %s provider after an owner retry", provider)
+    except Exception:
+        logger.warning("could not clear the %s provider limit after an owner retry", provider)
+
+
 def _run_quiet_single_query(cli, effective_query):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
     HERMES_TURN_AUTHOR (set only by a bot-to-bot dispatcher) is consumed here so tool subprocesses do not inherit it."""
@@ -4491,6 +4555,7 @@ def _configure_quiet_agent(agent) -> None:
 
 def _run_single_query_mode(cli, query, image, quiet, oneshot):
     """``-q``/``--image`` entry: seed an interactive session on a TTY, else run the one-shot turn and exit."""
+    _clear_owner_retried_provider_limit(cli)
     if _should_seed_interactive(query, image, quiet, oneshot):
         seeded_query, seeded_images = _collect_query_images(query, image)
         logger.info(
