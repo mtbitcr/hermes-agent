@@ -733,6 +733,66 @@ def test_project_snapshot_names_the_source_of_a_copied_attachment(ctx):
     assert by_id[str(copy)]["media_type"] == "text/markdown"
 
 
+def _store_project_attachments_at(result: dict, times: list[int]) -> list[int]:
+    """Store one attachment on the Project per time, each dated to its time,
+    and return their native ids in the order they were stored."""
+    board = result["board"]
+    with kanban_db.connect(board=board) as conn:
+        attachment_ids = [
+            kanban_db.store_attachment_bytes(
+                conn, result["task_ids"][0], f"file-{index}.txt", b"owner bytes",
+                board=board,
+            )
+            for index in range(len(times))
+        ]
+        with kanban_db.write_txn(conn):
+            for attachment_id, created_at in zip(attachment_ids, times):
+                conn.execute(
+                    "UPDATE task_attachments SET created_at = ? WHERE id = ?",
+                    (created_at, attachment_id),
+                )
+    return attachment_ids
+
+
+def test_project_snapshot_carries_a_busy_projects_newest_attachments_first(ctx):
+    """A Project with more files than the snapshot carries shows the ones
+    added last; the oldest file is the one left out."""
+    result = _committed_project(ctx, key="graph-attachments-busy", name="Busy Files")
+    stored = _store_project_attachments_at(
+        result,
+        [10_000 + index for index in range(ow._OWNER_PROJECT_MAX_ATTACHMENTS + 1)],
+    )
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+
+    projected = [item["id"] for item in snapshot["attachments"]]
+    assert projected == [str(attachment_id) for attachment_id in reversed(stored[1:])]
+    assert str(stored[0]) not in projected
+    assert snapshot["truncated"]["attachments"] is True
+
+
+def test_project_snapshot_carries_every_attachment_of_a_small_project_newest_first(ctx):
+    result = _committed_project(ctx, key="graph-attachments-few", name="Few Files")
+    # Dated out of storage order, so newest means each file's own time.
+    stored = _store_project_attachments_at(result, [10_060, 10_120, 10_000])
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+
+    assert [item["id"] for item in snapshot["attachments"]] == [
+        str(stored[1]), str(stored[0]), str(stored[2]),
+    ]
+    assert snapshot["truncated"]["attachments"] is False
+
+
+def test_project_snapshot_orders_same_second_attachments_higher_id_first(ctx):
+    result = _committed_project(ctx, key="graph-attachments-tie", name="Tied Files")
+    lower, higher = sorted(_store_project_attachments_at(result, [10_000, 10_000]))
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+
+    assert [item["id"] for item in snapshot["attachments"]] == [str(higher), str(lower)]
+
+
 def test_project_snapshot_is_exact_receipt_backed_and_read_only(ctx):
     args = _task_graph_args(
         idempotency_key="graph-snapshot",
