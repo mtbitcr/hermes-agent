@@ -1395,6 +1395,10 @@ _OWNER_REFUSED_TURN_MESSAGE = (
     "Raphael could not work on this request as it is worded. Nothing was "
     "changed. Rewording the request may help."
 )
+_OWNER_PROVIDER_UNAVAILABLE_TURN_MESSAGE = (
+    "The AI provider did not answer, so nothing was prepared and nothing was "
+    "changed. You can send it again in a few minutes."
+)
 _OWNER_RUN_STOPPED_MESSAGE = (
     "This stopped before it finished. Nothing was changed. You can ask for it "
     "again."
@@ -2558,6 +2562,9 @@ class ResponseStore:
         # Whether the most recent such output of that turn is the platform's
         # own refusal notice. Reset and read with ``unreadable_reply``.
         refusal_notice_reply = False
+        # Whether it is instead the platform's own text for a provider that
+        # never answered. Reset and read with ``unreadable_reply`` too.
+        provider_failure_reply = False
         substituted_failure_turn = False
 
         def _flush() -> None:
@@ -2602,6 +2609,7 @@ class ResponseStore:
                 _flush()
                 unreadable_reply = False
                 refusal_notice_reply = False
+                provider_failure_reply = False
                 if len(text) > _OWNER_HISTORY_OWNER_MAX_CHARS:
                     text = (
                         "[Earlier owner message omitted from this view because it "
@@ -2619,6 +2627,7 @@ class ResponseStore:
                 unreadable_reply = unreadable_reply or bool(content)
                 if content:
                     refusal_notice_reply = False
+                    provider_failure_reply = False
                 continue
             text = content.strip()
             if not text:
@@ -2635,6 +2644,9 @@ class ResponseStore:
                 refusal_notice_reply = content.startswith(
                     CONTENT_POLICY_REFUSAL_NOTICE_FIRST_LINE
                 )
+                # A provider that never answered is recognised the same way, by
+                # the fixed words ``agent.turn_recovery`` starts that text with.
+                provider_failure_reply = content.startswith("API call failed after")
                 continue
             if (
                 not isinstance(candidate, dict)
@@ -2646,6 +2658,7 @@ class ResponseStore:
                 # kind this service ever writes, so it carries no outcome.
                 unreadable_reply = True
                 refusal_notice_reply = False
+                provider_failure_reply = False
                 continue
             if (
                 candidate["kind"]
@@ -2697,6 +2710,11 @@ class ResponseStore:
         # declined again, so its failure says rewording may help instead — also
         # a fixed constant, so neither the notice nor the model's explanation
         # reaches the owner.
+        #
+        # A turn the provider never answered ends on the platform's own
+        # "API call failed after" text, so its failure says exactly that —
+        # again a fixed constant, so neither the provider's text nor any error
+        # detail reaches the owner.
         if owner_text is not None and raphael_text is None and unreadable_reply:
             raphael_text = json.dumps(
                 {
@@ -2705,6 +2723,8 @@ class ResponseStore:
                     "message": (
                         _OWNER_REFUSED_TURN_MESSAGE
                         if refusal_notice_reply
+                        else _OWNER_PROVIDER_UNAVAILABLE_TURN_MESSAGE
+                        if provider_failure_reply
                         else _OWNER_INTERRUPTED_TURN_MESSAGE
                     ),
                 },
@@ -3060,11 +3080,36 @@ class ResponseStore:
                                 "owner conversation has no readable transcript"
                             )
 
+                    # The failed turn's own stored reply is what its record
+                    # holds beyond the transcript it continued. Only when that
+                    # reply starts with the platform's own provider-failure
+                    # words, read exactly as the history projection reads
+                    # them, is the turn sealed as the provider not answering.
+                    # Every other record keeps the generic message — including
+                    # one that only carries an earlier turn's words.
+                    own_history = terminal_data.get("conversation_history")
+                    own_reply = (
+                        own_history[-1]
+                        if isinstance(own_history, list)
+                        and len(own_history) > len(previous_history)
+                        and own_history[:len(previous_history)] == previous_history
+                        else None
+                    )
+                    provider_failure_reply = (
+                        isinstance(own_reply, dict)
+                        and own_reply.get("role") == "assistant"
+                        and isinstance(own_reply.get("content"), str)
+                        and own_reply["content"].startswith("API call failed after")
+                    )
                     failure_reply = json.dumps(
                         {
                             "schema_version": 1,
                             "kind": "failure",
-                            "message": _OWNER_INTERRUPTED_TURN_MESSAGE,
+                            "message": (
+                                _OWNER_PROVIDER_UNAVAILABLE_TURN_MESSAGE
+                                if provider_failure_reply
+                                else _OWNER_INTERRUPTED_TURN_MESSAGE
+                            ),
                         },
                         ensure_ascii=False,
                     )
