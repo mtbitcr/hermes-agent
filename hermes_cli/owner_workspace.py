@@ -2595,6 +2595,10 @@ OWNER_PROJECT_RUN_CONTEXT_CAPABILITY = "run_task_context"
 # planning. The ordinary snapshot keeps its historical closed schema; only a
 # reader naming this capability receives the bounded planning DTO below.
 OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY = "planning_context_v1"
+# The same planning DTO at schema version 2, each task also carrying the owned
+# paths its row stores. Version 1 stays exactly what the released Workspace
+# reads; a reader naming both receives version 2.
+OWNER_PROJECT_PLANNING_CONTEXT_V2_CAPABILITY = "planning_context_v2"
 # A separately negotiated contour for what waits on the owner and why work
 # stopped. Without it the snapshot and Decisions keep today's shape and
 # selection exactly; only a reader naming it receives the waiting answers.
@@ -3109,6 +3113,8 @@ def owner_project_planning_context(
     conn: sqlite3.Connection,
     project_id: str,
     counts: dict[str, int],
+    *,
+    owned_paths: bool = False,
 ) -> dict:
     """Return one bounded, relation-aware DTO for owner planning.
 
@@ -3116,6 +3122,9 @@ def owner_project_planning_context(
     related to that live set is then retained before recent terminal history
     fills the remaining capacity. SQL limits apply before materialization; a
     live or relation overflow is reported and the Workspace refuses to plan.
+
+    ``owned_paths`` serves schema version 2: the same DTO, each task also
+    carrying the owned paths its row stores (``[]`` when it stores none).
     """
     status_slots = ",".join("?" for _ in _OWNER_PROJECT_PLANNING_STATUSES)
     actionable_rows = conn.execute(
@@ -3258,13 +3267,15 @@ def owner_project_planning_context(
             "omitted_parent_count": omitted_parents,
             "omitted_child_count": omitted_children,
         })
+        if owned_paths:
+            tasks[-1]["owned_paths"] = task.owned_paths or []
 
     retained_terminal = sum(
         1 for row in selected_rows
         if str(row["status"]) in _OWNER_PROJECT_TERMINAL_STATUSES
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2 if owned_paths else 1,
         "actionable_count": sum(
             counts[status] for status in _OWNER_PROJECT_PLANNING_STATUSES
         ),
@@ -3306,6 +3317,7 @@ def read_project_snapshot(
     *,
     run_context: bool = False,
     planning_context: bool = False,
+    planning_context_v2: bool = False,
     owner_waiting: bool = False,
     provider_wait: bool = False,
 ) -> dict:
@@ -3322,6 +3334,12 @@ def read_project_snapshot(
     It defaults off so the shape stays exactly what the oldest owner
     Workspace release accepts; see
     ``OWNER_PROJECT_RUN_CONTEXT_CAPABILITY``.
+
+    ``planning_context_v2`` adds the planning context at schema version 2,
+    each task also carrying the owned paths its row stores; it takes the
+    place of version 1 when both are asked for and defaults off, so a
+    version-1 reader keeps exactly today's context; see
+    ``OWNER_PROJECT_PLANNING_CONTEXT_V2_CAPABILITY``.
 
     ``owner_waiting`` adds what waits on the owner and why work stopped; it
     defaults off so the shape and selection stay exactly today's; see
@@ -3599,7 +3617,7 @@ def read_project_snapshot(
             "runs": len(run_rows) > _OWNER_PROJECT_MAX_RUNS,
         },
     }
-    if planning_context:
+    if planning_context or planning_context_v2:
         # The main snapshot connection above was deliberately closed before
         # this separately negotiated projection. Reopen the same verified
         # board read-only; no GET may migrate or mutate it.
@@ -3607,6 +3625,7 @@ def read_project_snapshot(
         try:
             result["planning_context"] = owner_project_planning_context(
                 planning_conn, project_id, counts,
+                owned_paths=planning_context_v2,
             )
         except OwnerWorkspaceError:
             raise
