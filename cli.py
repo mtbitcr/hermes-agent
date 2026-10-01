@@ -4175,6 +4175,28 @@ def _record_kanban_rate_limit_reset(cli, exit_code: int) -> None:
         logger.debug("could not record the provider reset on this kanban run", exc_info=True)
 
 
+def _record_kanban_provider_stop(exit_code: int) -> None:
+    """Before a usage-limit or refusal exit, record on this worker's own run which provider stop it is.
+
+    The dispatcher then books the exit as that stop, not as a crash, even when a restart has lost
+    the exit status it reaped. Best-effort: never raises and never changes the exit code.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli.kanban_provider_stops import KANBAN_PROVIDER_REFUSED_EXIT_CODE
+
+        if exit_code not in (_kb.KANBAN_RATE_LIMIT_EXIT_CODE, KANBAN_PROVIDER_REFUSED_EXIT_CODE):
+            return
+        task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+        run_id = _int_or(os.environ.get("HERMES_KANBAN_RUN_ID"), None)
+        if not task_id or run_id is None:
+            return
+        with _kb.connect_closing() as conn:
+            _kb.record_run_provider_stop(conn, task_id, run_id=run_id, exit_code=exit_code)
+    except Exception:
+        logger.debug("could not record the provider stop on this kanban run", exc_info=True)
+
+
 def _kanban_worker_owns_anthropic_rows(provider: str) -> bool:
     """Whether the request is for ``anthropic`` and this profile's own store holds its rows.
 
@@ -4286,6 +4308,7 @@ def _run_quiet_single_query(cli, effective_query):
 
     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
     _record_kanban_rate_limit_reset(cli, _exit_code)
+    _record_kanban_provider_stop(_exit_code)
     sys.exit(_exit_code)
 
 
@@ -4610,6 +4633,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
         _exit_code = _single_query_exit_code(getattr(cli, "_last_turn_result", None), default=0)
         if _exit_code:
             _record_kanban_rate_limit_reset(cli, _exit_code)
+            _record_kanban_provider_stop(_exit_code)
             sys.exit(_exit_code)
     finally:
         _finalize_single_query(cli)

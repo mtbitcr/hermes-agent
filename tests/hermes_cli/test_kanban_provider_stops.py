@@ -17,12 +17,17 @@ built-in providers ends a hold early. A reset the worker records
 goes through the worker's own path, under exactly the environment the dispatcher
 builds for the claimed run, onto a named board under the test root. The refusal
 exit is covered end to end in ``tests/cli/test_kanban_worker_refusal_exit.py``.
+A worker's stop stays booked as that stop when its claim expires or its heartbeat
+goes stale before the dead-worker scan books it, and when a restart loses the exit
+the dispatcher reaped: the worker recorded the stop on its own run on its way out.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import signal
+import sqlite3
 import subprocess
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -35,6 +40,7 @@ from agent import vertex_adapter
 from agent.credential_pool import STATUS_EXHAUSTED, CredentialPool, PooledCredential
 from hermes_cli import kanban_db as kb
 from hermes_cli.auth import resolve_provider
+from hermes_cli.kanban_provider_stops import KANBAN_PROVIDER_REFUSED_EXIT_CODE
 from hermes_cli.runtime_provider import resolve_runtime_provider
 from plugins.dashboard_auth.raphael_workspace import model_policy
 
@@ -74,11 +80,11 @@ def _claimer(pid):
     return f"{host}:w{pid}"
 
 
-def _start_worker(conn, task_id, pid, *, lane="ready"):
+def _start_worker(conn, task_id, pid, *, lane="ready", ttl_seconds=None):
     if lane == "review":
-        task = kb.claim_review_task(conn, task_id, claimer=_claimer(pid))
+        task = kb.claim_review_task(conn, task_id, claimer=_claimer(pid), ttl_seconds=ttl_seconds)
     else:
-        task = kb.claim_task(conn, task_id, claimer=_claimer(pid))
+        task = kb.claim_task(conn, task_id, claimer=_claimer(pid), ttl_seconds=ttl_seconds)
     assert task is not None
     conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (pid, task_id))
     conn.commit()
@@ -937,3 +943,267 @@ def test_a_stop_streak_counts_one_named_endpoint_and_never_merges_two(conn, cloc
     kb.set_model_override(conn, moved, "m-1", provider="custom:box")
     fourth = _rate_limited_stop(conn, moved, pid=4994)
     assert _resume_at(fourth) == fourth.ended_at + 2 * COOLDOWN
+
+
+OTHER_BOARD = "elsewhere"
+# The stale-heartbeat sweep's window, as a gateway configures one.
+STALE_TIMEOUT = 3600
+# The two provider stops by exit code: the kind each is booked as, and the turn
+# result a worker's provider stops its turn with.
+STOP_KINDS = {
+    kb.KANBAN_RATE_LIMIT_EXIT_CODE: "rate_limited",
+    KANBAN_PROVIDER_REFUSED_EXIT_CODE: "provider_refused",
+}
+STOPPED_BY = {
+    kb.KANBAN_RATE_LIMIT_EXIT_CODE: {
+        "final_response": "", "completed": False, "failed": True,
+        "failure_reason": "rate_limit", "error": "placeholder usage limit",
+    },
+    KANBAN_PROVIDER_REFUSED_EXIT_CODE: {
+        "final_response": "", "completed": False, "failed": True,
+        "error": "content_policy_blocked: placeholder refusal",
+    },
+}
+
+
+@pytest.fixture
+def signals(monkeypatch):
+    """Every signal a sweep sends a worker; none reaches a process, as each placeholder pid is gone."""
+    sent = []
+
+    def kill(pid, sig):
+        sent.append((pid, sig))
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(kb.os, "kill", kill)
+    return sent
+
+
+def _stopping_worker(conn, task_id, pid, lapse):
+    """Claim the card for the worker ``pid``; a claim whose heartbeat is to lapse outlasts it."""
+    if lapse != "heartbeat":
+        return _start_worker(conn, task_id, pid)
+    run_id = _start_worker(conn, task_id, pid, ttl_seconds=3 * STALE_TIMEOUT)
+    assert kb.heartbeat_worker(conn, task_id)
+    return run_id
+
+
+def _lapse(conn, clock, task_id, lapse):
+    """Let the running card's claim expire, or its heartbeat go stale while its claim holds."""
+    task = kb.get_task(conn, task_id)
+    if lapse == "claim":
+        clock["t"] = task.claim_expires + 1
+    elif lapse == "heartbeat":
+        clock["t"] = task.last_heartbeat_at + kb._STALE_HEARTBEAT_GAP_SECONDS + 60
+        assert clock["t"] < task.claim_expires
+
+
+def _full_tick(conn, spawned):
+    """One whole dispatcher tick, every sweep in its order, the stale-heartbeat sweep on."""
+    return kb.dispatch_once(
+        conn, spawn_fn=_spawn_recorder(spawned), board=BOARD, stale_timeout_seconds=STALE_TIMEOUT,
+    )
+
+
+def _booked_as_the_stop(conn, task_id, run_id, code):
+    """The run ended as the stop ``code`` with no failure counted: a limit holds the card, a refusal blocks it."""
+    task, run = kb.get_task(conn, task_id), kb.get_run(conn, run_id)
+    assert run.ended_at is not None and run.outcome == STOP_KINDS[code]
+    assert task.consecutive_failures == 0 and task.worker_pid is None
+    assert not [event for event in kb.list_events(conn, task_id) if event.kind in ("reclaimed", "stale", "crashed")]
+    if code == kb.KANBAN_RATE_LIMIT_EXIT_CODE:
+        assert task.status == "ready" and _resume_at(run) is not None
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    else:
+        assert (task.status, task.block_kind) == ("blocked", "capability")
+
+
+class _StoppedWorker:
+    """The slice of HermesCLI a worker's one-shot turn touches; its provider stops the turn with ``result``."""
+
+    def __init__(self, result):
+        self.result = result
+        self.session_id = "worker-session"
+        self.conversation_history = []
+        self.console = SimpleNamespace(print=lambda *_args, **_kwargs: None)
+        self._active_agent_route_signature = "route"
+        self.agent = SimpleNamespace(
+            session_id=self.session_id, _credential_pool=None, run_conversation=lambda **_kwargs: result,
+        )
+
+    def _claim_active_session(self, _surface, *, stderr=False):
+        return True
+
+    def _show_security_advisories(self):
+        pass
+
+    def chat(self, query, images=None):
+        self._last_turn_result = self.result
+        return self.result.get("final_response")
+
+    def _print_exit_summary(self, clear_screen=True):
+        pass
+
+    def _ensure_runtime_credentials(self):
+        return True
+
+    def _resolve_turn_agent_config(self, _query):
+        return {"signature": "route", "model": None, "runtime": None}
+
+    def _init_agent(self, **_kwargs):
+        return True
+
+
+def _reaches_every_board_and_the_root(root, boards):
+    """Pinned to its card's board, the worker still reaches every other board and the root registry."""
+    assert kb.kanban_home() == root
+    assert kb.register_db_path() == root / "kanban" / "board_register.db"
+    for board, task_id in boards.items():
+        entry = kb.get_register_entry(board)
+        assert entry is not None and entry.lifecycle is kb.BoardLifecycle.LIVE
+        with closing(kb.connect(db_path=kb.board_dir(board) / "kanban.db")) as board_conn:
+            assert kb.get_task(board_conn, task_id) is not None
+
+
+def _recorded_stops_under(root):
+    """Every ``(store, run id, stop)`` recorded under ``root``, read straight from each SQLite file there."""
+    found = []
+    for path in sorted(root.rglob("*.db")):
+        with closing(sqlite3.connect(path)) as store:
+            if store.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_runs'",
+            ).fetchone() is None:
+                continue
+            for run_id, metadata in store.execute("SELECT id, metadata FROM task_runs ORDER BY id"):
+                stop = json.loads(metadata or "{}").get("provider_stop")
+                if stop is not None:
+                    found.append((path.resolve(), run_id, stop))
+    return found
+
+
+@pytest.mark.parametrize("lapse", ["claim", "heartbeat"])
+@pytest.mark.parametrize("code", sorted(STOP_KINDS))
+def test_a_stop_the_reaper_saw_is_booked_as_that_stop_after_its_claim_or_heartbeat_lapses(
+    conn, clock, signals, code, lapse,
+):
+    task_id = kb.create_task(conn, title="stopped card", assignee="worker")
+    run_id = _stopping_worker(conn, task_id, 6101, lapse)
+    _lapse(conn, clock, task_id, lapse)
+    kb._record_worker_exit(6101, code << 8)
+    spawned = []
+    _full_tick(conn, spawned)
+    _booked_as_the_stop(conn, task_id, run_id, code)
+    assert spawned == [] and signals == []
+
+
+@pytest.mark.parametrize("lapse", [None, "claim", "heartbeat"])
+@pytest.mark.parametrize("quiet", [False, True])
+@pytest.mark.parametrize("code", sorted(STOP_KINDS))
+def test_after_a_restart_a_stop_the_worker_recorded_on_its_run_is_booked_as_that_stop(
+    conn, clock, signals, monkeypatch, tmp_path, code, quiet, lapse,
+):
+    """The worker records its stop on its way out, under exactly the environment the dispatcher
+    builds for its run; a restart then loses the exit the dispatcher reaped.
+    """
+    root = Path(os.environ["HERMES_HOME"])
+    kb.create_board(OTHER_BOARD)
+    with closing(kb.connect(board=OTHER_BOARD)) as other_conn:
+        elsewhere = kb.create_task(other_conn, title="card elsewhere", assignee="worker")
+    task_id = kb.create_task(conn, title="stopped card", assignee="worker")
+    run_id = _stopping_worker(conn, task_id, 6120, lapse)
+    env = _dispatcher_env(monkeypatch, conn, task_id)
+    assert env["HERMES_HOME"] == str(root / "profiles" / "worker")
+    assert env["HERMES_KANBAN_TASK"] == task_id
+    assert env["HERMES_KANBAN_RUN_ID"] == str(run_id)
+    assert env["HERMES_KANBAN_DB"] == str(kb.kanban_db_path(board=BOARD))
+    assert env["HERMES_KANBAN_BOARD"] == BOARD
+
+    # The one-shot entry sets this marker on os.environ itself; registering it here undoes that.
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    monkeypatch.setattr(cli, "_should_seed_interactive", lambda *_args: False)
+    monkeypatch.setattr(cli, "_collect_query_images", lambda query, _image: (query, []))
+    monkeypatch.setattr(cli, "_collect_kanban_task_images", lambda _images: [])
+    monkeypatch.setattr(cli, "_finalize_single_query", lambda _worker: None)
+    with _as_worker_process(monkeypatch, env):
+        assert dict(os.environ) == env
+        with pytest.raises(SystemExit) as exited:
+            cli._run_single_query_mode(
+                _StoppedWorker(STOPPED_BY[code]), f"work kanban task {task_id}", None, quiet, False,
+            )
+        _reaches_every_board_and_the_root(root, {BOARD: task_id, OTHER_BOARD: elsewhere})
+    assert exited.value.code == code
+    # Counted straight from every store under the test root: one run, on the claimed board.
+    assert _recorded_stops_under(tmp_path) == [
+        (kb.kanban_db_path(board=BOARD).resolve(), run_id, STOP_KINDS[code]),
+    ]
+
+    monkeypatch.setattr(kb, "_recent_worker_exits", {})  # the restart: no reaped exit survives
+    _lapse(conn, clock, task_id, lapse)
+    spawned = []
+    _full_tick(conn, spawned)
+    _booked_as_the_stop(conn, task_id, run_id, code)
+    assert spawned == [] and signals == []
+
+
+@pytest.mark.parametrize(
+    ("lapse", "outcome"), [(None, "crashed"), ("claim", "reclaimed"), ("heartbeat", "stale")],
+)
+def test_a_run_with_no_recorded_stop_and_an_unknown_exit_keeps_todays_booking(
+    conn, clock, signals, monkeypatch, lapse, outcome,
+):
+    monkeypatch.setattr(kb, "_recent_worker_exits", {})
+    task_id = kb.create_task(conn, title="crashed card", assignee="worker")
+    run_id = _stopping_worker(conn, task_id, 6130, lapse)
+    _lapse(conn, clock, task_id, lapse)
+    _full_tick(conn, [])
+    assert kb.get_run(conn, run_id).outcome == outcome
+    assert kb.get_task(conn, task_id).consecutive_failures == (1 if outcome == "crashed" else 0)
+    assert signals == ([] if lapse is None else [(6130, signal.SIGTERM)])
+
+
+def test_the_exit_the_reaper_saw_wins_over_a_recorded_stop(conn, clock, signals, monkeypatch):
+    task_id = kb.create_task(conn, title="crashed card", assignee="worker")
+    run_id = _start_worker(conn, task_id, 6140)
+    with monkeypatch.context() as worker:
+        worker.setenv("HERMES_KANBAN_TASK", task_id)
+        worker.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+        assert kb.record_run_provider_stop(
+            conn, task_id, run_id=run_id, exit_code=kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+        )
+    kb._record_worker_exit(6140, 1 << 8)
+    _full_tick(conn, [])
+    assert kb.get_run(conn, run_id).outcome == "crashed"
+    assert kb.get_task(conn, task_id).consecutive_failures == 1
+
+
+def test_the_stop_recorder_writes_only_the_open_run_the_dispatcher_gave_this_worker(conn, monkeypatch):
+    mine = kb.create_task(conn, title="my card", assignee="worker")
+    other = kb.create_task(conn, title="other card", assignee="worker")
+    ended = _start_worker(conn, mine, 6150)
+    _worker_exits(conn, 6150, 1)
+    given = _start_worker(conn, mine, 6151)
+    others = _start_worker(conn, other, 6152)
+    assert kb.get_run(conn, ended).ended_at is not None
+
+    def record(task_id, run_id, *, given_run=given, exit_code=kb.KANBAN_RATE_LIMIT_EXIT_CODE):
+        """The worker the dispatcher gave ``mine`` and ``given_run`` records a stop on ``run_id``."""
+        with monkeypatch.context() as worker:
+            worker.setenv("HERMES_KANBAN_TASK", mine)
+            worker.setenv("HERMES_KANBAN_RUN_ID", str(given_run))
+            return kb.record_run_provider_stop(conn, task_id, run_id=run_id, exit_code=exit_code)
+
+    def runs():
+        return [tuple(row) for row in conn.execute("SELECT id, metadata FROM task_runs ORDER BY id")]
+
+    before = runs()
+    assert not record(other, others)  # another task's run
+    assert not record(mine, others, given_run=others)  # another task's run, even when given
+    assert not record(mine, ended, given_run=ended)  # an ended run
+    assert not record(mine, given, given_run=ended)  # the open run, not the one given
+    for not_a_stop in (0, 1):
+        assert not record(mine, given, exit_code=not_a_stop)
+    assert runs() == before
+
+    assert record(mine, given, exit_code=KANBAN_PROVIDER_REFUSED_EXIT_CODE)
+    assert kb.get_run(conn, given).metadata["provider_stop"] == "provider_refused"
+    assert [run for run in runs() if run[0] != given] == [run for run in before if run[0] != given]

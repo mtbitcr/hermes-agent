@@ -643,6 +643,9 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # waiting longer than seven days.
 RATE_LIMIT_RESET_MAX_WAIT_SECONDS = 7 * 24 * 3600
 _RATE_LIMIT_RESET_KEY = "rate_limit_reset_at"
+# The provider stop a worker recorded on its own run before exiting with its
+# code (see ``record_run_provider_stop``): the stop's exit kind.
+_PROVIDER_STOP_KEY = "provider_stop"
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -23587,6 +23590,50 @@ def record_run_rate_limit_reset(
     return True
 
 
+def record_run_provider_stop(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    exit_code: Any,
+) -> bool:
+    """Record on a worker's own run which provider stop it is exiting with.
+
+    Written by the worker right before it exits with
+    ``KANBAN_RATE_LIMIT_EXIT_CODE`` or ``KANBAN_PROVIDER_REFUSED_EXIT_CODE``,
+    so :func:`detect_crashed_workers` books that stop even when the reap
+    registry, which lives in the dispatcher's memory, lost the exit to a
+    restart. Stored as the stop's exit kind under ``provider_stop`` in the
+    run's own metadata; every other key there is kept.
+
+    Returns False and writes nothing unless ``exit_code`` is one of those two
+    codes, ``run_id`` is ``task_id``'s current open run, and both are the
+    ones the dispatcher gave the calling worker (``HERMES_KANBAN_TASK`` and
+    ``HERMES_KANBAN_RUN_ID``), so no caller can write another task's run.
+    """
+    if (
+        task_id != (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        or str(run_id) != (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    ):
+        return False
+    # A bool is an int to Python but is no exit code.
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return False
+    kind = _WORKER_EXIT_KINDS.get(exit_code)
+    if kind not in _PROVIDER_STOP_EXIT_CODES:
+        return False
+    with write_txn(conn):
+        if _validated_open_current_run(conn, task_id, run_id) is None:
+            return False
+        persisted, _profile = _persisted_run_metadata(conn, run_id)
+        persisted[_PROVIDER_STOP_KEY] = kind
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(persisted, ensure_ascii=False), run_id),
+        )
+    return True
+
+
 def recorded_rate_limit_reset(metadata: Any, *, anchor: Optional[int]) -> Optional[int]:
     """Return the provider reset recorded in a run's metadata, if it is believable.
 
@@ -24706,7 +24753,9 @@ def release_stale_claims(
     (:func:`_saved_patch_handover_pending`): a process that stopped before
     the handover usually restarts past the claim deadline, a claim can lapse
     before the first scan, and reclaiming the run then would lose its saved
-    patch.
+    patch. A run whose worker is provably gone with a known usage-limit or
+    refusal stop is left to it the same way (:func:`_provider_stop_pending`),
+    and it books the run as that stop instead of reclaimed.
 
     Returns the number of stale claims actually reclaimed (live-pid
     extensions don't count). Safe to call often.
@@ -24724,6 +24773,8 @@ def release_stale_claims(
     ).fetchall()
     for row in stale:
         if _saved_patch_handover_pending(conn, row, before_scan=True):
+            continue
+        if _provider_stop_pending(conn, row):
             continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
@@ -33202,6 +33253,12 @@ _WORKER_EXIT_KINDS = {
     KANBAN_RATE_LIMIT_EXIT_CODE: "rate_limited",
     _provider_stops.KANBAN_PROVIDER_REFUSED_EXIT_CODE: "provider_refused",
 }
+# The provider stops a worker records on its own run before exiting with their
+# code (:func:`record_run_provider_stop`): exit kind -> exit code.
+_PROVIDER_STOP_EXIT_CODES = {
+    "rate_limited": KANBAN_RATE_LIMIT_EXIT_CODE,
+    "provider_refused": _provider_stops.KANBAN_PROVIDER_REFUSED_EXIT_CODE,
+}
 
 
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
@@ -33245,6 +33302,29 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     except Exception:
         pass
     return ("unknown", None)
+
+
+def _known_provider_stop(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int], pid: int,
+) -> "tuple[str, Optional[int]]":
+    """A dead worker's exit as ``(kind, code)``, with its known provider stop.
+
+    The reap registry's classification (:func:`_classify_worker_exit`) when
+    it saw the exit; otherwise the usage-limit or refusal stop the worker
+    recorded on the task's current open run before exiting
+    (:func:`record_run_provider_stop`), because the registry lives in process
+    memory and a restart loses it; otherwise the registry's
+    ``("unknown", None)``. A run that recorded no stop, such as one written
+    before the record existed, reads as unknown.
+    """
+    kind, code = _classify_worker_exit(pid)
+    if kind != "unknown" or _validated_open_current_run(conn, task_id, run_id) is None:
+        return kind, code
+    persisted, _profile = _persisted_run_metadata(conn, run_id)
+    recorded = persisted.get(_PROVIDER_STOP_KEY)
+    if isinstance(recorded, str) and recorded in _PROVIDER_STOP_EXIT_CODES:
+        return recorded, _PROVIDER_STOP_EXIT_CODES[recorded]
+    return kind, code
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -34101,7 +34181,10 @@ def detect_stale_running(
     sets aside later on this tick, is left to it untouched
     (:func:`_saved_patch_handover_pending`): its worker is gone and sends no
     heartbeat, so after a process stop, or before the first scan, the run
-    reads as stale, and reclaiming it then would lose its saved patch.
+    reads as stale, and reclaiming it then would lose its saved patch. A run
+    whose worker is provably gone with a known usage-limit or refusal stop is
+    left to it the same way (:func:`_provider_stop_pending`), and it books the
+    run as that stop instead of stale.
 
     ``stale_timeout_seconds=0`` disables the check entirely (returns ``[]``
     immediately).  ``signal_fn`` is a test hook; defaults to ``os.kill``
@@ -34137,6 +34220,8 @@ def detect_stale_running(
         if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
             continue  # recent heartbeat → still alive
         if _saved_patch_handover_pending(conn, row, before_scan=True):
+            continue
+        if _provider_stop_pending(conn, row):
             continue
 
         pid = row["worker_pid"]
@@ -34580,6 +34665,34 @@ def _saved_patch_handover_pending(
     ) is HolderPresence.PROVABLY_ABSENT
 
 
+def _provider_stop_pending(conn: sqlite3.Connection, row) -> bool:
+    """Whether :func:`detect_crashed_workers` will book this running row as a provider stop.
+
+    True for a claim made on this host whose recorded worker its identity
+    proves gone and whose known stop (:func:`_known_provider_stop`) is a usage
+    limit or a refusal. The stale-claim and stale-running reclaims, which run
+    before the scan, skip such a row and leave it to the scan, which books it
+    as that stop: the dead worker sends no heartbeat, so its claim or
+    heartbeat can lapse before the scan, and after a restart usually has, and
+    reclaiming it then would close its run as reclaimed or stale instead. A
+    row the scan would not book that way keeps its sweep's ordinary outcome.
+
+    ``row`` carries the task's ``id``, ``claim_lock``, ``worker_pid``,
+    ``worker_start_time`` and ``current_run_id``.
+    """
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    if not (row["claim_lock"] or "").startswith(host_prefix) or not row["worker_pid"]:
+        return False
+    # The stop before the identity probe: a row with no known stop -- nearly
+    # every row -- then reaches its sweep without an extra probe.
+    kind, _code = _known_provider_stop(
+        conn, row["id"], row["current_run_id"], row["worker_pid"],
+    )
+    return kind in _PROVIDER_STOP_EXIT_CODES and _worker_identity_presence(
+        row["worker_pid"], _row_worker_start_time(row),
+    ) is HolderPresence.PROVABLY_ABSENT
+
+
 def _merge_unreported_completion(
     conn: sqlite3.Connection, run_id: int, fields: dict,
 ) -> None:
@@ -34834,6 +34947,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``provider_refused`` and the card is parked blocked as a capability wall,
     without counting a failure, so it is never retried unchanged.
 
+    When the registry no longer knows the exit -- it lives in process memory,
+    so a restart loses it -- the usage-limit or refusal stop the worker
+    recorded on its open run before exiting (:func:`record_run_provider_stop`)
+    classifies it instead (:func:`_known_provider_stop`), and the run is
+    booked as that stop.
+
     A clean exit whose run saved exactly one patch of its own, on a card that
     requires review, is handed to review through :func:`complete_task` -- the
     existing handover -- once the main transaction has committed, instead of
@@ -34909,7 +35028,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             if handover_marker is not None:
                 kind, code = "clean_exit", 0
             else:
-                kind, code = _classify_worker_exit(pid)
+                # Likewise a usage-limit or refusal stop the worker recorded
+                # on its run before exiting.
+                kind, code = _known_provider_stop(
+                    conn, row["id"], open_run_id, pid,
+                )
             if kind == "provider_refused":
                 # The provider refused the work as worded: retrying it
                 # unchanged meets the same refusal, so park the card instead,
