@@ -12993,6 +12993,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             from hermes_cli.owner_workspace import (
                 OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY,
+                OWNER_PROJECT_PLANNING_CONTEXT_V2_CAPABILITY,
                 OWNER_PROJECT_RUN_CONTEXT_CAPABILITY,
                 OWNER_WAITING_CAPABILITY,
                 PROVIDER_WAIT_CAPABILITY,
@@ -13014,6 +13015,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, PROVIDER_WAIT_CAPABILITY
             ):
                 waiting["provider_wait"] = True
+            # And for planning_context_v2, which the kernel serves in place of
+            # planning_context_v1 when a reader names both.
+            planning_v2 = (
+                {"planning_context_v2": True}
+                if _owner_workspace_capability_requested(
+                    request, OWNER_PROJECT_PLANNING_CONTEXT_V2_CAPABILITY
+                )
+                else {}
+            )
             snapshot = read_project_snapshot(
                 resolve_owner_context(),
                 request.match_info.get("project_slug", ""),
@@ -13024,6 +13034,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     request, OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY
                 ),
                 **waiting,
+                **planning_v2,
             )
         except OwnerWorkspaceError as exc:
             if exc.code == "project_not_found":
