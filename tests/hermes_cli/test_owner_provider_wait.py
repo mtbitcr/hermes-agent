@@ -1774,9 +1774,41 @@ def test_an_unreadable_own_store_logs_one_provider_only_warning_and_writes_nothi
     run = scene["run"]
     assert _board_rows(scene["board"], scene["task_id"], run.id) == ((run.id, "rate_limited"), 1)
 
-    # The helper's one line is a warning naming only the provider: no traceback, no exception text.
-    [warning] = [record for record in caplog.records if record.name == "cli"]
-    assert warning.levelno == logging.WARNING
-    _names_only_the_provider(warning, root, scene["task_id"], ANTHROPIC)
-    # The store's own reader still reports the failure in its own record, as it always does.
-    assert [record for record in caplog.records if record.name == "hermes_cli.auth" and record.exc_info]
+    _one_provider_only_warning(caplog, root, scene["task_id"])
+
+
+def _one_provider_only_warning(caplog, root: Path, task_id: str) -> None:
+    """The check reads the store silently: the helper's one warning, naming only the provider, is the
+    only record at that level from any logger, and no record carries a traceback."""
+    [warning] = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert warning.name == "cli"
+    _names_only_the_provider(warning, root, task_id, ANTHROPIC)
+    assert [record for record in caplog.records if record.exc_info] == []
+
+
+def test_an_own_store_that_does_not_parse_logs_one_provider_only_warning_and_writes_nothing(
+    root, owner, clock, monkeypatch, caplog,
+):
+    scene = _owner_retried(root, owner, clock, monkeypatch, "Torn Store", 5895, provider=ANTHROPIC)
+    own_pool = _anthropic_pools(root)["own"]
+    argv, env = _worker_start(root, scene["board"], scene["task_id"], 5896)
+    stores = _stores(root)
+    folders = [root] + [root / "profiles" / profile for profile in (ASSIGNEE, STEWARD, OTHER)]
+    caplog.set_level("DEBUG")
+    with _as_worker(monkeypatch, env):
+        # Any process sets its own home up long before this check: only what the check adds counts.
+        ensure_hermes_home()
+        own_pool.write_bytes(b'{"credential_pool": {"anthropic": [')
+        raw = {path: path.read_bytes() for path in stores}
+        names = {folder: set(os.listdir(folder)) for folder in folders}
+        caplog.clear()
+        cli._clear_owner_retried_provider_limit(_Worker(argv))
+
+    for path in stores:
+        assert path.read_bytes() == raw[path], path
+    for folder in folders:
+        # Nothing is repaired or preserved beside a store: no copy of the torn file appears.
+        assert set(os.listdir(folder)) == names[folder], folder
+    run = scene["run"]
+    assert _board_rows(scene["board"], scene["task_id"], run.id) == ((run.id, "rate_limited"), 1)
+    _one_provider_only_warning(caplog, root, scene["task_id"])
