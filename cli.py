@@ -4175,43 +4175,20 @@ def _record_kanban_rate_limit_reset(cli, exit_code: int) -> None:
         logger.debug("could not record the provider reset on this kanban run", exc_info=True)
 
 
-def _kanban_worker_at_anthropic_default_url(cli, provider: str) -> bool:
-    """Whether this worker's first model request goes to ``anthropic`` at its default base URL.
+def _kanban_worker_owns_anthropic_rows(provider: str) -> bool:
+    """Whether the request is for ``anthropic`` and this profile's own store holds its rows.
 
-    Only a request for ``anthropic`` itself, with no API key or base URL on the command line and
-    no base URL in the environment or in config, whose rows are the profile's own and name no
-    other base URL; then only when ``resolve_runtime_provider``, called as that first request
-    calls it, gives the provider's default base URL from ``PROVIDER_REGISTRY``. Anything else is
-    False.
+    Which endpoint the request calls is not checked: the reset only lets it try again, and a limit
+    that still holds marks the rows again. Anything else is False.
     """
-    from agent.credential_pool import get_env_prefer_dotenv
-    from hermes_cli.auth import PROVIDER_REGISTRY, _load_auth_store
-    from hermes_cli.config import load_config
-    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.auth import _load_auth_store
 
-    if provider != "anthropic" or cli._explicit_api_key or cli._explicit_base_url:
+    if provider != "anthropic":
         return False
-    anthropic = PROVIDER_REGISTRY[provider]
-    model_cfg = load_config().get("model")
-    if get_env_prefer_dotenv(anthropic.base_url_env_var) or (
-        isinstance(model_cfg, dict) and str(model_cfg.get("base_url") or "").strip()
-    ):
-        return False
-    # Read first: an unreadable own store raises here, before the resolution can write anything.
+    # Read first: an unreadable own store raises here, before loading the pool can write anything.
     pool = _load_auth_store().get("credential_pool")
     rows = pool.get(provider) if isinstance(pool, dict) else None
-    # Resolving rows the profile borrows from the root heals them, which may write the root; and a
-    # row naming another endpoint could serve the first request once its limit is cleared.
-    if not isinstance(rows, list) or not rows or any(
-        not isinstance(row, dict) or str(row.get("base_url") or "").strip() not in ("", anthropic.inference_base_url)
-        for row in rows
-    ):
-        return False
-    runtime = resolve_runtime_provider(
-        requested=cli.requested_provider, explicit_api_key=cli._explicit_api_key,
-        explicit_base_url=cli._explicit_base_url,
-    )
-    return runtime.get("provider") == provider and runtime.get("base_url") == anthropic.inference_base_url
+    return isinstance(rows, list) and bool(rows)
 
 
 def _clear_owner_retried_provider_limit(cli) -> None:
@@ -4221,9 +4198,9 @@ def _clear_owner_retried_provider_limit(cli) -> None:
     Silent unless the task's latest ended run ended ``rate_limited`` and an owner retry is bound to
     that very run (``kanban_db.owner_retried_provider_limit``); the owner's process never writes a
     pool. It clears only when this process is the task's current running run, served from its
-    assignee's profile home, the first request goes to ``anthropic`` at its default base URL
-    (``_kanban_worker_at_anthropic_default_url``), and that provider's rows are the profile's own
-    with none read from the root store; else one line says nothing was cleared. Every line names
+    assignee's profile home, the request is for ``anthropic`` and that provider's rows are the
+    profile's own (``_kanban_worker_owns_anthropic_rows``) with none read from the root store,
+    whichever endpoint the request calls; else one line says nothing was cleared. Every line names
     only the provider; any failure logs one warning and the start goes on.
     """
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
@@ -4243,7 +4220,7 @@ def _clear_owner_retried_provider_limit(cli) -> None:
         cleared = 0
         if (
             assignee and (os.environ.get("HERMES_HOME") or "").strip() and profile_matches_home(assignee)
-            and _kanban_worker_at_anthropic_default_url(cli, provider)
+            and _kanban_worker_owns_anthropic_rows(provider)
         ):
             pool = load_pool(provider)
             if not pool._borrowed_root_ids and _profile_owns_pool_provider(provider):

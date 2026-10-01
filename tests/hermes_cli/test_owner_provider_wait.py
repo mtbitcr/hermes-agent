@@ -4,8 +4,8 @@ A ready card held after a rate-limited run is accepted by the owner retry,
 which records ``owner_retry`` against that exact run and writes no profile's
 credential pool; the next tick may spawn it, and a limit that still holds books
 a new reset and a new hold without counting a failure. The card's own worker,
-when it next starts, clears its own pool's limit only for ``anthropic`` at that
-provider's default base URL, before its first model request resolves
+when it next starts, clears its own pool's limit only for ``anthropic``,
+whichever endpoint it calls, before its first model request resolves
 credentials, and only when its card's latest ended run ended ``rate_limited``
 and the owner's retry is bound to that run; nothing else clears a pool. A reader that names
 ``provider_wait_v1`` is told plainly why stopped work waits; one that does not
@@ -1320,7 +1320,7 @@ def _cli_lines(caplog) -> list:
     return [record for record in caplog.records if record.name == "cli" and record.levelno >= logging.INFO]
 
 
-# The only provider whose limit a worker start resets, and the default endpoint it resets it at.
+# The only provider whose limit a worker start resets, and its default endpoint.
 ANTHROPIC = "anthropic"
 ANTHROPIC_URL = PROVIDER_REGISTRY[ANTHROPIC].inference_base_url
 PROXY_URL = "https://proxy.placeholder.invalid/v1"
@@ -1650,16 +1650,72 @@ def test_the_worker_start_resets_nothing_for_a_provider_other_than_anthropic(
     _start_clears_nothing(root, scene, argv, env, monkeypatch, caplog, provider)
 
 
-def test_the_worker_start_resets_nothing_when_the_environment_sets_a_base_url(
+CLEARED_LINE = "cleared the {provider} provider limit after an owner retry"
+
+
+def _limited_anthropic_pools(root: Path) -> None:
+    """Every own anthropic row at its limit, beside another provider's; no other store holds an anthropic row."""
+    _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
+    _write_pool(root / "profiles" / ASSIGNEE, {
+        ANTHROPIC: [_exhausted("own-s"), dict(_exhausted("own-t"), priority=1)],
+        SECOND_PROVIDER: [_routed("own-b")],
+    })
+    for profile in (STEWARD, OTHER):
+        _write_pool(root / "profiles" / profile, {BUILT_IN: [_exhausted(f"{profile}-a")]})
+
+
+def _start_resets_the_own_rows(root: Path, scene: dict, argv: list, env: dict, monkeypatch, caplog) -> None:
+    """The worker starts under ``env``: its own anthropic rows are reset, no other store changes, one line says so."""
+    stores = _stores(root)
+    own_pool = root / "profiles" / ASSIGNEE / "auth.json"
+    others = [path for path in stores if path != own_pool]
+    caplog.set_level("DEBUG")
+    with _as_worker(monkeypatch, env):
+        # Any process sets its own home up long before this check: only what the check adds counts.
+        ensure_hermes_home()
+        raw = {path: path.read_bytes() for path in others}
+        names = {path.parent: set(os.listdir(path.parent)) for path in others}
+        before = _exhausted_entries(stores)
+        _reaches_every_board_and_the_root(root, scene["boards"])
+        cli._clear_owner_retried_provider_limit(_Worker(argv))
+
+    for path in others:
+        assert path.read_bytes() == raw[path], path
+    for folder, listed in names.items():
+        # Nothing appears or goes beside another store, but the root store's lock, which any load
+        # of the anthropic pool may take for its heal check.
+        assert listed <= set(os.listdir(folder)) <= listed | ({"auth.lock"} if folder == root else set()), folder
+    stored = json.loads(own_pool.read_text())["credential_pool"]
+    assert [(entry["id"], _marks(entry)) for entry in stored[ANTHROPIC]] == [
+        ("own-s", dict.fromkeys(_STATUS_KEYS)), ("own-t", dict.fromkeys(_STATUS_KEYS)),
+    ]
+    assert stored[SECOND_PROVIDER] == [_routed("own-b")]
+    # The independent counts, straight from the files and from the card's own board rows.
+    assert _exhausted_entries(stores) == before - 2 == len(stores)
+    run = scene["run"]
+    assert _board_rows(scene["board"], scene["task_id"], run.id) == ((run.id, "rate_limited"), 1)
+    [line] = _cli_lines(caplog)
+    assert (line.levelno, line.getMessage()) == (logging.INFO, CLEARED_LINE.format(provider=ANTHROPIC))
+    _names_only_the_provider(line, root, scene["task_id"], ANTHROPIC)
+
+
+def test_the_worker_start_resets_its_own_anthropic_rows_when_every_one_is_at_its_limit(
     root, owner, clock, monkeypatch, caplog,
 ):
+    scene = _owner_retried(root, owner, clock, monkeypatch, "Limited Rows", 5866, provider=ANTHROPIC)
+    _limited_anthropic_pools(root)
+    argv, env = _worker_start(root, scene["board"], scene["task_id"], 5867)
+    _start_resets_the_own_rows(root, scene, argv, env, monkeypatch, caplog)
+
+
+def test_a_base_url_in_the_environment_does_not_change_the_reset(root, owner, clock, monkeypatch, caplog):
     scene = _owner_retried(root, owner, clock, monkeypatch, "Env Endpoint", 5871, provider=ANTHROPIC)
-    _anthropic_pools(root)
+    _limited_anthropic_pools(root)
     # The dispatcher's own environment names an endpoint, so the worker's carries it too.
     monkeypatch.setenv(PROVIDER_REGISTRY[ANTHROPIC].base_url_env_var, PROXY_URL)
     argv, env = _worker_start(root, scene["board"], scene["task_id"], 5872)
     assert env[PROVIDER_REGISTRY[ANTHROPIC].base_url_env_var] == PROXY_URL
-    _start_clears_nothing(root, scene, argv, env, monkeypatch, caplog, ANTHROPIC)
+    _start_resets_the_own_rows(root, scene, argv, env, monkeypatch, caplog)
     assert PROXY_URL not in caplog.text
 
 
@@ -1671,14 +1727,14 @@ _CONFIG_URLS = {
 
 
 @pytest.mark.parametrize("url", sorted(_CONFIG_URLS))
-def test_the_worker_start_resets_nothing_when_the_config_sets_a_base_url(url, root, owner, clock, monkeypatch, caplog):
+def test_a_base_url_in_config_does_not_change_the_reset(url, root, owner, clock, monkeypatch, caplog):
     scene = _owner_retried(root, owner, clock, monkeypatch, "Config Endpoint", 5881, provider=ANTHROPIC)
-    _anthropic_pools(root)
+    _limited_anthropic_pools(root)
     (root / "profiles" / ASSIGNEE / "config.yaml").write_text(
         f"model:\n  provider: {ANTHROPIC}\n  base_url: {_CONFIG_URLS[url]}\n"
     )
     argv, env = _worker_start(root, scene["board"], scene["task_id"], 5882)
-    _start_clears_nothing(root, scene, argv, env, monkeypatch, caplog, ANTHROPIC)
+    _start_resets_the_own_rows(root, scene, argv, env, monkeypatch, caplog)
     assert _CONFIG_URLS[url] not in caplog.text
 
 
@@ -1724,19 +1780,3 @@ def test_an_unreadable_own_store_logs_one_provider_only_warning_and_writes_nothi
     _names_only_the_provider(warning, root, scene["task_id"], ANTHROPIC)
     # The store's own reader still reports the failure in its own record, as it always does.
     assert [record for record in caplog.records if record.name == "hermes_cli.auth" and record.exc_info]
-
-
-def test_the_worker_start_resets_nothing_when_an_own_row_names_an_endpoint_of_its_own(
-    root, owner, clock, monkeypatch, caplog,
-):
-    scene = _owner_retried(root, owner, clock, monkeypatch, "Row Endpoint", 5901, provider=ANTHROPIC)
-    pools = _anthropic_pools(root)
-    # Once clear, the exhausted own row would be drawn first, at its own endpoint; the spare row,
-    # which a resolution draws while the limit holds, names none.
-    _write_pool(pools["own"].parent, {
-        ANTHROPIC: [dict(_exhausted("own-s"), base_url=PROXY_URL), _spare("own-t")],
-        SECOND_PROVIDER: [_routed("own-b")],
-    })
-    argv, env = _worker_start(root, scene["board"], scene["task_id"], 5902)
-    _start_clears_nothing(root, scene, argv, env, monkeypatch, caplog, ANTHROPIC)
-    assert PROXY_URL not in caplog.text
