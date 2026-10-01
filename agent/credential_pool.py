@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from agent.credential_pool_admin import CredentialPoolAdminMixin
 
-import json
 import logging
 import os
 import random
