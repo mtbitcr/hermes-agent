@@ -4175,6 +4175,61 @@ def _record_kanban_rate_limit_reset(cli, exit_code: int) -> None:
         logger.debug("could not record the provider reset on this kanban run", exc_info=True)
 
 
+def _kanban_worker_pool_key(cli) -> Optional[str]:
+    """The credential pool this worker's runtime resolution is about to draw from.
+
+    A named custom endpoint's preferred pool key (``custom_providers`` / ``providers:``), else the
+    provider ``auth.resolve_provider`` gives for the request, as ``resolve_runtime_provider`` does.
+    """
+    from agent.credential_pool import get_custom_provider_pool_key
+    from hermes_cli.auth import resolve_provider
+    from hermes_cli.runtime_provider import _get_named_custom_provider, resolve_requested_provider
+
+    requested = resolve_requested_provider(cli.requested_provider)
+    custom = _get_named_custom_provider(requested)
+    if custom:
+        base_url = ((cli._explicit_base_url or "").strip() or custom.get("base_url", "")).rstrip("/")
+        return get_custom_provider_pool_key(base_url, custom.get("provider_key") or custom.get("name"))
+    return resolve_provider(
+        requested, explicit_api_key=cli._explicit_api_key, explicit_base_url=cli._explicit_base_url,
+    )
+
+
+def _clear_owner_retried_provider_limit(cli) -> None:
+    """At a kanban worker's start, before its first model request: when the owner retried this
+    task's run held at the provider's limit, clear the limit in this worker's own pool.
+
+    Only when the task's latest ended run ended ``rate_limited`` and an owner retry is bound to
+    that very run (``kanban_db.owner_retried_provider_limit``); the owner's process never writes a
+    pool. The pool of the provider this worker is about to use resets its own statuses.
+    Best-effort: both lines name only the provider, and the start always goes on.
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        with _kb.connect_closing() as conn:
+            if not _kb.owner_retried_provider_limit(conn, task_id):
+                return
+    except Exception:
+        logger.debug("could not read the owner retry on this kanban task", exc_info=True)
+        return
+    provider = str(getattr(cli, "requested_provider", "") or "").strip().lower() or "auto"
+    try:
+        from agent.credential_pool import load_pool
+
+        pool_key = _kanban_worker_pool_key(cli)
+        if not pool_key:
+            return
+        provider = pool_key
+        load_pool(pool_key).reset_statuses()
+        logger.info("cleared the %s provider limit after an owner retry", provider)
+    except Exception:
+        logger.warning("could not clear the %s provider limit after an owner retry", provider)
+
+
 def _run_quiet_single_query(cli, effective_query):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
     HERMES_TURN_AUTHOR (set only by a bot-to-bot dispatcher) is consumed here so tool subprocesses do not inherit it."""
@@ -4491,6 +4546,7 @@ def _configure_quiet_agent(agent) -> None:
 
 def _run_single_query_mode(cli, query, image, quiet, oneshot):
     """``-q``/``--image`` entry: seed an interactive session on a TTY, else run the one-shot turn and exit."""
+    _clear_owner_retried_provider_limit(cli)
     if _should_seed_interactive(query, image, quiet, oneshot):
         seeded_query, seeded_images = _collect_query_images(query, image)
         logger.info(

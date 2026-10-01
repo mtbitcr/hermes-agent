@@ -1,20 +1,21 @@
 """The owner can try work that waits for the AI provider again now.
 
 A ready card held after a rate-limited run is accepted by the owner retry,
-which records ``owner_retry`` against that exact run and clears a built-in
-provider's exhaustion mark in the assignee profile's canonical own pool only;
-the next tick may spawn it, and a limit that still holds books a new reset and
-a new hold without counting a failure. A pool path shared with another profile
-or the root, and a custom provider, leave every store byte for byte as it was,
-and the retry still goes ahead. A reader that names ``provider_wait_v1`` is
-told plainly why stopped work waits; one that does not gets today's payload,
-compared whole against the one captured at the start commit. A card reads as
-waiting only while the dispatcher still holds it, and the pool clear finds the
-provider the card or its run records.
+which records ``owner_retry`` against that exact run and writes no profile's
+credential pool; the next tick may spawn it, and a limit that still holds books
+a new reset and a new hold without counting a failure. The card's own worker,
+when it next starts, clears its own pool's limit for the provider it is about
+to use, before its first model request resolves credentials, and only when its
+card's latest ended run ended ``rate_limited`` and the owner's retry is bound
+to that run; nothing else clears a pool. A reader that names
+``provider_wait_v1`` is told plainly why stopped work waits; one that does not
+gets today's payload, compared whole against the one captured at the start
+commit. A card reads as waiting only while the dispatcher still holds it.
 
 Every stop is booked through the real reap path (the dispatcher spawns the
-card, its worker exits, the sweep books the run), and every owner call runs
-under exactly the environment the dispatcher builds for a claimed worker. The
+card, its worker exits, the sweep books the run), every owner call runs under
+exactly the environment the dispatcher builds for a claimed worker, and every
+worker start under exactly the one it builds for the card's own worker. The
 root, each profile home, each pool and each board live in the test's own
 temporary folder; every card, profile, custom provider, key, token and time is
 made up. A built-in provider is named by its real id: a name, not a credential.
@@ -35,18 +36,18 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import cli
 from agent import credential_pool
-from agent.credential_pool import CredentialPool
-from hermes_cli import auth, auth_nous
 from hermes_cli import kanban_db as kb, kanban_provider_stops, owner_workspace as ow
+from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.kanban_provider_stops import KANBAN_PROVIDER_REFUSED_EXIT_CODE
 
 ASSIGNEE = "worker"
 STEWARD = "steward"
 OTHER = "other"
-# Made up, so a custom provider: a pool the clear never reaches.
+# Made up, so a custom provider.
 PROVIDER = "placeholder-alpha"
-# Two built-in providers, by their real ids: the only pools the clear reaches.
+# Two built-in providers, by their real ids.
 BUILT_IN = "deepseek"
 SECOND_PROVIDER = "zai"
 # A named custom provider and the legacy pool key its worker draws from.
@@ -314,153 +315,6 @@ def test_a_retry_while_the_limit_holds_leaves_the_card_waiting_with_a_new_reset_
         assert kb.get_task(conn, task_id).consecutive_failures == 0
 
 
-def test_the_pool_clear_reaches_only_the_assignees_own_pool_for_that_provider(
-    root, owner, clock, monkeypatch, caplog,
-):
-    project = _project(owner, "Pool Pilot")
-    board = project["board"]
-    with _board(board) as conn:
-        task_id = _card(conn, project, "Draft the placeholder letter", provider=BUILT_IN)
-        run = _held(conn, board, task_id, 4401)
-        clock["t"] = run.ended_at + 60
-
-    root_pool = _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
-    own_pool = _write_pool(root / "profiles" / ASSIGNEE, {
-        BUILT_IN: [_exhausted("own-a")],
-        SECOND_PROVIDER: [_exhausted("own-b")],
-    })
-    other_pool = _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("other-a")]})
-    untouched = {path: path.read_bytes() for path in (root_pool, other_pool)}
-
-    env = _steward_env(root, board)
-    caplog.set_level("DEBUG")
-    with _as_worker(monkeypatch, env):
-        retried = _retry(owner, project, task_id, "retry-pool")
-    assert retried["ok"] is True, retried
-
-    for path, raw in untouched.items():
-        assert path.read_bytes() == raw
-    pool = json.loads(own_pool.read_text())["credential_pool"]
-    cleared = dict(_exhausted("own-a"))
-    cleared.pop("failure_reason")
-    cleared.update({key: None for key in _STATUS_KEYS})
-    assert pool[BUILT_IN] == [cleared]
-    assert pool[SECOND_PROVIDER] == [_exhausted("own-b")]
-
-    with _board(board) as conn:
-        events = json.dumps([event.payload for event in kb.list_events(conn, task_id)])
-    for leaked in (json.dumps(retried), events, caplog.text):
-        assert "placeholder-token" not in leaked
-
-
-def test_the_pool_clear_writes_nothing_without_a_provider_an_own_entry_or_off_the_root(root):
-    root_pool = _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
-    own_pool = _write_pool(root / "profiles" / ASSIGNEE, {
-        SECOND_PROVIDER: [_exhausted("own-b")],
-        VENDOR: [_exhausted("own-v")],
-        VENDOR_POOL: [_exhausted("own-c")],
-    })
-    before = {path: path.read_bytes() for path in (root_pool, own_pool)}
-
-    assert CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, None) == 0
-    assert CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, BUILT_IN) == 0
-    assert CredentialPool.clear_profile_provider_exhaustion(OTHER, BUILT_IN) == 0
-    assert CredentialPool.clear_profile_provider_exhaustion("default", BUILT_IN) == 0
-    # A custom provider, by its name or by its legacy pool key, is never cleared,
-    # though the assignee's own pool holds exhausted entries at both.
-    assert CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, VENDOR) == 0
-    assert CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, VENDOR_POOL) == 0
-
-    for path, raw in before.items():
-        assert path.read_bytes() == raw
-    assert not (root / "profiles" / OTHER / "auth.json").exists()
-
-
-_LEGACY_USER = "placeholder-user"
-_LEGACY_PASSWORD = "placeholder-pass"
-_LEGACY_HOST = "legacy.placeholder.invalid"
-_PORTAL = "https://portal.placeholder.invalid"
-_STAMPS = ("version", "updated_at")
-
-
-def _legacy_store(pool: dict) -> dict:
-    """A store whose other provider keeps legacy state the shared loader migrates and logs."""
-    return {
-        "version": 1,
-        "active_provider": "nous",
-        "updated_at": "2030-03-17T17:00:00+00:00",
-        "providers": {
-            "nous": {
-                "portal_base_url": f"https://{_LEGACY_USER}:{_LEGACY_PASSWORD}@{_LEGACY_HOST}/",
-                "access_token": "placeholder-token-nous",
-            },
-        },
-        "credential_pool": pool,
-    }
-
-
-def test_the_pool_clear_keeps_another_providers_legacy_state_and_logs_no_credential(
-    root, owner, clock, monkeypatch, caplog, tmp_path,
-):
-    project = _project(owner, "Legacy Pilot")
-    board = project["board"]
-    with _board(board) as conn:
-        task_id = _card(conn, project, "Draft the placeholder note", provider=BUILT_IN)
-        run = _held(conn, board, task_id, 4801)
-        clock["t"] = run.ended_at + 60
-
-    # The shared loader would move the portal URL kept for this host, and log it.
-    monkeypatch.setattr(auth_nous, "_NOUS_STALE_PORTAL_HOSTS", frozenset({_LEGACY_HOST}))
-    monkeypatch.setattr(auth_nous, "DEFAULT_NOUS_PORTAL_URL", _PORTAL)
-    root_pool = _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
-    own_pool = root / "profiles" / ASSIGNEE / "auth.json"
-    own_pool.write_text(json.dumps(_legacy_store({
-        BUILT_IN: [_exhausted("own-a")],
-        SECOND_PROVIDER: [_exhausted("own-b")],
-    }), indent=2) + "\n")
-    steward_pool = _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("steward-a")]})
-    other_pool = _write_pool(root / "profiles" / OTHER, {BUILT_IN: [_exhausted("other-a")]})
-    pools = (root_pool, own_pool, steward_pool, other_pool)
-    untouched = {path: path.read_bytes() for path in (root_pool, steward_pool, other_pool)}
-    before = _exhausted_entries(pools)
-
-    env = _steward_env(root, board)
-    caplog.set_level("DEBUG")
-    caplog.set_level("DEBUG", logger="hermes_cli.auth")
-    with _as_worker(monkeypatch, env):
-        retried = _retry(owner, project, task_id, "retry-legacy-state")
-    assert retried["ok"] is True, retried
-
-    for path, raw in untouched.items():
-        assert path.read_bytes() == raw
-    cleared = dict(_exhausted("own-a"))
-    cleared.pop("failure_reason")
-    cleared.update({key: None for key in _STATUS_KEYS})
-    expected = _legacy_store({BUILT_IN: [cleared], SECOND_PROVIDER: [_exhausted("own-b")]})
-    stored = json.loads(own_pool.read_text())
-    assert {key: value for key, value in stored.items() if key not in _STAMPS} == {
-        key: value for key, value in expected.items() if key not in _STAMPS
-    }
-    assert _exhausted_entries(pools) == before - 1
-
-    # The capture is live: it hears the shared loader move a URL on that host.
-    probe = tmp_path / "probe.json"
-    probe.write_text(json.dumps({
-        "providers": {"nous": {"portal_base_url": f"https://{_LEGACY_HOST}/"}},
-    }))
-    heard = len(caplog.records)
-    assert auth._load_auth_store(probe)["providers"]["nous"]["portal_base_url"] == _PORTAL
-    assert "hermes_cli.auth" in {record.name for record in caplog.records[heard:]}
-
-    with _board(board) as conn:
-        [event] = _events(conn, task_id, "owner_retry")
-        assert event.run_id == run.id
-        events = json.dumps([event.payload for event in kb.list_events(conn, task_id)])
-    for leaked in (json.dumps(retried), events, caplog.text):
-        for secret in (_LEGACY_USER, _LEGACY_PASSWORD, "placeholder-token"):
-            assert secret not in leaked
-
-
 def _unparsed_store(shape: str) -> bytes:
     """The assignee's own store, holding an exhausted entry, in a shape no store is read from."""
     store = {"version": 1, "credential_pool": {BUILT_IN: [_exhausted("own-a")]}}
@@ -558,8 +412,8 @@ def test_the_retry_goes_ahead_and_changes_no_pool_when_the_own_pool_path_is_unus
         assert own_pool.read_bytes() == own_raw
     else:
         assert os.readlink(own_pool) == own_pool.name
-    # Only the lock the clear reads under may leave its file: no copy, no temporary file.
-    assert set(os.listdir(home)) - names <= {own_pool.with_suffix(".lock").name}
+    # The owner never reaches a pool: no lock, no copy, no temporary file.
+    assert set(os.listdir(home)) == names
 
     with _board(board) as conn:
         [event] = _events(conn, task_id, "owner_retry")
@@ -568,11 +422,8 @@ def test_the_retry_goes_ahead_and_changes_no_pool_when_the_own_pool_path_is_unus
         assert kb.check_respawn_guard(conn, task_id) is None
         events = json.dumps([event.payload for event in kb.list_events(conn, task_id)])
     records = [record for record in caplog.records if record.name == "agent.credential_pool"]
-    if state == "unreadable":
-        # Refused on every Python version. A link to itself makes resolve()
-        # raise only on some, so that case is not required to be heard.
-        [warning] = [record for record in records if record.levelno == logging.WARNING]
-        assert BUILT_IN in warning.getMessage()
+    # Nothing tried to clear the pool, so nothing warns that it could not.
+    assert [record for record in records if record.levelno >= logging.WARNING] == []
     logged = "\n".join(logging.Formatter().format(record) for record in records)
     for leaked in (json.dumps(retried), events, logged):
         for value in ("placeholder-token", str(own_pool), str(home)):
@@ -1050,7 +901,7 @@ def _exhausted_entries(paths) -> int:
     [_booked_before_the_card_named_its_provider, _booked_on_a_receipt_naming_its_provider],
     ids=["card_provider", "run_receipt_provider"],
 )
-def test_the_retry_clears_the_assignees_own_entry_for_the_provider_the_card_or_its_run_records(
+def test_the_owner_retry_writes_no_pool_file_whichever_provider_the_card_or_its_run_records(
     book, root, owner, clock, monkeypatch, caplog,
 ):
     project = _project(owner, "Recorded Route")
@@ -1060,39 +911,20 @@ def test_the_retry_clears_the_assignees_own_entry_for_the_provider_the_card_or_i
         clock["t"] = run.ended_at + 60
         assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
 
-    root_pool = _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
-    own_pool = _write_pool(root / "profiles" / ASSIGNEE, {
+    # The assignee's own canonical pool holds the provider's exhausted entry.
+    _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
+    _write_pool(root / "profiles" / ASSIGNEE, {
         BUILT_IN: [_exhausted("own-a")],
         SECOND_PROVIDER: [_exhausted("own-b")],
     })
-    steward_pool = _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("steward-a")]})
-    other_pool = _write_pool(root / "profiles" / OTHER, {BUILT_IN: [_exhausted("other-a")]})
-    pools = (root_pool, own_pool, steward_pool, other_pool)
-    untouched = {path: path.read_bytes() for path in (root_pool, steward_pool, other_pool)}
-    before = _exhausted_entries(pools)
+    _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("steward-a")]})
+    _write_pool(root / "profiles" / OTHER, {BUILT_IN: [_exhausted("other-a")]})
+    before = _exhausted_entries(_stores(root))
 
-    env = _steward_env(root, board)
-    caplog.set_level("DEBUG")
-    with _as_worker(monkeypatch, env):
-        retried = _retry(owner, project, task_id, "retry-recorded-route")
-    assert retried["ok"] is True, retried
+    _retried_changing_no_store(root, owner, project, task_id, run, monkeypatch, caplog)
 
-    for path, raw in untouched.items():
-        assert path.read_bytes() == raw
-    cleared = dict(_exhausted("own-a"))
-    cleared.pop("failure_reason")
-    cleared.update({key: None for key in _STATUS_KEYS})
-    assert json.loads(own_pool.read_text())["credential_pool"] == {
-        BUILT_IN: [cleared], SECOND_PROVIDER: [_exhausted("own-b")],
-    }
-    assert _exhausted_entries(pools) == before - 1
-
-    with _board(board) as conn:
-        [event] = _events(conn, task_id, "owner_retry")
-        assert event.run_id == run.id
-        events = json.dumps([event.payload for event in kb.list_events(conn, task_id)])
-    for leaked in (json.dumps(retried), events, caplog.text):
-        assert "placeholder-token" not in leaked
+    # The independent count, straight from the files: every exhausted entry still is.
+    assert _exhausted_entries(_stores(root)) == before == len(_stores(root)) + 1
 
 
 def _stores(root: Path) -> list:
@@ -1225,33 +1057,6 @@ def test_the_retry_goes_ahead_and_changes_no_store_for_a_custom_provider(
     _retried_changing_no_store(root, owner, project, task_id, run, monkeypatch, caplog)
 
 
-def test_the_pool_clear_still_clears_the_own_pool_when_the_whole_root_is_reached_through_a_link(
-    root, tmp_path, monkeypatch,
-):
-    root_pool = _write_pool(root, {BUILT_IN: [_exhausted("root-a")]})
-    own_pool = _write_pool(root / "profiles" / ASSIGNEE, {
-        BUILT_IN: [_exhausted("own-a")],
-        SECOND_PROVIDER: [_exhausted("own-b")],
-    })
-    steward_pool = _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("steward-a")]})
-    other_pool = _write_pool(root / "profiles" / OTHER, {BUILT_IN: [_exhausted("other-a")]})
-    untouched = {path: path.read_bytes() for path in (root_pool, steward_pool, other_pool)}
-    linked = tmp_path / "linked-root"
-    linked.symlink_to(root, target_is_directory=True)
-    monkeypatch.setenv("HERMES_HOME", str(linked / "profiles" / STEWARD))
-
-    assert CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, BUILT_IN) == 1
-
-    for path, raw in untouched.items():
-        assert path.read_bytes() == raw
-    cleared = dict(_exhausted("own-a"))
-    cleared.pop("failure_reason")
-    cleared.update({key: None for key in _STATUS_KEYS})
-    assert json.loads(own_pool.read_text())["credential_pool"] == {
-        BUILT_IN: [cleared], SECOND_PROVIDER: [_exhausted("own-b")],
-    }
-
-
 _FILE_SYNC, _FOLDER_SYNC = "file", "folder"
 
 
@@ -1299,106 +1104,357 @@ def _failing_sync(monkeypatch, pool: Path, fails):
         yield synced
 
 
-@pytest.mark.parametrize("via", ["direct_call", "owner_retry"])
-@pytest.mark.parametrize(
-    "fails", [_FOLDER_SYNC, _FILE_SYNC, None],
-    ids=["folder_sync_fails_after_the_replace", "file_sync_fails_before_the_replace", "no_sync_fails"],
-)
-def test_the_clear_counts_once_the_save_replaced_the_store_and_the_retry_goes_ahead_whichever_sync_fails(
-    fails, via, root, owner, clock, monkeypatch, caplog,
-):
-    project = _project(owner, "Synced Pool")
+# The card's own worker, at its next start.
+
+ROUTE_URL = "https://deepseek.placeholder.invalid/v1"
+DESK = "steward-desk"
+
+
+def _routed(entry_id: str) -> dict:
+    """An exhausted entry that names its own endpoint, so once clear it is drawn as it is."""
+    return dict(_exhausted(entry_id), base_url=ROUTE_URL)
+
+
+def _worker_pools(root: Path) -> dict:
+    """Every store holds an exhausted entry for the built-in provider; the own one another provider's too."""
+    return {
+        "root": _write_pool(root, {BUILT_IN: [_routed("root-a")]}),
+        "own": _write_pool(root / "profiles" / ASSIGNEE, {
+            BUILT_IN: [_routed("own-a")], SECOND_PROVIDER: [_routed("own-b")],
+        }),
+        "steward": _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_routed("steward-a")]}),
+        "other": _write_pool(root / "profiles" / OTHER, {BUILT_IN: [_routed("other-a")]}),
+    }
+
+
+def _marks(entry: dict) -> dict:
+    return {key: entry.get(key) for key in _STATUS_KEYS}
+
+
+def _scene(root: Path, owner: ow.OwnerContext, clock, name: str, pid: int) -> dict:
+    """A card held at the built-in provider's limit, and a card of the steward's on a board of its own."""
+    project = _project(owner, name)
     board = project["board"]
     with _board(board) as conn:
-        task_id = _card(conn, project, "Draft the placeholder ledger", provider=BUILT_IN)
-        run = _held(conn, board, task_id, 5301)
+        task_id = _card(conn, project, "Draft the placeholder outline", provider=BUILT_IN)
+        run = _held(conn, board, task_id, pid)
         clock["t"] = run.ended_at + 60
-        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    kb.create_board(DESK)
+    with _board(DESK) as conn:
+        desk_task = kb.create_task(conn, title="Steward the placeholder desk", assignee=STEWARD)
+    return {
+        "project": project, "board": board, "task_id": task_id, "run": run,
+        "boards": {board: task_id, DESK: desk_task},
+    }
 
-    home = root / "profiles" / ASSIGNEE
-    own_pool = _write_pool(home, {
-        BUILT_IN: [_exhausted("own-a")],
-        SECOND_PROVIDER: [_exhausted("own-b")],
-    })
-    others = (
-        _write_pool(root, {BUILT_IN: [_exhausted("root-a")]}),
-        _write_pool(root / "profiles" / STEWARD, {BUILT_IN: [_exhausted("steward-a")]}),
-        _write_pool(root / "profiles" / OTHER, {BUILT_IN: [_exhausted("other-a")]}),
-    )
-    pools = (own_pool, *others)
-    raw = {path: path.read_bytes() for path in pools}
-    before, names = _exhausted_entries(pools), set(os.listdir(home))
-    # Only a save that replaced the store clears: the folder syncs after the replace.
-    expected = 0 if fails == _FILE_SYNC else 1
 
-    env = _steward_env(root, board)
-    caplog.set_level("DEBUG")
-    with _as_worker(monkeypatch, env), _failing_sync(monkeypatch, own_pool, fails) as synced:
-        if via == "direct_call":
-            result = CredentialPool.clear_profile_provider_exhaustion(ASSIGNEE, BUILT_IN)
-        else:
-            result = _retry(owner, project, task_id, "retry-synced-pool")
-        # Pinned to its own board, the worker still reaches the root registry.
-        assert kb.kanban_home() == root
-        assert kb.register_db_path() == root / "kanban" / "board_register.db"
+def _owner_retried(root: Path, owner: ow.OwnerContext, clock, monkeypatch, name: str, pid: int) -> dict:
+    scene = _scene(root, owner, clock, name, pid)
+    with _as_worker(monkeypatch, _steward_env(root, scene["board"])):
+        retried = _retry(owner, scene["project"], scene["task_id"], f"retry-{pid}")
+    assert retried["ok"] is True, retried
+    return scene
+
+
+def _worker_start(root: Path, board: str, task_id: str, pid: int) -> tuple:
+    """The dispatcher's next tick spawns the card: exactly the argv and env it builds for its worker."""
+    launched = []
+
+    def fake_popen(cmd, *_args, **kwargs):
+        launched.append((list(cmd), dict(kwargs["env"])))
+        return SimpleNamespace(pid=pid)
+
+    with _board(board) as conn, pytest.MonkeyPatch.context() as dispatcher:
+        dispatcher.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+        dispatcher.setattr(subprocess, "Popen", fake_popen)
+        kb.dispatch_once(conn, board=board)
+        run_id = kb.get_task(conn, task_id).current_run_id
+    [(argv, env)] = launched
+    assert env["HERMES_HOME"] == str(root / "profiles" / ASSIGNEE)
+    assert env["HERMES_KANBAN_TASK"] == task_id
+    assert env["HERMES_KANBAN_RUN_ID"] == str(run_id)
+    assert env["HERMES_KANBAN_DB"] == str(kb.kanban_db_path(board=board))
+    assert env["HERMES_KANBAN_BOARD"] == board
+    return argv, env
+
+
+def _reaches_every_board_and_the_root(root: Path, boards: dict) -> None:
+    """Pinned to the card's board, the worker still reaches every other board and the root registry."""
+    assert kb.kanban_home() == root
+    assert kb.register_db_path() == root / "kanban" / "board_register.db"
+    for board, task_id in boards.items():
         entry = kb.get_register_entry(board)
         assert entry is not None and entry.lifecycle is kb.BoardLifecycle.LIVE
+        with contextlib.closing(kb.connect(db_path=kb.board_dir(board) / "kanban.db")) as conn:
+            assert kb.get_task(conn, task_id) is not None
 
-    assert synced == ([_FILE_SYNC] if fails == _FILE_SYNC else [_FILE_SYNC, _FOLDER_SYNC])
-    if via == "direct_call":
-        assert result == expected
-    for path in others:
-        assert path.read_bytes() == raw[path], path
-    if expected:
-        cleared = dict(_exhausted("own-a"))
-        cleared.pop("failure_reason")
-        cleared.update({key: None for key in _STATUS_KEYS})
-        stored = json.loads(own_pool.read_text())
-        assert {key: value for key, value in stored.items() if key not in _STAMPS} == {
-            "credential_pool": {BUILT_IN: [cleared], SECOND_PROVIDER: [_exhausted("own-b")]},
-        }
-    else:
-        assert own_pool.read_bytes() == raw[own_pool]
-    # The independent count, straight from the files.
-    assert _exhausted_entries(pools) == before - expected
-    # No temporary file remains: only the lock the clear saves under may appear.
-    assert set(os.listdir(home)) - names <= {own_pool.with_suffix(".lock").name}
 
-    records = [record for record in caplog.records if record.name == "agent.credential_pool"]
-    warnings = [record for record in records if record.levelno >= logging.WARNING]
-    if fails is None:
-        assert warnings == []
-    else:
-        [warning] = warnings
-        message = warning.getMessage()
-        assert BUILT_IN in message
-        assert ("may not be durable yet" in message) is bool(expected)
-        assert ("could not clear" in message) is not bool(expected)
-        assert warning.exc_info is None
-        shown = logging.Formatter().format(warning)
-        for value in (
-            str(root), os.path.realpath(root), own_pool.name, ASSIGNEE, STEWARD, OTHER,
-            os.strerror(errno.EIO), "Errno", "placeholder-token",
-        ):
-            assert value not in shown
+class _Worker(CLIAgentSetupMixin):
+    """The card's own worker, as the real ``-q`` entry drives it.
 
-    if via == "direct_call":
-        return
-    with _board(board) as conn:
-        [event] = _events(conn, task_id, "owner_retry")
-        assert result == {
-            "ok": True, "task_id": task_id, "status": "ready",
-            "revision": event.id, "retry_reason": REASON,
-        }
-        assert event.run_id == run.id
-        assert kb.get_task(conn, task_id).status == "ready"
-        assert kb.check_respawn_guard(conn, task_id) is None
-    # The independent count, straight from the Project board's own rows.
-    path = kb.board_dir(board) / "kanban.db"
-    with contextlib.closing(kb.connect(db_path=path)) as conn:
+    Credentials come from the real runtime resolution, for the provider and
+    model the dispatcher put on the worker's command line. Only the agent and
+    its model request are stubbed; ``chat`` resolves credentials before it
+    builds the agent, as the real chat turn does.
+    """
+
+    def __init__(self, argv: list):
+        self.requested_provider = argv[argv.index("--provider") + 1]
+        self.model = argv[argv.index("-m") + 1]
+        self._explicit_api_key = self._explicit_base_url = None
+        self.provider, self.api_mode, self.acp_command, self.acp_args = None, "chat_completions", None, []
+        self.api_key = self.base_url = self._credential_pool = self._provider_source = None
+        self._fallback_model = []
+        self.agent = None
+        self._active_agent_route_signature = "route"
+        self.session_id = "placeholder-session-0002"
+        self.conversation_history = []
+        self.console = SimpleNamespace(print=lambda *_args, **_kwargs: None)
+        self.resolved, self.requests = [], []
+
+    def _ensure_runtime_credentials(self):
+        # The own pool's marks for the provider, straight from the file, as the resolution starts.
+        store = json.loads((Path(os.environ["HERMES_HOME"]) / "auth.json").read_text())
+        self.resolved.append({
+            entry["id"]: _marks(entry) for entry in store["credential_pool"][self.requested_provider]
+        })
+        return super()._ensure_runtime_credentials()
+
+    def _maybe_print_free_tier_available_notice(self):
+        pass
+
+    def _normalize_model_for_provider(self, _provider):
+        return False
+
+    def _claim_active_session(self, _surface, *, stderr=False):
+        return True
+
+    def _show_security_advisories(self):
+        pass
+
+    def _print_exit_summary(self, clear_screen=True):
+        pass
+
+    def _resolve_turn_agent_config(self, _query):
+        return {"signature": "route", "model": None, "runtime": None}
+
+    def _init_agent(self, **_kwargs):
+        self.agent = SimpleNamespace(session_id=self.session_id, run_conversation=self._request)
+        return True
+
+    def _request(self, **_kwargs):
+        """The model request, stubbed: it notes the credential it would send."""
+        self.requests.append((self.api_key, self.base_url, getattr(self._credential_pool, "provider", None)))
+        return {"final_response": "done", "completed": True}
+
+    def chat(self, query, images=None):
+        if not self._ensure_runtime_credentials():
+            return None
+        route = self._resolve_turn_agent_config(query)
+        if not self._init_agent(model_override=route["model"], runtime_override=route["runtime"]):
+            return None
+        self._last_turn_result = self.agent.run_conversation(
+            user_message=query, conversation_history=self.conversation_history,
+        )
+        return self._last_turn_result["final_response"]
+
+
+@pytest.fixture
+def one_shot(monkeypatch):
+    """The real ``-q`` entry, with its image and session plumbing out of the way."""
+    # The entry sets this marker on os.environ itself; registering it here undoes that.
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    monkeypatch.setattr(cli, "_should_seed_interactive", lambda *_args: False)
+    monkeypatch.setattr(cli, "_collect_query_images", lambda query, _image: (query, []))
+    monkeypatch.setattr(cli, "_collect_kanban_task_images", lambda _images: [])
+    monkeypatch.setattr(cli, "_finalize_single_query", lambda _worker: None)
+
+    def start(worker: _Worker, argv: list, *, quiet: bool = False) -> None:
+        """The worker runs the prompt the dispatcher gave it, and exits 0."""
+        query = argv[argv.index("-q") + 1]
+        if not quiet:
+            cli._run_single_query_mode(worker, query, None, False, False)
+            return
+        with pytest.raises(SystemExit) as exited:
+            cli._run_single_query_mode(worker, query, None, True, False)
+        assert exited.value.code == 0
+
+    return start
+
+
+def _board_rows(board: str, task_id: str, run_id: int) -> tuple:
+    """The independent count, straight from the card's own board rows.
+
+    The latest ended run's outcome, and the owner retries bound to ``run_id``.
+    """
+    with contextlib.closing(kb.connect(db_path=kb.board_dir(board) / "kanban.db")) as conn:
+        latest = conn.execute(
+            "SELECT id, outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC, id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
         bound = conn.execute(
             "SELECT COUNT(*) AS n FROM task_events "
             "WHERE task_id = ? AND kind = 'owner_retry' AND run_id = ?",
-            (task_id, run.id),
+            (task_id, run_id),
         ).fetchone()["n"]
-    assert bound == 1
+    return (latest["id"], latest["outcome"]), bound
+
+
+def _names_only_the_provider(record: logging.LogRecord, root: Path, task_id: str) -> None:
+    assert BUILT_IN in record.getMessage()
+    assert record.exc_info is None
+    shown = logging.Formatter().format(record)
+    for value in (
+        str(root), os.path.realpath(root), "auth.json", ROUTE_URL, ASSIGNEE, STEWARD, OTHER,
+        task_id, os.strerror(errno.EIO), "Errno", "placeholder-token", "Traceback",
+    ):
+        assert value not in shown, value
+
+
+def _cli_lines(caplog) -> list:
+    return [record for record in caplog.records if record.name == "cli" and record.levelno >= logging.INFO]
+
+
+@pytest.mark.parametrize("quiet", [False, True], ids=["one_shot", "quiet_one_shot"])
+def test_after_an_owner_retry_the_worker_clears_its_own_provider_limit_before_its_first_request(
+    quiet, root, owner, clock, monkeypatch, caplog, one_shot,
+):
+    scene = _owner_retried(root, owner, clock, monkeypatch, "Worker Start", 5401)
+    board, task_id, run = scene["board"], scene["task_id"], scene["run"]
+    pools = _worker_pools(root)
+    own_pool = pools["own"]
+    untouched = {path: path.read_bytes() for key, path in pools.items() if key != "own"}
+    before = _exhausted_entries(pools.values())
+
+    argv, env = _worker_start(root, board, task_id, 5402)
+    worker = _Worker(argv)
+    caplog.set_level("DEBUG")
+    with _as_worker(monkeypatch, env):
+        _reaches_every_board_and_the_root(root, scene["boards"])
+        one_shot(worker, argv, quiet=quiet)
+
+    # When the worker first resolves its credentials, its own entry is already clear,
+    # so the request draws that entry from its own pool.
+    assert worker.resolved == [{"own-a": dict.fromkeys(_STATUS_KEYS)}]
+    assert worker.requests == [("placeholder-token-own-a", ROUTE_URL, BUILT_IN)]
+
+    for path, raw in untouched.items():
+        assert path.read_bytes() == raw, path
+    stored = json.loads(own_pool.read_text())["credential_pool"]
+    assert [(entry["id"], _marks(entry)) for entry in stored[BUILT_IN]] == [
+        ("own-a", dict.fromkeys(_STATUS_KEYS)),
+    ]
+    assert stored[SECOND_PROVIDER] == [_routed("own-b")]
+    # The independent counts, straight from the files and from the card's own board rows.
+    assert _exhausted_entries(pools.values()) == before - 1 == len(pools)
+    assert _board_rows(board, task_id, run.id) == ((run.id, "rate_limited"), 1)
+
+    [line] = _cli_lines(caplog)
+    assert line.levelno == logging.INFO
+    _names_only_the_provider(line, root, task_id)
+
+
+@pytest.mark.parametrize("retried", ["no_owner_retry", "owner_retry_bound_to_an_earlier_run"])
+def test_the_worker_start_clears_nothing_without_an_owner_retry_bound_to_the_latest_ended_run(
+    retried, root, owner, clock, monkeypatch, caplog,
+):
+    scene = _scene(root, owner, clock, "Plain Resume", 5501)
+    project, board, task_id, run = scene["project"], scene["board"], scene["task_id"], scene["run"]
+    if retried == "owner_retry_bound_to_an_earlier_run":
+        with _as_worker(monkeypatch, _steward_env(root, board)):
+            assert _retry(owner, project, task_id, "retry-earlier-run")["ok"] is True
+        with _board(board) as conn:
+            clock["t"] += 30
+            run = _held(conn, board, task_id, 5502)
+    with _board(board) as conn:
+        # The hold ends by itself; the latest ended run is still the rate-limited one.
+        clock["t"] = _resume_at(run)
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+    pools = _worker_pools(root)
+    argv, env = _worker_start(root, board, task_id, 5503)
+    raw = {path: path.read_bytes() for path in pools.values()}
+    names = {path.parent: set(os.listdir(path.parent)) for path in pools.values()}
+    caplog.set_level("DEBUG")
+    with _as_worker(monkeypatch, env):
+        _reaches_every_board_and_the_root(root, scene["boards"])
+        cli._clear_owner_retried_provider_limit(_Worker(argv))
+
+    for path, before in raw.items():
+        assert path.read_bytes() == before, path
+    for folder, before in names.items():
+        assert set(os.listdir(folder)) == before, folder
+    # The independent counts, straight from the files and from the card's own board rows.
+    assert _exhausted_entries(pools.values()) == len(pools) + 1
+    assert _board_rows(board, task_id, run.id) == ((run.id, "rate_limited"), 0)
+    assert _cli_lines(caplog) == []
+
+
+def test_the_worker_start_clears_nothing_when_the_latest_ended_run_did_not_end_rate_limited(
+    root, owner, clock, monkeypatch, caplog,
+):
+    scene = _owner_retried(root, owner, clock, monkeypatch, "Crashed Resume", 5601)
+    board, task_id, held = scene["board"], scene["task_id"], scene["run"]
+    with _board(board) as conn:
+        clock["t"] += 30
+        crashed = _reaped(conn, board, task_id, 5602, 1)
+        assert crashed.outcome != "rate_limited"
+        assert kb.get_task(conn, task_id).status == "ready"
+        clock["t"] = crashed.ended_at + 3_600
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+    pools = _worker_pools(root)
+    argv, env = _worker_start(root, board, task_id, 5603)
+    raw = {path: path.read_bytes() for path in pools.values()}
+    names = {path.parent: set(os.listdir(path.parent)) for path in pools.values()}
+    caplog.set_level("DEBUG")
+    with _as_worker(monkeypatch, env):
+        _reaches_every_board_and_the_root(root, scene["boards"])
+        cli._clear_owner_retried_provider_limit(_Worker(argv))
+
+    for path, before in raw.items():
+        assert path.read_bytes() == before, path
+    for folder, before in names.items():
+        assert set(os.listdir(folder)) == before, folder
+    # The independent counts: the owner's retry is bound to the held run, which no longer ended last.
+    assert _exhausted_entries(pools.values()) == len(pools) + 1
+    assert _board_rows(board, task_id, held.id) == ((crashed.id, crashed.outcome), 1)
+    assert _cli_lines(caplog) == []
+
+
+def test_a_failed_clear_logs_one_provider_only_warning_and_the_worker_start_goes_on(
+    root, owner, clock, monkeypatch, caplog, one_shot,
+):
+    scene = _owner_retried(root, owner, clock, monkeypatch, "Failed Clear", 5701)
+    board, task_id, run = scene["board"], scene["task_id"], scene["run"]
+    pools = _worker_pools(root)
+    own_pool = pools["own"]
+    raw = {path: path.read_bytes() for path in pools.values()}
+
+    argv, env = _worker_start(root, board, task_id, 5702)
+    names = set(os.listdir(own_pool.parent))
+    worker = _Worker(argv)
+    caplog.set_level("DEBUG")
+    # Only the worker's own start counts: the dispatcher's spawn above logged in this process too.
+    caplog.clear()
+    with _as_worker(monkeypatch, env), _failing_sync(monkeypatch, own_pool, _FILE_SYNC) as synced:
+        _reaches_every_board_and_the_root(root, scene["boards"])
+        one_shot(worker, argv)
+
+    # The clear's save failed before it replaced the store: every store is as it was.
+    assert synced == [_FILE_SYNC]
+    for path, before in raw.items():
+        assert path.read_bytes() == before, path
+    # No temporary file remains: only the lock the save ran under may appear.
+    assert set(os.listdir(own_pool.parent)) - names <= {own_pool.with_suffix(".lock").name}
+    # The independent counts, straight from the files and from the card's own board rows.
+    assert _exhausted_entries(pools.values()) == len(pools) + 1
+    assert _board_rows(board, task_id, run.id) == ((run.id, "rate_limited"), 1)
+
+    # The start went on: the worker resolved its credentials and made its request.
+    assert worker.resolved == [{"own-a": _marks(_routed("own-a"))}]
+    assert len(worker.requests) == 1
+    [warning] = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert warning.name == "cli"
+    _names_only_the_provider(warning, root, task_id)

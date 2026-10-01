@@ -35605,6 +35605,29 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def owner_retried_provider_limit(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the task's latest ended run ended ``rate_limited`` and an
+    ``owner_retry`` event is bound to that very run.
+
+    The same rows :func:`check_respawn_guard` reads for the owner's retry.
+    The task's own worker reads this at its start, before its first model
+    request, and then clears its own pool's limit for the provider it is
+    about to use: the owner's process never writes a pool. A retry bound to
+    an earlier run, or a later run that ended otherwise, gives False.
+    """
+    latest = conn.execute(
+        "SELECT id, outcome FROM task_runs WHERE task_id = ? "
+        "AND ended_at IS NOT NULL ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is None or latest["outcome"] != "rate_limited":
+        return False
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? AND run_id = ? LIMIT 1",
+        (task_id, OWNER_RETRY_EVENT_KIND, latest["id"]),
+    ).fetchone() is not None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
