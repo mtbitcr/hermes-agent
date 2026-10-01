@@ -4179,14 +4179,20 @@ def _kanban_worker_owns_anthropic_rows(provider: str) -> bool:
     """Whether the request is for ``anthropic`` and this profile's own store holds its rows.
 
     Which endpoint the request calls is not checked: the reset only lets it try again, and a limit
-    that still holds marks the rows again. Anything else is False.
+    that still holds marks the rows again. The store is read here directly, silently and without
+    repair, so an unreadable or unparseable store raises to the caller's one warning and nothing
+    beside it is logged or written. Anything else is False.
     """
-    from hermes_cli.auth import _load_auth_store
+    from hermes_cli.auth import _auth_file_path
 
     if provider != "anthropic":
         return False
-    # Read first: an unreadable own store raises here, before loading the pool can write anything.
-    pool = _load_auth_store().get("credential_pool")
+    store_path = _auth_file_path()
+    if not store_path.exists():
+        return False
+    # Read first: a bad own store raises here, before loading the pool can log or write anything.
+    store = json.loads(store_path.read_text(encoding="utf-8-sig"))
+    pool = store.get("credential_pool") if isinstance(store, dict) else None
     rows = pool.get(provider) if isinstance(pool, dict) else None
     return isinstance(rows, list) and bool(rows)
 
