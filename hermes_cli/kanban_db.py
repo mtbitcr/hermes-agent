@@ -35605,15 +35605,20 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-def owner_retried_provider_limit(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the task's latest ended run ended ``rate_limited`` and an
-    ``owner_retry`` event is bound to that very run.
+def owner_retried_provider_limit(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
+) -> tuple[bool, Optional[str]]:
+    """Whether the owner retried the task's provider limit, and the task's
+    assignee when ``run_id`` is the task's current run, still running.
 
-    The same rows :func:`check_respawn_guard` reads for the owner's retry.
-    The task's own worker reads this at its start, before its first model
-    request, and then clears its own pool's limit for the provider it is
-    about to use: the owner's process never writes a pool. A retry bound to
-    an earlier run, or a later run that ended otherwise, gives False.
+    The first value is True when the task's latest ended run ended
+    ``rate_limited`` and an ``owner_retry`` event is bound to that very run:
+    the same rows :func:`check_respawn_guard` reads for the owner's retry. A
+    retry bound to an earlier run, or a later run that ended otherwise, gives
+    False. The second value is None unless that holds and ``run_id`` is the
+    task's ``current_run_id``, a run of this task with status ``running`` and
+    no ``ended_at``. The task's own worker reads both at its start, before its
+    first model request: the owner's process never writes a pool.
     """
     latest = conn.execute(
         "SELECT id, outcome FROM task_runs WHERE task_id = ? "
@@ -35621,11 +35626,21 @@ def owner_retried_provider_limit(conn: sqlite3.Connection, task_id: str) -> bool
         (task_id,),
     ).fetchone()
     if latest is None or latest["outcome"] != "rate_limited":
-        return False
-    return conn.execute(
+        return False, None
+    if conn.execute(
         "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? AND run_id = ? LIMIT 1",
         (task_id, OWNER_RETRY_EVENT_KIND, latest["id"]),
-    ).fetchone() is not None
+    ).fetchone() is None:
+        return False, None
+    if run_id is None:
+        return True, None
+    claim = conn.execute(
+        "SELECT t.assignee FROM tasks t "
+        "JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
+        "WHERE t.id = ? AND r.id = ? AND r.status = 'running' AND r.ended_at IS NULL",
+        (task_id, run_id),
+    ).fetchone()
+    return True, (claim["assignee"] if claim is not None else None)
 
 
 def check_respawn_guard(

@@ -37,9 +37,10 @@ import pytest
 import yaml
 
 import cli
-from agent import credential_pool
+from agent import credential_pool, models_dev
 from hermes_cli import kanban_db as kb, kanban_provider_stops, owner_workspace as ow
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+from hermes_cli.config import ensure_hermes_home
 from hermes_cli.kanban_provider_stops import KANBAN_PROVIDER_REFUSED_EXIT_CODE
 
 ASSIGNEE = "worker"
@@ -1131,12 +1132,12 @@ def _marks(entry: dict) -> dict:
     return {key: entry.get(key) for key in _STATUS_KEYS}
 
 
-def _scene(root: Path, owner: ow.OwnerContext, clock, name: str, pid: int) -> dict:
-    """A card held at the built-in provider's limit, and a card of the steward's on a board of its own."""
+def _scene(root: Path, owner: ow.OwnerContext, clock, name: str, pid: int, *, provider: str = BUILT_IN) -> dict:
+    """A card held at the provider's limit, and a card of the steward's on a board of its own."""
     project = _project(owner, name)
     board = project["board"]
     with _board(board) as conn:
-        task_id = _card(conn, project, "Draft the placeholder outline", provider=BUILT_IN)
+        task_id = _card(conn, project, "Draft the placeholder outline", provider=provider)
         run = _held(conn, board, task_id, pid)
         clock["t"] = run.ended_at + 60
     kb.create_board(DESK)
@@ -1148,8 +1149,10 @@ def _scene(root: Path, owner: ow.OwnerContext, clock, name: str, pid: int) -> di
     }
 
 
-def _owner_retried(root: Path, owner: ow.OwnerContext, clock, monkeypatch, name: str, pid: int) -> dict:
-    scene = _scene(root, owner, clock, name, pid)
+def _owner_retried(
+    root: Path, owner: ow.OwnerContext, clock, monkeypatch, name: str, pid: int, *, provider: str = BUILT_IN,
+) -> dict:
+    scene = _scene(root, owner, clock, name, pid, provider=provider)
     with _as_worker(monkeypatch, _steward_env(root, scene["board"])):
         retried = _retry(owner, scene["project"], scene["task_id"], f"retry-{pid}")
     assert retried["ok"] is True, retried
@@ -1301,12 +1304,12 @@ def _board_rows(board: str, task_id: str, run_id: int) -> tuple:
     return (latest["id"], latest["outcome"]), bound
 
 
-def _names_only_the_provider(record: logging.LogRecord, root: Path, task_id: str) -> None:
-    assert BUILT_IN in record.getMessage()
+def _names_only_the_provider(record: logging.LogRecord, root: Path, task_id: str, provider: str = BUILT_IN) -> None:
+    assert provider in record.getMessage()
     assert record.exc_info is None
     shown = logging.Formatter().format(record)
     for value in (
-        str(root), os.path.realpath(root), "auth.json", ROUTE_URL, ASSIGNEE, STEWARD, OTHER,
+        str(root), os.path.realpath(root), "auth.json", ROUTE_URL, VENDOR_URL, ASSIGNEE, STEWARD, OTHER,
         task_id, os.strerror(errno.EIO), "Errno", "placeholder-token", "Traceback",
     ):
         assert value not in shown, value
@@ -1458,3 +1461,150 @@ def test_a_failed_clear_logs_one_provider_only_warning_and_the_worker_start_goes
     [warning] = [record for record in caplog.records if record.levelno >= logging.WARNING]
     assert warning.name == "cli"
     _names_only_the_provider(warning, root, task_id)
+
+
+NOTHING_CLEARED_LINE = "nothing was cleared for the {provider} provider after an owner retry"
+
+
+def _start_clears_nothing(root: Path, scene: dict, argv: list, env: dict, monkeypatch, caplog, provider: str) -> None:
+    """The worker starts under ``env``: no store changes, no file appears, one line says nothing was cleared."""
+    stores = _stores(root)
+    folders = [root] + [root / "profiles" / profile for profile in (ASSIGNEE, STEWARD, OTHER)]
+    caplog.set_level("DEBUG")
+    with _as_worker(monkeypatch, env):
+        # Any process sets its own home up long before this check: only what the check adds counts.
+        ensure_hermes_home()
+        raw = {path: path.read_bytes() for path in stores}
+        names = {folder: set(os.listdir(folder)) for folder in folders}
+        before = _exhausted_entries(stores)
+        _reaches_every_board_and_the_root(root, scene["boards"])
+        cli._clear_owner_retried_provider_limit(_Worker(argv))
+
+    for path in stores:
+        assert path.read_bytes() == raw[path], path
+    for folder in folders:
+        assert set(os.listdir(folder)) == names[folder], folder
+    # The independent counts, straight from the files and from the card's own board rows.
+    assert _exhausted_entries(stores) == before
+    run = scene["run"]
+    assert _board_rows(scene["board"], scene["task_id"], run.id) == ((run.id, "rate_limited"), 1)
+    [line] = _cli_lines(caplog)
+    assert (line.levelno, line.getMessage()) == (logging.INFO, NOTHING_CLEARED_LINE.format(provider=provider))
+    _names_only_the_provider(line, root, scene["task_id"], provider)
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai-codex", "xai-oauth"])
+def test_the_worker_start_leaves_root_rows_its_profile_reads_byte_for_byte(
+    provider, root, owner, clock, monkeypatch, caplog,
+):
+    scene = _owner_retried(root, owner, clock, monkeypatch, "Borrowed Rows", 5801, provider=provider)
+    # The worker's own store holds no row for the provider, so the worker reads the root's.
+    _write_pool(root, {provider: [_exhausted("root-s")]})
+    _write_pool(root / "profiles" / ASSIGNEE, {BUILT_IN: [_routed("own-a")]})
+    _write_pool(root / "profiles" / STEWARD, {provider: [_exhausted("steward-s")]})
+    _write_pool(root / "profiles" / OTHER, {provider: [_exhausted("other-s")]})
+    assert _exhausted_entries(_stores(root)) == len(_stores(root))
+
+    argv, env = _worker_start(root, scene["board"], scene["task_id"], 5802)
+    _start_clears_nothing(root, scene, argv, env, monkeypatch, caplog, provider)
+
+
+_VENDOR_CONFIGS = {
+    "custom_providers": f"custom_providers:\n  - name: {VENDOR}\n    base_url: {VENDOR_URL}\n",
+    "providers": f"providers:\n  {VENDOR}:\n    base_url: {VENDOR_URL}\n",
+}
+
+
+@pytest.mark.parametrize("config", sorted(_VENDOR_CONFIGS))
+def test_the_worker_start_resets_nothing_for_a_custom_provider(config, root, owner, clock, monkeypatch, caplog):
+    scene = _owner_retried(root, owner, clock, monkeypatch, "Vendor Start", 5811, provider=VENDOR)
+    # The worker's own config names the vendor; every store holds its exhausted rows under both pool keys.
+    (root / "profiles" / ASSIGNEE / "config.yaml").write_text(_VENDOR_CONFIGS[config])
+    for path, label in zip(_stores(root), ("root", "own", "steward", "other")):
+        _write_pool(path.parent, {VENDOR: [_exhausted(f"{label}-v")], VENDOR_POOL: [_exhausted(f"{label}-c")]})
+
+    argv, env = _worker_start(root, scene["board"], scene["task_id"], 5812)
+    _start_clears_nothing(root, scene, argv, env, monkeypatch, caplog, VENDOR)
+
+
+def test_a_failed_task_read_logs_one_provider_only_warning_and_the_worker_start_goes_on(
+    root, owner, clock, monkeypatch, caplog, one_shot,
+):
+    scene = _owner_retried(root, owner, clock, monkeypatch, "Unread Task", 5821)
+    board, task_id, run = scene["board"], scene["task_id"], scene["run"]
+    pools = _worker_pools(root)
+    detail = f"placeholder private detail under {root}"
+
+    def unreadable(*_args, **_kwargs):
+        raise OSError(errno.EIO, detail)
+
+    argv, env = _worker_start(root, board, task_id, 5822)
+    raw = {path: path.read_bytes() for path in pools.values()}
+    names = {path.parent: set(os.listdir(path.parent)) for path in pools.values()}
+    worker = _Worker(argv)
+    caplog.set_level("DEBUG")
+    # Only the worker's own start counts: the dispatcher's spawn above logged in this process too.
+    caplog.clear()
+    offline = models_dev.get_provider_info
+    with _as_worker(monkeypatch, env), monkeypatch.context() as reading:
+        reading.setattr(kb, "owner_retried_provider_limit", unreadable)
+        # With its own entry still exhausted, the worker's resolution looks its provider up: offline only.
+        reading.setattr(models_dev, "get_provider_info", lambda name, **_kwargs: offline(name, allow_network=False))
+        _reaches_every_board_and_the_root(root, scene["boards"])
+        one_shot(worker, argv)
+
+    for path, before in raw.items():
+        assert path.read_bytes() == before, path
+    for folder, before in names.items():
+        assert set(os.listdir(folder)) == before, folder
+    # The independent counts, straight from the files and from the card's own board rows.
+    assert _exhausted_entries(pools.values()) == len(pools) + 1
+    assert _board_rows(board, task_id, run.id) == ((run.id, "rate_limited"), 1)
+
+    # The start went on: the worker resolved its credentials and made its request.
+    assert worker.resolved == [{"own-a": _marks(_routed("own-a"))}]
+    assert len(worker.requests) == 1
+    [warning] = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert warning.name == "cli"
+    _names_only_the_provider(warning, root, task_id)
+    # No traceback and no exception text, at any level.
+    assert [record for record in caplog.records if record.name == "cli" and record.exc_info] == []
+    assert detail not in caplog.text
+
+
+@pytest.mark.parametrize("home", [OTHER, "root"], ids=["another_profile", "the_root"])
+def test_the_worker_start_resets_nothing_under_the_home_of_another_profile(
+    home, root, owner, clock, monkeypatch, caplog,
+):
+    scene = _owner_retried(root, owner, clock, monkeypatch, "Other Home", 5831)
+    _worker_pools(root)
+    argv, env = _worker_start(root, scene["board"], scene["task_id"], 5832)
+    # Only the profile home differs from what the dispatcher built.
+    env["HERMES_HOME"] = str(root if home == "root" else root / "profiles" / home)
+    _start_clears_nothing(root, scene, argv, env, monkeypatch, caplog, BUILT_IN)
+
+
+@pytest.mark.parametrize("run_id", ["held_run", "unknown_run"])
+def test_the_worker_start_resets_nothing_for_a_run_that_is_not_the_task_current_running_run(
+    run_id, root, owner, clock, monkeypatch, caplog,
+):
+    scene = _owner_retried(root, owner, clock, monkeypatch, "Stale Run", 5841)
+    _worker_pools(root)
+    argv, env = _worker_start(root, scene["board"], scene["task_id"], 5842)
+    # Only the run id differs: the held run, which has ended, or one the board never had.
+    current = int(env["HERMES_KANBAN_RUN_ID"])
+    env["HERMES_KANBAN_RUN_ID"] = str(scene["run"].id if run_id == "held_run" else current + 1)
+    _start_clears_nothing(root, scene, argv, env, monkeypatch, caplog, BUILT_IN)
+
+
+def test_the_worker_start_says_nothing_was_cleared_when_its_own_rows_hold_no_limit(
+    root, owner, clock, monkeypatch, caplog,
+):
+    scene = _owner_retried(root, owner, clock, monkeypatch, "Clear Rows", 5851)
+    pools = _worker_pools(root)
+    # The worker's own rows for the provider carry no limit; every other store is as before.
+    clear = {key: value for key, value in _routed("own-a").items() if key not in (*_STATUS_KEYS, "failure_reason")}
+    _write_pool(pools["own"].parent, {BUILT_IN: [clear], SECOND_PROVIDER: [_routed("own-b")]})
+
+    argv, env = _worker_start(root, scene["board"], scene["task_id"], 5852)
+    _start_clears_nothing(root, scene, argv, env, monkeypatch, caplog, BUILT_IN)

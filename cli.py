@@ -4175,57 +4175,70 @@ def _record_kanban_rate_limit_reset(cli, exit_code: int) -> None:
         logger.debug("could not record the provider reset on this kanban run", exc_info=True)
 
 
-def _kanban_worker_pool_key(cli) -> Optional[str]:
-    """The credential pool this worker's runtime resolution is about to draw from.
+def _kanban_worker_provider(cli) -> tuple[str, bool]:
+    """The provider this worker's runtime resolution is about to use, and whether it is built-in.
 
-    A named custom endpoint's preferred pool key (``custom_providers`` / ``providers:``), else the
-    provider ``auth.resolve_provider`` gives for the request, as ``resolve_runtime_provider`` does.
+    A named custom endpoint (``custom_providers`` / ``providers:``) gives its own name; a request
+    with an explicit API key or base URL, or for ``custom`` / ``custom:<name>``, stays as asked.
+    None of those is built-in. Otherwise the provider ``auth.resolve_provider`` gives for the
+    request, built-in only when it is ``openrouter`` or a ``PROVIDER_REGISTRY`` key.
     """
-    from agent.credential_pool import get_custom_provider_pool_key
-    from hermes_cli.auth import resolve_provider
+    from agent.credential_pool import CUSTOM_POOL_PREFIX
+    from hermes_cli.auth import PROVIDER_REGISTRY, resolve_provider
     from hermes_cli.runtime_provider import _get_named_custom_provider, resolve_requested_provider
 
     requested = resolve_requested_provider(cli.requested_provider)
     custom = _get_named_custom_provider(requested)
     if custom:
-        base_url = ((cli._explicit_base_url or "").strip() or custom.get("base_url", "")).rstrip("/")
-        return get_custom_provider_pool_key(base_url, custom.get("provider_key") or custom.get("name"))
-    return resolve_provider(
-        requested, explicit_api_key=cli._explicit_api_key, explicit_base_url=cli._explicit_base_url,
-    )
+        return str(custom.get("name") or requested), False
+    if (
+        cli._explicit_api_key or cli._explicit_base_url
+        or requested == "custom" or requested.startswith(CUSTOM_POOL_PREFIX)
+    ):
+        return requested, False
+    provider = resolve_provider(requested)
+    # Plugin providers and their aliases join PROVIDER_REGISTRY unchecked, so a custom id is ruled out here too.
+    custom_id = provider == "custom" or provider.startswith(CUSTOM_POOL_PREFIX)
+    return provider, not custom_id and (provider == "openrouter" or provider in PROVIDER_REGISTRY)
 
 
 def _clear_owner_retried_provider_limit(cli) -> None:
     """At a kanban worker's start, before its first model request: when the owner retried this
     task's run held at the provider's limit, clear the limit in this worker's own pool.
 
-    Only when the task's latest ended run ended ``rate_limited`` and an owner retry is bound to
+    Silent unless the task's latest ended run ended ``rate_limited`` and an owner retry is bound to
     that very run (``kanban_db.owner_retried_provider_limit``); the owner's process never writes a
-    pool. The pool of the provider this worker is about to use resets its own statuses.
-    Best-effort: both lines name only the provider, and the start always goes on.
+    pool. It clears only when this process is the task's current running run, served from its
+    assignee's profile home, the provider about to be used is built-in, and that provider's rows
+    are the profile's own with none read from the root store; else one line says nothing was
+    cleared. Every line names only the provider; any failure logs one warning and the start goes on.
     """
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
         return
-    try:
-        from hermes_cli import kanban_db as _kb
-
-        with _kb.connect_closing() as conn:
-            if not _kb.owner_retried_provider_limit(conn, task_id):
-                return
-    except Exception:
-        logger.debug("could not read the owner retry on this kanban task", exc_info=True)
-        return
     provider = str(getattr(cli, "requested_provider", "") or "").strip().lower() or "auto"
     try:
-        from agent.credential_pool import load_pool
+        from agent.credential_pool import _profile_owns_pool_provider, load_pool
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli.profiles import profile_matches_home
 
-        pool_key = _kanban_worker_pool_key(cli)
-        if not pool_key:
+        run_id = _int_or(os.environ.get("HERMES_KANBAN_RUN_ID"), None)
+        with _kb.connect_closing() as conn:
+            retried, assignee = _kb.owner_retried_provider_limit(conn, task_id, run_id)
+        if not retried:
             return
-        provider = pool_key
-        load_pool(pool_key).reset_statuses()
-        logger.info("cleared the %s provider limit after an owner retry", provider)
+        cleared = 0
+        if assignee and (os.environ.get("HERMES_HOME") or "").strip() and profile_matches_home(assignee):
+            provider, built_in = _kanban_worker_provider(cli)
+            # Loading a pool the profile borrows from the root heals it, which may write the root.
+            if built_in and _profile_owns_pool_provider(provider):
+                pool = load_pool(provider)
+                if not pool._borrowed_root_ids and _profile_owns_pool_provider(provider):
+                    cleared = pool.reset_statuses()
+        if cleared:
+            logger.info("cleared the %s provider limit after an owner retry", provider)
+        else:
+            logger.info("nothing was cleared for the %s provider after an owner retry", provider)
     except Exception:
         logger.warning("could not clear the %s provider limit after an owner retry", provider)
 
