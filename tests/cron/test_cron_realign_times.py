@@ -316,6 +316,7 @@ def _without(key):
 
 
 PAUSED = {"enabled": False, "state": "paused", "paused_at": "2026-10-19T09:00:00+02:00"}
+COMPLETED = {"state": "completed", "enabled": False, "next_run_at": None}
 # A cron expression the scheduler cannot use damages the entry whatever the
 # job's state; the marker is also in the entry's name and schedule display.
 UNUSABLE_CRON = {
@@ -327,6 +328,28 @@ UNUSABLE_CRON = {
 SURROGATE = "\ud800"
 # Without a top-level display, the preview prints the schedule's own fields.
 NO_DISPLAY = _without("schedule_display")
+# One-time starts before and after the fixed clock; PAST has also passed on
+# today's clock, which the real launcher runs on.
+PAST, FUTURE = "2026-09-28T09:00:00+02:00", "2026-10-30T09:00:00+01:00"
+
+
+def _malformed(shape, schedule, cause):
+    """``schedule`` in an active, a paused and a completed entry."""
+    entry = {**HEALTHY, "name": MARKER, "schedule_display": MARKER, "schedule": {**schedule, "display": MARKER}}
+    forms = {"active": {}, "paused": PAUSED, "completed": COMPLETED}
+    return [pytest.param({**entry, **fields}, cause, id=f"{shape}-{form}") for form, fields in forms.items()]
+
+
+# A schedule the scheduler cannot use damages the entry whatever the job's
+# state; the marker is also in the entry's name and both schedule displays.
+MALFORMED = [
+    *_malformed("interval-without-minutes", {"kind": "interval"}, "unreadable interval"),
+    *_malformed("unsupported-kind", {"kind": "weekly"}, "unreadable schedule"),
+    *_malformed("interval-minutes-object", {"kind": "interval", "minutes": {"every": MARKER}}, "unreadable interval"),
+    *_malformed("one-time-start-not-a-time", {"kind": "once", "run_at": MARKER}, "unreadable one-time start"),
+    # The scheduler works out no next start from a one-time start that has passed.
+    *_malformed("one-time-start-passed", {"kind": "once", "run_at": PAST}, "one-time start has passed"),
+]
 
 DAMAGED_SHAPES = [
     pytest.param(MARKER, "not a job record", id="bare-string"),
@@ -423,6 +446,55 @@ DAMAGED_SHAPES = [
         "unreadable next start",
         id="next-start-text",
     ),
+    *MALFORMED,
+    pytest.param(
+        {**HEALTHY, "schedule": {"kind": "interval", "minutes": "30"}},
+        "unreadable interval",
+        id="interval-minutes-text",
+    ),
+    # Too many minutes to add to a date.
+    pytest.param(
+        {**HEALTHY, "schedule": {"kind": "interval", "minutes": 10**12}},
+        "unreadable interval",
+        id="interval-minutes-too-large",
+    ),
+    pytest.param({**HEALTHY, "schedule": {"kind": "once"}}, "unreadable one-time start", id="one-time-start-missing"),
+    pytest.param(
+        {**HEALTHY, "schedule": {"kind": "once", "run_at": ""}},
+        "unreadable one-time start",
+        id="one-time-start-empty",
+    ),
+    # Hermes saves no other state than scheduled, paused, completed and error.
+    pytest.param({**HEALTHY, "state": f"waiting {MARKER}"}, "unreadable state", id="state-unknown"),
+    pytest.param(
+        {**HEALTHY, "state": f"waiting {MARKER}", "enabled": False},
+        "unreadable state",
+        id="state-unknown-disabled",
+    ),
+    # Only plain printable text is shown: a line break, tab, escape character
+    # or right-to-left override damages the entry, and so does a missing name.
+    pytest.param({**HEALTHY, "id": f"{MARKER}\n"}, "unreadable job ID", id="id-line-break"),
+    pytest.param({**HEALTHY, "name": f"Weekly {MARKER}\ndigest"}, "unreadable name", id="name-line-break"),
+    pytest.param({**HEALTHY, "name": f"\x1b[2JWeekly {MARKER} digest"}, "unreadable name", id="name-escape"),
+    pytest.param({**HEALTHY, "name": f"Weekly \u202e{MARKER} digest"}, "unreadable name", id="name-right-to-left"),
+    pytest.param(_without("name"), "unreadable name", id="name-missing"),
+    pytest.param({**HEALTHY, "name": None}, "unreadable name", id="name-null"),
+    pytest.param(
+        {**HEALTHY, "schedule_display": f"0 10 * * 1\t{MARKER}"},
+        "unreadable schedule display",
+        id="schedule-display-tab",
+    ),
+    pytest.param(
+        {**NO_DISPLAY, "schedule": {"kind": "cron", "expr": "0 10 * * 1", "display": f"0 10 * * 1\n{MARKER}"}},
+        "unreadable schedule",
+        id="schedule-display-field-line-break",
+    ),
+    # No text at all: the preview would show the schedule as "?".
+    pytest.param(
+        {**NO_DISPLAY, "schedule": {"kind": "interval", "minutes": 30}},
+        "unreadable schedule",
+        id="schedule-without-text",
+    ),
 ]
 
 
@@ -466,6 +538,40 @@ def test_an_expression_the_scheduler_accepts_is_not_damaged(store, fields, reaso
     assert (row["before"], row["after"]) == (HEALTHY["next_run_at"], after)
 
 
+EVERY_30M = {"kind": "interval", "minutes": 30, "display": "every 30m"}
+
+
+@pytest.mark.parametrize(
+    "entry, reason",
+    [
+        pytest.param({**NO_DISPLAY, "schedule": EVERY_30M}, "not a time-of-day schedule", id="interval-active"),
+        pytest.param({**NO_DISPLAY, "schedule": EVERY_30M, **PAUSED}, "paused", id="interval-paused"),
+        pytest.param({**NO_DISPLAY, "schedule": EVERY_30M, **COMPLETED}, "finished", id="interval-completed"),
+        # What Hermes saves for "every 0m".
+        pytest.param(
+            {**NO_DISPLAY, "schedule": {"kind": "interval", "minutes": 0, "display": "every 0m"}},
+            "not a time-of-day schedule",
+            id="interval-zero",
+        ),
+        pytest.param(
+            {**NO_DISPLAY, "schedule": {"kind": "once", "run_at": FUTURE}, "next_run_at": FUTURE},
+            "not a time-of-day schedule",
+            id="one-time-future",
+        ),
+        pytest.param(HEALTHY, None, id="cron-scheduled"),
+        pytest.param({**HEALTHY, **PAUSED}, "paused", id="cron-paused"),
+        pytest.param({**HEALTHY, **COMPLETED}, "finished", id="cron-completed"),
+        pytest.param({**HEALTHY, "state": "error"}, None, id="cron-error"),
+        pytest.param(_without("state"), None, id="cron-without-state"),
+        pytest.param({**HEALTHY, "state": None}, None, id="cron-null-state"),
+    ],
+)
+def test_a_schedule_and_state_hermes_saves_are_not_damaged(store, entry, reason):
+    store.save([entry, *store.entries])
+    row = jobs.plan_realign_times()[0]
+    assert (row["id"], row["name"], row["reason"]) == (DAMAGED_ID, HEALTHY["name"], reason)
+
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -473,15 +579,17 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
     "damaged, cause",
     [
         pytest.param({**HEALTHY, "name": f"Weekly {MARKER}{SURROGATE} digest"}, "unreadable name", id="name-text"),
+        pytest.param({**HEALTHY, "name": f"Weekly {MARKER}\ndigest"}, "unreadable name", id="name-line-break"),
         # At the year limit the preview cannot convert the start, so it would print it as saved.
         pytest.param(
             {**HEALTHY, "next_run_at": f"0001-01-01{SURROGATE}00:00:00"},
             "unreadable next start",
             id="next-start-text-year-limit",
         ),
+        *MALFORMED,
     ],
 )
-def test_launcher_lists_the_jobs_after_an_entry_with_invalid_text(store, tmp_path, damaged, cause):
+def test_launcher_lists_the_jobs_after_a_damaged_entry(store, tmp_path, damaged, cause):
     """The real ``hermes`` launcher, writing strict UTF-8 to pipes.
 
     It runs on today's clock, so the job after the damaged entry is a paused one.

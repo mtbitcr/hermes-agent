@@ -2429,17 +2429,21 @@ def remove_job(job_id: str) -> bool:
 def _realign_damage(job: Any) -> Optional[str]:
     """Why a saved entry cannot be read as a job, or None when it can.
 
-    The cause names the field, never its value. Every string the preview
-    can print must be valid text, and a cron expression must be one the
-    scheduler can work out, whatever the job's state.
+    The cause names the field, never its value. An entry is shown only when
+    its ID, name and schedule text are plain printable strings and the
+    scheduler's own ``compute_next_run`` returns a valid start time for its
+    schedule without raising. Every other entry is damaged, whatever its kind
+    or state, as is one whose enabled flag, state, pause time, repeat limit or
+    saved next start cannot be read.
     """
     if not isinstance(job, dict):
         return "not a job record"
     if not _realign_is_text(job.get("id")) or not job["id"]:
         return "unreadable job ID"
-    for field, label in (("name", "name"), ("schedule_display", "schedule display")):
-        if field in job and not _realign_is_text(job[field]):
-            return f"unreadable {label}"
+    if not _realign_is_text(job.get("name")):
+        return "unreadable name"
+    if "schedule_display" in job and not _realign_is_text(job["schedule_display"]):
+        return "unreadable schedule display"
     schedule = job.get("schedule")
     if (
         not isinstance(schedule, dict)
@@ -2448,19 +2452,33 @@ def _realign_damage(job: Any) -> Optional[str]:
             key in schedule and not _realign_is_text(schedule[key])
             for key in ("display", "value", "expr", "run_at")
         )
+        or not any(  # with no text the preview would print "?"
+            isinstance(text, str) and text.strip()
+            for text in (
+                job.get("schedule_display"),
+                *(schedule.get(key) for key in ("display", "value", "expr", "run_at")),
+            )
+        )
     ):
         return "unreadable schedule"
-    if schedule["kind"] == "cron":
-        if not schedule.get("expr"):
+    kind = schedule["kind"]
+    if kind not in ("cron", "interval", "once"):
+        return "unreadable schedule"
+    try:  # the scheduler's own calculation, which writes nothing
+        _ensure_aware(datetime.fromisoformat(compute_next_run(schedule))).timestamp()
+    except Exception:  # it raised, or gave no readable time (None included)
+        if kind == "cron":
             return "unreadable cron expression"
-        if _ensure_croniter():  # without croniter no expression can be tried
-            try:
-                compute_next_run(schedule)
-            except Exception:
-                return "unreadable cron expression"
+        if kind == "interval":
+            return "unreadable interval"
+        try:
+            _ensure_aware(datetime.fromisoformat(schedule.get("run_at"))).timestamp()
+        except (TypeError, ValueError, OverflowError):  # missing, empty or not a time
+            return "unreadable one-time start"
+        return "one-time start has passed"
     if "enabled" in job and not isinstance(job["enabled"], bool):
         return "unreadable enabled flag"
-    if job.get("state") is not None and not _realign_is_text(job["state"]):
+    if job.get("state") not in (None, "scheduled", "paused", "completed", "error"):
         return "unreadable state"
     if job.get("paused_at") is not None and not isinstance(job["paused_at"], str):
         return "unreadable pause time"
@@ -2485,14 +2503,13 @@ def _realign_damage(job: Any) -> Optional[str]:
 
 
 def _realign_is_text(value: Any) -> bool:
-    """True for a string that is valid text, that is, encodable as UTF-8."""
-    if not isinstance(value, str):
-        return False
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:  # a lone surrogate, saved as an escape
-        return False
-    return True
+    """True for a plain printable string, as ``str.isprintable()`` defines it.
+
+    Such a string holds no line breaks, tabs or other control characters, no
+    invisible format characters (such as a right-to-left override or a
+    zero-width joiner), no non-breaking spaces and no lone surrogates.
+    """
+    return isinstance(value, str) and value.isprintable()
 
 
 def _realign_finished(job: Dict[str, Any]) -> bool:
@@ -2526,12 +2543,7 @@ def _realign_reason(job: Any, now_ts: float) -> Tuple[Optional[str], Optional[st
         saved_ts = None
     if saved_ts is None or saved_ts <= now_ts:
         return "no saved next start in the future", None
-    try:
-        realigned = compute_next_run(schedule)
-    except Exception:
-        return "damaged entry: unreadable cron expression", None
-    if realigned is None:
-        return "next start cannot be computed", None
+    realigned = compute_next_run(schedule)  # the damage check has shown it gives a start
     if datetime.fromisoformat(realigned).timestamp() == saved_ts:
         return "already correct", None
     return None, realigned

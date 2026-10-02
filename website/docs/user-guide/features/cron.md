@@ -978,10 +978,9 @@ The preview lists every entry in the saved job list. For each job it shows the I
 - **already correct** — the saved next start is the one the current calculation gives.
 - **paused** — the job is paused.
 - **finished** — the job has completed, or it has run as many times as its repeat limit allows.
-- **not a time-of-day schedule** — the job runs at an interval or once, not on a cron schedule.
+- **not a time-of-day schedule** — the job runs at an interval, or once at a time still to come, not on a cron schedule.
 - **no saved next start in the future** — the job has no saved next start, or it has already passed.
-- **next start cannot be computed** — no next start can be worked out for the schedule.
-- **damaged entry** — the entry cannot be read as a job, for example because a field has the wrong type. The reason names the field, such as `damaged entry: unreadable next start`. The entry is shown only by its place in the list, such as "Entry 3 in the saved list". Its contents are never shown.
+- **damaged entry** — the preview shows a job's ID, name, schedule and times only when its ID, name and schedule text are plain printable text (no line breaks, tabs, or other control or invisible characters) and the scheduler can work out a next start for its schedule. Every other entry, whatever its state, is listed only by its place, such as "Entry 3 in the saved list". Examples are a one-time job whose time has passed, a schedule of a kind Hermes does not use, and a name with a line break. Such an entry is marked damaged with a reason that names the field, for example `damaged entry: one-time start has passed`. Its contents are never shown, and it is never marked **needs pause and resume**. The same applies when its state, enabled flag, pause time, repeat limit or saved next start cannot be read.
 
 The preview reads the saved job list exactly as it is stored. It does not lock, repair or save it, and it writes no other file. If the saved job list cannot be read at all, the preview says so and stops, without showing any of its contents.
 
