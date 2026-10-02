@@ -12,6 +12,7 @@ realigned by pausing and resuming it; the preview only says which ones.
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -625,6 +626,116 @@ def test_launcher_lists_the_jobs_after_a_damaged_entry(store, tmp_path, damaged,
     assert "Traceback" not in out + err
     assert MARKER not in out + err
     assert DAMAGED_ID not in out + err
+    assert _file_state(store.jobs_file) == saved
+    assert sorted(os.listdir(store.cron_dir)) == names
+
+
+# Without croniter no cron expression can be checked, and the scheduler logs
+# each expression it cannot use. Here the expression, name and schedule
+# display are all the marker.
+MARKER_CRON = {
+    **HEALTHY,
+    "name": MARKER,
+    "schedule_display": MARKER,
+    "schedule": {"kind": "cron", "expr": MARKER, "display": MARKER},
+}
+NO_CRONITER = "cron expression cannot be checked without the croniter package"
+
+
+def test_preview_without_croniter_lists_cron_entries_as_damaged(store, capsys, caplog, monkeypatch):
+    """Each cron entry is damaged and the other jobs are still listed; no expression is logged."""
+    monkeypatch.setattr(jobs, "HAS_CRONITER", False)
+    entries = [MARKER_CRON, *store.entries]
+    store.save(entries)
+    saved = _file_state(store.jobs_file)
+    names = sorted(os.listdir(store.cron_dir))
+    caplog.set_level(logging.DEBUG)
+    rows = jobs.plan_realign_times()
+    code, out, err = _cli(capsys, "realign-times")
+    assert MARKER not in caplog.text
+    assert MARKER not in repr(rows)
+    assert MARKER not in out + err
+    assert len(rows) == len(entries)
+    listed = {}
+    for position, (entry, row) in enumerate(zip(entries, rows), start=1):
+        if entry["schedule"]["kind"] == "cron":
+            assert row == _damaged_row(position, NO_CRONITER)
+        else:
+            name = entry["name"]
+            assert (row["position"], row["id"], row["name"]) == (position, store.ids[name], name)
+            listed[name] = row["reason"]
+    assert listed == {
+        name: UNCHANGED[name] for name in ("Paused automation two", "Conference reminder", "Inbox sweep")
+    }
+    assert code == 0
+    assert "Entry 1 in the saved list [damaged]" in out
+    assert f"unchanged (damaged entry: {NO_CRONITER}); its contents are not shown" in out
+    for name, reason in listed.items():
+        block = _block(out, store.ids[name])
+        assert f"{store.ids[name]} {name} [" in block
+        assert f"unchanged ({reason})" in block
+    assert f"0 of {len(store.entries) + 1} saved next start(s) differ" in out
+    assert _file_state(store.jobs_file) == saved
+    assert sorted(os.listdir(store.cron_dir)) == names
+
+
+# Put first on the launcher's path as its sitecustomize module: importing
+# croniter then fails, as it does when croniter is not installed.
+BLOCK_CRONITER = """\
+import sys
+
+
+class BlockCroniter:
+    def find_spec(self, name, path=None, target=None):
+        if name == "croniter" or name.startswith("croniter."):
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return None
+
+
+sys.meta_path.insert(0, BlockCroniter())
+"""
+
+
+def test_launcher_without_croniter_logs_no_entry_contents(store, tmp_path):
+    """The real ``hermes`` launcher with croniter blocked, writing its usual profile logs."""
+    site = tmp_path / "block-croniter"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(BLOCK_CRONITER, encoding="utf-8")
+    name = "Paused automation two"
+    job_id = store.ids[name]
+    store.save([MARKER_CRON, store.original["Paused automation one"], store.original[name]], escaped=True)
+    saved = _file_state(store.jobs_file)
+    names = sorted(os.listdir(store.cron_dir))
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "hermes"), "cron", "realign-times"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "PYTHONIOENCODING": "utf-8",
+            "HERMES_HOME": str(store.home),
+            "HERMES_TIMEZONE": "Europe/Vienna",
+            "PYTHONPATH": os.pathsep.join(filter(None, [str(site), os.environ.get("PYTHONPATH")])),
+        },
+        cwd=tmp_path,
+        timeout=120,
+    )
+    out, err = result.stdout.decode("utf-8"), result.stderr.decode("utf-8")
+    assert result.returncode == 0, err
+    logs = store.home / "logs"
+    log_files = [path for path in logs.rglob("*") if path.is_file()] if logs.is_dir() else []
+    for private in (MARKER, DAMAGED_ID):
+        assert private not in out + err
+        assert [path.name for path in log_files if private.encode() in path.read_bytes()] == []
+    assert "Entry 1 in the saved list [damaged]" in out
+    assert "Entry 2 in the saved list [damaged]" in out
+    assert out.count(f"unchanged (damaged entry: {NO_CRONITER}); its contents are not shown") == 2
+    block = _block(out, job_id)
+    assert f"{job_id} {name} [paused]" in block
+    assert "unchanged (paused)" in block
+    assert "0 of 3 saved next start(s) differ" in out
+    assert "Traceback" not in out + err
     assert _file_state(store.jobs_file) == saved
     assert sorted(os.listdir(store.cron_dir)) == names
 

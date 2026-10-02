@@ -2434,7 +2434,9 @@ def _realign_damage(job: Any) -> Optional[str]:
     scheduler's own ``compute_next_run`` returns a valid start time for its
     schedule without raising. Every other entry is damaged, whatever its kind
     or state, as is one whose enabled flag, state, pause time, repeat limit or
-    saved next start cannot be read.
+    saved next start cannot be read. Without the croniter package a cron entry
+    is damaged with no call to ``compute_next_run``, which would log the raw
+    expression.
     """
     if not isinstance(job, dict):
         return "not a job record"
@@ -2464,6 +2466,8 @@ def _realign_damage(job: Any) -> Optional[str]:
     kind = schedule["kind"]
     if kind not in ("cron", "interval", "once"):
         return "unreadable schedule"
+    if kind == "cron" and not _ensure_croniter():
+        return "cron expression cannot be checked without the croniter package"
     try:  # the scheduler's own calculation, which writes nothing
         _ensure_aware(datetime.fromisoformat(compute_next_run(schedule))).timestamp()
     except Exception:  # it raised, or gave no readable time (None included)
