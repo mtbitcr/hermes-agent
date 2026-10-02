@@ -286,6 +286,27 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_notepad.add_argument("key", nargs="?", help="Notepad key (get/set/delete)")
     cron_notepad.add_argument("value", nargs="?", help="Value to store (set)")
 
+    # cron realign-times — preview (default), apply or undo saved next starts
+    # realigned to the configured local time.
+    cron_realign = cron_subparsers.add_parser(
+        "realign-times",
+        help="Preview saved next starts realigned to local time; apply or restore explicitly",
+    )
+    realign_mode = cron_realign.add_mutually_exclusive_group()
+    realign_mode.add_argument(
+        "--apply", action="store_true", help="Rewrite the next starts the preview marks as changing"
+    )
+    realign_mode.add_argument(
+        "--restore", action="store_true", help="Put back the next starts an earlier --apply replaced"
+    )
+    cron_realign.add_argument(
+        "--job",
+        dest="job_ids",
+        action="append",
+        metavar="JOB_ID",
+        help="With --apply: realign only this job (repeatable)",
+    )
+
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)

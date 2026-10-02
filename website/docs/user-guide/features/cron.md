@@ -247,6 +247,7 @@ hermes cron remove <job_id_or_name>
 hermes cron edit <job_id_or_name> [...flags]
 hermes cron status
 hermes cron tick
+hermes cron realign-times [--apply [--job <job_id>] | --restore]
 ```
 
 What they do:
@@ -256,6 +257,7 @@ What they do:
 - `run` — trigger the job on the next scheduler tick
 - `remove` — delete it entirely
 - `edit` — modify schedule, prompt, delivery, etc.
+- `realign-times` — show every job's saved next start beside the one worked out in local time; `--apply` rewrites the ones that are wrong, `--restore` puts them back (see [Realigning saved next starts](#realigning-saved-next-starts))
 
 **Name-based lookup.** All four mutating verbs (`pause`, `resume`, `run`, `remove`, `edit`) plus the agent's `cronjob` tool now accept a job **name** (case-insensitive) in place of the hex ID. The agent and CLI both prefer an exact ID match if one exists; ambiguous name matches (multiple jobs sharing the same name) are refused with the full list of candidate IDs so you can pick one explicitly. Names are not unique, so this guard is load-bearing — it prevents silently mutating the wrong job when two share a name.
 
@@ -951,6 +953,34 @@ Times accept `9am`, `9:30pm`, `14:00`, bare 24-hour hours (`at 7`), `noon`, and 
 ```text
 2026-03-15T09:00:00    → One-time at March 15, 2026 9:00 AM
 ```
+
+### Local time and clock changes
+
+Cron expressions and the day/time forms above run at the clock time you give them, in the time zone of the [`timezone` setting](../configuration.md#timezone) (the `HERMES_TIMEZONE` environment variable takes precedence). A job set for `0 10 * * 1` runs at 10:00 every Monday, in summer and in winter. On the nights the clocks change (daylight saving time):
+
+- **Clocks go back** and an hour repeats (for example 02:00–02:59): a job set for a time in that hour runs once, the first time the clock shows it.
+- **Clocks go forward** and an hour is skipped (for example 02:00–02:59): a job set for a time in that hour runs once, as soon as the clocks have gone forward (at 03:00).
+- Cron schedules that run **every hour or every few minutes** (`0 * * * *`, `*/15 * * * *`) do not run again while the hour repeats, so there is one hour without runs. When the clocks go forward they do not make up the skipped hour; they carry on at their usual spacing.
+- **Interval schedules** (`every 30m`, `every 2h`) add the interval to the previous run time as the local clock shows it. When the clocks go back, the wait that reaches past the repeated hour is one hour longer than the interval. When the clocks go forward, a wait that reaches past the skipped hour is one hour shorter — an `every 2h` job that ran at 01:00 runs next at 03:00, one hour later; intervals of an hour or less are not affected.
+
+If `timezone` is not set, Hermes uses the server's local time and works out each next start with the server's UTC offset at that moment, so the first run after a clock change can be an hour off. Set `timezone` (for example `timezone: "Europe/Vienna"`) to keep schedules on local time all year.
+
+### Realigning saved next starts
+
+Each job keeps its next start in `jobs.json`. A next start that an earlier version of Hermes saved before a clock change, for a time after it, can be an hour off — for example, a job set for 10:00 on the 1st of each month, saved in October, waits for 11:00 on 1 November. `hermes cron realign-times` finds these and shows them to you before anything is changed:
+
+```bash
+hermes cron realign-times                                  # preview only; writes nothing
+hermes cron realign-times --apply                          # realign every job marked "will change"
+hermes cron realign-times --apply --job <job_id> --job <job_id>   # realign only these jobs
+hermes cron realign-times --restore                        # undo an earlier --apply
+```
+
+The preview lists every saved job with its ID, name, status, schedule, saved next start and next start after realignment. Times are shown in the configured time zone with their UTC offset, and the first line says which time zone was used (or that the server's local time was used because no time zone is set). A job whose saved next start is wrong is marked **will change**. Every other job is marked **unchanged**, with a short reason such as paused, not a time-of-day schedule, no saved next start in the future, or already correct.
+
+Nothing is written until you add `--apply`. It rewrites only the next starts the preview marks as changing — with `--job`, only those of the jobs you name by ID (an unknown ID stops it before anything is written). Nothing else about a job changes: paused jobs stay paused, and running `--apply` a second time finds nothing left to change. Before it saves `jobs.json`, it adds one entry per changed job (job ID, name, old and new next start, and when it was applied) to `realign_times_restore.json` next to `jobs.json` (`~/.hermes/cron/` for the default profile), keeping earlier entries. If nothing needs realigning, it writes nothing.
+
+`--restore` puts the old next start back for every job in that file whose saved next start is still the realigned one. Jobs whose next start has changed since — for example because the job has run or was edited — are left as they are and listed as skipped.
 
 ## Repeat behavior
 

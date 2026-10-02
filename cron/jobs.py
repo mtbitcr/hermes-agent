@@ -986,6 +986,44 @@ def _job_is_stale_error_recurring(
     return age_seconds > (cadence_seconds + _compute_grace_seconds(schedule))
 
 
+def _cron_next_after(expr: str, base: datetime) -> datetime:
+    """Return the first start of cron ``expr`` strictly after ``base``.
+
+    The expression is matched against wall-clock time in the configured
+    timezone; croniter's own handling of aware datetimes assumes pytz and is
+    an hour off for zoneinfo around clock changes. A start in the hour the
+    clocks repeat runs on its first pass only. A start in the hour the clocks
+    skip runs as soon as they have gone forward, except for schedules that
+    cover every hour, which carry on with their next start.
+    """
+    tz = _hermes_now().tzinfo
+
+    def _exists(wall: datetime) -> bool:
+        local = datetime.fromtimestamp(wall.replace(tzinfo=tz).timestamp(), tz)
+        return local.replace(tzinfo=None) == wall
+
+    base_ts = base.timestamp()
+    it = croniter(expr, base.astimezone(tz).replace(tzinfo=None))
+    every_hour = it.expanded[1] == ["*"]
+    # Candidates are only passed over within one skipped or repeated hour.
+    for _ in range(10000):
+        wall = it.get_next(datetime)
+        if not _exists(wall):
+            if every_hour:
+                continue
+            wall = wall.replace(second=0, microsecond=0)
+            for _ in range(24 * 60):
+                wall += timedelta(minutes=1)
+                if _exists(wall):
+                    break
+            else:
+                continue
+        start = wall.replace(tzinfo=tz, fold=0)  # fold=0: first pass of a repeated hour
+        if start.timestamp() > base_ts:
+            return start
+    raise ValueError(f"No start found for cron expression {expr!r}")
+
+
 def _schedule_cadence_seconds(schedule: Dict[str, Any]) -> Optional[float]:
     """Approximate the natural period of a schedule, in seconds, or None.
 
@@ -1017,11 +1055,9 @@ def _schedule_cadence_seconds(schedule: Dict[str, Any]) -> Optional[float]:
         if expr in _cron_cadence_cache:
             return _cron_cadence_cache[expr]
         try:
-            base = _hermes_now()
-            it = croniter(expr, base)
-            first = it.get_next(datetime)
-            second = it.get_next(datetime)
-            gap = (second - first).total_seconds()
+            first = _cron_next_after(expr, _hermes_now())
+            second = _cron_next_after(expr, first)
+            gap = second.timestamp() - first.timestamp()
             result = gap if gap > 0 else None
         except Exception:
             result = None
@@ -1124,9 +1160,7 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
                 base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
             except Exception:
                 base_time = now
-        cron = croniter(expr, base_time)
-        next_run = cron.get_next(datetime)
-        return next_run.isoformat()
+        return _cron_next_after(expr, base_time).isoformat()
 
     return None
 
@@ -2390,6 +2424,150 @@ def remove_job(job_id: str) -> bool:
                 _fire_fence_locks.pop(_fence_key, None)
             return True
     return False
+
+
+def _realign_reason(job: Dict[str, Any], now_ts: float) -> Tuple[Optional[str], Optional[str]]:
+    """``(reason, None)`` when a saved next start stays as it is, else ``(None, realigned)``."""
+    if not is_job_runnable(job):
+        return ("completed" if effective_job_state(job) == "completed" else "paused"), None
+    schedule = job.get("schedule")
+    if not isinstance(schedule, dict) or schedule.get("kind") != "cron":
+        return "not a time-of-day schedule", None
+    try:
+        saved_ts = _ensure_aware(datetime.fromisoformat(job.get("next_run_at"))).timestamp()
+    except (TypeError, ValueError):
+        saved_ts = None
+    if saved_ts is None or saved_ts <= now_ts:
+        return "no saved next start in the future", None
+    try:
+        realigned = compute_next_run(schedule)
+    except Exception:
+        realigned = None
+    if realigned is None:
+        return "next start cannot be computed", None
+    if datetime.fromisoformat(realigned).timestamp() == saved_ts:
+        return "already correct", None
+    return None, realigned
+
+
+def plan_realign_times(jobs: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Preview ``hermes cron realign-times``: one row per saved job, writing nothing.
+
+    Rows carry ``id``, ``name``, ``status``, ``schedule``, ``before`` (the
+    saved next start), ``after`` and ``reason``. ``reason`` is None exactly
+    for the jobs whose saved next start would change; every other row keeps
+    ``after == before`` and says why the job is left alone.
+    """
+    if jobs is None:
+        jobs = _peek_jobs_unlocked()  # a plain read: no lock file, no repair
+        if jobs is None:
+            raise RuntimeError("Cron database is unreadable or corrupted")
+    now_ts = _hermes_now().timestamp()
+    rows = []
+    for job in jobs:
+        reason, realigned = _realign_reason(job, now_ts)
+        state = effective_job_state(job)
+        rows.append({
+            "id": job.get("id"),
+            "name": job.get("name") or job.get("id"),
+            "status": "active" if state == "scheduled" else state,
+            "schedule": _schedule_display_for_job(job),
+            "before": job.get("next_run_at"),
+            "after": job.get("next_run_at") if reason else realigned,
+            "reason": reason,
+        })
+    return rows
+
+
+def realign_restore_file() -> Path:
+    """Restore record of ``hermes cron realign-times --apply``, beside jobs.json."""
+    return _current_cron_store().cron_dir / "realign_times_restore.json"
+
+
+def _read_realign_record(path: Path) -> List[Dict[str, Any]]:
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"Cannot read {path}: {e}") from e
+    if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+        raise RuntimeError(f"Cannot read {path}: expected a list of entries")
+    return entries
+
+
+def apply_realign_times(job_ids: Optional[Collection[str]] = None) -> List[Dict[str, Any]]:
+    """Rewrite the saved next starts the preview marks as changing.
+
+    ``job_ids`` limits this to those jobs; an unknown id raises ValueError
+    before anything is written. Each change is added to the restore record
+    (earlier entries are kept) before jobs.json is saved, and only
+    ``next_run_at`` is rewritten. Returns the new entries; when nothing
+    needs realigning nothing is written and the result is empty.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        known = {str(job.get("id")) for job in jobs}
+        unknown = [job_id for job_id in dict.fromkeys(job_ids or ()) if job_id not in known]
+        if unknown:
+            raise ValueError(f"Unknown job id: {', '.join(unknown)}")
+        changes = [
+            (job, row)
+            for job, row in zip(jobs, plan_realign_times(jobs))
+            if row["reason"] is None and (job_ids is None or str(row["id"]) in job_ids)
+        ]
+        if not changes:
+            return []
+        applied_at = _hermes_now().isoformat()
+        added = [
+            {"job_id": row["id"], "name": row["name"], "before": row["before"],
+             "after": row["after"], "applied_at": applied_at}
+            for _job, row in changes
+        ]
+        path = realign_restore_file()
+        entries = _read_realign_record(path) + added
+        try:
+            stat_before = os.stat(path)
+        except OSError:
+            stat_before = os.stat(path.parent)
+        atomic_write_text(path, json.dumps(entries, indent=2, ensure_ascii=False), tmp_prefix=".realign_")
+        _secure_file(path)
+        _preserve_file_ownership(path, stat_before)
+        for job, row in changes:
+            job["next_run_at"] = row["after"]
+        save_jobs(jobs)
+        return added
+
+
+def restore_realign_times() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Put back the saved next starts ``apply_realign_times`` replaced.
+
+    A job's start is restored only while it still equals the realigned one
+    (a job that has run since keeps its new start); its latest entry
+    decides. Returns ``(restored, skipped)`` restore entries, skipped ones
+    with a ``reason``. Without a restore record nothing is touched.
+    """
+    path = realign_restore_file()
+    if not path.exists():
+        return [], []
+    with _jobs_lock():
+        jobs = load_jobs()
+        by_id = {str(job.get("id")): job for job in jobs}
+        restored, skipped, seen = [], [], set()
+        for entry in reversed(_read_realign_record(path)):
+            job_id = str(entry.get("job_id"))
+            if job_id in seen:
+                continue
+            seen.add(job_id)
+            job = by_id.get(job_id)
+            if job is None:
+                skipped.append({**entry, "reason": "job no longer exists"})
+            elif job.get("next_run_at") != entry.get("after"):
+                skipped.append({**entry, "reason": "next start has changed since it was realigned"})
+            else:
+                job["next_run_at"] = entry.get("before")
+                restored.append(entry)
+        if restored:
+            save_jobs(jobs)
+    return restored[::-1], skipped[::-1]
 
 
 def mark_job_run(

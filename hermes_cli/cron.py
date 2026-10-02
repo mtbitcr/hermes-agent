@@ -618,6 +618,97 @@ def cron_notepad(args) -> int:
         return 1
 
 
+def _realign_time_text(value, zone) -> str:
+    """``2026-11-01 10:00 (UTC+01:00)`` in ``zone`` (the server's local time when None)."""
+    from datetime import datetime
+
+    try:
+        text = datetime.fromisoformat(value).astimezone(zone).isoformat(timespec="minutes")
+    except (TypeError, ValueError):
+        return str(value) if value else "none"
+    return f"{text[:10]} {text[11:16]} (UTC{text[16:]})"
+
+
+def cron_realign_times(args) -> int:
+    """Handle ``hermes cron realign-times [--apply [--job JOB_ID ...] | --restore]``.
+
+    Without a flag this only previews: every saved job with its saved next
+    start and the start it gets once realigned to local time. Nothing is
+    written until ``--apply``; ``--restore`` undoes an earlier apply.
+    """
+    import hermes_time
+    from cron import jobs as cron_jobs
+
+    job_ids = getattr(args, "job_ids", None)
+    if job_ids and not getattr(args, "apply", False):
+        print(color("--job can only be used together with --apply.", Colors.RED))
+        return 1
+    zone = hermes_time.get_timezone()
+
+    def when(value):
+        return _realign_time_text(value, zone)
+
+    def job_line(entry, text):
+        print(f"  {color(str(entry['job_id']), Colors.YELLOW)} {entry['name']}: {text}")
+
+    try:
+        if getattr(args, "restore", False):
+            restored, skipped = cron_jobs.restore_realign_times()
+            if not restored and not skipped:
+                print("No realigned next starts to restore.")
+            if restored:
+                print(color(f"Restored {len(restored)} saved next start(s):", Colors.GREEN))
+            for entry in restored:
+                job_line(entry, f"{when(entry['after'])} -> {when(entry['before'])}")
+            if skipped:
+                print(color(f"Left {len(skipped)} job(s) as they are:", Colors.YELLOW))
+            for entry in skipped:
+                job_line(entry, entry["reason"])
+            return 0
+
+        if getattr(args, "apply", False):
+            applied = cron_jobs.apply_realign_times(job_ids)
+            if not applied:
+                print("No saved next start needs realigning; nothing was written.")
+                return 0
+            print(color(f"Realigned {len(applied)} saved next start(s):", Colors.GREEN))
+            for entry in applied:
+                job_line(entry, f"{when(entry['before'])} -> {when(entry['after'])}")
+            print(f"Restore record: {cron_jobs.realign_restore_file()}")
+            print(color("Undo with: hermes cron realign-times --restore", Colors.DIM))
+            return 0
+
+        rows = cron_jobs.plan_realign_times()
+    except (RuntimeError, ValueError) as exc:
+        print(color(f"Cannot realign next starts: {exc}", Colors.RED))
+        return 1
+
+    name = hermes_time.get_timezone_name()
+    if zone is not None:
+        print(f"Times below are in the configured time zone {name}.")
+    else:
+        why = f"the time zone {name!r} is not valid" if name else "no time zone is set"
+        print(f"Times below are in the server's local time ({why}).")
+    print()
+    for row in rows:
+        if row["reason"] is None:
+            outcome = color("will change", Colors.GREEN)
+        else:
+            outcome = color(f"unchanged ({row['reason']})", Colors.DIM)
+        print(f"  {color(str(row['id']), Colors.YELLOW)} {row['name']} [{row['status']}]")
+        print(f"    Schedule:          {row['schedule']}")
+        print(f"    Saved next start:  {when(row['before'])}")
+        print(f"    After realignment: {when(row['after'])} — {outcome}")
+        print()
+    changing = sum(row["reason"] is None for row in rows)
+    print(f"{changing} of {len(rows)} saved next start(s) will change. Nothing has been written.")
+    if changing:
+        print(color("Apply all:      hermes cron realign-times --apply", Colors.DIM))
+        print(color("Apply chosen:   hermes cron realign-times --apply --job JOB_ID [--job JOB_ID ...]", Colors.DIM))
+        print(color("Undo an apply:  hermes cron realign-times --restore", Colors.DIM))
+    return 0
+
+
 def cron_command(args):
     """Handle cron subcommands."""
     subcmd = getattr(args, 'cron_command', None)
@@ -659,6 +750,9 @@ def cron_command(args):
     if subcmd in {"remove", "rm", "delete"}:
         return _job_action("remove", args.job_id, "Removed")
 
+    if subcmd == "realign-times":
+        return cron_realign_times(args)
+
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick|realign-times]")
     sys.exit(1)
