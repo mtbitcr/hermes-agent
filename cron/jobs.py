@@ -986,6 +986,44 @@ def _job_is_stale_error_recurring(
     return age_seconds > (cadence_seconds + _compute_grace_seconds(schedule))
 
 
+def _cron_next_after(expr: str, base: datetime) -> datetime:
+    """Return the first start of cron ``expr`` strictly after ``base``.
+
+    The expression is matched against wall-clock time in the configured
+    timezone; croniter's own handling of aware datetimes assumes pytz and is
+    an hour off for zoneinfo around clock changes. A start in the hour the
+    clocks repeat runs on its first pass only. A start in the hour the clocks
+    skip runs as soon as they have gone forward, except for schedules that
+    cover every hour, which carry on with their next start.
+    """
+    tz = _hermes_now().tzinfo
+
+    def _exists(wall: datetime) -> bool:
+        local = datetime.fromtimestamp(wall.replace(tzinfo=tz).timestamp(), tz)
+        return local.replace(tzinfo=None) == wall
+
+    base_ts = base.timestamp()
+    it = croniter(expr, base.astimezone(tz).replace(tzinfo=None))
+    every_hour = it.expanded[1] == ["*"]
+    # Candidates are only passed over within one skipped or repeated hour.
+    for _ in range(10000):
+        wall = it.get_next(datetime)
+        if not _exists(wall):
+            if every_hour:
+                continue
+            wall = wall.replace(second=0, microsecond=0)
+            for _ in range(24 * 60):
+                wall += timedelta(minutes=1)
+                if _exists(wall):
+                    break
+            else:
+                continue
+        start = wall.replace(tzinfo=tz, fold=0)  # fold=0: first pass of a repeated hour
+        if start.timestamp() > base_ts:
+            return start
+    raise ValueError(f"No start found for cron expression {expr!r}")
+
+
 def _schedule_cadence_seconds(schedule: Dict[str, Any]) -> Optional[float]:
     """Approximate the natural period of a schedule, in seconds, or None.
 
@@ -1017,11 +1055,9 @@ def _schedule_cadence_seconds(schedule: Dict[str, Any]) -> Optional[float]:
         if expr in _cron_cadence_cache:
             return _cron_cadence_cache[expr]
         try:
-            base = _hermes_now()
-            it = croniter(expr, base)
-            first = it.get_next(datetime)
-            second = it.get_next(datetime)
-            gap = (second - first).total_seconds()
+            first = _cron_next_after(expr, _hermes_now())
+            second = _cron_next_after(expr, first)
+            gap = second.timestamp() - first.timestamp()
             result = gap if gap > 0 else None
         except Exception:
             result = None
@@ -1124,9 +1160,7 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
                 base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
             except Exception:
                 base_time = now
-        cron = croniter(expr, base_time)
-        next_run = cron.get_next(datetime)
-        return next_run.isoformat()
+        return _cron_next_after(expr, base_time).isoformat()
 
     return None
 
@@ -2390,6 +2424,187 @@ def remove_job(job_id: str) -> bool:
                 _fire_fence_locks.pop(_fence_key, None)
             return True
     return False
+
+
+def _realign_damage(job: Any) -> Optional[str]:
+    """Why a saved entry cannot be read as a job, or None when it can.
+
+    The cause names the field, never its value. An entry is shown only when
+    its ID, name and schedule text are plain printable strings and the
+    scheduler's own ``compute_next_run`` returns a valid start time for its
+    schedule without raising. Every other entry is damaged, whatever its kind
+    or state, as is one whose enabled flag, state, pause time, repeat limit or
+    saved next start cannot be read. Without the croniter package a cron entry
+    is damaged with no call to ``compute_next_run``, which would log the raw
+    expression.
+    """
+    if not isinstance(job, dict):
+        return "not a job record"
+    if not _realign_is_text(job.get("id")) or not job["id"]:
+        return "unreadable job ID"
+    if not _realign_is_text(job.get("name")):
+        return "unreadable name"
+    if "schedule_display" in job and not _realign_is_text(job["schedule_display"]):
+        return "unreadable schedule display"
+    schedule = job.get("schedule")
+    if (
+        not isinstance(schedule, dict)
+        or not isinstance(schedule.get("kind"), str)
+        or any(
+            key in schedule and not _realign_is_text(schedule[key])
+            for key in ("display", "value", "expr", "run_at")
+        )
+        or not any(  # with no text the preview would print "?"
+            isinstance(text, str) and text.strip()
+            for text in (
+                job.get("schedule_display"),
+                *(schedule.get(key) for key in ("display", "value", "expr", "run_at")),
+            )
+        )
+    ):
+        return "unreadable schedule"
+    kind = schedule["kind"]
+    if kind not in ("cron", "interval", "once"):
+        return "unreadable schedule"
+    if kind == "cron" and not _ensure_croniter():
+        return "cron expression cannot be checked without the croniter package"
+    try:  # the scheduler's own calculation, which writes nothing
+        _ensure_aware(datetime.fromisoformat(compute_next_run(schedule))).timestamp()
+    except Exception:  # it raised, or gave no readable time (None included)
+        if kind == "cron":
+            return "unreadable cron expression"
+        if kind == "interval":
+            return "unreadable interval"
+        try:
+            _ensure_aware(datetime.fromisoformat(schedule.get("run_at"))).timestamp()
+        except (TypeError, ValueError, OverflowError):  # missing, empty or not a time
+            return "unreadable one-time start"
+        return "one-time start has passed"
+    if "enabled" in job and not isinstance(job["enabled"], bool):
+        return "unreadable enabled flag"
+    if job.get("state") not in (None, "scheduled", "paused", "completed", "error"):
+        return "unreadable state"
+    if job.get("paused_at") is not None and not isinstance(job["paused_at"], str):
+        return "unreadable pause time"
+    repeat = job.get("repeat")
+    if repeat is not None and (
+        not isinstance(repeat, dict)
+        or any(
+            repeat.get(key) is not None
+            and (isinstance(repeat[key], bool) or not isinstance(repeat[key], int))
+            for key in ("times", "completed")
+        )
+    ):
+        return "unreadable repeat limit"
+    if job.get("next_run_at") is not None:
+        if not _realign_is_text(job["next_run_at"]):
+            return "unreadable next start"
+        try:
+            _ensure_aware(datetime.fromisoformat(job["next_run_at"])).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return "unreadable next start"
+    return None
+
+
+def _realign_is_text(value: Any) -> bool:
+    """True for a plain printable string, as ``str.isprintable()`` defines it.
+
+    Such a string holds no line breaks, tabs or other control characters, no
+    invisible format characters (such as a right-to-left override or a
+    zero-width joiner), no non-breaking spaces and no lone surrogates.
+    """
+    return isinstance(value, str) and value.isprintable()
+
+
+def _realign_finished(job: Dict[str, Any]) -> bool:
+    """True when a job is stored as completed or has reached its repeat limit."""
+    if effective_job_state(job) == "completed":
+        return True
+    repeat = job.get("repeat") or {}
+    times = repeat.get("times")
+    return bool(times and times > 0 and (repeat.get("completed") or 0) >= times)
+
+
+def _realign_reason(job: Any, now_ts: float) -> Tuple[Optional[str], Optional[str]]:
+    """``(reason, None)`` when a saved entry stays as it is, else ``(None, realigned)``.
+
+    Checked in this order: damaged entry, finished, paused, then the
+    schedule and its saved next start.
+    """
+    damage = _realign_damage(job)
+    if damage:
+        return f"damaged entry: {damage}", None
+    if _realign_finished(job):
+        return "finished", None
+    if not is_job_runnable(job):
+        return "paused", None
+    schedule = job.get("schedule")
+    if not isinstance(schedule, dict) or schedule.get("kind") != "cron":
+        return "not a time-of-day schedule", None
+    try:
+        saved_ts = _ensure_aware(datetime.fromisoformat(job.get("next_run_at"))).timestamp()
+    except (TypeError, ValueError):
+        saved_ts = None
+    if saved_ts is None or saved_ts <= now_ts:
+        return "no saved next start in the future", None
+    realigned = compute_next_run(schedule)  # the damage check has shown it gives a start
+    if datetime.fromisoformat(realigned).timestamp() == saved_ts:
+        return "already correct", None
+    return None, realigned
+
+
+def _realign_damaged_row(reason: str) -> Dict[str, Any]:
+    """A damaged entry's row: nothing from inside the entry is passed on."""
+    return {"id": None, "name": None, "status": "damaged", "schedule": None,
+            "before": None, "after": None, "reason": reason}
+
+
+def _realign_row(job: Any, now_ts: float) -> Dict[str, Any]:
+    """One preview row for a saved entry (without its ``position``)."""
+    reason, realigned = _realign_reason(job, now_ts)
+    if reason and reason.startswith("damaged entry"):
+        return _realign_damaged_row(reason)
+    state = effective_job_state(job)
+    return {
+        "id": job.get("id"),
+        "name": job.get("name") or job.get("id"),
+        "status": "active" if state == "scheduled" else state,
+        "schedule": _schedule_display_for_job(job),
+        "before": job.get("next_run_at"),
+        "after": job.get("next_run_at") if reason else realigned,
+        "reason": reason,
+    }
+
+
+def plan_realign_times() -> List[Dict[str, Any]]:
+    """Preview ``hermes cron realign-times``: one row per saved entry, writing nothing.
+
+    The saved list is read exactly as stored: no lock file, no repair, no
+    save. Rows carry ``position`` (the entry's 1-based place in the saved
+    list), ``id``, ``name``, ``status``, ``schedule``, ``before`` (the saved
+    next start), ``after`` and ``reason``. ``reason`` is None exactly for
+    the jobs whose saved next start is wrong; pausing and then resuming such
+    a job saves ``after``. Every other row keeps ``after == before`` and
+    says why the entry is left as it is. A damaged entry's row has status
+    "damaged", a reason starting with "damaged entry" and None for
+    everything else. Raises RuntimeError only when the saved list itself
+    cannot be read.
+    """
+    try:
+        jobs = _peek_jobs_unlocked()  # a plain read: no lock file, no repair
+    except OSError:
+        jobs = None
+    if jobs is None:
+        raise RuntimeError("The saved job list could not be read")
+    now_ts = _hermes_now().timestamp()
+    rows = []
+    for position, job in enumerate(jobs, start=1):
+        try:
+            row = _realign_row(job, now_ts)
+        except Exception:  # one entry never stops the preview
+            row = _realign_damaged_row("damaged entry: cannot be checked")
+        rows.append({"position": position, **row})
+    return rows
 
 
 def mark_job_run(
