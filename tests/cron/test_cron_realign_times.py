@@ -13,8 +13,10 @@ realigned by pausing and resuming it; the preview only says which ones.
 import argparse
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -108,13 +110,17 @@ class _Store:
         self.original = {}
         self.ids = {}
 
-    def save(self, entries):
-        """Write ``entries`` as the saved job list, the way an earlier version saved it."""
+    def save(self, entries, *, escaped=False):
+        """Write ``entries`` as the saved job list, the way an earlier version saved it.
+
+        ``escaped`` writes every non-ASCII character as a JSON escape: the only
+        way a lone surrogate can be saved (the file stays valid UTF-8).
+        """
         self.jobs_file.write_text(
             json.dumps(
                 {"jobs": entries, "updated_at": NOW.astimezone(VIENNA).isoformat()},
                 indent=2,
-                ensure_ascii=False,
+                ensure_ascii=escaped,
             ),
             encoding="utf-8",
         )
@@ -309,6 +315,19 @@ def _without(key):
     return entry
 
 
+PAUSED = {"enabled": False, "state": "paused", "paused_at": "2026-10-19T09:00:00+02:00"}
+# A cron expression the scheduler cannot use damages the entry whatever the
+# job's state; the marker is also in the entry's name and schedule display.
+UNUSABLE_CRON = {
+    **HEALTHY,
+    "schedule": {"kind": "cron", "expr": f"{MARKER} 10 * * 1", "display": f"{MARKER} 10 * * 1"},
+    "schedule_display": f"{MARKER} 10 * * 1",
+}
+# An escaped lone surrogate is not valid text: it cannot be printed at all.
+SURROGATE = "\ud800"
+# Without a top-level display, the preview prints the schedule's own fields.
+NO_DISPLAY = _without("schedule_display")
+
 DAMAGED_SHAPES = [
     pytest.param(MARKER, "not a job record", id="bare-string"),
     pytest.param(7, "not a job record", id="number"),
@@ -347,12 +366,69 @@ DAMAGED_SHAPES = [
         "unreadable cron expression",
         id="cron-expression",
     ),
+    pytest.param({**UNUSABLE_CRON, **PAUSED}, "unreadable cron expression", id="cron-expression-paused"),
+    pytest.param(
+        {**UNUSABLE_CRON, "state": "completed", "enabled": False, "next_run_at": None},
+        "unreadable cron expression",
+        id="cron-expression-completed",
+    ),
+    pytest.param({**UNUSABLE_CRON, "next_run_at": None}, "unreadable cron expression", id="cron-expression-no-next-start"),
+    pytest.param(
+        {**UNUSABLE_CRON, "next_run_at": "2026-10-19T10:00:00+02:00"},
+        "unreadable cron expression",
+        id="cron-expression-past-next-start",
+    ),
+    pytest.param(
+        {**HEALTHY, **PAUSED, "schedule": {"kind": "cron", "expr": "0 0 31 2 *"}, "schedule_display": "0 0 31 2 *"},
+        "unreadable cron expression",
+        id="cron-expression-without-a-start",
+    ),
+    pytest.param({**HEALTHY, "id": f"{DAMAGED_ID}{SURROGATE}"}, "unreadable job ID", id="id-text"),
+    pytest.param({**HEALTHY, "name": f"Weekly {MARKER}{SURROGATE} digest"}, "unreadable name", id="name-text"),
+    pytest.param({**HEALTHY, "state": f"scheduled{SURROGATE}"}, "unreadable state", id="state-text"),
+    pytest.param(
+        {**HEALTHY, "schedule_display": f"0 10 * * 1{SURROGATE}"},
+        "unreadable schedule display",
+        id="schedule-display-text",
+    ),
+    pytest.param(
+        {**NO_DISPLAY, "schedule": {"kind": "cron", "expr": "0 10 * * 1", "display": f"0 10 * * 1{SURROGATE}"}},
+        "unreadable schedule",
+        id="schedule-display-field-text",
+    ),
+    pytest.param(
+        {**NO_DISPLAY, "schedule": {"kind": "cron", "expr": "0 10 * * 1", "value": f"0 10 * * 1{SURROGATE}"}},
+        "unreadable schedule",
+        id="schedule-value-text",
+    ),
+    # Paused, so the expression is shown rather than used to work out a next start.
+    pytest.param(
+        {**NO_DISPLAY, **PAUSED, "schedule": {"kind": "cron", "expr": f"0 10 * * 1{SURROGATE}"}},
+        "unreadable schedule",
+        id="schedule-expr-text",
+    ),
+    pytest.param(
+        {**NO_DISPLAY, "schedule": {"kind": "once", "run_at": f"2026-10-30T09:00:00+01:00{SURROGATE}"}},
+        "unreadable schedule",
+        id="schedule-run-at-text",
+    ),
+    # Each reads as a time, since any character may separate the date from the time.
+    pytest.param(
+        {**HEALTHY, "next_run_at": f"0001-01-01{SURROGATE}00:00:00"},
+        "unreadable next start",
+        id="next-start-text-year-limit",
+    ),
+    pytest.param(
+        {**HEALTHY, "next_run_at": f"2026-10-26{SURROGATE}10:00:00+01:00"},
+        "unreadable next start",
+        id="next-start-text",
+    ),
 ]
 
 
 @pytest.mark.parametrize("entry, cause", DAMAGED_SHAPES)
 def test_preview_lists_a_damaged_entry_without_its_contents(store, capsys, entry, cause):
-    store.save([entry, *store.entries])
+    store.save([entry, *store.entries], escaped=True)
     saved = _file_state(store.jobs_file)
     names = sorted(os.listdir(store.cron_dir))
     rows = jobs.plan_realign_times()
@@ -366,8 +442,81 @@ def test_preview_lists_a_damaged_entry_without_its_contents(store, capsys, entry
     assert code == 0
     assert "Entry 1 in the saved list [damaged]" in out
     assert f"unchanged (damaged entry: {cause}); its contents are not shown" in out
+    for name, job_id in store.ids.items():
+        assert f"{job_id} {name} [" in out
+    assert "Traceback" not in out + err
     assert MARKER not in out + err
     assert f"{len(REALIGNED)} of {len(store.entries) + 1} saved next start(s) differ" in out
+    assert _file_state(store.jobs_file) == saved
+    assert sorted(os.listdir(store.cron_dir)) == names
+
+
+@pytest.mark.parametrize(
+    "fields, reason, after",
+    [
+        pytest.param({}, None, "2026-10-26T10:00:00+01:00", id="active"),
+        pytest.param(PAUSED, "paused", HEALTHY["next_run_at"], id="paused"),
+    ],
+)
+def test_an_expression_the_scheduler_accepts_is_not_damaged(store, fields, reason, after):
+    schedule = {"kind": "cron", "expr": "0 10 * * MON", "display": "0 10 * * MON"}
+    store.save([{**HEALTHY, "schedule": schedule, "schedule_display": "0 10 * * MON", **fields}, *store.entries])
+    row = jobs.plan_realign_times()[0]
+    assert (row["id"], row["schedule"], row["reason"]) == (HEALTHY["id"], "0 10 * * MON", reason)
+    assert (row["before"], row["after"]) == (HEALTHY["next_run_at"], after)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize(
+    "damaged, cause",
+    [
+        pytest.param({**HEALTHY, "name": f"Weekly {MARKER}{SURROGATE} digest"}, "unreadable name", id="name-text"),
+        # At the year limit the preview cannot convert the start, so it would print it as saved.
+        pytest.param(
+            {**HEALTHY, "next_run_at": f"0001-01-01{SURROGATE}00:00:00"},
+            "unreadable next start",
+            id="next-start-text-year-limit",
+        ),
+    ],
+)
+def test_launcher_lists_the_jobs_after_an_entry_with_invalid_text(store, tmp_path, damaged, cause):
+    """The real ``hermes`` launcher, writing strict UTF-8 to pipes.
+
+    It runs on today's clock, so the job after the damaged entry is a paused one.
+    """
+    name = "Paused automation one"
+    job_id = store.ids[name]
+    store.save([damaged, store.original[name]], escaped=True)
+    saved = _file_state(store.jobs_file)
+    names = sorted(os.listdir(store.cron_dir))
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "hermes"), "cron", "realign-times"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "PYTHONIOENCODING": "utf-8",
+            "HERMES_HOME": str(store.home),
+            "HERMES_TIMEZONE": "Europe/Vienna",
+        },
+        cwd=tmp_path,
+        timeout=120,
+    )
+    out, err = result.stdout.decode("utf-8"), result.stderr.decode("utf-8")
+    assert result.returncode == 0, err
+    assert "Entry 1 in the saved list [damaged]" in out
+    assert f"unchanged (damaged entry: {cause}); its contents are not shown" in out
+    block = _block(out, job_id)
+    assert f"{job_id} {name} [paused]" in block
+    assert "Saved next start:  2026-10-21 03:30 (UTC+02:00)" in block
+    assert "unchanged (paused)" in block
+    assert "0 of 2 saved next start(s) differ" in out
+    assert "Traceback" not in out + err
+    assert MARKER not in out + err
+    assert DAMAGED_ID not in out + err
     assert _file_state(store.jobs_file) == saved
     assert sorted(os.listdir(store.cron_dir)) == names
 

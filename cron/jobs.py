@@ -2429,30 +2429,41 @@ def remove_job(job_id: str) -> bool:
 def _realign_damage(job: Any) -> Optional[str]:
     """Why a saved entry cannot be read as a job, or None when it can.
 
-    The cause names the field, never its value.
+    The cause names the field, never its value. Every string the preview
+    can print must be valid text, and a cron expression must be one the
+    scheduler can work out, whatever the job's state.
     """
     if not isinstance(job, dict):
         return "not a job record"
-    if not isinstance(job.get("id"), str) or not job["id"]:
+    if not _realign_is_text(job.get("id")) or not job["id"]:
         return "unreadable job ID"
     for field, label in (("name", "name"), ("schedule_display", "schedule display")):
-        if field in job and not isinstance(job[field], str):
+        if field in job and not _realign_is_text(job[field]):
             return f"unreadable {label}"
     schedule = job.get("schedule")
     if (
         not isinstance(schedule, dict)
         or not isinstance(schedule.get("kind"), str)
         or any(
-            key in schedule and not isinstance(schedule[key], str)
+            key in schedule and not _realign_is_text(schedule[key])
             for key in ("display", "value", "expr", "run_at")
         )
     ):
         return "unreadable schedule"
+    if schedule["kind"] == "cron":
+        if not schedule.get("expr"):
+            return "unreadable cron expression"
+        if _ensure_croniter():  # without croniter no expression can be tried
+            try:
+                compute_next_run(schedule)
+            except Exception:
+                return "unreadable cron expression"
     if "enabled" in job and not isinstance(job["enabled"], bool):
         return "unreadable enabled flag"
-    for field, label in (("state", "state"), ("paused_at", "pause time")):
-        if job.get(field) is not None and not isinstance(job[field], str):
-            return f"unreadable {label}"
+    if job.get("state") is not None and not _realign_is_text(job["state"]):
+        return "unreadable state"
+    if job.get("paused_at") is not None and not isinstance(job["paused_at"], str):
+        return "unreadable pause time"
     repeat = job.get("repeat")
     if repeat is not None and (
         not isinstance(repeat, dict)
@@ -2464,11 +2475,24 @@ def _realign_damage(job: Any) -> Optional[str]:
     ):
         return "unreadable repeat limit"
     if job.get("next_run_at") is not None:
+        if not _realign_is_text(job["next_run_at"]):
+            return "unreadable next start"
         try:
             _ensure_aware(datetime.fromisoformat(job["next_run_at"])).timestamp()
         except (TypeError, ValueError, OverflowError):
             return "unreadable next start"
     return None
+
+
+def _realign_is_text(value: Any) -> bool:
+    """True for a string that is valid text, that is, encodable as UTF-8."""
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:  # a lone surrogate, saved as an escape
+        return False
+    return True
 
 
 def _realign_finished(job: Dict[str, Any]) -> bool:
