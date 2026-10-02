@@ -618,6 +618,77 @@ def cron_notepad(args) -> int:
         return 1
 
 
+def _realign_time_text(value, zone) -> str:
+    """``2026-11-01 10:00 (UTC+01:00)`` in ``zone`` (the server's local time when None)."""
+    from datetime import datetime
+
+    try:
+        text = datetime.fromisoformat(value).astimezone(zone).isoformat(timespec="minutes")
+    except (TypeError, ValueError, OverflowError):
+        return str(value) if value else "none"
+    return f"{text[:10]} {text[11:16]} (UTC{text[16:]})"
+
+
+def cron_realign_times(args) -> int:
+    """Handle ``hermes cron realign-times``: a preview that writes nothing.
+
+    Lists every saved entry with its saved next start and the start worked
+    out in local time. A job marked "needs pause and resume" is realigned
+    by pausing and then resuming it. A damaged entry is listed by its place
+    in the saved list only; its contents are never printed.
+    """
+    import hermes_time
+    from cron import jobs as cron_jobs
+
+    zone = hermes_time.get_timezone()
+
+    def when(value):
+        return _realign_time_text(value, zone)
+
+    try:
+        rows = cron_jobs.plan_realign_times()
+    except RuntimeError:
+        print(color("Cannot preview next starts: the saved job list could not be read.", Colors.RED))
+        return 1
+
+    name = hermes_time.get_timezone_name()
+    if zone is not None:
+        print(f"Times below are in the configured time zone {name}.")
+    else:
+        why = f"the time zone {name!r} is not valid" if name else "no time zone is set"
+        print(f"Times below are in the server's local time ({why}).")
+    print()
+    for row in rows:
+        if row["status"] == "damaged":
+            print(f"  Entry {row['position']} in the saved list [damaged]")
+            print("    " + color(f"unchanged ({row['reason']}); its contents are not shown", Colors.DIM))
+            print()
+            continue
+        if row["reason"] is None:
+            outcome = color("needs pause and resume", Colors.GREEN)
+        else:
+            outcome = color(f"unchanged ({row['reason']})", Colors.DIM)
+        print(f"  {color(str(row['id']), Colors.YELLOW)} {row['name']} [{row['status']}]")
+        print(f"    Schedule:          {row['schedule']}")
+        print(f"    Saved next start:  {when(row['before'])}")
+        print(f"    After realignment: {when(row['after'])} — {outcome}")
+        print()
+    changing = sum(row["reason"] is None for row in rows)
+    print(
+        f"{changing} of {len(rows)} saved next start(s) differ from the fixed calculation. "
+        "Nothing has been written."
+    )
+    if changing:
+        print(color(
+            "To realign a job marked 'needs pause and resume', pause it and then resume it, "
+            "on the Automations page or with hermes cron pause <job> and hermes cron resume <job>. "
+            "Resuming works out its next start again and saves it. "
+            "Leave paused and finished jobs as they are.",
+            Colors.DIM,
+        ))
+    return 0
+
+
 def cron_command(args):
     """Handle cron subcommands."""
     subcmd = getattr(args, 'cron_command', None)
@@ -659,6 +730,9 @@ def cron_command(args):
     if subcmd in {"remove", "rm", "delete"}:
         return _job_action("remove", args.job_id, "Removed")
 
+    if subcmd == "realign-times":
+        return cron_realign_times(args)
+
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick|realign-times]")
     sys.exit(1)
