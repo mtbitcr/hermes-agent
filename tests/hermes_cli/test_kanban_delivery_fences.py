@@ -3,8 +3,9 @@
 Tests 1 to 14 are plan section 8's, adapted as the owner directs: load_policy takes the
 policy text, and the merge reads the security reviewer's own approval (no mirror). The
 four tests after them show owner cases that tests 1 to 14 do not show in full, the next
-four are regressions for the first independent review's findings 1 to 4, and the last is
-the regression for the latest review's finding: an unknown job's unnamed failed step.
+four are regressions for the first independent review's findings 1 to 4, the next is
+the regression for the latest review's finding: an unknown job's unnamed failed step, and the
+last six are regressions for security findings 1 to 6 on pull request 140.
 """
 import ast
 import json
@@ -553,3 +554,88 @@ def test_rerun_refuses_an_unknown_job_whose_failed_step_has_no_name(name):
     bad["steps"][1]["name"] = None
     d = rerun([bad])
     assert (d.allowed, d.code, d.matches) == (False, "not_test_job", [])
+
+
+def test_malformed_facts_refuse_as_invalid_fact():
+    # Security finding 1: a fact without its documented type refuses with invalid_fact instead of passing
+    # as truthy, falsy, equal or distinct. The reviewer's reproductions, fence by fence.
+    for changes in ({"approved_by_review_lane": "false"}, {"reopened_after_approval": None}, {"base": None},
+                    {"reviewer": 1, "implementer": 2}):
+        d = fences.decide_publish(approval(**changes), ledger(), remote())
+        assert (d.allowed, d.code) == (False, "invalid_fact"), changes
+    flaky = slice_job(3, 3, [FLAKY_46])
+    for head, jobs, reruns in ((H, [{**flaky, "run_attempt": True}], []),
+                               (H, [{**flaky, "run_attempt": 1.0}], []),
+                               (H, [flaky], {}),
+                               (H, [{**flaky, "failed_tests": {FLAKY_46: None}, "failed_count": 1}], []),
+                               (None, [{**flaky, "head_sha": None}], [])):
+        d = fences.decide_rerun(policy(), PLATFORM, head, jobs, {"reruns": reruns})
+        assert (d.allowed, d.code) == (False, "invalid_fact"), (head, jobs, reruns)
+    d = fences.decide_lens_request(None, None, [evidence(1, head=None)], [], "reviewer-profile", "worker-profile")
+    assert (d.allowed, d.code) == (False, "invalid_fact")
+    null_heads = [{**verdict, "head": None} for verdict in LENSES]
+    d = fences.decide_merge(policy(), PLATFORM, None, pr(head=None, ledger_head=None),
+                            checks(check_run(head_sha=None)), null_heads,
+                            [review(10, "APPROVED", commit_id=None)], SECURITY)
+    assert (d.allowed, d.code) == (False, "invalid_fact")
+    first, second = LENSES
+    for d in (merge(verdicts=[{**first, "lens": None}, {**second, "lens": ""}]),
+              merge(check_facts=checks(check_run(), total_count=True)),
+              merge(reviews=[review(10, "APPROVED", login=7)], security_reviewer=7)):
+        assert (d.allowed, d.code) == (False, "invalid_fact")
+
+
+def test_latest_record_selection_needs_unique_int_ids():
+    # Security finding 2: the latest evidence, review or status is chosen by id only among unique positive
+    # int ids; a str id ("9" sorts after "10") or a tie refuses with invalid_fact.
+    for records in ([evidence("9"), rerun_record("10")], [evidence(5), rerun_record(5)]):
+        d = lens_request(records)
+        assert (d.allowed, d.code) == (False, "invalid_fact"), records
+    d = merge(reviews=[review("9", "APPROVED"), review("10", "CHANGES_REQUESTED")])
+    assert (d.allowed, d.code) == (False, "invalid_fact")
+    d = merge(check_facts=checks(statuses=[status("9", "success"), status("10", "failure")]))
+    assert (d.allowed, d.code) == (False, "invalid_fact")
+
+
+def test_lens_request_needs_sha256_digests():
+    # Security finding 3: equal digests prove a re-read only as two 64-character lowercase hex SHA-256 strings.
+    for digest in (1, "not-a-digest", DIGEST.upper()):
+        d = lens_request([evidence(1, digest=digest, reread_digest=digest)])
+        assert (d.allowed, d.code) == (False, "evidence_unverified"), digest
+
+
+def test_check_kind_comes_from_its_list():
+    # Security finding 4: a check run is classified as a run and a legacy status as a status, by the list
+    # each came in, whatever other fields it carries.
+    in_progress = without(check_run(status="in_progress", state="success"), "conclusion")
+    d = merge(check_facts=checks(in_progress))
+    assert (d.allowed, d.code) == (False, "check_pending")
+    contradictory = {**status(1, "failure"), "conclusion": "success", "status": "completed"}
+    d = merge(check_facts=checks(statuses=[contradictory]))
+    assert (d.allowed, d.code) == (False, "check_failure")
+
+
+def test_summary_check_is_a_summary_only_when_its_evaluate_step_failed():
+    # Security finding 5: failed at "Set up job", the summary check is one more failed job and refuses the
+    # rerun; failed at its "Evaluate job results" step it still summarises the eligible slices.
+    flaky = slice_job(3, 3, [FLAKY_46])
+    setup = job(99, GATE, "failure", steps=[{"name": "Set up job", "conclusion": "failure"}])
+    d = rerun([flaky, setup])
+    assert (d.allowed, d.code, d.matches) == (False, "not_test_job", [])
+    evaluate = job(99, GATE, "failure", steps=[{"name": "Set up job", "conclusion": "success"},
+                                               {"name": "Evaluate job results", "conclusion": "failure"}])
+    d = rerun([flaky, evaluate])
+    assert (d.allowed, d.code) == (True, "rerun")
+
+
+def test_merge_after_a_rerun_needs_required_checks_from_a_later_attempt():
+    # Security finding 6: after H's rerun the caller passes the rerun attempt number; a required check run
+    # then counts only from a later attempt, so an old success re-read under later evidence is stale.
+    for run, outcome in ((check_run(run_attempt=1), (False, "check_stale")),
+                         (check_run(), (False, "invalid_fact")),
+                         (check_run(run_attempt=True), (False, "invalid_fact")),
+                         (check_run(run_attempt=2), (True, "merge"))):
+        facts = checks(run, evidence_id=20, last_rerun_id=10)
+        d = fences.decide_merge(policy(), PLATFORM, H, pr(), facts, list(LENSES), [review(10, "APPROVED")],
+                                SECURITY, rerun_attempt=1)
+        assert (d.allowed, d.code) == outcome, run
