@@ -13,7 +13,7 @@ instead of the one running the release.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from hermes_cli.release_guards import (
@@ -74,10 +74,15 @@ class ReleaseHost(HostReader, Protocol):
 
 @dataclass(frozen=True)
 class Readback:
-    """What one readback saw, checked against the version the host should now be running."""
+    """What one readback saw, checked against the version the host should now be running.
+
+    A read that raises fails its check; `errors` keeps its cause, "Type: message", under the
+    check's name, as evidence for the release journal and the operator.
+    """
 
     expected: str
     checks: Mapping[str, bool]
+    errors: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -212,18 +217,28 @@ def _read_back(
     host: ReleaseHost, expected: str, steps: list[str], readbacks: list[Readback]
 ) -> Readback:
     steps.append("readback")
-    readback = Readback(
-        expected, {name: _holds(check, host, expected) for name, check in READBACKS}
-    )
+    errors: dict[str, str] = {}
+    checks = {name: _holds(name, check, host, expected, errors) for name, check in READBACKS}
+    readback = Readback(expected, checks, errors)
     readbacks.append(readback)
     return readback
 
 
-def _holds(check: Callable[[ReleaseHost, str], bool], host: ReleaseHost, expected: str) -> bool:
-    """A read that raises counts as a failed check, so it can neither pass nor skip a readback."""
+def _holds(
+    name: str,
+    check: Callable[[ReleaseHost, str], bool],
+    host: ReleaseHost,
+    expected: str,
+    errors: dict[str, str],
+) -> bool:
+    """A read that raises counts as a failed check, so it can neither pass nor skip a readback.
+
+    Its cause goes into `errors` under the check's name.
+    """
     try:
         return check(host, expected)
-    except Exception:
+    except Exception as error:
+        errors[name] = f"{type(error).__name__}: {error}"
         return False
 
 

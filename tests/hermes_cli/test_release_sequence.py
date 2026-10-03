@@ -218,7 +218,7 @@ def test_tier0_goes_forward_only():
 
 
 @pytest.mark.parametrize(
-    ("host_setup", "steps", "outcome", "failed_checks", "errors"),
+    ("host_setup", "steps", "outcome", "failed_checks", "errors", "read_errors"),
     [
         pytest.param(
             {"will_not_start": {NEW}},
@@ -226,6 +226,7 @@ def test_tier0_goes_forward_only():
             "restored",
             [],
             (f"RuntimeError: units failed to start on {NEW}",),
+            {},
             id="new-version-will-not-start",
         ),
         pytest.param(
@@ -234,7 +235,17 @@ def test_tier0_goes_forward_only():
             "restored",
             [],
             ("OSError: no space left for the state snapshot",),
+            {},
             id="snapshot-fails",
+        ),
+        pytest.param(
+            {"health_unanswered": {NEW}},
+            RESTORE_AFTER_FORWARD,
+            "restored",
+            [],
+            (f"ReadbackFailed: R4 did not hold on {NEW}",),
+            {0: {"R4": f"ConnectionError: health endpoint did not answer on {NEW}"}},
+            id="forward-readback-read-raises",
         ),
         pytest.param(
             {"workspace_ok": False},
@@ -242,6 +253,7 @@ def test_tier0_goes_forward_only():
             "failed",
             ["R6"],
             (f"ReadbackFailed: R6 did not hold on {NEW}",),
+            {},
             id="readback-after-restore-fails-too",
         ),
         # In the cases below NEW is unhealthy, so the readback after forward starts the restore,
@@ -256,6 +268,7 @@ def test_tier0_goes_forward_only():
                 f"ReadbackFailed: R4 did not hold on {NEW}",
                 f"RuntimeError: units did not stop on {NEW}",
             ),
+            {},
             id="recovery-stop-fails",
         ),
         pytest.param(
@@ -267,6 +280,7 @@ def test_tier0_goes_forward_only():
                 f"ReadbackFailed: R4 did not hold on {NEW}",
                 f"OSError: checkout of {PREV} failed",
             ),
+            {},
             id="recovery-checkout-fails",
         ),
         pytest.param(
@@ -278,6 +292,7 @@ def test_tier0_goes_forward_only():
                 f"ReadbackFailed: R4, configuration did not hold on {NEW}",
                 "OSError: the named configuration snapshot could not be copied back",
             ),
+            {},
             id="recovery-config-restore-fails",
         ),
         pytest.param(
@@ -289,6 +304,7 @@ def test_tier0_goes_forward_only():
                 f"ReadbackFailed: R4 did not hold on {NEW}",
                 f"RuntimeError: units failed to start on {PREV}",
             ),
+            {},
             id="recovery-prev-start-fails",
         ),
         pytest.param(
@@ -297,6 +313,7 @@ def test_tier0_goes_forward_only():
             "failed",
             ["R4"],
             (f"ReadbackFailed: R4 did not hold on {NEW}",),
+            {-1: {"R4": f"ConnectionError: health endpoint did not answer on {PREV}"}},
             id="recovery-readback-read-raises",
         ),
         pytest.param(
@@ -306,12 +323,13 @@ def test_tier0_goes_forward_only():
             "failed",
             ["configuration"],
             (f"ReadbackFailed: R4 did not hold on {NEW}",),
+            {},
             id="config-drifts-when-prev-starts",
         ),
     ],
 )
 def test_failure_after_cutover_restores_previous_and_reads_back(
-    host_setup, steps, outcome, failed_checks, errors
+    host_setup, steps, outcome, failed_checks, errors, read_errors
 ):
     host = FakeHost(**host_setup)
 
@@ -325,6 +343,9 @@ def test_failure_after_cutover_restores_previous_and_reads_back(
     assert [name for name, ok in readback.checks.items() if not ok] == failed_checks
     # The failure that started the restore comes first, then every failure inside the restore.
     assert (result.error, *result.restore_errors) == errors
+    # A read that raised fails its check, and the readback it ran in keeps its cause by check
+    # name. read_errors names each such readback by its index in readbacks.
+    assert {index: result.readbacks[index].errors for index in read_errors} == read_errors
     # A restored result holds for the host itself, not only for its readback.
     if outcome == "restored":
         assert (host.head, host.running, host.config) == (PREV, PREV, PREV_CONFIG)
