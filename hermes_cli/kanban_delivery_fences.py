@@ -13,9 +13,11 @@ from dataclasses import dataclass, field
 from hermes_cli.kanban_pr_acceptance import _classify
 
 # The owner keeps these out of the policy file; each is the CI's literal text, so a renamed
-# job or a new slice count is refused until a reviewed change updates it here.
+# job or a new slice count is refused until a reviewed change updates it here. The jobs API
+# names a called workflow's job "<calling job> / <called job>": tests.yml's slices carry
+# ci.yaml's "Python tests" prefix, their steps and ci.yaml's own summary job carry none.
 SUMMARY_CHECK = "All required checks pass"
-TEST_JOB_STEPS = {f"Run tests slice {n}/12": f"Run tests (slice {n}/12)" for n in range(1, 13)}
+TEST_JOB_STEPS = {f"Python tests / Run tests slice {n}/12": f"Run tests (slice {n}/12)" for n in range(1, 13)}
 # The plan names no lenses, only "both lens verdicts", so the merge counts distinct lenses on H.
 LENS_COUNT = 2
 
@@ -188,7 +190,10 @@ def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger:
     if head in ledger["reruns"] or any(job["run_attempt"] > 1 for job in jobs):
         return _refuse("rerun_used", "H already had its one rerun")
     # Owner decision 2: the summary check is a summary only beside other failed jobs that are all
-    # eligible. It is then not rerun itself; GitHub reruns it after the jobs it waits on.
+    # eligible. It is then not rerun itself; GitHub reruns it after the jobs it waits on. Only its
+    # ordinary failure summarises them: a cancelled, timed-out, missing or unknown end stops.
+    if any(job["conclusion"] != "failure" for job in failed if job["name"] == SUMMARY_CHECK):
+        return _refuse("summary_not_failure", "the summary check ended in something other than failure")
     others = [job for job in failed if job["name"] != SUMMARY_CHECK]
     if not others:
         return _refuse("summary_failed_alone", "the summary check failed and no other job did")
@@ -254,10 +259,14 @@ def decide_merge(policy: Policy, repo: str, head: str, pr: dict, checks: dict, v
     """T6: may the pull request be merged at exactly H?
 
     pr: state, merged, head, ledger_head, mergeable, mergeable_state. checks: GitHub's latest
-    check runs and legacy statuses for H after the last rerun, {total_count, check_runs,
-    statuses}. verdicts: lens verdicts [{lens, head, verdict}]. github_reviews: the pull
-    request's reviews as GitHub returns them. security_reviewer: the security reviewer's GitHub
-    login; the plan does not say who supplies it, so a missing one refuses.
+    check runs and legacy statuses for H, {total_count, check_runs, statuses}, every one on H,
+    with two kernel record ids: evidence_id (the check evidence they were recorded under) and
+    last_rerun_id (the last rerun recorded for H, None when H was never rerun; required).
+    verdicts: lens verdicts [{id, lens, head, verdict}], id being the verdict's kernel record
+    id. As in decide_lens_request, a larger id was recorded later: the evidence must follow the
+    last rerun, and every approval for H the evidence. github_reviews: the pull request's
+    reviews as GitHub returns them. security_reviewer: the security reviewer's GitHub login;
+    the plan does not say who supplies it, so a missing one refuses.
     """
     if repo not in policy.required_checks:
         return _refuse("unknown_repository", "the policy has no entry for this repository")
@@ -269,13 +278,27 @@ def decide_merge(policy: Policy, repo: str, head: str, pr: dict, checks: dict, v
         return _refuse("head_moved", f"the pull request head and the ledger head are not both {head}")
     if len({run["id"] for run in checks["check_runs"]}) != checks["total_count"]:
         return _refuse("incomplete_checks", "the check runs read do not match GitHub's total_count")
+    # Section 4 binds every check read to H, required or not, its head read as _classify reads it.
+    supplied = [*checks["check_runs"], *checks["statuses"]]
+    if any(check.get("head_sha", check.get("sha")) != head for check in supplied):
+        return _refuse("check_stale", f"a check run or status read is not on {head}")
+    # Only an explicit None says H was never rerun; a missing last_rerun_id proves nothing.
+    evidence_id, last_rerun_id = checks.get("evidence_id"), checks.get("last_rerun_id", False)
+    if type(evidence_id) is not int or not (last_rerun_id is None or type(last_rerun_id) is int):
+        return _refuse("order_unproven", "the check evidence or the last rerun has no kernel record id")
+    if last_rerun_id is not None and evidence_id <= last_rerun_id:
+        return _refuse("evidence_before_rerun", "H was rerun after its check evidence was recorded")
     for name in policy.required_checks[repo]:
         outcome = _required_check(name, head, checks)
         if outcome != "success":
             return _refuse(f"check_{outcome}", f"required check {name!r} is {outcome} for H")
     on_head = [verdict for verdict in verdicts if verdict["head"] == head]
+    if any(type(verdict.get("id")) is not int for verdict in on_head):
+        return _refuse("order_unproven", "a lens verdict for H has no kernel record id")
     if any(verdict["verdict"] != "approve" for verdict in on_head):
         return _refuse("changes_verdict", "a lens verdict for H is not approve")
+    if any(verdict["id"] <= evidence_id for verdict in on_head):
+        return _refuse("verdict_before_evidence", "a lens approval for H was recorded before its check evidence")
     if len({verdict["lens"] for verdict in on_head}) != LENS_COUNT:
         return _refuse("lens_approval_missing", f"H lacks approve verdicts from {LENS_COUNT} distinct lenses")
     if not security_reviewer:

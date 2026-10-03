@@ -2,7 +2,8 @@
 
 Tests 1 to 14 are plan section 8's, adapted as the owner directs: load_policy takes the
 policy text, and the merge reads the security reviewer's own approval (no mirror). The
-last four tests show owner cases that tests 1 to 14 do not show in full.
+four tests after them show owner cases that tests 1 to 14 do not show in full, and the
+last four are regressions for the independent review's findings 1 to 4.
 """
 import ast
 import json
@@ -32,8 +33,9 @@ POLICY_TEXT = json.dumps({
         {"test": FLAKY_46, "finding": 46}, {"test": FLAKY_100, "finding": 100}]},
     WORKSPACE: {"required_checks": ["quality"], "flaky_tests": []},
 })
-LENSES = ({"lens": "first-lens", "head": H, "verdict": "approve"},
-          {"lens": "second-lens", "head": H, "verdict": "approve"})
+# Kernel record ids order the merge facts: H's check evidence (20, see checks) precedes both approvals.
+LENSES = ({"id": 30, "lens": "first-lens", "head": H, "verdict": "approve"},
+          {"id": 31, "lens": "second-lens", "head": H, "verdict": "approve"})
 
 
 def policy():
@@ -67,7 +69,8 @@ def slice_job(job_id, n, tests, failed_count=None, step=None):
     steps = [{"name": "Checkout code", "conclusion": "success"},
              {"name": step or f"Run tests (slice {n}/12)", "conclusion": "failure"},
              {"name": "Upload per-slice durations", "conclusion": "skipped"}]
-    return job(job_id, f"Run tests slice {n}/12", "failure", steps=steps, failed_tests=list(tests),
+    # The jobs API names a called workflow's job "<calling job> / <called job>" (review finding 1).
+    return job(job_id, f"Python tests / Run tests slice {n}/12", "failure", steps=steps, failed_tests=list(tests),
                failed_count=len(tests) if failed_count is None else failed_count)
 
 
@@ -102,9 +105,14 @@ def status(status_id, state):
     return {"id": status_id, "context": GATE, "state": state, "sha": H}
 
 
-def checks(*runs, statuses=(), total_count=None):
+def checks(*runs, statuses=(), total_count=None, evidence_id=20, last_rerun_id=None):
     return {"total_count": len(runs) if total_count is None else total_count,
-            "check_runs": list(runs), "statuses": list(statuses)}
+            "check_runs": list(runs), "statuses": list(statuses),
+            "evidence_id": evidence_id, "last_rerun_id": last_rerun_id}
+
+
+def without(facts, key):
+    return {name: value for name, value in facts.items() if name != key}
 
 
 def review(review_id, state, commit_id=H, login=SECURITY):
@@ -258,7 +266,7 @@ def test_rerun_gate_job_follows_the_owner_decision():
     d = rerun([slice_job(3, 3, [FLAKY_46]), slice_job(7, 7, [FLAKY_100]), job(99, GATE, "failure")])
     assert (d.allowed, d.code) == (True, "rerun")
     assert {match["job_id"] for match in d.matches} == {3, 7}
-    d = rerun([job(3, "Run tests slice 3/12"), job(99, GATE, "failure")])
+    d = rerun([job(3, "Python tests / Run tests slice 3/12"), job(99, GATE, "failure")])
     assert (d.allowed, d.code, d.matches) == (False, "summary_failed_alone", [])
 
 
@@ -404,7 +412,7 @@ def test_fences_have_no_io():
 
 
 def test_summary_check_failing_alone_stops_the_flow():
-    d = rerun([job(3, "Run tests slice 3/12"), job(5, "Python lints"), job(99, GATE, "failure")])
+    d = rerun([job(3, "Python tests / Run tests slice 3/12"), job(5, "Python lints"), job(99, GATE, "failure")])
     assert (d.allowed, d.code, d.matches) == (False, "summary_failed_alone", [])
     d = merge(check_facts=checks(check_run(99, conclusion="failure")))
     assert (d.allowed, d.code) == (False, "check_failure")
@@ -447,3 +455,85 @@ def test_a_test_not_in_the_policy_is_never_flaky():
     assert (d.allowed, d.code) == (False, "not_flaky")
     d = rerun([slice_job(3, 3, [FLAKY_46])], repo="mtbitcr/unlisted-repo")
     assert (d.allowed, d.code) == (False, "unknown_repository")
+
+
+def test_rerun_knows_test_slices_by_the_job_names_github_reports():
+    # Finding 1: ci.yaml's "Python tests" job calls tests.yml, so the jobs API reports each slice as
+    # "Python tests / Run tests slice N/12", while its test step keeps the name "Run tests (slice N/12)".
+    live = slice_job(3, 3, [FLAKY_46])
+    assert (live["name"], live["steps"][1]["name"]) == ("Python tests / Run tests slice 3/12", "Run tests (slice 3/12)")
+    d = rerun([live, job(99, GATE, "failure")])
+    assert (d.allowed, d.code) == (True, "rerun")
+    assert d.matches == [{"job_id": 3, "test": FLAKY_46, "list_entry": {"test": FLAKY_46, "finding": 46}}]
+    for n in range(1, 13):
+        assert rerun([slice_job(n, n, [FLAKY_100])]).allowed, n
+    # Every other name is an unknown job, the bare called-job name included.
+    for name in ("Run tests slice 3/12", "Python tests / Generate slices", "OS-specific tests / Windows-only tests",
+                 "Python tests / Run tests slice 13/12", "Python tests / Run tests slice 3/8"):
+        d = rerun([{**live, "name": name}, job(99, GATE, "failure")])
+        assert (d.allowed, d.code, d.matches) == (False, "not_test_job", []), name
+    # Under its full name a slice still has to fail at its own test step and nowhere else.
+    for step in ("Install dependencies", "Run tests (slice 4/12)", "Python tests / Run tests (slice 3/12)"):
+        d = rerun([slice_job(3, 3, [FLAKY_46], step=step), job(99, GATE, "failure")])
+        assert (d.allowed, d.code, d.matches) == (False, "not_test_job", []), step
+
+
+def test_summary_check_counts_only_when_it_ended_in_failure():
+    # Finding 2: only the summary job's ordinary failure summarises the jobs it waits on; any other
+    # end refuses the rerun, beside an eligible slice or alone.
+    flaky, passed = slice_job(3, 3, [FLAKY_46]), job(3, "Python tests / Run tests slice 3/12")
+    for conclusion in ("cancelled", "timed_out", "action_required", "startup_failure", "stale", None, "unknown"):
+        decisions = [rerun([other, job(99, GATE, conclusion)]) for other in (flaky, passed)]
+        assert [(d.allowed, d.code, d.matches) for d in decisions] == [(False, "summary_not_failure", [])] * 2, conclusion
+    d = rerun([flaky, job(99, GATE, "failure")])
+    assert (d.allowed, d.code) == (True, "rerun")
+
+
+def test_merge_follows_the_kernel_record_order():
+    # Finding 3: kernel record ids order the facts, as in decide_lens_request; a larger id is later.
+    first, second = LENSES
+    # The last rerun (10), then the check evidence (20), then both approvals (30 and 31).
+    d = merge(check_facts=checks(check_run(), evidence_id=20, last_rerun_id=10))
+    assert (d.allowed, d.code) == (True, "merge")
+    # The reviewer's two reproductions: approvals before the evidence, and evidence before the rerun.
+    early = [{**verdict, "id": 10, "evidence_id": 5} for verdict in LENSES]
+    d = merge(check_facts=checks(check_run(), evidence_id=30, last_rerun_id=20), verdicts=early)
+    assert (d.allowed, d.code) == (False, "verdict_before_evidence")
+    d = merge(check_facts=checks(check_run(), evidence_id=10, last_rerun_id=20),
+              verdicts=[{**verdict, "id": 30} for verdict in LENSES])
+    assert (d.allowed, d.code) == (False, "evidence_before_rerun")
+    d = merge(check_facts=checks(check_run(), evidence_id=20, last_rerun_id=20))
+    assert (d.allowed, d.code) == (False, "evidence_before_rerun")
+    for verdicts in ([first, {**second, "id": 15}], [{**first, "id": 20}, second]):
+        d = merge(verdicts=verdicts)
+        assert (d.allowed, d.code) == (False, "verdict_before_evidence"), verdicts
+    # Missing ordering facts, or ids that are not ints, prove no order; a bool is not an int.
+    facts = checks(check_run())
+    unproven = [without(facts, "evidence_id"), without(facts, "last_rerun_id")]
+    unproven += [{**facts, "evidence_id": value} for value in (None, "20", 20.0, True)]
+    unproven += [{**facts, "last_rerun_id": value} for value in ("10", 10.0, False, True)]
+    for check_facts in unproven:
+        d = merge(check_facts=check_facts)
+        assert (d.allowed, d.code) == (False, "order_unproven"), check_facts
+    for verdict in (without(second, "id"), {**second, "id": None}, {**second, "id": "31"}, {**second, "id": True}):
+        d = merge(verdicts=[first, verdict])
+        assert (d.allowed, d.code) == (False, "order_unproven"), verdict
+    # A verdict for another head is not one for H, so it needs no place in H's order.
+    assert merge(verdicts=[*LENSES, {**without(second, "id"), "head": OLD}]).allowed
+
+
+def test_merge_refuses_a_check_on_another_head_whatever_its_name():
+    # Finding 4: section 4 binds every check read to H, not only the checks the policy requires.
+    lint_status = {"id": 5, "context": "Python lints", "state": "success", "sha": H}
+    d = merge(check_facts=checks(check_run(), check_run(2, name="Python lints"), statuses=[lint_status]))
+    assert (d.allowed, d.code) == (True, "merge")
+    # The reviewer's reproduction first; a head is read as _classify reads it (head_sha, else sha).
+    foreign = [checks(check_run(), check_run(2, name="Python lints", head_sha=OLD)),
+               checks(check_run(), check_run(2, name="Python lints", head_sha=None)),
+               checks(check_run(), without(check_run(2, name="Python lints"), "head_sha")),
+               checks(check_run(), statuses=[{**lint_status, "sha": OLD}]),
+               checks(check_run(), statuses=[without(lint_status, "sha")]),
+               checks(statuses=[{**status(1, "success"), "sha": OLD}, status(2, "success")])]
+    for facts in foreign:
+        d = merge(check_facts=facts)
+        assert (d.allowed, d.code) == (False, "check_stale"), facts
