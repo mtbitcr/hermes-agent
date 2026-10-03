@@ -504,7 +504,7 @@ def test_readback_is_one_snapshot_under_a_concurrent_merge(open_ledger):
 
 # The second security review (2026-10-03): the module reads and writes only its own store.
 _PUBLIC = ("record_merge", "decide_release", "list_batches", "reminder_due", "record_reminder")
-_NOT_OWN_STORE = ("copy", "memory", "attached")
+_NOT_OWN_STORE = ("copy", "memory", "attached", "temp", "forged-rows")
 
 
 def _public_call(name: str, batch):
@@ -519,10 +519,18 @@ def _public_call(name: str, batch):
     }[name]
 
 
+def _claim_own_path(cursor, row):
+    """A row factory that reports the own store's path for the main database."""
+    if len(row) == 3 and row[1] == "main":
+        return (row[0], row[1], str(ledger.ledger_path()))
+    return sqlite3.Row(cursor, row)
+
+
 def _not_own_store(kind: str, tmp_path: Path) -> sqlite3.Connection:
-    """A byte copy of the store at another path, an in-memory database, or the
-    store itself with another database attached."""
-    if kind == "copy":
+    """A byte copy of the store at another path, an in-memory database, the store
+    with another database attached, the store with temporary tables that shadow
+    its own, or a copy whose row factory reports the own store's path."""
+    if kind in ("copy", "forged-rows"):
         copy = tmp_path / "copy" / ledger.STORE_NAME
         copy.parent.mkdir()
         shutil.copyfile(ledger.ledger_path(), copy)
@@ -531,8 +539,18 @@ def _not_own_store(kind: str, tmp_path: Path) -> sqlite3.Connection:
         conn = sqlite3.connect(":memory:", isolation_level=None)
     else:
         conn = ledger.connect()
+    if kind == "attached":
         conn.execute("ATTACH DATABASE ? AS other", (str(tmp_path / "other.db"),))
-    conn.row_factory = sqlite3.Row
+    if kind == "temp":
+        names = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM main.sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite%'"
+            )
+        ]
+        for name in names:
+            conn.execute(f'CREATE TEMP TABLE "{name}" AS SELECT * FROM main."{name}" WHERE 0')
+    conn.row_factory = _claim_own_path if kind == "forged-rows" else sqlite3.Row
     return conn
 
 
@@ -551,3 +569,49 @@ def test_connection_other_than_the_own_store_is_refused(open_ledger, tmp_path, n
     finally:
         other.close()
     assert _store_rows(own) == own_before
+
+
+class _Disguised(str):
+    """Text whose characters pass a check while SQLite stores another value."""
+
+    def __conform__(self, protocol):
+        return self.stored
+
+
+def _disguised(text: str, stored: str) -> str:
+    value = _Disguised(text)
+    value.stored = stored
+    return value
+
+
+# The third security review (2026-10-03): only exact str values are accepted.
+@pytest.mark.parametrize("case", ("decision", "shown_digest", "pr_url"))
+def test_text_that_is_not_exactly_str_is_refused(open_ledger, case):
+    conn = open_ledger()
+    batch = _merge(conn, "a")["batch"]
+    before = _store_rows(conn)
+
+    with pytest.raises(ValueError):
+        if case == "pr_url":
+            ledger.record_merge(
+                conn,
+                merge_commit=_commit("b"),
+                pr_url=_disguised("https://github.com/mtbitcr/hermes-agent/pull/2", "https://example.invalid/pull/2"),
+                reviewed_base=_commit("b-base"),
+                reviewed_head=_commit("b-head"),
+                reviewed_tree=_commit("b-tree"),
+                tier=1,
+                card_id="t_0badc0de",
+                on_main=True,
+            )
+        else:
+            ledger.decide_release(
+                conn,
+                batch["batch_id"],
+                decision=_disguised("deferred", "rejected") if case == "decision" else "accepted",
+                shown_digest=_disguised(batch["digest"], "f" * 64) if case == "shown_digest" else batch["digest"],
+                expected_version=batch["version"],
+                decision_ref=PAGE_REF,
+            )
+
+    assert _store_rows(conn) == before
