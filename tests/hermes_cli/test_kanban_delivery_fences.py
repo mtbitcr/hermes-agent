@@ -858,3 +858,17 @@ def test_merge_after_a_rerun_refuses_without_the_rerun_attempt():
     d = fences.decide_merge(policy(), PLATFORM, H, pr(), facts, list(LENSES), [review(10, "APPROVED")], SECURITY)
     assert (d.allowed, d.code) == (False, "invalid_fact")
     assert "rerun_attempt" in d.detail
+
+
+def test_merge_after_a_rerun_needs_a_check_run_for_every_required_check():
+    # Second security review of PR 140: a legacy status carries no attempt, so after a rerun a required
+    # check counts only through a check run from a later attempt.
+    lint = check_run(2, name="Python lints", run_attempt=2)
+    facts = checks(lint, statuses=[status(5, "success")], evidence_id=20, last_rerun_id=10)
+    d = fences.decide_merge(policy(), PLATFORM, H, pr(), facts, list(LENSES), [review(10, "APPROVED")],
+                            SECURITY, rerun_attempt=1)
+    assert (d.allowed, d.code) == (False, "check_stale")
+    # Control: without a rerun the legacy status still decides as before.
+    facts = checks(check_run(2, name="Python lints"), statuses=[status(5, "success")], evidence_id=20)
+    d = fences.decide_merge(policy(), PLATFORM, H, pr(), facts, list(LENSES), [review(10, "APPROVED")], SECURITY)
+    assert (d.allowed, d.code) == (True, "merge")
