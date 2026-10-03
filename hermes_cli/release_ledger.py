@@ -155,6 +155,7 @@ def record_merge(
     Returns ``recorded`` (False for a repeat), the ``member`` row and the
     ``batch`` it belongs to, read back after the write.
     """
+    _own_store(conn)
     if on_main is not True:
         raise ValueError("on_main must be True: the merge step's confirmation that merge_commit is on main")
     for name, value in (
@@ -234,6 +235,7 @@ def decide_release(
     Returns the batch read back after the decision: on Accept, its frozen
     member list and digest.
     """
+    _own_store(conn)
     _refuse_worker_context()
     if decision not in _DECISIONS:
         raise ValueError("a release decision is 'accepted' or 'deferred'; there is no reject")
@@ -275,6 +277,7 @@ def decide_release(
 def list_batches(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """Every batch, oldest first, each with its members in merge order, all read
     from one snapshot."""
+    _own_store(conn)
     with _read_txn(conn):
         ids = [row["id"] for row in conn.execute("SELECT id FROM release_batches ORDER BY id").fetchall()]
         return [_snapshot(conn, batch_id) for batch_id in ids]
@@ -299,6 +302,7 @@ def reminder_due_at(now: datetime, *, waiting: bool, last_reminder_day: Optional
 def reminder_due(conn: sqlite3.Connection, now: datetime) -> bool:
     """Apply :func:`reminder_due_at` to the record. An open or a put-off batch
     waits (owner decision 3); an accepted one does not."""
+    _own_store(conn)
     waiting = conn.execute(f"SELECT 1 FROM release_batches WHERE {_WAITING_SQL} LIMIT 1").fetchone()
     (last_day,) = conn.execute("SELECT MAX(vienna_date) FROM release_reminders").fetchone()
     return reminder_due_at(
@@ -310,6 +314,7 @@ def reminder_due(conn: sqlite3.Connection, now: datetime) -> bool:
 
 def record_reminder(conn: sqlite3.Connection, now: datetime) -> str:
     """Record that the reminder went out on ``now``'s Vienna day; returns that day."""
+    _own_store(conn)
     day = _in_vienna(now).date().isoformat()
     with write_txn(conn):
         conn.execute(
@@ -317,6 +322,19 @@ def record_reminder(conn: sqlite3.Connection, now: datetime) -> str:
             (day, int(now.timestamp())),
         )
     return day
+
+
+def _own_store(conn: sqlite3.Connection) -> None:
+    """Refuse a connection to any database other than this module's own store.
+
+    The main database must be the file of :func:`ledger_path`, and no other
+    database may be attached, so no row goes to another store.
+    """
+    databases = {row[1]: row[2] for row in conn.execute("PRAGMA database_list")}
+    main = databases.pop("main", "")
+    databases.pop("temp", None)
+    if databases or not main or os.path.realpath(main) != os.path.realpath(ledger_path()):
+        raise PermissionError("the release record works only on a connection to its own store")
 
 
 def _refuse_worker_context() -> None:
