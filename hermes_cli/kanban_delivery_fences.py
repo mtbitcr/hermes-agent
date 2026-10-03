@@ -73,8 +73,8 @@ def _is_positive_int(value: object) -> bool:
     return type(value) is int and value >= 1
 
 
-def _has_unique_ids(records: list[dict]) -> bool:
-    ids = [record.get("id") for record in records]
+def _has_unique_ids(records: list[dict], key: str = "id") -> bool:
+    ids = [record.get(key) for record in records]
     return all(_is_positive_int(record_id) for record_id in ids) and len(set(ids)) == len(ids)
 
 
@@ -84,13 +84,25 @@ def _is_sha(value: object) -> bool:
 
 
 def _is_text(value: object) -> bool:
-    # Identities and lens names.
+    # Identities, lens names and the other documented strs: names, contexts, states and conclusions.
     return isinstance(value, str) and value != ""
 
 
 def _is_digest(value: object) -> bool:
     # Owner rule 5: a SHA-256 digest is 64 lowercase hex characters before any comparison.
     return isinstance(value, str) and _DIGEST.fullmatch(value) is not None
+
+
+def _shape(name: str, value: object, keys: str = ""):
+    # Collections: a documented list is a list, and a documented record a dict holding every
+    # documented key (keys), so no tuple, mapping or missing key passes for one. Yields
+    # (fact, valid) pairs; a reader stops at the first invalid one, before reading any key.
+    if not keys:
+        yield name, type(value) is list
+        return
+    yield name, type(value) is dict
+    for key in keys.split():
+        yield f"{name}.{key}", key in value
 
 
 def _unique_keys(pairs: list[tuple[str, object]]) -> dict:
@@ -160,18 +172,16 @@ def decide_publish(approval: dict, ledger: dict, remote: dict) -> Decision:
     git's head_exists, base and base_is_ancestor. ledger: the recorded pull_request (None when
     none), its head and state, and head_is_ancestor (git: that head is an ancestor of H).
     remote: branch_head (None when the branch is absent) and open_pulls [{number, head}].
+    Owner rule 1: the flags and head_is_ancestor are bools, every head and the base 40-character
+    lowercase hex SHAs, pull_request and each number positive ints (numbers unique), reviewer,
+    implementer and state non-empty strs; head and state may be None only when pull_request is.
     """
+    fault = next((fact for fact, valid in _publish_facts(approval, ledger, remote) if not valid), None)
+    if fault:
+        return _refuse("invalid_fact", f"{fault} is missing or does not have its documented type")
     head = approval["head_commit"]
-    # Owner rule 1: the approval's flags are bools, its base a SHA and its identities non-empty strs.
-    # A None or "" identity still refuses below as missing, the code the existing tests pin.
-    flags = ("source_done", "approved_by_review_lane", "reopened_after_approval", "head_exists", "base_is_ancestor")
-    if not (all(_is_bool(approval[flag]) for flag in flags) and _is_sha(approval["base"])
-            and all(_is_text(approval[who]) or approval[who] in (None, "") for who in ("reviewer", "implementer"))):
-        return _refuse("invalid_fact", "an approval flag, the base or an identity does not have its documented type")
     if not (approval["source_done"] and approval["approved_by_review_lane"]):
         return _refuse("not_approved", "the source card is not done with an approving review-lane completion")
-    if not isinstance(head, str) or not _SHA.fullmatch(head):
-        return _refuse("invalid_head", "head_commit is not a 40-character lowercase hex SHA")
     if not _independent(approval["reviewer"], approval["implementer"]):
         return _refuse("reviewer_not_independent", "the reviewer is missing or is the implementer")
     if approval["reopened_after_approval"]:
@@ -208,6 +218,32 @@ def decide_publish(approval: dict, ledger: dict, remote: dict) -> Decision:
     return _refuse("head_moved", "the branch or the pull request is at neither the recorded head nor H")
 
 
+def _publish_facts(approval: dict, ledger: dict, remote: dict):
+    # Owner rule 1 for T1, checked once before any decision; a record's keys are read only after its shape.
+    yield from _shape("approval", approval, "source_done approved_by_review_lane head_commit review_head bound_head"
+                      " reviewer implementer reopened_after_approval head_exists base base_is_ancestor")
+    for flag in ("source_done", "approved_by_review_lane", "reopened_after_approval", "head_exists", "base_is_ancestor"):
+        yield f"approval.{flag}", _is_bool(approval[flag])
+    for name in ("head_commit", "review_head", "bound_head", "base"):
+        yield f"approval.{name}", _is_sha(approval[name])
+    for name in ("reviewer", "implementer"):
+        yield f"approval.{name}", _is_text(approval[name])
+    yield from _shape("ledger", ledger, "pull_request head state head_is_ancestor")
+    recorded = ledger["pull_request"] is not None
+    yield "ledger.pull_request", not recorded or _is_positive_int(ledger["pull_request"])
+    yield "ledger.head", _is_sha(ledger["head"]) or (not recorded and ledger["head"] is None)
+    yield "ledger.state", _is_text(ledger["state"]) or (not recorded and ledger["state"] is None)
+    yield "ledger.head_is_ancestor", _is_bool(ledger["head_is_ancestor"])
+    yield from _shape("remote", remote, "branch_head open_pulls")
+    yield "remote.branch_head", remote["branch_head"] is None or _is_sha(remote["branch_head"])
+    pulls = remote["open_pulls"]
+    yield from _shape("remote.open_pulls", pulls)
+    for index, pull in enumerate(pulls):
+        yield from _shape(f"remote.open_pulls[{index}]", pull, "number head")
+        yield f"remote.open_pulls[{index}].number", _has_unique_ids(pulls[: index + 1], "number")
+        yield f"remote.open_pulls[{index}].head", _is_sha(pull["head"])
+
+
 def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger: dict) -> Decision:
     """T3: may the failed jobs of H's workflow run be rerun once, as listed flaky failures?
 
@@ -215,15 +251,15 @@ def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger:
     steps [{name, conclusion}]; a failed slice also carries failed_tests (the test ids its log
     names) and failed_count (the count its pytest summary reports). ledger: {"reruns": [heads
     already rerun]}. All or nothing: one ineligible failed job refuses the whole rerun.
+    Owner rule 1: repo, names, statuses and failed test ids are non-empty strs, a conclusion too
+    or None before its job or step completes, H and the heads SHAs, ids (unique), run_attempt and
+    failed_count positive ints; a failed slice is a TEST_JOB_STEPS job whose conclusion is not passing.
     """
+    fault = next((fact for fact, valid in _rerun_facts(repo, head, jobs, ledger) if not valid), None)
+    if fault:
+        return _refuse("invalid_fact", f"{fault} is missing or does not have its documented type")
     if repo not in policy.flaky_tests:
         return _refuse("unknown_repository", "the policy has no entry for this repository")
-    # Owner rule 1: H and the rerun heads are SHAs and the reruns a list, and every run_attempt is a
-    # positive int, so a null head matches no null job head and a bool or float is no first attempt.
-    reruns = ledger["reruns"]
-    if not (_is_sha(head) and isinstance(reruns, list) and all(_is_sha(rerun_head) for rerun_head in reruns)
-            and all(_is_positive_int(job.get("run_attempt")) for job in jobs)):
-        return _refuse("invalid_fact", "H, the rerun ledger or a job's run_attempt does not have its documented type")
     if any(job["head_sha"] != head for job in jobs):
         return _refuse("head_moved", f"a job ran on a head other than {head}")
     if any(job["status"] != "completed" for job in jobs):
@@ -239,22 +275,18 @@ def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger:
     if any(job["conclusion"] != "failure" for job in failed if job["name"] == SUMMARY_CHECK):
         return _refuse("summary_not_failure", "the summary check ended in something other than failure")
     # Owner rule 3: it counts as a summary only when its only failed step is ci.yaml's "Evaluate job
-    # results"; failed at any other step it is one more failed job, refused under the rule above.
-    # One with no failed step at all stays a summary: the existing tests' summary fixture has none.
+    # results", failed; with no failed step or any other failed step it is one more failed job,
+    # refused under the rule above.
     others = [job for job in failed if job["name"] != SUMMARY_CHECK
               or [(step["name"], step["conclusion"]) for step in job["steps"] if step["conclusion"] not in _PASSING]
-              not in ([], [("Evaluate job results", "failure")])]
+              != [("Evaluate job results", "failure")]]
     if not others:
         return _refuse("summary_failed_alone", "the summary check failed and no other job did")
     flaky, matches = policy.flaky_tests[repo], []
     for job in others:
         if not _is_test_job(job):
             return _refuse("not_test_job", f"job {job['id']} did not fail only at its test step")
-        named = job.get("failed_tests")
-        # Owner rule 1: failed_tests is the documented list, so a dict of listed ids proves nothing.
-        # None still refuses below as naming no test, the code the existing tests pin.
-        if named is not None and not isinstance(named, list):
-            return _refuse("invalid_fact", f"job {job['id']}'s failed_tests is not a list")
+        named = job.get("failed_tests") or []
         if not named:
             return _refuse("no_failed_test", f"job {job['id']} names no failed test")
         count = job.get("failed_count")
@@ -267,6 +299,36 @@ def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger:
                     for test in named]
     ids = [job["id"] for job in others]
     return Decision(True, "rerun", f"rerun jobs {ids} once; GitHub reruns the summary check after them", matches)
+
+
+def _rerun_facts(repo: str, head: str, jobs: list[dict], ledger: dict):
+    # Owner rule 1 for T3, checked once before any decision; a record's keys are read only after its shape.
+    yield "repo", _is_text(repo)
+    yield "head", _is_sha(head)
+    yield from _shape("jobs", jobs)
+    for index, job in enumerate(jobs):
+        name = f"jobs[{index}]"
+        yield from _shape(name, job, "id name head_sha status conclusion run_attempt steps")
+        yield f"{name}.id", _has_unique_ids(jobs[: index + 1])
+        yield f"{name}.name", _is_text(job["name"])
+        yield f"{name}.head_sha", _is_sha(job["head_sha"])
+        yield f"{name}.status", _is_text(job["status"])
+        yield f"{name}.conclusion", job["conclusion"] is None or _is_text(job["conclusion"])
+        yield f"{name}.run_attempt", _is_positive_int(job["run_attempt"])
+        yield from _shape(f"{name}.steps", job["steps"])
+        for step_index, step in enumerate(job["steps"]):
+            yield from _shape(f"{name}.steps[{step_index}]", step, "name conclusion")
+            yield f"{name}.steps[{step_index}].name", _is_text(step["name"])
+            yield f"{name}.steps[{step_index}].conclusion", step["conclusion"] is None or _is_text(step["conclusion"])
+        if job["name"] in TEST_JOB_STEPS and job["conclusion"] not in _PASSING:
+            yield from _shape(name, job, "failed_tests failed_count")
+            yield from _shape(f"{name}.failed_tests", job["failed_tests"])
+            yield f"{name}.failed_tests", all(_is_text(test) for test in job["failed_tests"])
+            yield f"{name}.failed_count", _is_positive_int(job["failed_count"])
+    yield from _shape("ledger", ledger, "reruns")
+    yield from _shape("ledger.reruns", ledger["reruns"])
+    for index, rerun_head in enumerate(ledger["reruns"]):
+        yield f"ledger.reruns[{index}]", _is_sha(rerun_head)
 
 
 def _is_test_job(job: dict) -> bool:
@@ -288,26 +350,26 @@ def decide_lens_request(head: str, pr_head: str, evidence: list[dict], existing_
     evidence: the T2 and T3 records [{id, kind ("checks" or "rerun"), head}], where a checks
     record also carries overall, digest (the attachment's recorded SHA-256) and reread_digest
     (its SHA-256 as just re-read). reviewer: from policy_resolved_reviewer().
-    existing_lens_cards: [{lens, task_id, head}].
+    existing_lens_cards: [{lens, task_id, head}]. Owner rule 1: the heads are SHAs, the ids
+    unique positive ints, kind, overall, lens, task_id and both identities non-empty strs, and
+    both digests 64-character lowercase hex; the reviewer may be None, which refuses below as
+    missing, since policy_resolved_reviewer() returns None when it resolves no reviewer.
     """
-    # Owner rule 1: H is a SHA and the identities non-empty strs; policy_resolved_reviewer() may
-    # return None, and a None or "" reviewer still refuses below as missing, as the existing tests pin.
-    if not (_is_sha(head) and _is_text(implementer) and (_is_text(reviewer) or reviewer in (None, ""))):
-        return _refuse("invalid_fact", "H or an identity does not have its documented type")
+    fault = next((fact for fact, valid in _lens_request_facts(head, pr_head, evidence, existing_lens_cards,
+                                                             reviewer, implementer) if not valid), None)
+    if fault:
+        return _refuse("invalid_fact", f"{fault} is missing or does not have its documented type")
     if pr_head != head:
         return _refuse("head_moved", f"the pull request head is not {head}")
     records = [record for record in evidence if record["head"] == head]
     if not records:
         return _refuse("no_evidence", f"no check evidence is recorded for {head}")
-    # Owner rule 1: ids order the records only as unique positive ints; no str or tied id picks the latest.
-    if not _has_unique_ids(evidence):
-        return _refuse("invalid_fact", "an evidence record id is not a unique positive int")
     latest = max(records, key=lambda record: record["id"])
     if latest["kind"] != "checks":
         return _refuse("evidence_before_rerun", "H was rerun after its latest check evidence")
     if latest["overall"] != "success":
         return _refuse("checks_not_passing", "the latest check evidence for H is not success")
-    if not (_is_digest(latest["digest"]) and _is_digest(latest["reread_digest"])) or latest["reread_digest"] != latest["digest"]:
+    if not latest["digest"] or latest["reread_digest"] != latest["digest"]:
         return _refuse("evidence_unverified", "the evidence attachment does not re-read to its recorded SHA-256")
     if not _independent(reviewer, implementer):
         return _refuse("reviewer_not_independent", "the reviewer is missing or is the implementer")
@@ -316,6 +378,34 @@ def decide_lens_request(head: str, pr_head: str, evidence: list[dict], existing_
     if cards:
         return Decision(True, "already_requested", "lens cards for H exist; create no more", cards)
     return Decision(True, "request", f"request read-only lens cards bound to {head}, carrying the evidence")
+
+
+def _lens_request_facts(head: str, pr_head: str, evidence: list[dict], existing_lens_cards: list[dict],
+                        reviewer: str | None, implementer: str | None):
+    # Owner rule 1 for T4, checked once before any decision; a record's keys are read only after its shape.
+    yield "head", _is_sha(head)
+    yield "pr_head", _is_sha(pr_head)
+    yield from _shape("evidence", evidence)
+    for index, record in enumerate(evidence):
+        name = f"evidence[{index}]"
+        yield from _shape(name, record, "id kind head")
+        yield f"{name}.id", _has_unique_ids(evidence[: index + 1])
+        yield f"{name}.kind", _is_text(record["kind"])
+        yield f"{name}.head", _is_sha(record["head"])
+        if record["kind"] == "checks":
+            yield from _shape(name, record, "overall digest reread_digest")
+            yield f"{name}.overall", _is_text(record["overall"])
+            yield f"{name}.digest", _is_digest(record["digest"])
+            yield f"{name}.reread_digest", _is_digest(record["reread_digest"])
+    yield from _shape("existing_lens_cards", existing_lens_cards)
+    for index, card in enumerate(existing_lens_cards):
+        name = f"existing_lens_cards[{index}]"
+        yield from _shape(name, card, "lens task_id head")
+        yield f"{name}.lens", _is_text(card["lens"])
+        yield f"{name}.task_id", _is_text(card["task_id"])
+        yield f"{name}.head", _is_sha(card["head"])
+    yield "reviewer", reviewer is None or _is_text(reviewer)
+    yield "implementer", _is_text(implementer)
 
 
 def decide_merge(policy: Policy, repo: str, head: str, pr: dict, checks: dict, verdicts: list[dict],
@@ -335,44 +425,41 @@ def decide_merge(policy: Policy, repo: str, head: str, pr: dict, checks: dict, v
     rerun, the rerun attempt number, the run_attempt H's jobs had when their rerun was requested;
     every required check run must then carry an int run_attempt greater than it, or the merge
     refuses. None, the default, checks no attempt, so callers that do not pass it keep working.
+    A check run carries id, name, head_sha, status, conclusion and, read after a rerun,
+    run_attempt; a legacy status id, context, state and sha; a review id, user ({login}, None
+    for a deleted account), state and commit_id. Owner rule 1: every head and commit_id is a
+    SHA, merged a bool and mergeable a bool or None while GitHub computes it, total_count,
+    evidence_id, last_rerun_id, rerun_attempt, run_attempt and every id positive ints (ids
+    unique in their list), and repo, state, names, contexts, lens, verdict, login and the
+    security reviewer non-empty strs; a conclusion is None until its check run completes, and
+    a None security reviewer refuses below as missing.
     """
+    fault = next((fact for fact, valid in _merge_facts(policy, repo, head, pr, checks, verdicts, github_reviews,
+                                                      security_reviewer, rerun_attempt) if not valid), None)
+    if fault:
+        return _refuse("invalid_fact", f"{fault} is missing or does not have its documented type")
     if repo not in policy.required_checks:
         return _refuse("unknown_repository", "the policy has no entry for this repository")
-    # Owner rule 1: H is a SHA, so a null head matches no null pull request, check, verdict or review head.
-    if not _is_sha(head):
-        return _refuse("invalid_fact", "H is not a 40-character lowercase hex SHA")
     if pr["merged"] and pr["head"] == head:
         return Decision(True, "already_merged", f"the pull request is already merged at {head}")
     if pr["state"] != "open":
         return _refuse("pull_request_not_open", "the pull request is not open")
     if pr["head"] != head or pr["ledger_head"] != head:
         return _refuse("head_moved", f"the pull request head and the ledger head are not both {head}")
-    # Owner rule 1: total_count is a count, never a bool, and the check run ids are unique positive ints.
-    # A total_count of 0 (no check run) stays allowed: the existing tests pin it.
-    total = checks["total_count"]
-    if not ((_is_positive_int(total) or (total == 0 and type(total) is int)) and _has_unique_ids(checks["check_runs"])):
-        return _refuse("invalid_fact", "total_count or a check run id does not have its documented type")
     if len({run["id"] for run in checks["check_runs"]}) != checks["total_count"]:
         return _refuse("incomplete_checks", "the check runs read do not match GitHub's total_count")
-    # Section 4 binds every check read to H, required or not, its head read as _classify reads it.
-    supplied = [*checks["check_runs"], *checks["statuses"]]
-    if any(check.get("head_sha", check.get("sha")) != head for check in supplied):
+    # Section 4 binds every check read to H, required or not. Owner rule 2: each is read through its
+    # own list's head field, head_sha for a check run and sha for a legacy status.
+    if (any(run["head_sha"] != head for run in checks["check_runs"])
+            or any(status["sha"] != head for status in checks["statuses"])):
         return _refuse("check_stale", f"a check run or status read is not on {head}")
-    # Only an explicit None says H was never rerun; a missing last_rerun_id proves nothing.
-    evidence_id, last_rerun_id = checks.get("evidence_id"), checks.get("last_rerun_id", False)
-    if type(evidence_id) is not int or not (last_rerun_id is None or type(last_rerun_id) is int):
-        return _refuse("order_unproven", "the check evidence or the last rerun has no kernel record id")
+    evidence_id, last_rerun_id = checks["evidence_id"], checks["last_rerun_id"]
     if last_rerun_id is not None and evidence_id <= last_rerun_id:
         return _refuse("evidence_before_rerun", "H was rerun after its check evidence was recorded")
-    # Owner rule 1: the latest legacy status is chosen only among unique positive int ids.
-    if not _has_unique_ids(checks["statuses"]):
-        return _refuse("invalid_fact", "a legacy status id is not a unique positive int")
     # Owner rule 4: re-reading an old success does not make it fresh; after H's rerun every required
     # check run must come from a later attempt.
     if rerun_attempt is not None:
         required = [run for run in checks["check_runs"] if run["name"] in policy.required_checks[repo]]
-        if not (_is_positive_int(rerun_attempt) and all(_is_positive_int(run.get("run_attempt")) for run in required)):
-            return _refuse("invalid_fact", "the rerun attempt or a required check run's run_attempt is not a positive int")
         if any(run["run_attempt"] <= rerun_attempt for run in required):
             return _refuse("check_stale", f"a required check run is not from an attempt after {rerun_attempt}")
     for name in policy.required_checks[repo]:
@@ -380,26 +467,14 @@ def decide_merge(policy: Policy, repo: str, head: str, pr: dict, checks: dict, v
         if outcome != "success":
             return _refuse(f"check_{outcome}", f"required check {name!r} is {outcome} for H")
     on_head = [verdict for verdict in verdicts if verdict["head"] == head]
-    if any(type(verdict.get("id")) is not int for verdict in on_head):
-        return _refuse("order_unproven", "a lens verdict for H has no kernel record id")
     if any(verdict["verdict"] != "approve" for verdict in on_head):
         return _refuse("changes_verdict", "a lens verdict for H is not approve")
     if any(verdict["id"] <= evidence_id for verdict in on_head):
         return _refuse("verdict_before_evidence", "a lens approval for H was recorded before its check evidence")
-    # Owner rule 1: lens names are non-empty strs, so None and "" never count as two lenses.
-    if not all(_is_text(verdict["lens"]) for verdict in on_head):
-        return _refuse("invalid_fact", "a lens verdict for H has no lens name")
     if len({verdict["lens"] for verdict in on_head}) != LENS_COUNT:
         return _refuse("lens_approval_missing", f"H lacks approve verdicts from {LENS_COUNT} distinct lenses")
-    # Owner rule 1: a supplied security reviewer is a non-empty str, so no number matches a login.
-    # None or "" still refuses as missing, the code the existing tests pin.
-    if security_reviewer not in (None, "") and not _is_text(security_reviewer):
-        return _refuse("invalid_fact", "the security reviewer identity is not a non-empty str")
     if not security_reviewer:
         return _refuse("no_security_reviewer", "no security reviewer identity was supplied")
-    # Owner rule 1: the latest review is chosen only among unique positive int ids.
-    if not _has_unique_ids(github_reviews):
-        return _refuse("invalid_fact", "a review id is not a unique positive int")
     # Owner change, no approval mirror: the security reviewer's own latest decisive review decides.
     own = [review for review in github_reviews if review["state"] in _DECISIVE_REVIEWS
            and (review.get("user") or {}).get("login") == security_reviewer]
@@ -409,6 +484,67 @@ def decide_merge(policy: Policy, repo: str, head: str, pr: dict, checks: dict, v
     if pr["mergeable"] is not True or pr["mergeable_state"] != "clean":
         return _refuse("not_mergeable", "GitHub does not report the pull request as mergeable and clean")
     return Decision(True, "merge", f"merge with sha={head}; request no bypass")
+
+
+def _merge_facts(policy: Policy, repo: str, head: str, pr: dict, checks: dict, verdicts: list[dict],
+                 github_reviews: list[dict], security_reviewer: str | None, rerun_attempt: int | None):
+    # Owner rule 1 for T6, checked once before any decision; a record's keys are read only after its shape.
+    # The policy is the reviewed file load_policy already checked, so it is no fact here.
+    yield "repo", _is_text(repo)
+    yield "head", _is_sha(head)
+    yield from _shape("pr", pr, "state merged head ledger_head mergeable mergeable_state")
+    yield "pr.state", _is_text(pr["state"])
+    yield "pr.merged", _is_bool(pr["merged"])
+    yield "pr.head", _is_sha(pr["head"])
+    yield "pr.ledger_head", _is_sha(pr["ledger_head"])
+    yield "pr.mergeable", pr["mergeable"] is None or _is_bool(pr["mergeable"])
+    yield "pr.mergeable_state", _is_text(pr["mergeable_state"])
+    yield from _shape("checks", checks, "total_count check_runs statuses evidence_id last_rerun_id")
+    yield "checks.total_count", _is_positive_int(checks["total_count"])
+    yield "checks.evidence_id", _is_positive_int(checks["evidence_id"])
+    yield "checks.last_rerun_id", checks["last_rerun_id"] is None or _is_positive_int(checks["last_rerun_id"])
+    yield "rerun_attempt", rerun_attempt is None or _is_positive_int(rerun_attempt)
+    runs, statuses = checks["check_runs"], checks["statuses"]
+    yield from _shape("checks.check_runs", runs)
+    for index, run in enumerate(runs):
+        name = f"checks.check_runs[{index}]"
+        yield from _shape(name, run, "id name head_sha status conclusion")
+        yield f"{name}.id", _has_unique_ids(runs[: index + 1])
+        yield f"{name}.name", _is_text(run["name"])
+        yield f"{name}.head_sha", _is_sha(run["head_sha"])
+        yield f"{name}.status", _is_text(run["status"])
+        yield f"{name}.conclusion", run["conclusion"] is None or _is_text(run["conclusion"])
+        # Owner rule 4: run_attempt is read only after a rerun, and only on a required check run.
+        if rerun_attempt is not None and run["name"] in policy.required_checks.get(repo, ()):
+            yield from _shape(name, run, "run_attempt")
+            yield f"{name}.run_attempt", _is_positive_int(run["run_attempt"])
+    yield from _shape("checks.statuses", statuses)
+    for index, status in enumerate(statuses):
+        name = f"checks.statuses[{index}]"
+        yield from _shape(name, status, "id context state sha")
+        yield f"{name}.id", _has_unique_ids(statuses[: index + 1])
+        yield f"{name}.context", _is_text(status["context"])
+        yield f"{name}.state", _is_text(status["state"])
+        yield f"{name}.sha", _is_sha(status["sha"])
+    yield from _shape("verdicts", verdicts)
+    for index, verdict in enumerate(verdicts):
+        name = f"verdicts[{index}]"
+        yield from _shape(name, verdict, "id lens head verdict")
+        yield f"{name}.id", _has_unique_ids(verdicts[: index + 1])
+        yield f"{name}.lens", _is_text(verdict["lens"])
+        yield f"{name}.head", _is_sha(verdict["head"])
+        yield f"{name}.verdict", _is_text(verdict["verdict"])
+    yield from _shape("github_reviews", github_reviews)
+    for index, review in enumerate(github_reviews):
+        name = f"github_reviews[{index}]"
+        yield from _shape(name, review, "id user state commit_id")
+        yield f"{name}.id", _has_unique_ids(github_reviews[: index + 1])
+        if review["user"] is not None:
+            yield from _shape(f"{name}.user", review["user"], "login")
+            yield f"{name}.user.login", _is_text(review["user"]["login"])
+        yield f"{name}.state", _is_text(review["state"])
+        yield f"{name}.commit_id", _is_sha(review["commit_id"])
+    yield "security_reviewer", security_reviewer is None or _is_text(security_reviewer)
 
 
 def _required_check(name: str, head: str, checks: dict) -> str:
