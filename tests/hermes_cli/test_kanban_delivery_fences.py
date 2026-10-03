@@ -3,12 +3,10 @@
 Tests 1 to 14 are plan section 8's, adapted as the owner directs: load_policy takes the
 policy text, and the merge reads the security reviewer's own approval (no mirror). The
 four tests after them show owner cases that tests 1 to 14 do not show in full, the next
-four are regressions for the independent review's findings 1 to 4, and the last six are
-the third pass's: the next review's null-step regression, a run with no jobs, and, per
-decision, the owner's rule that every fact it reads refuses when missing or malformed.
+four are regressions for the first independent review's findings 1 to 4, and the last is
+the regression for the latest review's finding: an unknown job's unnamed failed step.
 """
 import ast
-import copy
 import json
 from pathlib import Path
 
@@ -128,56 +126,6 @@ def merge(pr_facts=None, check_facts=None, verdicts=LENSES, reviews=None,
         reviews = [review(10, "APPROVED")]
     return fences.decide_merge(policy(), repo, H, pr_facts or pr(), check_facts or checks(check_run()),
                                list(verdicts), reviews, security_reviewer)
-
-
-# The owner's rule, fault by fault: each value is one that a fact of that kind must never hold.
-# REMOVED drops the key instead; an argument or a list item has no key, so it is never dropped.
-REMOVED = object()
-NOT_A_DICT = (REMOVED, None, "x", [], ["x"])
-RECORD = (*NOT_A_DICT, {})
-RECORDS = (REMOVED, None, "x", {}, [None], ["x"], [[]])
-FLAG = (REMOVED, None, "", 0, 1, "x", [])
-NUMBER = (REMOVED, None, "", True, 2.0, "7", [])
-TEXT = (REMOVED, None, "", 5, ["x"])
-SHA = (*TEXT, H.upper(), H[:39])
-
-
-def nullable(faults):
-    # None is a documented value of the fact, but its key must still be present.
-    return tuple(value for value in faults if value is not None)
-
-
-def faulted(facts, path, value):
-    """A deep copy of facts with the fact at path set to value, or its key removed for REMOVED."""
-    facts = copy.deepcopy(facts)
-    *parents, key = path
-    target = facts
-    for step in parents:
-        target = target[step]
-    if value is REMOVED:
-        del target[key]
-    else:
-        target[key] = copy.deepcopy(value)
-    return facts
-
-
-def not_refused(decide, facts, faults):
-    """Inject each fault alone into a copy of facts, the decision's arguments, and describe every
-    call that raised, allowed, or refused with a code other than the expected one."""
-    failures = []
-    for path, values, code in faults:
-        for value in values:
-            if value is REMOVED and (len(path) == 1 or isinstance(path[-1], int)):
-                continue
-            fault = f"{path} {'removed' if value is REMOVED else repr(value)}"
-            try:
-                d = decide(**faulted(facts, path, value))
-            except Exception as error:
-                failures.append(f"{fault}: raised {type(error).__name__}")
-                continue
-            if (d.allowed, d.code) != (False, code):
-                failures.append(f"{fault}: gave {d.allowed}, {d.code} instead of False, {code}")
-    return failures
 
 
 def test_publish_refuses_when_the_head_moved():
@@ -590,3 +538,18 @@ def test_merge_refuses_a_check_on_another_head_whatever_its_name():
     for facts in foreign:
         d = merge(check_facts=facts)
         assert (d.allowed, d.code) == (False, "check_stale"), facts
+
+
+@pytest.mark.parametrize("name", ["Python lints", "Run tests slice 3/12"])
+def test_rerun_refuses_an_unknown_job_whose_failed_step_has_no_name(name):
+    # The latest review's finding: a job off the allowlist is no test job even when its failed step
+    # has no name, whether it is unrelated or the bare slice name, which the jobs API never reports
+    # (it reports "Python tests / Run tests slice N/12"). The valid full-name control first.
+    d = rerun([slice_job(3, 3, [FLAKY_46])])
+    assert (d.allowed, d.code) == (True, "rerun")
+    # The reviewer's reproduction.
+    bad = slice_job(3, 3, [FLAKY_46])
+    bad["name"] = name
+    bad["steps"][1]["name"] = None
+    d = rerun([bad])
+    assert (d.allowed, d.code, d.matches) == (False, "not_test_job", [])

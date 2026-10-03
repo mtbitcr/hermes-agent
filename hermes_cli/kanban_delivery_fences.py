@@ -217,11 +217,15 @@ def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger:
 
 
 def _is_test_job(job: dict) -> bool:
-    # Test shape: a slice job that failed with exactly one failed step, the slice's test step.
+    # Test shape: a slice job on the TEST_JOB_STEPS allowlist that failed with exactly one failed
+    # step, the slice's test step. The name must be a str key and the step's name a non-empty str
+    # equal to its value, so a job off the list never matches through a failed step with no name.
     failed_steps = [step for step in job["steps"] if step["conclusion"] not in _PASSING]
-    return (job["conclusion"] == "failure" and len(failed_steps) == 1
+    return (isinstance(job["name"], str) and job["name"] in TEST_JOB_STEPS
+            and job["conclusion"] == "failure" and len(failed_steps) == 1
             and failed_steps[0]["conclusion"] == "failure"
-            and failed_steps[0]["name"] == TEST_JOB_STEPS.get(job["name"]))
+            and isinstance(failed_steps[0]["name"], str) and failed_steps[0]["name"] != ""
+            and failed_steps[0]["name"] == TEST_JOB_STEPS[job["name"]])
 
 
 def decide_lens_request(head: str, pr_head: str, evidence: list[dict], existing_lens_cards: list[dict],
