@@ -1011,3 +1011,44 @@ def test_commit_statuses_are_refused_before_any_socket_or_token(monkeypatch, tmp
                     transport.request("GET", path, query=query)
                 assert refused.value.reason == "endpoint_not_allowed", (step, path, query)
     assert opened == []
+
+
+def test_push_starts_no_git_from_the_working_directory(github, monkeypatch, tmp_path):
+    """Security review of PR 141, finding 1: a git program in the caller's working directory,
+    reached through an empty or relative PATH entry, never runs, and the leased push still works."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    mod = _transport_module(monkeypatch, github)
+    work, bare, origin, (first, _second, _third) = _repositories(tmp_path)
+    monkeypatch.setattr(mod, "GIT_ORIGIN", origin)
+    card = tmp_path / "card"
+    card.mkdir()
+    stolen = tmp_path / "stolen"  # the planted git copies its environment here, credential included
+    (card / "git").write_text(f"#!/bin/sh\nenv >> '{stolen}'\nexit 1\n")
+    (card / "git").chmod(0o755)
+    path = os.environ["PATH"]
+    monkeypatch.chdir(card)
+    monkeypatch.setenv("PATH", os.pathsep.join(["", ".", path]))
+    publish = mod.GitHubTransport("publish", REPO, key_path=github["key_file"])
+
+    assert publish.push(work, "delivery/card-1", first, expected="")["head"] == first
+    assert not stolen.exists(), "a git from the working directory ran"
+    # The readback below starts the test's own git, so it leaves the planted directory first.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", path)
+    assert _remote_head(bare, "delivery/card-1") == first
+
+
+def test_the_api_connection_opens_no_tls_key_log(monkeypatch, tmp_path):
+    """Security review of PR 141, finding 2: SSLKEYLOGFILE names a key log; building the API
+    connection neither opens nor creates it, and the connection still verifies the server."""
+    keylog = tmp_path / "tls-keys.log"
+    monkeypatch.setenv("SSLKEYLOGFILE", str(keylog))
+    connection = _module()._connect()
+    try:
+        assert not keylog.exists()
+        assert connection._context.verify_mode == ssl.CERT_REQUIRED
+        assert connection._context.check_hostname is True
+    finally:
+        connection.close()
