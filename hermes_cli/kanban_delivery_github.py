@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import os
 import re
 import ssl
 import subprocess
@@ -61,7 +62,10 @@ class Endpoint(NamedTuple):
 _TOKEN_ENDPOINT = Endpoint("POST", "/app/installations/{installation}/access_tokens", None)
 
 # The plan's endpoint list and nothing else: no protection, rules, settings, hooks, collaborators,
-# keys or installation management, and no GraphQL.
+# keys or installation management, and no GraphQL. Commit statuses are left out by the owner's call:
+# the required checks of both repositories are check runs and the App holds no commit-statuses
+# permission, so the transport offers no statuses read and a later merge fence takes an empty
+# statuses list.
 REST_ALLOWLIST = (
     Endpoint("GET", "/repos/{repo}/pulls", ("pull_requests", "read"), MappingProxyType(
         {"state": "open|closed|all", "head": rf"[A-Za-z0-9-]+:{_BRANCH.pattern}", "base": _BRANCH.pattern, **_PAGE})),
@@ -71,7 +75,6 @@ REST_ALLOWLIST = (
     Endpoint("POST", "/repos/{repo}/pulls/{number}/reviews", ("pull_requests", "write")),
     Endpoint("GET", "/repos/{repo}/commits/{sha}/check-runs", ("checks", "read"),
              MappingProxyType({"filter": "latest|all", **_PAGE})),
-    Endpoint("GET", "/repos/{repo}/commits/{sha}/statuses", ("statuses", "read"), MappingProxyType(_PAGE)),
     Endpoint("GET", "/repos/{repo}/actions/runs", ("actions", "read"),
              MappingProxyType({"head_sha": _SHA.pattern, **_PAGE}), ("head_sha",)),
     Endpoint("GET", "/repos/{repo}/actions/runs/{id}/jobs", ("actions", "read"),
@@ -86,7 +89,7 @@ REST_ALLOWLIST = (
 # never pass, and neither do response headers.
 _FIELDS = frozenset({
     "id", "number", "name", "state", "status", "conclusion", "merged", "mergeable", "mergeable_state",
-    "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app", "context",
+    "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app",
     "total_count", "check_runs", "workflow_runs", "jobs", "steps", "run_id", "run_attempt",
 })
 _MAX_TEXT = 256
@@ -101,9 +104,11 @@ class GitHubTransportError(Exception):
 
 
 def _connect() -> http.client.HTTPConnection:
-    # http.client follows no redirect, reads no proxy or netrc setting and logs nothing; httpcore's
-    # DEBUG trace would log response headers.
-    return http.client.HTTPSConnection(API_HOST, timeout=30, context=ssl.create_default_context())
+    # http.client follows no redirect and reads no proxy or netrc setting; httpcore's DEBUG trace
+    # would log response headers. Its wire debugging is switched off in _exchange.
+    context = ssl.create_default_context()
+    context.keylog_filename = None  # no TLS key log, even when SSLKEYLOGFILE names one
+    return http.client.HTTPSConnection(API_HOST, timeout=30, context=context)
 
 
 def _exchange(method: str, target: str, authorization: str, payload=None) -> tuple[int, object]:
@@ -114,6 +119,9 @@ def _exchange(method: str, target: str, authorization: str, payload=None) -> tup
     if body is not None:
         headers["Content-Type"] = "application/json"
     connection = _connect()
+    # Any level above 0, which a host process may set as the class default, prints every header,
+    # Authorization included; the response takes its level from the connection.
+    connection.set_debuglevel(0)
     try:
         connection.request(method, target, body=body, headers=headers)
         response = connection.getresponse()
@@ -168,6 +176,11 @@ def _is_sha(value) -> bool:
     return isinstance(value, str) and _SHA.fullmatch(value) is not None
 
 
+def _basic(token: str) -> str:
+    """The token as git's Basic authorization header carries it."""
+    return base64.b64encode(f"x-access-token:{token}".encode()).decode()
+
+
 class GitHubTransport:
     """One step's GitHub access to one repository, through one narrowed installation token."""
 
@@ -216,13 +229,15 @@ class GitHubTransport:
                 f"{GIT_ORIGIN}/{self.repository}.git", f"{sha}:{ref}"]
         env = self._git_env()
         try:
-            result = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True,
-                                    text=True, timeout=300)
+            result = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
         except (OSError, subprocess.SubprocessError):
             result = None
         if result is None:
             raise GitHubTransportError("push_failed")
-        line = next((fields for fields in (text.split("\t") for text in result.stdout.splitlines())
+        # Bytes, decoded here with replacement: a strict decode fails with an error that carries git's
+        # output, and with it whatever git echoed of the credential.
+        lines = result.stdout.decode("utf-8", "replace").splitlines()
+        line = next((fields for fields in (text.split("\t") for text in lines)
                      if len(fields) == 3 and fields[1].endswith(f":{ref}")), None)
         if line and line[0] == "!" and line[2].endswith("(stale info)"):
             raise GitHubTransportError("push_lease_mismatch")
@@ -253,14 +268,19 @@ class GitHubTransport:
     def _git_env(self) -> dict[str, str]:
         """The push's environment: the only place its credential lives, as with_git_auth does it."""
         # Inherited command-scope git config is dropped: read after ours, it could bring a credential
-        # helper back.
+        # helper back. So are git's traces, curl's verbose log and the TLS key log, which would write
+        # the credential out.
         env = {key: value for key, value in noninteractive_git_env().items()
-               if not re.fullmatch(r"GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS)", key)}
+               if not re.fullmatch(r"GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS)|GIT_TRACE(?:_.*)?"
+                                   r"|GIT_CURL_VERBOSE|SSLKEYLOGFILE", key)}
+        # "0" turns off a trace2 target that system or global config names; unset or empty would not.
+        env.update(GIT_TRACE2="0", GIT_TRACE2_PERF="0", GIT_TRACE2_EVENT="0")
         env.pop("GIT_ASKPASS", None)
         env.pop("SSH_ASKPASS", None)
-        basic = base64.b64encode(f"x-access-token:{self._installation_token()}".encode()).decode()
-        config = {"credential.helper": "", "core.askPass": "", "http.followRedirects": "false",
-                  f"http.{GIT_ORIGIN}/.extraheader": f"Authorization: basic {basic}"}
+        # Command scope outranks the hooks path a repository or global config names, so no hook runs.
+        config = {"credential.helper": "", "core.askPass": "", "core.hooksPath": os.devnull,
+                  "http.followRedirects": "false",
+                  f"http.{GIT_ORIGIN}/.extraheader": f"Authorization: basic {_basic(self._installation_token())}"}
         for index, (key, value) in enumerate(config.items()):
             env[f"GIT_CONFIG_KEY_{index}"] = key
             env[f"GIT_CONFIG_VALUE_{index}"] = value
@@ -273,5 +293,7 @@ class GitHubTransport:
         if isinstance(value, list):
             return [self._project(item) for item in value]
         if isinstance(value, str):
-            return redact_sensitive_text(value.replace(self._token, "[redacted]"), force=True)[:_MAX_TEXT]
+            for secret in (self._token, _basic(self._token)):  # the token, and git's Basic form of it
+                value = value.replace(secret, "[redacted]")
+            return redact_sensitive_text(value, force=True)[:_MAX_TEXT]
         return value
