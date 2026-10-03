@@ -124,8 +124,10 @@ class GitHubTransportError(Exception):
 def _connect() -> http.client.HTTPConnection:
     # http.client follows no redirect and reads no proxy or netrc setting; httpcore's DEBUG trace
     # would log response headers. Its wire debugging is switched off in _exchange.
-    context = ssl.create_default_context()
-    context.keylog_filename = None  # no TLS key log, even when SSLKEYLOGFILE names one
+    # Built directly: create_default_context opens the file that SSLKEYLOGFILE names. This context
+    # checks the hostname and requires a verified certificate, as create_default_context does.
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_default_certs()
     return http.client.HTTPSConnection(API_HOST, timeout=30, context=context)
 
 
@@ -211,9 +213,18 @@ def _git_base_env(home: str) -> dict[str, str]:
 
 
 def _run_git(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess | None:
-    """One git with nothing to read on stdin; None when it could not start or did not finish."""
+    """One git with nothing to read on stdin; None when it could not start or did not finish.
+
+    The program is the absolute git found on the absolute PATH entries only, and it runs in the
+    push's private directory (*env*'s HOME), so no git in the caller's working directory or in a
+    relative PATH entry can start."""
+    search = os.pathsep.join(entry for entry in env.get("PATH", "").split(os.pathsep) if os.path.isabs(entry))
+    program = shutil.which("git", path=search)
+    if not program or not os.path.isabs(program):
+        return None
     try:
-        return subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
+        return subprocess.run([program, *argv[1:]], env=env, cwd=env["HOME"], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=300)
     except (OSError, subprocess.SubprocessError):
         return None
 

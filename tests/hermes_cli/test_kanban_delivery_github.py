@@ -873,8 +873,10 @@ def test_push_follows_the_owner_rule(github, monkeypatch, tmp_path):
     assert [_subcommand(argv) for argv, _ in carrying] == ["push"]  # exactly one git holds the credential
     ((argv, env),) = carrying
     git_dir = argv[argv.index("--git-dir") + 1] if "--git-dir" in argv else None
-    assert argv[:argv.index("push")] == ["git", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
-                                         "--git-dir", git_dir]
+    # Finding 1 of the security review: the program is an absolute git, never a bare name.
+    assert os.path.isabs(argv[0]) and os.path.basename(argv[0]) == "git"
+    assert argv[1:argv.index("push")] == ["-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+                                          "--git-dir", git_dir]
     assert len(made) == 1 and made[0] in Path(git_dir).parents  # a fresh repository in one private directory
     temp = made[0]
     options = [a for a in argv[argv.index("push") + 1:] if a.startswith("-")]
