@@ -424,7 +424,8 @@ def decide_merge(policy: Policy, repo: str, head: str, pr: dict, checks: dict, v
     the plan does not say who supplies it, so a missing one refuses. rerun_attempt: when H was
     rerun, the rerun attempt number, the run_attempt H's jobs had when their rerun was requested;
     every required check run must then carry an int run_attempt greater than it, or the merge
-    refuses. None, the default, checks no attempt, so callers that do not pass it keep working.
+    refuses. None, the default, is valid only when H was never rerun (last_rerun_id None); after a
+    rerun a missing rerun_attempt refuses as invalid_fact, so an old success cannot count again.
     A check run carries id, name, head_sha, status, conclusion and, read after a rerun,
     run_attempt; a legacy status id, context, state and sha; a review id, user ({login}, None
     for a deleted account), state and commit_id. Owner rule 1: every head and commit_id is a
@@ -503,7 +504,8 @@ def _merge_facts(policy: Policy, repo: str, head: str, pr: dict, checks: dict, v
     yield "checks.total_count", _is_positive_int(checks["total_count"])
     yield "checks.evidence_id", _is_positive_int(checks["evidence_id"])
     yield "checks.last_rerun_id", checks["last_rerun_id"] is None or _is_positive_int(checks["last_rerun_id"])
-    yield "rerun_attempt", rerun_attempt is None or _is_positive_int(rerun_attempt)
+    yield "rerun_attempt", (_is_positive_int(rerun_attempt) if checks["last_rerun_id"] is not None
+                            else rerun_attempt is None or _is_positive_int(rerun_attempt))
     runs, statuses = checks["check_runs"], checks["statuses"]
     yield from _shape("checks.check_runs", runs)
     for index, run in enumerate(runs):

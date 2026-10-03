@@ -124,11 +124,11 @@ def review(review_id, state, commit_id=H, login=SECURITY):
 
 
 def merge(pr_facts=None, check_facts=None, verdicts=LENSES, reviews=None,
-          security_reviewer=SECURITY, repo=PLATFORM):
+          security_reviewer=SECURITY, repo=PLATFORM, rerun_attempt=None):
     if reviews is None:
         reviews = [review(10, "APPROVED")]
     return fences.decide_merge(policy(), repo, H, pr_facts or pr(), check_facts or checks(check_run()),
-                               list(verdicts), reviews, security_reviewer)
+                               list(verdicts), reviews, security_reviewer, rerun_attempt)
 
 
 def test_publish_refuses_when_the_head_moved():
@@ -515,16 +515,16 @@ def test_merge_follows_the_kernel_record_order():
     # Finding 3: kernel record ids order the facts, as in decide_lens_request; a larger id is later.
     first, second = LENSES
     # The last rerun (10), then the check evidence (20), then both approvals (30 and 31).
-    d = merge(check_facts=checks(check_run(), evidence_id=20, last_rerun_id=10))
+    d = merge(check_facts=checks(check_run(run_attempt=2), evidence_id=20, last_rerun_id=10), rerun_attempt=1)
     assert (d.allowed, d.code) == (True, "merge")
     # The reviewer's two reproductions: approvals before the evidence, and evidence before the rerun.
     # Owner rule 1: verdict ids are unique in their list, so the two approvals keep distinct ids.
     early = [{**verdict, "id": verdict["id"] - 20, "evidence_id": 5} for verdict in LENSES]
-    d = merge(check_facts=checks(check_run(), evidence_id=30, last_rerun_id=20), verdicts=early)
+    d = merge(check_facts=checks(check_run(run_attempt=2), evidence_id=30, last_rerun_id=20), verdicts=early, rerun_attempt=1)
     assert (d.allowed, d.code) == (False, "verdict_before_evidence")
-    d = merge(check_facts=checks(check_run(), evidence_id=10, last_rerun_id=20), verdicts=LENSES)
+    d = merge(check_facts=checks(check_run(run_attempt=2), evidence_id=10, last_rerun_id=20), verdicts=LENSES, rerun_attempt=1)
     assert (d.allowed, d.code) == (False, "evidence_before_rerun")
-    d = merge(check_facts=checks(check_run(), evidence_id=20, last_rerun_id=20))
+    d = merge(check_facts=checks(check_run(run_attempt=2), evidence_id=20, last_rerun_id=20), rerun_attempt=1)
     assert (d.allowed, d.code) == (False, "evidence_before_rerun")
     for verdicts in ([first, {**second, "id": 15}], [{**first, "id": 20}, second]):
         d = merge(verdicts=verdicts)
