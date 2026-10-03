@@ -61,6 +61,7 @@ def _merge(conn, label: str, *, tier=1, pr: int = 1):
         reviewed_tree=_commit(f"{label}-tree"),
         tier=tier,
         card_id=f"t_{_commit(label)[:8]}",
+        on_main=True,
     )
 
 
@@ -341,3 +342,115 @@ def test_decision_refuses_reject_and_an_accepted_batch(open_ledger):
         with pytest.raises(ValueError):
             _decide(conn, accepted, decision)
     assert _store_rows(conn) == after_accept
+
+
+# The rework: the owner's rule on the review findings.
+def _merge_args(label: str, **changes) -> dict:
+    """record_merge's keyword arguments for one merge, without the main confirmation."""
+    args = {
+        "merge_commit": _commit(label),
+        "pr_url": "https://github.com/acme/hermes/pull/1",
+        "reviewed_base": _commit(f"{label}-base"),
+        "reviewed_head": _commit(f"{label}-head"),
+        "reviewed_tree": _commit(f"{label}-tree"),
+        "tier": 1,
+        "card_id": f"t_{_commit(label)[:8]}",
+    }
+    args.update(changes)
+    return args
+
+
+# Owner rule 1: record_merge relies on the merge step's confirmation that the commit is on main.
+def test_merge_not_confirmed_on_main_is_refused(open_ledger):
+    conn = open_ledger()
+    merge = _merge_args("a")
+    before = _store_rows(conn)
+
+    with pytest.raises(ValueError):
+        ledger.record_merge(conn, **merge)  # no confirmation
+    for on_main in (False, None, 1, "true"):
+        with pytest.raises(ValueError):
+            ledger.record_merge(conn, **merge, on_main=on_main)
+    assert _store_rows(conn) == before
+
+    # Confirmed, the same merge is recorded; a repeat still needs the confirmation.
+    assert ledger.record_merge(conn, **merge, on_main=True)["recorded"] is True
+    recorded = _store_rows(conn)
+    with pytest.raises(ValueError):
+        ledger.record_merge(conn, **merge, on_main=False)
+    assert _store_rows(conn) == recorded
+
+
+# Owner rule 3: only the exact, canonical pull-request URL is recorded.
+def test_non_canonical_pr_url_is_refused(open_ledger):
+    conn = open_ledger()
+    _merge(conn, "a")
+    before = _store_rows(conn)
+    refused = (
+        "https://github.com/../hermes/pull/1",
+        "https://github.com/acme/../pull/1",
+        "https://github.com/./hermes/pull/1",
+        "https://github.com/acme/./pull/1",
+        # Owner: a dot, an underscore, a leading, a trailing and a doubled hyphen, 40 characters.
+        "https://github.com/ac.me/hermes/pull/1",
+        "https://github.com/ac_me/hermes/pull/1",
+        "https://github.com/-acme/hermes/pull/1",
+        "https://github.com/acme-/hermes/pull/1",
+        "https://github.com/ac--me/hermes/pull/1",
+        f"https://github.com/{'a' * 40}/hermes/pull/1",
+        # Repository: GitHub's ".git" alias and 101 characters ("." and ".." are above).
+        "https://github.com/acme/hermes.git/pull/1",
+        f"https://github.com/acme/{'r' * 101}/pull/1",
+    )
+
+    for url in refused:
+        with pytest.raises(ValueError):
+            ledger.record_merge(conn, **_merge_args("b", pr_url=url), on_main=True)
+    assert _store_rows(conn) == before
+
+    canonical = (
+        "https://github.com/acme/hermes.cli_x-1/pull/7",
+        "https://github.com/Acme/.github/pull/8",  # the case stays as given
+        f"https://github.com/{'a-' * 19}a/{'r' * 100}/pull/9",  # 39 and 100 characters
+    )
+    for label, url in zip(("c", "d", "e"), canonical):
+        readback = ledger.record_merge(conn, **_merge_args(label, pr_url=url), on_main=True)
+        assert readback["recorded"] is True
+        assert readback["member"]["pr_url"] == url
+
+
+# Owner rule 2: the review's concurrent-read regression.
+def test_readback_is_one_snapshot_under_a_concurrent_merge(open_ledger):
+    reader, writer = open_ledger(), open_ledger()
+    _merge(writer, "a", tier=0)
+    # The store keeps SQLite's rollback journal: the writer cannot commit while the reader
+    # holds a snapshot. Without a busy wait that refusal is immediate, never the timeout.
+    writer.execute("PRAGMA busy_timeout = 0")
+    attempts: list[object] = []
+
+    def merge_before_members_select(statement: str) -> None:
+        # Once, just before the reader's SELECT of the members; touches only the writer.
+        if attempts or "FROM release_members" not in statement:
+            return
+        try:
+            attempts.append(_merge(writer, "b", tier=2)["recorded"])
+        except sqlite3.OperationalError as refused:  # the reader's snapshot holds it off
+            attempts.append(refused)
+
+    reader.set_trace_callback(merge_before_members_select)
+    try:
+        [batch] = ledger.list_batches(reader)
+    finally:
+        reader.set_trace_callback(None)
+
+    assert len(attempts) == 1
+    assert batch["tier"] == max(member["tier"] for member in batch["members"])
+    commits = _commits(batch)
+    assert batch["digest"] == hashlib.sha256("".join(f"{c}\n" for c in commits).encode()).hexdigest()
+    assert batch["version"] == len(commits)  # no decision was made
+    # The readback ended its snapshot, so the merge lands now if it had not already.
+    assert not reader.in_transaction
+    _merge(writer, "b", tier=2)
+    [current] = ledger.list_batches(reader)
+    assert _commits(current) == [_commit("a"), _commit("b")]
+    assert (current["tier"], current["version"]) == (2, 2)

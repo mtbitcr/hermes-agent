@@ -18,6 +18,7 @@ page and the reminder job belong to later cards.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -26,7 +27,7 @@ import sqlite3
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 from zoneinfo import ZoneInfo
 
 from hermes_cli.kanban_db import kanban_home
@@ -40,8 +41,17 @@ REMINDER_HOUR = 18
 VIENNA = ZoneInfo("Europe/Vienna")
 
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
-# The exact PR URL shape the kernel's PR acceptance binds.
-_PR_URL_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*")
+# The exact, canonical PR URL: https://github.com/<owner>/<repository>/pull/<number>.
+# The owner is a GitHub account name: 1-39 ASCII letters, digits and single inner
+# hyphens. The repository is 1-100 ASCII letters, digits, ".", "_" and "-", never a
+# "." or ".." path segment and never ending in ".git" (GitHub's alias of the name
+# without it). The case stays as given: the record cannot ask GitHub for it.
+_PR_URL_RE = re.compile(
+    r"https://github\.com"
+    r"/(?=[A-Za-z0-9-]{1,39}/)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
+    r"/(?!\.\.?/)(?![A-Za-z0-9._-]*\.git/)[A-Za-z0-9._-]{1,100}"
+    r"/pull/[1-9][0-9]*"
+)
 # Card ids and page references are lowercase non-secret identifiers, as in kanban.
 _IDENTIFIER_RE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,199}")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -133,17 +143,24 @@ def record_merge(
     reviewed_tree: str,
     tier: Any,
     card_id: str,
+    on_main: bool = False,
 ) -> dict[str, Any]:
     """K1: add one merged change to the waiting release decision.
 
-    For the kernel merge step, after the merge is confirmed. A commit already
-    recorded returns its existing row and writes nothing. A tier that is not
-    exactly 0, 1 or 2 is stored as 2, "tier not recorded": the release never
-    parses prose and never assumes a lower risk than it was given.
+    For the kernel merge step, after the merge is confirmed: ``on_main`` is that
+    step's confirmation, made through its GitHub transport, that
+    ``merge_commit`` is on main. This function never checks main itself and does
+    no input or output beyond the release store; anything but ``True`` is refused
+    like a malformed input, and nothing is written. A commit already recorded
+    returns its existing row and writes nothing. A tier that is not exactly 0, 1
+    or 2 is stored as 2, "tier not recorded": the release never parses prose and
+    never assumes a lower risk than it was given.
 
     Returns ``recorded`` (False for a repeat), the ``member`` row and the
     ``batch`` it belongs to, read back after the write.
     """
+    if on_main is not True:
+        raise ValueError("on_main must be True: the merge step's confirmation that merge_commit is on main")
     for name, value in (
         ("merge_commit", merge_commit),
         ("reviewed_base", reviewed_base),
@@ -255,9 +272,11 @@ def decide_release(
 
 
 def list_batches(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """Every batch, oldest first, each with its members in merge order."""
-    ids = [row["id"] for row in conn.execute("SELECT id FROM release_batches ORDER BY id").fetchall()]
-    return [_snapshot(conn, batch_id) for batch_id in ids]
+    """Every batch, oldest first, each with its members in merge order, all read
+    from one snapshot."""
+    with _read_txn(conn):
+        ids = [row["id"] for row in conn.execute("SELECT id FROM release_batches ORDER BY id").fetchall()]
+        return [_snapshot(conn, batch_id) for batch_id in ids]
 
 
 def reminder_due_at(now: datetime, *, waiting: bool, last_reminder_day: Optional[date]) -> bool:
@@ -335,16 +354,35 @@ def _member(row: sqlite3.Row) -> dict[str, Any]:
     return member
 
 
+@contextlib.contextmanager
+def _read_txn(conn: sqlite3.Connection) -> Iterator[None]:
+    """Run a readback's reads in one SQLite read transaction, so they see one
+    snapshot. Inside a transaction the caller already opened (``record_merge``
+    and ``decide_release`` read back inside their ``write_txn``) the reads join
+    it: this never commits, rolls back or fails there."""
+    if conn.in_transaction:
+        yield
+        return
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")  # a read snapshot keeps nothing
+
+
 def _snapshot(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
-    row = conn.execute("SELECT * FROM release_batches WHERE id = ?", (batch_id,)).fetchone()
-    if row is None:
-        raise ValueError(f"release batch {batch_id!r} not found")
-    members = [
-        _member(member)
-        for member in conn.execute(
-            "SELECT * FROM release_members WHERE batch_id = ? ORDER BY position", (batch_id,)
-        ).fetchall()
-    ]
+    """The batch readback: metadata, ordered members and digest from one snapshot."""
+    with _read_txn(conn):
+        row = conn.execute("SELECT * FROM release_batches WHERE id = ?", (batch_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"release batch {batch_id!r} not found")
+        members = [
+            _member(member)
+            for member in conn.execute(
+                "SELECT * FROM release_members WHERE batch_id = ? ORDER BY position", (batch_id,)
+            ).fetchall()
+        ]
     return {
         "batch_id": row["id"],
         "state": row["state"],
