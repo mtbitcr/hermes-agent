@@ -94,6 +94,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli import kanban_provider_stops as _provider_stops
+from hermes_cli.kanban_risk_tier import parse_risk_tier
 from hermes_cli.sqlite_util import (
     InitLockDirectoryAbsent,
     InitLockUnavailable,
@@ -15645,6 +15646,10 @@ class Task:
     # the implementer's handover parks the card on the review lane instead of
     # completing it. See the ``requires_review`` column comment in SCHEMA_SQL.
     requires_review: bool = False
+    # The risk tier (0, 1 or 2) the approved plan gave this card, or None when
+    # none is recorded (counts as tier 2, see hermes_cli.kanban_risk_tier). See
+    # the ``risk_tier`` column comment in SCHEMA_SQL.
+    risk_tier: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -15776,6 +15781,11 @@ class Task:
                 bool(row["requires_review"])
                 if "requires_review" in keys and row["requires_review"] is not None
                 else False
+            ),
+            risk_tier=(
+                int(row["risk_tier"])
+                if "risk_tier" in keys and row["risk_tier"] is not None
+                else None
             ),
         )
 
@@ -16044,6 +16054,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- committed graph, which keep their historical complete-on-handover
     -- behaviour.
     requires_review      INTEGER NOT NULL DEFAULT 0,
+    -- The risk tier (0, 1 or 2) the owner-approved plan gave this card. NULL
+    -- (every card from before the tier existed, and every ordinary/manual/CLI
+    -- task) means no tier is recorded: it reads 'Risk not recorded', counts as
+    -- tier 2 and is treated as high risk (hermes_cli.kanban_risk_tier). It
+    -- changes no routing, effort or time box.
+    risk_tier            INTEGER,
     -- Discriminates ordinary work tasks ('work', the create_task default) from native
     -- recommendation cards (see create_recommendation). recommendation_* / target_profile /
     -- review_policy / provenance_* are populated only when task_kind='recommendation' (NULL otherwise).
@@ -17753,6 +17769,10 @@ def _migrate_add_optional_columns(
             "requires_review",
             "requires_review INTEGER NOT NULL DEFAULT 0",
         )
+    if "risk_tier" not in cols:
+        # Approved-plan risk tier (see SCHEMA_SQL). Existing rows get NULL: no
+        # tier is recorded, so they count as tier 2 and change no behaviour.
+        _add_column_if_missing(conn, "tasks", "risk_tier", "risk_tier INTEGER")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
@@ -19262,6 +19282,7 @@ def create_task(
     control: bool = False,
     receipt_owned: bool = False,
     requires_review: bool = False,
+    risk_tier: Optional[int] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -19361,6 +19382,10 @@ def create_task(
             "requires_review is only meaningful for executable implementation "
             "work, not for a control anchor or a read-only reviewer task"
         )
+    if risk_tier is not None:
+        # The one writer validates the tier, so no path stores a bad one. None
+        # stays None: legacy and CLI cards record no tier.
+        risk_tier = parse_risk_tier(risk_tier)
     responsibility = normalize_responsibility(responsibility)
     owned_paths_list = normalize_owned_paths(owned_paths)
     if assignee in _READ_ONLY_PROFILES:
@@ -19665,8 +19690,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, execution_tier, model_policy_lock,
                         goal_mode, goal_max_turns, session_id, task_kind,
-                        owner_receipt_bound, requires_review
-                    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{gate_sql}
+                        owner_receipt_bound, requires_review, risk_tier
+                    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{gate_sql}
                     """,
                     (
                         task_id,
@@ -19700,6 +19725,7 @@ def create_task(
                         "control" if control else "work",
                         1 if receipt_owned else 0,
                         1 if requires_review else 0,
+                        risk_tier,
                         *gate_params,
                     ),
                 )
@@ -29948,6 +29974,14 @@ def decompose_triage_task(
                     f"child[{idx}] read-only reviewer work cannot itself "
                     "require review"
                 )
+            # The approved risk tier, validated like create_task's: None stays
+            # None (no tier recorded).
+            risk_tier = child.get("risk_tier")
+            if risk_tier is not None:
+                try:
+                    risk_tier = parse_risk_tier(risk_tier)
+                except ValueError as exc:
+                    raise ValueError(f"child[{idx}] {exc}") from None
             # Written with the row but never part of the approved children,
             # so the owner graph digest that names them is unchanged.
             skills = (
@@ -29998,9 +30032,9 @@ def decompose_triage_task(
                 " workspace_path, tenant, project_id, owned_paths, "
                 " integrates_parent_heads, skills, model_override, provider_override, "
                 " reasoning_effort, execution_tier, model_policy_lock, "
-                " owner_receipt_bound, requires_review, park_generation, "
+                " owner_receipt_bound, requires_review, risk_tier, park_generation, "
                 " created_at, created_by) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -30022,6 +30056,7 @@ def decompose_triage_task(
                     model_policy_lock,
                     1 if receipt_owned else 0,
                     1 if requires_review else 0,
+                    risk_tier,
                     generation,
                     now,
                     (author or "decomposer"),
@@ -30036,6 +30071,7 @@ def decompose_triage_task(
                     "integrates_parent_heads": integrates_parent_heads or None,
                     "skills": skills,
                     "requires_review": requires_review or None,
+                    "risk_tier": risk_tier,
                     "execution_tier": execution_tier,
                     "model_route_pinned": bool(model_policy_lock),
                     "parked_for_activation": True if parked else None,
