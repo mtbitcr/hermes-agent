@@ -776,7 +776,8 @@ def test_malformed_facts_refuse_as_invalid_fact():
                 (rerun([flaky, in_progress]), (False, "not_completed")),
                 (lens_request([evidence(1)], reviewer=None), (False, "reviewer_not_independent")),
                 (merge(), (True, "merge")),
-                (fences.decide_merge(**{**merge_base, "rerun_attempt": None}), (True, "merge")),
+                (fences.decide_merge(**{**merge_base, "rerun_attempt": None,
+                                        "checks": {**snapshot, "last_rerun_id": None}}), (True, "merge")),
                 (merge(check_facts=checks(check_run(status="in_progress", conclusion=None))), (False, "check_pending")),
                 (merge(pr(mergeable=None)), (False, "not_mergeable")),
                 (merge(reviews=[{**review(9, "APPROVED"), "user": None}, review(10, "APPROVED")]), (True, "merge")),
@@ -849,3 +850,11 @@ def test_merge_after_a_rerun_needs_required_checks_from_a_later_attempt():
         d = fences.decide_merge(policy(), PLATFORM, H, pr(), facts, list(LENSES), [review(10, "APPROVED")],
                                 SECURITY, rerun_attempt=1)
         assert (d.allowed, d.code) == outcome, run
+
+
+def test_merge_after_a_rerun_refuses_without_the_rerun_attempt():
+    # After H's rerun the attempt number is required: without it an old success could count again.
+    facts = checks(check_run(run_attempt=2), evidence_id=20, last_rerun_id=10)
+    d = fences.decide_merge(policy(), PLATFORM, H, pr(), facts, list(LENSES), [review(10, "APPROVED")], SECURITY)
+    assert (d.allowed, d.code) == (False, "invalid_fact")
+    assert "rerun_attempt" in d.detail
