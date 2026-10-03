@@ -7,6 +7,7 @@ test on its own instead of the whole file at collection.
 from __future__ import annotations
 
 import hashlib
+import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -499,3 +500,54 @@ def test_readback_is_one_snapshot_under_a_concurrent_merge(open_ledger):
     [current] = ledger.list_batches(reader)
     assert _commits(current) == [_commit("a"), _commit("b")]
     assert (current["tier"], current["version"]) == (2, 2)
+
+
+# The second security review (2026-10-03): the module reads and writes only its own store.
+_PUBLIC = ("record_merge", "decide_release", "list_batches", "reminder_due", "record_reminder")
+_NOT_OWN_STORE = ("copy", "memory", "attached")
+
+
+def _public_call(name: str, batch):
+    """One public function, called as the merge step, the page or the reminder job would."""
+    now = _utc(2026, 10, 5, 16, 0)  # 18:00 in Vienna
+    return {
+        "record_merge": lambda conn: _merge(conn, "elsewhere"),
+        "decide_release": lambda conn: _decide(conn, batch, "accepted"),
+        "list_batches": ledger.list_batches,
+        "reminder_due": lambda conn: ledger.reminder_due(conn, now),
+        "record_reminder": lambda conn: ledger.record_reminder(conn, now),
+    }[name]
+
+
+def _not_own_store(kind: str, tmp_path: Path) -> sqlite3.Connection:
+    """A byte copy of the store at another path, an in-memory database, or the
+    store itself with another database attached."""
+    if kind == "copy":
+        copy = tmp_path / "copy" / ledger.STORE_NAME
+        copy.parent.mkdir()
+        shutil.copyfile(ledger.ledger_path(), copy)
+        conn = sqlite3.connect(str(copy), isolation_level=None)
+    elif kind == "memory":
+        conn = sqlite3.connect(":memory:", isolation_level=None)
+    else:
+        conn = ledger.connect()
+        conn.execute("ATTACH DATABASE ? AS other", (str(tmp_path / "other.db"),))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@pytest.mark.parametrize("kind", _NOT_OWN_STORE)
+@pytest.mark.parametrize("name", _PUBLIC)
+def test_connection_other_than_the_own_store_is_refused(open_ledger, tmp_path, name, kind):
+    own = open_ledger()
+    batch = _merge(own, "a")["batch"]
+    own_before = _store_rows(own)
+    other = _not_own_store(kind, tmp_path)
+    try:
+        other_before = _store_rows(other)
+        with pytest.raises(PermissionError):
+            _public_call(name, batch)(other)
+        assert _store_rows(other) == other_before
+    finally:
+        other.close()
+    assert _store_rows(own) == own_before
