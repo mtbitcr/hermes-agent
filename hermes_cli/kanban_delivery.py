@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -31,9 +33,13 @@ from hermes_cli.kanban_delivery_fences import Decision, decide_publish
 
 logger = logging.getLogger(__name__)
 
-# The integration card's idempotency key is this prefix + source card id +
-# ":" + approved head, so one source card and head can only ever name one card.
+# The integration card's idempotency key (plan section 5) is this prefix, the
+# owner-confirmed value, + source card id + ":" + approved head, so one source
+# card and head can only ever name one card.
 DELIVERY_KEY_PREFIX = "delivery:"
+
+# The creator every kernel-made integration card carries.
+_CREATED_BY = "kanban-delivery"
 
 _SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -47,6 +53,55 @@ _NO_REMOTE = {"branch_head": None, "open_pulls": []}
 
 def delivery_key(source_task_id: str, head: str) -> str:
     return DELIVERY_KEY_PREFIX + source_task_id + ":" + head
+
+
+# The integration card's body (plan section 5) is this fixed kernel text: the
+# steps in order and where it stops. Only the source card id, the approved head
+# and the delivery key are filled in, so no worker prose can reach the card.
+_INTEGRATION_CARD_BODY = (
+    "Kernel integration card for an approved build.\n"
+    "Approved source card: {source}\n"
+    "Approved head: {head}\n"
+    "Delivery key: {key}\n"
+    "\n"
+    "Steps, in this order:\n"
+    "1. T1 kanban_delivery_publish: publish the approved head.\n"
+    "2. T2 kanban_delivery_read_checks: read the required checks on the head.\n"
+    "3. T3 kanban_delivery_rerun_flaky: only for an eligible flaky failure, the one\n"
+    "   rerun, then T2 again.\n"
+    "4. T4 kanban_delivery_request_lenses: once the checks pass, request the lenses.\n"
+    "5. T6 kanban_delivery_merge: once both lenses approve the head, merge it.\n"
+    "6. T7 kanban_delivery_handoff: record the handoff of the merge.\n"
+    "\n"
+    "Where it stops:\n"
+    "- T1 refused (not approved, head mismatch, foreign branch, unknown pull\n"
+    "  request): block (needs_input) for Delivery and infrastructure and the\n"
+    "  owner. The source card is untouched.\n"
+    "- Checks pending: wait (blocked, transient); nothing moves.\n"
+    "- GitHub started zero jobs: stop and block for Delivery and infrastructure\n"
+    "  and the owner.\n"
+    "- Ineligible failure, or a failure after the one rerun: stop and complete as\n"
+    "  returned for changes with the evidence; the source card goes back to its\n"
+    "  implementer.\n"
+    "- Cancelled, timed out or infrastructure failure: stop and block\n"
+    "  (needs_input) for Delivery and infrastructure, not the authors.\n"
+    "- The review-labels gate (CI files touched): stop and block for the owner.\n"
+    "- A lens asks for changes: complete as returned for changes; the source card\n"
+    "  returns to Software engineering with the findings document.\n"
+    "- Identical findings twice on an identical head: stop for an owner decision.\n"
+    "- Head moved: all evidence and approvals for the head are void; stop and\n"
+    "  block for Delivery and infrastructure.\n"
+    "- Merge refused (not clean, or a GitHub refusal): stop and block for\n"
+    "  Delivery and infrastructure.\n"
+    "- Handoff error: retry; block as transient.\n"
+)
+
+
+def integration_card_body(source_task_id: str, head: str) -> str:
+    """The integration card's fixed kernel text for ``source_task_id`` at ``head``."""
+    return _INTEGRATION_CARD_BODY.format(
+        source=source_task_id, head=head, key=delivery_key(source_task_id, head),
+    )
 
 
 def delivery_settings() -> tuple[bool, Optional[str]]:
@@ -80,14 +135,52 @@ def _repository(workspace_path) -> Optional[Path]:
     return None
 
 
-def _git_confirms(workdir: Optional[Path], *args: str) -> bool:
-    if workdir is None:
-        return False
-    try:
-        kb._git_output(workdir, *args)
-    except (kb.WorktreeScopeError, OSError, subprocess.SubprocessError):
-        return False
-    return True
+def _git_proof(
+    workdir: Optional[Path], head: Optional[str], base: Optional[str],
+) -> tuple[bool, bool]:
+    """``(head_exists, base_is_ancestor)`` in the repository at ``workdir`` only.
+
+    git is resolved once, as an absolute path from the absolute PATH entries
+    only, and every check runs with ``-C`` set to ``workdir``, standard input
+    closed and a 30-second timeout. The environment is this process's without
+    any GIT_* variable, so GIT_DIR, GIT_OBJECT_DIRECTORY and the like cannot
+    answer from another repository, and without system or global configuration.
+    A check that cannot run confirms nothing.
+    """
+    if workdir is None or head is None:
+        return False, False
+    search = os.pathsep.join(
+        entry for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if os.path.isabs(entry)
+    )
+    git = shutil.which("git", path=search) if search else None
+    if git is None or not os.path.isabs(git):
+        return False, False
+    env = {
+        name: value for name, value in os.environ.items()
+        if not name.startswith("GIT_")
+    }
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+
+    def confirms(*args: str) -> bool:
+        try:
+            result = subprocess.run(
+                [git, "-C", str(workdir), *args],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    head_exists = confirms("cat-file", "-e", f"{head}^{{commit}}")
+    return head_exists, head_exists and base is not None and confirms(
+        "merge-base", "--is-ancestor", base, head,
+    )
 
 
 def approval_facts(
@@ -149,12 +242,7 @@ def approval_facts(
     implementer, _ = kb._latest_review_provenance(conn, task_id)
 
     workdir = _repository(row["workspace_path"]) if row is not None else None
-    head_exists = head is not None and _git_confirms(
-        workdir, "cat-file", "-e", f"{head}^{{commit}}",
-    )
-    base_is_ancestor = head_exists and base is not None and _git_confirms(
-        workdir, "merge-base", "--is-ancestor", base, head,
-    )
+    head_exists, base_is_ancestor = _git_proof(workdir, head, base)
     return {
         "source_done": status == "done",
         "approved_by_review_lane": approved,
@@ -185,6 +273,8 @@ def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional
     Returns the integration card id, or ``None`` when delivery is off, the card
     carries no review requirement, or the approval proof refuses. A second call
     for the same source card and head returns the card the first one created.
+    A card that only carries the delivery key is never adopted: the call raises
+    instead, so the approval, the record and any new card roll back together.
     """
     enabled, profile = delivery_settings()
     if not enabled or profile is None:
@@ -223,20 +313,28 @@ def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional
         ).fetchone()
         if record["integration_task_id"]:
             return record["integration_task_id"]
-        key = delivery_key(task_id, head)
+        body = integration_card_body(task_id, head)
         integration_id = kb.create_task(
             conn,
             title=f"Integrate {task_id} at {head[:12]}",
-            body=(
-                f"Approved source card: {task_id}\n"
-                f"Approved head: {head}\n"
-                f"Delivery key: {key}"
-            ),
+            body=body,
             assignee=profile,
-            created_by="kanban-delivery",
+            created_by=_CREATED_BY,
             owned_paths=[],
-            idempotency_key=key,
+            idempotency_key=delivery_key(task_id, head),
         )
+        # create_task answers a key that is already taken with that card, whoever
+        # made it. Nothing is adopted by its key alone: the card must be this
+        # delivery's own kernel card, or the approval, the record and any new
+        # card roll back together.
+        card = kb.get_task(conn, integration_id)
+        if card is None or (
+            card.created_by, card.assignee, card.owned_paths, card.body,
+        ) != (_CREATED_BY, kb._canonical_assignee(profile), [], body):
+            raise RuntimeError(
+                f"kanban delivery: the integration card {integration_id} for "
+                f"{task_id} at {head} is not this delivery's kernel card"
+            )
         conn.execute(
             "UPDATE kanban_deliveries SET integration_task_id = ? WHERE id = ?",
             (integration_id, record["id"]),
