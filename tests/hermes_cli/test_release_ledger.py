@@ -55,7 +55,7 @@ def _merge(conn, label: str, *, tier=1, pr: int = 1):
     return ledger.record_merge(
         conn,
         merge_commit=_commit(label),
-        pr_url=f"https://github.com/acme/hermes/pull/{pr}",
+        pr_url=f"https://github.com/mtbitcr/hermes-agent/pull/{pr}",
         reviewed_base=_commit(f"{label}-base"),
         reviewed_head=_commit(f"{label}-head"),
         reviewed_tree=_commit(f"{label}-tree"),
@@ -349,7 +349,7 @@ def _merge_args(label: str, **changes) -> dict:
     """record_merge's keyword arguments for one merge, without the main confirmation."""
     args = {
         "merge_commit": _commit(label),
-        "pr_url": "https://github.com/acme/hermes/pull/1",
+        "pr_url": "https://github.com/mtbitcr/hermes-agent/pull/1",
         "reviewed_base": _commit(f"{label}-base"),
         "reviewed_head": _commit(f"{label}-head"),
         "reviewed_tree": _commit(f"{label}-tree"),
@@ -381,42 +381,87 @@ def test_merge_not_confirmed_on_main_is_refused(open_ledger):
     assert _store_rows(conn) == recorded
 
 
-# Owner rule 3: only the exact, canonical pull-request URL is recorded.
-def test_non_canonical_pr_url_is_refused(open_ledger):
+# Owner rule, second round on pull-request URLs: only the two allowlisted shapes are recorded.
+_REFUSED_PR_URLS = (
+    # Dot segments: the four earlier ones and three inside the accepted shapes.
+    "https://github.com/../hermes/pull/1",
+    "https://github.com/acme/../pull/1",
+    "https://github.com/./hermes/pull/1",
+    "https://github.com/acme/./pull/1",
+    "https://github.com/mtbitcr/../pull/1",
+    "https://github.com/mtbitcr/./pull/1",
+    "https://github.com/mtbitcr/hermes-agent/../raphael-workspace/pull/1",
+    # Case variants.
+    "https://github.com/MTBITCR/hermes-agent/pull/1",
+    "https://github.com/mtbitcr/Hermes-Agent/pull/1",
+    "https://github.com/mtbitcr/RAPHAEL-WORKSPACE/pull/1",
+    "https://GitHub.com/mtbitcr/hermes-agent/pull/1",
+    "HTTPS://github.com/mtbitcr/hermes-agent/pull/1",
+    # Unknown repositories and an unknown owner.
+    "https://github.com/mtbitcr/hermes/pull/1",
+    "https://github.com/mtbitcr/hermes-agent-fork/pull/1",
+    "https://github.com/acme/hermes-agent/pull/1",
+    # Managed-user owners.
+    "https://github.com/mona-cat_octo/hermes-agent/pull/1",
+    "https://github.com/mtbitcr_octo/hermes-agent/pull/1",
+    # The ".git" suffix, in any case.
+    "https://github.com/mtbitcr/hermes-agent.git/pull/1",
+    "https://github.com/mtbitcr/hermes-agent.GIT/pull/1",
+    "https://github.com/mtbitcr/hermes-agent.Git/pull/1",
+    "https://github.com/mtbitcr/raphael-workspace.gIt/pull/1",
+    # Other suffixes and forms.
+    "https://github.com/mtbitcr/hermes-agent/pull/1/",
+    "https://github.com/mtbitcr/hermes-agent/pull/1/files",
+    "https://github.com/mtbitcr/hermes-agent/pull/1?w=1",
+    "https://github.com/mtbitcr/hermes-agent/pull/1#x",
+    "https://github.com/mtbitcr/hermes-agent/pull/1\n",
+    " https://github.com/mtbitcr/hermes-agent/pull/1",
+    "https://github.com/mtbitcr/hermes-agent/pull/1 ",
+    "http://github.com/mtbitcr/hermes-agent/pull/1",
+    "https://www.github.com/mtbitcr/hermes-agent/pull/1",
+    "https://github.com/mtbitcr/hermes-\u0430gent/pull/1",  # a Cyrillic look-alike "a"
+    # Pull numbers.
+    "https://github.com/mtbitcr/hermes-agent/pull/0",
+    "https://github.com/mtbitcr/hermes-agent/pull/01",
+    "https://github.com/mtbitcr/hermes-agent/pull/-1",
+    "https://github.com/mtbitcr/hermes-agent/pull/+1",
+    "https://github.com/mtbitcr/hermes-agent/pull/",
+    "https://github.com/mtbitcr/hermes-agent/pull/1.0",
+    "https://github.com/mtbitcr/hermes-agent/pull/\u0661",  # an Arabic-Indic one
+    "https://github.com/mtbitcr/hermes-agent/pull/\uff11",  # a full-width one
+    # The previous candidate's canonical examples.
+    "https://github.com/acme/hermes.cli_x-1/pull/7",
+    "https://github.com/Acme/.github/pull/8",
+)
+
+
+@pytest.mark.parametrize("pr_url", _REFUSED_PR_URLS)
+def test_pr_url_outside_the_allowlist_is_refused(open_ledger, pr_url):
     conn = open_ledger()
     _merge(conn, "a")
     before = _store_rows(conn)
-    refused = (
-        "https://github.com/../hermes/pull/1",
-        "https://github.com/acme/../pull/1",
-        "https://github.com/./hermes/pull/1",
-        "https://github.com/acme/./pull/1",
-        # Owner: a dot, an underscore, a leading, a trailing and a doubled hyphen, 40 characters.
-        "https://github.com/ac.me/hermes/pull/1",
-        "https://github.com/ac_me/hermes/pull/1",
-        "https://github.com/-acme/hermes/pull/1",
-        "https://github.com/acme-/hermes/pull/1",
-        "https://github.com/ac--me/hermes/pull/1",
-        f"https://github.com/{'a' * 40}/hermes/pull/1",
-        # Repository: GitHub's ".git" alias and 101 characters ("." and ".." are above).
-        "https://github.com/acme/hermes.git/pull/1",
-        f"https://github.com/acme/{'r' * 101}/pull/1",
-    )
 
-    for url in refused:
-        with pytest.raises(ValueError):
-            ledger.record_merge(conn, **_merge_args("b", pr_url=url), on_main=True)
+    with pytest.raises(ValueError):
+        ledger.record_merge(conn, **_merge_args("b", pr_url=pr_url), on_main=True)
     assert _store_rows(conn) == before
 
-    canonical = (
-        "https://github.com/acme/hermes.cli_x-1/pull/7",
-        "https://github.com/Acme/.github/pull/8",  # the case stays as given
-        f"https://github.com/{'a-' * 19}a/{'r' * 100}/pull/9",  # 39 and 100 characters
-    )
-    for label, url in zip(("c", "d", "e"), canonical):
-        readback = ledger.record_merge(conn, **_merge_args(label, pr_url=url), on_main=True)
-        assert readback["recorded"] is True
-        assert readback["member"]["pr_url"] == url
+
+@pytest.mark.parametrize(
+    "pr_url",
+    (
+        "https://github.com/mtbitcr/hermes-agent/pull/138",
+        "https://github.com/mtbitcr/raphael-workspace/pull/1024",
+    ),
+)
+def test_pr_url_on_the_allowlist_is_recorded(open_ledger, pr_url):
+    conn = open_ledger()
+
+    readback = ledger.record_merge(conn, **_merge_args("a", pr_url=pr_url), on_main=True)
+
+    assert readback["recorded"] is True
+    assert readback["member"]["pr_url"] == pr_url
+    [batch] = ledger.list_batches(conn)
+    assert [member["pr_url"] for member in batch["members"]] == [pr_url]
 
 
 # Owner rule 2: the review's concurrent-read regression.

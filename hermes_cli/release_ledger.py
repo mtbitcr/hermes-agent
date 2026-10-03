@@ -41,16 +41,12 @@ REMINDER_HOUR = 18
 VIENNA = ZoneInfo("Europe/Vienna")
 
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
-# The exact, canonical PR URL: https://github.com/<owner>/<repository>/pull/<number>.
-# The owner is a GitHub account name: 1-39 ASCII letters, digits and single inner
-# hyphens. The repository is 1-100 ASCII letters, digits, ".", "_" and "-", never a
-# "." or ".." path segment and never ending in ".git" (GitHub's alias of the name
-# without it). The case stays as given: the record cannot ask GitHub for it.
+# The owner's allowlist, compared byte for byte: exactly
+# https://github.com/mtbitcr/hermes-agent/pull/<number> or
+# https://github.com/mtbitcr/raphael-workspace/pull/<number>, the number a positive
+# ASCII decimal without leading zeros. Every other URL is refused.
 _PR_URL_RE = re.compile(
-    r"https://github\.com"
-    r"/(?=[A-Za-z0-9-]{1,39}/)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
-    r"/(?!\.\.?/)(?![A-Za-z0-9._-]*\.git/)[A-Za-z0-9._-]{1,100}"
-    r"/pull/[1-9][0-9]*"
+    r"https://github\.com/mtbitcr/(?:hermes-agent|raphael-workspace)/pull/[1-9][0-9]*"
 )
 # Card ids and page references are lowercase non-secret identifiers, as in kanban.
 _IDENTIFIER_RE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,199}")
@@ -168,7 +164,12 @@ def record_merge(
         ("reviewed_tree", reviewed_tree),
     ):
         _require(value, _COMMIT_RE, f"{name} must be a 40-character lowercase hex commit id")
-    _require(pr_url, _PR_URL_RE, "pr_url must be an exact https://github.com/<owner>/<repo>/pull/<number> URL")
+    _require(
+        pr_url,
+        _PR_URL_RE,
+        "pr_url must be https://github.com/mtbitcr/hermes-agent/pull/<number> or "
+        "https://github.com/mtbitcr/raphael-workspace/pull/<number>",
+    )
     _require(card_id, _IDENTIFIER_RE, "card_id must be a lowercase kanban card id")
     tier_recorded = type(tier) is int and tier in _RISK_TIERS
     member_tier = tier if tier_recorded else _UNRECORDED_TIER
