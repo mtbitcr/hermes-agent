@@ -237,7 +237,7 @@ def decide_release(
     """
     _own_store(conn)
     _refuse_worker_context()
-    if decision not in _DECISIONS:
+    if type(decision) is not str or decision not in _DECISIONS:
         raise ValueError("a release decision is 'accepted' or 'deferred'; there is no reject")
     for name, value in (("batch_id", batch_id), ("expected_version", expected_version)):
         if type(value) is not int or value < 0:
@@ -328,12 +328,15 @@ def _own_store(conn: sqlite3.Connection) -> None:
     """Refuse a connection to any database other than this module's own store.
 
     The main database must be the file of :func:`ledger_path`, and no other
-    database may be attached, so no row goes to another store.
+    database may be attached, so no row goes to another store. Temporary
+    tables are refused too, because they shadow the store's tables. The list
+    is read without the caller's row factory, and only the own path is resolved.
     """
-    databases = {row[1]: row[2] for row in conn.execute("PRAGMA database_list")}
-    main = databases.pop("main", "")
-    databases.pop("temp", None)
-    if databases or not main or os.path.realpath(main) != os.path.realpath(ledger_path()):
+    cursor = conn.cursor()
+    cursor.row_factory = None
+    databases = {row[1]: row[2] for row in cursor.execute("PRAGMA database_list")}
+    own = ledger_path()
+    if set(databases) != {"main"} or databases["main"] not in (str(own), os.path.realpath(own)):
         raise PermissionError("the release record works only on a connection to its own store")
 
 
@@ -351,7 +354,8 @@ def _in_vienna(now: datetime) -> datetime:
 
 
 def _require(value: Any, pattern: re.Pattern[str], message: str) -> None:
-    if not isinstance(value, str) or not pattern.fullmatch(value):
+    # Exactly str: SQLite can store another value for a subclass of str.
+    if type(value) is not str or not pattern.fullmatch(value):
         raise ValueError(message)
 
 
