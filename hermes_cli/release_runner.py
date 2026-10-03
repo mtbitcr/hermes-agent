@@ -42,7 +42,8 @@ TIER_MOVES: dict[int, tuple[str, ...]] = {
 class ReleaseHost(HostReader, Protocol):
     """Everything the runner asks of the release host, on top of the guards' reads.
 
-    The readback reads answer False, rather than raising, when the host does not answer.
+    The readback reads answer False, rather than raising, when the host does not answer. A read
+    that raises anyway counts as a failed check.
     """
 
     def unit_active(self, unit: str) -> bool: ...
@@ -91,6 +92,9 @@ READBACKS: tuple[tuple[str, Callable[[ReleaseHost, str], bool]], ...] = (
     ("R5", lambda host, expected: host.unit_active(SANDBOX_TUNNEL_UNIT)),
     ("R6", lambda host, expected: host.workspace_reads_ok()),
     ("fleet version", lambda host, expected: host.fleet_version() == expected),
+    # After every move the live configuration still equals the named snapshot G11 compared it
+    # with: releases are code-only, and the restore puts that snapshot back.
+    ("configuration", lambda host, expected: host.live_config() == host.named_config_snapshot()),
 )
 
 
@@ -100,7 +104,8 @@ class ReleaseResult:
 
     `outcome` is "refused" (a guard failed and nothing was written), "released", "restored" (a
     failure after cutover was undone and PREV read back), or "failed" (the readback after the
-    restore did not hold either, so the host needs a person).
+    restore did not hold either, so the host needs a person). `error` is the failure that started
+    the restore, and `restore_errors` holds every failure inside the restore.
     """
 
     outcome: str
@@ -108,6 +113,7 @@ class ReleaseResult:
     guards: tuple[GuardResult, ...]
     readbacks: tuple[Readback, ...] = ()
     error: str = ""
+    restore_errors: tuple[str, ...] = ()
 
 
 class ReadbackFailed(Exception):
@@ -142,7 +148,7 @@ def run_release(
         _require(_read_back(host, pins.new, steps, readbacks))
     except Exception as failure:
         steps.append("restore")
-        _back(host, pins)
+        restore_errors = _restore(host, pins)
         restored = _read_back(host, pins.prev, steps, readbacks).ok
         return ReleaseResult(
             "restored" if restored else "failed",
@@ -150,6 +156,7 @@ def run_release(
             guards,
             tuple(readbacks),
             f"{type(failure).__name__}: {failure}",
+            restore_errors,
         )
     return ReleaseResult("released", tuple(steps), guards, tuple(readbacks))
 
@@ -168,13 +175,34 @@ def _forward(host: ReleaseHost, pins: Pins) -> str:
     return pins.new
 
 
+# Going back brings both units up on PREV and its configuration; a restore takes the same steps.
+BACK_STEPS: tuple[Callable[[ReleaseHost, Pins], None], ...] = (
+    lambda host, pins: host.stop_units(PLATFORM_UNITS),
+    lambda host, pins: host.checkout(pins.prev),
+    lambda host, pins: host.restore_config(),
+    lambda host, pins: host.start_units(PLATFORM_UNITS),
+)
+
+
 def _back(host: ReleaseHost, pins: Pins) -> str:
-    """Bring both units up on PREV and its configuration, which is also how a failure restores."""
-    host.stop_units(PLATFORM_UNITS)
-    host.checkout(pins.prev)
-    host.restore_config()
-    host.start_units(PLATFORM_UNITS)
+    """The back move. Like any move, a step that fails here sets off the failure rule."""
+    for step in BACK_STEPS:
+        step(host, pins)
     return pins.prev
+
+
+def _restore(host: ReleaseHost, pins: Pins) -> tuple[str, ...]:
+    """Take every step of going back, even after one fails, and return each failure.
+
+    Only the restore contains its own failures, so the readback of PREV after it always runs.
+    """
+    errors: list[str] = []
+    for step in BACK_STEPS:
+        try:
+            step(host, pins)
+        except Exception as error:
+            errors.append(f"{type(error).__name__}: {error}")
+    return tuple(errors)
 
 
 MOVES: dict[str, Callable[[ReleaseHost, Pins], str]] = {"forward": _forward, "back": _back}
@@ -184,9 +212,19 @@ def _read_back(
     host: ReleaseHost, expected: str, steps: list[str], readbacks: list[Readback]
 ) -> Readback:
     steps.append("readback")
-    readback = Readback(expected, {name: check(host, expected) for name, check in READBACKS})
+    readback = Readback(
+        expected, {name: _holds(check, host, expected) for name, check in READBACKS}
+    )
     readbacks.append(readback)
     return readback
+
+
+def _holds(check: Callable[[ReleaseHost, str], bool], host: ReleaseHost, expected: str) -> bool:
+    """A read that raises counts as a failed check, so it can neither pass nor skip a readback."""
+    try:
+        return check(host, expected)
+    except Exception:
+        return False
 
 
 def _require(readback: Readback) -> None:
