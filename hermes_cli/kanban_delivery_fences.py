@@ -463,6 +463,9 @@ def decide_merge(policy: Policy, repo: str, head: str, pr: dict, checks: dict, v
         required = [run for run in checks["check_runs"] if run["name"] in policy.required_checks[repo]]
         if any(run["run_attempt"] <= rerun_attempt for run in required):
             return _refuse("check_stale", f"a required check run is not from an attempt after {rerun_attempt}")
+        # A legacy status carries no attempt, so after the rerun each required check needs a check run.
+        if {run["name"] for run in required} != set(policy.required_checks[repo]):
+            return _refuse("check_stale", f"a required check has no check run from an attempt after {rerun_attempt}")
     for name in policy.required_checks[repo]:
         outcome = _required_check(name, head, checks)
         if outcome != "success":
