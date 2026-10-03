@@ -16,6 +16,7 @@ import shutil
 import socket
 import ssl
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -34,6 +35,8 @@ INSTALLATION = 151217494
 TOKEN = "ghs_" + "Zq81Lw0Xp3Tn" * 3  # what the stand-in mints, then echoes in bodies, headers and errors
 STRAY = "ghs_" + "Vb27Kc5Hd9Rm" * 3  # an unrelated token-shaped value inside a projected field
 BASIC = base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()  # the token as git's Basic header carries it
+DUMMY = "ghs_" + "Nf64Jt8Yw2Qs" * 3  # a credential of the controls' own, so a control never plants TOKEN anywhere
+DUMMY_BASIC = base64.b64encode(f"x-access-token:{DUMMY}".encode()).decode()
 HEAD = "a" * 40
 BASE = "b" * 40
 SAMPLE = {"repo": REPO, "number": "7", "sha": HEAD, "id": "9", "head_sha": HEAD, "installation": str(INSTALLATION)}
@@ -57,6 +60,7 @@ ADMIN_CALLS = [
     ("POST", "/graphql"),
 ]
 _RUN = subprocess.run
+_MKDTEMP = tempfile.mkdtemp
 
 
 def _module():
@@ -105,6 +109,31 @@ def _remote_head(bare, branch):
                 capture_output=True, text=True).stdout.strip()
 
 
+def _remote_refs(bare):
+    """Every ref the bare remote holds, read back from the remote itself rather than from output."""
+    listed = _RUN(["git", "--git-dir", str(bare), "for-each-ref", "--format=%(refname)"],
+                  capture_output=True, text=True).stdout.split()
+    return sorted(listed)
+
+
+def _apply_git_config(monkeypatch, scope, work, tmp_path, settings):
+    """Put *settings* where the named git configuration scope reads them: the card repository's own
+    config, the global file, or the system file. git writes each file, so the section quoting is
+    exactly what git reads back."""
+    if scope == "repository":
+        for key, value in settings:
+            _git("config", key, value, cwd=work)
+        return
+    path = tmp_path / f"{scope}.gitconfig"
+    for key, value in settings:
+        _git("config", "--file", str(path), key, value)
+    if scope == "system":
+        monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
+        monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(path))
+    else:
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(path))
+
+
 def _record_git(monkeypatch):
     """Every subprocess the module starts, with its argv and environment, still really run."""
     calls = []
@@ -115,6 +144,53 @@ def _record_git(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", run)
     return calls
+
+
+def _record_mkdtemp(monkeypatch):
+    """Every directory tempfile.mkdtemp makes from here on, the push's private one included."""
+    made = []
+
+    def mkdtemp(*args, **kwargs):
+        made.append(Path(_MKDTEMP(*args, **kwargs)))
+        return str(made[-1])
+
+    monkeypatch.setattr(tempfile, "mkdtemp", mkdtemp)
+    return made
+
+
+def _answer_pushes(monkeypatch, github, answer, inspect):
+    """Every subprocess the module starts, with its argv, its environment and the number of token
+    requests the stand-in GitHub had seen when it started. Local git runs for real. A push is never
+    run: *inspect* sees it as it would start, and *answer* comes back as its porcelain output with
+    status 0, so nothing reaches the network."""
+    calls = []
+
+    def run(argv, *args, **kwargs):
+        env = dict(kwargs.get("env") or os.environ)
+        calls.append((list(argv), env, len(github["token_requests"])))
+        if "push" not in argv and not [a for a in argv if "github.com" in a]:
+            return _RUN(argv, *args, **kwargs)
+        inspect(list(argv), env)
+        return subprocess.CompletedProcess(argv, 0, stdout=answer, stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+def _subcommand(argv):
+    """The git command *argv* runs: its first word after git's own options and their values."""
+    words = iter(argv[1:])
+    for word in words:
+        if word in ("-c", "-C", "--git-dir"):
+            next(words, None)
+        elif not word.startswith("-"):
+            return word
+    return None
+
+
+def _carries(argv, env):
+    """Whether a git call holds the credential anywhere, in its argv or its environment."""
+    return any(secret in text for secret in (TOKEN, BASIC) for text in (*argv, *env.values()))
 
 
 def _capture_all_logs(caplog):
@@ -512,19 +588,25 @@ def test_push_carries_an_explicit_lease_and_keeps_the_credential_in_the_environm
 
     basic = base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
     lease = re.compile(rf"--force-with-lease=refs/heads/{re.escape(branch)}:([0-9a-f]{{40}})?")
+    carrying = 0
     for argv, env in calls:
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+        assert not [a for a in argv if TOKEN in a or basic in a]
+        holders = [k for k, v in env.items() if TOKEN in v or basic in v]
+        if not holders:  # the init and the copy, run before any credential exists: nothing to leak
+            assert "push" not in argv and not [a for a in argv if a.startswith("--force-with-lease")]
+            continue
+        carrying += 1
         leases = [a for a in argv if a.startswith("--force-with-lease")]
         assert len(leases) == 1 and lease.fullmatch(leases[0])
         assert not {"--force", "-f", "--mirror", "--all", "--tags", "--delete", "-d", "--prune"} & set(argv)
         assert not [a for a in argv if a.startswith("+")]
         assert f"{origin}/{REPO}.git" in argv
-        assert not [a for a in argv if TOKEN in a or basic in a]
         config = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
         assert config[f"http.{origin}/.extraheader"] == f"Authorization: basic {basic}"
         assert config["credential.helper"] == ""
-        assert env["GIT_TERMINAL_PROMPT"] == "0"
-        holders = [k for k, v in env.items() if TOKEN in v or basic in v]
         assert len(holders) == 1 and holders[0].startswith("GIT_CONFIG_VALUE_")
+    assert carrying == 5  # the five pushes above that reached git, each carrying it once
     assert not [k for k, v in os.environ.items() if TOKEN in v or basic in v]
     for path, text in _files_text(tmp_path).items():
         assert TOKEN not in text and basic not in text, path
@@ -631,6 +713,222 @@ def test_push_runs_no_git_hook(github, monkeypatch, tmp_path):
     assert _remote_head(bare, branch) == third
     for path, text in _files_text(tmp_path).items():
         assert TOKEN not in text and BASIC not in text, path
+
+
+@pytest.mark.parametrize("transport", ["ext", "ssh"])
+@pytest.mark.parametrize("scope", ["repository", "global", "system"])
+def test_push_ignores_configured_url_rewrites_and_transport_commands(github, monkeypatch, tmp_path,
+                                                                    scope, transport):
+    """A rewrite that sends the push through a helper program — named by the card repository's own
+    configuration, by global configuration or by system configuration: the helper never runs, so it
+    never sees the credential, and the leased push still reaches the intended remote. Each
+    configuration is first shown to run the helper for a plain push that carries a credential of the
+    control's own, so the regression cannot pass vacuously."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    mod = _transport_module(monkeypatch, github)
+    work, bare, origin, (first, second, *_) = _repositories(tmp_path)
+    monkeypatch.setattr(mod, "GIT_ORIGIN", origin)
+    stolen = tmp_path / "stolen"  # the helper keeps every environment it is started with
+    helper = tmp_path / "helper"
+    helper.write_text(f"#!/bin/sh\nenv >> '{stolen}'\nexit 1\n")  # and makes no request of its own
+    helper.chmod(0o755)
+    rewrites = {"ext": [("protocol.ext.allow", "always"), (f"url.ext::{helper} .insteadOf", f"{origin}/")],
+                "ssh": [("core.sshCommand", str(helper)),
+                        ("url.ssh://example.invalid/.insteadOf", f"{origin}/")]}
+    _apply_git_config(monkeypatch, scope, work, tmp_path, rewrites[transport])
+    branch = "delivery/card-1"
+
+    plain = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"http.{origin}/.extraheader",
+             "GIT_CONFIG_VALUE_0": f"Authorization: basic {DUMMY_BASIC}"}
+    _RUN(["git", "-C", str(work), "push", "--porcelain", f"{origin}/{REPO}.git", f"{first}:refs/heads/plain"],
+         env={**os.environ, **plain}, capture_output=True)
+    assert stolen.exists() and DUMMY_BASIC in stolen.read_text()  # this helper would catch a credential
+    stolen.unlink()
+
+    publish = mod.GitHubTransport("publish", REPO, key_path=github["key_file"])
+    try:
+        outcome = publish.push(work, branch, second, expected="")
+    except mod.GitHubTransportError as exc:  # whatever escapes is reported beside the leak itself
+        outcome = exc.reason
+
+    held = sorted(path.name for path, text in _files_text(tmp_path).items() if TOKEN in text or BASIC in text)
+    assert (held, stolen.exists()) == ([], False)  # no configured helper ran, and no file holds it
+    assert outcome == {"state": "pushed", "branch": branch, "head": second}
+    assert _remote_refs(bare) == [f"refs/heads/{branch}"]
+    assert list(Path(tempfile.gettempdir()).glob("hermes-delivery-push-*")) == []  # nothing left behind
+
+
+def test_push_cannot_be_redirected_to_another_remote_of_the_same_scheme(github, monkeypatch, tmp_path):
+    """Rewrites that keep GIT_ORIGIN's own scheme, so restricting the transport cannot refuse them:
+    all three of url.insteadOf, url.pushInsteadOf and remote.<the push URL>.pushurl name a second
+    bare remote. The decoy receives nothing and the intended remote receives the branch."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    mod = _transport_module(monkeypatch, github)
+    work, bare, origin, (first, *_) = _repositories(tmp_path)
+    monkeypatch.setattr(mod, "GIT_ORIGIN", origin)
+    decoy_root = tmp_path / "decoy"
+    decoy = decoy_root / "mtbitcr" / "hermes-agent.git"
+    _git("init", "-q", "--bare", str(decoy))
+    _apply_git_config(monkeypatch, "repository", work, tmp_path, [
+        (f"url.{decoy_root.as_uri()}/.insteadOf", f"{origin}/"),
+        (f"url.{decoy_root.as_uri()}/.pushInsteadOf", f"{origin}/"),
+        (f"remote.{origin}/{REPO}.git.pushurl", decoy.as_uri())])
+    branch = "delivery/card-1"
+
+    publish = mod.GitHubTransport("publish", REPO, key_path=github["key_file"])
+    try:
+        outcome = publish.push(work, branch, first, expected="")
+    except mod.GitHubTransportError as exc:
+        outcome = exc.reason
+
+    assert _remote_refs(decoy) == []  # the decoy never became the push's destination
+    assert outcome == {"state": "pushed", "branch": branch, "head": first}
+    assert _remote_refs(bare) == [f"refs/heads/{branch}"]
+    for path, text in _files_text(tmp_path).items():
+        assert TOKEN not in text and BASIC not in text, path
+
+
+@pytest.mark.parametrize("scope", ["repository", "global"])
+def test_push_publishes_no_ref_beside_the_leased_branch(github, monkeypatch, tmp_path, scope):
+    """push.followTags in the card repository's own configuration or in global configuration: the
+    push writes exactly one remote ref, the leased branch, and the annotated tag sitting on the very
+    commit being pushed stays unpublished."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    mod = _transport_module(monkeypatch, github)
+    work, bare, origin, (first, *_) = _repositories(tmp_path)
+    monkeypatch.setattr(mod, "GIT_ORIGIN", origin)
+    _git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "tag", "-a", "-m", "t", "not-leased",
+         first, cwd=work)
+    _apply_git_config(monkeypatch, scope, work, tmp_path, [("push.followTags", "true")])
+    branch = "delivery/probe"
+
+    pushed = mod.GitHubTransport("publish", REPO, key_path=github["key_file"]).push(
+        work, branch, first, expected="")
+
+    assert pushed == {"state": "pushed", "branch": branch, "head": first}
+    assert _remote_refs(bare) == [f"refs/heads/{branch}"]  # read back from the remote, not from output
+
+
+def test_push_follows_the_owner_rule(github, monkeypatch, tmp_path):
+    """The owner's rule for the credential-bearing push, as the next review judges it, with the
+    production GIT_ORIGIN and host variables planted that would redirect or widen the push if
+    inherited. The init and the copy run for real; the push is answered here and never run. The
+    commit reaches a fresh bare repository in a private temporary directory before any token exists.
+    Then exactly one git holds the credential, the push: it reads no git configuration the transport
+    does not set, may speak only https, and names one URL, one refspec and its lease. The directory
+    is gone afterwards."""
+    mod = _transport_module(monkeypatch, github)
+    assert mod.GIT_ORIGIN == "https://github.com"  # the production origin, so the push below is never run
+    work, _, _, (first, second, _) = _repositories(tmp_path)
+    helper = tmp_path / "helper"
+    helper.write_text(f"#!/bin/sh\nenv >> '{tmp_path / 'stolen'}'\nexit 1\n")
+    helper.chmod(0o755)
+    hostile = tmp_path / "hostile.gitconfig"  # a rewrite through the helper, and tags that follow the branch
+    _git("config", "--file", str(hostile), f"url.ext::{helper} .insteadOf", "https://github.com/")
+    _git("config", "--file", str(hostile), "push.followTags", "true")
+    planted = {
+        "GIT_ALLOW_PROTOCOL": "ext:https", "GIT_SSH_COMMAND": str(helper), "GIT_SSH": str(helper),
+        "GIT_PROXY_COMMAND": str(helper), "GIT_ASKPASS": str(helper), "SSH_ASKPASS": str(helper),
+        "GIT_CONFIG_PARAMETERS": f"'url.ext::{helper} .insteadof'='https://github.com/' 'push.followtags'='true'",
+        "GIT_CONFIG_SYSTEM": str(hostile), "GIT_DIR": str(work / ".git"), "HTTPS_PROXY": "http://127.0.0.1:9",
+        "GIT_SSL_NO_VERIFY": "1", "GIT_TRACE": str(tmp_path / "trace"), "GIT_TRACE_CURL": str(tmp_path / "curl"),
+        "GIT_CURL_VERBOSE": "1", "SSLKEYLOGFILE": str(tmp_path / "tls-keys.log")}
+    for name, value in planted.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(hostile))  # to be replaced by the push's own empty file
+    made = _record_mkdtemp(monkeypatch)
+    branch = "delivery/card-1"
+    ref = f"refs/heads/{branch}"
+    at_push = {}
+
+    def inspect(argv, env):  # the moment the push would start
+        temp = made[0] if len(made) == 1 else None
+        git_dir = argv[argv.index("--git-dir") + 1] if "--git-dir" in argv else str(work / ".git")
+        clean = {"PATH": os.environ["PATH"], "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+
+        def read(*args):
+            return _RUN(["git", "--git-dir", git_dir, *args], env=clean, capture_output=True, text=True).stdout.split()
+
+        global_file = Path(env.get("GIT_CONFIG_GLOBAL") or os.devnull)
+        at_push.update(
+            bare=read("rev-parse", "--is-bare-repository"), history=read("rev-list", second),
+            config=global_file.read_bytes() if global_file.is_file() else None,
+            executables=None if temp is None else [
+                p.name for p in temp.rglob("*") if p.is_file() and os.access(p, os.X_OK)],
+            holders=None if temp is None else [
+                p.name for p, text in _files_text(temp).items() if TOKEN in text or BASIC in text])
+
+    answer = f"To https://github.com/{REPO}.git\n*\t{second}:{ref}\t[new branch]\nDone\n".encode()
+    calls = _answer_pushes(monkeypatch, github, answer, inspect)
+
+    pushed = mod.GitHubTransport("publish", REPO, key_path=github["key_file"]).push(work, branch, second, expected="")
+
+    carrying = [(argv, env) for argv, env, _ in calls if _carries(argv, env)]
+    assert [_subcommand(argv) for argv, _ in carrying] == ["push"]  # exactly one git holds the credential
+    ((argv, env),) = carrying
+    git_dir = argv[argv.index("--git-dir") + 1] if "--git-dir" in argv else None
+    assert argv[:argv.index("push")] == ["git", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+                                         "--git-dir", git_dir]
+    assert len(made) == 1 and made[0] in Path(git_dir).parents  # a fresh repository in one private directory
+    temp = made[0]
+    options = [a for a in argv[argv.index("push") + 1:] if a.startswith("-")]
+    assert sorted(options) == sorted(["--porcelain", "--no-follow-tags", f"--force-with-lease={ref}:"])
+    assert [a for a in argv[argv.index("push") + 1:] if not a.startswith("-")] == [
+        f"https://github.com/{REPO}.git", f"{second}:{ref}"]  # one URL and exactly one refspec
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert temp in Path(env["GIT_CONFIG_GLOBAL"]).parents and at_push["config"] == b""  # an empty file of its own
+    assert env["HOME"] == env["XDG_CONFIG_HOME"] == str(temp)
+    assert [name for name in planted if name in env] == []
+    holders = [name for name, value in env.items() if TOKEN in value or BASIC in value]
+    assert len(holders) == 1 and holders[0].startswith("GIT_CONFIG_VALUE_")
+    config = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
+    assert config["http.https://github.com/.extraheader"] == f"Authorization: basic {BASIC}"
+
+    assert at_push["bare"] == ["true"] and at_push["history"] == [second, first]  # the commit, with its history
+    assert at_push["executables"] == [] and at_push["holders"] == []  # no hook to run, no file with the credential
+
+    assert [_subcommand(argv) for argv, _, _ in calls] == ["init", "fetch", "push"]
+    (init, init_env, _), (copy, copy_env, requests_at_copy), (_, _, requests_at_push) = calls
+    assert (requests_at_copy, requests_at_push, len(github["token_requests"])) == (0, 1, 1)  # minted after the copy
+    assert not _carries(init, init_env) and not _carries(copy, copy_env)
+    assert {"--bare", "--quiet", "--template=", git_dir} <= set(init)
+    assert {("-c", "protocol.allow=never"), ("-c", "protocol.file.allow=always"), ("--git-dir", git_dir)} <= set(
+        zip(copy, copy[1:]))
+    assert {"--no-tags", "--no-write-fetch-head", str(work)} <= set(copy)
+    assert copy[-1].split(":")[0] == second  # exactly the commit, from the worktree's absolute path
+    for other in (init_env, copy_env):  # every git the push starts reads only what the transport sets
+        assert [other.get(name) for name in ("GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "HOME", "XDG_CONFIG_HOME")] == [
+            env[name] for name in ("GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "HOME", "XDG_CONFIG_HOME")]
+        assert [name for name in planted if name in other] == []
+
+    assert pushed == {"state": "pushed", "branch": branch, "head": second}
+    assert not temp.exists()  # the repository, its copy of the commit and the empty config are gone
+
+
+def test_push_of_a_commit_missing_from_the_worktree_requests_no_token(github, monkeypatch, tmp_path):
+    """The commit is not in the worktree, so the copy fails: push_failed before any token request,
+    with no push started and the temporary directory gone."""
+    mod = _transport_module(monkeypatch, github)
+    work, bare, origin, _ = _repositories(tmp_path)
+    monkeypatch.setattr(mod, "GIT_ORIGIN", origin)
+    made = _record_mkdtemp(monkeypatch)
+    calls = _record_git(monkeypatch)
+
+    with pytest.raises(mod.GitHubTransportError) as failed:
+        mod.GitHubTransport("publish", REPO, key_path=github["key_file"]).push(
+            work, "delivery/card-1", "c" * 40, expected="")
+
+    assert failed.value.reason == "push_failed"
+    assert github["token_requests"] == []  # the copy failed before any credential existed
+    assert [argv for argv, _ in calls if _subcommand(argv) == "push"] == []
+    assert len(made) == 1 and not made[0].exists()
+    assert _remote_refs(bare) == []
 
 
 def test_push_with_undecodable_git_output_yields_only_fixed_results(github, monkeypatch, tmp_path):

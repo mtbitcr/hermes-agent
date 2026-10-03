@@ -5,6 +5,13 @@ Nothing calls this yet. A transport serves one step on one repository. It signs 
 in-process from the key file and mints one installation token naming only that step's permissions
 and that repository. Every call is checked against REST_ALLOWLIST before any token or connection
 exists, and results carry fixed fields only.
+
+The push that carries the credential runs from a fresh bare repository in a private temporary
+directory, made for that one push and removed after it. The commit is copied in from the card worktree
+before any credential exists. The push then reads no git configuration the transport does not set,
+inherits no variable from the host beyond what starting a process needs, may speak only GIT_ORIGIN's
+own protocol, and names one URL, one refspec and its lease. So no hook, trace, URL rewrite, custom
+transport or push setting of the worktree can reach it.
 """
 from __future__ import annotations
 
@@ -13,13 +20,15 @@ import http.client
 import json
 import os
 import re
+import shutil
 import ssl
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from types import MappingProxyType
 from typing import NamedTuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import jwt
 
@@ -31,6 +40,15 @@ APP_ID = "4485539"  # a string: GitHub requires the JWT issuer to be one
 INSTALLATION_ID = 151217494
 API_HOST = "api.github.com"
 GIT_ORIGIN = "https://github.com"
+
+# The only schemes a push may speak, and the only ones its git is allowed to use: https in
+# production, file where a test points GIT_ORIGIN at a local root. ext::, ssh, git and plain http are
+# refused, so no configured rewrite or helper program can stand in for the transport.
+_PUSH_SCHEMES = ("https", "file")
+# The whole environment of every git this module starts is built from these names: locations the
+# operating system needs to start a process at all. Nothing git reads as policy is carried over: no
+# configuration, transport, proxy, trust-store, askpass or trace variable can arrive from the host.
+_GIT_ENV_NAMES = ("PATH", "SYSTEMROOT", "COMSPEC", "TEMP", "TMP", "TMPDIR")
 
 # Callers name a step, never a permission map, so these are the only token requests there are.
 # On GitHub write includes read, and every token gets metadata read without asking.
@@ -181,6 +199,47 @@ def _basic(token: str) -> str:
     return base64.b64encode(f"x-access-token:{token}".encode()).decode()
 
 
+def _git_base_env(home: str) -> dict[str, str]:
+    """The environment of every git a push starts, built name by name rather than as a copy of
+    os.environ with entries removed. *home* is the push's private directory, and the only git
+    configuration file read there is the empty one the transport made."""
+    env = noninteractive_git_env({name: os.environ[name] for name in _GIT_ENV_NAMES if name in os.environ})
+    env["GIT_CONFIG_NOSYSTEM"] = "1"  # the system file is not read, whatever GIT_CONFIG_SYSTEM says
+    env["GIT_CONFIG_GLOBAL"] = os.path.join(home, ".gitconfig")  # nor ~/.gitconfig: this empty file instead
+    env["HOME"] = env["XDG_CONFIG_HOME"] = home  # nor the XDG file, nor the ~/.netrc that curl reads
+    return env
+
+
+def _run_git(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess | None:
+    """One git with nothing to read on stdin; None when it could not start or did not finish."""
+    try:
+        return subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _copy_commit(home: str, worktree: str | Path, sha: str, ref: str) -> str:
+    """A fresh bare repository in *home* holding commit *sha* and its history under *ref*, copied
+    from the worktree before any credential exists. Of the gits a push starts, only the one that
+    serves this copy reads the worktree's own configuration."""
+    env = _git_base_env(home)
+    repository = os.path.join(home, "push.git")
+    try:
+        Path(env["GIT_CONFIG_GLOBAL"]).touch(exist_ok=False)  # the global configuration: empty
+    except OSError:
+        raise GitHubTransportError("push_failed") from None
+    # An empty --template= copies no sample hook or other file: the repository holds what init writes.
+    init = ["git", "init", "--bare", "--quiet", "--template=", repository]
+    # Only the file protocol, from the worktree's absolute path, for exactly this commit and no tag.
+    fetch = ["git", "-c", "protocol.allow=never", "-c", "protocol.file.allow=always", "--git-dir", repository,
+             "fetch", "--no-tags", "--no-write-fetch-head", os.path.abspath(worktree), f"{sha}:{ref}"]
+    for argv in (init, fetch):
+        result = _run_git(argv, env)
+        if result is None or result.returncode != 0:
+            raise GitHubTransportError("push_failed")
+    return repository
+
+
 class GitHubTransport:
     """One step's GitHub access to one repository, through one narrowed installation token."""
 
@@ -225,13 +284,21 @@ class GitHubTransport:
         if not _holds(self._permissions, ("contents", "write")):
             raise GitHubTransportError("step_not_permitted")
         ref = f"refs/heads/{branch}"
-        argv = ["git", "-C", str(worktree), "push", "--porcelain", f"--force-with-lease={ref}:{expected}",
-                f"{GIT_ORIGIN}/{self.repository}.git", f"{sha}:{ref}"]
-        env = self._git_env()
+        url, scheme = self._push_url()  # the destination, fixed before any credential exists
         try:
-            result = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
-        except (OSError, subprocess.SubprocessError):
-            result = None
+            home = tempfile.mkdtemp(prefix="hermes-delivery-push-")  # mode 0700, for this one push
+        except OSError:
+            raise GitHubTransportError("push_failed") from None
+        try:
+            repository = _copy_commit(home, worktree, sha, ref)
+            # Only GIT_ORIGIN's own protocol, so no rewrite to ext:: or ssh:// can be carried out. One
+            # URL, one refspec and its lease, and --no-follow-tags, so nothing adds a ref beside them.
+            argv = ["git", "-c", "protocol.allow=never", "-c", f"protocol.{scheme}.allow=always",
+                    "--git-dir", repository, "push", "--porcelain", "--no-follow-tags",
+                    f"--force-with-lease={ref}:{expected}", url, f"{sha}:{ref}"]
+            result = _run_git(argv, self._git_env(_git_base_env(home)))  # the token is minted here
+        finally:
+            shutil.rmtree(home, ignore_errors=True)  # the repository, its copy of the commit and the config
         if result is None:
             raise GitHubTransportError("push_failed")
         # Bytes, decoded here with replacement: a strict decode fails with an error that carries git's
@@ -265,19 +332,20 @@ class GitHubTransport:
             raise GitHubTransportError("token_scope_mismatch")
         return token
 
-    def _git_env(self) -> dict[str, str]:
-        """The push's environment: the only place its credential lives, as with_git_auth does it."""
-        # Inherited command-scope git config is dropped: read after ours, it could bring a credential
-        # helper back. So are git's traces, curl's verbose log and the TLS key log, which would write
-        # the credential out.
-        env = {key: value for key, value in noninteractive_git_env().items()
-               if not re.fullmatch(r"GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS)|GIT_TRACE(?:_.*)?"
-                                   r"|GIT_CURL_VERBOSE|SSLKEYLOGFILE", key)}
-        # "0" turns off a trace2 target that system or global config names; unset or empty would not.
-        env.update(GIT_TRACE2="0", GIT_TRACE2_PERF="0", GIT_TRACE2_EVENT="0")
-        env.pop("GIT_ASKPASS", None)
-        env.pop("SSH_ASKPASS", None)
-        # Command scope outranks the hooks path a repository or global config names, so no hook runs.
+    def _push_url(self) -> tuple[str, str]:
+        """The one address this push may reach, built from GIT_ORIGIN and the bound repository, and
+        the one scheme its git may speak. Checked here, before a credential is minted."""
+        origin = urlsplit(GIT_ORIGIN)
+        if origin.scheme not in _PUSH_SCHEMES or origin.query or origin.fragment or "@" in origin.netloc:
+            raise GitHubTransportError("bad_push_target")
+        return f"{GIT_ORIGIN}/{self.repository}.git", origin.scheme
+
+    def _git_env(self, env: dict[str, str]) -> dict[str, str]:
+        """The push's environment: *env* and the credential, which lives only here, as with_git_auth
+        does it."""
+        # Command scope outranks every file git could still read, though the push reads only the empty
+        # global file and the config its fresh repository was made with: no hooks path, helper or
+        # redirect is in force.
         config = {"credential.helper": "", "core.askPass": "", "core.hooksPath": os.devnull,
                   "http.followRedirects": "false",
                   f"http.{GIT_ORIGIN}/.extraheader": f"Authorization: basic {_basic(self._installation_token())}"}
