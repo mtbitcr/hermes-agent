@@ -57,6 +57,19 @@ _EXECUTION_TIER = {
     ),
 }
 
+# The risk tier the owner approves for every created task: the kernel refuses
+# a created task without one, so every task-creating shape below requires it.
+_RISK_TIER = {
+    "type": "integer",
+    "enum": [0, 1, 2],
+    "description": (
+        "Required risk tier: 0 for text, documentation or settings without "
+        "data writes; 1 for owner pages and data reads; 2 for data writes, "
+        "the kernel, access or money. When more than one fits, choose the "
+        "higher."
+    ),
+}
+
 # The explicit repository write boundary for one created task. The field stays
 # optional so a proposal committed before it existed still replays unchanged
 # (the kernel keeps that task's historical NULL whole-repository ownership),
@@ -438,6 +451,7 @@ registry.register(
                                 ),
                             },
                             "execution_tier": _EXECUTION_TIER,
+                            "risk_tier": _RISK_TIER,
                             "owned_paths": _OWNED_PATHS,
                             "parents": {
                                 "type": "array",
@@ -447,7 +461,7 @@ registry.register(
                         },
                         "required": [
                             "title", "body", "assignee", "responsibility",
-                            "execution_tier", "parents",
+                            "execution_tier", "risk_tier", "parents",
                         ],
                     },
                 },
@@ -497,9 +511,13 @@ _PROJECT_TASK_SPEC = {
             "description": "Stable logical responsibility; separate from the runtime profile.",
         },
         "execution_tier": _EXECUTION_TIER,
+        "risk_tier": _RISK_TIER,
         "owned_paths": _OWNED_PATHS,
     },
-    "required": ["title", "body", "assignee", "responsibility", "execution_tier"],
+    "required": [
+        "title", "body", "assignee", "responsibility", "execution_tier",
+        "risk_tier",
+    ],
 }
 
 _PROJECT_SPLIT_TASK_SPEC = {
@@ -513,7 +531,8 @@ _PROJECT_SPLIT_TASK_SPEC = {
         },
     },
     "required": [
-        "title", "body", "assignee", "responsibility", "execution_tier", "parents",
+        "title", "body", "assignee", "responsibility", "execution_tier",
+        "risk_tier", "parents",
     ],
 }
 
@@ -529,11 +548,12 @@ _PROJECT_PRESERVED_TASK_SPEC = {
             "description": "Stable logical responsibility; separate from the runtime profile.",
         },
         "execution_tier": _EXECUTION_TIER,
+        "risk_tier": _RISK_TIER,
         "owned_paths": _OWNED_PATHS,
     },
     "required": [
         "title", "body_mode", "assignee", "responsibility",
-        "execution_tier", "owned_paths",
+        "execution_tier", "risk_tier", "owned_paths",
     ],
 }
 
@@ -546,7 +566,7 @@ _PROJECT_REWRITTEN_TASK_SPEC = {
     },
     "required": [
         "title", "body_mode", "body", "assignee", "responsibility",
-        "execution_tier", "owned_paths",
+        "execution_tier", "risk_tier", "owned_paths",
     ],
 }
 
@@ -622,7 +642,7 @@ registry.register(
                                 },
                                 "required": [
                                     "action", "reason", "title", "body", "assignee", "responsibility",
-                                    "execution_tier", "existing_parents", "new_parents",
+                                    "execution_tier", "risk_tier", "existing_parents", "new_parents",
                                 ],
                             },
                             {

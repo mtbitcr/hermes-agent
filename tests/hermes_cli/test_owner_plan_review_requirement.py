@@ -54,6 +54,8 @@ def _spec(title: str, *, requires_review: bool | None = None, **overrides) -> di
         "body": "Produce the owner-visible result.",
         "assignee": "default",
         "execution_tier": "routine",
+        # Every created task states its risk tier.
+        "risk_tier": 1,
     }
     if requires_review is not None:
         spec["requires_review"] = requires_review
@@ -523,12 +525,15 @@ def test_a_non_boolean_requirement_is_refused(ctx, value):
 # policy migration moved that route to claude-opus-5-5, after comparing the two
 # normalized payloads: exactly eight leaves differ — ``model_override`` and its
 # ``model_policy_lock`` on each of the four created-task specs — and neither
-# payload carries a ``requires_review`` key. It stays a literal so that
-# accepting ``requires_review`` can never disturb the request digest — and
-# therefore the receipt identity and replay — of any plan that omits it; only a
-# route-only delta like that one may ever move it.
+# payload carries a ``requires_review`` key. It was re-frozen from 1525d9dd…413e
+# when every created task began stating its risk tier: the fixture gained
+# ``risk_tier`` on each of its four created-task specs, the only new leaves in
+# the normalized payload, which still carries no ``requires_review`` key. It
+# stays a literal so that accepting ``requires_review`` can never disturb the
+# request digest — and therefore the receipt identity and replay — of any plan
+# that omits it; only a delta like those two may ever move it.
 _OMITTED_REQUIREMENT_DIGEST = (
-    "1525d9ddd8653cdcba19f95dc0f49f4835e4b3d5f82da3787fe2ddf5e956413e"
+    "3d43ac9e3130658ae912b31f4f3846d2cfaf6aaadeb6c0369c7683200e1353bd"
 )
 
 
@@ -549,6 +554,7 @@ def _fixed_changes(*, requires_review: bool = False) -> list[dict]:
             "assignee": "default",
             "responsibility": "B04",
             "execution_tier": "routine",
+            "risk_tier": 1,
             "existing_parents": [],
             "new_parents": [],
             **stated,
@@ -566,6 +572,7 @@ def _fixed_changes(*, requires_review: bool = False) -> list[dict]:
                 "body": "Deliver the smaller outcome.",
                 "assignee": "default",
                 "execution_tier": "routine",
+                "risk_tier": 1,
                 **stated,
             },
         },
@@ -583,6 +590,7 @@ def _fixed_changes(*, requires_review: bool = False) -> list[dict]:
                     "body": "Produce one owner-visible outcome.",
                     "assignee": "default",
                     "execution_tier": "routine",
+                    "risk_tier": 1,
                     "parents": [],
                     **stated,
                 },
@@ -591,6 +599,7 @@ def _fixed_changes(*, requires_review: bool = False) -> list[dict]:
                     "body": "Verify the outcome before downstream work continues.",
                     "assignee": "default",
                     "execution_tier": "routine",
+                    "risk_tier": 1,
                     "parents": [0],
                 },
             ],

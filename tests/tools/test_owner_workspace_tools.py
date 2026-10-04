@@ -159,7 +159,7 @@ class TestSchemas:
         assert tasks["maxItems"] == 12
         assert tasks["items"]["additionalProperties"] is False
         assert set(tasks["items"]["required"]) == {
-            "title", "body", "assignee", "responsibility", "execution_tier",
+            "title", "body", "assignee", "responsibility", "execution_tier", "risk_tier",
             "parents",
         }
         assert tasks["items"]["properties"]["execution_tier"]["enum"] == [
@@ -300,6 +300,106 @@ class TestSchemas:
             "execution_tier" in variant["required"]
             for variant in replacement["oneOf"]
         )
+
+    def test_a_schema_valid_tiered_task_reaches_the_real_normalizer(self, monkeypatch):
+        """Every created task must state its risk tier, so every shape a model
+        can send carries one: a task that validates against the registered
+        schema with its tier reaches the real kernel normalizer and is
+        accepted there with that same tier."""
+        from jsonschema import Draft202012Validator
+
+        from hermes_cli import owner_workspace as kernel
+        from plugins.dashboard_auth.raphael_workspace import model_policy
+
+        # Only the provider a role's config.yaml would select is stood in for;
+        # the normalizers and the route pin they resolve are the real kernel.
+        monkeypatch.setattr(
+            model_policy, "configured_assignment_for",
+            lambda profile: model_policy.assignment_for(profile, "anthropic"),
+        )
+        task = {
+            "title": "Draft the workshop plan",
+            "body": "Prepare the private workshop plan.",
+            "assignee": "default",
+            "responsibility": "B03",
+            "execution_tier": "routine",
+        }
+        preserved = {key: value for key, value in task.items() if key != "body"}
+        target = {"task_id": "t_left", "expected_status": "todo", "expected_revision": 1}
+        milestone = {
+            "idempotency_key": "tiered-tasks",
+            "request_title": "Prepare the workshop",
+            "specification": "Create one owner-visible workshop milestone.",
+            "current_milestone": "Prepare the workshop",
+            "owner_visible_result": "A reviewed workshop plan.",
+        }
+
+        graph_args = {
+            **milestone, "mode": "new", "project_name": "Workshop pilot",
+            "root_assignee": "default",
+            "tasks": [{**task, "risk_tier": 2, "parents": []}],
+        }
+        Draft202012Validator(
+            registry.get_entry("owner_task_graph_commit").schema["parameters"]
+        ).validate(graph_args)
+        assert [
+            created["risk_tier"]
+            for created in kernel._normalize_graph_tasks(graph_args["tasks"])
+        ] == [2]
+
+        plan = Draft202012Validator(
+            registry.get_entry("owner_project_plan_commit").schema["parameters"]
+        )
+        reason = "The approved milestone needs this change."
+        changes = [
+            {
+                "action": "add", "reason": reason, **task, "risk_tier": 0,
+                "existing_parents": [], "new_parents": [],
+            },
+            {
+                "action": "split", "reason": reason, "target": target,
+                "replacements": [
+                    {**task, "risk_tier": 2, "parents": []},
+                    {**task, "risk_tier": 0, "parents": [0]},
+                ],
+            },
+            {
+                "action": "replace", "reason": reason, "target": target,
+                "replacement": {
+                    **preserved, "body_mode": "preserve", "owned_paths": [],
+                    "risk_tier": 1,
+                },
+            },
+            {
+                "action": "replace", "reason": reason, "target": target,
+                "replacement": {
+                    **task, "body_mode": "rewrite", "owned_paths": [],
+                    "risk_tier": 2,
+                },
+            },
+            {
+                "action": "merge", "reason": reason,
+                "targets": [target, {**target, "task_id": "t_right"}],
+                "replacement": {**task, "risk_tier": 1},
+            },
+        ]
+        created_tasks = {
+            "add": lambda change: [change],
+            "split": lambda change: change["replacements"],
+            "replace": lambda change: [change["replacement"]],
+            "merge": lambda change: [change["replacement"]],
+        }
+        for change in changes:
+            plan.validate({
+                **milestone, "project_id": "project_raphael",
+                "trigger": "owner_request", "summary": reason,
+                "later_milestones": [], "changes": [change],
+            })
+            [normalized], _ = kernel._normalize_project_changes([change])
+            created = created_tasks[change["action"]]
+            assert [spec["risk_tier"] for spec in created(normalized)] == [
+                spec["risk_tier"] for spec in created(change)
+            ]
 
     def test_task_comment_requires_task_id_and_body(self):
         entry = registry.get_entry("owner_task_comment")

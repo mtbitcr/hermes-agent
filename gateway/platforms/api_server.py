@@ -1425,16 +1425,16 @@ _OWNER_CONVERSATION_RESERVATION_RENEW_SECONDS = 60
 _OWNER_CONVERSATION_RECOVERY_NO_EXPIRY = float("inf")
 _OWNER_PROPOSAL_MAX_MUTATIONS = 12
 # The exact proposal schema versions that carry approval authority. Every
-# created task must now name its ``execution_tier``, so only these versions can
-# be committed: an older stored proposal stays readable (see
-# ``_OWNER_HISTORY_SCHEMA_VERSIONS``) but is no longer actionable, because
+# created task must now name its ``execution_tier`` and its ``risk_tier``, so
+# only these versions can be committed: an older stored proposal stays readable
+# (see ``_OWNER_HISTORY_SCHEMA_VERSIONS``) but is no longer actionable, because
 # committing it would leave the native kernel resolving a route from a class
-# the planner never stated.
-_OWNER_NEW_PROPOSAL_SCHEMA = 3
-_OWNER_EXISTING_PROPOSAL_SCHEMA = 5
+# the planner never stated, or a card without the risk tier the owner approves.
+_OWNER_NEW_PROPOSAL_SCHEMA = 4
+_OWNER_EXISTING_PROPOSAL_SCHEMA = 6
 # Every schema version whose structured assistant replies remain projectable in
 # owner conversation history, including the pre-tier ones.
-_OWNER_HISTORY_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5})
+_OWNER_HISTORY_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6})
 _OWNER_NEW_PROPOSAL_KEYS = frozenset({
     "schema_version", "kind", "mode", "project_name",
     "project_description", "request_title", "summary", "project_size",
@@ -1451,7 +1451,7 @@ _OWNER_EXISTING_PROPOSAL_KEYS = frozenset({
 # gateway must not let the native expand-compatible legacy arm supply them.
 _OWNER_PROPOSAL_TASK_KEYS = frozenset({
     "title", "body", "assignee", "responsibility", "execution_tier",
-    "owned_paths",
+    "owned_paths", "risk_tier",
 })
 _OWNER_PROPOSAL_ADD_KEYS = _OWNER_PROPOSAL_TASK_KEYS | frozenset({
     "action", "reason", "existing_parent_refs", "new_parents",
@@ -1506,10 +1506,26 @@ def _owner_review_requirement(value: Dict[str, Any]) -> Dict[str, Any]:
     return {"requires_review": True}
 
 
+def _owner_risk_tier(value: Dict[str, Any]) -> Dict[str, Any]:
+    """The risk-tier fragment of a created-task payload.
+
+    Every created task states ``risk_tier``, the integer 0, 1 or 2; a missing
+    or unknown tier makes the whole stored proposal unusable as authority,
+    refused before any run is reserved.
+    """
+    from hermes_cli.kanban_risk_tier import parse_risk_tier
+
+    try:
+        return {"risk_tier": parse_risk_tier(value.get("risk_tier"))}
+    except ValueError:
+        raise ValueError("stored proposal change is invalid") from None
+
+
 def _owner_task_payload(value: Dict[str, Any]) -> Dict[str, Any]:
     """The created-task shape as the Workspace forwards it in the run payload."""
     payload = {key: item for key, item in value.items() if key != "requires_review"}
     payload.update(_owner_review_requirement(value))
+    payload.update(_owner_risk_tier(value))
     return payload
 
 
@@ -13392,9 +13408,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # The stored tasks travel into the expected payload as the
             # Workspace forwards them: the review requirement only when true
             # (an explicit false and an absent key derive the same payload),
-            # and the one rule the apply path enforces per task before it
-            # commits (a boolean, never true on a read-only role) is enforced
-            # here too, before any run is reserved.
+            # and the rules the apply path enforces per task before it
+            # commits (a boolean, never true on a read-only role; a risk tier
+            # that is the integer 0, 1 or 2) are enforced here too, before any
+            # run is reserved.
             stored_tasks = candidate.get("tasks")
             if not isinstance(stored_tasks, list):
                 raise ValueError("stored proposal task is invalid")
@@ -13528,6 +13545,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "execution_tier": clean(raw.get("execution_tier")),
                         "owned_paths": clean(raw.get("owned_paths")),
                         **_owner_review_requirement(raw),
+                        **_owner_risk_tier(raw),
                         "existing_parents": [native(ref) for ref in raw["existing_parent_refs"]],
                         "new_parents": clean(raw.get("new_parents")),
                     })
@@ -13598,11 +13616,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 "changes": changes,
             }
 
-        if clean(authority["payload"]) != expected_payload:
-            raise ValueError("run payload differs from the stored owner proposal")
         canonical = json.dumps(
             expected_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
         )
+        # Compared as canonical JSON, not with ==: Python equality would accept
+        # true or 1.0 for a stored 1, and the owner approved the exact value.
+        if json.dumps(
+            clean(authority["payload"]),
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ) != canonical:
+            raise ValueError("run payload differs from the stored owner proposal")
         return {
             "proposal_profile": proposal_profile,
             "conversation": authority["conversation"],
