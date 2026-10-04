@@ -1,0 +1,15 @@
+{
+  "created_at": 1790000000.0,
+  "last_event": "run.completed",
+  "object": "hermes.run",
+  "output": "{\"ok\":true,\"retry_reason\":\"I have added the provider credentials to the account.\",\"revision\":11,\"status\":\"ready\",\"task_id\":\"t_00000008\"}",
+  "owner_mutation_committed": true,
+  "run_id": "run_00000000000040008000000000000009",
+  "status": "completed",
+  "updated_at": 1790000000.0,
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0
+  }
+}

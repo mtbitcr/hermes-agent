@@ -1,0 +1,11 @@
+{
+  "body": {
+    "error": {
+      "code": "run_not_found",
+      "message": "Run not found: run_00000000000000000000000000000000",
+      "param": null,
+      "type": "invalid_request_error"
+    }
+  },
+  "status": 404
+}

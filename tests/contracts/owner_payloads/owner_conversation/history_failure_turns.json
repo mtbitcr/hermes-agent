@@ -1,0 +1,86 @@
+[
+  {
+    "body": {
+      "active_run_id": null,
+      "completed_run_id": null,
+      "conversation_closed": false,
+      "data": [
+        {
+          "owner": "Placeholder request 0.",
+          "raphael": "{\"schema_version\": 1, \"kind\": \"question\", \"message\": \"Placeholder question?\"}"
+        },
+        {
+          "owner": "Placeholder request 1.",
+          "raphael": "{\"schema_version\": 1, \"kind\": \"failure\", \"message\": \"Raphael could not prepare a safe plan for this request. Nothing was changed. You can send it again.\"}"
+        }
+      ],
+      "head_response_id": "resp_failure_2",
+      "incomplete": false,
+      "latest_response_id": null,
+      "object": "hermes.response.owner_history",
+      "pending": null,
+      "proposal_claimed": false,
+      "proposal_consumed": false,
+      "recovery": null,
+      "released_run_id": null,
+      "truncated": false
+    },
+    "status": 200
+  },
+  {
+    "body": {
+      "active_run_id": null,
+      "completed_run_id": null,
+      "conversation_closed": false,
+      "data": [
+        {
+          "owner": "Placeholder request 0.",
+          "raphael": "{\"schema_version\": 1, \"kind\": \"question\", \"message\": \"Placeholder question?\"}"
+        },
+        {
+          "owner": "Placeholder request 1.",
+          "raphael": "{\"schema_version\": 1, \"kind\": \"failure\", \"message\": \"Raphael could not work on this request as it is worded. Nothing was changed. Rewording the request may help.\"}"
+        }
+      ],
+      "head_response_id": "resp_failure_4",
+      "incomplete": false,
+      "latest_response_id": null,
+      "object": "hermes.response.owner_history",
+      "pending": null,
+      "proposal_claimed": false,
+      "proposal_consumed": false,
+      "recovery": null,
+      "released_run_id": null,
+      "truncated": false
+    },
+    "status": 200
+  },
+  {
+    "body": {
+      "active_run_id": null,
+      "completed_run_id": null,
+      "conversation_closed": false,
+      "data": [
+        {
+          "owner": "Placeholder request 0.",
+          "raphael": "{\"schema_version\": 1, \"kind\": \"question\", \"message\": \"Placeholder question?\"}"
+        },
+        {
+          "owner": "Placeholder request 1.",
+          "raphael": "{\"schema_version\": 1, \"kind\": \"failure\", \"message\": \"The AI provider did not answer, so nothing was prepared and nothing was changed. You can send it again in a few minutes.\"}"
+        }
+      ],
+      "head_response_id": "resp_failure_5",
+      "incomplete": false,
+      "latest_response_id": null,
+      "object": "hermes.response.owner_history",
+      "pending": null,
+      "proposal_claimed": false,
+      "proposal_consumed": false,
+      "recovery": null,
+      "released_run_id": null,
+      "truncated": false
+    },
+    "status": 200
+  }
+]

@@ -1,0 +1,26 @@
+[
+  {
+    "body": {
+      "acknowledged": false,
+      "object": "hermes.response.owner_recovery_acknowledgement",
+      "outcome": "mismatch"
+    },
+    "status": 409
+  },
+  {
+    "body": {
+      "acknowledged": true,
+      "object": "hermes.response.owner_recovery_acknowledgement",
+      "outcome": "retired"
+    },
+    "status": 200
+  },
+  {
+    "body": {
+      "acknowledged": true,
+      "object": "hermes.response.owner_recovery_acknowledgement",
+      "outcome": "absent"
+    },
+    "status": 200
+  }
+]

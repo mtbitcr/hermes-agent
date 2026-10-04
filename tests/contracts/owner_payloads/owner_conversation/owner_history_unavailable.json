@@ -1,0 +1,11 @@
+{
+  "body": {
+    "error": {
+      "code": "owner_history_unavailable",
+      "message": "Owner conversation history is unavailable",
+      "param": null,
+      "type": "server_error"
+    }
+  },
+  "status": 503
+}

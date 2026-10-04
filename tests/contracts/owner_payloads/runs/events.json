@@ -1,0 +1,144 @@
+[
+  {
+    "actor": "default",
+    "approval_id": "0000000000004000800000000000000b",
+    "choices": [
+      "once",
+      "deny"
+    ],
+    "command": "Try 'Connect the payment provider' again",
+    "description": "Try 'Connect the payment provider' again",
+    "event": "approval.request",
+    "exact_operation": true,
+    "operation": "owner_task_retry",
+    "payload_digest": "ecb729eb046e9733983d30fad534474106975dd27474715309fb367d68bab1be",
+    "profile": "default",
+    "request_id": "0000000000004000800000000000000b",
+    "run_id": "run_00000000000040008000000000000009",
+    "timestamp": 1790000000.0
+  },
+  {
+    "choice": "once",
+    "event": "approval.responded",
+    "resolved": 1,
+    "run_id": "run_00000000000040008000000000000009",
+    "timestamp": 1790000000.0
+  },
+  {
+    "event": "run.completed",
+    "output": "{\"ok\":true,\"retry_reason\":\"I have added the provider credentials to the account.\",\"revision\":11,\"status\":\"ready\",\"task_id\":\"t_00000008\"}",
+    "run_id": "run_00000000000040008000000000000009",
+    "timestamp": 1790000000.0,
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "total_tokens": 0
+    }
+  },
+  {
+    "error": "The approved Project change was not committed: owner_task_retry: the task is not part of this receipt-owned Project",
+    "event": "run.failed",
+    "run_id": "run_0000000000004000800000000000000c",
+    "timestamp": 1790000000.0
+  },
+  {
+    "event": "tool.started",
+    "preview": "plan.md",
+    "run_id": "run_0000000000004000800000000000000d",
+    "timestamp": 1790000000.0,
+    "tool": "read_file"
+  },
+  {
+    "duration": 0.25,
+    "error": false,
+    "event": "tool.completed",
+    "run_id": "run_0000000000004000800000000000000d",
+    "timestamp": 1790000000.0,
+    "tool": "read_file"
+  },
+  {
+    "event": "reasoning.available",
+    "run_id": "run_0000000000004000800000000000000d",
+    "text": "Placeholder reasoning.",
+    "timestamp": 1790000000.0
+  },
+  {
+    "child_session_id": "session-1",
+    "depth": 1,
+    "event": "subagent.start",
+    "goal": "Placeholder goal.",
+    "model": "placeholder-model",
+    "parent_id": "parent-1",
+    "preview": "Placeholder goal.",
+    "run_id": "run_0000000000004000800000000000000d",
+    "subagent_id": "subagent-1",
+    "task_count": 1,
+    "task_index": 0,
+    "timestamp": 1790000000.0,
+    "tool_count": 1
+  },
+  {
+    "api_calls": 1,
+    "child_session_id": "session-1",
+    "cost_usd": 0.0,
+    "depth": 1,
+    "duration_seconds": 1.0,
+    "event": "subagent.complete",
+    "files_read": [
+      "plan.md"
+    ],
+    "files_written": [
+      "agenda.md"
+    ],
+    "goal": "Placeholder goal.",
+    "input_tokens": 1,
+    "model": "placeholder-model",
+    "output_tail": [
+      {
+        "is_error": false,
+        "preview": "Placeholder text.",
+        "tool": "read_file"
+      }
+    ],
+    "output_tokens": 1,
+    "parent_id": "parent-1",
+    "preview": "Placeholder summary.",
+    "reasoning_tokens": 0,
+    "run_id": "run_0000000000004000800000000000000d",
+    "status": "completed",
+    "subagent_id": "subagent-1",
+    "summary": "Placeholder summary.",
+    "task_count": 1,
+    "task_index": 0,
+    "timestamp": 1790000000.0,
+    "tool_count": 1
+  },
+  {
+    "delta": "Placeholder answer.",
+    "event": "message.delta",
+    "run_id": "run_0000000000004000800000000000000d",
+    "timestamp": 1790000000.0
+  },
+  {
+    "accepted": true,
+    "event": "run.steered",
+    "run_id": "run_0000000000004000800000000000000d",
+    "timestamp": 1790000000.0
+  },
+  {
+    "event": "run.completed",
+    "output": "Placeholder answer.",
+    "run_id": "run_0000000000004000800000000000000d",
+    "timestamp": 1790000000.0,
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "total_tokens": 0
+    }
+  },
+  {
+    "event": "run.cancelled",
+    "run_id": "run_0000000000004000800000000000000e",
+    "timestamp": 1790000000.0
+  }
+]

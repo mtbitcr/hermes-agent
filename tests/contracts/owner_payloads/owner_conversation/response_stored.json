@@ -1,0 +1,28 @@
+{
+  "body": {
+    "background": true,
+    "created_at": 1790000000,
+    "id": "resp_0000000000004000800000000000",
+    "model": "hermes-agent",
+    "object": "response",
+    "output": [
+      {
+        "content": [
+          {
+            "text": "{\"schema_version\": 1, \"kind\": \"question\", \"message\": \"Which outcome first?\"}",
+            "type": "output_text"
+          }
+        ],
+        "role": "assistant",
+        "type": "message"
+      }
+    ],
+    "status": "completed",
+    "usage": {
+      "input_tokens": 1,
+      "output_tokens": 1,
+      "total_tokens": 2
+    }
+  },
+  "status": 200
+}

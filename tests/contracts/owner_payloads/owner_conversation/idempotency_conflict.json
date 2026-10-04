@@ -1,0 +1,11 @@
+{
+  "body": {
+    "error": {
+      "code": "idempotency_conflict",
+      "message": "Idempotency-Key was already used for a different request",
+      "param": null,
+      "type": "invalid_request_error"
+    }
+  },
+  "status": 409
+}

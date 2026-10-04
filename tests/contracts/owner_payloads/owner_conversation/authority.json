@@ -1,0 +1,61 @@
+[
+  {
+    "body": {
+      "action": "claim",
+      "applied": true,
+      "object": "hermes.response.owner_authority"
+    },
+    "status": 200
+  },
+  {
+    "body": {
+      "action": "abandon",
+      "applied": true,
+      "object": "hermes.response.owner_authority"
+    },
+    "status": 200
+  },
+  {
+    "body": {
+      "action": "claim",
+      "applied": true,
+      "object": "hermes.response.owner_authority"
+    },
+    "status": 200
+  },
+  {
+    "body": {
+      "error": {
+        "code": null,
+        "message": "Owner proposal authority changed",
+        "param": null,
+        "type": "invalid_request_error"
+      }
+    },
+    "status": 409
+  },
+  {
+    "body": {
+      "action": "attach",
+      "applied": true,
+      "object": "hermes.response.owner_authority"
+    },
+    "status": 200
+  },
+  {
+    "body": {
+      "action": "complete",
+      "applied": true,
+      "object": "hermes.response.owner_authority"
+    },
+    "status": 200
+  },
+  {
+    "body": {
+      "action": "close",
+      "applied": true,
+      "object": "hermes.response.owner_authority"
+    },
+    "status": 200
+  }
+]

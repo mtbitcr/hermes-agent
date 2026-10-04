@@ -1,0 +1,530 @@
+{
+  "body": {
+    "data": {
+      "attachments": [],
+      "board": {
+        "counts": {
+          "archived": 0,
+          "blocked": 2,
+          "done": 1,
+          "ready": 2,
+          "review": 1,
+          "running": 0,
+          "scheduled": 0,
+          "todo": 0,
+          "triage": 1
+        },
+        "name": "Workshop Pilot",
+        "project_id": "p_787fde8aa1f51ec773a73a1c",
+        "slug": "workshop-pilot",
+        "total": 7
+      },
+      "columns": [
+        {
+          "name": "triage",
+          "tasks": [
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "event_revision": 19,
+              "id": "t_0000000b",
+              "parent_ids": [
+                "t_0000000a"
+              ],
+              "responsibility": null,
+              "review_state": "none",
+              "stopped_work": "none",
+              "title": "Rework: Review the changes outline",
+              "updated_at": "2026-09-21T14:13:20Z"
+            }
+          ]
+        },
+        {
+          "name": "todo",
+          "tasks": []
+        },
+        {
+          "name": "scheduled",
+          "tasks": []
+        },
+        {
+          "name": "ready",
+          "tasks": [
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "event_revision": 12,
+              "id": "t_00000008",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "stopped_work": "none",
+              "title": "Draft the workshop agenda",
+              "updated_at": "2026-09-21T14:13:20Z"
+            },
+            {
+              "assignee_name": "default",
+              "child_ids": [
+                "t_0000000b"
+              ],
+              "event_revision": 20,
+              "id": "t_0000000a",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "changes_requested",
+              "stopped_work": "none",
+              "title": "Review the changes outline",
+              "updated_at": "2026-09-21T14:13:20Z"
+            }
+          ]
+        },
+        {
+          "name": "running",
+          "tasks": []
+        },
+        {
+          "name": "blocked",
+          "tasks": [
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "event_revision": 8,
+              "id": "t_00000006",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "stopped_work": "gave_up",
+              "title": "Print the workshop handouts",
+              "updated_at": "2026-09-21T14:13:20Z"
+            },
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "event_revision": 11,
+              "id": "t_00000007",
+              "owner_wait": {
+                "reason": "the provider account has no API credentials",
+                "since": "2026-09-21T14:13:20Z"
+              },
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "stopped_work": "capability",
+              "title": "Connect the payment provider",
+              "updated_at": "2026-09-21T14:13:20Z"
+            }
+          ]
+        },
+        {
+          "name": "review",
+          "tasks": [
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "event_revision": 15,
+              "id": "t_00000009",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "awaiting_review",
+              "stopped_work": "none",
+              "title": "Review the awaiting outline",
+              "updated_at": "2026-09-21T14:13:20Z"
+            }
+          ]
+        },
+        {
+          "name": "done",
+          "tasks": [
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "event_revision": 4,
+              "id": "t_00000005",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "approved",
+              "stopped_work": "none",
+              "title": "Review the approved outline",
+              "updated_at": "2026-09-21T14:13:20Z"
+            }
+          ]
+        }
+      ],
+      "planning_context": {
+        "actionable_count": 6,
+        "actionable_truncated": false,
+        "omitted_terminal_count": 0,
+        "relations_truncated": false,
+        "schema_version": 1,
+        "tasks": [
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 8,
+            "id": "t_00000006",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "blocked",
+            "title": "Print the workshop handouts",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 11,
+            "id": "t_00000007",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "blocked",
+            "title": "Connect the payment provider",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 12,
+            "id": "t_00000008",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "ready",
+            "title": "Draft the workshop agenda",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 15,
+            "id": "t_00000009",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "review",
+            "title": "Review the awaiting outline",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [
+              "t_0000000b"
+            ],
+            "event_revision": 20,
+            "id": "t_0000000a",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "ready",
+            "title": "Review the changes outline",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 19,
+            "id": "t_0000000b",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [
+              "t_0000000a"
+            ],
+            "responsibility": null,
+            "status": "triage",
+            "title": "Rework: Review the changes outline",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 4,
+            "id": "t_00000005",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "done",
+            "title": "Review the approved outline",
+            "updated_at": "2026-09-21T14:13:20Z"
+          }
+        ]
+      },
+      "project": {
+        "archived": false,
+        "board": "workshop-pilot",
+        "description": null,
+        "id": "p_787fde8aa1f51ec773a73a1c",
+        "name": "Workshop Pilot",
+        "slug": "workshop-pilot"
+      },
+      "runs": [
+        {
+          "finished_at": "2026-09-21T14:13:20Z",
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "attention",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "The review asked for changes; the work went back for rework."
+          },
+          "retry_origin": "none",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Review the changes outline"
+        },
+        {
+          "finished_at": "2026-09-21T14:13:20Z",
+          "has_newer_run": true,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "completed",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Work finished and is awaiting review."
+          },
+          "retry_origin": "unattributed",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Review the changes outline"
+        },
+        {
+          "finished_at": "2026-09-21T14:13:20Z",
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "completed",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Work finished and is awaiting review."
+          },
+          "retry_origin": "none",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Review the awaiting outline"
+        },
+        {
+          "finished_at": "2026-09-21T14:13:20Z",
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "attention",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "stop_reason": "the provider account has no API credentials",
+            "summary": "Work stopped and needs attention."
+          },
+          "retry_origin": "none",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Connect the payment provider"
+        },
+        {
+          "finished_at": "2026-09-21T14:13:20Z",
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "attention",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Work stopped and needs attention."
+          },
+          "retry_origin": "none",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Print the workshop handouts"
+        },
+        {
+          "finished_at": "2026-09-21T14:13:20Z",
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "completed",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Work finished."
+          },
+          "retry_origin": "none",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Review the approved outline"
+        },
+        {
+          "finished_at": "2026-09-21T14:13:20Z",
+          "has_newer_run": true,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "completed",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Work finished and is awaiting review."
+          },
+          "retry_origin": "unattributed",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Review the approved outline"
+        }
+      ],
+      "steward": {
+        "active_work": [
+          {
+            "state": "Being checked",
+            "title": "Review the awaiting outline"
+          },
+          {
+            "state": "Ready",
+            "title": "Review the changes outline"
+          },
+          {
+            "state": "Ready",
+            "title": "Draft the workshop agenda"
+          }
+        ],
+        "counts": {
+          "awaiting_review": 1,
+          "completed_in_window": 1,
+          "needs_attention": 1,
+          "open": 6
+        },
+        "decisions_needed": [
+          {
+            "reason": "the provider account has no API credentials",
+            "state": "Waiting for your answer",
+            "title": "Connect the payment provider",
+            "waiting_since": "2026-09-21T14:13:20Z"
+          }
+        ],
+        "execution": {
+          "paused": false,
+          "state": "waiting_for_approval",
+          "summary": "Raphael is waiting for an approved milestone before starting work."
+        },
+        "generated_at": "2026-09-21T14:13:20Z",
+        "lookback_days": 7,
+        "needs_attention": [
+          {
+            "reason": "Reason not recorded",
+            "state": "Blocked",
+            "title": "Print the workshop handouts"
+          }
+        ],
+        "progress": [
+          {
+            "completed_at": "2026-09-21T14:13:20Z",
+            "title": "Review the approved outline"
+          }
+        ],
+        "project": {
+          "name": "Workshop Pilot"
+        },
+        "schema_version": 2,
+        "stale_candidates": [],
+        "truncated": {
+          "active_work": false,
+          "decisions_needed": false,
+          "needs_attention": false,
+          "progress": false,
+          "stale_candidates": false
+        }
+      },
+      "truncated": {
+        "attachments": false,
+        "runs": false,
+        "tasks": false,
+        "workers": false
+      },
+      "workers": []
+    },
+    "object": "hermes.owner_workspace.project_snapshot"
+  },
+  "status": 200
+}

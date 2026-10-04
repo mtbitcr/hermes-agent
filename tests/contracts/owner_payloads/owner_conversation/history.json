@@ -1,0 +1,40 @@
+{
+  "body": {
+    "active_run_id": null,
+    "completed_run_id": null,
+    "conversation_closed": false,
+    "data": [
+      {
+        "owner": "Placeholder request 0.",
+        "raphael": "{\"schema_version\": 1, \"kind\": \"question\", \"message\": \"Placeholder question?\"}"
+      },
+      {
+        "owner": "Placeholder request 1.",
+        "raphael": "{\"schema_version\": 1, \"kind\": \"no_change\", \"message\": \"Nothing to change.\"}"
+      },
+      {
+        "owner": "Placeholder request 2.",
+        "raphael": "{\"schema_version\": 4, \"kind\": \"proposal\", \"mode\": \"new\", \"project_name\": \"Workshop pilot\", \"project_description\": \"A private workshop pilot.\", \"request_title\": \"Prepare the workshop\", \"summary\": \"Prepare the first private milestone.\", \"project_size\": \"small\", \"specification\": \"Create one owner-visible workshop milestone.\", \"current_milestone\": \"Prepare the workshop\", \"owner_visible_result\": \"A reviewed workshop plan.\", \"impact\": [\"Adds one private milestone.\"], \"later_milestones\": [], \"tasks\": [{\"title\": \"Draft the workshop plan\", \"body\": \"Prepare the private workshop plan.\", \"assignee\": \"default\", \"responsibility\": \"B03\", \"execution_tier\": \"routine\", \"risk_tier\": 1, \"parents\": []}]}"
+      },
+      {
+        "owner": "Placeholder request 3.",
+        "raphael": "{\"schema_version\": 6, \"kind\": \"project_change_proposal\", \"mode\": \"existing\", \"request_title\": \"Add the approved milestone\", \"summary\": \"Add one owner-visible milestone.\", \"project_size\": \"small\", \"specification\": \"Add and verify the approved milestone.\", \"current_milestone\": \"Add the approved milestone\", \"owner_visible_result\": \"The owner can review the finished milestone.\", \"impact\": [\"Keeps completed work intact.\"], \"later_milestones\": [], \"changes\": [{\"action\": \"add\", \"reason\": \"The approved milestone needs one task.\", \"title\": \"Prepare the milestone\", \"body\": \"Prepare the owner-visible milestone.\", \"assignee\": \"default\", \"responsibility\": \"B03\", \"execution_tier\": \"routine\", \"risk_tier\": 1, \"owned_paths\": [], \"existing_parent_refs\": [], \"new_parents\": []}]}"
+      },
+      {
+        "owner": "Placeholder request 4.",
+        "raphael": "{\"schema_version\": 1, \"kind\": \"failure\", \"message\": \"Raphael could not prepare a safe plan for this request. Nothing was changed. You can send it again.\"}"
+      }
+    ],
+    "head_response_id": "resp_every_kind",
+    "incomplete": false,
+    "latest_response_id": null,
+    "object": "hermes.response.owner_history",
+    "pending": null,
+    "proposal_claimed": false,
+    "proposal_consumed": false,
+    "recovery": null,
+    "released_run_id": null,
+    "truncated": false
+  },
+  "status": 200
+}

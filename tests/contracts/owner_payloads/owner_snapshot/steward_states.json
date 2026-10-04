@@ -1,0 +1,216 @@
+[
+  {
+    "active_work": [],
+    "counts": {
+      "awaiting_review": 0,
+      "completed_in_window": 0,
+      "needs_attention": 0,
+      "open": 0
+    },
+    "decisions_needed": [],
+    "execution": {
+      "paused": false,
+      "state": "waiting_for_approval",
+      "summary": "Raphael is waiting for an approved milestone before starting work."
+    },
+    "generated_at": "2026-09-21T14:13:20Z",
+    "lookback_days": 7,
+    "needs_attention": [],
+    "progress": [],
+    "project": {
+      "name": "Fresh Pilot"
+    },
+    "schema_version": 2,
+    "stale_candidates": [],
+    "truncated": {
+      "active_work": false,
+      "decisions_needed": false,
+      "needs_attention": false,
+      "progress": false,
+      "stale_candidates": false
+    }
+  },
+  {
+    "active_work": [
+      {
+        "state": "Ready",
+        "title": "Draft the agenda"
+      }
+    ],
+    "counts": {
+      "awaiting_review": 0,
+      "completed_in_window": 0,
+      "needs_attention": 0,
+      "open": 1
+    },
+    "decisions_needed": [],
+    "execution": {
+      "paused": false,
+      "state": "working",
+      "summary": "Raphael is coordinating the approved milestone."
+    },
+    "generated_at": "2026-09-21T14:13:20Z",
+    "lookback_days": 7,
+    "needs_attention": [],
+    "progress": [],
+    "project": {
+      "name": "Working Pilot"
+    },
+    "schema_version": 2,
+    "stale_candidates": [],
+    "truncated": {
+      "active_work": false,
+      "decisions_needed": false,
+      "needs_attention": false,
+      "progress": false,
+      "stale_candidates": false
+    }
+  },
+  {
+    "active_work": [],
+    "counts": {
+      "awaiting_review": 0,
+      "completed_in_window": 1,
+      "needs_attention": 0,
+      "open": 0
+    },
+    "decisions_needed": [],
+    "execution": {
+      "paused": false,
+      "state": "complete",
+      "summary": "The approved work is complete."
+    },
+    "generated_at": "2026-09-21T14:13:20Z",
+    "lookback_days": 7,
+    "needs_attention": [],
+    "progress": [
+      {
+        "completed_at": "2026-09-21T14:13:20Z",
+        "title": "Draft the agenda"
+      }
+    ],
+    "project": {
+      "name": "Complete Pilot"
+    },
+    "schema_version": 2,
+    "stale_candidates": [],
+    "truncated": {
+      "active_work": false,
+      "decisions_needed": false,
+      "needs_attention": false,
+      "progress": false,
+      "stale_candidates": false
+    }
+  },
+  {
+    "active_work": [
+      {
+        "state": "Ready",
+        "title": "Draft the agenda"
+      }
+    ],
+    "counts": {
+      "awaiting_review": 0,
+      "completed_in_window": 0,
+      "needs_attention": 0,
+      "open": 1
+    },
+    "decisions_needed": [],
+    "execution": {
+      "paused": true,
+      "state": "paused",
+      "summary": "Raphael is paused and will not start new work."
+    },
+    "generated_at": "2026-09-21T14:13:20Z",
+    "lookback_days": 7,
+    "needs_attention": [],
+    "progress": [],
+    "project": {
+      "name": "Paused Pilot"
+    },
+    "schema_version": 2,
+    "stale_candidates": [],
+    "truncated": {
+      "active_work": false,
+      "decisions_needed": false,
+      "needs_attention": false,
+      "progress": false,
+      "stale_candidates": false
+    }
+  },
+  {
+    "active_work": [],
+    "counts": {
+      "awaiting_review": 0,
+      "completed_in_window": 0,
+      "needs_attention": 1,
+      "open": 1
+    },
+    "decisions_needed": [],
+    "execution": {
+      "paused": false,
+      "state": "needs_attention",
+      "summary": "Raphael found a problem and is preparing the safest next step."
+    },
+    "generated_at": "2026-09-21T14:13:20Z",
+    "lookback_days": 7,
+    "needs_attention": [
+      {
+        "reason": "Reason not recorded",
+        "state": "Blocked",
+        "title": "Print the handouts"
+      }
+    ],
+    "progress": [],
+    "project": {
+      "name": "Attention Pilot"
+    },
+    "schema_version": 2,
+    "stale_candidates": [],
+    "truncated": {
+      "active_work": false,
+      "decisions_needed": false,
+      "needs_attention": false,
+      "progress": false,
+      "stale_candidates": false
+    }
+  },
+  {
+    "active_work": [],
+    "counts": {
+      "awaiting_review": 0,
+      "completed_in_window": 0,
+      "needs_attention": 0,
+      "open": 1
+    },
+    "decisions_needed": [
+      {
+        "reason": "the provider account has no API credentials",
+        "state": "Waiting for your answer",
+        "title": "Connect the provider",
+        "waiting_since": "2026-09-21T14:13:20Z"
+      }
+    ],
+    "execution": {
+      "paused": false,
+      "state": "waiting_for_you",
+      "summary": "Raphael needs your answer before the plan can continue."
+    },
+    "generated_at": "2026-09-21T14:13:20Z",
+    "lookback_days": 7,
+    "needs_attention": [],
+    "progress": [],
+    "project": {
+      "name": "Waiting Pilot"
+    },
+    "schema_version": 2,
+    "stale_candidates": [],
+    "truncated": {
+      "active_work": false,
+      "decisions_needed": false,
+      "needs_attention": false,
+      "progress": false,
+      "stale_candidates": false
+    }
+  }
+]

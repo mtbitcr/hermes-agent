@@ -1,0 +1,8 @@
+{
+  "created_at": 1790000000.0,
+  "error": "This stopped before it finished because Raphael restarted. Nothing was changed. You can ask for it again.",
+  "object": "hermes.run",
+  "run_id": "run_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "status": "failed",
+  "updated_at": 1790000000.0
+}

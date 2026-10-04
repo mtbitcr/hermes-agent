@@ -1,0 +1,9 @@
+{
+  "body": {
+    "choice": "once",
+    "object": "hermes.run.approval_response",
+    "resolved": 1,
+    "run_id": "run_00000000000040008000000000000009"
+  },
+  "status": 200
+}

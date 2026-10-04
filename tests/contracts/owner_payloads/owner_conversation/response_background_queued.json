@@ -1,0 +1,12 @@
+{
+  "body": {
+    "background": true,
+    "created_at": 1790000000,
+    "id": "resp_0000000000004000800000000000",
+    "model": "hermes-agent",
+    "object": "response",
+    "output": [],
+    "status": "queued"
+  },
+  "status": 200
+}

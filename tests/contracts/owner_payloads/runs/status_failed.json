@@ -1,0 +1,26 @@
+{
+  "created_at": 1790000000.0,
+  "error": "The approved Project change was not committed: owner_task_retry: the task is not part of this receipt-owned Project",
+  "error_code": "task_not_found",
+  "error_reason": "owner_task_retry: the task is not part of this receipt-owned Project",
+  "last_event": "run.failed",
+  "model": "hermes-agent",
+  "object": "hermes.run",
+  "owner_mutation_committed": false,
+  "owner_workspace_context": {
+    "mode": "existing",
+    "profile": "default",
+    "project_name": "Workshop pilot",
+    "project_slug": "workshop-pilot"
+  },
+  "run_id": "run_0000000000004000800000000000000c",
+  "runtime": {
+    "effort": "",
+    "engine": "",
+    "model": "",
+    "provider": ""
+  },
+  "session_id": "run_0000000000004000800000000000000c",
+  "status": "failed",
+  "updated_at": 1790000000.0
+}

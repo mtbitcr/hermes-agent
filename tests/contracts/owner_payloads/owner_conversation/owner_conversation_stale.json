@@ -1,0 +1,11 @@
+{
+  "body": {
+    "error": {
+      "code": "owner_conversation_stale",
+      "message": "The conversation moved on before this request was planned",
+      "param": null,
+      "type": "invalid_request_error"
+    }
+  },
+  "status": 409
+}

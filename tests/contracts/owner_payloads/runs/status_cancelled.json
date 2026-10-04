@@ -1,0 +1,17 @@
+{
+  "created_at": 1790000000.0,
+  "last_event": "run.cancelled",
+  "model": "hermes-agent",
+  "object": "hermes.run",
+  "owner_workspace_context": null,
+  "run_id": "run_0000000000004000800000000000000e",
+  "runtime": {
+    "effort": "",
+    "engine": "",
+    "model": "",
+    "provider": ""
+  },
+  "session_id": "run_0000000000004000800000000000000e",
+  "status": "cancelled",
+  "updated_at": 1790000000.0
+}
