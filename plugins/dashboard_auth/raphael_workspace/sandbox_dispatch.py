@@ -888,7 +888,17 @@ def _load_connection_secret() -> str:
 
 
 def _resolve_host_credential() -> str:
-    """The existing host-owned Anthropic resolver — never a tool argument."""
+    """The existing host-owned Anthropic resolver — never a tool argument.
+
+    A long-lived setup token in ``CLAUDE_CODE_OAUTH_TOKEN`` comes first. It
+    needs no refresh, so two build machines provisioned at once never rotate
+    the host sign-in under each other. The general resolver would prefer a
+    refreshable Claude Code login over that token, which suits the gateway's
+    own calls but not build machines.
+    """
+    setup_token = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
+    if setup_token:
+        return setup_token
     try:
         from agent.anthropic_credentials import resolve_anthropic_token
 
