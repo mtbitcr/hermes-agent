@@ -151,7 +151,7 @@ def run_release(
         steps.append("start")
         host.start_units(PLATFORM_UNITS)
         _require(_read_back(host, pins.new, steps, readbacks))
-    except Exception as failure:
+    except BaseException as failure:
         steps.append("restore")
         restore_errors = _restore(host, pins)
         restored = _read_back(host, pins.prev, steps, readbacks).ok
@@ -205,7 +205,7 @@ def _restore(host: ReleaseHost, pins: Pins) -> tuple[str, ...]:
     for step in BACK_STEPS:
         try:
             step(host, pins)
-        except Exception as error:
+        except BaseException as error:
             errors.append(f"{type(error).__name__}: {error}")
     return tuple(errors)
 
@@ -237,7 +237,7 @@ def _holds(
     """
     try:
         return check(host, expected)
-    except Exception as error:
+    except BaseException as error:
         errors[name] = f"{type(error).__name__}: {error}"
         return False
 
