@@ -1780,6 +1780,10 @@ DEFAULT_CONFIG = {
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
         "done_sub_retention_days": 30,
+        # Approving a review-required build card from the review lane records one delivery for
+        # the card and its approved head and creates one integration card assigned to
+        # integration_profile (hermes_cli/kanban_delivery.py). Off, or no profile = no delivery.
+        "delivery": {"enabled": False, "integration_profile": None},
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.
