@@ -1582,9 +1582,11 @@ class GatewayKanbanWatchersMixin:
             boards: list,
         ) -> "tuple[dict[str, int], list[str]]":
             """Running tasks of each profile in max_in_progress_by_profile,
-            summed over the boards this tick dispatches (boards sharing one
-            DB count once), and the boards that could not be read. While
-            that list is non-empty the sum is incomplete: unknown, not 0."""
+            summed over every listed board (boards sharing one DB count
+            once), and the boards that could not be read. A board the owner
+            paused or never activated counts too: a pause stops new claims,
+            not the workers already running. While that list is non-empty
+            the sum is incomplete: unknown, not 0."""
             counts = dict.fromkeys(max_in_progress_by_profile, 0)
             unreadable: list[str] = []
             seen_dbs: set[str] = set()
@@ -1592,11 +1594,11 @@ class GatewayKanbanWatchersMixin:
                 conn = None
                 slug = None
                 try:
-                    if not _board_is_dispatchable(b):
-                        continue
                     slug = b.get("slug") or _kb.DEFAULT_BOARD
-                    db = _board_db_fingerprint(slug)[0]
-                    if db in seen_dbs:
+                    db, mtime, _ = _board_db_fingerprint(slug)
+                    # A board without its DB file runs nothing, and a
+                    # connect would create that file.
+                    if mtime is None or db in seen_dbs:
                         continue
                     seen_dbs.add(db)
                     conn = _kb.connect(board=slug)
