@@ -78,7 +78,8 @@ class FakeHost:
         return "new-tree"
 
     def is_ancestor(self, ancestor, descendant):
-        return (ancestor, descendant) == (PREV, NEW)
+        # As in git, a commit is its own ancestor.
+        return ancestor == descendant or (ancestor, descendant) == (PREV, NEW)
 
     def changed_paths(self, prev, new):
         return {"hermes_cli/main.py"}
