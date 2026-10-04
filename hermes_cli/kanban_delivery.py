@@ -22,6 +22,7 @@ whether the approved head becomes the delivery's one pull request.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -494,6 +495,18 @@ def _source_state(conn: sqlite3.Connection, source: str) -> tuple:
     return task, kb.task_event_revision(conn, source)
 
 
+@contextlib.contextmanager
+def _one_read(conn: sqlite3.Connection):
+    """One SQLite read transaction, so every read inside sees the same committed
+    state. It keeps nothing, so it ends with a rollback."""
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+
+
 def _lease_refusal(error, code: str, detail: str) -> Exception:
     """A lease that GitHub refuses is the fence's ``code``; any other transport
     failure is reported by its reason alone."""
@@ -516,7 +529,10 @@ def publish_delivery(task_id: str, run_id: int) -> dict:
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     board = os.environ.get("HERMES_KANBAN_BOARD")
-    with kb.connect_closing(board=board) as conn:
+    # The admission, the approval and ledger reads and the snapshot are one read, so a
+    # reclaim after the admission cannot put the reclaimed run into the snapshot that
+    # the final write compares against. The read ends before any GitHub call.
+    with kb.connect_closing(board=board) as conn, _one_read(conn):
         record, workdir, repository = _bind(conn, task_id, run_id)
         source = record["source_task_id"]
         if conn.execute(
