@@ -60,9 +60,9 @@ from gateway.platforms.api_server import (
 
 def _owner_new_proposal(**overrides):
     proposal = {
-        # v3 is the first new-project schema carrying execution_tier, and
-        # therefore the first that can grant commit authority.
-        "schema_version": 3,
+        # v3 is the first new-project schema carrying execution_tier and v4
+        # the first carrying risk_tier, so only v4 can grant commit authority.
+        "schema_version": 4,
         "kind": "proposal",
         "mode": "new",
         "project_name": "Workshop pilot",
@@ -81,6 +81,7 @@ def _owner_new_proposal(**overrides):
             "assignee": "default",
             "responsibility": "B03",
             "execution_tier": "routine",
+            "risk_tier": 1,
             "parents": [],
         }],
     }
@@ -90,7 +91,8 @@ def _owner_new_proposal(**overrides):
 
 def _owner_existing_proposal(**overrides):
     proposal = {
-        "schema_version": 5,
+        # v6 is the first plan-change schema carrying risk_tier.
+        "schema_version": 6,
         "kind": "project_change_proposal",
         "mode": "existing",
         "request_title": "Add the approved milestone",
@@ -109,6 +111,7 @@ def _owner_existing_proposal(**overrides):
             "assignee": "default",
             "responsibility": "B03",
             "execution_tier": "routine",
+            "risk_tier": 1,
             "owned_paths": [],
             "existing_parent_refs": [],
             "new_parents": [],
@@ -136,6 +139,7 @@ def test_schema_v5_created_tasks_require_explicit_array_scope_and_body_mode():
         "assignee": "default",
         "responsibility": "B03",
         "execution_tier": "routine",
+        "risk_tier": 1,
         "owned_paths": [],
         "parents": [],
     }
@@ -146,6 +150,7 @@ def test_schema_v5_created_tasks_require_explicit_array_scope_and_body_mode():
         "assignee": "default",
         "responsibility": "B03",
         "execution_tier": "routine",
+        "risk_tier": 1,
         "owned_paths": [],
     }
     assert _owner_current_replace_shape({**common, "body_mode": "preserve"})
@@ -371,6 +376,7 @@ class TestOwnerWorkspaceRunContext:
                 "assignee": "raphael-claude-worker",
                 "responsibility": "R07",
                 "execution_tier": "deep",
+                "risk_tier": 1,
                 "owned_paths": [],
             }, True),
             ({
@@ -379,6 +385,7 @@ class TestOwnerWorkspaceRunContext:
                 "assignee": "raphael-claude-worker",
                 "responsibility": "R07",
                 "execution_tier": "deep",
+                "risk_tier": 1,
             }, False),
             # The review requirement rides inside the replacement, exactly as
             # the Workspace forwards it.
@@ -388,6 +395,7 @@ class TestOwnerWorkspaceRunContext:
                 "assignee": "raphael-claude-worker",
                 "responsibility": "R07",
                 "execution_tier": "deep",
+                "risk_tier": 1,
                 "owned_paths": [],
                 "requires_review": True,
             }, True),
@@ -399,6 +407,7 @@ class TestOwnerWorkspaceRunContext:
                 "assignee": "raphael-planner",
                 "responsibility": "R01",
                 "execution_tier": "routine",
+                "risk_tier": 1,
                 "owned_paths": [],
                 "requires_review": True,
             }, False),
@@ -408,6 +417,7 @@ class TestOwnerWorkspaceRunContext:
                 "assignee": " Raphael-Planner ",
                 "responsibility": "R01",
                 "execution_tier": "routine",
+                "risk_tier": 1,
                 "owned_paths": [],
                 "requires_review": True,
             }, False),
@@ -594,6 +604,7 @@ class TestOwnerWorkspaceRunContext:
             "assignee": assignee,
             "responsibility": responsibility,
             "execution_tier": "deep",
+            "risk_tier": 1,
             "owned_paths": ["tests/hermes_cli"] if assignee == "raphael-claude-worker" else [],
             "existing_parent_refs": [],
             "new_parents": [],
@@ -714,6 +725,7 @@ class TestOwnerWorkspaceRunContext:
             "assignee": assignee,
             "responsibility": "R14",
             "execution_tier": "deep",
+            "risk_tier": 1,
             "parents": [],
             "requires_review": requires_review,
         }])
@@ -772,6 +784,7 @@ class TestOwnerWorkspaceRunContext:
             "assignee": "raphael-claude-worker",
             "responsibility": "R14",
             "execution_tier": "deep",
+            "risk_tier": 1,
             "parents": [],
             "requires_review": False,
         }

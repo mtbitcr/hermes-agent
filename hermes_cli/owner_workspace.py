@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db, projects_db
+from hermes_cli.kanban_risk_tier import parse_risk_tier
 from hermes_cli.sqlite_util import write_txn
 from plugins.dashboard_auth.raphael_workspace.model_policy import (
     configured_assignment_for,
@@ -1267,6 +1268,17 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
                 f"{assignee}: a read-only role is the review or the plan, "
                 "not work awaiting a review",
             )
+        # The risk tier the approved proposal gave this card. Every created
+        # task states one, so it is always carried (into the request digest
+        # too) and the owner approves the exact tier. Checked after the review
+        # requirement, whose refusals keep their precedence.
+        try:
+            entry["risk_tier"] = parse_risk_tier(raw.get("risk_tier"))
+        except ValueError:
+            raise OwnerWorkspaceError(
+                "invalid_argument",
+                f"tasks[{index}].risk_tier must be the integer 0, 1 or 2",
+            ) from None
         if assignee == "raphael-verifier":
             scope = (
                 _normalize_ownership_scope(
@@ -5112,18 +5124,20 @@ def _normalize_project_task_spec(
     body_mode = value.get("body_mode") if allow_body_mode and isinstance(value, dict) else None
     if body_mode == "preserve":
         required = {"title", "body_mode", "assignee", "execution_tier", "owned_paths"}
-        allowed = required | {"responsibility", "requires_review"}
+        allowed = required | {"responsibility", "requires_review", "risk_tier"}
     elif body_mode == "rewrite":
         required = {
             "title", "body_mode", "body", "assignee", "execution_tier",
             "owned_paths",
         }
-        allowed = required | {"responsibility", "requires_review"}
+        allowed = required | {"responsibility", "requires_review", "risk_tier"}
     else:
         required = {
             "title", "body", "assignee", "execution_tier",
         } | ({"parents"} if parent_limit is not None else set())
-        allowed = required | {"responsibility", "owned_paths", "requires_review"}
+        allowed = required | {
+            "responsibility", "owned_paths", "requires_review", "risk_tier",
+        }
     if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(allowed):
         raise OwnerWorkspaceError(
             "invalid_argument",
@@ -5174,6 +5188,16 @@ def _normalize_project_task_spec(
             f"{field}.requires_review is not accepted for {result['assignee']}: "
             "a read-only role is the review or the plan, not work awaiting a review",
         )
+    # The risk tier the approved change gave this card. Every created task
+    # states one, so it is always carried (into the request digest too) and
+    # the owner approves the exact tier. Checked after the review requirement,
+    # whose refusals keep their precedence.
+    try:
+        result["risk_tier"] = parse_risk_tier(raw.get("risk_tier"))
+    except ValueError:
+        raise OwnerWorkspaceError(
+            "invalid_argument", f"{field}.risk_tier must be the integer 0, 1 or 2",
+        ) from None
     if result["assignee"] == "raphael-verifier":
         scope = (
             _normalize_ownership_scope(raw["owned_paths"], field)
@@ -5238,7 +5262,7 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
                 "existing_parents", "new_parents",
             }
             allowed = required | {
-                "responsibility", "owned_paths", "requires_review",
+                "responsibility", "owned_paths", "requires_review", "risk_tier",
             }
             if not required.issubset(item) or not set(item).issubset(allowed):
                 raise OwnerWorkspaceError(
@@ -5281,6 +5305,11 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
                     **(
                         {"requires_review": raw["requires_review"]}
                         if "requires_review" in raw
+                        else {}
+                    ),
+                    **(
+                        {"risk_tier": raw["risk_tier"]}
+                        if "risk_tier" in raw
                         else {}
                     ),
                 },
@@ -5473,6 +5502,11 @@ def _commit_plan_review_requirements(
     commits the requirement itself, here, from the same normalized changes the
     owner approved and the request digest binds.
 
+    The approved ``risk_tier`` travels the same way, under the same guards: it
+    is written to each created row that does not hold it yet, a row that
+    already holds it is left alone (an exact replay), and a row that holds a
+    different tier, or no longer parked, is ``crash_recovery_failed``.
+
     Ordering: this runs while every created row is still parked in
     :data:`kanban_db.PARKED_STATUS` — un-promotable and un-claimable — inside
     the plan's board guard, BEFORE the terminal receipt is finalized and before
@@ -5503,10 +5537,11 @@ def _commit_plan_review_requirements(
         )
 
     pending: list[str] = []
+    pending_tiers: list[tuple[str, int]] = []
     for spec, task_id in zip(specs, task_ids):
         row = kconn.execute(
             "SELECT title, assignee, status, task_kind, project_id, "
-            "owner_receipt_bound, requires_review FROM tasks WHERE id = ?",
+            "owner_receipt_bound, requires_review, risk_tier FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if (
@@ -5522,6 +5557,14 @@ def _commit_plan_review_requirements(
                 f"created task {task_id!r} is not the receipt-owned work this "
                 "approved change specifies",
             )
+        risk_tier = spec.get("risk_tier")
+        if risk_tier is not None and row["risk_tier"] != risk_tier:
+            if row["risk_tier"] is not None or row["status"] != kanban_db.PARKED_STATUS:
+                raise OwnerWorkspaceError(
+                    "crash_recovery_failed",
+                    f"created task {task_id!r} cannot carry its approved risk tier",
+                )
+            pending_tiers.append((task_id, risk_tier))
         if not spec.get("requires_review"):
             continue
         if row["requires_review"]:
@@ -5535,9 +5578,22 @@ def _commit_plan_review_requirements(
             )
         pending.append(task_id)
 
-    if not pending:
+    if not pending and not pending_tiers:
         return
     with kanban_db.write_txn(kconn):
+        for task_id, risk_tier in pending_tiers:
+            cursor = kconn.execute(
+                "UPDATE tasks SET risk_tier = ? "
+                "WHERE id = ? AND task_kind = 'work' AND project_id = ? "
+                "AND owner_receipt_bound = 1 AND status = ? AND risk_tier IS NULL",
+                (risk_tier, task_id, project_id, kanban_db.PARKED_STATUS),
+            )
+            if cursor.rowcount != 1:
+                raise OwnerWorkspaceError(
+                    "crash_recovery_failed",
+                    f"the approved risk tier could not be written to created "
+                    f"task {task_id!r}",
+                )
         for task_id in pending:
             # One guarded UPDATE per task, touching no other column: the row
             # must still be exactly the parked, receipt-owned work of this

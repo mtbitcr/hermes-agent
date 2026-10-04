@@ -75,6 +75,7 @@ def _graph_payload(idempotency_key: str) -> dict:
             "assignee": "default",
             "responsibility": "B03",
             "execution_tier": "routine",
+            "risk_tier": 1,
             "parents": [],
         }],
         "later_milestones": [],
