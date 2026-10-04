@@ -343,3 +343,15 @@ def test_the_risk_tier_is_part_of_the_authority(kind):
         }[kind](bound["changes"][0])
     )
     assert created["risk_tier"] == 1
+
+
+# A JSON value of another type that Python compares equal to the stored tier:
+# true and 1.0 equal 1, false and 0.0 equal 0, 2.0 equals 2.
+_SAME_VALUE_OTHER_TYPE = [(1, True), (1, 1.0), (0, False), (0, 0.0), (2, 2.0)]
+
+
+@pytest.mark.parametrize(("tier", "run_tier"), _SAME_VALUE_OTHER_TYPE)
+@pytest.mark.parametrize("kind", _KINDS)
+def test_a_run_tier_of_another_json_type_authorizes_no_run(kind, tier, run_tier):
+    with pytest.raises(ValueError, match="run payload differs"):
+        _validate(*_case(kind, tier, run_tier=run_tier))
