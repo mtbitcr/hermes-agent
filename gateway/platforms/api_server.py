@@ -13616,11 +13616,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 "changes": changes,
             }
 
-        if clean(authority["payload"]) != expected_payload:
-            raise ValueError("run payload differs from the stored owner proposal")
         canonical = json.dumps(
             expected_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
         )
+        # Compared as canonical JSON, not with ==: Python equality would accept
+        # true or 1.0 for a stored 1, and the owner approved the exact value.
+        if json.dumps(
+            clean(authority["payload"]),
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ) != canonical:
+            raise ValueError("run payload differs from the stored owner proposal")
         return {
             "proposal_profile": proposal_profile,
             "conversation": authority["conversation"],
