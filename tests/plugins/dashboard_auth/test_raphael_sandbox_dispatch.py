@@ -35,6 +35,9 @@ from hermes_cli import kanban_db as kb
 from plugins.dashboard_auth import raphael_workspace
 from plugins.dashboard_auth.raphael_workspace import sandbox_dispatch as sd
 
+# The host fixture replaces this resolver; a test of the resolver itself puts it back.
+_REAL_RESOLVE_HOST_CREDENTIAL = sd._resolve_host_credential
+
 
 REAL_SECRET = "sk-ant-api03-REAL-host-owned-anthropic-credential-value"
 REAL_OAUTH = "sk-ant-oat01-REAL-host-owned-claude-code-oauth-token"
@@ -1241,6 +1244,28 @@ class TestCredentialPreflight:
         )
         _provision()
         assert refresh_spy.calls == []
+
+    def test_a_setup_token_in_the_environment_signs_build_machines_in_without_a_refresh(
+        self, host, sdk, monkeypatch, refresh_spy
+    ):
+        # The general resolver prefers a refreshable Claude Code login over an
+        # environment token. A build machine takes the long-lived setup token
+        # instead, so two machines provisioned at once never rotate the host
+        # sign-in under each other.
+        import agent.anthropic_credentials as credentials
+
+        setup_token = "sk-ant-oat01-LONG-LIVED-setup-token-from-the-environment"
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", setup_token)
+        monkeypatch.setattr(sd, "_resolve_host_credential", _REAL_RESOLVE_HOST_CREDENTIAL)
+        monkeypatch.setattr(credentials, "resolve_anthropic_token", lambda: REAL_OAUTH)
+        monkeypatch.setattr(
+            sd, "_claude_account_credentials",
+            lambda: _account_record(REAL_OAUTH, _expires_in(600)),
+        )
+        _provision()
+        assert refresh_spy.calls == []
+        (cred,) = FakeSandbox.created[0].vault_calls[0]["credentials"]
+        assert cred.source.value == setup_token
 
     def test_an_unrefreshable_short_lived_token_fails_closed(
         self, host, sdk, monkeypatch, refresh_spy
