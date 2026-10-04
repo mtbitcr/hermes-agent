@@ -228,6 +228,29 @@ def test_listed_profile_cap_counts_running_task_on_a_paused_board(
     assert _status(kb, capped_next) == "ready"
 
 
+# b. a board whose DB cannot be opened is unknown, not empty: the listed
+# profile waits for that tick
+def test_listed_profile_waits_when_a_board_db_cannot_be_opened(
+    kb, spawns, monkeypatch
+):
+    _running(kb, CAPPED, board=SECOND_BOARD)
+    capped_next = _ready(kb, CAPPED)
+    other_next = _ready(kb, OTHER)
+    # board.json keeps the board listed; its DB becomes a symlink loop, which
+    # fails every stat and open with ELOOP, not with a missing file.
+    kb.write_board_metadata(SECOND_BOARD, name="Two")
+    db = kb.kanban_db_path(board=SECOND_BOARD)
+    db.rename(db.with_name("kanban.db.moved"))
+    db.symlink_to(db.name)
+
+    _run_dispatcher(
+        monkeypatch, {"max_in_progress_by_profile": {CAPPED: 1}}, ticks=1
+    )
+
+    assert [(a, t) for _, a, t in spawns] == [(OTHER, other_next)]
+    assert _status(kb, capped_next) == "ready"
+
+
 # b. a spawn on one board holds the same profile's card on the next board
 def test_listed_profile_spawn_on_one_board_holds_card_on_next_board(
     kb, spawns, monkeypatch
