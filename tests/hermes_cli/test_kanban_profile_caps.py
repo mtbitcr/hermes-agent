@@ -203,6 +203,31 @@ def test_listed_profile_cap_counts_running_task_on_another_board(
     assert _status(kb, capped_next) == "ready"
 
 
+# b. the running task that fills the cap lives on a board the owner paused
+def test_listed_profile_cap_counts_running_task_on_a_paused_board(
+    kb, spawns, monkeypatch
+):
+    # A pause stops new claims on its board; its running worker still runs.
+    for board in (kb.DEFAULT_BOARD, SECOND_BOARD):
+        kb.write_board_metadata(board, dispatch_enabled=True)
+    _running(kb, CAPPED, board=SECOND_BOARD)
+    kb.write_board_metadata(SECOND_BOARD, dispatch_paused_by_owner=True)
+    capped_next = _ready(kb, CAPPED)
+    other_next = _ready(kb, OTHER)
+
+    _run_dispatcher(
+        monkeypatch,
+        {
+            "max_in_progress_by_profile": {CAPPED: 1},
+            "dispatch_require_board_activation": True,
+        },
+        ticks=1,
+    )
+
+    assert [(a, t) for _, a, t in spawns] == [(OTHER, other_next)]
+    assert _status(kb, capped_next) == "ready"
+
+
 # b. a spawn on one board holds the same profile's card on the next board
 def test_listed_profile_spawn_on_one_board_holds_card_on_next_board(
     kb, spawns, monkeypatch
