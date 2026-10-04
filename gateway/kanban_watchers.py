@@ -1595,11 +1595,23 @@ class GatewayKanbanWatchersMixin:
                 slug = None
                 try:
                     slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    path = _kb.kanban_db_path(slug)
+                    try:
+                        path.stat()
+                    except FileNotFoundError:
+                        # A board without its DB file runs nothing. Any
+                        # other stat error marks the board unreadable.
+                        continue
                     db = _board_db_fingerprint(slug)[0]
                     if db in seen_dbs:
                         continue
                     seen_dbs.add(db)
-                    conn = _kb.connect(board=slug)
+                    # Read only: the count must not migrate, repair or
+                    # create a board's DB, and its opener logs no path.
+                    conn = sqlite3.connect(
+                        path.resolve().as_uri() + "?mode=ro", uri=True
+                    )
+                    conn.row_factory = sqlite3.Row
                     for name, n in _kb.count_running_by_assignee(conn).items():
                         if name in counts:
                             counts[name] += n
