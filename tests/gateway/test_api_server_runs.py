@@ -87,9 +87,9 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
 
 def _new_owner_proposal():
     return {
-        # v3 is the first new-project schema that carries execution_tier, so it
+        # v4 is the first new-project schema that carries risk_tier, so it
         # is the first one that grants commit authority.
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": "proposal",
         "mode": "new",
         "project_name": "Workshop pilot",
@@ -108,6 +108,7 @@ def _new_owner_proposal():
             "assignee": "default",
             "responsibility": "B03",
             "execution_tier": "routine",
+            "risk_tier": 1,
             "parents": [],
         }],
     }

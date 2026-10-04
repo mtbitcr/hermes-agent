@@ -1,11 +1,12 @@
 """Cross-repository owner-proposal schema contract.
 
-The Workspace planner emits ``schema_version`` 3 for a new-project proposal and
-5 for an existing-project change proposal, and every created task now names its
-``execution_tier`` and repository scope. Hermes must recognise exactly those as actionable — an
-older stored proposal stays readable in history but can no longer be committed,
-because committing it would leave the kernel resolving a route from a class the
-planner never stated.
+The Workspace planner emits ``schema_version`` 4 for a new-project proposal and
+6 for an existing-project change proposal, and every created task now names its
+``execution_tier``, its ``risk_tier`` and repository scope. Hermes must
+recognise exactly those as actionable — an older stored proposal stays
+readable in history but can no longer be committed, because committing it
+would leave the kernel resolving a route from a class the planner never
+stated, or a card without the risk tier the owner approves.
 
 The proposal objects below are the exact shapes ``src/lib/conversation-plan.ts``
 produces; they are duplicated here on purpose because this file IS the contract
@@ -28,7 +29,7 @@ from gateway.platforms.api_server import (
 
 def _workspace_new_proposal(**overrides):
     proposal = {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": "proposal",
         "mode": "new",
         "project_name": "Workshop pilot",
@@ -47,6 +48,7 @@ def _workspace_new_proposal(**overrides):
             "assignee": "default",
             "responsibility": "B03",
             "execution_tier": "routine",
+            "risk_tier": 1,
             "parents": [],
         }],
     }
@@ -56,7 +58,7 @@ def _workspace_new_proposal(**overrides):
 
 def _workspace_existing_proposal(**overrides):
     proposal = {
-        "schema_version": 5,
+        "schema_version": 6,
         "kind": "project_change_proposal",
         "mode": "existing",
         "request_title": "Add the approved milestone",
@@ -75,6 +77,7 @@ def _workspace_existing_proposal(**overrides):
             "assignee": "default",
             "responsibility": "B03",
             "execution_tier": "deep",
+            "risk_tier": 1,
             "owned_paths": [],
             "existing_parent_refs": [],
             "new_parents": [],
