@@ -39,7 +39,8 @@ DUMMY = "ghs_" + "Nf64Jt8Yw2Qs" * 3  # a credential of the controls' own, so a c
 DUMMY_BASIC = base64.b64encode(f"x-access-token:{DUMMY}".encode()).decode()
 HEAD = "a" * 40
 BASE = "b" * 40
-SAMPLE = {"repo": REPO, "number": "7", "sha": HEAD, "id": "9", "head_sha": HEAD, "installation": str(INSTALLATION)}
+SAMPLE = {"repo": REPO, "number": "7", "sha": HEAD, "id": "9", "head_sha": HEAD, "installation": str(INSTALLATION),
+          "branch": "card-1"}
 SECTION_4_PERMISSIONS = {"contents", "pull_requests", "checks", "actions"}
 ADMIN_CALLS = [
     ("GET", f"/repos/{REPO}/branches/main/protection"),
@@ -332,6 +333,11 @@ def github(tmp_path):
                                          "documentation_url": f"https://docs.example/{TOKEN}"})
             if path.endswith("/logs"):
                 return self._reply(302, None, [("Location", f"https://storage.example/log?sig={TOKEN}")])
+            if method == "GET" and "/git/ref/heads/" in path:  # one branch exists; any other is absent
+                if path == f"/repos/{REPO}/git/ref/heads/delivery/card-1":
+                    return self._reply(200, {"ref": "refs/heads/delivery/card-1", "node_id": TOKEN, "url": TOKEN,
+                                             "object": {"sha": HEAD, "type": "commit", "url": TOKEN}})
+                return self._reply(404, {"message": f"Not Found {TOKEN}"})
             return self._reply(200, {})
 
         def log_message(self, *args):
@@ -1054,3 +1060,27 @@ def test_the_api_connection_opens_no_tls_key_log(monkeypatch, tmp_path):
         assert connection._context.check_hostname is True
     finally:
         connection.close()
+
+
+def test_branch_head_reads_the_commit_the_branch_holds(github, monkeypatch):
+    """Finding 1 of the slice 4 review: the one branch read goes through the allowlist and the
+    step's one narrowed token, and returns the head SHA of the branch."""
+    mod = _transport_module(monkeypatch, github)
+
+    head = mod.GitHubTransport("publish", REPO, key_path=github["key_file"]).branch_head("delivery/card-1")
+
+    assert head == HEAD
+    assert github["calls"] == [("GET", f"/repos/{REPO}/git/ref/heads/delivery/card-1")]
+    assert github["token_requests"] == [
+        {"repositories": ["hermes-agent"], "permissions": {"contents": "write", "pull_requests": "write"}}]
+
+
+def test_branch_head_is_none_when_github_answers_404(github, monkeypatch):
+    """The same read for a branch GitHub does not have: GitHub answers 404 and the read returns None,
+    the branch's absence."""
+    mod = _transport_module(monkeypatch, github)
+
+    head = mod.GitHubTransport("publish", REPO, key_path=github["key_file"]).branch_head("delivery/card-2")
+
+    assert head is None
+    assert github["calls"] == [("GET", f"/repos/{REPO}/git/ref/heads/delivery/card-2")]
