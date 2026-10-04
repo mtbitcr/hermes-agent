@@ -561,3 +561,42 @@ def test_store_path_under_the_dispatcher_worker_environment(board, monkeypatch):
     assert _independent_counts(root / "kanban.db", tid, head)[2:] == (0, 0)
     assert not (profile_home / "kanban.db").exists()
     assert not (profile_home / "kanban").exists()
+
+
+def test_the_publish_ledger_columns_join_an_existing_delivery_table(board):
+    """Slice 4 keeps its publish ledger in four new columns of the delivery row.
+    A board whose table predates them gains them on open, and its rows keep
+    their values with an empty ledger."""
+    kb, root, repo = board
+    db_path = kb.kanban_db_path()
+    raw = sqlite3.connect(str(db_path))
+    try:
+        raw.execute("DROP TABLE kanban_deliveries")
+        raw.execute(
+            "CREATE TABLE kanban_deliveries ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, source_task_id TEXT NOT NULL, "
+            "source_head TEXT NOT NULL, integration_task_id TEXT, approval_run_id INTEGER, "
+            "created_at INTEGER NOT NULL, UNIQUE(source_task_id, source_head))"
+        )
+        raw.execute(
+            "INSERT INTO kanban_deliveries (source_task_id, source_head, integration_task_id, "
+            "approval_run_id, created_at) VALUES ('t_old', ?, 't_card', 7, 1700000000)",
+            ("a" * 40,),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    raw = sqlite3.connect(str(db_path))
+    try:
+        columns = [row[1] for row in raw.execute("PRAGMA table_info(kanban_deliveries)")]
+        rows = raw.execute("SELECT * FROM kanban_deliveries").fetchall()
+    finally:
+        raw.close()
+    assert columns[-4:] == [
+        "pull_request_number", "pull_request_head", "pull_request_state", "pull_request_branch",
+    ]
+    assert rows == [(1, "t_old", "a" * 40, "t_card", 7, 1700000000, None, None, None, None)]
