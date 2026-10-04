@@ -18076,6 +18076,18 @@ def _migrate_add_optional_columns(
         "CREATE TABLE IF NOT EXISTS kanban_migration_markers ("
         "name TEXT PRIMARY KEY, completed_at INTEGER NOT NULL)"
     )
+    # One delivery per approved source card and head (hermes_cli/kanban_delivery.py).
+    # The UNIQUE pair is what makes two concurrent approvals record exactly once.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS kanban_deliveries ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "source_task_id TEXT NOT NULL, "
+        "source_head TEXT NOT NULL, "
+        "integration_task_id TEXT, "
+        "approval_run_id INTEGER, "
+        "created_at INTEGER NOT NULL, "
+        "UNIQUE(source_task_id, source_head))"
+    )
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -26474,6 +26486,11 @@ def complete_task(
             _resolve_recorded_review_followups(
                 conn, task_id, run_id=run_id, now=now,
             )
+            # With kanban.delivery on, the approved head's one delivery record
+            # and one integration card land in THIS transaction as well.
+            from hermes_cli import kanban_delivery
+
+            kanban_delivery.record_approved_delivery(conn, task_id)
     # Everything below this point runs AFTER the completion is durable, so
     # none of it may turn into a refusal of the completion: a caller told
     # "REFUSED_TIMEOUT" while the board says ``status='done'`` has been

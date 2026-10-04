@@ -1,0 +1,19 @@
+{
+  "mtbitcr/hermes-agent": {
+    "required_checks": ["All required checks pass"],
+    "flaky_tests": [
+      {
+        "test": "tests/tools/test_zombie_process_cleanup.py::TestDelegationCleanup::test_timed_out_child_keeps_relay_session_until_its_turn_exits",
+        "finding": 46
+      },
+      {
+        "test": "tests/tui_gateway/test_compute_host_turn_protocol.py::test_turn_start_streams_deltas_then_turn_end_with_history_identity",
+        "finding": 100
+      }
+    ]
+  },
+  "mtbitcr/raphael-workspace": {
+    "required_checks": ["quality"],
+    "flaky_tests": []
+  }
+}
