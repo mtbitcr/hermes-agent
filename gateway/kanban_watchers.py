@@ -1582,9 +1582,11 @@ class GatewayKanbanWatchersMixin:
             boards: list,
         ) -> "tuple[dict[str, int], list[str]]":
             """Running tasks of each profile in max_in_progress_by_profile,
-            summed over the boards this tick dispatches (boards sharing one
-            DB count once), and the boards that could not be read. While
-            that list is non-empty the sum is incomplete: unknown, not 0."""
+            summed over every listed board (boards sharing one DB count
+            once), and the boards that could not be read. A board the owner
+            paused or never activated counts too: a pause stops new claims,
+            not the workers already running. While that list is non-empty
+            the sum is incomplete: unknown, not 0."""
             counts = dict.fromkeys(max_in_progress_by_profile, 0)
             unreadable: list[str] = []
             seen_dbs: set[str] = set()
@@ -1592,14 +1594,24 @@ class GatewayKanbanWatchersMixin:
                 conn = None
                 slug = None
                 try:
-                    if not _board_is_dispatchable(b):
-                        continue
                     slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    path = _kb.kanban_db_path(slug)
+                    try:
+                        path.stat()
+                    except FileNotFoundError:
+                        # A board without its DB file runs nothing. Any
+                        # other stat error marks the board unreadable.
+                        continue
                     db = _board_db_fingerprint(slug)[0]
                     if db in seen_dbs:
                         continue
                     seen_dbs.add(db)
-                    conn = _kb.connect(board=slug)
+                    # Read only: the count must not migrate, repair or
+                    # create a board's DB, and its opener logs no path.
+                    conn = sqlite3.connect(
+                        path.resolve().as_uri() + "?mode=ro", uri=True
+                    )
+                    conn.row_factory = sqlite3.Row
                     for name, n in _kb.count_running_by_assignee(conn).items():
                         if name in counts:
                             counts[name] += n
