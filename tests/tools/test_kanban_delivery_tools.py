@@ -583,6 +583,42 @@ def test_a_run_that_loses_its_claim_during_the_network_work_records_nothing(worl
     assert len(github["pulls"]) == 1 and len(github["pushes"]) == 1
 
 
+def test_a_reclaim_between_the_admission_and_the_snapshot_records_nothing(world, github, monkeypatch):
+    """Finding of the PR 145 security review: the operator reclaims the card after the run is
+    admitted but before its facts are captured. The admission and the snapshot are one read, so
+    the snapshot still holds the admitted run, and the final write sees the reclaim. The reclaim
+    runs in its own thread, as another process would: on a board in rollback-journal mode it
+    waits for that read to end, so the pull request creation waits for the reclaim to land."""
+    kb, root, repo, bare = world
+    tid, head, card = _approved(kb, repo)
+    _claim(kb, card, monkeypatch)
+    from hermes_cli import kanban_delivery
+
+    original = kanban_delivery.approval_facts
+    reclaimed = []
+
+    def reclaim():
+        own = kb.connect()
+        try:
+            reclaimed.append(kb.reclaim_task(own, card, reason="operator"))
+        finally:
+            own.close()
+
+    operator = threading.Thread(target=reclaim)
+
+    def reclaim_then_prove(conn, task_id, bound_head):
+        if operator.ident is None:
+            operator.start()
+            operator.join(timeout=1)  # at once, unless the board's journal makes it wait for the read
+        return original(conn, task_id, bound_head)
+
+    monkeypatch.setattr(kanban_delivery, "approval_facts", reclaim_then_prove)
+    github["on_create"] = lambda: operator.join(timeout=30)
+    _refused(_publish(), "stale_run")
+    assert reclaimed == [True]
+    assert _ledger(kb, card) == (None, None, None, None) and _events(kb, card) == []
+
+
 def test_a_source_reopened_during_the_network_work_records_nothing(world, github, monkeypatch):
     """Finding 2 of the slice 4 review: the owner reopens the source card while GitHub is creating
     the pull request. The delivery row and the run stay unchanged, but the approval the publish was
