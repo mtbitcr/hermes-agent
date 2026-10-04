@@ -35,3 +35,69 @@ def effective_risk_tier(value: Optional[int]) -> int:
     if value is None:
         return UNRECORDED_RISK_TIER
     return parse_risk_tier(value)
+
+
+# The only efforts a card is ever pinned at. The model policy admits exactly
+# these next to each other on a lane's own model, and nothing wider.
+PINNED_EFFORTS = ("high", "max")
+# Responsibility "Security review" runs at max whatever its tier (decision 6).
+SECURITY_REVIEW_RESPONSIBILITY = "R12"
+
+
+def pinned_reasoning_effort(tier: Optional[int], responsibility: Optional[str]) -> str:
+    """The effort a new card is pinned at: max for tier 2 and for a security
+    review, high for everything else."""
+    if effective_risk_tier(tier) == 2:
+        return "max"
+    if str(responsibility or "").strip().upper() == SECURITY_REVIEW_RESPONSIBILITY:
+        return "max"
+    return "high"
+
+
+# Seconds per run for each kind of work (the plan's owner summary and
+# decision 2).
+_TIME_BOX_SECONDS = {
+    "build": 7200,
+    "analysis": 2700,
+    "proposal": 1800,
+    "review": 2700,
+    "release": 2700,
+    "coordinator_deep": 2700,
+    "coordinator_routine": 1800,
+}
+_COORDINATOR = "default"
+_REVIEWER = "raphael-verifier"
+# The builder integrates verified work and operates infrastructure, so its
+# cards are release, integration and infrastructure work.
+_RELEASE = "raphael-builder"
+
+
+def card_work_kind(
+    assignee: Optional[str], owned_paths: Optional[list], execution_tier: Optional[str],
+) -> str:
+    """Classify a card's work for its time box.
+
+    The role decides first: the coordinator, the independent reviewer and the
+    builder have their own boxes. Any other card is a build when it may write
+    (``owned_paths`` None is legacy whole-repository ownership), and read-only
+    work is an analysis when deep and a proposal when routine.
+    """
+    deep = str(execution_tier or "").strip().lower() == "deep"
+    role = str(assignee or "").strip()
+    if role == _COORDINATOR:
+        return "coordinator_deep" if deep else "coordinator_routine"
+    if role == _REVIEWER:
+        return "review"
+    if role == _RELEASE:
+        return "release"
+    if owned_paths is not None and not list(owned_paths):
+        return "analysis" if deep else "proposal"
+    return "build"
+
+
+def pinned_time_box_seconds(kind: str) -> int:
+    """The per-run time box, in seconds, for one kind of work."""
+    try:
+        return _TIME_BOX_SECONDS[kind]
+    except KeyError:
+        raise ValueError(f"unknown kind of work {kind!r}") from None

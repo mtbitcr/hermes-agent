@@ -1354,6 +1354,8 @@ _OWNER_HISTORY_RAPHAEL_MAX_CHARS = 50_000
 _OWNER_CONVERSATION_RE = re.compile(
     r"raphael-owner-[a-f0-9]{32}(?:-[a-f0-9]{32})?"
 )
+# The effort every owner-conversation turn runs at (tier plan P4).
+_OWNER_TURN_REASONING_EFFORT = "high"
 _OWNER_RESPONSE_RE = re.compile(r"resp_[A-Za-z0-9_-]{8,128}")
 # "The caller asserted nothing about the predecessor", which is distinct from
 # asserting ``None`` ("this conversation must still have no turn").
@@ -10511,6 +10513,15 @@ class APIServerAdapter(BasePlatformAdapter):
             virtual_model=self._model_name,
             allow_bare_model=self._direct_model_requests,
         )
+        if is_owner_conversation:
+            # The owner's conversation turns run at high, not the profile's
+            # max (owner decision, tier plan P4). Fixed here, so the caller
+            # can neither raise nor lower it; every other request keeps the
+            # profile's effort or the one it asked for.
+            owner_options = dict(agent_overrides.get("model_options") or {})
+            owner_options.pop("reasoning", None)
+            owner_options["reasoning_effort"] = _OWNER_TURN_REASONING_EFFORT
+            agent_overrides["model_options"] = owner_options
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,

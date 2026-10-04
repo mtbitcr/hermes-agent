@@ -94,7 +94,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli import kanban_provider_stops as _provider_stops
-from hermes_cli.kanban_risk_tier import parse_risk_tier
+from hermes_cli.kanban_risk_tier import (
+    card_work_kind,
+    parse_risk_tier,
+    pinned_reasoning_effort,
+    pinned_time_box_seconds,
+)
 from hermes_cli.sqlite_util import (
     InitLockDirectoryAbsent,
     InitLockUnavailable,
@@ -279,6 +284,37 @@ def policy_lock_error(
     return _model_policy().policy_lock_error(
         lock, assignee, provider, model, effort, execution_tier
     )
+
+
+def _pin_new_card(
+    assignee: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    effort: Optional[str],
+    execution_tier: Optional[str],
+    lock: Optional[str],
+    risk_tier: Optional[int],
+    responsibility: Optional[str],
+    owned_paths: Optional[list],
+    max_runtime_seconds: Optional[int],
+) -> tuple[Optional[str], Optional[str], Optional[int]]:
+    """Return a new card's ``(effort, lock, max_runtime_seconds)`` pins.
+
+    Only a card with a route lock is pinned; a CLI or other unlocked card keeps
+    what its creator passed. The time box follows the card's kind of work. The
+    effort follows the card's risk tier and is sealed again on the same model;
+    a card without a tier keeps its approved route's effort (owner decision 3).
+    The rules live in :mod:`hermes_cli.kanban_risk_tier`.
+    """
+    if lock is None:
+        return effort, lock, max_runtime_seconds
+    box = pinned_time_box_seconds(card_work_kind(assignee, owned_paths, execution_tier))
+    if risk_tier is None:
+        return effort, lock, box
+    pinned = pinned_reasoning_effort(risk_tier, responsibility)
+    if pinned != effort:
+        lock = mint_policy_lock(assignee, provider, model, pinned, execution_tier)
+    return pinned, lock, box
 
 
 def _task_kinds(include_control: bool) -> str:
@@ -19416,6 +19452,11 @@ def create_task(
         if integrates_parent_heads:
             raise ValueError(f"{assignee} tasks cannot integrate parent heads")
         owned_paths_list = []
+    reasoning_effort, model_policy_lock, max_runtime_seconds = _pin_new_card(
+        assignee, provider_override, model_override, reasoning_effort,
+        execution_tier, model_policy_lock, risk_tier, responsibility,
+        owned_paths_list, max_runtime_seconds,
+    )
     if not isinstance(integrates_parent_heads, bool):
         raise ValueError("integrates_parent_heads must be a boolean")
     if integrates_parent_heads and not owned_paths_list:
@@ -21477,22 +21518,29 @@ def _live_policy_route_assignments(
     already carries the review requirement, which is what authorizes the
     re-pin: the owner approved review for this exact card, so handing it to the
     reviewer and back is approved work, not a silent re-route.
+
+    A card with a recorded risk tier keeps the effort its tier pins, on the
+    new role's model, so the round-trip never moves it back to the role's
+    base effort (:mod:`hermes_cli.kanban_risk_tier`).
     """
     policy = _model_policy()
     tier = policy.normalize_execution_tier(row["execution_tier"])
     assignment = policy.resolve_task_assignment(target, tier)
+    effort = assignment.reasoning_effort
+    if row["risk_tier"] is not None:
+        effort = pinned_reasoning_effort(row["risk_tier"], row["responsibility"])
     lock = mint_policy_lock(
         target,
         assignment.provider,
         assignment.model,
-        assignment.reasoning_effort,
+        effort,
         tier,
     )
     return (
         [
             ("model_override", assignment.model),
             ("provider_override", assignment.provider),
-            ("reasoning_effort", assignment.reasoning_effort),
+            ("reasoning_effort", effort),
             ("execution_tier", tier),
             ("model_policy_lock", lock),
         ],
@@ -21500,7 +21548,7 @@ def _live_policy_route_assignments(
             "assignee": target,
             "model": assignment.model,
             "provider": assignment.provider,
-            "reasoning_effort": assignment.reasoning_effort,
+            "reasoning_effort": effort,
             "execution_tier": tier,
             "source": "committed_review_requirement",
         },
@@ -21594,7 +21642,7 @@ def role_transition_route(
     row = conn.execute(
         "SELECT assignee, execution_tier, model_policy_lock, model_override, "
         "provider_override, reasoning_effort, owner_receipt_bound, "
-        "requires_review FROM tasks "
+        "requires_review, risk_tier, responsibility FROM tasks "
         "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
@@ -30009,6 +30057,11 @@ def decompose_triage_task(
                     risk_tier = parse_risk_tier(risk_tier)
                 except ValueError as exc:
                     raise ValueError(f"child[{idx}] {exc}") from None
+            reasoning_effort, model_policy_lock, max_runtime_seconds = _pin_new_card(
+                assignee, provider_override, model_override, reasoning_effort,
+                execution_tier, model_policy_lock, risk_tier, responsibility,
+                owned_paths, None,
+            )
             # Written with the row but never part of the approved children,
             # so the owner graph digest that names them is unchanged.
             skills = (
@@ -30060,8 +30113,8 @@ def decompose_triage_task(
                 " integrates_parent_heads, skills, model_override, provider_override, "
                 " reasoning_effort, execution_tier, model_policy_lock, "
                 " owner_receipt_bound, requires_review, risk_tier, park_generation, "
-                " created_at, created_by) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " created_at, created_by, max_runtime_seconds) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -30087,6 +30140,7 @@ def decompose_triage_task(
                     generation,
                     now,
                     (author or "decomposer"),
+                    max_runtime_seconds,
                 ),
             )
             _append_event(
@@ -30519,6 +30573,8 @@ def apply_owner_project_plan(
                 reasoning_effort=spec.get("reasoning_effort"),
                 execution_tier=spec.get("execution_tier"),
                 model_policy_lock=spec.get("model_policy_lock"),
+                # The approved tier pins the card's effort at creation.
+                risk_tier=spec.get("risk_tier"),
                 # Absent means legacy fail-closed whole-repository ownership,
                 # exactly as before this key existed; a present value is the
                 # owner-approved explicit write boundary and forces the
