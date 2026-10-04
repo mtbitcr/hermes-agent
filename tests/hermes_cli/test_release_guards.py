@@ -17,6 +17,8 @@ GiB = 1024**3
 PREV = "prev-sha"
 FIRST_MERGE = "first-merge-sha"
 NEW = "second-merge-sha"
+# A change merged after Accept: origin main has moved past NEW.
+LATER = "later-merge-sha"
 CHECKOUT = "/srv/hermes/checkout"
 ALL_GUARDS = [f"G{number}" for number in range(1, 12)]
 
@@ -50,6 +52,8 @@ class FakeHost:
         default_factory=lambda: {FIRST_MERGE: "first-tree", NEW: "new-tree"}
     )
     prev_is_ancestor: bool = True
+    # (ancestor, descendant) pairs on the history besides PREV to NEW.
+    history: set[tuple[str, str]] = field(default_factory=lambda: {(NEW, LATER)})
     changed: set[str] = field(default_factory=lambda: {"hermes_cli/main.py"})
     venv_root: str = CHECKOUT
     gateway: dict[str, str] = field(
@@ -83,7 +87,10 @@ class FakeHost:
         return self.trees.get(commit, "")
 
     def is_ancestor(self, ancestor, descendant):
-        return self.prev_is_ancestor and (ancestor, descendant) == (PREV, NEW)
+        if (ancestor, descendant) == (PREV, NEW):
+            return self.prev_is_ancestor
+        # As in git, a commit is its own ancestor.
+        return ancestor == descendant or (ancestor, descendant) in self.history
 
     def changed_paths(self, prev, new):
         return set(self.changed)
@@ -152,12 +159,24 @@ def test_prepare_mode_runs_every_guard_and_writes_nothing():
     assert healthy.writes == failing.writes == []
 
 
+def test_g2_accepts_an_origin_main_that_moved_past_new():
+    # A change that merges after Accept joins the next decision; it does not refuse this release.
+    host = FakeHost(origin=LATER)
+
+    results = prepare(host, PINS, MERGES)
+
+    assert [(result.guard, result.ok) for result in results] == [
+        (guard, True) for guard in ALL_GUARDS
+    ]
+    assert host.writes == []
+
+
 @pytest.mark.parametrize(
     ("guard", "merges", "host_setup"),
     [
         refusal("G1", "G1-checkout-not-at-prev", head="other-sha"),
         refusal("G1", "G1-checkout-not-clean", clean=False),
-        refusal("G2", "G2-origin-main-is-not-new", origin="later-sha"),
+        refusal("G2", "G2-new-not-on-the-history-of-origin-main", origin="rewritten-sha"),
         refusal("G3", "G3-merge-on-chain-not-in-batch", merges=MERGES[1:]),
         refusal(
             "G3",
