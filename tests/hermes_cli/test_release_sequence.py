@@ -52,6 +52,10 @@ class FakeHost:
     config_drifts_on_start: set[str] = field(default_factory=set)
     snapshot_fails: bool = False
     restore_config_fails: bool = False
+    # Interruptions are BaseException, not Exception: a person's Ctrl-C or an exit inside a call.
+    snapshot_interrupted: bool = False
+    checkout_interrupted: set[str] = field(default_factory=set)
+    health_exits: set[str] = field(default_factory=set)
     workspace_ok: bool = True
     modules_at_stop: set[str] | None = None
 
@@ -107,6 +111,8 @@ class FakeHost:
         return unit in self.active
 
     def health_ok(self):
+        if self.running in self.health_exits:
+            raise SystemExit(f"health check exited on {self.running}")
         if self.running in self.health_unanswered:
             raise ConnectionError(f"health endpoint did not answer on {self.running}")
         return self.running is not None and self.running not in self.unhealthy
@@ -136,6 +142,8 @@ class FakeHost:
                 self.config = dict(DRIFTED_CONFIG)
 
     def checkout(self, commit):
+        if commit in self.checkout_interrupted:
+            raise KeyboardInterrupt(f"checkout of {commit} interrupted")
         if commit in self.checkout_fails:
             raise OSError(f"checkout of {commit} failed")
         self.head = commit
@@ -146,6 +154,8 @@ class FakeHost:
         self.config = dict(PREV_CONFIG)
 
     def take_snapshot(self, name):
+        if self.snapshot_interrupted:
+            raise KeyboardInterrupt("snapshot interrupted")
         if self.snapshot_fails:
             raise OSError("no space left for the state snapshot")
         self.snapshot_dirs.append(name)
@@ -325,6 +335,38 @@ def test_tier0_goes_forward_only():
             (f"ReadbackFailed: R4 did not hold on {NEW}",),
             {},
             id="config-drifts-when-prev-starts",
+        ),
+        # Interruptions (security review of PR 143): each of the three barriers holds for a
+        # BaseException that is not an Exception, as it does for an ordinary failure.
+        pytest.param(
+            {"snapshot_interrupted": True},
+            ("guards", "stop", "snapshot", "restore", "readback"),
+            "restored",
+            [],
+            ("KeyboardInterrupt: snapshot interrupted",),
+            {},
+            id="interrupted-after-the-stop",
+        ),
+        pytest.param(
+            {"unhealthy": {NEW}, "checkout_interrupted": {PREV}},
+            RESTORE_AFTER_FORWARD,
+            "failed",
+            ["R1", "R4", "fleet version"],
+            (
+                f"ReadbackFailed: R4 did not hold on {NEW}",
+                f"KeyboardInterrupt: checkout of {PREV} interrupted",
+            ),
+            {},
+            id="recovery-step-interrupted",
+        ),
+        pytest.param(
+            {"unhealthy": {NEW}, "health_exits": {PREV}},
+            RESTORE_AFTER_FORWARD,
+            "failed",
+            ["R4"],
+            (f"ReadbackFailed: R4 did not hold on {NEW}",),
+            {-1: {"R4": f"SystemExit: health check exited on {PREV}"}},
+            id="recovery-readback-read-exits",
         ),
     ],
 )
