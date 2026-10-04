@@ -3,12 +3,15 @@
 P2 of the risk tier plan (tests P2-1 to P2-6), through the real kernel:
 
 * effort is pinned at creation and sealed in the card's existing route lock:
-  high by default, max for tier 2 and for a security review card (R12);
-* the time box is pinned at creation from the kind of work (decision 2);
+  high by default, max for tier 2 and for a security review card (R12); a
+  new card without a tier counts as tier 2 (decision 3);
+* the time box is pinned at creation from the kind of work (decision 2): an
+  integration card gets the integration box, and a review run gets the review
+  box while its card keeps its own;
 * the pins use only what the model policy admits: high next to max on the
   lane's own model, nothing wider, and never a fallback;
-* a build run past its box with its saved work parks in review instead of
-  being retried;
+* every new governed build card is reviewed (decision 4), so a build run past
+  its box with one saved patch parks in review instead of being retried;
 * ``kanban_create`` carries ``risk_tier`` on an owner-governed board, under
   the exact environment the dispatcher gives a worker.
 """
@@ -149,6 +152,18 @@ def _owner_created_rows(ctx, path: str, tiers, responsibilities) -> list:
         return [_row(conn, task_id) for task_id in created]
 
 
+def _kanban_create(args: dict) -> dict:
+    """Create a card through the registered, schema-checked ``kanban_create``."""
+    from jsonschema import Draft202012Validator
+
+    from tools import kanban_tools  # noqa: F401  (registers the tool)
+    from tools.registry import registry
+
+    schema = registry.get_entry("kanban_create").schema["parameters"]
+    Draft202012Validator(schema).validate(args)
+    return json.loads(registry.dispatch("kanban_create", args))
+
+
 # ---------------------------------------------------------------------------
 # P2-1 and P2-2: the pinned effort
 # ---------------------------------------------------------------------------
@@ -219,6 +234,24 @@ def test_the_time_box_is_pinned_at_creation(
     assert row["max_runtime_seconds"] == box
     assert task.max_runtime_seconds == box
     assert kb.task_policy_lock_error(row) is None
+
+
+def test_an_integration_card_gets_the_integration_box(kanban_home):
+    """The existing marker makes integration work, whichever profile runs it."""
+    with kb.connect() as conn:
+        rows = [
+            _row(conn, _locked_card(
+                conn, "raphael-claude-worker", "deep", risk_tier=2,
+                owned_paths=["."], integrates_parent_heads=integrates,
+            ))
+            for integrates in (True, False)
+        ]
+
+    assert [
+        (row["integrates_parent_heads"], row["max_runtime_seconds"]) for row in rows
+    ] == [(1, DEEP_BOX), (0, BUILD_BOX)]
+    for row in rows:
+        assert kb.task_policy_lock_error(row) is None
 
 
 def test_a_card_without_a_route_lock_is_not_pinned(kanban_home):
@@ -343,74 +376,158 @@ def test_no_other_effort_model_route_or_fallback(kanban_home):
 SLUG = "pinned-box"
 OWNED = "src/owned"
 WORKER_PID = 70998
+# What a build run saves: its patch, and possibly its report.
+PATCH = (
+    "x.patch",
+    (
+        f"diff --git a/{OWNED}/saved.py b/{OWNED}/saved.py\n"
+        "new file mode 100644\n--- /dev/null\n"
+        f"+++ b/{OWNED}/saved.py\n@@ -0,0 +1 @@\n+saved = True\n"
+    ).encode("utf-8"),
+    "text/x-diff",
+)
+REPORT = ("report.md", b"# Report\n\nSaved before the box ended.\n", "text/markdown")
 
 
-def test_the_build_box_hands_over_instead_of_retrying(fence_home, tmp_path, monkeypatch):
+@pytest.fixture
+def build_repo(fence_home, tmp_path, monkeypatch):
+    """A repository with an owned module, worked on from a governed board."""
     repo = tmp_path / "repo"
     make_git_repo(repo)
     (repo / OWNED).mkdir(parents=True)
     (repo / OWNED / "app.py").write_text("value = 1\n", encoding="utf-8")
     git(repo, "add", f"{OWNED}/app.py")
     git(repo, "commit", "-m", "owned module", author=DEFAULT_GIT_IDENTITY)
-    create_fenced_board(SLUG)
+    create_fenced_board(SLUG, project_id="p_governed_test")
     monkeypatch.setenv("HERMES_KANBAN_BOARD", SLUG)
     monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(tmp_path / "at"))
+    return repo
+
+
+def _outlast(conn, task_id: str, run_id: int, box: int, pid: int) -> tuple:
+    """Run past ``box`` as worker ``pid``; return the sweep's timeouts and signals."""
+    kb._set_worker_pid(conn, task_id, pid)
+    conn.execute(
+        "UPDATE task_runs SET started_at = ? WHERE id = ?",
+        (int(time.time()) - box - 60, run_id),
+    )
+    signalled = []
+    timed_out = kb.enforce_max_runtime(
+        conn, signal_fn=lambda target, _sig: signalled.append(target),
+    )
+    return timed_out, signalled
+
+
+def _build_past_its_box(conn, task_id: str, saved) -> tuple:
+    """Claim the build, save ``saved`` in its run, and run past the build box."""
+    host = kb._claimer_id().split(":", 1)[0]
+    claimed = kb.claim_task(conn, task_id, claimer=f"{host}:w0")
+    workspace, branch = kb._resolve_worktree_workspace(claimed)
+    kb.set_workspace_path(conn, task_id, workspace)
+    kb.set_branch_name(conn, task_id, branch)
+    kb.record_worktree_base(conn, task_id, workspace)
+    run_id = claimed.current_run_id
+    for name, data, content_type in saved:
+        kb.store_attachment_bytes(
+            conn, task_id, name, data, content_type=content_type,
+            uploaded_by="agent", expected_run_id=run_id,
+        )
+    return (run_id, *_outlast(conn, task_id, run_id, BUILD_BOX, WORKER_PID))
+
+
+def test_a_decomposed_build_child_is_reviewed(kanban_home):
+    """Decision 4 reaches decomposed work too; a read-only child is not reviewed."""
+    route = mp.task_assignment_for("raphael-claude-worker", "anthropic", "deep")
+    child = {
+        "assignee": "raphael-claude-worker", "execution_tier": "deep", "risk_tier": 1,
+        "provider_override": route.provider, "model_override": route.model,
+        "reasoning_effort": route.reasoning_effort,
+        "model_policy_lock": kb.mint_policy_lock(
+            "raphael-claude-worker", route.provider, route.model,
+            route.reasoning_effort, "deep",
+        ),
+    }
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="Ship the owned module", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn, root, root_assignee="default", children=[
+                {**child, "title": "Build", "owned_paths": [OWNED],
+                 "workspace_kind": "worktree"},
+                {**child, "title": "Analyse", "owned_paths": []},
+            ],
+        )
+        rows = [_row(conn, task_id) for task_id in child_ids]
+
+    assert [(row["requires_review"], row["max_runtime_seconds"]) for row in rows] == [
+        (1, BUILD_BOX), (0, DEEP_BOX),
+    ]
+    for row in rows:
+        assert kb.task_policy_lock_error(row) is None
+
+
+@pytest.mark.parametrize(
+    "saved", [(PATCH,), (PATCH, REPORT)], ids=["patch", "patch-and-report"],
+)
+def test_the_build_box_hands_over_instead_of_retrying(build_repo, saved):
+    # P2-6 as planned: one saved patch is enough. The card is created through
+    # the registered tool, and nobody asks for its review.
+    created = _kanban_create({
+        "title": "Build the owned module", "assignee": "raphael-claude-worker",
+        "execution_tier": "deep", "risk_tier": 1, "owned_paths": [OWNED],
+        "workspace_kind": "worktree", "workspace_path": str(build_repo),
+    })
+    assert created["ok"] is True, created
     with closing(kb.connect(board=SLUG)) as conn:
-        task_id = _locked_card(
-            conn, "raphael-claude-worker", "deep", risk_tier=1,
-            owned_paths=[OWNED], workspace_kind="worktree",
-            workspace_path=str(repo), branch_name="feature/boxed",
-            requires_review=True,
-        )
-        assert kb.get_task(conn, task_id).max_runtime_seconds == BUILD_BOX
-        host = kb._claimer_id().split(":", 1)[0]
-        claimed = kb.claim_task(conn, task_id, claimer=f"{host}:w0")
-        run_id = claimed.current_run_id
-        workspace, branch = kb._resolve_worktree_workspace(claimed)
-        kb.set_workspace_path(conn, task_id, workspace)
-        kb.set_branch_name(conn, task_id, branch)
-        kb.record_worktree_base(conn, task_id, workspace)
-        # The build saved its work: one patch and its report, both its own.
-        for name, data, content_type in (
-            (
-                "x.patch",
-                (
-                    f"diff --git a/{OWNED}/saved.py b/{OWNED}/saved.py\n"
-                    "new file mode 100644\n--- /dev/null\n"
-                    f"+++ b/{OWNED}/saved.py\n@@ -0,0 +1 @@\n+saved = True\n"
-                ).encode("utf-8"),
-                "text/x-diff",
-            ),
-            ("report.md", b"# Report\n\nSaved before the box ended.\n", "text/markdown"),
-        ):
-            kb.store_attachment_bytes(
-                conn, task_id, name, data, content_type=content_type,
-                uploaded_by="agent", expected_run_id=run_id,
-            )
-        kb._set_worker_pid(conn, task_id, WORKER_PID)
-        # The run has been going for longer than its pinned box.
-        conn.execute(
-            "UPDATE task_runs SET started_at = ? WHERE id = ?",
-            (int(time.time()) - BUILD_BOX - 60, run_id),
-        )
-        signals = []
-
-        timed_out = kb.enforce_max_runtime(
-            conn, signal_fn=lambda pid, sig: signals.append((pid, sig)),
-        )
-
-        task = kb.get_task(conn, task_id)
-        kinds = [event.kind for event in kb.list_events(conn, task_id)]
+        card = kb.get_task(conn, created["task_id"])
+        run_id, timed_out, signalled = _build_past_its_box(conn, card.id, saved)
+        task = kb.get_task(conn, card.id)
+        kinds = [event.kind for event in kb.list_events(conn, card.id)]
         run = kb.get_run(conn, run_id)
 
     assert timed_out == []
-    assert task.status == "review"
-    assert "run_handover_completed" in kinds
+    # Parked with the independent reviewer, not re-queued for a rebuild.
+    assert (task.status, task.assignee) == ("review", "raphael-verifier")
+    assert {"run_handover_completed", "review_requested"} <= set(kinds)
+    # A lone saved patch goes over through the existing saved-result handover,
+    # whose review park records its receipt.
+    assert ("saved_result_handed_over" in kinds) == (REPORT not in saved)
     assert "timed_out" not in kinds
     assert run.outcome != "timed_out"
-    # Not re-queued for a rebuild: the reviewer holds it now.
-    assert task.status not in {"ready", "todo", "running"}
-    assert [pid for pid, _sig in signals] == [WORKER_PID]
+    assert signalled == [WORKER_PID]
+    # The saved patch is the head under review, materialized in the worktree.
+    saved_file = Path(task.workspace_path) / OWNED / "saved.py"
+    assert saved_file.read_text(encoding="utf-8") == "saved = True\n"
+    # Decision 4 is the kernel's: every new governed build card is reviewed.
+    assert (card.requires_review, card.max_runtime_seconds) == (True, BUILD_BOX)
+
+
+def test_a_review_run_gets_the_review_box(build_repo):
+    """Decision 2: a review run gets 45 minutes; its card keeps two hours."""
+    with closing(kb.connect(board=SLUG)) as conn:
+        task_id = _locked_card(
+            conn, "raphael-claude-worker", "deep", risk_tier=1, owned_paths=[OWNED],
+            workspace_path=str(build_repo), requires_review=True,
+        )
+        _build_past_its_box(conn, task_id, (PATCH, REPORT))
+        host = kb._claimer_id().split(":", 1)[0]
+        review = kb.claim_review_task(conn, task_id, claimer=f"{host}:r0")
+        timed_out, signalled = _outlast(
+            conn, task_id, review.current_run_id, DEEP_BOX, WORKER_PID + 1,
+        )
+        boxes = [
+            row["max_runtime_seconds"] for row in conn.execute(
+                "SELECT max_runtime_seconds FROM task_runs WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            )
+        ]
+        task = kb.get_task(conn, task_id)
+
+    assert timed_out == [task_id]
+    assert set(signalled) == {WORKER_PID + 1}
+    # The build run kept the build box and the review run got the review box;
+    # the card keeps its own box for an implementation handback.
+    assert boxes == [BUILD_BOX, DEEP_BOX]
+    assert (task.max_runtime_seconds, task.status) == (BUILD_BOX, "review")
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +641,24 @@ def test_kanban_create_carries_the_tier_under_the_worker_environment(
     ) == 1
     for answer in (created, routine):
         assert kb.task_policy_lock_error(_raw_row(worker_db, answer["task_id"])) is None
+
+
+def test_a_new_card_without_a_tier_is_pinned_as_tier_2(fence_home, monkeypatch):
+    """Decision 3: a new governed card without a tier counts as tier 2, so max."""
+    kb.create_board(WORKER_BOARD, project_id="p_governed_test")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", WORKER_BOARD)
+
+    created = _kanban_create({
+        "title": "Read the plan", "assignee": "raphael-business",
+        "execution_tier": "routine", "owned_paths": [],
+    })
+
+    assert created["ok"] is True, created
+    row = _raw_row(kb.kanban_db_path(board=WORKER_BOARD), created["task_id"])
+    # Business routine is the one lane whose own effort is high (Sonnet 5).
+    assert (row["risk_tier"], row["model_override"]) == (None, "claude-sonnet-5")
+    assert (row["reasoning_effort"], row["max_runtime_seconds"]) == ("max", ROUTINE_BOX)
+    assert kb.task_policy_lock_error(row) is None
 
 
 def test_kanban_create_refuses_a_tier_on_a_board_no_owner_governs(kanban_home):

@@ -70,20 +70,28 @@ _REVIEWER = "raphael-verifier"
 # The builder integrates verified work and operates infrastructure, so its
 # cards are release, integration and infrastructure work.
 _RELEASE = "raphael-builder"
+# The roles that only read: the planner shapes the plan and the reviewer is the
+# review, so neither is work awaiting a review.
+_READ_ONLY = frozenset({"raphael-planner", _REVIEWER})
 
 
 def card_work_kind(
     assignee: Optional[str], owned_paths: Optional[list], execution_tier: Optional[str],
+    integrates_parent_heads: bool = False,
 ) -> str:
     """Classify a card's work for its time box.
 
-    The role decides first: the coordinator, the independent reviewer and the
-    builder have their own boxes. Any other card is a build when it may write
+    A card marked to integrate its parents' heads is integration work,
+    whichever profile runs it. Otherwise the role decides first: the
+    coordinator, the independent reviewer and the builder have their own
+    boxes. Any other card is a build when it may write
     (``owned_paths`` None is legacy whole-repository ownership), and read-only
     work is an analysis when deep and a proposal when routine.
     """
     deep = str(execution_tier or "").strip().lower() == "deep"
     role = str(assignee or "").strip()
+    if integrates_parent_heads:
+        return "release"
     if role == _COORDINATOR:
         return "coordinator_deep" if deep else "coordinator_routine"
     if role == _REVIEWER:
@@ -101,3 +109,37 @@ def pinned_time_box_seconds(kind: str) -> int:
         return _TIME_BOX_SECONDS[kind]
     except KeyError:
         raise ValueError(f"unknown kind of work {kind!r}") from None
+
+
+def review_run_box_seconds(card_box: Optional[int], route_locked: bool) -> Optional[int]:
+    """The time box of one review run of a card, pinned when it is claimed.
+
+    Every review run of a pinned card gets the review box (decision 2), while
+    the card keeps its own box for a handback to its implementer. A card
+    without a route lock, or without a box, keeps what it has today.
+    """
+    if route_locked and card_box is not None:
+        return _TIME_BOX_SECONDS["review"]
+    return card_box
+
+
+def active_run_box_seconds(
+    card_box: Optional[int], run_box: Optional[int], review_run: bool,
+) -> Optional[int]:
+    """The time box a running attempt is held to.
+
+    A review run is held to the box pinned on it when it was claimed; any
+    other run, and a review run that carries no box, to its card's box.
+    """
+    if review_run and run_box is not None:
+        return run_box
+    return card_box
+
+
+def requires_independent_review(assignee: Optional[str], kind: str) -> bool:
+    """Whether a new card's work is independently reviewed before it is done.
+
+    Every build is (decision 4): work saved at two hours goes to the reviewer
+    and is not retried. A role that only reads never is.
+    """
+    return kind == "build" and str(assignee or "").strip() not in _READ_ONLY

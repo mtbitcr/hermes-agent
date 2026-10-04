@@ -95,10 +95,13 @@ from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli import kanban_provider_stops as _provider_stops
 from hermes_cli.kanban_risk_tier import (
+    active_run_box_seconds,
     card_work_kind,
     parse_risk_tier,
     pinned_reasoning_effort,
     pinned_time_box_seconds,
+    requires_independent_review,
+    review_run_box_seconds,
 )
 from hermes_cli.sqlite_util import (
     InitLockDirectoryAbsent,
@@ -297,24 +300,28 @@ def _pin_new_card(
     responsibility: Optional[str],
     owned_paths: Optional[list],
     max_runtime_seconds: Optional[int],
-) -> tuple[Optional[str], Optional[str], Optional[int]]:
-    """Return a new card's ``(effort, lock, max_runtime_seconds)`` pins.
+    integrates_parent_heads: bool,
+    requires_review: bool,
+) -> tuple[Optional[str], Optional[str], Optional[int], bool]:
+    """Return a new card's ``(effort, lock, max_runtime_seconds, requires_review)``.
 
     Only a card with a route lock is pinned; a CLI or other unlocked card keeps
-    what its creator passed. The time box follows the card's kind of work. The
-    effort follows the card's risk tier and is sealed again on the same model;
-    a card without a tier keeps its approved route's effort (owner decision 3).
-    The rules live in :mod:`hermes_cli.kanban_risk_tier`.
+    what its creator passed. The time box follows the card's kind of work, and
+    a build is always reviewed (owner decision 4). The effort follows the
+    card's risk tier, a new card without one counting as tier 2 (owner
+    decision 3), and is sealed again on the same model. Only new cards are
+    pinned here. The rules live in :mod:`hermes_cli.kanban_risk_tier`.
     """
     if lock is None:
-        return effort, lock, max_runtime_seconds
-    box = pinned_time_box_seconds(card_work_kind(assignee, owned_paths, execution_tier))
-    if risk_tier is None:
-        return effort, lock, box
+        return effort, lock, max_runtime_seconds, requires_review
+    kind = card_work_kind(assignee, owned_paths, execution_tier, integrates_parent_heads)
     pinned = pinned_reasoning_effort(risk_tier, responsibility)
     if pinned != effort:
         lock = mint_policy_lock(assignee, provider, model, pinned, execution_tier)
-    return pinned, lock, box
+    return (
+        pinned, lock, pinned_time_box_seconds(kind),
+        requires_review or requires_independent_review(assignee, kind),
+    )
 
 
 def _task_kinds(include_control: bool) -> str:
@@ -19452,17 +19459,20 @@ def create_task(
         if integrates_parent_heads:
             raise ValueError(f"{assignee} tasks cannot integrate parent heads")
         owned_paths_list = []
-    reasoning_effort, model_policy_lock, max_runtime_seconds = _pin_new_card(
-        assignee, provider_override, model_override, reasoning_effort,
-        execution_tier, model_policy_lock, risk_tier, responsibility,
-        owned_paths_list, max_runtime_seconds,
-    )
     if not isinstance(integrates_parent_heads, bool):
         raise ValueError("integrates_parent_heads must be a boolean")
     if integrates_parent_heads and not owned_paths_list:
         raise ValueError(
             "integrates_parent_heads requires a mutating owned_paths scope"
         )
+    (
+        reasoning_effort, model_policy_lock, max_runtime_seconds, requires_review,
+    ) = _pin_new_card(
+        assignee, provider_override, model_override, reasoning_effort,
+        execution_tier, model_policy_lock, risk_tier, responsibility,
+        owned_paths_list, max_runtime_seconds, integrates_parent_heads,
+        requires_review,
+    )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -24608,8 +24618,8 @@ def claim_review_task(
         if cur.rowcount != 1:
             return None
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
-            "FROM tasks WHERE id = ?",
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "model_policy_lock FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         run_cur = conn.execute(
@@ -24626,7 +24636,10 @@ def claim_review_task(
                 trow["current_step_key"] if trow else None,
                 lock,
                 expires,
-                trow["max_runtime_seconds"] if trow else None,
+                # The review box for this run; the card keeps its own box.
+                review_run_box_seconds(
+                    trow["max_runtime_seconds"], bool(trow["model_policy_lock"]),
+                ) if trow else None,
                 now,
             ),
         )
@@ -25871,8 +25884,9 @@ def _review_approval_head(
 class _SavedResultHandoverRefused(Exception):
     """Internal: the review transition refused a saved-result handover.
 
-    Raised by :func:`complete_task` in place of ``False``, and only for
-    :func:`_hand_over_saved_patch`, so that the run it parks records
+    Raised by :func:`complete_task` in place of ``False``, and only for the
+    kernel's saved-patch handovers (:func:`_hand_over_saved_patch` and
+    :func:`_complete_run_handover_before_timeout`), so that each records
     :func:`request_review`'s own reason rather than a bare refusal.
     """
 
@@ -25989,12 +26003,13 @@ def complete_task(
     ``integrates_parent_heads=true``. Neither option grants the worker host
     filesystem or shell access.
 
-    ``_saved_result_attachment_id`` is KERNEL-INTERNAL: only
-    :func:`_hand_over_saved_patch` passes it, and the review park hands it on
-    unchanged to :func:`request_review`, which records that handover in the
-    transaction that parks the card. When that review transition refuses,
-    :class:`_SavedResultHandoverRefused` carries ``request_review``'s reason
-    instead of ``False``.
+    ``_saved_result_attachment_id`` is KERNEL-INTERNAL: only the kernel's
+    saved-patch handovers (:func:`_hand_over_saved_patch` and
+    :func:`_complete_run_handover_before_timeout`) pass it, and the review
+    park hands it on unchanged to :func:`request_review`, which records that
+    handover in the transaction that parks the card. When that review
+    transition refuses, :class:`_SavedResultHandoverRefused` carries
+    ``request_review``'s reason instead of ``False``.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
@@ -27851,10 +27866,12 @@ def request_review(
     exact git object id.
 
     ``_saved_result_attachment_id`` is KERNEL-INTERNAL too: nothing outside
-    this module may pass it. It exists so the dead-worker scan's handover of a
-    saved patch (:func:`_hand_over_saved_patch`, through :func:`complete_task`)
-    records its ``saved_result_handed_over`` event in the SAME transaction as
-    this transition, bound to the implementation run it closes. Appended in a
+    this module may pass it. It exists so the kernel's handovers of a saved
+    patch (the dead-worker scan's :func:`_hand_over_saved_patch` and the
+    budget's :func:`_complete_run_handover_before_timeout`, both through
+    :func:`complete_task`) record their ``saved_result_handed_over`` event in
+    the SAME transaction as this transition, bound to the implementation run
+    it closes. Appended in a
     transaction of its own afterwards, a process stop in between lost the
     event for good: the next scan no longer sees a running task to record it
     for.
@@ -30057,10 +30074,13 @@ def decompose_triage_task(
                     risk_tier = parse_risk_tier(risk_tier)
                 except ValueError as exc:
                     raise ValueError(f"child[{idx}] {exc}") from None
-            reasoning_effort, model_policy_lock, max_runtime_seconds = _pin_new_card(
+            (
+                reasoning_effort, model_policy_lock, max_runtime_seconds,
+                requires_review,
+            ) = _pin_new_card(
                 assignee, provider_override, model_override, reasoning_effort,
                 execution_tier, model_policy_lock, risk_tier, responsibility,
-                owned_paths, None,
+                owned_paths, None, integrates_parent_heads, requires_review,
             )
             # Written with the row but never part of the approved children,
             # so the owner graph digest that names them is unchanged.
@@ -33939,6 +33959,12 @@ def _complete_run_handover_before_timeout(
     """Complete a run that already delivered its handover, instead of timing
     it out. Returns True only when the completion landed.
 
+    A handover is the run's own patch and report. On a card that requires
+    review the run's one saved patch is enough (owner decision 4): it goes
+    over as the existing saved-result handover does, the one candidate of
+    :func:`_saved_patch_ids_for_review` passed to :func:`complete_task` as
+    ``_saved_result_attachment_id``, whose review park records it.
+
     THE single place any expiring budget consults the handover, so the two
     exits that can end a run on a budget cannot disagree about it:
 
@@ -33956,7 +33982,7 @@ def _complete_run_handover_before_timeout(
 
     Materialization is :func:`complete_task` with ``patch_attachment_id`` —
     the SAME single path every other completion uses, never a second forked
-    materialization. The report's bytes become the completion summary. On
+    materialization. A report's bytes become the completion summary. On
     success a ``run_handover_completed`` event marks the handover; if
     completion fails for any reason a ``run_handover_failed`` event records
     why and ``False`` is returned, so the caller falls back to its ordinary
@@ -33982,27 +34008,35 @@ def _complete_run_handover_before_timeout(
             return False
         run_id = int(row["current_run_id"])
     handover = _run_handover_artifacts(conn, task_id, int(run_id))
-    if handover is None:
-        return False
-    patch_attachment, report_attachment = handover
+    if handover is not None:
+        patch_id, report_attachment = handover[0].id, handover[1]
+    else:
+        # Without a report, only the one patch a reviewed card's run saved.
+        patches = _saved_patch_ids_for_review(conn, task_id, int(run_id))
+        if len(patches) != 1:
+            return False
+        patch_id, report_attachment = patches[0], None
     if stop_worker is not None:
         stop_worker()
-    try:
-        report_text = read_attachment_bytes(report_attachment).decode(
-            "utf-8", errors="replace",
-        ).strip()
-    except (OSError, ValueError):
-        report_text = ""
+    summary: Optional[str] = _BUDGET_PATCH_HANDOVER_SUMMARY
+    report_id = report_attachment.id if report_attachment is not None else None
+    if report_attachment is not None:
+        try:
+            summary = read_attachment_bytes(report_attachment).decode(
+                "utf-8", errors="replace",
+            ).strip()[:4000] or None
+        except (OSError, ValueError):
+            summary = None
     metadata: dict[str, Any] = {
         "handover": handover_reason,
-        "report_attachment_id": report_attachment.id,
+        "report_attachment_id": report_id,
     }
     if metadata_extra:
         metadata.update(metadata_extra)
     payload: dict[str, Any] = {
         "handover": handover_reason,
-        "patch_attachment_id": patch_attachment.id,
-        "report_attachment_id": report_attachment.id,
+        "patch_attachment_id": patch_id,
+        "report_attachment_id": report_id,
     }
     if event_payload_extra:
         payload.update(event_payload_extra)
@@ -34011,10 +34045,13 @@ def _complete_run_handover_before_timeout(
     try:
         handover_ok = complete_task(
             conn, task_id,
-            summary=report_text[:4000] or None,
+            summary=summary,
             metadata=metadata,
-            patch_attachment_id=patch_attachment.id,
+            patch_attachment_id=patch_id,
             expected_run_id=int(run_id),
+            # A lone saved patch is the saved-result handover: its review park
+            # records it, and a refusal carries the park's own reason.
+            _saved_result_attachment_id=patch_id if report_id is None else None,
         )
         if not handover_ok:
             handover_error = "task changed during handover completion"
@@ -34072,13 +34109,19 @@ def enforce_max_runtime(
     ``run_handover_completed`` event marks the handover. If
     materialization/completion fails for any reason, this falls back to
     the ordinary timeout behavior below (never silently loses the task)
-    and records why via a ``run_handover_failed`` event.
+    and records why via a ``run_handover_failed`` event. On a card that
+    requires review the run's one saved patch is enough without a report:
+    the same completion parks it in the review lane.
 
     Otherwise: sends SIGTERM, waits a short grace window, then SIGKILL.
     Emits a ``timed_out`` event and restores the task's source phase so
     the next dispatcher tick re-spawns the same kind of worker — unless
     the circuit breaker has already given up, in which case the task
     stays blocked where ``_record_spawn_failure`` parked it.
+
+    A review run is held to the review box pinned on it when it was claimed
+    (:func:`claim_review_task`), any other run to its card's
+    ``max_runtime_seconds`` (``kanban_risk_tier.active_run_box_seconds``).
 
     Runs host-local: only tasks claimed by this host are candidates
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
@@ -34097,7 +34140,8 @@ def enforce_max_runtime(
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_start_time, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, "
+        "       r.max_runtime_seconds AS run_max_runtime_seconds "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -34112,7 +34156,13 @@ def enforce_max_runtime(
         # intentionally records the first time a task ever started, so retries
         # must be measured from the active task_runs row when present.
         elapsed = now - int(row["active_started_at"])
-        if elapsed < int(row["max_runtime_seconds"]):
+        # A review run is held to its own box, any other run to its card's.
+        limit = active_run_box_seconds(
+            row["max_runtime_seconds"], row["run_max_runtime_seconds"],
+            row["current_run_id"] is not None
+            and run_claimed_from_review(conn, row["id"], int(row["current_run_id"])),
+        )
+        if elapsed < int(limit):
             continue
         if _saved_patch_handover_pending(conn, row):
             continue
@@ -34149,12 +34199,12 @@ def enforce_max_runtime(
             event_payload_extra={
                 "pid": pid,
                 "elapsed_seconds": int(elapsed),
-                "limit_seconds": int(row["max_runtime_seconds"]),
+                "limit_seconds": int(limit),
                 **identity,
             },
             metadata_extra={
                 "elapsed_seconds": int(elapsed),
-                "limit_seconds": int(row["max_runtime_seconds"]),
+                "limit_seconds": int(limit),
             },
         ):
             continue
@@ -34190,7 +34240,7 @@ def enforce_max_runtime(
 
         error_text = (
             f"elapsed {int(elapsed)}s > "
-            f"limit {int(row['max_runtime_seconds'])}s"
+            f"limit {int(limit)}s"
         )
         if pid_reused:
             # Saying nothing here would leave the history claiming we stopped
@@ -34215,7 +34265,7 @@ def enforce_max_runtime(
                 payload = {
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
-                    "limit_seconds": int(row["max_runtime_seconds"]),
+                    "limit_seconds": int(limit),
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
@@ -34640,6 +34690,10 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
 _SAVED_PATCH_HANDOVER_SUMMARY = (
     "The kernel handed the saved patch to review because the worker exited "
     "without reporting its result."
+)
+_BUDGET_PATCH_HANDOVER_SUMMARY = (
+    "The kernel handed the saved patch to review because the run used up its "
+    "budget without reporting its result."
 )
 
 
