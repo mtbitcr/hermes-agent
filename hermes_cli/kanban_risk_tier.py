@@ -4,7 +4,7 @@ the kernel.
 An approved plan states a risk tier for every card it creates or replaces: the
 integer 0, 1 or 2, never a boolean or a string. The tier is stored with the
 card (``tasks.risk_tier``). A card without a recorded tier -- every card from
-before the tier existed, and a card made outside an approved plan -- holds
+before the tier existed, and a card made without a route lock -- holds
 null, counts as tier 2 and is treated as high risk (owner answer 3).
 """
 

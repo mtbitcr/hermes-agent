@@ -97,6 +97,7 @@ from hermes_cli import kanban_provider_stops as _provider_stops
 from hermes_cli.kanban_risk_tier import (
     active_run_box_seconds,
     card_work_kind,
+    effective_risk_tier,
     parse_risk_tier,
     pinned_reasoning_effort,
     pinned_time_box_seconds,
@@ -302,25 +303,29 @@ def _pin_new_card(
     max_runtime_seconds: Optional[int],
     integrates_parent_heads: bool,
     requires_review: bool,
-) -> tuple[Optional[str], Optional[str], Optional[int], bool]:
-    """Return a new card's ``(effort, lock, max_runtime_seconds, requires_review)``.
+) -> tuple[Optional[str], Optional[str], Optional[int], bool, Optional[int]]:
+    """Return a new card's ``(effort, lock, max_runtime_seconds, requires_review,
+    risk_tier)``.
 
     Only a card with a route lock is pinned; a CLI or other unlocked card keeps
     what its creator passed. The time box follows the card's kind of work, and
     a build is always reviewed (owner decision 4). The effort follows the
     card's risk tier, a new card without one counting as tier 2 (owner
-    decision 3), and is sealed again on the same model. Only new cards are
-    pinned here. The rules live in :mod:`hermes_cli.kanban_risk_tier`.
+    decision 3), and is sealed again on the same model. The tier the card
+    counts as is returned for its writer to record, so a review round trip
+    pins the same effort. Only new cards are pinned here. The rules live in
+    :mod:`hermes_cli.kanban_risk_tier`.
     """
     if lock is None:
-        return effort, lock, max_runtime_seconds, requires_review
+        return effort, lock, max_runtime_seconds, requires_review, risk_tier
     kind = card_work_kind(assignee, owned_paths, execution_tier, integrates_parent_heads)
-    pinned = pinned_reasoning_effort(risk_tier, responsibility)
+    tier = effective_risk_tier(risk_tier)
+    pinned = pinned_reasoning_effort(tier, responsibility)
     if pinned != effort:
         lock = mint_policy_lock(assignee, provider, model, pinned, execution_tier)
     return (
         pinned, lock, pinned_time_box_seconds(kind),
-        requires_review or requires_independent_review(assignee, kind),
+        requires_review or requires_independent_review(assignee, kind), tier,
     )
 
 
@@ -19448,8 +19453,8 @@ def create_task(
             "work, not for a control anchor or a read-only reviewer task"
         )
     if risk_tier is not None:
-        # The one writer validates the tier, so no path stores a bad one. None
-        # stays None: legacy and CLI cards record no tier.
+        # The one writer validates the tier, so no path stores a bad one. A
+        # CLI card without one records none; a locked card records its pin's.
         risk_tier = parse_risk_tier(risk_tier)
     responsibility = normalize_responsibility(responsibility)
     owned_paths_list = normalize_owned_paths(owned_paths)
@@ -19467,6 +19472,7 @@ def create_task(
         )
     (
         reasoning_effort, model_policy_lock, max_runtime_seconds, requires_review,
+        risk_tier,
     ) = _pin_new_card(
         assignee, provider_override, model_override, reasoning_effort,
         execution_tier, model_policy_lock, risk_tier, responsibility,
@@ -30066,8 +30072,8 @@ def decompose_triage_task(
                     f"child[{idx}] read-only reviewer work cannot itself "
                     "require review"
                 )
-            # The approved risk tier, validated like create_task's: None stays
-            # None (no tier recorded).
+            # The approved risk tier, validated like create_task's. A locked
+            # child without one records the tier its pin counts it as.
             risk_tier = child.get("risk_tier")
             if risk_tier is not None:
                 try:
@@ -30076,7 +30082,7 @@ def decompose_triage_task(
                     raise ValueError(f"child[{idx}] {exc}") from None
             (
                 reasoning_effort, model_policy_lock, max_runtime_seconds,
-                requires_review,
+                requires_review, risk_tier,
             ) = _pin_new_card(
                 assignee, provider_override, model_override, reasoning_effort,
                 execution_tier, model_policy_lock, risk_tier, responsibility,

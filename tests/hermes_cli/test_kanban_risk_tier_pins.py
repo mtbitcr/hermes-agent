@@ -4,7 +4,9 @@ P2 of the risk tier plan (tests P2-1 to P2-6), through the real kernel:
 
 * effort is pinned at creation and sealed in the card's existing route lock:
   high by default, max for tier 2 and for a security review card (R12); a
-  new card without a tier counts as tier 2 (decision 3);
+  new governed card without a tier counts as tier 2 and records it, so a
+  review round trip keeps its pin, while a card from before keeps its own
+  effort and time box (decision 3);
 * the time box is pinned at creation from the kind of work (decision 2): an
   integration card gets the integration box, and a review run gets the review
   box while its card keeps its own;
@@ -46,6 +48,7 @@ from tests.hermes_cli.test_owner_workspace import (  # noqa: F401
 from tests.hermes_cli._kanban_fence_support import (
     DEFAULT_GIT_IDENTITY, create_fenced_board, git, make_git_repo,
 )
+from tests.hermes_cli.test_kanban_committed_review_requirement import _finding
 
 _PROVIDER = {"raphael-verifier": "openai-codex"}
 BUILD_BOX = 7200
@@ -656,7 +659,7 @@ def test_a_new_card_without_a_tier_is_pinned_as_tier_2(fence_home, monkeypatch):
     assert created["ok"] is True, created
     row = _raw_row(kb.kanban_db_path(board=WORKER_BOARD), created["task_id"])
     # Business routine is the one lane whose own effort is high (Sonnet 5).
-    assert (row["risk_tier"], row["model_override"]) == (None, "claude-sonnet-5")
+    assert (row["risk_tier"], row["model_override"]) == (2, "claude-sonnet-5")
     assert (row["reasoning_effort"], row["max_runtime_seconds"]) == ("max", ROUTINE_BOX)
     assert kb.task_policy_lock_error(row) is None
 
@@ -674,3 +677,106 @@ def test_kanban_create_refuses_a_tier_on_a_board_no_owner_governs(kanban_home):
     assert answer.get("ok") is not True
     assert "risk_tier" in json.dumps(answer)
     assert _count(db) == before
+
+
+# ---------------------------------------------------------------------------
+# A new card records the tier it counts as; a card from before does not
+# ---------------------------------------------------------------------------
+
+# A box no kind of work is pinned at, as a card from before may hold.
+LEGACY_BOX = 3600
+
+
+def _review_round_trip(conn, task_id: str) -> list:
+    """Creation, review and a typed non-empty findings handback: the row after each."""
+    rows = [_row(conn, task_id)]
+    _build_past_its_box(conn, task_id, (PATCH,))
+    rows.append(_row(conn, task_id))
+    host = kb._claimer_id().split(":", 1)[0]
+    review = kb.claim_review_task(conn, task_id, claimer=f"{host}:r0")
+    handback = kb.submit_review_findings(
+        conn, task_id, findings=[_finding()], candidate_digest="digest-1",
+        expected_run_id=review.current_run_id,
+    )
+    assert handback["outcome"] == "handed_back", handback
+    rows.append(_row(conn, task_id))
+    assert [(row["status"], row["assignee"]) for row in rows[1:]] == [
+        ("review", "raphael-verifier"), ("ready", rows[0]["assignee"]),
+    ]
+    for row in rows:
+        assert kb.task_policy_lock_error(row) is None
+    return rows
+
+
+@pytest.mark.parametrize(
+    ("risk_tier", "recorded", "effort"), [(None, 2, "max"), (1, 1, "high")],
+    ids=["omitted-tier", "tier-1"],
+)
+def test_kanban_create_keeps_the_tier_effort_through_review(
+    build_repo, risk_tier, recorded, effort,
+):
+    """An omitted tier is recorded as tier 2 and keeps max; tier 1 keeps high."""
+    # Business routine is the one lane whose own effort is high (Sonnet 5).
+    args = {
+        "title": "Write the pricing page", "assignee": "raphael-business",
+        "execution_tier": "routine", "owned_paths": [OWNED],
+        "workspace_kind": "worktree", "workspace_path": str(build_repo),
+    }
+    if risk_tier is not None:
+        args["risk_tier"] = risk_tier
+    created = _kanban_create(args)
+    assert created["ok"] is True, created
+    with closing(kb.connect(board=SLUG)) as conn:
+        rows = _review_round_trip(conn, created["task_id"])
+
+    assert [(row["risk_tier"], row["reasoning_effort"]) for row in rows] == [
+        (recorded, effort),
+    ] * 3
+    assert created["risk_tier"] == recorded
+    assert rows[-1]["model_override"] == "claude-sonnet-5"
+
+
+def test_a_native_security_review_card_keeps_max_through_review(build_repo):
+    """The same for a card made through create_task as a security review."""
+    with closing(kb.connect(board=SLUG)) as conn:
+        task_id = _locked_card(
+            conn, "raphael-business", "routine", risk_tier=None,
+            responsibility="R12", owned_paths=[OWNED], workspace_path=str(build_repo),
+        )
+        rows = _review_round_trip(conn, task_id)
+
+    assert [(row["risk_tier"], row["reasoning_effort"]) for row in rows] == [
+        (2, "max"),
+    ] * 3
+    assert rows[-1]["model_override"] == "claude-sonnet-5"
+
+
+def test_a_legacy_card_keeps_its_base_effort_and_saved_box_through_review(build_repo):
+    """Decision 3: a card from before the tier is not repinned."""
+    route = mp.task_assignment_for("raphael-business", "anthropic", "routine")
+    with closing(kb.connect(board=SLUG)) as conn:
+        task_id = _locked_card(
+            conn, "raphael-business", "routine", risk_tier=None,
+            owned_paths=[OWNED], workspace_path=str(build_repo),
+        )
+        # The row as it was written before: no tier, the lane's own effort
+        # sealed, and the box it was given then.
+        conn.execute(
+            "UPDATE tasks SET risk_tier = NULL, reasoning_effort = ?, "
+            "model_policy_lock = ?, max_runtime_seconds = ? WHERE id = ?",
+            (
+                route.reasoning_effort,
+                kb.mint_policy_lock(
+                    "raphael-business", route.provider, route.model,
+                    route.reasoning_effort, "routine",
+                ),
+                LEGACY_BOX, task_id,
+            ),
+        )
+        rows = _review_round_trip(conn, task_id)
+
+    # Each role's own effort: high for business, max for the reviewer.
+    assert [row["reasoning_effort"] for row in rows] == ["high", "max", "high"]
+    assert [(row["risk_tier"], row["max_runtime_seconds"]) for row in rows] == [
+        (None, LEGACY_BOX),
+    ] * 3
