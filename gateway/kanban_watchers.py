@@ -1595,10 +1595,8 @@ class GatewayKanbanWatchersMixin:
                 slug = None
                 try:
                     slug = b.get("slug") or _kb.DEFAULT_BOARD
-                    db, mtime, _ = _board_db_fingerprint(slug)
-                    # A board without its DB file runs nothing, and a
-                    # connect would create that file.
-                    if mtime is None or db in seen_dbs:
+                    db = _board_db_fingerprint(slug)[0]
+                    if db in seen_dbs:
                         continue
                     seen_dbs.add(db)
                     conn = _kb.connect(board=slug)
