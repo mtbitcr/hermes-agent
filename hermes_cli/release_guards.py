@@ -77,7 +77,11 @@ class HostReader(Protocol):
 
     def commit_tree(self, commit: str) -> str: ...
 
-    def is_ancestor(self, ancestor: str, descendant: str) -> bool: ...
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """True when `ancestor` is on the history of `descendant`.
+
+        As in git, a commit is its own ancestor.
+        """
 
     def changed_paths(self, prev: str, new: str) -> Collection[str]:
         """Repository-relative paths that differ between the two commits."""
@@ -141,7 +145,11 @@ GUARDS: tuple[tuple[str, str, GuardCheck], ...] = (
         "the checkout is at PREV and clean",
         lambda host, pins, merges: host.checkout_head() == pins.prev and host.checkout_is_clean(),
     ),
-    ("G2", "origin main equals NEW", lambda host, pins, merges: host.origin_main() == pins.new),
+    (
+        "G2",
+        "NEW is on the history of origin main",
+        lambda host, pins, merges: host.is_ancestor(pins.new, host.origin_main()),
+    ),
     (
         "G3",
         "every commit from PREV to NEW is a batch merge that matches its own review",
