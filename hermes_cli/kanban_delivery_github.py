@@ -65,7 +65,7 @@ _BRANCH = re.compile(rf"(?!.*\.\.)(?!.*\.lock(?:/|$)){_COMPONENT}(?:/{_COMPONENT
 _SHA = re.compile(r"[0-9a-f]{40}")
 _REPOSITORY = re.compile(r"[A-Za-z0-9-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
 _TOKEN = re.compile(r"[A-Za-z0-9_.-]+")  # it travels in a header, so nothing that could split one
-_SEGMENTS = {"number": r"[1-9][0-9]{0,9}", "id": r"[1-9][0-9]{0,19}", "sha": _SHA.pattern}
+_SEGMENTS = {"number": r"[1-9][0-9]{0,9}", "id": r"[1-9][0-9]{0,19}", "sha": _SHA.pattern, "branch": _BRANCH.pattern}
 _PAGE = {"per_page": r"[1-9][0-9]?|100", "page": r"[1-9][0-9]{0,3}"}
 
 
@@ -91,6 +91,8 @@ REST_ALLOWLIST = (
     Endpoint("GET", "/repos/{repo}/pulls/{number}", ("pull_requests", "read")),
     Endpoint("PUT", "/repos/{repo}/pulls/{number}/merge", ("contents", "write")),
     Endpoint("POST", "/repos/{repo}/pulls/{number}/reviews", ("pull_requests", "write")),
+    # T1's one branch read: the commit a head branch holds, and 404 when the branch does not exist.
+    Endpoint("GET", "/repos/{repo}/git/ref/heads/{branch}", ("contents", "read")),
     Endpoint("GET", "/repos/{repo}/commits/{sha}/check-runs", ("checks", "read"),
              MappingProxyType({"filter": "latest|all", **_PAGE})),
     Endpoint("GET", "/repos/{repo}/actions/runs", ("actions", "read"),
@@ -107,7 +109,7 @@ REST_ALLOWLIST = (
 # never pass, and neither do response headers.
 _FIELDS = frozenset({
     "id", "number", "name", "state", "status", "conclusion", "merged", "mergeable", "mergeable_state",
-    "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app",
+    "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app", "object",
     "total_count", "check_runs", "workflow_runs", "jobs", "steps", "run_id", "run_attempt",
 })
 _MAX_TEXT = 256
@@ -285,6 +287,17 @@ class GitHubTransport:
         target = f"{path}?{urlencode(values)}" if values else path
         status, value = _exchange(method, target, f"Bearer {self._installation_token()}", body)
         return {"status": status, "data": None if value is None else self._project(value)}
+
+    def branch_head(self, branch: str) -> str | None:
+        """The commit `branch` holds now, or None when GitHub answers 404: the branch does not exist."""
+        answer = self.request("GET", f"/repos/{self.repository}/git/ref/heads/{branch}")
+        if answer["status"] == 404:
+            return None
+        target = answer["data"].get("object") if isinstance(answer["data"], dict) else None
+        sha = target.get("sha") if isinstance(target, dict) else None
+        if answer["status"] != 200 or not _is_sha(sha):
+            raise GitHubTransportError("bad_response")
+        return sha
 
     def push(self, worktree: str | Path, branch: str, sha: str, *, expected: str) -> dict:
         """Push commit `sha` to `branch`, leased on what the branch holds now: the commit `expected`,

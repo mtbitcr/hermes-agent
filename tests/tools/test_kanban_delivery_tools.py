@@ -56,9 +56,11 @@ def _tool():
 
 @pytest.fixture
 def github():
-    """GitHub for one repository: the App's token call, and listing and creating pull requests.
+    """GitHub for one repository: the App's token call, listing, creating and reading pull requests,
+    and reading a branch.
 
-    A pull request's head is what its branch holds now in the bare remote, as on GitHub. Titles,
+    A pull request's head and a branch's head are what the branch holds now in the bare remote, as
+    on GitHub, where a branch the bare remote lacks answers 404. Titles,
     bodies, URLs, a header and every error carry the minted token, so any echo of a raw answer
     shows."""
     state = {"public": None, "jwts": [], "token_requests": [], "calls": [], "pulls": [],
@@ -129,6 +131,15 @@ def github():
                         "base_ref": body["base"], "sha": sha}
                 state["pulls"].append(pull)
                 return self._reply(201, self._pull(pull))
+            pull = next((p for p in state["pulls"] if parts.path == f"{PULLS}/{p['number']}"), None)
+            if method == "GET" and pull is not None:
+                return self._reply(200, self._pull(pull))
+            branch = parts.path.removeprefix(f"/repos/{REPO}/git/ref/heads/")
+            sha = _remote_head(state["bare"], branch) if branch != parts.path else ""
+            if method == "GET" and sha:
+                return self._reply(200, {"ref": f"refs/heads/{branch}", "node_id": TOKEN,
+                                         "url": f"https://api.github.com/repos/{REPO}/git/{TOKEN}",
+                                         "object": {"type": "commit", "sha": sha, "url": TOKEN}})
             return self._reply(404, {"message": f"Not Found {TOKEN}"})
 
         def log_message(self, *args):
@@ -314,8 +325,10 @@ def test_publish_opens_one_pull_request_at_the_approved_head(world, github, monk
     assert _remote_head(bare, branch) == head
     assert [(p["number"], p["head_ref"], p["base_ref"]) for p in github["pulls"]] == [(41, branch, "main")]
     assert github["pushes"] == [(branch, head, "")]
-    assert [(method, path) for method, path, _, _ in github["calls"]] == [("GET", PULLS), ("POST", PULLS)]
-    listed, created = github["calls"][0][2], github["calls"][1][3]
+    ref = f"/repos/{REPO}/git/ref/heads/{branch}"
+    assert [(method, path) for method, path, _, _ in github["calls"]] == [
+        ("GET", PULLS), ("GET", ref), ("POST", PULLS), ("GET", f"{PULLS}/41"), ("GET", ref)]
+    listed, created = github["calls"][0][2], github["calls"][2][3]
     assert (listed["state"], listed["head"]) == ("open", f"mtbitcr:{branch}")
     assert set(created) == {"title", "head", "base", "body"}
     assert (created["head"], created["base"]) == (branch, "main")
@@ -349,7 +362,8 @@ def test_a_second_publish_is_already_published_and_changes_nothing(world, github
     again = _publish()
 
     assert again == {"state": "already_published", "head": head, "pull_request_number": 41, "branch": branch}
-    assert [(method, path) for method, path, _, _ in github["calls"][calls:]] == [("GET", PULLS)]
+    assert [(method, path) for method, path, _, _ in github["calls"][calls:]] == [
+        ("GET", PULLS), ("GET", f"/repos/{REPO}/git/ref/heads/{branch}")]
     assert github["pushes"] == [(branch, head, "")]
     assert len(github["pulls"]) == 1 and _remote_head(bare, branch) == head
     assert _ledger(kb, card) == ledger
@@ -472,7 +486,8 @@ def test_publish_refuses_a_head_not_approved_by_the_kernel(world, github, monkey
 
 
 def test_publish_refuses_a_foreign_branch(world, github, monkeypatch):
-    """The branch already holds a commit the delivery did not push: the leased push refuses it."""
+    """The branch already holds a commit the delivery did not push: the branch read refuses it
+    before any push."""
     kb, root, repo, bare = world
     tid, head, card = _approved(kb, repo)
     _claim(kb, card, monkeypatch)
@@ -481,9 +496,9 @@ def test_publish_refuses_a_foreign_branch(world, github, monkeypatch):
     foreign = _git(repo, "commit-tree", f"{base}^{{tree}}", "-p", base, "-m", "foreign")
     _git(repo, "push", "-q", str(bare), f"{foreign}:refs/heads/{branch}")
 
-    _refused(_publish(), "foreign_branch")
+    _refused(_publish(), "head_moved")
 
-    assert github["pushes"] == [(branch, head, "")]
+    assert github["pushes"] == []
     assert _remote_head(bare, branch) == foreign
     assert [c for c in github["calls"] if c[0] == "POST"] == [] and github["pulls"] == []
     assert _ledger(kb, card) == (None, None, None, None) and _events(kb, card) == []
@@ -498,6 +513,7 @@ def test_publish_adopts_a_branch_already_at_the_approved_head(world, github, mon
 
     assert _publish() == {"state": "created", "head": head, "pull_request_number": 41, "branch": branch}
 
+    assert github["pushes"] == []  # the branch read found H: adopted, not pushed
     assert [(p["number"], p["head_ref"]) for p in github["pulls"]] == [(41, branch)]
     assert _remote_head(bare, branch) == head
     assert _ledger(kb, card) == (41, head, "open", branch)
@@ -565,6 +581,78 @@ def test_a_run_that_loses_its_claim_during_the_network_work_records_nothing(worl
     _claim(kb, card, monkeypatch)
     _refused(_publish(), "second_pull_request")
     assert len(github["pulls"]) == 1 and len(github["pushes"]) == 1
+
+
+def test_a_source_reopened_during_the_network_work_records_nothing(world, github, monkeypatch):
+    """Finding 2 of the slice 4 review: the owner reopens the source card while GitHub is creating
+    the pull request. The delivery row and the run stay unchanged, but the approval the publish was
+    proven on is gone, so the final write stores nothing."""
+    kb, root, repo, bare = world
+    tid, head, card = _approved(kb, repo)
+    run_id = _claim(kb, card, monkeypatch)
+    reopened = []
+
+    def unchanged():  # what the run's own recheck compares: the delivery rows and the run
+        return (_sql(kb, "SELECT * FROM kanban_deliveries ORDER BY id"),
+                _sql(kb, "SELECT status, current_run_id FROM tasks WHERE id = ?", card),
+                _sql(kb, "SELECT status, ended_at FROM task_runs WHERE id = ?", run_id))
+
+    def reopen():
+        own = kb.connect()
+        try:
+            reopened.append(kb.cas_transition_task(
+                own, tid, expected_status="done", expected_revision=kb.task_event_revision(own, tid),
+                to_status="ready", event_kind="owner_move", event_payload={"to": "ready"},
+            )["moved"])
+        finally:
+            own.close()
+
+    before = unchanged()
+    github["on_create"] = reopen
+    _refused(_publish(), "source_changed")
+
+    assert reopened == [True]
+    assert _sql(kb, "SELECT status FROM tasks WHERE id = ?", tid) == [("ready",)]
+    assert len(github["pulls"]) == 1 and len(github["pushes"]) == 1  # GitHub changed; the board did not
+    assert unchanged() == before
+    assert _ledger(kb, card) == (None, None, None, None) and _events(kb, card) == []
+
+
+def test_an_outside_push_right_after_the_publish_push_records_nothing(world, github, monkeypatch):
+    """Finding 3 of the slice 4 review: someone pushes to the branch right after the tool's own
+    leased fast-forward. GitHub, read again after the push, shows the pull request and the branch
+    at that commit rather than at H, so the tool answers head_moved and stores no success."""
+    kb, root, repo, bare = world
+    from hermes_cli import kanban_delivery_github as transport
+
+    tid, first, card = _approved(kb, repo)
+    _claim(kb, card, monkeypatch)
+    branch = "delivery/" + tid
+    assert _publish()["state"] == "created"
+    second, newer = _rework(kb, repo, tid)
+    _sql(kb, "UPDATE kanban_deliveries SET pull_request_state = 'returned_for_changes' "
+             "WHERE integration_task_id = ?", card)
+    _claim(kb, newer, monkeypatch)
+    outside = _git(repo, "commit-tree", f"{second}^{{tree}}", "-p", second, "-m", "outside")
+    push = transport.GitHubTransport.push  # the fixture's spy, which still pushes for real
+
+    def push_then_outside(self, worktree, to, sha, *, expected):
+        pushed = push(self, worktree, to, sha, expected=expected)
+        _git(repo, "push", "-q", str(bare), f"{outside}:refs/heads/{to}")
+        return pushed
+
+    monkeypatch.setattr(transport.GitHubTransport, "push", push_then_outside)
+    calls = len(github["calls"])
+
+    _refused(_publish(), "head_moved")
+
+    ref = f"/repos/{REPO}/git/ref/heads/{branch}"
+    assert github["pushes"] == [(branch, first, ""), (branch, second, first)]
+    assert _remote_head(bare, branch) == outside
+    assert [(method, path) for method, path, _, _ in github["calls"][calls:]] == [
+        ("GET", PULLS), ("GET", ref), ("GET", f"{PULLS}/41"), ("GET", ref)]
+    assert _ledger(kb, newer) == (None, None, None, None) and _events(kb, newer) == []
+    assert _ledger(kb, card) == (41, first, "returned_for_changes", branch)
 
 
 @pytest.mark.parametrize("args", [

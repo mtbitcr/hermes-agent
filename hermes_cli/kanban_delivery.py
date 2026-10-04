@@ -485,6 +485,15 @@ def _snapshot(conn: sqlite3.Connection, task_id: str, run_id: int, source: str) 
     return records, run
 
 
+def _source_state(conn: sqlite3.Connection, source: str) -> tuple:
+    """What the approval of a publish is proven on: the source card's status,
+    its head and its latest event revision."""
+    task = [tuple(row) for row in conn.execute(
+        "SELECT status, head_commit FROM tasks WHERE id = ?", (source,),
+    )]
+    return task, kb.task_event_revision(conn, source)
+
+
 def _lease_refusal(error, code: str, detail: str) -> Exception:
     """A lease that GitHub refuses is the fence's ``code``; any other transport
     failure is reported by its reason alone."""
@@ -500,7 +509,9 @@ def publish_delivery(task_id: str, run_id: int) -> dict:
     Returns ``{state, head, pull_request_number, branch}`` or raises
     :class:`PublishRefused`. Every fact is captured first, the GitHub work runs
     outside every transaction and connection, and the ledger and the events are
-    stored only if the delivery records and the run are unchanged (C4).
+    stored only if the delivery records, the run and the source card are
+    unchanged (C4), and only once GitHub, read again after any push or creation,
+    shows the pull request open at H on the branch at H.
     """
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
@@ -513,6 +524,8 @@ def publish_delivery(task_id: str, run_id: int) -> dict:
             (source, record["id"]),
         ).fetchall():
             raise PublishRefused("superseded", f"a newer approved head of {source} has its own delivery")
+        # Captured before the approval is proven, so the final write sees any later change.
+        approved_source = _source_state(conn, source)
         approval = approval_facts(conn, source, record["source_head"])
         # The approval half of T1 answers before GitHub is touched.
         early = decide_publish(approval, dict(_NO_LEDGER), dict(_NO_REMOTE))
@@ -553,24 +566,23 @@ def publish_delivery(task_id: str, run_id: int) -> dict:
             "number": pull.get("number"),
             "head": pull["head"].get("sha") if isinstance(pull.get("head"), dict) else None,
         } for pull in pulls]
-        # No allowlisted endpoint reads a branch, so the recorded pull request's
-        # head stands for it, and with nothing recorded the leased push below
-        # finds the branch absent (pushed), at H (up to date) or foreign.
         remote = {
-            "branch_head": open_pulls[0]["head"] if open_pulls else None,
+            "branch_head": github.branch_head(branch),  # None when GitHub has no such branch
             "open_pulls": open_pulls,
         }
         decision = decide_publish(approval, ledger, remote)
         if not decision.allowed:
             raise PublishRefused(decision.code, decision.detail)
         if decision.code in ("push_and_create", "adopt_and_create"):
-            try:
-                pushed = github.push(workdir, branch, head, expected="")
-            except GitHubTransportError as error:
-                raise _lease_refusal(
-                    error, "foreign_branch", f"{branch} holds a head other than {head}",
-                ) from None
-            state = "adopted" if pushed["state"] == "up_to_date" else "created"
+            state = "adopted"  # the branch already holds H, so nothing is pushed
+            if decision.code == "push_and_create":
+                try:
+                    pushed = github.push(workdir, branch, head, expected="")
+                except GitHubTransportError as error:
+                    raise _lease_refusal(
+                        error, "foreign_branch", f"{branch} holds a head other than {head}",
+                    ) from None
+                state = "adopted" if pushed["state"] == "up_to_date" else "created"
             created = github.request("POST", pulls_path, body={
                 "title": _PULL_REQUEST_TITLE.format(source=source, head=head),
                 "head": branch,
@@ -597,6 +609,17 @@ def publish_delivery(task_id: str, run_id: int) -> dict:
         else:  # already_published or adopt_fast_forward: GitHub already holds H
             number = ledger["pull_request"]
             state = "already_published" if decision.code == "already_published" else "fast_forwarded"
+        if decision.code in ("push_and_create", "adopt_and_create", "push_fast_forward"):
+            # GitHub changed, so both are read again, still outside every transaction:
+            # only the pull request open at H on the branch at H is a success.
+            again = github.request("GET", f"{pulls_path}/{number}")
+            reread = again["data"] if again["status"] == 200 and isinstance(again["data"], dict) else {}
+            reread_head = reread["head"].get("sha") if isinstance(reread.get("head"), dict) else None
+            if (reread.get("state"), reread_head, github.branch_head(branch)) != ("open", head, head):
+                raise PublishRefused(
+                    "head_moved",
+                    f"pull request {number} or {branch} is not open at {head} after the publish",
+                )
     except GitHubTransportError as error:
         raise PublishRefused("transport_failed", error.reason) from None
 
@@ -605,6 +628,11 @@ def publish_delivery(task_id: str, run_id: int) -> dict:
             if _snapshot(conn, task_id, run_id, source) != snapshot:
                 raise PublishRefused(
                     "stale_run", "the delivery record or the run changed; nothing was stored",
+                )
+            if _source_state(conn, source) != approved_source:
+                raise PublishRefused(
+                    "source_changed",
+                    "the source card changed after its approval was proven; nothing was stored",
                 )
             if state != "already_published":
                 conn.execute(
