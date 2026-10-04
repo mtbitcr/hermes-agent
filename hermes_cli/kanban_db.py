@@ -18088,6 +18088,16 @@ def _migrate_add_optional_columns(
         "created_at INTEGER NOT NULL, "
         "UNIQUE(source_task_id, source_head))"
     )
+    # Additive: the T1 publish ledger (hermes_cli/kanban_delivery.py), the
+    # delivery's one pull request, the head it was published at, its state and
+    # its branch. A row recorded before slice 4 has no pull request yet.
+    for column, ddl in (
+        ("pull_request_number", "pull_request_number INTEGER"),
+        ("pull_request_head", "pull_request_head TEXT"),
+        ("pull_request_state", "pull_request_state TEXT"),
+        ("pull_request_branch", "pull_request_branch TEXT"),
+    ):
+        _add_column_if_missing(conn, "kanban_deliveries", column, ddl)
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
