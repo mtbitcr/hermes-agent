@@ -16110,10 +16110,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- tier 2 and is treated as high risk (hermes_cli.kanban_risk_tier). It
     -- changes no routing, effort or time box.
     risk_tier            INTEGER,
-    -- The effort pinned from the risk tier when the card was created. NULL
-    -- for every card written before the pins and every unlocked card: a
-    -- recorded tier alone does not prove a pin, so such a card keeps each
-    -- role's own effort on a review round trip.
+    -- The effort pinned from the risk tier when the card was created. Its
+    -- presence marks a card pinned at creation, which re-pins by its current
+    -- tier on a review round trip. NULL for every card written before the
+    -- pins and every unlocked card: a recorded tier alone does not prove a
+    -- pin, so such a card keeps each role's own effort.
     pinned_effort        TEXT,
     -- Discriminates ordinary work tasks ('work', the create_task default) from native
     -- recommendation cards (see create_recommendation). recommendation_* / target_profile /
@@ -21547,17 +21548,18 @@ def _live_policy_route_assignments(
     re-pin: the owner approved review for this exact card, so handing it to the
     reviewer and back is approved work, not a silent re-route.
 
-    A card pinned at creation keeps its recorded pinned effort, on the new
-    role's model, so the round-trip never moves it back to the role's base
-    effort. A card without that record, also one with a tier recorded before
-    the pins, keeps each role's own effort (:mod:`hermes_cli.kanban_risk_tier`).
+    A card pinned at creation (its pinned_effort is recorded) keeps the
+    effort its current tier pins, on the new role's model, so the round trip
+    never moves it back to the role's base effort and a raised tier re-pins.
+    A card without that record, also one with a tier recorded before the pins,
+    keeps each role's own effort (:mod:`hermes_cli.kanban_risk_tier`).
     """
     policy = _model_policy()
     tier = policy.normalize_execution_tier(row["execution_tier"])
     assignment = policy.resolve_task_assignment(target, tier)
     effort = assignment.reasoning_effort
     if row["pinned_effort"] is not None:
-        effort = row["pinned_effort"]
+        effort = pinned_reasoning_effort(row["risk_tier"], row["responsibility"])
     lock = mint_policy_lock(
         target,
         assignment.provider,
