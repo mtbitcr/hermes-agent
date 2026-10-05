@@ -269,7 +269,8 @@ STORES = (
     "profiles/coder/telemetry/shared_metrics/metrics.sqlite3",
 )
 # Databases inside the root that are no application store: the tasks' workspaces and attachments
-# of the default board and of another board (kanban_db.py), the checkout and the release snapshots.
+# of the default board and of another board (kanban_db.py), the checkout, the release snapshots,
+# and backup.py's artifacts and infrastructure, at the root or in a plugin's directory.
 NOT_STORES = (
     "kanban/workspaces/t_root/app.db",
     "kanban/attachments/t_root/upload.sqlite3",
@@ -277,6 +278,9 @@ NOT_STORES = (
     "kanban/boards/sample/attachments/t_worker/upload.sqlite3",
     "work/hermes/tests/fixture.db",
     "release-snapshots/state/OLD/state.db",
+    "state.db.retired-wal-1-2/state.db",
+    "state.db.pre-update-emergency-1.bak",
+    "plugin-data/ordinary/node_modules/cache.db",
 )
 
 
@@ -309,6 +313,91 @@ def test_state_snapshot_reaches_every_store_from_a_worker_environment(tmp_path, 
     for rows, rel in enumerate(STORES, start=1):
         with contextlib.closing(sqlite3.connect(saved / rel)) as copy:
             assert copy.execute("SELECT count(*) FROM notes").fetchone() == (rows,), rel
+
+
+# A plugin may take any name and give its store any file name (plugins/plugin_storage.py): names
+# that backup.py gives its own directories and artifacts, and file names that end like a sidecar.
+# The ordinary names, plugin-data/ordinary/data.db among them, are the controls.
+PLUGIN_NAMES = (
+    "backups", "state-snapshots", "checkpoints", "browser-profile", "browser-profiles",
+    "node_modules", "site-packages", "venv", "state.db.retired-wal-capture",
+    "ordinary", "attachments", "workspaces", "hermes-agent",
+)
+STORE_NAMES = ("audit-wal", "audit-shm", "audit-journal", "facts.sqlite", "facts.sqlite3", "store")
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [f"plugin-data/{name}/data.db" for name in PLUGIN_NAMES]
+    + [f"plugin-data/ordinary/{name}" for name in STORE_NAMES],
+)
+def test_state_snapshot_keeps_a_plugin_store_under_any_name(tmp_path, monkeypatch, rel):
+    root = tmp_path / "root"
+    writer = make_store(root, rel, 3, monkeypatch)
+    try:
+        assert (root / f"{rel}-wal").stat().st_size > 0
+        make_actions(tmp_path).take_snapshot("NEW")
+    finally:
+        writer.close()
+
+    saved = tmp_path / "snapshots" / "state" / "NEW"
+    assert sorted(published(saved)) == [rel]  # none of the store's own sidecars
+    with contextlib.closing(sqlite3.connect(saved / rel)) as copy:
+        assert copy.execute("SELECT count(*) FROM notes").fetchone() == (3,)
+
+
+# A store whose image is damaged, by a database name: the metrics store of the root and of a
+# profile (observability/shared_metrics.py) and a plugin's store. A .db name is the control.
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "telemetry/shared_metrics/metrics.sqlite3",
+        "profiles/coder/telemetry/shared_metrics/metrics.sqlite3",
+        "plugin-data/ordinary/facts.sqlite",
+        "plugin-data/ordinary/data.db",
+    ],
+)
+def test_state_snapshot_is_not_published_without_a_damaged_store(tmp_path, monkeypatch, rel):
+    root = tmp_path / "root"
+    make_store(root, rel, 3, monkeypatch).close()
+    (root / rel).write_bytes(bytes(4096))  # the header and the first page overwritten
+    writer = wal_database(root / "state.db", 2)
+    try:
+        with pytest.raises(RuntimeError, match=f"could not copy {rel}$"):
+            make_actions(tmp_path).take_snapshot("NEW")
+    finally:
+        writer.close()
+    snapshots = tmp_path / "snapshots"
+    assert list(snapshots.rglob("*")) == [snapshots / "state"]  # nothing published or staged
+
+
+@pytest.mark.parametrize(
+    "setting, name", [("snapshot_root", "release-snapshots"), ("checkout", "checkout")]
+)
+@pytest.mark.parametrize("container", ["kanban/boards/example", "pairing", "platforms/pairing"])
+def test_state_snapshot_leaves_out_the_snapshots_and_the_checkout(
+    tmp_path, container, setting, name
+):
+    """Also inside a directory that a quick snapshot copies whole (backup.py): a board's
+    directory and both pairing directories."""
+    root, place = tmp_path / "root", tmp_path / "root" / container / name
+    wal_database(place / "fixtures" / "example.db", 1).close()
+    (place / "placeholder.txt").write_text("placeholder\n")
+    (root / "config.yaml").write_bytes(b"model: root\n")
+    actions = make_actions(tmp_path, **{setting: place})
+    writer = wal_database(root / "state.db", 2)
+    try:
+        actions.save_config_snapshot("CONFIG")
+        actions.take_snapshot("OLD")
+        actions.take_snapshot("NEW")
+    finally:
+        writer.close()
+
+    state, live = actions.snapshot_root / "state", ["config.yaml", "state.db"]
+    assert {snapshot: sorted(published(state / snapshot)) for snapshot in ("OLD", "NEW")} == {
+        "OLD": live,
+        "NEW": live,
+    }
 
 
 def test_state_snapshot_is_not_published_when_a_file_is_not_copied(tmp_path, monkeypatch):
