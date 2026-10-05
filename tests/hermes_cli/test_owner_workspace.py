@@ -478,16 +478,18 @@ def test_task_graph_resolves_and_locks_model_routes_before_approval(ctx):
             task.model_policy_lock,
         )
 
-    def lock(assignee, model, tier):
+    def lock(assignee, model, tier, effort="max"):
         return kanban_db.mint_policy_lock(
-            assignee, "anthropic", model, "max", tier,
+            assignee, "anthropic", model, effort, tier,
         )
 
     # 'default'/anthropic admits claude-opus-5-5 on BOTH lanes, so the digest —
     # not the model — is what distinguishes the deep pin from the routine one.
+    # The effort follows the risk tier: high for the tier-1 build, max for the
+    # tier-1 security review (R12) and for the root, which records tier 2.
     assert route(first) == (
-        "anthropic", "claude-opus-5-5", "max",
-        lock("default", "claude-opus-5-5", "deep"),
+        "anthropic", "claude-opus-5-5", "high",
+        lock("default", "claude-opus-5-5", "deep", "high"),
     )
     assert route(second) == (
         "anthropic", "claude-opus-5-5", "max",
@@ -551,6 +553,13 @@ def test_committed_owner_task_route_cannot_be_mutated_afterwards(ctx):
     result = _commit_task_graph(ctx, **_task_graph_args(idempotency_key="graph-immutable"))
     approver.join()
 
+    # The pinned effort follows each card's risk tier: high for the tier-1
+    # build, max for the tier-1 security review (R12) and for the root.
+    pinned = {
+        result["root_task_id"]: "max",
+        result["task_ids"][0]: "high",
+        result["task_ids"][1]: "max",
+    }
     with kanban_db.connect(board=result["board"]) as conn:
         for task_id in (result["root_task_id"], *result["task_ids"]):
             with pytest.raises(RuntimeError, match="owner-governed"):
@@ -561,7 +570,7 @@ def test_committed_owner_task_route_cannot_be_mutated_afterwards(ctx):
                 kanban_db.set_reasoning_effort(conn, task_id, "ultra")
             task = kanban_db.get_task(conn, task_id)
             assert task.model_override == "claude-opus-5-5"
-            assert task.reasoning_effort == "max"
+            assert task.reasoning_effort == pinned[task_id]
 
 
 def test_task_graph_rejects_invalid_responsibility_before_approval(ctx):
@@ -3583,9 +3592,9 @@ def test_project_plan_resolves_and_locks_a_new_task_model_route(ctx):
         task.execution_tier,
         task.model_policy_lock,
     ) == (
-        "anthropic", "claude-opus-5-5", "max", "deep",
+        "anthropic", "claude-opus-5-5", "high", "deep",
         kanban_db.mint_policy_lock(
-            "default", "anthropic", "claude-opus-5-5", "max", "deep",
+            "default", "anthropic", "claude-opus-5-5", "high", "deep",
         ),
     )
 
@@ -4064,9 +4073,10 @@ def test_project_plan_replace_carries_an_explicit_ownership_scope(ctx, tmp_path)
         assert replacement.workspace_path == str(
             repo / ".worktrees" / replacement_id
         )
-        # The route lock still binds the whole approved route tuple.
+        # The route lock still binds the whole approved route tuple, with
+        # the effort that the replacement's tier 1 pins.
         assert replacement.model_policy_lock == kanban_db.mint_policy_lock(
-            "default", "anthropic", "claude-opus-5-5", "max", "deep",
+            "default", "anthropic", "claude-opus-5-5", "high", "deep",
         )
         assert replacement.responsibility == "R09"
         with pytest.raises(RuntimeError, match="owner-governed"):
@@ -7306,8 +7316,8 @@ def test_real_profile_config_resolves_and_locks_owner_task_routes(ctx, real_reso
     as ``_default_spawn`` does.
     """
     # raphael-business is the Anthropic role whose current matrix really does
-    # give routine and deep work different lanes (Sonnet 5 / high vs Opus 5.5
-    # / max), so the pins below can only be right if the matrix chose them.
+    # give routine and deep work different lanes (Sonnet 5 vs Opus 5.5), so
+    # the pins below can only be right if the matrix chose them.
     _write_real_profile_config(
         "raphael-business", "anthropic", "claude-sonnet-5", "high"
     )
@@ -7337,12 +7347,13 @@ def test_real_profile_config_resolves_and_locks_owner_task_routes(ctx, real_reso
     deep_row = rows[result["task_ids"][0]]
     routine_row = rows[result["task_ids"][1]]
     # The matrix — not the test — decides the lanes: raphael-business on
-    # anthropic is Sonnet for routine work and Opus for deep work.
+    # anthropic is Sonnet for routine work and Opus for deep work. The effort
+    # follows the cards' risk tier 1: high on both lanes.
     assert (
         deep_row["execution_tier"],
         deep_row["model_override"],
         deep_row["reasoning_effort"],
-    ) == ("deep", "claude-opus-5-5", "max")
+    ) == ("deep", "claude-opus-5-5", "high")
     assert (
         routine_row["execution_tier"],
         routine_row["model_override"],
@@ -8096,9 +8107,8 @@ def test_a_graph_created_project_accepts_a_later_existing_project_plan(ctx):
     with contextlib.closing(kanban_db.connect(board=created["board"])) as conn:
         added = kanban_db.get_task(conn, new_task_id)
     assert (added.model_override, added.provider_override) == (deep.model, deep.provider)
-    assert (added.reasoning_effort, added.execution_tier) == (
-        deep.reasoning_effort, "deep",
-    )
+    # The effort follows the new card's risk tier 1, not the lane's default.
+    assert (added.reasoning_effort, added.execution_tier) == ("high", "deep")
     assert kanban_db.policy_lock_error(
         added.model_policy_lock, added.assignee, added.provider_override,
         added.model_override, added.reasoning_effort, added.execution_tier,

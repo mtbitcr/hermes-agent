@@ -387,10 +387,50 @@ def test_a_tampered_or_foreign_seal_still_fails_closed():
     assert model_policy.policy_lock_error("", *route) == "policy lock is missing"
 
 
+@pytest.mark.parametrize("lane", sorted(model_policy._ASSIGNMENTS))
+@pytest.mark.parametrize("tier", ["routine", "deep"])
+def test_a_card_seal_admits_high_next_to_max_on_every_admitted_lane(lane, tier):
+    """Risk tiers pin a card at high or max (decisions 5 and 6), on the lane's
+    own model only: no other effort, model or route becomes mintable."""
+    profile, provider = lane
+    model = task_assignment_for(profile, provider, tier).model
+    for effort in ("high", "max"):
+        route = (profile, provider, model, effort, tier)
+        lock = model_policy.mint_policy_lock(*route)
+        assert lock == _sealed(*route)
+        assert model_policy.policy_lock_error(lock, *route) is None
+    for effort in ("none", "minimal", "low", "medium", "xhigh", "ultra"):
+        route = (profile, provider, model, effort, tier)
+        with pytest.raises(ValueError):
+            model_policy.mint_policy_lock(*route)
+        assert model_policy.policy_lock_error(_sealed(*route), *route) is not None
+
+
+def test_tier_2_work_runs_at_max_on_the_high_base_lane_but_the_role_does_not():
+    """Decision 5: business routine on Sonnet 5 may seal a card at max, while
+    the role's own configured route stays exactly its high base route."""
+    route = ("raphael-business", "anthropic", "claude-sonnet-5", "max", "routine")
+    lock = model_policy.mint_policy_lock(*route)
+    assert model_policy.policy_lock_error(lock, *route) is None
+    with pytest.raises(ValueError):
+        validate_assignment(
+            "raphael-business", "anthropic", "claude-sonnet-5", "max",
+            disable_fallbacks=True,
+        )
+    with pytest.raises(ValueError):
+        validate_assignment(
+            "default", "anthropic", "claude-opus-5-5", "high", disable_fallbacks=True,
+        )
+
+
 @pytest.mark.parametrize("route", [
-    # Another role's historical route: Sonnet 5 / max was the planner's
-    # routine lane, never business's (business routine was and is high).
-    ("raphael-business", "anthropic", "claude-sonnet-5", "max", "routine"),
+    # High is admitted only on the lane's own model: never on another lane's
+    # model, a superseded model, or a tier the model does not serve.
+    ("raphael-business", "anthropic", "claude-opus-5-5", "high", "routine"),
+    ("raphael-verifier", "anthropic", "claude-sonnet-5", "high", "routine"),
+    ("default", "anthropic", "claude-opus-5", "high", "routine"),
+    ("raphael-claude-worker", "anthropic", "claude-sonnet-5", "high", "routine"),
+    ("raphael-verifier", "openai-codex", "gpt-6-sol", "high", "routine"),
     # Business's Terra lane is not a verifier route.
     ("raphael-verifier", "openai-codex", "gpt-5.6-terra", "max", "routine"),
     # A historical route on a tier it was never admitted on.
