@@ -615,3 +615,277 @@ def test_text_that_is_not_exactly_str_is_refused(open_ledger, case):
             )
 
     assert _store_rows(conn) == before
+
+
+# Card 1 of the release re-cut: each release's outcome, and one waiting decision (S-B, S-G).
+LIVE = _commit("live")  # the checkout's head while no batch was ever released
+
+
+def _accepted(conn, *labels: str):
+    """Merge the changes, then accept the waiting batch they joined."""
+    for label in labels:
+        batch = _merge(conn, label)["batch"]
+    return _decide(conn, batch, "accepted")
+
+
+def _begin(conn, batch, *, prev: str = LIVE):
+    """Begin the batch's release with NEW at its last member's merge commit (S-B)."""
+    return ledger.begin_release(conn, batch["batch_id"], prev=prev, new=_commits(batch)[-1])
+
+
+def _finish(conn, batch, outcome):
+    return ledger.finish_release(conn, batch["batch_id"], outcome=outcome)
+
+
+def _waiting(conn) -> list[dict]:
+    return [batch for batch in ledger.list_batches(conn) if batch["state"] in ("open", "deferred")]
+
+
+def test_begin_release_moves_an_accepted_batch_to_releasing_with_both_versions(open_ledger):
+    conn = open_ledger()
+    accepted = _accepted(conn, "a", "b")
+    other = _accepted(conn, "c")
+    waiting = _merge(conn, "d")["batch"]
+    with pytest.raises(ValueError):
+        _begin(conn, waiting)
+    put_off = _decide(conn, waiting, "deferred")
+    before = _store_rows(conn)
+    with pytest.raises(ValueError):
+        _begin(conn, put_off)
+    # NEW is the merge commit of the batch's last member: not an earlier one, not another batch's.
+    for new in (_commit("a"), _commit("c"), _disguised(_commit("b"), _commit("a"))):
+        with pytest.raises(ValueError):
+            ledger.begin_release(conn, accepted["batch_id"], prev=LIVE, new=new)
+    assert _store_rows(conn) == before
+
+    releasing = _begin(conn, accepted)
+
+    assert releasing["state"] == "releasing"
+    assert (releasing["prev"], releasing["new"]) == (LIVE, _commit("b"))
+    assert _commits(releasing) == _commits(accepted)
+    assert ledger.list_batches(conn)[0] == releasing
+    # One release at a time: while one is releasing, no batch begins, that one included.
+    before = _store_rows(conn)
+    for batch in (other, releasing):
+        with pytest.raises(ValueError):
+            _begin(conn, batch)
+    assert _store_rows(conn) == before
+
+
+def test_released_batch_is_final_and_names_the_live_version(open_ledger):
+    conn = open_ledger()
+    assert ledger.last_released(conn) is None  # so PREV is the checkout's head
+    releasing = _begin(conn, _accepted(conn, "a", "b"))
+
+    released = _finish(conn, releasing, "released")
+
+    assert (released["state"], released["outcome"]) == ("released", "released")
+    assert ledger.last_released(conn) == _commit("b")
+    before = _store_rows(conn)
+    for outcome in ("released", "restored", "refused", "failed"):
+        with pytest.raises(ValueError):
+            _finish(conn, released, outcome)
+    with pytest.raises(ValueError):
+        ledger.begin_recovery(conn, released["batch_id"])
+    assert _store_rows(conn) == before
+    following = _merge(conn, "c")["batch"]
+    assert (following["state"], _commits(following)) == ("open", [_commit("c")])
+    assert ledger.list_batches(conn)[0] == released
+    # The next release starts from the live version (S-B), then names its own.
+    accepted = _decide(conn, following, "accepted")
+    with pytest.raises(ValueError):
+        _begin(conn, accepted, prev=LIVE)
+    _finish(conn, _begin(conn, accepted, prev=_commit("b")), "released")
+    assert ledger.last_released(conn) == _commit("c")
+
+
+@pytest.mark.parametrize("outcome", ("restored", "refused"))
+def test_restored_or_refused_changes_return_to_the_one_waiting_decision(open_ledger, outcome):
+    conn = open_ledger()
+    releasing = _begin(conn, _accepted(conn, "a", "b"))
+    _merge(conn, "c", tier=0)
+    newer = _merge(conn, "d", tier=0)["batch"]  # merged while the release ran
+
+    folded = _finish(conn, releasing, outcome)
+
+    assert (folded["state"], folded["outcome"], folded["members"]) == ("folded", outcome, [])
+    [waiting] = _waiting(conn)
+    assert (waiting["batch_id"], waiting["state"]) == (newer["batch_id"], "open")
+    assert _commits(waiting) == [_commit("a"), _commit("b"), _commit("c"), _commit("d")]
+    assert waiting["version"] > newer["version"]
+    assert waiting["digest"] != newer["digest"]
+    assert waiting["tier"] == 1  # the returned changes bring their tier back
+    commits = [commit for batch in ledger.list_batches(conn) for commit in _commits(batch)]
+    assert len(commits) == len(set(commits)) == 4
+    # A page drawn before the changes came back is stale; the new list can be decided.
+    with pytest.raises(ValueError):
+        _decide(conn, newer, "accepted")
+    assert _decide(conn, waiting, "accepted")["state"] == "accepted"
+
+
+def test_failed_release_stays_open_for_recovery(open_ledger):
+    conn = open_ledger()
+    accepted = _accepted(conn, "a", "b")
+    before = _store_rows(conn)
+    # A release that never began neither recovers nor ends.
+    with pytest.raises(ValueError):
+        ledger.begin_recovery(conn, accepted["batch_id"])
+    for outcome in ("released", "failed"):
+        with pytest.raises(ValueError):
+            _finish(conn, accepted, outcome)
+    assert _store_rows(conn) == before
+    releasing = _begin(conn, accepted)
+    # A run killed while releasing recovers from there.
+    assert ledger.begin_recovery(conn, releasing["batch_id"])["recovery_attempts"] == 1
+
+    failed = _finish(conn, releasing, "failed")
+
+    assert (failed["state"], failed["outcome"], failed["recovery_attempts"]) == ("failed", "failed", 1)
+    other = _accepted(conn, "c")
+    with pytest.raises(ValueError):
+        _begin(conn, other)  # the failed release still holds the host
+    for attempt in (2, 3):
+        assert ledger.begin_recovery(conn, failed["batch_id"])["recovery_attempts"] == attempt
+    assert _finish(conn, failed, "failed")["state"] == "failed"
+    before = _store_rows(conn)
+    # Refused says the host was never touched, which a failed release cannot claim.
+    for outcome in ("refused", "rolled back", _disguised("failed", "released")):
+        with pytest.raises(ValueError):
+            _finish(conn, failed, outcome)
+    assert _store_rows(conn) == before
+
+    restored = _finish(conn, failed, "restored")
+
+    assert (restored["state"], restored["outcome"], restored["recovery_attempts"]) == ("folded", "restored", 3)
+    with pytest.raises(ValueError):
+        ledger.begin_recovery(conn, restored["batch_id"])
+    # No batch was waiting, so the changes open a new one.
+    [waiting] = _waiting(conn)
+    assert (waiting["state"], _commits(waiting)) == ("open", [_commit("a"), _commit("b")])
+    # Released in merge order, the older batch last: the live version is the last one released.
+    _finish(conn, _begin(conn, _decide(conn, waiting, "accepted")), "released")
+    _finish(conn, _begin(conn, other, prev=_commit("b")), "released")
+    assert ledger.last_released(conn) == _commit("c")
+
+
+# The three-state schema on main before card 1, as the first build created it.
+_FIRST_SCHEMA = (
+    "CREATE TABLE release_batches (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " state TEXT NOT NULL CHECK (state IN ('open', 'deferred', 'accepted')), version INTEGER NOT NULL,"
+    " tier INTEGER NOT NULL CHECK (tier IN (0, 1, 2)), created_at INTEGER NOT NULL, decided_at INTEGER,"
+    " decided_by TEXT, decision_ref TEXT, shown_digest TEXT);"
+    "CREATE TABLE release_members (batch_id INTEGER NOT NULL REFERENCES release_batches(id),"
+    " merge_commit TEXT NOT NULL UNIQUE, pr_url TEXT NOT NULL, reviewed_base TEXT NOT NULL,"
+    " reviewed_head TEXT NOT NULL, reviewed_tree TEXT NOT NULL, tier INTEGER NOT NULL CHECK (tier IN (0, 1, 2)),"
+    " tier_recorded INTEGER NOT NULL CHECK (tier_recorded IN (0, 1)), card_id TEXT NOT NULL,"
+    " merged_at INTEGER NOT NULL, position INTEGER NOT NULL, UNIQUE (batch_id, position));"
+    "CREATE TABLE release_events (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " batch_id INTEGER NOT NULL REFERENCES release_batches(id), kind TEXT NOT NULL, payload TEXT NOT NULL,"
+    " created_at INTEGER NOT NULL);"
+    "CREATE TABLE release_reminders (vienna_date TEXT NOT NULL UNIQUE, recorded_at INTEGER NOT NULL);"
+)
+
+
+def _first_schema_store(path: Path) -> dict[str, tuple[list[str], list[tuple]]]:
+    """A store made with the first schema, holding an accepted and a put-off batch;
+    returns each table's columns and rows."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    first = sqlite3.connect(path)
+    try:
+        first.executescript(_FIRST_SCHEMA)
+        with first:
+            first.executemany(
+                "INSERT INTO release_batches VALUES (?, ?, ?, ?, 1759500000, 1759500100, 'owner', ?, ?)",
+                [(1, "accepted", 3, 1, PAGE_REF, "a" * 64), (2, "deferred", 2, 2, PAGE_REF, "b" * 64)],
+            )
+            first.executemany(
+                "INSERT INTO release_members VALUES (?, ?, 'https://github.com/mtbitcr/hermes-agent/pull/1',"
+                " ?, ?, ?, ?, ?, 't_0badc0de', 1759500000, ?)",
+                [
+                    (batch, _commit(label), _commit(f"{label}-base"), _commit(f"{label}-head"),
+                     _commit(f"{label}-tree"), tier, int(tier < 2), position)
+                    for batch, label, tier, position in ((1, "a", 1, 1), (1, "b", 0, 2), (2, "c", 2, 1))
+                ],
+            )
+            first.execute(
+                "INSERT INTO release_events (batch_id, kind, payload, created_at)"
+                " VALUES (1, 'release_decided', '{}', 1759500100)"
+            )
+            first.execute("INSERT INTO release_reminders VALUES ('2026-10-03', 1759507200)")
+        tables = {}
+        for name in ("release_batches", "release_members", "release_events", "release_reminders"):
+            cursor = first.execute(f"SELECT * FROM {name}")
+            tables[name] = ([column[0] for column in cursor.description], cursor.fetchall())
+        return tables
+    finally:
+        first.close()
+
+
+def test_store_created_with_the_first_schema_is_upgraded(open_ledger):
+    first = _first_schema_store(ledger.ledger_path())
+
+    conn = open_ledger()
+
+    for name, (columns, rows) in first.items():
+        kept = conn.execute(f"SELECT {', '.join(columns)} FROM {name}").fetchall()
+        assert [tuple(row) for row in kept] == rows, name
+    accepted, put_off = ledger.list_batches(conn)
+    assert (accepted["state"], put_off["state"]) == ("accepted", "deferred")
+    assert (accepted["prev"], accepted["new"], accepted["outcome"], accepted["recovery_attempts"]) == (
+        None, None, None, 0,
+    )
+    assert {(member["title"], member["board"]) for member in accepted["members"] + put_off["members"]} == {("", "")}
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    # The new states now hold, and opening the store again changes nothing.
+    _finish(conn, _finish(conn, _begin(conn, accepted), "failed"), "restored")
+    upgraded = _store_rows(conn)
+    assert _store_rows(open_ledger()) == upgraded
+    assert _commits(_waiting(conn)[0]) == [_commit("a"), _commit("b"), _commit("c")]
+
+
+def test_title_and_board_are_kept_when_given(open_ledger):
+    conn = open_ledger()
+    title = "Show the release decision on the Decisions page"
+
+    titled = ledger.record_merge(conn, **_merge_args("a"), title=title, board="hermes-agent", on_main=True)
+    plain = _merge(conn, "b")  # an existing caller, with neither
+
+    assert (titled["member"]["title"], titled["member"]["board"]) == (title, "hermes-agent")
+    assert (plain["member"]["title"], plain["member"]["board"]) == ("", "")
+    [batch] = ledger.list_batches(conn)
+    assert [(member["title"], member["board"]) for member in batch["members"]] == [(title, "hermes-agent"), ("", "")]
+    # Only text is kept, and a board is a kanban board slug; anything else writes nothing.
+    before = _store_rows(conn)
+    for changes in (
+        {"title": 7},
+        {"title": _disguised(title, "t_0badc0de")},
+        {"board": "Hermes Agent"},
+        {"board": "../main"},
+        {"board": None},
+    ):
+        with pytest.raises(ValueError):
+            ledger.record_merge(conn, **_merge_args("c", **changes), on_main=True)
+    assert _store_rows(conn) == before
+
+
+# The security reviews' rule holds for card 1's steps too: they work only on the own store.
+@pytest.mark.parametrize("kind", _NOT_OWN_STORE)
+def test_release_steps_refuse_a_connection_other_than_the_own_store(open_ledger, tmp_path, kind):
+    own = open_ledger()
+    batch = _accepted(own, "a")
+    own_before = _store_rows(own)
+    other = _not_own_store(kind, tmp_path)
+    try:
+        other_before = _store_rows(other)
+        for step in (
+            lambda conn: _begin(conn, batch),
+            lambda conn: ledger.begin_recovery(conn, batch["batch_id"]),
+            lambda conn: _finish(conn, batch, "released"),
+            ledger.last_released,
+        ):
+            with pytest.raises(PermissionError):
+                step(other)
+        assert _store_rows(other) == other_before
+    finally:
+        other.close()
+    assert _store_rows(own) == own_before
