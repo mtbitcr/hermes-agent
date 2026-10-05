@@ -12,8 +12,14 @@ home: a release is host-wide, and a dispatcher worker (``HERMES_KANBAN_DB`` and
 ``HERMES_KANBAN_BOARD`` pinned to its board, ``HERMES_HOME`` at a profile home)
 must reach the same record. The file is created on first use.
 
-Nothing calls this module yet: the merge-step call, the hold, the Decisions
-page and the reminder job belong to later cards.
+A release runs under the platform's global pause (``hermes pause``), so the
+record keeps no hold of its own. An accepted batch becomes releasing when its
+release begins, with PREV and NEW stored, and ends released, failed (kept for
+recovery, whose attempts are counted) or folded: a restored or refused release
+puts its changes back into the one waiting decision.
+
+Nothing calls this module yet: the merge-step call, the release command, the
+Decisions page and the reminder job belong to later cards.
 """
 
 from __future__ import annotations
@@ -57,18 +63,35 @@ _UNRECORDED_TIER = 2
 _DECISIONS = frozenset({"accepted", "deferred"})
 _WAITING_STATES = ("open", "deferred")
 _WAITING_SQL = "state IN ('open', 'deferred')"
+# A release that began and has not ended: releasing, or failed and kept for recovery.
+_UNFINISHED_STATES = ("releasing", "failed")
+_UNFINISHED_SQL = "state IN ('releasing', 'failed')"
+_OUTCOMES = frozenset({"released", "restored", "refused", "failed"})
+# A kanban board slug, or empty when the merge step does not name one.
+_BOARD_RE = re.compile(r"(?:[a-z0-9][a-z0-9_-]{0,63})?")
+# The first build's batch columns, copied as they are when its store is upgraded.
+_FIRST_BATCH_COLUMNS = (
+    "id, state, version, tier, created_at, decided_at, decided_by, decision_ref, shown_digest"
+)
 
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS release_batches (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        state TEXT NOT NULL CHECK (state IN ('open', 'deferred', 'accepted')),
+        state TEXT NOT NULL CHECK (state IN (
+            'open', 'deferred', 'accepted', 'releasing', 'released', 'failed', 'folded'
+        )),
         version INTEGER NOT NULL,
         tier INTEGER NOT NULL CHECK (tier IN (0, 1, 2)),
         created_at INTEGER NOT NULL,
         decided_at INTEGER,
         decided_by TEXT,
         decision_ref TEXT,
-        shown_digest TEXT
+        shown_digest TEXT,
+        prev TEXT,
+        new TEXT,
+        outcome TEXT CHECK (outcome IN ('released', 'restored', 'refused', 'failed')),
+        outcome_at INTEGER,
+        recovery_attempts INTEGER NOT NULL DEFAULT 0
     )""",
     """CREATE TABLE IF NOT EXISTS release_members (
         batch_id INTEGER NOT NULL REFERENCES release_batches(id),
@@ -82,6 +105,8 @@ _SCHEMA = (
         card_id TEXT NOT NULL,
         merged_at INTEGER NOT NULL,
         position INTEGER NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        board TEXT NOT NULL DEFAULT '',
         UNIQUE (batch_id, position)
     )""",
     """CREATE TABLE IF NOT EXISTS release_events (
@@ -109,20 +134,24 @@ def ledger_path() -> Path:
 
 
 def connect() -> sqlite3.Connection:
-    """Open the release store, creating the file and its tables on first use.
+    """Open the release store, creating the file and its tables on first use and
+    upgrading a store the first build made.
 
     ``isolation_level=None`` because every write runs inside the kanban
-    ``write_txn`` boundary (BEGIN IMMEDIATE with busy retries).
+    ``write_txn`` boundary (BEGIN IMMEDIATE with busy retries). Foreign keys
+    are turned on after that first transaction: SQLite ignores the switch
+    inside one, and the upgrade replaces the table the others refer to.
     """
     path = ledger_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), isolation_level=None, timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("PRAGMA foreign_keys=ON")
         with write_txn(conn):
+            _upgrade_first_schema(conn)
             for statement in _SCHEMA:
                 conn.execute(statement)
+        conn.execute("PRAGMA foreign_keys=ON")
     except Exception:
         conn.close()
         raise
@@ -139,6 +168,8 @@ def record_merge(
     reviewed_tree: str,
     tier: Any,
     card_id: str,
+    title: str = "",
+    board: str = "",
     on_main: bool = False,
 ) -> dict[str, Any]:
     """K1: add one merged change to the waiting release decision.
@@ -150,7 +181,9 @@ def record_merge(
     like a malformed input, and nothing is written. A commit already recorded
     returns its existing row and writes nothing. A tier that is not exactly 0, 1
     or 2 is stored as 2, "tier not recorded": the release never parses prose and
-    never assumes a lower risk than it was given.
+    never assumes a lower risk than it was given. ``title`` and ``board`` are the
+    card's plain title and board slug, kept for the owner page; both stay empty
+    when not given.
 
     Returns ``recorded`` (False for a repeat), the ``member`` row and the
     ``batch`` it belongs to, read back after the write.
@@ -172,6 +205,9 @@ def record_merge(
         "https://github.com/mtbitcr/raphael-workspace/pull/<number>",
     )
     _require(card_id, _IDENTIFIER_RE, "card_id must be a lowercase kanban card id")
+    if type(title) is not str:
+        raise ValueError("title must be the card's plain title, as text")
+    _require(board, _BOARD_RE, "board must be a kanban board slug, or empty")
     tier_recorded = type(tier) is int and tier in _RISK_TIERS
     member_tier = tier if tier_recorded else _UNRECORDED_TIER
 
@@ -197,11 +233,11 @@ def record_merge(
         ).fetchone()
         conn.execute(
             "INSERT INTO release_members (batch_id, merge_commit, pr_url, reviewed_base, "
-            "reviewed_head, reviewed_tree, tier, tier_recorded, card_id, merged_at, position) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "reviewed_head, reviewed_tree, tier, tier_recorded, card_id, merged_at, position, "
+            "title, board) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 batch_id, merge_commit, pr_url, reviewed_base, reviewed_head, reviewed_tree,
-                member_tier, int(tier_recorded), card_id, now, count + 1,
+                member_tier, int(tier_recorded), card_id, now, count + 1, title, board,
             ),
         )
         conn.execute(
@@ -272,6 +308,115 @@ def decide_release(
             (batch_id, json.dumps(payload, sort_keys=True), now),
         )
         return decided
+
+
+def begin_release(conn: sqlite3.Connection, batch_id: int, *, prev: str, new: str) -> dict[str, Any]:
+    """Mark an accepted batch releasing and store its release's two versions (S-B).
+
+    ``prev`` is what the host runs: :func:`last_released`, or the checkout's
+    head while no batch was ever released. ``new`` is the merge commit of the
+    batch's last member, so the release ships the whole list the owner
+    accepted. One release runs at a time: while any batch is releasing, or
+    failed and not yet recovered, none begins. Anything else raises
+    ``ValueError`` and writes nothing.
+
+    Returns the batch read back, now releasing.
+    """
+    _own_store(conn)
+    _require_batch_id(batch_id)
+    for name, value in (("prev", prev), ("new", new)):
+        _require(value, _COMMIT_RE, f"{name} must be a 40-character lowercase hex commit id")
+
+    with write_txn(conn):
+        current = _snapshot(conn, batch_id)
+        if current["state"] != "accepted":
+            raise ValueError(f"release batch {batch_id} is {current['state']}, not accepted")
+        unfinished = conn.execute(f"SELECT id FROM release_batches WHERE {_UNFINISHED_SQL}").fetchone()
+        if unfinished is not None:
+            raise ValueError(f"release batch {unfinished['id']} has not finished its release")
+        if not current["members"] or new != current["members"][-1]["merge_commit"]:
+            raise ValueError("new must be the merge commit of the batch's last member")
+        live = last_released(conn)
+        if live is not None and prev != live:
+            raise ValueError("prev must be the NEW of the last released batch")
+        conn.execute(
+            "UPDATE release_batches SET state = 'releasing', prev = ?, new = ? WHERE id = ?",
+            (prev, new, batch_id),
+        )
+        _record_event(conn, batch_id, "release_began", {"prev": prev, "new": new}, int(time.time()))
+        return _snapshot(conn, batch_id)
+
+
+def begin_recovery(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
+    """Count one recovery attempt of a release that stopped midway: its batch
+    is still releasing (the run was killed) or failed.
+
+    The state stays until :func:`finish_release` records the outcome, and any
+    cap on attempts is the caller's. Any other batch raises ``ValueError`` and
+    nothing is written. Returns the batch read back with its attempt count.
+    """
+    _own_store(conn)
+    _require_batch_id(batch_id)
+    with write_txn(conn):
+        current = _snapshot(conn, batch_id)
+        if current["state"] not in _UNFINISHED_STATES:
+            raise ValueError(f"release batch {batch_id} is {current['state']}; nothing to recover")
+        conn.execute(
+            "UPDATE release_batches SET recovery_attempts = recovery_attempts + 1 WHERE id = ?",
+            (batch_id,),
+        )
+        attempt = {"attempt": current["recovery_attempts"] + 1}
+        _record_event(conn, batch_id, "recovery_began", attempt, int(time.time()))
+        return _snapshot(conn, batch_id)
+
+
+def finish_release(conn: sqlite3.Connection, batch_id: int, *, outcome: str) -> dict[str, Any]:
+    """Record how the release of a releasing or failed batch ended (S-G).
+
+    ``released`` is final, and :func:`last_released` then names its NEW.
+    ``failed`` keeps the batch for recovery, and a later outcome replaces it.
+    ``restored`` and ``refused`` fold the batch: its changes go back into the
+    one waiting decision, opened if none waits, which keeps its changes in
+    merge order. A failed release cannot end refused, which says the host was
+    never changed. Anything else raises ``ValueError`` and writes nothing.
+
+    Returns the batch read back; a folded one keeps its versions and outcome
+    but no members.
+    """
+    _own_store(conn)
+    _require_batch_id(batch_id)
+    if type(outcome) is not str or outcome not in _OUTCOMES:
+        raise ValueError("a release outcome is 'released', 'restored', 'refused' or 'failed'")
+
+    with write_txn(conn):
+        current = _snapshot(conn, batch_id)
+        was = current["state"]
+        if was not in _UNFINISHED_STATES or (outcome, was) == ("refused", "failed"):
+            raise ValueError(f"release batch {batch_id} is {was}; it cannot end {outcome}")
+        now = int(time.time())
+        state = outcome if outcome in ("released", "failed") else "folded"
+        conn.execute(
+            "UPDATE release_batches SET state = ?, outcome = ?, outcome_at = ? WHERE id = ?",
+            (state, outcome, now, batch_id),
+        )
+        payload: dict[str, Any] = {"outcome": outcome}
+        if state == "folded":
+            payload["returned_to"] = _return_changes(conn, current, now)
+        _record_event(conn, batch_id, "release_finished", payload, now)
+        return _snapshot(conn, batch_id)
+
+
+def last_released(conn: sqlite3.Connection) -> Optional[str]:
+    """NEW of the batch released last: what the host runs, and the next
+    release's PREV (S-B). ``None`` while no batch was ever released; PREV is
+    then the checkout's head. The order is that of the events, never of the
+    clock."""
+    _own_store(conn)
+    row = conn.execute(
+        "SELECT new FROM release_batches JOIN release_events ON batch_id = release_batches.id "
+        "WHERE state = 'released' AND kind = 'release_finished' ORDER BY release_events.id DESC LIMIT 1"
+    ).fetchone()
+    return None if row is None else row["new"]
 
 
 def list_batches(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -359,6 +504,54 @@ def _require(value: Any, pattern: re.Pattern[str], message: str) -> None:
         raise ValueError(message)
 
 
+def _require_batch_id(batch_id: Any) -> None:
+    if type(batch_id) is not int or batch_id < 0:
+        raise ValueError("batch_id must be a non-negative integer")
+
+
+def _record_event(
+    conn: sqlite3.Connection, batch_id: int, kind: str, payload: dict[str, Any], now: int
+) -> None:
+    conn.execute(
+        "INSERT INTO release_events (batch_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+        (batch_id, kind, json.dumps(payload, sort_keys=True), now),
+    )
+
+
+def _return_changes(conn: sqlite3.Connection, folded: dict[str, Any], now: int) -> int:
+    """Move a folded batch's changes into the one waiting batch, opening one if
+    none waits, and keep that batch's changes in merge order; returns its id.
+
+    The waiting batch's version rises, so a decision on the list shown before
+    is stale, and a put-off batch stays put off (owner decision 2).
+    """
+    waiting = conn.execute(f"SELECT id FROM release_batches WHERE {_WAITING_SQL}").fetchone()
+    if waiting is None:
+        target = conn.execute(
+            "INSERT INTO release_batches (state, version, tier, created_at) VALUES ('open', 0, ?, ?)",
+            (folded["tier"], now),
+        ).lastrowid
+    else:
+        target = waiting["id"]
+    # Merge order is the order the changes were recorded in: their rowid order.
+    # UNIQUE (batch_id, position) is checked row by row, so the positions pass
+    # through distinct negative values first.
+    conn.execute(
+        "UPDATE release_members SET batch_id = ?, position = -rowid WHERE batch_id IN (?, ?)",
+        (target, target, folded["batch_id"]),
+    )
+    conn.execute(
+        "UPDATE release_members SET position = (SELECT COUNT(*) FROM release_members AS earlier "
+        "WHERE earlier.batch_id = ? AND earlier.rowid <= release_members.rowid) WHERE batch_id = ?",
+        (target, target),
+    )
+    conn.execute(
+        "UPDATE release_batches SET version = version + 1, tier = MAX(tier, ?) WHERE id = ?",
+        (folded["tier"], target),
+    )
+    return target
+
+
 def _digest(commits: Iterable[str]) -> str:
     """SHA-256 over the ordered member commits, one per line."""
     return hashlib.sha256("".join(f"{commit}\n" for commit in commits).encode("ascii")).hexdigest()
@@ -418,4 +611,33 @@ def _snapshot(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
         "decided_by": row["decided_by"],
         "decision_ref": row["decision_ref"],
         "shown_digest": row["shown_digest"],
+        "prev": row["prev"],
+        "new": row["new"],
+        "outcome": row["outcome"],
+        "outcome_at": row["outcome_at"],
+        "recovery_attempts": row["recovery_attempts"],
     }
+
+
+def _upgrade_first_schema(conn: sqlite3.Connection) -> None:
+    """Bring a store the first build made up to this schema, keeping every row.
+
+    SQLite cannot change a CHECK, so the batches are copied aside and their
+    table is made anew under the name the members and events refer to. It is
+    never renamed: a rename opens the temporary database, which
+    :func:`_own_store` refuses. Runs inside :func:`connect`'s first
+    transaction, before foreign keys are on.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(release_batches)")}
+    if not columns or "outcome" in columns:
+        return
+    conn.execute("CREATE TABLE release_batches_first AS SELECT * FROM release_batches")
+    conn.execute("DROP TABLE release_batches")
+    conn.execute(_SCHEMA[0])
+    conn.execute(
+        f"INSERT INTO release_batches ({_FIRST_BATCH_COLUMNS}) "
+        f"SELECT {_FIRST_BATCH_COLUMNS} FROM release_batches_first"
+    )
+    conn.execute("DROP TABLE release_batches_first")
+    for column in ("title", "board"):
+        conn.execute(f"ALTER TABLE release_members ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
