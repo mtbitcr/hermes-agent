@@ -549,6 +549,8 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     def hold() -> None:  # right before each change on GitHub, on its own connection
+        if not delivery_settings():  # switched off after the admission: change nothing
+            raise PublishRefused("delivery_disabled", "kanban.delivery.enabled is not true")
         with kb.connect_closing(db_path=db_path) as conn:
             _held(conn, delivery_id, holder)
 
@@ -603,7 +605,12 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
         open_pulls = [{
             "number": pull.get("number"),
             "head": pull["head"].get("sha") if isinstance(pull.get("head"), dict) else None,
+            "base": pull["base"].get("ref") if isinstance(pull.get("base"), dict) else None,
         } for pull in pulls]
+        # A pull request of the delivery branch that targets another base, or none, is not the
+        # delivery's own: nothing is updated, adopted or bound, before any decision.
+        if any(pull["base"] != _PULL_REQUEST_BASE for pull in open_pulls):
+            raise PublishRefused("wrong_base", "an open pull request of the delivery branch does not target main")
         remote = {
             "branch_head": _branch_head(github, branch),  # None when GitHub has no such branch
             "open_pulls": open_pulls,
@@ -652,7 +659,9 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
         else:  # already_published or adopt_fast_forward: GitHub already holds H
             number = ledger["pull_request"]
             state = "already_published" if decision.code == "already_published" else "fast_forwarded"
-        if decision.code in ("push_and_create", "adopt_and_create", "push_fast_forward", "adopt_pull_request"):
+        if decision.code in (
+            "push_and_create", "adopt_and_create", "push_fast_forward", "adopt_pull_request", "adopt_fast_forward",
+        ):
             # GitHub changed or holds an unrecorded pull request, so both are read again, outside every
             # transaction: only the pull request open at H against main on the branch at H is a success.
             again = _answered(github.request("GET", f"{pulls_path}/{number}"))

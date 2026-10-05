@@ -585,7 +585,7 @@ def test_switching_delivery_off_before_a_github_write_publishes_nothing(world, g
 
     assert github["pushes"] == pushes
     assert [call for call in github["calls"][calls:] if call[0] == "POST"] == []
-    assert _remote_head(bare, branch) == (first if path == "fast_forward" else None)
+    assert _remote_head(bare, branch) == (first if path == "fast_forward" else "")  # "": no such branch
     assert _row(kb, head)[:4] == UNSTORED and _row(kb, head)[6] is None
     assert _events(kb, tid) == events
     monkeypatch.setattr(transport.GitHubTransport, "request", request)
