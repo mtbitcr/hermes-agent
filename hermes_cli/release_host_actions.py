@@ -22,6 +22,7 @@ import http.client
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tomllib  # noqa: F401  (K6: build_info loads it to read the version)
 import urllib.parse
@@ -34,12 +35,11 @@ import psutil  # noqa: F401  (K6: gateway.status loads it to ask about a process
 import gateway.control_socket  # noqa: F401  (K6: update_receipt loads it to ask a gateway)
 import gateway.status  # noqa: F401  (K6: update_receipt loads it to read a gateway's record)
 import hermes_cli.build_info  # noqa: F401  (K6: update_receipt loads it for the code identity)
-import hermes_cli.sqlite_safe_read  # noqa: F401  (K6: backup.py loads it when a copy fails)
 from hermes_cli.backup import (
-    _copy_quick_snapshot_files,
-    _iter_backup_files,
+    _SQLITE_HEADER,
     _quick_snapshot_candidates,
     _safe_copy_db,
+    _should_exclude,
 )
 from hermes_cli.profiles import _PROFILE_ID_RE
 from hermes_cli.update_receipt import collect_fleet_versions
@@ -54,6 +54,9 @@ STATE, CONFIG = "state", "config"
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _SNAPSHOT_NAME = re.compile(r"[0-9A-Za-z][0-9A-Za-z._-]*")
+# SQLite's sidecars, beside a database of any name. One copied beside a database's standalone copy
+# would be read into it at the next open, so none is ever copied.
+_SIDECARS = ("-wal", "-shm", "-journal")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -143,12 +146,14 @@ class ReleaseHostActions:
     # Snapshots (S-C).
 
     def take_snapshot(self, name: str) -> None:
-        """Copy every application database and file into state/NAME with backup.py's copiers.
+        """Copy every application database and file of each served home into state/NAME.
 
-        That is each served home's quick-snapshot set and every other database a full backup of
-        the home holds, such as the release record, the board registry and the cron queues. The
-        online copy reads each database through its write-ahead log, so the copy holds rows not
-        yet checkpointed. A file that is not copied fails the snapshot before it is published, and
+        That is the home's quick-snapshot set and every other SQLite database in it (`_inventory`),
+        such as the release record, the board registry, the cron queues, the metrics store and the
+        plugins' stores. backup.py's online copy reads each database through its write-ahead log
+        into one standalone image, which holds the rows not yet checkpointed, and no -wal, -shm or
+        -journal file is ever copied beside it. A directory that cannot be listed, a file that
+        cannot be read or a file that is not copied fails the snapshot before it is published, and
         only the owner can read the copies, whatever the umask or the snapshot root's access.
         """
 
@@ -156,13 +161,10 @@ class ReleaseHostActions:
             missing: list[str] = []
             for home in self._served_homes():
                 rel = home.relative_to(self.root_home)
-                wanted = [sub for _, sub, _ in _quick_snapshot_candidates(home)]
-                copied, _, _ = _copy_quick_snapshot_files(home, staging / rel, None)
-                missing += [(rel / sub).as_posix() for sub in wanted if sub not in copied]
-                for store in self._other_databases(home, set(wanted)):
-                    copy = staging / rel / store.relative_to(home)
+                for sub, (source, database) in sorted(self._inventory(home).items()):
+                    copy = staging / rel / sub
                     copy.parent.mkdir(parents=True, exist_ok=True)
-                    if not _safe_copy_db(store, copy):
+                    if not (_safe_copy_db(source, copy) if database else _copied(source, copy)):
                         missing.append(copy.relative_to(staging).as_posix())
             if missing:
                 raise RuntimeError(f"could not copy {', '.join(missing)}")
@@ -274,23 +276,38 @@ class ReleaseHostActions:
             if (home / name).is_file()
         ]
 
-    def _other_databases(self, home: Path, quick: set[str]) -> list[Path]:
-        """Every *.db that backup.py's full-backup walk keeps in the home, beyond its quick set.
+    def _inventory(self, home: Path) -> dict[str, tuple[Path, bool]]:
+        """Each file of the home that a state snapshot copies, by its path in the home, and
+        whether it is a database: the quick-snapshot set and every other database of the home.
 
-        Left out are the profiles under the root, each served one walked as its own home, the task
-        workspaces and attachments, which hold the tasks' files rather than the platform's stores,
-        and the checkout and the release snapshots themselves.
+        The walk for the databases keeps backup.py's walk policy: its excluded directories, its
+        rules for the top of a home and for files, and no links. It also leaves out the checkout
+        and the release snapshots and, at the root, the profiles, each served one walked as its own
+        home, and the tasks' workspaces and attachments. Any other directory of those names, such
+        as a plugin's, holds application data. A directory that cannot be listed or a file that
+        cannot be read raises; only a file gone since it was listed is passed over.
         """
-        apart = [self.snapshot_root.resolve(), self.checkout_path.resolve()]
-        return sorted(
-            path
-            for path, rel in _iter_backup_files(home, self.snapshot_root)
-            if path.suffix == ".db"
-            and rel.as_posix() not in quick
-            and not (home == self.root_home and rel.parts[0] == "profiles")
-            and {"workspaces", "attachments"}.isdisjoint(rel.parts)
-            and not any(path.resolve().is_relative_to(place) for place in apart)
-        )
+        found: dict[str, tuple[Path, bool]] = {}
+        for source, sub, _ in _quick_snapshot_candidates(home):
+            database = _database(source)
+            if database is not None:
+                found[sub] = (source, database)
+        base, at_root = home.resolve(), home == self.root_home
+        apart = {self.snapshot_root.resolve(), self.checkout_path.resolve()}
+        for top, dirs, files in os.walk(base, onerror=_raise):
+            here = Path(top)
+            rel = here.relative_to(base)
+            dirs[:] = [
+                name
+                for name in dirs
+                if not _should_exclude(rel / name)
+                and here / name not in apart
+                and not (at_root and (rel / name == Path("profiles") or _task_files(rel / name)))
+            ]
+            for name in files:
+                if not _should_exclude(rel / name) and _database(here / name, walked=True):
+                    found.setdefault((rel / name).as_posix(), (here / name, True))
+        return found
 
     # Readbacks.
 
@@ -333,6 +350,48 @@ def _full_sha(commit: str) -> str:
     if not _FULL_SHA.fullmatch(commit):
         raise ValueError(f"not a full commit name: {commit!r}")
     return commit
+
+
+def _raise(error: OSError) -> None:
+    raise error  # a directory that cannot be listed would leave stores out of the snapshot
+
+
+def _database(path: Path, *, walked: bool = False) -> bool | None:
+    """Whether a listed file is a database by backup.py's rule: a .db name or SQLite's header.
+
+    None for a file that is not copied at all: a sidecar, a file gone since it was listed and, in
+    the walk, a link or a file that is not regular, which backup.py's walk leaves out too. Any
+    other error reading the file raises.
+    """
+    if path.name.endswith(_SIDECARS):
+        return None
+    try:
+        if walked and not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        if path.suffix == ".db":
+            return True
+        with open(path, "rb") as file:
+            return file.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER
+    except FileNotFoundError:
+        return None
+
+
+def _task_files(rel: Path) -> bool:
+    """The tasks' workspaces or attachments of a root (kanban_db.py): kanban/NAME for the default
+    board and kanban/boards/SLUG/NAME for the others. They hold the tasks' files, not stores."""
+    *place, name = rel.parts
+    return name in ("workspaces", "attachments") and (
+        place == ["kanban"] or (len(place) == 3 and place[:2] == ["kanban", "boards"])
+    )
+
+
+def _copied(source: Path, copy: Path) -> bool:
+    """Copy a file that is no database, as backup.py's quick snapshot does."""
+    try:
+        shutil.copy2(source, copy)
+    except OSError:
+        return False
+    return True
 
 
 def _answers_ok(url: str) -> bool:

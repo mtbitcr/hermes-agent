@@ -25,9 +25,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli import build_info, release_host_actions
+from hermes_cli import backup, build_info, release_host_actions
 from hermes_cli.release_host_actions import ReleaseHostActions
 from hermes_constants import mark_named_profile_deleted
+from plugins.plugin_storage import plugin_db
 
 # Stand-in unit names, so no call could reach a real unit even by mistake.
 UNITS = {
@@ -210,10 +211,13 @@ def test_state_snapshot_copies_every_database_consistently(tmp_path):
     assert (state / "newer" / "state.db").is_file()
 
 
-def wal_database(path: Path, rows: int) -> sqlite3.Connection:
-    """A database in write-ahead-log mode whose rows stay in its log while the writer is open."""
+def wal_database(
+    path: Path, rows: int, writer: sqlite3.Connection | None = None
+) -> sqlite3.Connection:
+    """A database in write-ahead-log mode whose rows stay in its log while the writer is open.
+    The writer may be one that the store's own code opened."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    writer = sqlite3.connect(path)
+    writer = sqlite3.connect(path) if writer is None else writer
     writer.execute("PRAGMA journal_mode=WAL")
     writer.execute("PRAGMA wal_autocheckpoint=0")
     writer.execute("CREATE TABLE notes (body TEXT)")
@@ -222,10 +226,29 @@ def wal_database(path: Path, rows: int) -> sqlite3.Connection:
     return writer
 
 
+def make_store(root: Path, rel: str, rows: int, monkeypatch) -> sqlite3.Connection:
+    """The store at rel with its rows still in its log. A plugin's store is opened by plugin
+    storage itself (plugins/plugin_storage.py), in the home that holds it."""
+    home, _, plugin = rel.partition("plugin-data/")
+    if not plugin:
+        return wal_database(root / rel, rows)
+    with monkeypatch.context() as patch:
+        patch.setenv("HERMES_HOME", str(root / home))
+        return wal_database(root / rel, rows, plugin_db(*plugin.split("/")))
+
+
+def published(snapshot: Path) -> dict[str, bytes]:
+    """Every file of a snapshot with its bytes, by its path in it. Read it before a copy is
+    opened: opening one makes the copy's own sidecars."""
+    files = filter(Path.is_file, snapshot.rglob("*"))
+    return {path.relative_to(snapshot).as_posix(): path.read_bytes() for path in files}
+
+
 # Every application store of a root with two boards and one served profile, where the release
 # record (release_ledger.py), the board registry, its removal archive and the boards (kanban_db.py),
-# the cron queues (cron/), the hosted rooms (gateway/hosted_rooms.py), a plugin's data
-# (plugins/plugin_storage.py) and the profile's own state keep them.
+# the cron queues (cron/), the hosted rooms (gateway/hosted_rooms.py), the metrics store
+# (observability/shared_metrics.py), plugins' stores under any name, including plugins named like
+# task payloads (plugins/plugin_storage.py), and the profile's own state keep them.
 STORES = (
     "state.db",
     "shared-state.db",
@@ -236,14 +259,22 @@ STORES = (
     "kanban/board_removal_archive.db",
     "kanban/boards/sample/kanban.db",
     "kanban/boards/other/kanban.db",
-    "plugin-data/sample/data.db",
+    "telemetry/shared_metrics/metrics.sqlite3",
+    "plugin-data/ordinary/data.db",
+    "plugin-data/ordinary/facts.sqlite",
+    "plugin-data/attachments/data.db",
+    "plugin-data/workspaces/data.db",
     "profiles/coder/state.db",
     "profiles/coder/cron/delivery_records.db",
+    "profiles/coder/telemetry/shared_metrics/metrics.sqlite3",
 )
-# Databases inside the root that are no application store: a task's workspace, the checkout and
-# the release snapshots.
+# Databases inside the root that are no application store: the tasks' workspaces and attachments
+# of the default board and of another board (kanban_db.py), the checkout and the release snapshots.
 NOT_STORES = (
+    "kanban/workspaces/t_root/app.db",
+    "kanban/attachments/t_root/upload.sqlite3",
     "kanban/boards/sample/workspaces/t_worker/app.db",
+    "kanban/boards/sample/attachments/t_worker/upload.sqlite3",
     "work/hermes/tests/fixture.db",
     "release-snapshots/state/OLD/state.db",
 )
@@ -251,13 +282,17 @@ NOT_STORES = (
 
 def test_state_snapshot_reaches_every_store_from_a_worker_environment(tmp_path, monkeypatch):
     root = tmp_path / "root"
-    writers = [wal_database(root / rel, rows) for rows, rel in enumerate(STORES, start=1)]
+    writers = [
+        make_store(root, rel, rows, monkeypatch) for rows, rel in enumerate(STORES, start=1)
+    ]
     for rel in NOT_STORES:
         wal_database(root / rel, 1).close()
-    # What the dispatcher gives a worker: its own board and task, and a profile home.
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(root / "kanban" / "boards" / "sample" / "kanban.db"))
+    # What the dispatcher gives a worker: its own board, task and workspaces, and a profile home.
+    board = root / "kanban" / "boards" / "sample"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(board / "kanban.db"))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "sample")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(board / "workspaces"))
     monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "coder"))
     try:
         assert all((root / f"{rel}-wal").stat().st_size > 0 for rel in STORES)
@@ -269,8 +304,8 @@ def test_state_snapshot_reaches_every_store_from_a_worker_environment(tmp_path, 
             writer.close()
 
     saved = root / "release-snapshots" / "state" / "NEW"
-    copies = sorted(path.relative_to(saved).as_posix() for path in saved.rglob("*.db"))
-    assert copies == sorted(STORES)  # against the independent count of the stores made above
+    # Against the independent count of the stores made above: no other file and no sidecar.
+    assert sorted(published(saved)) == sorted(STORES)
     for rows, rel in enumerate(STORES, start=1):
         with contextlib.closing(sqlite3.connect(saved / rel)) as copy:
             assert copy.execute("SELECT count(*) FROM notes").fetchone() == (rows,), rel
@@ -292,6 +327,74 @@ def test_state_snapshot_is_not_published_when_a_file_is_not_copied(tmp_path, mon
     with pytest.raises(RuntimeError, match="config.yaml"):
         make_actions(tmp_path).take_snapshot("NEW")
     assert not (tmp_path / "snapshots" / "state" / "NEW").exists()
+
+
+def test_state_snapshot_is_not_published_when_a_directory_cannot_be_listed(tmp_path, monkeypatch):
+    state, native = tmp_path / "snapshots" / "state", tmp_path / "root" / "plugin-data" / "native"
+    wal_database(native / "data.db", 3).close()
+    actions = make_actions(tmp_path)
+    actions.take_snapshot("OLD")  # the control: listed, the subtree's database is saved
+    earlier = published(state / "OLD")
+    assert list(earlier) == ["plugin-data/native/data.db"]
+    denied, real_scandir = os.path.realpath(native), os.scandir
+
+    def scandir(path="."):
+        if not isinstance(path, int) and os.path.realpath(path) == denied:
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    with pytest.raises(PermissionError, match="native"):
+        actions.take_snapshot("NEW")
+    assert not (state / "NEW").exists()
+    assert published(state / "OLD") == earlier
+
+
+def test_state_snapshot_never_pairs_a_safe_copy_with_later_sidecars(tmp_path, monkeypatch):
+    board = tmp_path / "root" / "kanban" / "boards" / "example"
+    board.mkdir(parents=True)
+    live = board / "kanban.db"
+    # A real WAL writer, the tables x and y on pages of their own: (1,1), then (2,2) at once.
+    writer = sqlite3.connect(live, isolation_level=None)
+    writer.executescript(
+        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE x (v); CREATE TABLE"
+        " y (v); BEGIN; INSERT INTO x VALUES (1); INSERT INTO y VALUES (1); COMMIT;"
+        " BEGIN; UPDATE x SET v = 2; UPDATE y SET v = 2; COMMIT;"
+    )
+    notes = wal_database(board / "notes.sqlite3", 5)  # another database name, rows in its log
+    real_copy, moved = backup._safe_copy_db, []
+
+    def copy_then_write(src, dst, **options):
+        done = real_copy(src, dst, **options)
+        if not moved and Path(src).samefile(live):  # right after the safe copy of the board
+            moved.append(src)
+            writer.executescript(
+                "BEGIN; UPDATE x SET v = 1; UPDATE y SET v = 1; COMMIT;"
+                " PRAGMA wal_checkpoint(TRUNCATE); UPDATE x SET v = 3;"
+            )
+        return done
+
+    for module in (release_host_actions, backup):
+        monkeypatch.setattr(module, "_safe_copy_db", copy_then_write)
+    try:
+        make_actions(tmp_path).take_snapshot("NEW")
+    finally:
+        writer.close()
+        notes.close()
+
+    def read(path: Path) -> tuple:
+        with contextlib.closing(sqlite3.connect(path)) as db:
+            return db.execute("SELECT (SELECT v FROM x), (SELECT v FROM y)").fetchone()
+
+    saved = tmp_path / "snapshots" / "state" / "NEW" / "kanban" / "boards" / "example"
+    names = sorted(published(saved))  # before a copy is opened
+    with contextlib.closing(sqlite3.connect(saved / "notes.sqlite3")) as copy:
+        rows = copy.execute("SELECT count(*) FROM notes").fetchone()
+    assert moved
+    # The safe image alone, as it was copied, with every row of the other database's log.
+    assert (names, read(saved / "kanban.db"), rows, read(live)) == (
+        ["kanban.db", "notes.sqlite3"], (2, 2), (5,), (3, 1)
+    )
 
 
 @contextlib.contextmanager
