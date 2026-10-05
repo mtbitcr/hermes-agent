@@ -28,7 +28,6 @@ import pytest
 from hermes_cli import backup, build_info, release_host_actions
 from hermes_cli.release_host_actions import ReleaseHostActions
 from hermes_constants import mark_named_profile_deleted
-from plugins.plugin_storage import plugin_db
 
 # Stand-in unit names, so no call could reach a real unit even by mistake.
 UNITS = {
@@ -50,27 +49,36 @@ def make_actions(tmp_path: Path, **values) -> ReleaseHostActions:
     return ReleaseHostActions(**{**settings, **values})
 
 
-# The stand-in user manager records every call. "reloading" exits 0 like the real is-active, but
-# it is not the answer active.
+# The stand-in user manager records every call. Only the unit named in STAND_IN_ACTIVE is active,
+# so by default every unit is stopped. "reloading" exits 0 like the real is-active, but it is not
+# the answer active.
 STAND_IN_SYSTEMCTL = """#!/bin/sh
 printf '%s\\n' "$*" >> "$STAND_IN_CALLS"
 case "$*" in
-  "--user is-active stand-in-gateway") echo active ;;
-  "--user is-active stand-in-serve") echo reloading ;;
+  "--user is-active $STAND_IN_ACTIVE") echo active ;;
+  "--user is-active $STAND_IN_RELOADING") echo reloading ;;
   "--user is-active "*) echo inactive; exit 3 ;;
   "--user start stand-in-tunnel") echo "Job for stand-in-tunnel.service failed." >&2; exit 1 ;;
 esac
 """
 
 
-def test_units_are_driven_only_through_the_user_manager(tmp_path, monkeypatch):
+@pytest.fixture(autouse=True)
+def calls(tmp_path, monkeypatch) -> Path:
+    """Every test runs with the stand-in user manager first on PATH, so none can reach a real
+    manager or unit: a state snapshot asks it first. Returns the file of its recorded calls."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "systemctl").write_text(STAND_IN_SYSTEMCTL)
     (bin_dir / "systemctl").chmod(0o755)
-    calls = tmp_path / "calls"
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("STAND_IN_CALLS", str(calls))
+    monkeypatch.setenv("STAND_IN_CALLS", str(tmp_path / "calls"))
+    return tmp_path / "calls"
+
+
+def test_units_are_driven_only_through_the_user_manager(tmp_path, monkeypatch, calls):
+    monkeypatch.setenv("STAND_IN_ACTIVE", "stand-in-gateway")
+    monkeypatch.setenv("STAND_IN_RELOADING", "stand-in-serve")
 
     def recorded() -> list[str]:
         return calls.read_text().splitlines() if calls.exists() else []
@@ -182,19 +190,11 @@ def test_state_snapshot_copies_every_database_consistently(tmp_path):
     }
     for rel, data in configs.items():
         (root / rel).write_bytes(data)
-    writer = sqlite3.connect(root / "state.db")
-    writer.execute("PRAGMA journal_mode=WAL")
-    writer.execute("PRAGMA wal_autocheckpoint=0")
-    writer.execute("CREATE TABLE notes (body TEXT)")
-    writer.executemany("INSERT INTO notes VALUES (?)", [(f"note {n}",) for n in range(100)])
-    writer.commit()
+    wal_database(root / "state.db", 100)
+    assert (root / "state.db-wal").stat().st_size > 0  # the rows are still in the log
     actions = make_actions(tmp_path)
-    try:
-        assert (root / "state.db-wal").stat().st_size > 0  # the rows are still in the log
-        actions.take_snapshot("older")
-        actions.take_snapshot("newer")
-    finally:
-        writer.close()
+    actions.take_snapshot("older")
+    actions.take_snapshot("newer")
 
     state = tmp_path / "snapshots" / "state"
     with contextlib.closing(sqlite3.connect(state / "older" / "state.db")) as copy:
@@ -211,30 +211,38 @@ def test_state_snapshot_copies_every_database_consistently(tmp_path):
     assert (state / "newer" / "state.db").is_file()
 
 
-def wal_database(
-    path: Path, rows: int, writer: sqlite3.Connection | None = None
-) -> sqlite3.Connection:
-    """A database in write-ahead-log mode whose rows stay in its log while the writer is open.
-    The writer may be one that the store's own code opened."""
+# A writer of its own process that commits its rows and stops without closing, as a stopped unit
+# leaves its store: no transaction is open anywhere, and the rows stay in the log beside it.
+STOPPED_WRITER = """
+import os, sqlite3, sys
+from plugins.plugin_storage import plugin_db
+path, rows, plugin = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+writer = plugin_db(*plugin) if plugin else sqlite3.connect(path)
+writer.execute("PRAGMA journal_mode=WAL")
+writer.execute("PRAGMA wal_autocheckpoint=0")
+writer.execute("CREATE TABLE notes (body TEXT)")
+writer.executemany("INSERT INTO notes VALUES (?)", [(f"note {n}",) for n in range(rows)])
+writer.commit()
+os._exit(0)
+"""
+
+
+def wal_database(path: Path, rows: int, *plugin: str, home: Path | None = None) -> None:
+    """A database in write-ahead-log mode whose stopped writer left its rows in the log. The
+    writer may be the store's own code, plugin storage, in the home that holds the store."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    writer = sqlite3.connect(path) if writer is None else writer
-    writer.execute("PRAGMA journal_mode=WAL")
-    writer.execute("PRAGMA wal_autocheckpoint=0")
-    writer.execute("CREATE TABLE notes (body TEXT)")
-    writer.executemany("INSERT INTO notes VALUES (?)", [(f"note {n}",) for n in range(rows)])
-    writer.commit()
-    return writer
+    env = None if home is None else {**os.environ, "HERMES_HOME": str(home)}
+    writer = [sys.executable, "-c", STOPPED_WRITER, str(path), str(rows), *plugin]
+    subprocess.run(writer, check=True, cwd=Path(__file__).resolve().parents[2], env=env)
 
 
-def make_store(root: Path, rel: str, rows: int, monkeypatch) -> sqlite3.Connection:
+def make_store(root: Path, rel: str, rows: int) -> None:
     """The store at rel with its rows still in its log. A plugin's store in its own directory is
     opened by plugin storage itself (plugins/plugin_storage.py), in the home that holds it."""
     home, _, plugin = rel.partition("plugin-data/")
     if plugin.count("/") != 1:
         return wal_database(root / rel, rows)
-    with monkeypatch.context() as patch:
-        patch.setenv("HERMES_HOME", str(root / home))
-        return wal_database(root / rel, rows, plugin_db(*plugin.split("/")))
+    return wal_database(root / rel, rows, *plugin.split("/"), home=root / home)
 
 
 def published(snapshot: Path) -> dict[str, bytes]:
@@ -279,9 +287,8 @@ PLAIN_FILES = ("config.yaml", ".env", "profiles/coder/config.yaml", "logs/agent.
 
 def test_state_snapshot_copies_the_walks_list_from_a_worker_environment(tmp_path, monkeypatch):
     root = tmp_path / "root"
-    writers = [
-        make_store(root, rel, rows, monkeypatch) for rows, rel in enumerate(STORES, start=1)
-    ]
+    for rows, rel in enumerate(STORES, start=1):
+        make_store(root, rel, rows)
     for rel in PLAIN_FILES:
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
         (root / rel).write_text(f"{rel}\n")
@@ -294,12 +301,8 @@ def test_state_snapshot_copies_the_walks_list_from_a_worker_environment(tmp_path
     monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "coder"))
     saved = tmp_path / "snapshots" / "state" / "NEW"
     expected = walked(root, saved)
-    try:
-        assert all((root / f"{rel}-wal").stat().st_size > 0 for rel in STORES)
-        make_actions(tmp_path).take_snapshot("NEW")
-    finally:
-        for writer in writers:
-            writer.close()
+    assert all((root / f"{rel}-wal").stat().st_size > 0 for rel in STORES)
+    make_actions(tmp_path).take_snapshot("NEW")
 
     # Against the independent count: the walk's own list, which holds every store and file made.
     assert set(STORES) | set(PLAIN_FILES) <= set(expected)
@@ -326,18 +329,15 @@ ARTIFACT_LIKE = (
     "place", ["plugin-data/ordinary/", "profiles/coder/plugin-data/ordinary/"]
 )
 def test_state_snapshot_holds_a_store_named_like_an_artifact_when_the_walk_yields_it(
-    tmp_path, monkeypatch, place
+    tmp_path, place
 ):
     root, rels = tmp_path / "root", [place + name for name in ARTIFACT_LIKE]
-    writers = [make_store(root, rel, rows, monkeypatch) for rows, rel in enumerate(rels, start=1)]
+    for rows, rel in enumerate(rels, start=1):
+        make_store(root, rel, rows)
     saved = tmp_path / "snapshots" / "state" / "NEW"
     expected = walked(root, saved)
-    try:
-        assert all((root / f"{rel}-wal").stat().st_size > 0 for rel in rels)
-        make_actions(tmp_path).take_snapshot("NEW")
-    finally:
-        for writer in writers:
-            writer.close()
+    assert all((root / f"{rel}-wal").stat().st_size > 0 for rel in rels)
+    make_actions(tmp_path).take_snapshot("NEW")
 
     assert sorted(published(saved)) == expected
     assert [rel in expected for rel in rels] == [True, True, True, False]
@@ -363,19 +363,19 @@ STORE_NAMES = ("audit-wal", "audit-shm", "audit-journal", "facts.sqlite", "facts
     + [f"plugin-data/ordinary/{name}" for name in STORE_NAMES],
 )
 def test_state_snapshot_holds_a_plugin_store_exactly_when_the_walk_yields_it(
-    tmp_path, monkeypatch, rel
+    tmp_path, rel
 ):
     root = tmp_path / "root"
-    writer = make_store(root, rel, 3, monkeypatch)
+    make_store(root, rel, 3)
     saved = tmp_path / "snapshots" / "state" / "NEW"
     expected = walked(root, saved)
-    try:
-        assert (root / f"{rel}-wal").stat().st_size > 0
-        make_actions(tmp_path).take_snapshot("NEW")
-    finally:
-        writer.close()
+    assert (root / f"{rel}-wal").stat().st_size > 0
+    make_actions(tmp_path).take_snapshot("NEW")
 
-    assert sorted(published(saved)) == expected  # a store not named .db with its own log and index
+    files = published(saved)
+    assert sorted(files) == expected  # a store not named .db with its own log and index
+    if f"{rel}-wal" in expected:  # the log its stopped writer left, as it is beside its image
+        assert files[f"{rel}-wal"] == (root / f"{rel}-wal").read_bytes()
     if rel in expected:
         with contextlib.closing(sqlite3.connect(saved / rel)) as copy:
             assert copy.execute("SELECT count(*) FROM notes").fetchone() == (3,)
@@ -393,38 +393,32 @@ def test_state_snapshot_holds_a_plugin_store_exactly_when_the_walk_yields_it(
     ],
 )
 def test_state_snapshot_refuses_a_damaged_database_and_copies_a_file_without_the_header(
-    tmp_path, monkeypatch, rel
+    tmp_path, rel
 ):
     root, snapshots = tmp_path / "root", tmp_path / "snapshots"
-    make_store(root, rel, 3, monkeypatch).close()
+    (root / rel).parent.mkdir(parents=True)  # no log beside it, which could hold its pages
     header = backup._SQLITE_HEADER
     (root / rel).write_bytes(header + bytes(4096 - len(header)))  # the header, then no database
-    writer = wal_database(root / "state.db", 2)
+    wal_database(root / "state.db", 2)
     actions = make_actions(tmp_path)
-    try:
-        with pytest.raises(RuntimeError, match=f"could not copy {rel}$"):
-            actions.take_snapshot("NEW")
-        assert list(snapshots.rglob("*")) == [snapshots / "state"]  # nothing published or staged
-        (root / rel).write_bytes(bytes(4096))  # the header overwritten too: a file like any other
+    with pytest.raises(RuntimeError, match=f"could not copy {rel}$"):
         actions.take_snapshot("NEW")
-    finally:
-        writer.close()
+    assert list(snapshots.rglob("*")) == [snapshots / "state"]  # nothing published or staged
+    (root / rel).write_bytes(bytes(4096))  # the header overwritten too: a file like any other
+    actions.take_snapshot("NEW")
     assert published(snapshots / "state" / "NEW")[rel] == bytes(4096)
 
 
 def test_state_snapshot_inside_the_root_copies_the_walks_list_from_before_its_first_copy(tmp_path):
     root = tmp_path / "root"
-    writer = wal_database(root / "state.db", 2)
+    wal_database(root / "state.db", 2)
     (root / "config.yaml").write_bytes(b"model: root\n")
     actions = make_actions(tmp_path, snapshot_root=root / "release-snapshots")
     state = actions.snapshot_root / "state"
-    try:
-        actions.save_config_snapshot("CONFIG")
-        actions.take_snapshot("OLD")
-        expected = walked(root, state / "NEW")
-        actions.take_snapshot("NEW")
-    finally:
-        writer.close()
+    actions.save_config_snapshot("CONFIG")
+    actions.take_snapshot("OLD")
+    expected = walked(root, state / "NEW")
+    actions.take_snapshot("NEW")
 
     files = sorted(published(state / "NEW"))
     assert files == expected
@@ -438,7 +432,7 @@ def test_state_snapshot_is_not_published_when_a_file_is_not_copied(tmp_path, mon
     root = tmp_path / "root"
     root.mkdir()
     (root / "config.yaml").write_bytes(b"model: root\n")
-    wal_database(root / "state.db", 1).close()
+    wal_database(root / "state.db", 1)
     real_copy2 = shutil.copy2
 
     def refuse_config(src, dst, **options):
@@ -454,7 +448,7 @@ def test_state_snapshot_is_not_published_when_a_file_is_not_copied(tmp_path, mon
 
 def test_state_snapshot_of_a_missing_root_home_raises_and_publishes_nothing(tmp_path):
     snapshots = tmp_path / "snapshots"
-    wal_database(tmp_path / "root" / "state.db", 1).close()
+    wal_database(tmp_path / "root" / "state.db", 1)
     actions = make_actions(tmp_path)
     actions.take_snapshot("OLD")
     shutil.rmtree(tmp_path / "root")  # the walk would yield nothing: an empty snapshot
@@ -464,57 +458,22 @@ def test_state_snapshot_of_a_missing_root_home_raises_and_publishes_nothing(tmp_
     assert [path.name for path in (snapshots / "state").iterdir()] == ["OLD"]
 
 
-def test_state_snapshot_never_pairs_a_safe_copy_with_later_sidecars(tmp_path, monkeypatch):
-    board = tmp_path / "root" / "kanban" / "boards" / "example"
-    board.mkdir(parents=True)
-    live = board / "kanban.db"
-    # A real WAL writer, the tables x and y on pages of their own: (1,1), then (2,2) at once.
-    writer = sqlite3.connect(live, isolation_level=None)
-    writer.executescript(
-        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE x (v); CREATE TABLE"
-        " y (v); BEGIN; INSERT INTO x VALUES (1); INSERT INTO y VALUES (1); COMMIT;"
-        " BEGIN; UPDATE x SET v = 2; UPDATE y SET v = 2; COMMIT;"
-    )
-    notes = wal_database(board / "notes.sqlite3", 5)  # another database name, rows in its log
-    snapshot = tmp_path / "snapshots" / "state" / "NEW"
-    expected, real_copy, moved = walked(tmp_path / "root", snapshot), backup._safe_copy_db, []
+@pytest.mark.parametrize("role", ["gateway", "serve"])
+def test_state_snapshot_refuses_while_a_platform_unit_is_active(tmp_path, monkeypatch, role):
+    root, snapshots = tmp_path / "root", tmp_path / "snapshots"
+    wal_database(root / "state.db", 2)
+    (root / "config.yaml").write_bytes(b"model: root\n")
+    actions = make_actions(tmp_path)
+    monkeypatch.setenv("STAND_IN_ACTIVE", UNITS[role])
+    with pytest.raises(RuntimeError, match=f"the {role} unit is active"):
+        actions.take_snapshot("NEW")
+    assert not snapshots.exists()  # nothing copied, staged or even made
 
-    def copy_then_write(src, dst, **options):
-        done = real_copy(src, dst, **options)
-        if not moved and Path(src).samefile(live):  # right after the safe copy of the board
-            moved.append(src)
-            writer.executescript(
-                "BEGIN; UPDATE x SET v = 1; UPDATE y SET v = 1; COMMIT;"
-                " PRAGMA wal_checkpoint(TRUNCATE); UPDATE x SET v = 3;"
-            )
-        return done
-
-    for module in (release_host_actions, backup):
-        monkeypatch.setattr(module, "_safe_copy_db", copy_then_write)
-    try:
-        make_actions(tmp_path).take_snapshot("NEW")
-        log = (board / "notes.sqlite3-wal").read_bytes()  # as it was when it was copied
-    finally:
-        writer.close()
-        notes.close()
-
-    def read(path: Path) -> tuple:
-        with contextlib.closing(sqlite3.connect(path)) as db:
-            return db.execute("SELECT (SELECT v FROM x), (SELECT v FROM y)").fetchone()
-
-    files = published(snapshot)  # before a copy is opened
-    saved = snapshot / "kanban" / "boards" / "example"
-    with contextlib.closing(sqlite3.connect(saved / "notes.sqlite3")) as copy:
-        rows = copy.execute("SELECT count(*) FROM notes").fetchone()
-    assert moved
-    assert sorted(files) == expected
-    # The safe image alone, as it was copied. Another database name has its own log and index
-    # beside its image, the log as it was, and every row of that log.
-    names = ["kanban.db", "notes.sqlite3", "notes.sqlite3-shm", "notes.sqlite3-wal"]
-    assert (expected, read(saved / "kanban.db"), rows, read(live)) == (
-        [f"kanban/boards/example/{name}" for name in names], (2, 2), (5,), (3, 1)
-    )
-    assert files["kanban/boards/example/notes.sqlite3-wal"] == log
+    # The sandbox tunnel is no platform unit: the release keeps it up.
+    monkeypatch.setenv("STAND_IN_ACTIVE", UNITS["sandbox-tunnel"])
+    expected = walked(root, snapshots / "state" / "NEW")
+    actions.take_snapshot("NEW")
+    assert sorted(published(snapshots / "state" / "NEW")) == expected == ["config.yaml", "state.db"]
 
 
 @contextlib.contextmanager
@@ -532,7 +491,7 @@ def snapshot_beside_a_public_file(public: Path) -> Path:
     root, snapshots = public / "root", public / "snapshots"
     with umask(0o022):
         root.mkdir(mode=0o700)
-        wal_database(root / "state.db", 1).close()
+        wal_database(root / "state.db", 1)
         (root / "state.db").chmod(0o600)
         snapshots.mkdir()
         (snapshots / "placeholder.txt").write_text("public placeholder\n")

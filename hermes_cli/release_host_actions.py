@@ -38,6 +38,7 @@ import gateway.status  # noqa: F401  (K6: update_receipt loads it to read a gate
 import hermes_cli.build_info  # noqa: F401  (K6: update_receipt loads it for the code identity)
 from hermes_cli.backup import _SQLITE_HEADER, _iter_backup_files, _safe_copy_db
 from hermes_cli.profiles import _PROFILE_ID_RE
+from hermes_cli.release_runner import PLATFORM_UNITS
 from hermes_cli.sqlite_safe_read import has_live_connection, read_header_bytes_preopen
 from hermes_cli.update_receipt import collect_fleet_versions
 from hermes_constants import get_default_hermes_root, named_profile_is_deleted
@@ -150,7 +151,14 @@ class ReleaseHostActions:
         root home that is not a directory, or a listed file that is not copied, fails the snapshot
         before it is published, and only the owner can read the copies, whatever the umask or the
         snapshot root's access.
+
+        The runner takes it with the platform units stopped, so no platform writer is live beside
+        the copy. While the user manager answers active for one of them, the snapshot is refused
+        before anything is copied.
         """
+        for role in PLATFORM_UNITS:
+            if self.unit_active(role):
+                raise RuntimeError(f"the {role} unit is active: the state snapshot is refused")
         target = self._named(STATE, name)
         if not self.root_home.is_dir():  # the walk would yield nothing: an empty snapshot
             raise NotADirectoryError(f"the root home {self.root_home} is not a directory")
