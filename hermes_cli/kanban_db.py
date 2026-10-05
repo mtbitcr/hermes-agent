@@ -303,21 +303,22 @@ def _pin_new_card(
     max_runtime_seconds: Optional[int],
     integrates_parent_heads: bool,
     requires_review: bool,
-) -> tuple[Optional[str], Optional[str], Optional[int], bool, Optional[int]]:
+) -> tuple[Optional[str], Optional[str], Optional[int], bool, Optional[int], Optional[str]]:
     """Return a new card's ``(effort, lock, max_runtime_seconds, requires_review,
-    risk_tier)``.
+    risk_tier, pinned_effort)``.
 
     Only a card with a route lock is pinned; a CLI or other unlocked card keeps
     what its creator passed. The time box follows the card's kind of work, and
     a build is always reviewed (owner decision 4). The effort follows the
     card's risk tier, a new card without one counting as tier 2 (owner
     decision 3), and is sealed again on the same model. The tier the card
-    counts as is returned for its writer to record, so a review round trip
-    pins the same effort. Only new cards are pinned here. The rules live in
-    :mod:`hermes_cli.kanban_risk_tier`.
+    counts as is returned for its writer to record. ``pinned_effort`` is the
+    effort pinned here, recorded with the row so a review round trip keeps it;
+    it is None for an unlocked card. Only new cards are pinned here. The rules
+    live in :mod:`hermes_cli.kanban_risk_tier`.
     """
     if lock is None:
-        return effort, lock, max_runtime_seconds, requires_review, risk_tier
+        return effort, lock, max_runtime_seconds, requires_review, risk_tier, None
     kind = card_work_kind(assignee, owned_paths, execution_tier, integrates_parent_heads)
     tier = effective_risk_tier(risk_tier)
     pinned = pinned_reasoning_effort(tier, responsibility)
@@ -326,6 +327,7 @@ def _pin_new_card(
     return (
         pinned, lock, pinned_time_box_seconds(kind),
         requires_review or requires_independent_review(assignee, kind), tier,
+        pinned,
     )
 
 
@@ -16108,6 +16110,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- tier 2 and is treated as high risk (hermes_cli.kanban_risk_tier). It
     -- changes no routing, effort or time box.
     risk_tier            INTEGER,
+    -- The effort pinned from the risk tier when the card was created. NULL
+    -- for every card written before the pins and every unlocked card: a
+    -- recorded tier alone does not prove a pin, so such a card keeps each
+    -- role's own effort on a review round trip.
+    pinned_effort        TEXT,
     -- Discriminates ordinary work tasks ('work', the create_task default) from native
     -- recommendation cards (see create_recommendation). recommendation_* / target_profile /
     -- review_policy / provenance_* are populated only when task_kind='recommendation' (NULL otherwise).
@@ -17821,6 +17828,10 @@ def _migrate_add_optional_columns(
         # Approved-plan risk tier (see SCHEMA_SQL). Existing rows get NULL: no
         # tier is recorded, so they count as tier 2 and change no behaviour.
         _add_column_if_missing(conn, "tasks", "risk_tier", "risk_tier INTEGER")
+    if "pinned_effort" not in cols:
+        # Creation-time effort pin (see SCHEMA_SQL). Existing rows get NULL and
+        # keep each role's own effort on a review round trip.
+        _add_column_if_missing(conn, "tasks", "pinned_effort", "pinned_effort TEXT")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
@@ -19472,7 +19483,7 @@ def create_task(
         )
     (
         reasoning_effort, model_policy_lock, max_runtime_seconds, requires_review,
-        risk_tier,
+        risk_tier, pinned_effort,
     ) = _pin_new_card(
         assignee, provider_override, model_override, reasoning_effort,
         execution_tier, model_policy_lock, risk_tier, responsibility,
@@ -19769,8 +19780,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, execution_tier, model_policy_lock,
                         goal_mode, goal_max_turns, session_id, task_kind,
-                        owner_receipt_bound, requires_review, risk_tier
-                    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{gate_sql}
+                        owner_receipt_bound, requires_review, risk_tier, pinned_effort
+                    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{gate_sql}
                     """,
                     (
                         task_id,
@@ -19805,6 +19816,7 @@ def create_task(
                         1 if receipt_owned else 0,
                         1 if requires_review else 0,
                         risk_tier,
+                        pinned_effort,
                         *gate_params,
                     ),
                 )
@@ -21535,16 +21547,17 @@ def _live_policy_route_assignments(
     re-pin: the owner approved review for this exact card, so handing it to the
     reviewer and back is approved work, not a silent re-route.
 
-    A card with a recorded risk tier keeps the effort its tier pins, on the
-    new role's model, so the round-trip never moves it back to the role's
-    base effort (:mod:`hermes_cli.kanban_risk_tier`).
+    A card pinned at creation keeps its recorded pinned effort, on the new
+    role's model, so the round-trip never moves it back to the role's base
+    effort. A card without that record, also one with a tier recorded before
+    the pins, keeps each role's own effort (:mod:`hermes_cli.kanban_risk_tier`).
     """
     policy = _model_policy()
     tier = policy.normalize_execution_tier(row["execution_tier"])
     assignment = policy.resolve_task_assignment(target, tier)
     effort = assignment.reasoning_effort
-    if row["risk_tier"] is not None:
-        effort = pinned_reasoning_effort(row["risk_tier"], row["responsibility"])
+    if row["pinned_effort"] is not None:
+        effort = row["pinned_effort"]
     lock = mint_policy_lock(
         target,
         assignment.provider,
@@ -21658,7 +21671,7 @@ def role_transition_route(
     row = conn.execute(
         "SELECT assignee, execution_tier, model_policy_lock, model_override, "
         "provider_override, reasoning_effort, owner_receipt_bound, "
-        "requires_review, risk_tier, responsibility FROM tasks "
+        "requires_review, risk_tier, pinned_effort, responsibility FROM tasks "
         "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
@@ -30082,7 +30095,7 @@ def decompose_triage_task(
                     raise ValueError(f"child[{idx}] {exc}") from None
             (
                 reasoning_effort, model_policy_lock, max_runtime_seconds,
-                requires_review, risk_tier,
+                requires_review, risk_tier, pinned_effort,
             ) = _pin_new_card(
                 assignee, provider_override, model_override, reasoning_effort,
                 execution_tier, model_policy_lock, risk_tier, responsibility,
@@ -30139,8 +30152,8 @@ def decompose_triage_task(
                 " integrates_parent_heads, skills, model_override, provider_override, "
                 " reasoning_effort, execution_tier, model_policy_lock, "
                 " owner_receipt_bound, requires_review, risk_tier, park_generation, "
-                " created_at, created_by, max_runtime_seconds) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " created_at, created_by, max_runtime_seconds, pinned_effort) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -30167,6 +30180,7 @@ def decompose_triage_task(
                     now,
                     (author or "decomposer"),
                     max_runtime_seconds,
+                    pinned_effort,
                 ),
             )
             _append_event(
