@@ -231,8 +231,9 @@ def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional
     Returns the delivery row id, or ``None`` when delivery is off, the card
     carries no review requirement, or the approval proof refuses. A second call
     for the same source card and head returns the row the first one recorded.
-    Older rows of the source card are returned for changes, and a new approval
-    re-arms the row of its head while no pull request is recorded on it.
+    Every other row of the source card is returned for changes, and a new
+    approval re-arms the row of its head, parked or returned for changes, while
+    no pull request is recorded on it.
     """
     if not delivery_settings():
         return None
@@ -266,9 +267,10 @@ def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional
         # A new approval of a head with no pull request recorded re-arms its row
         # and ends any lease on it, so a pass still holding one stores nothing.
         conn.execute(
-            "UPDATE kanban_deliveries SET approval_run_id = ?, publish_refusal = NULL, "
-            "publish_lease = NULL, publish_lease_until = NULL WHERE source_task_id = ? "
-            "AND source_head = ? AND pull_request_number IS NULL AND approval_run_id IS NOT ?",
+            "UPDATE kanban_deliveries SET approval_run_id = ?, pull_request_state = NULL, "
+            "publish_refusal = NULL, publish_lease = NULL, publish_lease_until = NULL "
+            "WHERE source_task_id = ? AND source_head = ? AND pull_request_number IS NULL "
+            "AND approval_run_id IS NOT ?",
             (approval["run_id"], task_id, head, approval["run_id"]),
         )
         record = conn.execute(
@@ -276,10 +278,12 @@ def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional
             "WHERE source_task_id = ? AND source_head = ?",
             (task_id, head),
         ).fetchone()
+        # The approval is the source card's latest, so every other head of it,
+        # older or newer, is returned for changes.
         conn.execute(
             "UPDATE kanban_deliveries SET pull_request_state = 'returned_for_changes' "
-            "WHERE source_task_id = ? AND id < ?",
-            (task_id, record["id"]),
+            "WHERE source_task_id = ? AND source_head != ?",
+            (task_id, head),
         )
         return record["id"]
 
@@ -322,6 +326,13 @@ _LEASE_SECONDS = 600
 # Refusals that can pass on their own: nothing is stored, and the row is tried
 # again once its lease runs out. Any other refusal parks the row, recorded once.
 _RETRIED = frozenset({"delivery_disabled", "transport_failed", "lease_lost", "source_changed"})
+
+# Transport reasons that are GitHub's own answer, one the step cannot use: a
+# successful status whose body is not a JSON object or list, or a token of
+# another scope. They are refusals. Every other reason is a request that did not
+# complete, the transport's own refusal before any request, or a failure it does
+# not tell apart from a temporary one, so it is ``transport_failed``.
+_REFUSED_REASONS = frozenset({"bad_response", "token_scope_mismatch"})
 
 
 class PublishRefused(Exception):
@@ -420,21 +431,43 @@ def _one_read(conn: sqlite3.Connection):
             conn.execute("ROLLBACK")
 
 
+def _transport_refusal(error) -> PublishRefused:
+    """A transport failure, classified by its reason."""
+    if error.reason in _REFUSED_REASONS:
+        return PublishRefused(error.reason, "GitHub answered with a body the step cannot use")
+    return PublishRefused("transport_failed", error.reason)
+
+
 def _lease_refusal(error, code: str, detail: str) -> Exception:
     """A lease that GitHub refuses is the fence's ``code``; any other transport
-    failure is reported by its reason alone."""
+    failure is classified by its reason."""
     if error.reason == "push_lease_mismatch":
         return PublishRefused(code, detail)
-    return PublishRefused("transport_failed", error.reason)
+    return _transport_refusal(error)
 
 
 def _answered(answer: dict) -> dict:
     """GitHub's answer, read as evidence only when it is not a temporary one: a
-    rate limit (403, 429), a timeout (408) or an outage (5xx) proves nothing, so
-    it stores nothing and the row is tried again once its lease runs out."""
-    if answer["status"] in (403, 408, 429) or answer["status"] >= 500:
+    rate limit (429) or an outage (5xx) proves nothing, so it stores nothing and
+    the row is tried again once its lease runs out. Any other answer the step
+    cannot use is a refusal."""
+    if answer["status"] == 429 or answer["status"] >= 500:
         raise PublishRefused("transport_failed", f"GitHub answered {answer['status']}")
     return answer
+
+
+def _branch_head(github, branch: str) -> Optional[str]:
+    """The commit ``branch`` holds on GitHub, or ``None`` when GitHub answers 404.
+    Read through ``request``: the transport's ``branch_head`` raises one reason
+    for a temporary answer and for a malformed one alike."""
+    answer = _answered(github.request("GET", f"/repos/{github.repository}/git/ref/heads/{branch}"))
+    if answer["status"] == 404:
+        return None
+    target = answer["data"].get("object") if isinstance(answer["data"], dict) else None
+    sha = target.get("sha") if isinstance(target, dict) else None
+    if answer["status"] != 200 or not isinstance(sha, str) or not _SHA.fullmatch(sha):
+        raise PublishRefused("branch_unreadable", f"GitHub answered {answer['status']}")
+    return sha
 
 
 def _take_lease(db_path: Path) -> Optional[tuple]:
@@ -525,11 +558,10 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
     with kb.connect_closing(db_path=db_path) as conn, _one_read(conn):
         record, workdir, repository = _bind(conn, delivery_id, holder)
         source = record["source_task_id"]
-        if conn.execute(
-            "SELECT 1 FROM kanban_deliveries WHERE source_task_id = ? AND id > ?",
-            (source, record["id"]),
-        ).fetchall():
-            raise PublishRefused("superseded", f"a newer approved head of {source} has its own delivery")
+        # Each approval returns every other head of the source card for changes, so
+        # only the row of its latest approval is still pending.
+        if record["pull_request_state"] is not None:
+            raise PublishRefused("superseded", f"a later approval of {source} returned this head for changes")
         # Captured before the approval is proven, so the final write sees any later change.
         approved_source = _source_state(conn, source)
         approval = approval_facts(conn, source, record["source_head"])
@@ -573,7 +605,7 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
             "head": pull["head"].get("sha") if isinstance(pull.get("head"), dict) else None,
         } for pull in pulls]
         remote = {
-            "branch_head": github.branch_head(branch),  # None when GitHub has no such branch
+            "branch_head": _branch_head(github, branch),  # None when GitHub has no such branch
             "open_pulls": open_pulls,
         }
         decision = decide_publish(approval, ledger, remote)
@@ -627,14 +659,14 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
             reread = again["data"] if again["status"] == 200 and isinstance(again["data"], dict) else {}
             reread_head = reread["head"].get("sha") if isinstance(reread.get("head"), dict) else None
             reread_base = reread["base"].get("ref") if isinstance(reread.get("base"), dict) else None
-            if (reread.get("state"), reread_head, reread_base, github.branch_head(branch)) != (
+            if (reread.get("state"), reread_head, reread_base, _branch_head(github, branch)) != (
                     "open", head, _PULL_REQUEST_BASE, head):
                 raise PublishRefused(
                     "head_moved",
                     f"pull request {number} or {branch} is not open at {head} after the publish",
                 )
     except GitHubTransportError as error:
-        raise PublishRefused("transport_failed", error.reason) from None
+        raise _transport_refusal(error) from None
 
     with kb.connect_closing(db_path=db_path) as conn:
         with kb.write_txn(conn):

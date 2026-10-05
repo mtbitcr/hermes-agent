@@ -168,9 +168,10 @@ def _sql(kb, statement: str, *params):
     return rows
 
 
-def _rework(kb, repo, tid: str, commit: bool = True) -> str:
+def _rework(kb, repo, tid: str, commit: bool = True, restore: str = "") -> str:
     """The owner sends the approved card back, unless it is back already; the implementer builds
-    it again, with a new commit or without, and the reviewer approves again. Returns the head."""
+    it again, with a new commit, without one or back at the commit ``restore``, and the reviewer
+    approves again. Returns the head."""
     conn = kb.connect()
     try:
         if kb.get_task(conn, tid).status == "done":
@@ -181,7 +182,9 @@ def _rework(kb, repo, tid: str, commit: bool = True) -> str:
         assert kb.assign_task(conn, tid, IMPLEMENTER)
         run = kb.claim_task(conn, tid, claimer=f"{IMPLEMENTER}:1")
         workspace, _ = kb._resolve_worktree_workspace(run)
-        if commit:
+        if restore:
+            _git(workspace, "reset", "-q", "--hard", restore)
+        elif commit:
             (workspace / "src" / "impl" / "feature.py").write_text("ok = 2\n", encoding="utf-8")
             _git(workspace, "add", "src/impl/feature.py")
             _git(workspace, "commit", "-m", "fix: feature")

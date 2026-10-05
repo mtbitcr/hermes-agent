@@ -29,21 +29,25 @@ from tests.hermes_cli.test_kanban_delivery_github import (
 )
 
 PULLS = f"/repos/{REPO}/pulls"
+BRANCHES = f"/repos/{REPO}/git/ref/heads/"
 UNSTORED = (None,) * 4
 
 
 @pytest.fixture
 def github():
     """GitHub for one repository: the App's token, listing, creating and reading pull requests and
-    reading a branch, whose head is what the bare remote holds. ``fail`` replaces one answer."""
-    state = {"calls": [], "tokens": [], "pulls": [], "pushes": [], "on_create": None, "fail": {}}
+    reading a branch, whose head is what the bare remote holds. ``fail`` replaces one answer and
+    ``always`` every answer of a route; a status of None drops the connection without an answer."""
+    state = {"calls": [], "tokens": [], "pulls": [], "pushes": [], "on_create": None, "fail": {}, "always": {}}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
 
         def _reply(self, route, status, value):
-            status, value = state["fail"].pop(route, (status, value))
+            status, value = state["always"].get(route) or state["fail"].pop(route, (status, value))
+            if status is None:
+                return
             data = json.dumps(value).encode()
             self.send_response(status)
             self.send_header("Content-Length", str(len(data)))
@@ -82,10 +86,10 @@ def github():
                 return self._reply(("GET", path), 200, [self._pull(p) for p in state["pulls"]])
             if state["pulls"] and path == f"{PULLS}/41":
                 return self._reply(("GET", path), 200, self._pull(state["pulls"][0]))
-            sha = _remote_head(state["bare"], path.removeprefix(f"/repos/{REPO}/git/ref/heads/"))
+            sha = _remote_head(state["bare"], path.removeprefix(BRANCHES))
             if sha:
-                return self._reply(None, 200, {"object": {"type": "commit", "sha": sha}})
-            return self._reply(None, 404, {})
+                return self._reply(("GET", BRANCHES), 200, {"object": {"type": "commit", "sha": sha}})
+            return self._reply(("GET", BRANCHES), 404, {})
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -231,10 +235,10 @@ def test_a_second_pass_makes_no_github_write_and_appends_no_event(world, github)
             _events(kb, tid)) == before
 
 
-@pytest.mark.parametrize("failure", ["crash", "creation-503", "readback-503"])
+@pytest.mark.parametrize("failure", ["crash", "creation-503", "readback-503", "readback-429", "readback-dropped"])
 def test_a_crash_after_opening_the_pull_request_is_adopted_next_pass(world, github, monkeypatch, failure):
-    """GitHub opened the pull request, but the pass died or GitHub's answer was a temporary one:
-    nothing is stored, nothing is parked, and the pass after the lease adopts the pull request."""
+    """GitHub opened the pull request, but the pass died, GitHub's answer was a temporary one or
+    none came: nothing is stored, nothing is parked, and the pass after the lease adopts it."""
     kb, root, repo, bare = world
     from hermes_cli import kanban_delivery_github as transport
 
@@ -253,7 +257,9 @@ def test_a_crash_after_opening_the_pull_request_is_adopted_next_pass(world, gith
             _tick(kb)
         monkeypatch.setattr(transport.GitHubTransport, "request", request)
     else:
-        github["fail"] = {("POST", PULLS) if failure == "creation-503" else ("GET", f"{PULLS}/41"): (503, {})}
+        read, answer = failure.split("-")
+        github["fail"] = {("POST", PULLS) if read == "creation" else ("GET", f"{PULLS}/41"):
+                          (None, None) if answer == "dropped" else (int(answer), {})}
         _tick(kb)
     assert len(github["pulls"]) == 1 and _row(kb, head)[:4] == UNSTORED and _events(kb, tid) == []
     assert _row(kb, head)[6] is None
@@ -451,9 +457,17 @@ def test_delivery_off_or_dry_run_or_skipped_tick_publishes_nothing(world, github
 @pytest.mark.parametrize("case, code, calls", [
     ("foreign-commit-on-the-branch", "head_moved", 2),
     ("source-head-moved-before-github", "head_moved", 0),
-    ("malformed-pull-request-listing", "pulls_unreadable", 1),
+    ("listing 200 {}", "pulls_unreadable", 1),
+    ("listing 200 null", "bad_response", 1),
+    ("listing 200 7", "bad_response", 1),
+    ('listing 200 "open"', "bad_response", 1),
+    ("listing 403 {}", "pulls_unreadable", 1),
+    ('branch 200 {"object": {"type": "commit", "sha": "not-a-sha"}}', "branch_unreadable", 2),
+    ("readback 200 null", "bad_response", 4),
 ])
 def test_a_refusal_is_recorded_once_and_not_retried_every_tick(world, github, case, code, calls):
+    """Any other ``case`` is the one answer GitHub gives to that read every time: a successful
+    status with a body the step cannot use, or a 4xx. The readback follows the push and creation."""
     kb, root, repo, bare = world
     tid, head = _approved(kb, repo)
     if case == "foreign-commit-on-the-branch":
@@ -464,14 +478,17 @@ def test_a_refusal_is_recorded_once_and_not_retried_every_tick(world, github, ca
         outside = _git(repo, "commit-tree", f"{head}^{{tree}}", "-p", head, "-m", "outside")
         _sql(kb, "UPDATE tasks SET head_commit = ? WHERE id = ?", outside, tid)
     else:
-        github["fail"] = {("GET", PULLS): (200, {})}
+        read, status, body = case.split(" ", 2)
+        route = {"listing": ("GET", PULLS), "branch": ("GET", BRANCHES), "readback": ("GET", f"{PULLS}/41")}[read]
+        github["always"] = {route: (int(status), json.loads(body))}
 
     _tick(kb)
     _expire(kb)
     _tick(kb)
     _tick(kb)
 
-    assert len(github["calls"]) == calls and github["pushes"] == [] and github["pulls"] == []
+    writes = 1 if case.startswith("readback") else 0
+    assert (len(github["calls"]), len(github["pushes"]), len(github["pulls"])) == (calls, writes, writes)
     assert _row(kb, head) == (*UNSTORED, None, None, code)
     assert [(kind, payload["code"], payload["head"]) for kind, payload in _events(kb, tid)] == [
         ("delivery_refused", code, head)]
@@ -511,3 +528,31 @@ def test_a_returned_head_fast_forwards_the_same_pull_request(world, github, monk
         assert _remote_head(bare, branch) == second
         assert _row(kb, second) == (41, second, "open", branch, None, None, None)
         assert events == [("delivery_bound", second, None), ("delivery_published", second, "fast_forwarded")]
+
+
+def test_approving_an_older_head_again_re_arms_its_row_and_returns_the_newer_one(world, github):
+    """H1 is approved, then H2, then H1 again, before any publication: H1's row is pending again
+    and published, H2's row is returned for changes and never published, and a lease taken on
+    either row before the last approval stores nothing."""
+    kb, root, repo, bare = world
+    from hermes_cli import kanban_delivery as kd
+
+    tid, first = _approved(kb, repo)
+    old = kd._take_lease(kb.kanban_db_path())
+    second = _rework(kb, repo, tid)
+    newer = kd._take_lease(kb.kanban_db_path())
+    assert _rework(kb, repo, tid, restore=first) == first
+
+    assert (_row(kb, first), _row(kb, second)[2]) == ((None,) * 7, "returned_for_changes")
+    for leased, code in ((old, "lease_lost"), (newer, "superseded")):
+        with pytest.raises(kd.PublishRefused, match=code):
+            kd.publish_delivery(kb.kanban_db_path(), *leased)
+    assert github["calls"] == []
+    _tick(kb)
+    _expire(kb)
+    _tick(kb)
+
+    branch = "delivery/" + tid
+    assert github["pushes"] == [(branch, first, "")] and len(github["pulls"]) == 1
+    assert _row(kb, first) == (41, first, "open", branch, None, None, None)
+    assert _row(kb, second)[:4] == (None, None, "returned_for_changes", None) and _row(kb, second)[6] is None
