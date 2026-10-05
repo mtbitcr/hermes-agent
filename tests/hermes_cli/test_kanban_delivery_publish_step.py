@@ -556,3 +556,66 @@ def test_approving_an_older_head_again_re_arms_its_row_and_returns_the_newer_one
     assert github["pushes"] == [(branch, first, "")] and len(github["pulls"]) == 1
     assert _row(kb, first) == (41, first, "open", branch, None, None, None)
     assert _row(kb, second)[:4] == (None, None, "returned_for_changes", None) and _row(kb, second)[6] is None
+
+
+@pytest.mark.parametrize("path", ["create", "fast_forward"])
+def test_switching_delivery_off_before_a_github_write_publishes_nothing(world, github, monkeypatch, path):
+    """Delivery is switched off after the pass read the open pull requests and before its first
+    write: the pass pushes nothing, opens nothing and stores nothing, and it publishes once
+    delivery is on again."""
+    kb, root, repo, bare = world
+    from hermes_cli import kanban_delivery_github as transport
+
+    tid, first = _approved(kb, repo)
+    branch, head = "delivery/" + tid, first
+    if path == "fast_forward":
+        _tick(kb)
+        head = _rework(kb, repo, tid)
+    pushes, calls, events = list(github["pushes"]), len(github["calls"]), _events(kb, tid)
+    request = transport.GitHubTransport.request
+
+    def switch_off_after_the_listing(self, method, route, **options):
+        answer = request(self, method, route, **options)
+        if (method, route) == ("GET", PULLS):
+            _write_config(root, enabled=False)
+        return answer
+
+    monkeypatch.setattr(transport.GitHubTransport, "request", switch_off_after_the_listing)
+    _tick(kb)
+
+    assert github["pushes"] == pushes
+    assert [call for call in github["calls"][calls:] if call[0] == "POST"] == []
+    assert _remote_head(bare, branch) == (first if path == "fast_forward" else None)
+    assert _row(kb, head)[:4] == UNSTORED and _row(kb, head)[6] is None
+    assert _events(kb, tid) == events
+    monkeypatch.setattr(transport.GitHubTransport, "request", request)
+    _write_config(root, enabled=True)
+    _expire(kb)
+    _tick(kb)
+    assert _row(kb, head)[:4] == (41, head, "open", branch) and _remote_head(bare, branch) == head
+
+
+@pytest.mark.parametrize("remote, base", [
+    ("old_head", "placeholder-base"), ("new_head", "placeholder-base"), ("old_head", None)])
+def test_a_pull_request_on_another_base_is_never_updated_or_adopted(world, github, remote, base):
+    """The delivery's pull request was retargeted away from main, or lost its base, before the
+    returned head was published: the pass pushes nothing, binds nothing and parks the row once,
+    whether the branch still holds the old head or already holds the new one."""
+    kb, root, repo, bare = world
+    tid, first = _approved(kb, repo)
+    branch = "delivery/" + tid
+    _tick(kb)
+    second = _rework(kb, repo, tid)
+    github["pulls"][0]["base"] = base
+    if remote == "new_head":
+        _git(repo, "push", "-q", str(bare), f"{second}:refs/heads/{branch}")
+
+    _tick(kb)
+    _expire(kb)
+    _tick(kb)
+
+    assert github["pushes"] == [(branch, first, "")]
+    assert _remote_head(bare, branch) == (second if remote == "new_head" else first)
+    assert _row(kb, second) == (*UNSTORED, None, None, "wrong_base")
+    events = [(kind, payload["head"], payload.get("code")) for kind, payload in _events(kb, tid)][2:]
+    assert events == [("delivery_refused", second, "wrong_base")]
