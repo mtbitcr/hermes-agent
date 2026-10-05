@@ -130,10 +130,11 @@ class ReleaseHostActions:
     def checkout(self, commit: str) -> None:
         """Move the checkout to exactly the commit, with a detached head [U14].
 
-        Without --force no local change is ever dropped: git carries it over or refuses. The
-        guards found the checkout clean before the stop.
+        Without --force no local change is ever dropped: git carries it over or refuses. An
+        ignored file that the commit tracks makes git refuse too (--no-overwrite-ignore), because
+        git status does not show it. The guards found the checkout clean before the stop.
         """
-        self._git("checkout", "--detach", _full_sha(commit))
+        self._git("checkout", "--detach", "--no-overwrite-ignore", _full_sha(commit))
 
     def _git(self, *args: str) -> None:
         _run(["git", "-C", str(self.checkout_path), *args])
