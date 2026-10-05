@@ -180,6 +180,32 @@ def test_checkout_moves_a_clean_checkout_to_the_exact_commit(repos, tmp_path):
         assert git(repos.checkout, "rev-parse", "HEAD") == repos.second
 
 
+def test_checkout_refuses_to_overwrite_an_ignored_local_file(repos, tmp_path):
+    # An ignored file is not in git status, so a clean checkout can still hold one. When the new
+    # commit tracks that file, the move must refuse instead of replacing the file's bytes.
+    work = tmp_path / "work"
+    (work / ".gitignore").write_text("local.txt\n")
+    git(work, "add", ".gitignore")
+    git(work, "commit", "-q", "-m", "ignore local.txt")
+    prev = git(work, "rev-parse", "HEAD")
+    (work / "local.txt").write_text("release\n")
+    git(work, "add", "-f", "local.txt")
+    git(work, "commit", "-q", "-m", "track local.txt")
+    new = git(work, "rev-parse", "HEAD")
+    git(work, "push", "-q", str(tmp_path / "origin.git"), "main")
+    git(repos.checkout, "fetch", "-q", "origin")
+    git(repos.checkout, "checkout", "-q", "--detach", prev)
+    (repos.checkout / "local.txt").write_text("local\n")
+    assert git(repos.checkout, "status", "--porcelain") == ""
+    actions = make_actions(tmp_path, checkout=repos.checkout)
+
+    with pytest.raises(RuntimeError):
+        actions.checkout(new)
+
+    assert git(repos.checkout, "rev-parse", "HEAD") == prev
+    assert (repos.checkout / "local.txt").read_text() == "local\n"
+
+
 def test_state_snapshot_copies_every_database_consistently(tmp_path):
     root = tmp_path / "root"
     (root / "profiles" / "coder").mkdir(parents=True)
