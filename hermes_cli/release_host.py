@@ -65,38 +65,48 @@ _OPEN_RUNS_SQL = (
 # board files. A descriptor on a live board never opens in this process: closing it would drop
 # every SQLite lock this process's own connections hold on the file, and a connection here would
 # share their -shm and write its read marks. The child prints, per file, its rows, or null for a
-# board it cannot read. A file whose header is not SQLite 3 in rollback or WAL format never reaches
-# SQLite, which deletes a -wal beside an empty file. A WAL file is read under a read lock on the
-# bytes SQLite's shared lock covers, held as an open file description lock: it keeps every
-# connection from the exclusive lock it needs to fold a -wal back and remove it. With no -wal there
-# is nothing to replay, and the file is opened immutable, which opens no side file; a -wal there
-# after that read was created during it and fails the read. With a -wal, readonly_shm reads its
-# commits and writes to neither file, and a missing -shm fails the read. SQLite must have opened
-# the very file whose header was checked.
+# board it cannot read; a listed board without its file is one, as a missing file is no proof of
+# an empty board. Before its header is read, a file is held under a read lock on the bytes
+# SQLite's shared lock covers, an open file description lock kept until SQLite has closed it: it
+# keeps every connection from the exclusive lock it needs to commit in rollback mode, to change
+# the journal mode either way, and to fold a -wal back and remove it, so the header read holds for
+# the whole read. A file whose header is not SQLite 3 in rollback or WAL format never reaches
+# SQLite, which deletes a -wal beside an empty file. A WAL file with no -wal has nothing to replay
+# and is opened immutable, which opens no side file; a -wal there after that read was created
+# during it and fails the read. Otherwise readonly_shm reads the -wal's commits and writes to
+# neither file, and a missing -shm fails the read. The one file SQLite opens must be the very file
+# that was locked and checked, so the descriptors the child gains in opening it must name that
+# file and no other.
 _BOARD_READ = r"""
 import fcntl, json, os, sqlite3, struct, sys
 from pathlib import Path
 LOCK = struct.pack("hhqqi4x", fcntl.F_RDLCK, os.SEEK_SET, 0x40000002, 510, 0)
+def descriptors():
+    found = {}
+    for number in os.listdir("/proc/self/fd"):
+        try:
+            info = os.fstat(int(number))
+        except OSError:
+            continue
+        found[number] = (info.st_dev, info.st_ino)
+    return found
 def rows(path):
     try:
         fd = os.open(path, os.O_RDONLY)
-    except FileNotFoundError:
-        return []
     except OSError:
         return None
     try:
-        header = os.pread(fd, 100, 0)
+        fcntl.fcntl(fd, fcntl.F_OFD_SETLK, LOCK)
+        header, info = os.pread(fd, 100, 0), os.fstat(fd)
         if len(header) < 100 or header[:16] != b"SQLite format 3\0" or header[18:20] not in (b"\1\1", b"\2\2"):
             return None
-        wal = header[18:20] == b"\2\2"
-        if wal:
-            fcntl.fcntl(fd, fcntl.F_OFD_SETLK, LOCK)
-        immutable = wal and not os.path.exists(path + "-wal")
+        immutable = header[18:20] == b"\2\2" and not os.path.exists(path + "-wal")
         mode = "immutable=1" if immutable else "readonly_shm=1"
+        before = descriptors()
         conn = sqlite3.connect(f"{Path(path).as_uri()}?mode=ro&{mode}", uri=True)
         try:
-            opened, checked = os.stat(path), os.fstat(fd)
-            if (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
+            gained = {file for number, file in descriptors().items() if before.get(number) != file}
+            if gained != {(info.st_dev, info.st_ino)}:
                 return None
             found = conn.execute(sys.argv[1]).fetchall()
         finally:

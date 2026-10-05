@@ -76,6 +76,20 @@ try:
 except sqlite3.Error as exc:
     print(exc)
 """
+# A journal mode change in a process of its own: it tries at once to turn a rollback board into a
+# WAL board, and once closed records the name and bytes of every file beside the board.
+PROMOTER = """
+import json, sqlite3, sys
+from pathlib import Path
+conn = sqlite3.connect(sys.argv[1], timeout=0)
+try:
+    conn.execute("PRAGMA journal_mode=WAL").fetchall()
+except sqlite3.Error:
+    pass
+conn.close()
+files = {path.name: path.read_bytes().hex() for path in Path(sys.argv[1]).parent.iterdir() if path.is_file()}
+Path(sys.argv[2]).write_text(json.dumps(files), encoding="utf-8")
+"""
 
 
 @pytest.fixture(autouse=True)
@@ -211,15 +225,19 @@ def _tree_bytes(*roots):
     return tree
 
 
-def _before_board_open(monkeypatch, board, *hook):
-    """Runs the *hook* lines once in the reader's board-reading process, just before SQLite opens *board*."""
+def _before_board_open(monkeypatch, board, *hook, after=()):
+    """Runs the *hook* lines once in the reader's board-reading process, just before SQLite opens *board*,
+    and the *after* lines just after."""
     prelude = "\n".join((
         "import sqlite3",
         "def _connect(database, *args, _real=sqlite3.connect, **kwargs):",
-        f"    if database.startswith({board.resolve().as_uri()!r}):",
-        "        sqlite3.connect = _real",
-        *(f"        {line}" for line in hook),
-        "    return _real(database, *args, **kwargs)",
+        f"    if not database.startswith({board.resolve().as_uri()!r}):",
+        "        return _real(database, *args, **kwargs)",
+        "    sqlite3.connect = _real",
+        *(f"    {line}" for line in hook),
+        "    conn = _real(database, *args, **kwargs)",
+        *(f"    {line}" for line in after),
+        "    return conn",
         "sqlite3.connect = _connect",
     ))
     monkeypatch.setattr(release_host, "_BOARD_READ", f"{prelude}\n{release_host._BOARD_READ}")
@@ -380,6 +398,22 @@ def test_unreadable_board_counts_as_an_open_live_run(tmp_path, fence_home):
     assert kb.count_running_tasks_other_boards("default") == 0  # the host-cap count fails open (F18)
 
 
+@pytest.mark.parametrize("board", ["default", "beta"])
+def test_a_listed_board_without_its_file_counts_as_an_open_live_run(tmp_path, fence_home, board):
+    kb.init_db()
+    create_fenced_board("beta")
+    with closing(kb.connect(board=board)) as conn:
+        _open_run(conn, os.getpid())
+    host = _reader(tmp_path, fence_home)
+    assert _check(host, "G10") is False
+    # The board file goes away, and the board stays listed.
+    path = fence_home / "kanban.db" if board == "default" else fence_home / "kanban" / "boards" / board / "kanban.db"
+    path.rename(tmp_path / "kanban.db")
+    assert board in {entry["slug"] for entry in kb.list_boards(include_archived=True)}
+    assert {(run.run_id, run.worker_alive) for run in host.open_native_runs()} == {(f"{board}:unreadable", True)}
+    assert _check(host, "G10") is False
+
+
 def test_a_run_committed_between_wal_detection_and_open_fails_the_drain(tmp_path, fence_home, monkeypatch):
     kb.init_db()
     create_fenced_board("beta")
@@ -396,6 +430,27 @@ def test_a_run_committed_between_wal_detection_and_open_fails_the_drain(tmp_path
     assert _check(_reader(tmp_path, fence_home), "G10") is False
     assert Path(f"{beta_db}-wal").stat().st_size > 0
     assert [alive for _run_id, alive in _independent_open_runs(fence_home)] == [True]  # written once
+
+
+def test_a_board_replaced_while_sqlite_opens_it_fails_the_drain(tmp_path, fence_home, monkeypatch):
+    kb.init_db()
+    create_fenced_board("beta")
+    beta_db, clone, aside = fence_home / "kanban" / "boards" / "beta" / "kanban.db", tmp_path / "clone.db", tmp_path / "aside.db"
+    with closing(kb.connect(board="beta")) as conn:
+        _open_run(conn, os.getpid())
+    with closing(sqlite3.connect(beta_db)) as conn:  # a rollback board, and a copy of it without runs
+        conn.execute("PRAGMA journal_mode=DELETE")
+    clone.write_bytes(beta_db.read_bytes())
+    with closing(sqlite3.connect(clone)) as conn:
+        conn.execute("DELETE FROM task_runs")
+        conn.commit()
+    # The reader has checked the board. The board is moved aside and the copy put in its place,
+    # SQLite opens the copy, and the board is moved back before the reader looks again.
+    swap = (f"os.rename({str(beta_db)!r}, {str(aside)!r})", f"os.rename({str(clone)!r}, {str(beta_db)!r})")
+    back = (f"os.rename({str(beta_db)!r}, {str(clone)!r})", f"os.rename({str(aside)!r}, {str(beta_db)!r})")
+    _before_board_open(monkeypatch, beta_db, "import os", *swap, after=back)
+    assert _check(_reader(tmp_path, fence_home), "G10") is False
+    assert [alive for _run_id, alive in _independent_open_runs(fence_home)] == [True]  # the board keeps its run
 
 
 def test_reading_boards_keeps_the_write_lock_of_this_process(tmp_path, fence_home):
@@ -450,8 +505,8 @@ def test_reading_a_wal_board_changes_none_of_its_files(tmp_path, fence_home, mon
             assert proc.wait(timeout=120) == 0
             Path(f"{beta_db}-shm").unlink()
         if writer == "closing":  # then, as the board's last connection, it closes after the -wal check
-            close = f"os.write(os.open('/proc/{proc.pid}/fd/0', os.O_WRONLY), b'\\n')"
-            gone = f"select.select([os.pidfd_open({proc.pid})], [], [], 120)"
+            close = f"stdin = os.open('/proc/{proc.pid}/fd/0', os.O_WRONLY); os.write(stdin, b'\\n'); os.close(stdin)"
+            gone = f"pidfd = os.pidfd_open({proc.pid}); select.select([pidfd], [], [], 120); os.close(pidfd)"
             _before_board_open(monkeypatch, beta_db, "import os, select", close, gone)
         if writer in ("empty", "corrupt"):  # and the board file itself left empty, or corrupt
             beta_db.write_bytes(b"" if writer == "empty" else b"not a database\n" * 512)
@@ -465,6 +520,27 @@ def test_reading_a_wal_board_changes_none_of_its_files(tmp_path, fence_home, mon
     assert [alive for _run_id, alive in expected] == [True]
     # The committed run stays visible, or the board fails closed; either way the drain refuses.
     assert found in (expected, unreadable)
+
+
+def test_a_journal_mode_change_after_the_header_check_changes_no_board_file(tmp_path, fence_home, monkeypatch):
+    kb.init_db()
+    create_fenced_board("beta")
+    beta_db, promoted = fence_home / "kanban" / "boards" / "beta" / "kanban.db", tmp_path / "promoted.json"
+    with closing(kb.connect(board="beta")) as conn:
+        _open_run(conn, os.getpid())
+    with closing(sqlite3.connect(beta_db)) as conn:  # a rollback board
+        conn.execute("PRAGMA journal_mode=DELETE")
+    # The reader has checked the rollback header. Just before it opens the board, another process
+    # turns the board into a WAL board, or is kept from it, and closes.
+    promote = [sys.executable, "-c", PROMOTER, str(beta_db), str(promoted)]
+    _before_board_open(monkeypatch, beta_db, "import subprocess", f"subprocess.run({promote!r}, check=True, timeout=120)")
+    found = {(run.run_id, run.worker_alive) for run in _reader(tmp_path, fence_home).open_native_runs()}
+    # The reader created no -wal or -shm file and changed none.
+    files = {path.name: path.read_bytes().hex() for path in beta_db.parent.iterdir() if path.is_file()}
+    assert files == json.loads(promoted.read_text(encoding="utf-8"))
+    expected = _independent_open_runs(fence_home)
+    assert [alive for _run_id, alive in expected] == [True]
+    assert found in (expected, {("beta:unreadable", True)})  # a completed read, or the board fails closed
 
 
 def test_config_digests_cover_root_and_profiles_and_match_the_named_snapshot(
