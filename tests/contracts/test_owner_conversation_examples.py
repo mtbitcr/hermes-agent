@@ -20,7 +20,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.platforms import api_server
-from tests.contracts.conftest import OWNER_PAYLOADS
+from tests.contracts import conftest as contract
 from tests.gateway.test_api_server import (
     _create_app,
     _interrupt_owner_turn,
@@ -36,31 +36,6 @@ from tests.gateway.test_owner_turn_provider_unavailable import (
 )
 
 FAMILY = "owner_conversation"
-# Only the failure sentences are adapter constants. The rest are written out
-# where they are produced: the reply kinds ``owner_history_snapshot`` projects
-# (failures through ``_owner_failure_reply_is_projectable``), the outcomes of
-# ``acknowledge_owner_conversation_recovery``, the action table of
-# ``_handle_owner_conversation_authority``, the statuses ``_handle_responses``
-# and ``_write_sse_responses`` give a response, and the events they stream.
-REPLY_KINDS = {"question", "no_change", "proposal", "project_change_proposal", "failure"}
-FAILURE_SENTENCES = {
-    api_server._OWNER_INTERRUPTED_TURN_MESSAGE,
-    api_server._OWNER_REFUSED_TURN_MESSAGE,
-    api_server._OWNER_PROVIDER_UNAVAILABLE_TURN_MESSAGE,
-}
-RECOVERY_OUTCOMES = {"mismatch", "retired", "absent"}
-RESPONSE_STATUSES = {"queued", "in_progress", "completed", "failed", "incomplete"}
-STREAM_EVENTS = {
-    "response.created", "response.output_item.added", "response.output_text.delta",
-    "response.output_item.done", "response.output_text.done", "response.completed",
-    "response.failed",
-}
-AUTHORITY_ACTIONS = {"claim", "abandon", "attach", "complete", "release", "reconcile", "close"}
-VOCABULARIES = {
-    "reply_kind": REPLY_KINDS, "failure_sentence": FAILURE_SENTENCES,
-    "recovery_outcome": RECOVERY_OUTCOMES, "authority_action": AUTHORITY_ACTIONS,
-    "response_status": RESPONSE_STATUSES, "stream_event": STREAM_EVENTS,
-}
 QUESTION = {"schema_version": 1, "kind": "question", "message": "Which outcome first?"}
 
 
@@ -109,49 +84,6 @@ def _turn(conversation: str, previous=None, **extra) -> dict:
         "conversation": conversation, "store": True,
         "expected_previous_response_id": previous, **extra,
     }
-
-
-def _fields(record: dict):
-    """``(vocabulary, value)`` for each closed-vocabulary field of one record."""
-    if "kind" in record:  # an owner reply, wherever its JSON is carried
-        yield "reply_kind", record["kind"]
-        if record["kind"] == "failure":
-            yield "failure_sentence", record["message"]
-    if "outcome" in record:  # a recovery acknowledgement
-        yield "recovery_outcome", record["outcome"]
-    if record.get("object") == "hermes.response.owner_authority":
-        yield "authority_action", record["action"]
-    if record.get("object") == "response":  # ordinary, stored, or inside an event
-        yield "response_status", record["status"]
-    if "event" in record:  # a streamed event, whose data repeats its header's type
-        yield "stream_event", record["event"]
-        yield "stream_event", record["data"]["type"]
-        assert record["data"]["type"] == record["event"], record["event"]
-
-
-def _vocabularies(*answers) -> dict:
-    """The values each closed vocabulary takes anywhere in ``answers``, each checked
-    to belong to it, in every record, nested record and list item."""
-    seen: dict = {name: set() for name in VOCABULARIES}
-
-    def visit(value):
-        if isinstance(value, str) and value[:1] in ("{", "["):
-            try:
-                value = json.loads(value)
-            except ValueError:
-                return
-        if isinstance(value, dict):
-            for name, item in _fields(value):
-                assert item in VOCABULARIES[name], f"{name}: {item!r}"
-                seen[name].add(item)
-            value = list(value.values())
-        if isinstance(value, list):
-            for item in value:
-                visit(item)
-
-    for answer in answers:
-        visit(answer)
-    return seen
 
 
 async def _answer(response) -> dict:
@@ -243,23 +175,14 @@ async def test_the_history_examples_carry_every_reply_kind_and_handle(owner_payl
             live["owner_history_unavailable"] = await history(_name("1"))
 
     saved = {kind: owner_payload_example(FAMILY, kind, body) for kind, body in live.items()}
-    assert _vocabularies(live) == _vocabularies(saved)
 
     for answers in (live, saved):
-        turns = answers["history"]["body"]["data"] + [
-            answer["body"]["data"][-1] for answer in answers["history_failure_turns"]
-        ]
-        replies = [json.loads(turn["raphael"]) for turn in turns]
-        assert {reply["kind"] for reply in replies} == REPLY_KINDS
-        assert {
-            reply["message"] for reply in replies if reply["kind"] == "failure"
-        } == FAILURE_SENTENCES
         assert answers["history_empty"]["body"]["data"] == []
         assert answers["history_pending"]["body"]["pending"] is not None
         assert answers["history_recovery"]["body"]["recovery"] is not None
-        assert {
-            answer["body"]["outcome"] for answer in answers["recovery_acknowledgements"]
-        } == RECOVERY_OUTCOMES
+        # Each acknowledgement answers a different case.
+        assert len(contract.closed_values(
+            answers["recovery_acknowledgements"], ("outcome",))) == 3
         assert answers["proposal_consumption_refused"]["status"] == 409
         assert answers["owner_history_unavailable"]["body"]["error"]["code"] == (
             "owner_history_unavailable")
@@ -313,12 +236,8 @@ async def test_the_authority_examples_carry_every_answer(owner_payload_example):
             "reconcile", "release")]
 
     saved = owner_payload_example(FAMILY, "authority", live)
-    assert _vocabularies(live) == _vocabularies(saved)
     assert {answer["status"] for answer in refused} == {409}
     for answers in (live, saved):
-        assert {
-            answer["body"]["action"] for answer in answers if answer["status"] == 200
-        } == AUTHORITY_ACTIONS
         assert {answer["status"] for answer in answers} == {200, 409}
 
 
@@ -385,7 +304,6 @@ async def test_the_response_examples_carry_every_object_event_and_refusal(
         if event["event"] == "response.created"]
     assert len(set(ids)) == len(ids)
     saved = {kind: owner_payload_example(FAMILY, kind, body) for kind, body in live.items()}
-    assert _vocabularies(live) == _vocabularies(saved)
 
     for answers in (live, saved):
         assert {
@@ -395,10 +313,12 @@ async def test_the_response_examples_carry_every_object_event_and_refusal(
         assert answers["response_background_queued"]["body"]["status"] == "queued"
         assert answers["response_stored"]["body"]["status"] == "completed"
         assert answers["response_stored_incomplete"]["body"]["status"] == "incomplete"
-        assert {
-            event["event"] for kind in ("streamed_events", "streamed_failure_events")
+        # Each streamed event's data repeats its header's type.
+        assert all(
+            event["data"]["type"] == event["event"]
+            for kind in ("streamed_events", "streamed_failure_events")
             for event in answers[kind]
-        } == STREAM_EVENTS
+        )
         assert {
             answers[kind]["body"]["error"]["code"]: answers[kind]["status"] for kind in (
                 "idempotency_conflict", "owner_conversation_stale",
@@ -411,10 +331,37 @@ async def test_the_response_examples_carry_every_object_event_and_refusal(
 
 
 def test_the_conversation_examples_keep_to_every_closed_vocabulary():
-    """Each saved conversation example, read whole, uses only and all of each
-    vocabulary; the tests above relate each one to the live answers it was saved from."""
-    saved = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted((OWNER_PAYLOADS / FAMILY).glob("*.json"))
-    ]
-    assert _vocabularies(*saved) == VOCABULARIES
+    """The saved conversation examples, read together, take every value of each
+    row of the table; the fixture holds each one to its row."""
+    contract.assert_closed_vocabularies_covered(FAMILY)
+
+
+def _saved(record_kind: str):
+    path = contract.OWNER_PAYLOADS / FAMILY / f"{record_kind}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("case", ["live", "saved", "second_record"])
+def test_a_value_outside_its_row_fails_the_closed_vocabulary_check(case):
+    """One allowed value, changed in memory to one outside its row, fails the
+    check, which names the payload, the concrete path and the value: in a live
+    history's stored reply, in the saved response and in the second streamed event."""
+    if case == "live":
+        store = _make_adapter()._response_store
+        _seed(store, _name("1"), "resp_head_turn", [_QUESTION_REPLY])
+        kind, payload = "history", store.owner_history_snapshot(_name("1"))
+        value, where = "not_a_reply_kind", "data[0].raphael<json>.kind"
+        turn = payload["data"][0]
+        turn["raphael"] = json.dumps({**json.loads(turn["raphael"]), "kind": value})
+    elif case == "saved":
+        kind, value, where = "response", "not_a_response_status", "body.status"
+        payload = _saved(kind)
+        payload["body"]["status"] = value
+    else:
+        kind, value, where = "streamed_events", "response.not_an_event", "[1].data.type"
+        payload = _saved(kind)
+        payload[1]["data"]["type"] = value
+    label = "live" if case == "live" else "saved"
+    with pytest.raises(AssertionError) as failure:
+        contract.check_closed_vocabularies(label, FAMILY, kind, payload)
+    assert f"{label} {FAMILY}/{kind}: {where} = {value!r}" in str(failure.value)

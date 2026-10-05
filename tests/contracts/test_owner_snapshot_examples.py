@@ -23,16 +23,21 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
-from hermes_cli import kanban_db, owner_workspace as ow
+from hermes_cli import kanban_db, owner_workspace as ow, projects_db
 from hermes_constants import get_hermes_home
-from tests.contracts.conftest import OWNER_PAYLOADS
+from tests.contracts import conftest as contract
 from tests.gateway.test_api_server_owner_suggestion_decisions import (  # noqa: F401  (owner is a fixture)
     _project,
     _write_owner_workspace_config,
     owner,
 )
 from tests.gateway.test_api_server_runs import _capability_stopped_task
-from tests.hermes_cli.test_owner_project_removal import _real_board, _start_and_join
+from tests.hermes_cli.test_owner_project_removal import (
+    _call,
+    _n,
+    _real_board,
+    _start_and_join,
+)
 from tests.hermes_cli.test_owner_provider_wait import (  # noqa: F401  (root and clock are fixtures)
     STEWARD,
     _waiting_and_refused,
@@ -47,11 +52,6 @@ from tests.hermes_cli.test_owner_workspace import (
 )
 
 FAMILY = "owner_snapshot"
-# The board's states are kanban_db constants. The rest are written out where
-# they are produced: the steward states of ``project_steward_snapshot`` and
-# ``_deleted_project_steward``, and the receipt states of
-# ``_owner_project_run_projection``, ``_owner_project_runtime_and_cost`` and
-# ``_owner_project_capability``.
 V1 = ",".join((
     ow.OWNER_PROJECT_RUN_CONTEXT_CAPABILITY,
     ow.OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY,
@@ -59,72 +59,6 @@ V1 = ",".join((
     ow.PROVIDER_WAIT_CAPABILITY,
 ))
 V2 = f"{V1},{ow.OWNER_PROJECT_PLANNING_CONTEXT_V2_CAPABILITY}"
-STEWARD_STATES = {
-    "working", "waiting_for_approval", "waiting_for_you", "paused",
-    "needs_attention", "complete", "deleted",
-}
-RECEIPT_OUTCOMES = {"running", "completed", "attention", "waiting", "unknown"}
-REVIEW_STATES = {
-    kanban_db.REVIEW_STATE_AWAITING_REVIEW, kanban_db.REVIEW_STATE_CHANGES_REQUESTED,
-    kanban_db.REVIEW_STATE_APPROVED, kanban_db.REVIEW_STATE_NONE,
-}
-STOPPED_WORK = {
-    kanban_db.STOPPED_WORK_GAVE_UP, kanban_db.STOPPED_WORK_CAPABILITY,
-    ow._OWNER_STOPPED_WORK_PROVIDER_WAIT, kanban_db.STOPPED_WORK_NONE,
-}
-RETRY_ORIGINS = {
-    kanban_db.RETRY_ORIGIN_NONE, kanban_db.RETRY_ORIGIN_AUTOMATIC,
-    kanban_db.RETRY_ORIGIN_OWNER, kanban_db.RETRY_ORIGIN_UNATTRIBUTED,
-}
-COST_STATES = {"estimated", "exact", "reported", "included", "unknown"}
-KNOWN_OR_UNKNOWN = {"known", "unknown"}
-VOCABULARIES = {
-    "review_state": REVIEW_STATES, "stopped_work": STOPPED_WORK,
-    "retry_origin": RETRY_ORIGINS, "outcome": RECEIPT_OUTCOMES,
-    "runtime": KNOWN_OR_UNKNOWN, "capability": KNOWN_OR_UNKNOWN, "cost": COST_STATES,
-    "external_effect": {"unknown"}, "evidence": {"available"}, "owner_retry": {"requested"},
-    "steward": STEWARD_STATES,
-}
-
-
-def _fields(record: dict):
-    """``(vocabulary, value)`` for each closed-vocabulary field of one record."""
-    for key in ("review_state", "stopped_work", "retry_origin", "outcome"):
-        if key in record:  # a task, a run, or a run's receipt
-            yield key, record[key]
-    if "runtime" in record:  # a run's receipt
-        for key in ("runtime", "cost", "external_effect", "evidence", "owner_retry"):
-            if key in record:
-                yield key, record[key]["state"]
-        if "capability" in record["runtime"]:
-            yield "capability", record["runtime"]["capability"]["state"]
-    if "execution" in record:  # a steward
-        yield "steward", record["execution"]["state"]
-
-
-def _vocabularies(*answers) -> dict:
-    """The values each closed vocabulary takes anywhere in ``answers``, each checked
-    to belong to it, in every record, nested record and list item."""
-    seen: dict = {name: set() for name in VOCABULARIES}
-
-    def visit(value):
-        if isinstance(value, str) and value[:1] in ("{", "["):
-            try:
-                value = json.loads(value)
-            except ValueError:
-                return
-        if isinstance(value, dict):
-            for name, item in _fields(value):
-                assert item in VOCABULARIES[name], f"{name}: {item!r}"
-                seen[name].add(item)
-            value = list(value.values())
-        if isinstance(value, list):
-            for item in value:
-                visit(item)
-
-    for answer in answers:
-        visit(answer)
-    return seen
 
 
 def _app() -> web.Application:
@@ -152,10 +86,11 @@ def _slug(owner: ow.OwnerContext, project: dict) -> str:
     )
 
 
-def _task(board: str, project: dict, title: str) -> str:
+def _task(board: str, project: dict, title: str, **fields) -> str:
     with contextlib.closing(kanban_db.connect(board=board)) as conn:
         return kanban_db.create_task(
             conn, title=title, assignee="default", project_id=project["project_id"],
+            **fields,
         )
 
 
@@ -172,10 +107,13 @@ async def test_the_snapshot_examples_carry_every_task_state_and_capability(
     project = _project(owner, "Workshop Pilot")
     board, slug = project["board"], _slug(owner, project)
     approved = _task(board, project, "Review the approved outline")
+    archived = _task(board, project, "Draft the old agenda")
     with contextlib.closing(kanban_db.connect(board=board)) as conn:
         assert kanban_db.request_review(conn, approved, summary="Ready.")
-        # A completion promotes a given-up card back to ready, so it goes first.
+        # A completion or an archive promotes a given-up card back to ready, so
+        # they go first; an archived card stays in the planning context.
         assert kanban_db.complete_task(conn, approved, result="Approved.")
+        assert kanban_db.archive_task(conn, archived)
     # The breaker trips on every ready or review card, so this comes next.
     _gave_up_task(board, project["project_id"], "Print the workshop handouts")
     _capability_stopped_task(board, project["project_id"], "Connect the payment provider")
@@ -201,6 +139,11 @@ async def test_the_snapshot_examples_carry_every_task_state_and_capability(
             conn, working, "plan.md", b"# Plan\n", content_type="text/markdown",
             board=board, expected_run_id=run_id,
         )
+    # A card after unfinished work is planned, and one put off is scheduled.
+    _task(board, project, "Book the workshop room", parents=(working,))
+    scheduled = _task(board, project, "Send the invitations")
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        assert kanban_db.schedule_task(conn, scheduled, reason="After the venue answers.")
 
     async with TestClient(TestServer(_app())) as client:
         live = {
@@ -218,21 +161,14 @@ async def test_the_snapshot_examples_carry_every_task_state_and_capability(
         live["owner_workspace_not_enabled"] = await _snapshot(client, slug)
 
     saved = {kind: owner_payload_example(FAMILY, kind, body) for kind, body in live.items()}
-    assert _vocabularies(live) == _vocabularies(saved)
 
     for answers in (live, saved):
         tasks = _tasks(answers["project_snapshot"])
-        assert {task["review_state"] for task in tasks} == REVIEW_STATES
-        # The provider wait has its own example below.
-        assert {task["stopped_work"] for task in tasks} == (
-            STOPPED_WORK - {ow._OWNER_STOPPED_WORK_PROVIDER_WAIT})
         assert any("owner_wait" in task for task in tasks)
         assert not any("owner_wait" in task for task in _tasks(
             answers["project_snapshot_without_capabilities"]))
         data = answers["project_snapshot"]["body"]["data"]
         assert data["workers"] and data["attachments"]
-        assert {run["receipt"]["outcome"] for run in data["runs"]} <= RECEIPT_OUTCOMES
-        assert {run["retry_origin"] for run in data["runs"]} <= RETRY_ORIGINS
         for kind in ("project_snapshot", "project_snapshot_planning_context_v2"):
             assert "planning_context" in answers[kind]["body"]["data"]
         assert "planning_context" not in (
@@ -250,25 +186,41 @@ async def test_the_steward_examples_carry_every_steward_state(
     owner, owner_payload_example, monkeypatch,
 ):
     projects = {name: _project(owner, f"{name.title()} Pilot") for name in (
-        "fresh", "working", "complete", "paused", "attention", "waiting",
+        "fresh", "working", "complete", "paused", "finishing", "attention", "waiting",
     )}
     for name in ("working", "attention", "waiting"):
         kanban_db.write_board_dispatch_state(projects[name]["board"], dispatch_enabled=True)
     _gave_up_task(projects["attention"]["board"], projects["attention"]["project_id"],
                   "Print the handouts")
-    for name in ("working", "complete", "paused"):
+    for name in ("working", "complete", "paused", "finishing"):
         _task(projects[name]["board"], projects[name], "Draft the agenda")
     with contextlib.closing(kanban_db.connect(board=projects["complete"]["board"])) as conn:
         [done] = [task.id for task in kanban_db.list_tasks(conn)
                   if task.project_id == projects["complete"]["project_id"]]
         assert kanban_db.complete_task(conn, done, result="Done.")
-    kanban_db.write_board_metadata(
-        projects["paused"]["board"], dispatch_enabled=False, dispatch_paused_by_owner=True,
-    )
+    # A pause leaves the work already underway to finish.
+    with contextlib.closing(kanban_db.connect(board=projects["finishing"]["board"])) as conn:
+        [underway] = [task.id for task in kanban_db.list_tasks(conn)
+                      if task.project_id == projects["finishing"]["project_id"]]
+        assert kanban_db.claim_task(conn, underway) is not None
+        kanban_db._set_worker_pid(conn, underway, os.getpid())
+    for name in ("paused", "finishing"):
+        kanban_db.write_board_metadata(
+            projects[name]["board"], dispatch_enabled=False, dispatch_paused_by_owner=True,
+        )
     _capability_stopped_task(projects["waiting"]["board"],
                              projects["waiting"]["project_id"], "Connect the provider")
     project_id, deleted_slug = _real_board(monkeypatch)
     _start_and_join(project_id, "contract")
+    # A recoverable removal confirmed as permanent leaves no copy to restore.
+    project_id, permanent_slug = _real_board(monkeypatch)
+    _start_and_join(project_id, "contract")
+    with projects_db.connect_closing() as conn:
+        served = ow._project_removal_state(conn, project_id, permanent_slug)
+    assert _call(project_id, f"permanent{_n[0]}", "confirm_permanent",
+                 consequences_digest=served["consequences_digest"])["ok"]
+    for thread in list(ow._removal_background_threads):
+        thread.join(timeout=60)
 
     async with TestClient(TestServer(_app())) as client:
         live = [
@@ -276,15 +228,21 @@ async def test_the_steward_examples_carry_every_steward_state(
             for project in projects.values()
         ]
         deleted = await _snapshot(client, deleted_slug, V1)
+        permanent = await _snapshot(client, permanent_slug, V1)
 
     saved = owner_payload_example(FAMILY, "steward_states", live)
     saved_deleted = owner_payload_example(FAMILY, "deleted_project", deleted)
-    assert _vocabularies(live, deleted) == _vocabularies(saved, saved_deleted)
-    for stewards, removed in ((live, deleted), (saved, saved_deleted)):
-        states = [steward["execution"]["state"] for steward in stewards]
-        states.append(removed["body"]["data"]["steward"]["execution"]["state"])
-        assert set(states) == STEWARD_STATES
-        assert "removal_state" in removed["body"]["data"]
+    saved_permanent = owner_payload_example(FAMILY, "permanently_deleted_project", permanent)
+    for removed in (deleted, saved_deleted, permanent, saved_permanent):
+        data = removed["body"]["data"]
+        assert data["steward"]["removal_state"] == data["removal_state"]
+    for stewards in (live, saved):
+        summaries = [steward["execution"]["summary"] for steward in stewards]
+        assert len(set(summaries)) == len(stewards)
+    for removed in (permanent, saved_permanent):
+        assert removed["body"]["data"]["removal_state"]["restorable"] is False
+    for removed in (deleted, saved_deleted):
+        assert removed["body"]["data"]["removal_state"]["restorable"] is True
 
 
 @pytest.mark.asyncio
@@ -301,12 +259,11 @@ async def test_the_provider_wait_example_carries_the_held_card_and_its_waiting_r
         live = await _snapshot(client, scene["project"]["slug"], V1)
 
     saved = owner_payload_example(FAMILY, "provider_wait", live)
-    assert _vocabularies(live) == _vocabularies(saved)
     for answer in (live, saved):
-        stopped = {task["stopped_work"] for task in _tasks(answer)}
-        assert ow._OWNER_STOPPED_WORK_PROVIDER_WAIT in stopped and stopped <= STOPPED_WORK
-        outcomes = {run["receipt"]["outcome"] for run in answer["body"]["data"]["runs"]}
-        assert "waiting" in outcomes and outcomes <= RECEIPT_OUTCOMES
+        assert ow._OWNER_STOPPED_WORK_PROVIDER_WAIT in contract.closed_values(
+            _tasks(answer), ("stopped_work",))
+        assert "waiting" in contract.closed_values(
+            answer["body"]["data"]["runs"], ("receipt", "outcome"))
 
 
 def test_the_run_receipt_examples_carry_every_outcome_and_summary(owner_payload_example):
@@ -340,10 +297,6 @@ def test_the_run_receipt_examples_carry_every_outcome_and_summary(owner_payload_
     ]
 
     saved = owner_payload_example(FAMILY, "run_receipts", live)
-    assert _vocabularies(live) == _vocabularies(saved)
-    for runs in (live, saved):
-        assert {run["receipt"]["outcome"] for run in runs} == RECEIPT_OUTCOMES
-        assert {run["retry_origin"] for run in runs} == RETRY_ORIGINS
     assert {run["receipt"]["summary"] for run in saved} == {
         run["receipt"]["summary"] for run in live
     }
@@ -378,14 +331,8 @@ def test_the_run_receipt_route_examples_carry_every_runtime_and_cost_state(
     ]
 
     saved = owner_payload_example(FAMILY, "run_receipt_routes", live)
-    assert _vocabularies(live) == _vocabularies(saved)
     for runs in (live, saved):
         runtimes = [run["receipt"]["runtime"] for run in runs]
-        assert {runtime["state"] for runtime in runtimes} == {"known", "unknown"}
-        assert {run["receipt"]["cost"]["state"] for run in runs} == COST_STATES
-        assert {
-            runtime["capability"]["state"] for runtime in runtimes if "capability" in runtime
-        } == {"known", "unknown"}
         assert [
             "capability" in runtime for runtime in runtimes
         ] == [metadata["runtime_receipt"]["schema_version"] == 3 for metadata in receipts]
@@ -395,10 +342,39 @@ def test_the_run_receipt_route_examples_carry_every_runtime_and_cost_state(
 
 
 def test_the_snapshot_examples_keep_to_every_closed_vocabulary():
-    """Each saved snapshot example, read whole, uses only and all of each
-    vocabulary; the tests above relate each one to the live answers it was saved from."""
-    saved = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted((OWNER_PAYLOADS / FAMILY).glob("*.json"))
-    ]
-    assert _vocabularies(*saved) == VOCABULARIES
+    """The saved snapshot examples, read together, take every value of each
+    row of the table; the fixture holds each one to its row."""
+    contract.assert_closed_vocabularies_covered(FAMILY)
+
+
+def _saved(record_kind: str):
+    path = contract.OWNER_PAYLOADS / FAMILY / f"{record_kind}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("case", ["live", "saved", "second_record"])
+def test_a_value_outside_its_row_fails_the_closed_vocabulary_check(case):
+    """One allowed value, changed in memory to one outside its row, fails the
+    check, which names the payload, the concrete path and the value: in a live
+    run receipt, in the saved snapshot and in the second steward of a list."""
+    if case == "live":
+        kind, payload = "run_receipts", [ow._owner_project_run_projection(
+            _ended_run("completed", None), "Draft the workshop agenda", task_pin=None,
+            has_newer_run=False, run_context=True,
+        )]
+        record, key, where = payload[0]["receipt"], "outcome", "[0].receipt.outcome"
+    elif case == "saved":
+        kind = "project_snapshot"
+        payload = _saved(kind)
+        record, key = payload["body"]["data"]["runs"][0], "retry_origin"
+        where = "body.data.runs[0].retry_origin"
+    else:
+        kind = "steward_states"
+        payload = _saved(kind)
+        record, key, where = payload[1]["execution"], "state", "[1].execution.state"
+    label = "live" if case == "live" else "saved"
+    value = f"not_a_{key}"
+    record[key] = value
+    with pytest.raises(AssertionError) as failure:
+        contract.check_closed_vocabularies(label, FAMILY, kind, payload)
+    assert f"{label} {FAMILY}/{kind}: {where} = {value!r}" in str(failure.value)

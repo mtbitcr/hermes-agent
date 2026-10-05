@@ -221,6 +221,150 @@
     "tool_count": 1
   },
   {
+    "api_calls": 1,
+    "child_session_id": "session-1",
+    "cost_usd": 0.0,
+    "depth": 1,
+    "duration_seconds": 1.0,
+    "event": "subagent.complete",
+    "files_read": [
+      "plan.md"
+    ],
+    "files_written": [
+      "agenda.md"
+    ],
+    "goal": "Placeholder goal.",
+    "input_tokens": 1,
+    "model": "placeholder-model",
+    "output_tail": [
+      {
+        "is_error": false,
+        "preview": "Placeholder text.",
+        "tool": "read_file"
+      }
+    ],
+    "output_tokens": 1,
+    "parent_id": "parent-1",
+    "preview": "Placeholder summary.",
+    "reasoning_tokens": 0,
+    "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",
+    "status": "failed",
+    "subagent_id": "subagent-1",
+    "summary": "Placeholder summary.",
+    "task_count": 1,
+    "task_index": 0,
+    "timestamp": 1790000000.0,
+    "tool_count": 1
+  },
+  {
+    "api_calls": 1,
+    "child_session_id": "session-1",
+    "cost_usd": 0.0,
+    "depth": 1,
+    "duration_seconds": 1.0,
+    "event": "subagent.complete",
+    "files_read": [
+      "plan.md"
+    ],
+    "files_written": [
+      "agenda.md"
+    ],
+    "goal": "Placeholder goal.",
+    "input_tokens": 1,
+    "model": "placeholder-model",
+    "output_tail": [
+      {
+        "is_error": false,
+        "preview": "Placeholder text.",
+        "tool": "read_file"
+      }
+    ],
+    "output_tokens": 1,
+    "parent_id": "parent-1",
+    "preview": "Placeholder summary.",
+    "reasoning_tokens": 0,
+    "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",
+    "status": "interrupted",
+    "subagent_id": "subagent-1",
+    "summary": "Placeholder summary.",
+    "task_count": 1,
+    "task_index": 0,
+    "timestamp": 1790000000.0,
+    "tool_count": 1
+  },
+  {
+    "api_calls": 1,
+    "child_session_id": "session-1",
+    "cost_usd": 0.0,
+    "depth": 1,
+    "duration_seconds": 1.0,
+    "event": "subagent.complete",
+    "files_read": [
+      "plan.md"
+    ],
+    "files_written": [
+      "agenda.md"
+    ],
+    "goal": "Placeholder goal.",
+    "input_tokens": 1,
+    "model": "placeholder-model",
+    "output_tail": [
+      {
+        "is_error": false,
+        "preview": "Placeholder text.",
+        "tool": "read_file"
+      }
+    ],
+    "output_tokens": 1,
+    "parent_id": "parent-1",
+    "preview": "Placeholder summary.",
+    "reasoning_tokens": 0,
+    "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",
+    "status": "timeout",
+    "subagent_id": "subagent-1",
+    "summary": "Placeholder summary.",
+    "task_count": 1,
+    "task_index": 0,
+    "timestamp": 1790000000.0,
+    "tool_count": 1
+  },
+  {
+    "api_calls": 1,
+    "child_session_id": "session-1",
+    "cost_usd": 0.0,
+    "depth": 1,
+    "duration_seconds": 1.0,
+    "event": "subagent.complete",
+    "files_read": [
+      "plan.md"
+    ],
+    "files_written": [
+      "agenda.md"
+    ],
+    "goal": "Placeholder goal.",
+    "input_tokens": 1,
+    "model": "placeholder-model",
+    "output_tail": [
+      {
+        "is_error": false,
+        "preview": "Placeholder text.",
+        "tool": "read_file"
+      }
+    ],
+    "output_tokens": 1,
+    "parent_id": "parent-1",
+    "preview": "Placeholder summary.",
+    "reasoning_tokens": 0,
+    "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",
+    "status": "error",
+    "subagent_id": "subagent-1",
+    "summary": "Placeholder summary.",
+    "task_count": 1,
+    "task_index": 0,
+    "timestamp": 1790000000.0,
+    "tool_count": 1
+  },
+  {
     "delta": "Placeholder answer.",
     "event": "message.delta",
     "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",

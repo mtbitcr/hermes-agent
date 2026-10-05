@@ -33,7 +33,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from cron import jobs as cron_jobs
 from gateway.platforms import api_server
-from tests.contracts.conftest import OWNER_PAYLOADS
+from tests.contracts import conftest as contract
 from tests.gateway import test_api_server_runs as runs_tests
 from tests.gateway.test_api_server_runs import (  # noqa: F401  (an autouse fixture)
     _create_runs_app,
@@ -45,27 +45,6 @@ from tests.gateway.test_api_server_runs import (  # noqa: F401  (an autouse fixt
 from tools import approval as approval_mod
 
 FAMILY = "runs"
-# The adapter keeps no constant for these closed vocabularies: a run status is
-# what ``_set_run_status`` is called with, an event kind what
-# ``_make_run_event_callback`` and the run routes emit, an offered choice what
-# ``_approval_event_choices`` returns and an answer what ``_handle_run_approval``
-# allows; ``_handle_runs`` answers a started run, and ``_handle_stop_run`` a
-# stop, with an answer status.
-RUN_STATUSES = {
-    "queued", "running", "waiting_for_approval", "completed", "failed", "cancelled",
-    "stopping",
-}
-EVENT_KINDS = {
-    "tool.started", "tool.completed", "reasoning.available", "subagent.start",
-    "subagent.complete", "message.delta", "approval.request", "approval.responded",
-    "run.steered", "run.completed", "run.failed", "run.cancelled",
-}
-APPROVAL_CHOICES = {"once", "session", "always", "deny"}
-ANSWER_STATUSES = {"started", "stopping"}
-VOCABULARIES = {
-    "run_status": RUN_STATUSES, "event": EVENT_KINDS, "offered_choice": APPROVAL_CHOICES,
-    "answered_choice": APPROVAL_CHOICES, "answer_status": ANSWER_STATUSES,
-}
 FINISHED = {"completed", "failed", "cancelled"}
 OWNER_CONFIG = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
 # What the delegate tool's relay sends with each subagent event
@@ -84,6 +63,9 @@ SUBAGENT_RESULT = {
     "files_read": ["plan.md"], "files_written": ["agenda.md"], "cost_usd": 0.0,
     "output_tail": [{"tool": "read_file", "preview": "Placeholder text.", "is_error": False}],
 }
+# Each status a finished child reports (tools/delegate_tool_child_run.py
+# ``_build_result_entry`` and its timeout and error paths); one completion each.
+SUBAGENT_STATUSES = ("completed", "failed", "interrupted", "timeout", "error")
 
 
 def _recorded_statuses(adapter, monkeypatch) -> dict:
@@ -116,8 +98,9 @@ def _stub_agent(steered: threading.Event):
             progress("tool.completed", "read_file", None, None, duration=0.25, is_error=False)
             progress("reasoning.available", None, "Placeholder reasoning.")
             progress("subagent.start", None, "Placeholder goal.", None, **SUBAGENT)
-            progress("subagent.complete", None, "Placeholder summary.", None,
-                     **SUBAGENT, **SUBAGENT_RESULT)
+            for status in SUBAGENT_STATUSES:
+                progress("subagent.complete", None, "Placeholder summary.", None,
+                         **SUBAGENT, **{**SUBAGENT_RESULT, "status": status})
             kwargs["stream_delta_callback"]("Placeholder answer.")
             steered.wait(timeout=10)
             return {"final_response": "Placeholder answer."}
@@ -142,45 +125,6 @@ def _gated_agent(**_kwargs):
 
     agent.run_conversation.side_effect = _run_conversation
     return agent
-
-
-def _fields(record: dict):
-    """``(vocabulary, value)`` for each closed-vocabulary field of one record."""
-    if record.get("object") == "hermes.run":
-        yield "run_status", record["status"]
-    if set(record) == {"run_id", "status"}:  # the start and stop answers
-        yield "answer_status", record["status"]
-    if "event" in record:
-        yield "event", record["event"]
-    for choice in record.get("choices", ()):  # a pending approval, or its event
-        yield "offered_choice", choice
-    if "choice" in record:  # an answer, or the event that echoes it
-        yield "answered_choice", record["choice"]
-
-
-def _vocabularies(*answers) -> dict:
-    """The values each closed vocabulary takes anywhere in ``answers``, each checked
-    to belong to it, in every record, nested record and list item."""
-    seen: dict = {name: set() for name in VOCABULARIES}
-
-    def visit(value):
-        if isinstance(value, str) and value[:1] in ("{", "["):
-            try:
-                value = json.loads(value)
-            except ValueError:
-                return
-        if isinstance(value, dict):
-            for name, item in _fields(value):
-                assert item in VOCABULARIES[name], f"{name}: {item!r}"
-                seen[name].add(item)
-            value = list(value.values())
-        if isinstance(value, list):
-            for item in value:
-                visit(item)
-
-    for answer in answers:
-        visit(answer)
-    return seen
 
 
 async def _answer(response) -> dict:
@@ -286,16 +230,16 @@ async def test_the_run_examples_carry_every_status_event_and_answer(
     live["approval_response"] = live["approval_responses"][0]
     live.update({f"status_{status}": record for status, record in statuses.items()})
     saved = {kind: owner_payload_example(FAMILY, kind, body) for kind, body in live.items()}
-    assert _vocabularies(live) == _vocabularies(saved)
 
     for answers in (live, saved):
-        assert {
-            record["status"] for kind, record in answers.items() if kind.startswith("status_")
-        } == RUN_STATUSES
+        # Each status is saved as the producer first set it.
+        assert all(
+            record["status"] == kind[len("status_"):]
+            for kind, record in answers.items() if kind.startswith("status_")
+        )
         assert "pending_approval" in answers["status_waiting_for_approval"]
         assert "pending_approval" not in answers["status_completed"]
         assert {"error", "error_code", "error_reason"} <= set(answers["status_failed"])
-        assert {event["event"] for event in answers["events"]} == EVENT_KINDS
         assert answers["approval_response"]["body"]["object"] == "hermes.run.approval_response"
         assert answers["steer"]["body"]["object"] == "hermes.run.steer"
         assert answers["stop"]["body"]["status"] == "stopping"
@@ -317,7 +261,6 @@ async def test_the_run_examples_carry_every_status_event_and_answer(
             (event["run_id"], event["choice"])
             for event in answers["events"] if event["event"] == "approval.responded"
         }
-        assert {response["choice"] for response in responses} == APPROVAL_CHOICES
 
 
 @pytest.mark.asyncio
@@ -337,19 +280,44 @@ async def test_the_restart_failure_example_carries_the_restart_sentence(
     # Saved as the bare body, like every other ``status_*`` example.
     assert live["status"] == 200
     saved = owner_payload_example(FAMILY, "status_failed_restart", live["body"])
-    assert _vocabularies(live["body"]) == _vocabularies(saved)
     assert saved["status"] == "failed"
     assert saved["error"] == api_server._OWNER_ORPHAN_RUN_MESSAGE
 
 
 def test_the_run_examples_keep_to_every_closed_vocabulary():
-    """Each saved run example, read whole, uses only and all of each vocabulary;
-    the tests above relate each one to the live answers it was saved from."""
-    saved = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted((OWNER_PAYLOADS / FAMILY).glob("*.json"))
-    ]
-    assert _vocabularies(*saved) == VOCABULARIES
+    """The saved run examples, read together, take every value of each row of
+    the table; the fixture holds each one to its row."""
+    contract.assert_closed_vocabularies_covered(FAMILY)
+
+
+def _saved(record_kind: str):
+    path = contract.OWNER_PAYLOADS / FAMILY / f"{record_kind}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("case", ["live", "saved", "second_record"])
+def test_a_value_outside_its_row_fails_the_closed_vocabulary_check(case):
+    """One allowed value, changed in memory to one outside its row, fails the
+    check, which names the payload, the concrete path and the value: in a live
+    run status, in the saved completed run and in the second pending approval."""
+    if case == "live":
+        kind, value, where = "status_running", "not_a_run_status", "status"
+        payload = json.loads(json.dumps(
+            _make_adapter()._set_run_status("run_contract", "running")))
+        payload["status"] = value
+    elif case == "saved":
+        kind, value, where = "status_completed", "not_a_run_status", "status"
+        payload = _saved(kind)
+        payload["status"] = value
+    else:
+        kind, value = "approval_requests", "not_an_approval_choice"
+        where = "[1].pending_approval.choices[0]"
+        payload = _saved(kind)
+        payload[1]["pending_approval"]["choices"][0] = value
+    label = "live" if case == "live" else "saved"
+    with pytest.raises(AssertionError) as failure:
+        contract.check_closed_vocabularies(label, FAMILY, kind, payload)
+    assert f"{label} {FAMILY}/{kind}: {where} = {value!r}" in str(failure.value)
 
 
 def _cron_job() -> dict:
