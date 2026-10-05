@@ -506,8 +506,18 @@ def test_reading_a_wal_board_changes_none_of_its_files(tmp_path, fence_home, mon
             Path(f"{beta_db}-shm").unlink()
         if writer == "closing":  # then, as the board's last connection, it closes after the -wal check
             close = f"stdin = os.open('/proc/{proc.pid}/fd/0', os.O_WRONLY); os.write(stdin, b'\\n'); os.close(stdin)"
-            gone = f"pidfd = os.pidfd_open({proc.pid}); select.select([pidfd], [], [], 120); os.close(pidfd)"
-            _before_board_open(monkeypatch, beta_db, "import os, select", close, gone)
+            # It has exited once its /proc entry is gone or shows a zombie (Z). Not every Python build
+            # has os.pidfd_open (the CI interpreter lacks it), so /proc is read instead.
+            gone = (
+                "def _exited():",
+                "    try:",
+                f"        return open('/proc/{proc.pid}/stat').read().rsplit(')', 1)[1].split()[0] in ('Z', 'X')",
+                "    except OSError:",
+                "        return True",
+                "deadline = time.monotonic() + 120",
+                "while not _exited() and time.monotonic() < deadline: time.sleep(0.05)",
+            )
+            _before_board_open(monkeypatch, beta_db, "import os, time", close, *gone)
         if writer in ("empty", "corrupt"):  # and the board file itself left empty, or corrupt
             beta_db.write_bytes(b"" if writer == "empty" else b"not a database\n" * 512)
         assert Path(f"{beta_db}-wal").stat().st_size > 0
