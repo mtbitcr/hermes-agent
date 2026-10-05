@@ -5,13 +5,15 @@ Every example comes from the adapter's real ``GET
 ``read_project_snapshot``, on real boards in the per-test home, except the run
 receipts, which come from ``_owner_project_run_projection``, the helper the
 snapshot builds each run with. What is asserted is described in
-tests/contracts/conftest.py; each closed vocabulary is checked in the live
-answers and in the saved examples alike.
+tests/contracts/conftest.py; each closed vocabulary is checked wherever it
+occurs, in the live answers and in every saved example alike, and the values
+each takes must agree.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 from unittest.mock import patch
 
@@ -23,6 +25,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_cli import kanban_db, owner_workspace as ow
 from hermes_constants import get_hermes_home
+from tests.contracts.conftest import OWNER_PAYLOADS
 from tests.gateway.test_api_server_owner_suggestion_decisions import (  # noqa: F401  (owner is a fixture)
     _project,
     _write_owner_workspace_config,
@@ -44,6 +47,11 @@ from tests.hermes_cli.test_owner_workspace import (
 )
 
 FAMILY = "owner_snapshot"
+# The board's states are kanban_db constants. The rest are written out where
+# they are produced: the steward states of ``project_steward_snapshot`` and
+# ``_deleted_project_steward``, and the receipt states of
+# ``_owner_project_run_projection``, ``_owner_project_runtime_and_cost`` and
+# ``_owner_project_capability``.
 V1 = ",".join((
     ow.OWNER_PROJECT_RUN_CONTEXT_CAPABILITY,
     ow.OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY,
@@ -69,6 +77,54 @@ RETRY_ORIGINS = {
     kanban_db.RETRY_ORIGIN_OWNER, kanban_db.RETRY_ORIGIN_UNATTRIBUTED,
 }
 COST_STATES = {"estimated", "exact", "reported", "included", "unknown"}
+KNOWN_OR_UNKNOWN = {"known", "unknown"}
+VOCABULARIES = {
+    "review_state": REVIEW_STATES, "stopped_work": STOPPED_WORK,
+    "retry_origin": RETRY_ORIGINS, "outcome": RECEIPT_OUTCOMES,
+    "runtime": KNOWN_OR_UNKNOWN, "capability": KNOWN_OR_UNKNOWN, "cost": COST_STATES,
+    "external_effect": {"unknown"}, "evidence": {"available"}, "owner_retry": {"requested"},
+    "steward": STEWARD_STATES,
+}
+
+
+def _fields(record: dict):
+    """``(vocabulary, value)`` for each closed-vocabulary field of one record."""
+    for key in ("review_state", "stopped_work", "retry_origin", "outcome"):
+        if key in record:  # a task, a run, or a run's receipt
+            yield key, record[key]
+    if "runtime" in record:  # a run's receipt
+        for key in ("runtime", "cost", "external_effect", "evidence", "owner_retry"):
+            if key in record:
+                yield key, record[key]["state"]
+        if "capability" in record["runtime"]:
+            yield "capability", record["runtime"]["capability"]["state"]
+    if "execution" in record:  # a steward
+        yield "steward", record["execution"]["state"]
+
+
+def _vocabularies(*answers) -> dict:
+    """The values each closed vocabulary takes anywhere in ``answers``, each checked
+    to belong to it, in every record, nested record and list item."""
+    seen: dict = {name: set() for name in VOCABULARIES}
+
+    def visit(value):
+        if isinstance(value, str) and value[:1] in ("{", "["):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return
+        if isinstance(value, dict):
+            for name, item in _fields(value):
+                assert item in VOCABULARIES[name], f"{name}: {item!r}"
+                seen[name].add(item)
+            value = list(value.values())
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    for answer in answers:
+        visit(answer)
+    return seen
 
 
 def _app() -> web.Application:
@@ -162,6 +218,7 @@ async def test_the_snapshot_examples_carry_every_task_state_and_capability(
         live["owner_workspace_not_enabled"] = await _snapshot(client, slug)
 
     saved = {kind: owner_payload_example(FAMILY, kind, body) for kind, body in live.items()}
+    assert _vocabularies(live) == _vocabularies(saved)
 
     for answers in (live, saved):
         tasks = _tasks(answers["project_snapshot"])
@@ -222,6 +279,7 @@ async def test_the_steward_examples_carry_every_steward_state(
 
     saved = owner_payload_example(FAMILY, "steward_states", live)
     saved_deleted = owner_payload_example(FAMILY, "deleted_project", deleted)
+    assert _vocabularies(live, deleted) == _vocabularies(saved, saved_deleted)
     for stewards, removed in ((live, deleted), (saved, saved_deleted)):
         states = [steward["execution"]["state"] for steward in stewards]
         states.append(removed["body"]["data"]["steward"]["execution"]["state"])
@@ -243,6 +301,7 @@ async def test_the_provider_wait_example_carries_the_held_card_and_its_waiting_r
         live = await _snapshot(client, scene["project"]["slug"], V1)
 
     saved = owner_payload_example(FAMILY, "provider_wait", live)
+    assert _vocabularies(live) == _vocabularies(saved)
     for answer in (live, saved):
         stopped = {task["stopped_work"] for task in _tasks(answer)}
         assert ow._OWNER_STOPPED_WORK_PROVIDER_WAIT in stopped and stopped <= STOPPED_WORK
@@ -281,6 +340,7 @@ def test_the_run_receipt_examples_carry_every_outcome_and_summary(owner_payload_
     ]
 
     saved = owner_payload_example(FAMILY, "run_receipts", live)
+    assert _vocabularies(live) == _vocabularies(saved)
     for runs in (live, saved):
         assert {run["receipt"]["outcome"] for run in runs} == RECEIPT_OUTCOMES
         assert {run["retry_origin"] for run in runs} == RETRY_ORIGINS
@@ -318,6 +378,7 @@ def test_the_run_receipt_route_examples_carry_every_runtime_and_cost_state(
     ]
 
     saved = owner_payload_example(FAMILY, "run_receipt_routes", live)
+    assert _vocabularies(live) == _vocabularies(saved)
     for runs in (live, saved):
         runtimes = [run["receipt"]["runtime"] for run in runs]
         assert {runtime["state"] for runtime in runtimes} == {"known", "unknown"}
@@ -331,3 +392,13 @@ def test_the_run_receipt_route_examples_carry_every_runtime_and_cost_state(
     assert {run["receipt"]["cost"]["summary"] for run in saved} == {
         run["receipt"]["cost"]["summary"] for run in live
     }
+
+
+def test_the_snapshot_examples_keep_to_every_closed_vocabulary():
+    """Each saved snapshot example, read whole, uses only and all of each
+    vocabulary; the tests above relate each one to the live answers it was saved from."""
+    saved = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((OWNER_PAYLOADS / FAMILY).glob("*.json"))
+    ]
+    assert _vocabularies(*saved) == VOCABULARIES

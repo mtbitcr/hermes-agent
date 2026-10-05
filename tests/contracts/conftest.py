@@ -49,14 +49,25 @@ def pytest_addoption(parser):
 def _shape(value):
     """The keys of a JSON value, record by record, without its values.
 
-    A list becomes the set of its distinct record shapes, so neither order nor
-    count matters but no record borrows a key from another. A string holding
-    JSON, like a stored owner reply, is compared by its decoded shape.
+    Each record of a list keeps its own shape and is paired by position with
+    the record in the same place among those of its event kind (records with
+    no ``event`` pair among themselves), so a record that loses a key cannot
+    hide behind another record's shape. The kind only pairs records; events of
+    different kinds may interleave differently from run to run. A scalar in a
+    list has no keys and is left out. A string holding JSON, like a stored
+    owner reply, is compared by its decoded shape.
     """
     if isinstance(value, dict):
         return {key: _shape(item) for key, item in value.items()}
     if isinstance(value, list):
-        return sorted({json.dumps(_shape(item), sort_keys=True) for item in value})
+        records: dict = {}
+        for item in value:
+            shape = _shape(item)
+            if shape is None:
+                continue
+            kind = item.get("event") if isinstance(item, dict) else None
+            records.setdefault(kind if isinstance(kind, str) else None, []).append(shape)
+        return records
     if isinstance(value, str) and value[:1] in ("{", "["):
         try:
             return _shape(json.loads(value))

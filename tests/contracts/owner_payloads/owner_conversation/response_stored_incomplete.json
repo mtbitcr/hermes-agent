@@ -1,0 +1,15 @@
+{
+  "body": {
+    "background": true,
+    "created_at": 1790000000,
+    "id": "resp_3a414ff697c54ecbace3b7319ea5",
+    "incomplete_details": {
+      "reason": "cancelled"
+    },
+    "model": "hermes-agent",
+    "object": "response",
+    "output": [],
+    "status": "incomplete"
+  },
+  "status": 200
+}

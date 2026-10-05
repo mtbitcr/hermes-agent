@@ -3,9 +3,11 @@
 Every example comes from the adapter's real ``/v1/responses`` routes, registered
 as the existing route tests register them, over the adapter's real response
 store in the per-test home. The agent is replaced by a stub that calls the real
-stream and tool callbacks, so every streamed event is produced without a model.
-What is asserted is described in tests/contracts/conftest.py; each closed
-vocabulary is checked in the live answers and in the saved examples alike.
+stream and tool callbacks, so every streamed event is produced without a model,
+or parks until its task is cancelled. What is asserted is described in
+tests/contracts/conftest.py; each closed vocabulary is checked wherever it
+occurs, in the live answers and in every saved example alike, and the values
+each takes must agree.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.platforms import api_server
+from tests.contracts.conftest import OWNER_PAYLOADS
 from tests.gateway.test_api_server import (
     _create_app,
     _interrupt_owner_turn,
@@ -33,18 +36,31 @@ from tests.gateway.test_owner_turn_provider_unavailable import (
 )
 
 FAMILY = "owner_conversation"
+# Only the failure sentences are adapter constants. The rest are written out
+# where they are produced: the reply kinds ``owner_history_snapshot`` projects
+# (failures through ``_owner_failure_reply_is_projectable``), the outcomes of
+# ``acknowledge_owner_conversation_recovery``, the action table of
+# ``_handle_owner_conversation_authority``, the statuses ``_handle_responses``
+# and ``_write_sse_responses`` give a response, and the events they stream.
 REPLY_KINDS = {"question", "no_change", "proposal", "project_change_proposal", "failure"}
 FAILURE_SENTENCES = {
     api_server._OWNER_INTERRUPTED_TURN_MESSAGE,
     api_server._OWNER_REFUSED_TURN_MESSAGE,
     api_server._OWNER_PROVIDER_UNAVAILABLE_TURN_MESSAGE,
 }
+RECOVERY_OUTCOMES = {"mismatch", "retired", "absent"}
+RESPONSE_STATUSES = {"queued", "in_progress", "completed", "failed", "incomplete"}
 STREAM_EVENTS = {
     "response.created", "response.output_item.added", "response.output_text.delta",
     "response.output_item.done", "response.output_text.done", "response.completed",
     "response.failed",
 }
 AUTHORITY_ACTIONS = {"claim", "abandon", "attach", "complete", "release", "reconcile", "close"}
+VOCABULARIES = {
+    "reply_kind": REPLY_KINDS, "failure_sentence": FAILURE_SENTENCES,
+    "recovery_outcome": RECOVERY_OUTCOMES, "authority_action": AUTHORITY_ACTIONS,
+    "response_status": RESPONSE_STATUSES, "stream_event": STREAM_EVENTS,
+}
 QUESTION = {"schema_version": 1, "kind": "question", "message": "Which outcome first?"}
 
 
@@ -95,8 +111,61 @@ def _turn(conversation: str, previous=None, **extra) -> dict:
     }
 
 
+def _fields(record: dict):
+    """``(vocabulary, value)`` for each closed-vocabulary field of one record."""
+    if "kind" in record:  # an owner reply, wherever its JSON is carried
+        yield "reply_kind", record["kind"]
+        if record["kind"] == "failure":
+            yield "failure_sentence", record["message"]
+    if "outcome" in record:  # a recovery acknowledgement
+        yield "recovery_outcome", record["outcome"]
+    if record.get("object") == "hermes.response.owner_authority":
+        yield "authority_action", record["action"]
+    if record.get("object") == "response":  # ordinary, stored, or inside an event
+        yield "response_status", record["status"]
+    if "event" in record:  # a streamed event, whose data repeats its header's type
+        yield "stream_event", record["event"]
+        yield "stream_event", record["data"]["type"]
+        assert record["data"]["type"] == record["event"], record["event"]
+
+
+def _vocabularies(*answers) -> dict:
+    """The values each closed vocabulary takes anywhere in ``answers``, each checked
+    to belong to it, in every record, nested record and list item."""
+    seen: dict = {name: set() for name in VOCABULARIES}
+
+    def visit(value):
+        if isinstance(value, str) and value[:1] in ("{", "["):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return
+        if isinstance(value, dict):
+            for name, item in _fields(value):
+                assert item in VOCABULARIES[name], f"{name}: {item!r}"
+                seen[name].add(item)
+            value = list(value.values())
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    for answer in answers:
+        visit(answer)
+    return seen
+
+
 async def _answer(response) -> dict:
     return {"status": response.status, "body": await response.json()}
+
+
+async def _terminal(client, response_id: str) -> dict:
+    """The stored response once its background turn has ended."""
+    for _ in range(400):
+        answer = await _answer(await client.get(f"/v1/responses/{response_id}"))
+        if answer["body"].get("status") not in {"queued", "in_progress"}:
+            return answer
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"{response_id} never ended: {answer}")
 
 
 def _events(payload: str) -> list[dict]:
@@ -174,6 +243,7 @@ async def test_the_history_examples_carry_every_reply_kind_and_handle(owner_payl
             live["owner_history_unavailable"] = await history(_name("1"))
 
     saved = {kind: owner_payload_example(FAMILY, kind, body) for kind, body in live.items()}
+    assert _vocabularies(live) == _vocabularies(saved)
 
     for answers in (live, saved):
         turns = answers["history"]["body"]["data"] + [
@@ -189,7 +259,7 @@ async def test_the_history_examples_carry_every_reply_kind_and_handle(owner_payl
         assert answers["history_recovery"]["body"]["recovery"] is not None
         assert {
             answer["body"]["outcome"] for answer in answers["recovery_acknowledgements"]
-        } == {"mismatch", "retired", "absent"}
+        } == RECOVERY_OUTCOMES
         assert answers["proposal_consumption_refused"]["status"] == 409
         assert answers["owner_history_unavailable"]["body"]["error"]["code"] == (
             "owner_history_unavailable")
@@ -243,6 +313,7 @@ async def test_the_authority_examples_carry_every_answer(owner_payload_example):
             "reconcile", "release")]
 
     saved = owner_payload_example(FAMILY, "authority", live)
+    assert _vocabularies(live) == _vocabularies(saved)
     assert {answer["status"] for answer in refused} == {409}
     for answers in (live, saved):
         assert {
@@ -282,25 +353,39 @@ async def test_the_response_examples_carry_every_object_event_and_refusal(
                     _turn(_name("4")), "contract-4"))
             queued = await respond(_turn(_name("5"), background=True), "contract-5")
             live["response_background_queued"] = await _answer(queued)
-            path = f"/v1/responses/{live['response_background_queued']['body']['id']}"
-            for _ in range(200):
-                live["response_stored"] = await _answer(await client.get(path))
-                if live["response_stored"]["body"].get("status") == "completed":
-                    break
-                await asyncio.sleep(0.02)
+            live["response_stored"] = await _terminal(
+                client, live["response_background_queued"]["body"]["id"])
             streamed = await respond(_turn(_name("6"), stream=True), "contract-6")
             live["streamed_events"] = _events(await streamed.text())
         with patch.object(adapter, "_run_agent", side_effect=_stub_agent(fail=True)):
             failed = await respond(_turn(_name("8"), stream=True), "contract-7")
             live["streamed_failure_events"] = _events(await failed.text())
 
+        # A background turn whose task is cancelled ends ``incomplete``; the
+        # agent parks as in test_api_server's cancelled background turn test.
+        parked: dict = {"ready": asyncio.Event()}
+
+        async def _park(**_kwargs):
+            parked["task"] = asyncio.current_task()
+            parked["ready"].set()
+            await asyncio.Event().wait()
+
+        with patch.object(adapter, "_run_agent", side_effect=_park):
+            cancelled = await respond(_turn(_name("9"), background=True), "contract-8")
+            await asyncio.wait_for(parked["ready"].wait(), timeout=10)
+            parked["task"].cancel()
+            live["response_stored_incomplete"] = await _terminal(
+                client, (await cancelled.json())["id"])
+
     # Independent requests get distinct ids, which the frozen ids must keep.
-    ids = [live[kind]["body"]["id"] for kind in ("response", "response_background_queued")]
+    ids = [live[kind]["body"]["id"] for kind in (
+        "response", "response_background_queued", "response_stored_incomplete")]
     ids += [event["data"]["response"]["id"] for kind in (
         "streamed_events", "streamed_failure_events") for event in live[kind]
         if event["event"] == "response.created"]
     assert len(set(ids)) == len(ids)
     saved = {kind: owner_payload_example(FAMILY, kind, body) for kind, body in live.items()}
+    assert _vocabularies(live) == _vocabularies(saved)
 
     for answers in (live, saved):
         assert {
@@ -309,6 +394,7 @@ async def test_the_response_examples_carry_every_object_event_and_refusal(
         } == {"response"}
         assert answers["response_background_queued"]["body"]["status"] == "queued"
         assert answers["response_stored"]["body"]["status"] == "completed"
+        assert answers["response_stored_incomplete"]["body"]["status"] == "incomplete"
         assert {
             event["event"] for kind in ("streamed_events", "streamed_failure_events")
             for event in answers[kind]
@@ -322,3 +408,13 @@ async def test_the_response_examples_carry_every_object_event_and_refusal(
             "idempotency_conflict": 409, "owner_conversation_stale": 409,
             "owner_conversation_locked": 409, "owner_response_incomplete": 409,
         }
+
+
+def test_the_conversation_examples_keep_to_every_closed_vocabulary():
+    """Each saved conversation example, read whole, uses only and all of each
+    vocabulary; the tests above relate each one to the live answers it was saved from."""
+    saved = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((OWNER_PAYLOADS / FAMILY).glob("*.json"))
+    ]
+    assert _vocabularies(*saved) == VOCABULARIES
