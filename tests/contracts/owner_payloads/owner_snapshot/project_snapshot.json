@@ -1,7 +1,16 @@
 {
   "body": {
     "data": {
-      "attachments": [],
+      "attachments": [
+        {
+          "created_at": "2026-09-21T14:13:20Z",
+          "filename": "plan.md",
+          "id": "1",
+          "media_type": "text/markdown",
+          "size": 7,
+          "source_attachment_id": null
+        }
+      ],
       "board": {
         "counts": {
           "archived": 0,
@@ -9,7 +18,7 @@
           "done": 1,
           "ready": 2,
           "review": 1,
-          "running": 0,
+          "running": 1,
           "scheduled": 0,
           "todo": 0,
           "triage": 1
@@ -17,7 +26,7 @@
         "name": "Workshop Pilot",
         "project_id": "p_787fde8aa1f51ec773a73a1c",
         "slug": "workshop-pilot",
-        "total": 7
+        "total": 8
       },
       "columns": [
         {
@@ -26,10 +35,10 @@
             {
               "assignee_name": "default",
               "child_ids": [],
-              "event_revision": 19,
-              "id": "t_0000000b",
+              "event_revision": 20,
+              "id": "t_348578f3",
               "parent_ids": [
-                "t_0000000a"
+                "t_136d9fda"
               ],
               "responsibility": null,
               "review_state": "none",
@@ -54,7 +63,7 @@
               "assignee_name": "default",
               "child_ids": [],
               "event_revision": 12,
-              "id": "t_00000008",
+              "id": "t_09dfb269",
               "parent_ids": [],
               "responsibility": null,
               "review_state": "none",
@@ -65,10 +74,10 @@
             {
               "assignee_name": "default",
               "child_ids": [
-                "t_0000000b"
+                "t_348578f3"
               ],
-              "event_revision": 20,
-              "id": "t_0000000a",
+              "event_revision": 21,
+              "id": "t_136d9fda",
               "parent_ids": [],
               "responsibility": null,
               "review_state": "changes_requested",
@@ -80,7 +89,20 @@
         },
         {
           "name": "running",
-          "tasks": []
+          "tasks": [
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "event_revision": 24,
+              "id": "t_8e3861d2",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "stopped_work": "none",
+              "title": "Rehearse the workshop",
+              "updated_at": "2026-09-21T14:13:20Z"
+            }
+          ]
         },
         {
           "name": "blocked",
@@ -88,20 +110,8 @@
             {
               "assignee_name": "default",
               "child_ids": [],
-              "event_revision": 8,
-              "id": "t_00000006",
-              "parent_ids": [],
-              "responsibility": null,
-              "review_state": "none",
-              "stopped_work": "gave_up",
-              "title": "Print the workshop handouts",
-              "updated_at": "2026-09-21T14:13:20Z"
-            },
-            {
-              "assignee_name": "default",
-              "child_ids": [],
               "event_revision": 11,
-              "id": "t_00000007",
+              "id": "t_112a104b",
               "owner_wait": {
                 "reason": "the provider account has no API credentials",
                 "since": "2026-09-21T14:13:20Z"
@@ -112,6 +122,18 @@
               "stopped_work": "capability",
               "title": "Connect the payment provider",
               "updated_at": "2026-09-21T14:13:20Z"
+            },
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "event_revision": 8,
+              "id": "t_cc2dc8d8",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "stopped_work": "gave_up",
+              "title": "Print the workshop handouts",
+              "updated_at": "2026-09-21T14:13:20Z"
             }
           ]
         },
@@ -121,8 +143,8 @@
             {
               "assignee_name": "default",
               "child_ids": [],
-              "event_revision": 15,
-              "id": "t_00000009",
+              "event_revision": 16,
+              "id": "t_0d869764",
               "parent_ids": [],
               "responsibility": null,
               "review_state": "awaiting_review",
@@ -139,7 +161,7 @@
               "assignee_name": "default",
               "child_ids": [],
               "event_revision": 4,
-              "id": "t_00000005",
+              "id": "t_172f84a6",
               "parent_ids": [],
               "responsibility": null,
               "review_state": "approved",
@@ -151,7 +173,7 @@
         }
       ],
       "planning_context": {
-        "actionable_count": 6,
+        "actionable_count": 7,
         "actionable_truncated": false,
         "omitted_terminal_count": 0,
         "relations_truncated": false,
@@ -160,34 +182,8 @@
           {
             "assignee_name": "default",
             "child_ids": [],
-            "event_revision": 8,
-            "id": "t_00000006",
-            "omitted_child_count": 0,
-            "omitted_parent_count": 0,
-            "parent_ids": [],
-            "responsibility": null,
-            "status": "blocked",
-            "title": "Print the workshop handouts",
-            "updated_at": "2026-09-21T14:13:20Z"
-          },
-          {
-            "assignee_name": "default",
-            "child_ids": [],
-            "event_revision": 11,
-            "id": "t_00000007",
-            "omitted_child_count": 0,
-            "omitted_parent_count": 0,
-            "parent_ids": [],
-            "responsibility": null,
-            "status": "blocked",
-            "title": "Connect the payment provider",
-            "updated_at": "2026-09-21T14:13:20Z"
-          },
-          {
-            "assignee_name": "default",
-            "child_ids": [],
             "event_revision": 12,
-            "id": "t_00000008",
+            "id": "t_09dfb269",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,
             "parent_ids": [],
@@ -199,8 +195,8 @@
           {
             "assignee_name": "default",
             "child_ids": [],
-            "event_revision": 15,
-            "id": "t_00000009",
+            "event_revision": 16,
+            "id": "t_0d869764",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,
             "parent_ids": [],
@@ -211,11 +207,24 @@
           },
           {
             "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 11,
+            "id": "t_112a104b",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "blocked",
+            "title": "Connect the payment provider",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
             "child_ids": [
-              "t_0000000b"
+              "t_348578f3"
             ],
-            "event_revision": 20,
-            "id": "t_0000000a",
+            "event_revision": 21,
+            "id": "t_136d9fda",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,
             "parent_ids": [],
@@ -227,12 +236,12 @@
           {
             "assignee_name": "default",
             "child_ids": [],
-            "event_revision": 19,
-            "id": "t_0000000b",
+            "event_revision": 20,
+            "id": "t_348578f3",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,
             "parent_ids": [
-              "t_0000000a"
+              "t_136d9fda"
             ],
             "responsibility": null,
             "status": "triage",
@@ -242,8 +251,34 @@
           {
             "assignee_name": "default",
             "child_ids": [],
+            "event_revision": 24,
+            "id": "t_8e3861d2",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "running",
+            "title": "Rehearse the workshop",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 8,
+            "id": "t_cc2dc8d8",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "blocked",
+            "title": "Print the workshop handouts",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
             "event_revision": 4,
-            "id": "t_00000005",
+            "id": "t_172f84a6",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,
             "parent_ids": [],
@@ -263,6 +298,33 @@
         "slug": "workshop-pilot"
       },
       "runs": [
+        {
+          "finished_at": null,
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "running",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Work is still in progress."
+          },
+          "retry_origin": "none",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Rehearse the workshop"
+        },
         {
           "finished_at": "2026-09-21T14:13:20Z",
           "has_newer_run": false,
@@ -457,6 +519,10 @@
       "steward": {
         "active_work": [
           {
+            "state": "In progress",
+            "title": "Rehearse the workshop"
+          },
+          {
             "state": "Being checked",
             "title": "Review the awaiting outline"
           },
@@ -473,7 +539,7 @@
           "awaiting_review": 1,
           "completed_in_window": 1,
           "needs_attention": 1,
-          "open": 6
+          "open": 7
         },
         "decisions_needed": [
           {
@@ -522,7 +588,13 @@
         "tasks": false,
         "workers": false
       },
-      "workers": []
+      "workers": [
+        {
+          "profile": "default",
+          "started_at": 1790000000,
+          "task_title": "Rehearse the workshop"
+        }
+      ]
     },
     "object": "hermes.owner_workspace.project_snapshot"
   },

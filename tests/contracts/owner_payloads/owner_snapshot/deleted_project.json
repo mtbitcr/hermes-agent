@@ -15,7 +15,7 @@
           "triage": 0
         },
         "name": "RP",
-        "project_id": "p_00000022",
+        "project_id": "p_cd859d8b",
         "slug": "rp1",
         "total": 0
       },
@@ -57,7 +57,7 @@
         "archived": false,
         "board": "rp1",
         "description": null,
-        "id": "p_00000022",
+        "id": "p_cd859d8b",
         "name": "RP",
         "slug": "rp1"
       },
@@ -76,7 +76,7 @@
         "phase": "done",
         "receipt_id": "contract1",
         "restorable": true,
-        "retained_copy_id": "00000000000000000000000000000026"
+        "retained_copy_id": "0a297c7e2b2f7f045b9eb086734791ab"
       },
       "runs": [],
       "steward": {
@@ -115,7 +115,7 @@
           "phase": "done",
           "receipt_id": "contract1",
           "restorable": true,
-          "retained_copy_id": "00000000000000000000000000000026"
+          "retained_copy_id": "0a297c7e2b2f7f045b9eb086734791ab"
         },
         "schema_version": 2,
         "stale_candidates": [],

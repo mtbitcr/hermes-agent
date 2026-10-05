@@ -39,7 +39,7 @@
               "assignee_name": "worker",
               "child_ids": [],
               "event_revision": 8,
-              "id": "t_00000006",
+              "id": "t_cc2dc8d8",
               "parent_ids": [],
               "responsibility": null,
               "review_state": "none",
@@ -60,7 +60,7 @@
               "assignee_name": "worker",
               "child_ids": [],
               "event_revision": 11,
-              "id": "t_00000007",
+              "id": "t_112a104b",
               "owner_wait": {
                 "reason": "The AI provider refused this work as worded; it is parked instead of being retried unchanged.",
                 "since": "2030-03-17T17:46:40Z"
@@ -93,27 +93,27 @@
           {
             "assignee_name": "worker",
             "child_ids": [],
-            "event_revision": 8,
-            "id": "t_00000006",
-            "omitted_child_count": 0,
-            "omitted_parent_count": 0,
-            "parent_ids": [],
-            "responsibility": null,
-            "status": "ready",
-            "title": "Draft the placeholder brief",
-            "updated_at": "2030-03-17T17:46:40Z"
-          },
-          {
-            "assignee_name": "worker",
-            "child_ids": [],
             "event_revision": 11,
-            "id": "t_00000007",
+            "id": "t_112a104b",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,
             "parent_ids": [],
             "responsibility": null,
             "status": "blocked",
             "title": "Word the placeholder notice",
+            "updated_at": "2030-03-17T17:46:40Z"
+          },
+          {
+            "assignee_name": "worker",
+            "child_ids": [],
+            "event_revision": 8,
+            "id": "t_cc2dc8d8",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "ready",
+            "title": "Draft the placeholder brief",
             "updated_at": "2030-03-17T17:46:40Z"
           }
         ]

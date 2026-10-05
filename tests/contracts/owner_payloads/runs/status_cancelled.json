@@ -4,14 +4,14 @@
   "model": "hermes-agent",
   "object": "hermes.run",
   "owner_workspace_context": null,
-  "run_id": "run_0000000000004000800000000000000e",
+  "run_id": "run_9e4dbe57dfb54b80b39b4e5e1280bf99",
   "runtime": {
     "effort": "",
     "engine": "",
     "model": "",
     "provider": ""
   },
-  "session_id": "run_0000000000004000800000000000000e",
+  "session_id": "run_9e4dbe57dfb54b80b39b4e5e1280bf99",
   "status": "cancelled",
   "updated_at": 1790000000.0
 }

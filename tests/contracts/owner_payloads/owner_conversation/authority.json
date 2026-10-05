@@ -57,5 +57,43 @@
       "object": "hermes.response.owner_authority"
     },
     "status": 200
+  },
+  {
+    "body": {
+      "error": {
+        "code": null,
+        "message": "Owner proposal authority changed",
+        "param": null,
+        "type": "invalid_request_error"
+      }
+    },
+    "status": 409
+  },
+  {
+    "body": {
+      "error": {
+        "code": null,
+        "message": "Owner proposal authority changed",
+        "param": null,
+        "type": "invalid_request_error"
+      }
+    },
+    "status": 409
+  },
+  {
+    "body": {
+      "action": "reconcile",
+      "applied": true,
+      "object": "hermes.response.owner_authority"
+    },
+    "status": 200
+  },
+  {
+    "body": {
+      "action": "release",
+      "applied": true,
+      "object": "hermes.response.owner_authority"
+    },
+    "status": 200
   }
 ]

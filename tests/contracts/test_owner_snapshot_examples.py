@@ -5,12 +5,14 @@ Every example comes from the adapter's real ``GET
 ``read_project_snapshot``, on real boards in the per-test home, except the run
 receipts, which come from ``_owner_project_run_projection``, the helper the
 snapshot builds each run with. What is asserted is described in
-tests/contracts/conftest.py.
+tests/contracts/conftest.py; each closed vocabulary is checked in the live
+answers and in the saved examples alike.
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
 from unittest.mock import patch
 
 import pytest
@@ -34,7 +36,12 @@ from tests.hermes_cli.test_owner_provider_wait import (  # noqa: F401  (root and
     clock,
     root,
 )
-from tests.hermes_cli.test_owner_workspace import _ended_run, _gave_up_task
+from tests.hermes_cli.test_owner_workspace import (
+    _capability_receipt_metadata,
+    _capability_run,
+    _ended_run,
+    _gave_up_task,
+)
 
 FAMILY = "owner_snapshot"
 V1 = ",".join((
@@ -49,6 +56,19 @@ STEWARD_STATES = {
     "needs_attention", "complete", "deleted",
 }
 RECEIPT_OUTCOMES = {"running", "completed", "attention", "waiting", "unknown"}
+REVIEW_STATES = {
+    kanban_db.REVIEW_STATE_AWAITING_REVIEW, kanban_db.REVIEW_STATE_CHANGES_REQUESTED,
+    kanban_db.REVIEW_STATE_APPROVED, kanban_db.REVIEW_STATE_NONE,
+}
+STOPPED_WORK = {
+    kanban_db.STOPPED_WORK_GAVE_UP, kanban_db.STOPPED_WORK_CAPABILITY,
+    ow._OWNER_STOPPED_WORK_PROVIDER_WAIT, kanban_db.STOPPED_WORK_NONE,
+}
+RETRY_ORIGINS = {
+    kanban_db.RETRY_ORIGIN_NONE, kanban_db.RETRY_ORIGIN_AUTOMATIC,
+    kanban_db.RETRY_ORIGIN_OWNER, kanban_db.RETRY_ORIGIN_UNATTRIBUTED,
+}
+COST_STATES = {"estimated", "exact", "reported", "included", "unknown"}
 
 
 def _app() -> web.Application:
@@ -108,6 +128,7 @@ async def test_the_snapshot_examples_carry_every_task_state_and_capability(
         state: _task(board, project, f"Review the {state} outline")
         for state in ("awaiting", "changes")
     }
+    working = _task(board, project, "Rehearse the workshop")
     with contextlib.closing(kanban_db.connect(board=board)) as conn:
         for task_id in reviews.values():
             assert kanban_db.request_review(conn, task_id, summary="Ready.")
@@ -115,6 +136,15 @@ async def test_the_snapshot_examples_carry_every_task_state_and_capability(
         assert kanban_db.request_changes(
             conn, reviews["changes"], reason="Name the date first.",
         )[0]
+        # A live claim held by this process is a verified worker, and the file
+        # its run attaches is bound to that run by the attachment receipt.
+        assert kanban_db.claim_task(conn, working) is not None
+        kanban_db._set_worker_pid(conn, working, os.getpid())
+        run_id = int(kanban_db.get_task(conn, working).current_run_id)
+        kanban_db.store_attachment_bytes(
+            conn, working, "plan.md", b"# Plan\n", content_type="text/markdown",
+            board=board, expected_run_id=run_id,
+        )
 
     async with TestClient(TestServer(_app())) as client:
         live = {
@@ -133,32 +163,29 @@ async def test_the_snapshot_examples_carry_every_task_state_and_capability(
 
     saved = {kind: owner_payload_example(FAMILY, kind, body) for kind, body in live.items()}
 
-    tasks = _tasks(saved["project_snapshot"])
-    assert {task["review_state"] for task in tasks} == {
-        kanban_db.REVIEW_STATE_AWAITING_REVIEW, kanban_db.REVIEW_STATE_CHANGES_REQUESTED,
-        kanban_db.REVIEW_STATE_APPROVED, kanban_db.REVIEW_STATE_NONE,
-    }
-    assert {
-        kanban_db.STOPPED_WORK_GAVE_UP, kanban_db.STOPPED_WORK_CAPABILITY,
-        kanban_db.STOPPED_WORK_NONE,
-    } <= {task["stopped_work"] for task in tasks}
-    assert any("owner_wait" in task for task in tasks)
-    assert not any("owner_wait" in task for task in _tasks(
-        saved["project_snapshot_without_capabilities"]))
-    for kind in ("project_snapshot", "project_snapshot_planning_context_v2"):
-        assert "planning_context" in saved[kind]["body"]["data"]
-    assert "planning_context" not in (
-        saved["project_snapshot_without_capabilities"]["body"]["data"])
-    assert set(saved["project_snapshot"]["body"]["data"]["truncated"]) == {
-        "tasks", "workers", "attachments", "runs",
-    }
-    errors = {
-        kind: example for kind, example in saved.items() if "error" in example["body"]
-    }
-    assert {example["body"]["error"]["code"] for example in errors.values()} == {
-        "project_not_found", "owner_workspace_unavailable", "owner_workspace_not_enabled",
-    }
-    assert all(example["status"] >= 400 for example in errors.values())
+    for answers in (live, saved):
+        tasks = _tasks(answers["project_snapshot"])
+        assert {task["review_state"] for task in tasks} == REVIEW_STATES
+        # The provider wait has its own example below.
+        assert {task["stopped_work"] for task in tasks} == (
+            STOPPED_WORK - {ow._OWNER_STOPPED_WORK_PROVIDER_WAIT})
+        assert any("owner_wait" in task for task in tasks)
+        assert not any("owner_wait" in task for task in _tasks(
+            answers["project_snapshot_without_capabilities"]))
+        data = answers["project_snapshot"]["body"]["data"]
+        assert data["workers"] and data["attachments"]
+        assert {run["receipt"]["outcome"] for run in data["runs"]} <= RECEIPT_OUTCOMES
+        assert {run["retry_origin"] for run in data["runs"]} <= RETRY_ORIGINS
+        for kind in ("project_snapshot", "project_snapshot_planning_context_v2"):
+            assert "planning_context" in answers[kind]["body"]["data"]
+        assert "planning_context" not in (
+            answers["project_snapshot_without_capabilities"]["body"]["data"])
+        assert set(data["truncated"]) == {"tasks", "workers", "attachments", "runs"}
+        errors = [answer for answer in answers.values() if "error" in answer["body"]]
+        assert {answer["body"]["error"]["code"] for answer in errors} == {
+            "project_not_found", "owner_workspace_unavailable", "owner_workspace_not_enabled",
+        }
+        assert all(answer["status"] >= 400 for answer in errors)
 
 
 @pytest.mark.asyncio
@@ -195,10 +222,11 @@ async def test_the_steward_examples_carry_every_steward_state(
 
     saved = owner_payload_example(FAMILY, "steward_states", live)
     saved_deleted = owner_payload_example(FAMILY, "deleted_project", deleted)
-    states = [steward["execution"]["state"] for steward in saved]
-    states.append(saved_deleted["body"]["data"]["steward"]["execution"]["state"])
-    assert set(states) == STEWARD_STATES
-    assert "removal_state" in saved_deleted["body"]["data"]
+    for stewards, removed in ((live, deleted), (saved, saved_deleted)):
+        states = [steward["execution"]["state"] for steward in stewards]
+        states.append(removed["body"]["data"]["steward"]["execution"]["state"])
+        assert set(states) == STEWARD_STATES
+        assert "removal_state" in removed["body"]["data"]
 
 
 @pytest.mark.asyncio
@@ -215,10 +243,11 @@ async def test_the_provider_wait_example_carries_the_held_card_and_its_waiting_r
         live = await _snapshot(client, scene["project"]["slug"], V1)
 
     saved = owner_payload_example(FAMILY, "provider_wait", live)
-    assert ow._OWNER_STOPPED_WORK_PROVIDER_WAIT in {
-        task["stopped_work"] for task in _tasks(saved)
-    }
-    assert "waiting" in {run["receipt"]["outcome"] for run in saved["body"]["data"]["runs"]}
+    for answer in (live, saved):
+        stopped = {task["stopped_work"] for task in _tasks(answer)}
+        assert ow._OWNER_STOPPED_WORK_PROVIDER_WAIT in stopped and stopped <= STOPPED_WORK
+        outcomes = {run["receipt"]["outcome"] for run in answer["body"]["data"]["runs"]}
+        assert "waiting" in outcomes and outcomes <= RECEIPT_OUTCOMES
 
 
 def test_the_run_receipt_examples_carry_every_outcome_and_summary(owner_payload_example):
@@ -252,8 +281,53 @@ def test_the_run_receipt_examples_carry_every_outcome_and_summary(owner_payload_
     ]
 
     saved = owner_payload_example(FAMILY, "run_receipts", live)
-    assert {run["receipt"]["outcome"] for run in saved} == RECEIPT_OUTCOMES
+    for runs in (live, saved):
+        assert {run["receipt"]["outcome"] for run in runs} == RECEIPT_OUTCOMES
+        assert {run["retry_origin"] for run in runs} == RETRY_ORIGINS
     assert {run["receipt"]["summary"] for run in saved} == {
         run["receipt"]["summary"] for run in live
     }
-    assert {run["retry_origin"] for run in saved} == set(origins)
+
+
+def test_the_run_receipt_route_examples_carry_every_runtime_and_cost_state(
+    owner_payload_example,
+):
+    """Native runtime receipts, projected as the snapshot projects each run.
+
+    Version 4 is not a receipt version the owner reads, so its route is
+    unknown; a receipt without a cost keeps its route; the capability object
+    is read from version 3 receipts only.
+    """
+    receipts = [_capability_receipt_metadata(4), _capability_receipt_metadata(2)]
+    del receipts[-1]["runtime_receipt"]["cost"]
+    for state in ("estimated", "exact", "reported", "included"):
+        receipts.append(_capability_receipt_metadata(2))
+        receipts[-1]["runtime_receipt"]["cost"]["state"] = state
+    for source in ("session-tool-calls", "unavailable"):
+        receipts.append(_capability_receipt_metadata(3, {
+            "schema_version": 1, "skills": [], "skills_truncated": False,
+            "tools": ["read_file"], "tools_truncated": False, "connections": [],
+            "connections_truncated": False, "source": source, "truncated": False,
+        }))
+    live = [
+        ow._owner_project_run_projection(
+            _capability_run(metadata), "Draft the workshop agenda", task_pin=None,
+            has_newer_run=False, run_context=True,
+        )
+        for metadata in receipts
+    ]
+
+    saved = owner_payload_example(FAMILY, "run_receipt_routes", live)
+    for runs in (live, saved):
+        runtimes = [run["receipt"]["runtime"] for run in runs]
+        assert {runtime["state"] for runtime in runtimes} == {"known", "unknown"}
+        assert {run["receipt"]["cost"]["state"] for run in runs} == COST_STATES
+        assert {
+            runtime["capability"]["state"] for runtime in runtimes if "capability" in runtime
+        } == {"known", "unknown"}
+        assert [
+            "capability" in runtime for runtime in runtimes
+        ] == [metadata["runtime_receipt"]["schema_version"] == 3 for metadata in receipts]
+    assert {run["receipt"]["cost"]["summary"] for run in saved} == {
+        run["receipt"]["cost"]["summary"] for run in live
+    }

@@ -4,7 +4,8 @@ Every example comes from the adapter's real ``/v1/responses`` routes, registered
 as the existing route tests register them, over the adapter's real response
 store in the per-test home. The agent is replaced by a stub that calls the real
 stream and tool callbacks, so every streamed event is produced without a model.
-What is asserted is described in tests/contracts/conftest.py.
+What is asserted is described in tests/contracts/conftest.py; each closed
+vocabulary is checked in the live answers and in the saved examples alike.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ STREAM_EVENTS = {
     "response.output_item.done", "response.output_text.done", "response.completed",
     "response.failed",
 }
+AUTHORITY_ACTIONS = {"claim", "abandon", "attach", "complete", "release", "reconcile", "close"}
 QUESTION = {"schema_version": 1, "kind": "question", "message": "Which outcome first?"}
 
 
@@ -173,23 +175,24 @@ async def test_the_history_examples_carry_every_reply_kind_and_handle(owner_payl
 
     saved = {kind: owner_payload_example(FAMILY, kind, body) for kind, body in live.items()}
 
-    turns = saved["history"]["body"]["data"] + [
-        example["body"]["data"][-1] for example in saved["history_failure_turns"]
-    ]
-    replies = [json.loads(turn["raphael"]) for turn in turns]
-    assert {reply["kind"] for reply in replies} == REPLY_KINDS
-    assert FAILURE_SENTENCES <= {
-        reply["message"] for reply in replies if reply["kind"] == "failure"
-    }
-    assert saved["history_empty"]["body"]["data"] == []
-    assert saved["history_pending"]["body"]["pending"] is not None
-    assert saved["history_recovery"]["body"]["recovery"] is not None
-    assert {answer["body"]["outcome"] for answer in saved["recovery_acknowledgements"]} == {
-        "mismatch", "retired", "absent",
-    }
-    assert saved["proposal_consumption_refused"]["status"] == 409
-    assert saved["owner_history_unavailable"]["body"]["error"]["code"] == (
-        "owner_history_unavailable")
+    for answers in (live, saved):
+        turns = answers["history"]["body"]["data"] + [
+            answer["body"]["data"][-1] for answer in answers["history_failure_turns"]
+        ]
+        replies = [json.loads(turn["raphael"]) for turn in turns]
+        assert {reply["kind"] for reply in replies} == REPLY_KINDS
+        assert {
+            reply["message"] for reply in replies if reply["kind"] == "failure"
+        } == FAILURE_SENTENCES
+        assert answers["history_empty"]["body"]["data"] == []
+        assert answers["history_pending"]["body"]["pending"] is not None
+        assert answers["history_recovery"]["body"]["recovery"] is not None
+        assert {
+            answer["body"]["outcome"] for answer in answers["recovery_acknowledgements"]
+        } == {"mismatch", "retired", "absent"}
+        assert answers["proposal_consumption_refused"]["status"] == 409
+        assert answers["owner_history_unavailable"]["body"]["error"]["code"] == (
+            "owner_history_unavailable")
 
 
 @pytest.mark.asyncio
@@ -200,12 +203,20 @@ async def test_the_authority_examples_carry_every_answer(owner_payload_example):
     claim_id, run_id = "claim_" + "a" * 32, "run_" + "b" * 32
     _seed(store, conversation, response_id,
           [json.dumps(_owner_existing_proposal())], owner_proposal=True)
+    # Another proposal's claim, attached to a run this process still sees, as
+    # the reconcile route test seeds it, is the tuple to release and reconcile.
+    other = (_name("b"), "resp_orphaned")
+    exact = {"claim_id": "claim_" + "c" * 32, "run_id": "run_" + "d" * 32}
+    _seed(store, *other, [json.dumps(_owner_new_proposal())], owner_proposal=True)
+    assert store.claim_owner_proposal("default", *other, exact["claim_id"]) is True
+    assert store.attach_owner_run("default", *other, *exact.values()) is True
+    adapter._set_run_status(exact["run_id"], "running")
 
     async with TestClient(TestServer(_create_app(adapter))) as client:
-        async def authority(action, **extra):
+        async def authority(action, at=(conversation, response_id), **extra):
             return await _answer(await client.post(
-                f"/v1/responses/conversations/{conversation}/authority",
-                json={"action": action, "response_id": response_id, **extra},
+                f"/v1/responses/conversations/{at[0]}/authority",
+                json={"action": action, "response_id": at[1], **extra},
             ))
 
         live = [
@@ -222,12 +233,22 @@ async def test_the_authority_examples_carry_every_answer(owner_payload_example):
             "default", conversation, response_id, claim_id, run_id) is True
         live.append(await authority("complete", claim_id=claim_id, run_id=run_id))
         live.append(await authority("close"))
+        # While its run is observable, the other claim is neither released nor
+        # orphaned; once the run is gone, reconcile releases it and release
+        # confirms that.
+        refused = [await authority(action, other, **exact) for action in (
+            "release", "reconcile")]
+        adapter._run_statuses.pop(exact["run_id"])
+        live += refused + [await authority(action, other, **exact) for action in (
+            "reconcile", "release")]
 
     saved = owner_payload_example(FAMILY, "authority", live)
-    assert {answer["body"].get("action") for answer in saved if answer["status"] == 200} == {
-        "claim", "abandon", "attach", "complete", "close",
-    }
-    assert any(answer["status"] == 409 for answer in saved)
+    assert {answer["status"] for answer in refused} == {409}
+    for answers in (live, saved):
+        assert {
+            answer["body"]["action"] for answer in answers if answer["status"] == 200
+        } == AUTHORITY_ACTIONS
+        assert {answer["status"] for answer in answers} == {200, 409}
 
 
 @pytest.mark.asyncio
@@ -273,24 +294,31 @@ async def test_the_response_examples_carry_every_object_event_and_refusal(
             failed = await respond(_turn(_name("8"), stream=True), "contract-7")
             live["streamed_failure_events"] = _events(await failed.text())
 
+    # Independent requests get distinct ids, which the frozen ids must keep.
+    ids = [live[kind]["body"]["id"] for kind in ("response", "response_background_queued")]
+    ids += [event["data"]["response"]["id"] for kind in (
+        "streamed_events", "streamed_failure_events") for event in live[kind]
+        if event["event"] == "response.created"]
+    assert len(set(ids)) == len(ids)
     saved = {kind: owner_payload_example(FAMILY, kind, body) for kind, body in live.items()}
 
-    assert {
-        example["body"]["object"] for kind, example in saved.items()
-        if kind.startswith("response")
-    } == {"response"}
-    assert saved["response_background_queued"]["body"]["status"] == "queued"
-    assert saved["response_stored"]["body"]["status"] == "completed"
-    assert {
-        event["event"] for kind in ("streamed_events", "streamed_failure_events")
-        for event in saved[kind]
-    } == STREAM_EVENTS
-    assert {
-        saved[kind]["body"]["error"]["code"]: saved[kind]["status"] for kind in (
-            "idempotency_conflict", "owner_conversation_stale",
-            "owner_conversation_locked", "owner_response_incomplete",
-        )
-    } == {
-        "idempotency_conflict": 409, "owner_conversation_stale": 409,
-        "owner_conversation_locked": 409, "owner_response_incomplete": 409,
-    }
+    for answers in (live, saved):
+        assert {
+            answer["body"]["object"] for kind, answer in answers.items()
+            if kind.startswith("response")
+        } == {"response"}
+        assert answers["response_background_queued"]["body"]["status"] == "queued"
+        assert answers["response_stored"]["body"]["status"] == "completed"
+        assert {
+            event["event"] for kind in ("streamed_events", "streamed_failure_events")
+            for event in answers[kind]
+        } == STREAM_EVENTS
+        assert {
+            answers[kind]["body"]["error"]["code"]: answers[kind]["status"] for kind in (
+                "idempotency_conflict", "owner_conversation_stale",
+                "owner_conversation_locked", "owner_response_incomplete",
+            )
+        } == {
+            "idempotency_conflict": 409, "owner_conversation_stale": 409,
+            "owner_conversation_locked": 409, "owner_response_incomplete": 409,
+        }

@@ -1,7 +1,7 @@
 [
   {
     "actor": "default",
-    "approval_id": "0000000000004000800000000000000b",
+    "approval_id": "ed6006fdde984412b7d29509e18c162d",
     "choices": [
       "once",
       "deny"
@@ -11,23 +11,23 @@
     "event": "approval.request",
     "exact_operation": true,
     "operation": "owner_task_retry",
-    "payload_digest": "ecb729eb046e9733983d30fad534474106975dd27474715309fb367d68bab1be",
+    "payload_digest": "e8c5ae0c57620464f6a579a2e0689c34399ecef7452a6904b22b7530ed6f88fb",
     "profile": "default",
-    "request_id": "0000000000004000800000000000000b",
-    "run_id": "run_00000000000040008000000000000009",
+    "request_id": "ed6006fdde984412b7d29509e18c162d",
+    "run_id": "run_1f83b976acfb4a56ac5f591d10f21614",
     "timestamp": 1790000000.0
   },
   {
     "choice": "once",
     "event": "approval.responded",
     "resolved": 1,
-    "run_id": "run_00000000000040008000000000000009",
+    "run_id": "run_1f83b976acfb4a56ac5f591d10f21614",
     "timestamp": 1790000000.0
   },
   {
     "event": "run.completed",
-    "output": "{\"ok\":true,\"retry_reason\":\"I have added the provider credentials to the account.\",\"revision\":11,\"status\":\"ready\",\"task_id\":\"t_00000008\"}",
-    "run_id": "run_00000000000040008000000000000009",
+    "output": "{\"ok\":true,\"retry_reason\":\"I have added the provider credentials to the account.\",\"revision\":11,\"status\":\"ready\",\"task_id\":\"t_09dfb269\"}",
+    "run_id": "run_1f83b976acfb4a56ac5f591d10f21614",
     "timestamp": 1790000000.0,
     "usage": {
       "input_tokens": 0,
@@ -38,13 +38,120 @@
   {
     "error": "The approved Project change was not committed: owner_task_retry: the task is not part of this receipt-owned Project",
     "event": "run.failed",
-    "run_id": "run_0000000000004000800000000000000c",
+    "run_id": "run_56ed42d09d2b49b697c8f897010ca55d",
     "timestamp": 1790000000.0
+  },
+  {
+    "actor": "default",
+    "approval_id": "4dc852d2cc81447e8a34b99376e7c199",
+    "choices": [
+      "once",
+      "deny"
+    ],
+    "command": "Try 'Connect the payment provider' again",
+    "description": "Try 'Connect the payment provider' again",
+    "event": "approval.request",
+    "exact_operation": true,
+    "operation": "owner_task_retry",
+    "payload_digest": "968dbda718e3cbdbdb567664d8c32a9b792092e9184acc6ea410c22fc37656fe",
+    "profile": "default",
+    "request_id": "4dc852d2cc81447e8a34b99376e7c199",
+    "run_id": "run_557fdd2f4c82464a8942d004e6243585",
+    "timestamp": 1790000000.0
+  },
+  {
+    "choice": "deny",
+    "event": "approval.responded",
+    "resolved": 1,
+    "run_id": "run_557fdd2f4c82464a8942d004e6243585",
+    "timestamp": 1790000000.0
+  },
+  {
+    "error": "The approved Project change was not committed: confirmation_denied",
+    "event": "run.failed",
+    "run_id": "run_557fdd2f4c82464a8942d004e6243585",
+    "timestamp": 1790000000.0
+  },
+  {
+    "allow_permanent": true,
+    "allow_session": true,
+    "choices": [
+      "once",
+      "session",
+      "always",
+      "deny"
+    ],
+    "command": "<write_file> (plugin approval rule)",
+    "description": "Write the session plan",
+    "event": "approval.request",
+    "pattern_key": "plugin_rule:write_file:763c46d6df3c",
+    "pattern_keys": [
+      "plugin_rule:write_file:763c46d6df3c"
+    ],
+    "request_id": "0d694cb3d1b6492cad421ed2cf38dcc8",
+    "run_id": "run_1a0e7b4650944375944664eaf6063657",
+    "timestamp": 1790000000.0
+  },
+  {
+    "choice": "session",
+    "event": "approval.responded",
+    "resolved": 1,
+    "run_id": "run_1a0e7b4650944375944664eaf6063657",
+    "timestamp": 1790000000.0
+  },
+  {
+    "event": "run.completed",
+    "output": "{\"approved\": true, \"message\": null}",
+    "run_id": "run_1a0e7b4650944375944664eaf6063657",
+    "timestamp": 1790000000.0,
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "total_tokens": 0
+    }
+  },
+  {
+    "allow_permanent": true,
+    "allow_session": true,
+    "choices": [
+      "once",
+      "session",
+      "always",
+      "deny"
+    ],
+    "command": "<write_file> (plugin approval rule)",
+    "description": "Write the always plan",
+    "event": "approval.request",
+    "pattern_key": "plugin_rule:write_file:9b28e7e5caef",
+    "pattern_keys": [
+      "plugin_rule:write_file:9b28e7e5caef"
+    ],
+    "request_id": "d735078d72754bed81b4ebc9ba133092",
+    "run_id": "run_73e9f633606b4b51983826e0937b025e",
+    "timestamp": 1790000000.0
+  },
+  {
+    "choice": "always",
+    "event": "approval.responded",
+    "resolved": 1,
+    "run_id": "run_73e9f633606b4b51983826e0937b025e",
+    "timestamp": 1790000000.0
+  },
+  {
+    "event": "run.completed",
+    "output": "{\"approved\": true, \"message\": null}",
+    "run_id": "run_73e9f633606b4b51983826e0937b025e",
+    "timestamp": 1790000000.0,
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "total_tokens": 0
+    }
   },
   {
     "event": "tool.started",
     "preview": "plan.md",
-    "run_id": "run_0000000000004000800000000000000d",
+    "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",
     "timestamp": 1790000000.0,
     "tool": "read_file"
   },
@@ -52,13 +159,13 @@
     "duration": 0.25,
     "error": false,
     "event": "tool.completed",
-    "run_id": "run_0000000000004000800000000000000d",
+    "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",
     "timestamp": 1790000000.0,
     "tool": "read_file"
   },
   {
     "event": "reasoning.available",
-    "run_id": "run_0000000000004000800000000000000d",
+    "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",
     "text": "Placeholder reasoning.",
     "timestamp": 1790000000.0
   },
@@ -70,7 +177,7 @@
     "model": "placeholder-model",
     "parent_id": "parent-1",
     "preview": "Placeholder goal.",
-    "run_id": "run_0000000000004000800000000000000d",
+    "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",
     "subagent_id": "subagent-1",
     "task_count": 1,
     "task_index": 0,
@@ -104,7 +211,7 @@
     "parent_id": "parent-1",
     "preview": "Placeholder summary.",
     "reasoning_tokens": 0,
-    "run_id": "run_0000000000004000800000000000000d",
+    "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",
     "status": "completed",
     "subagent_id": "subagent-1",
     "summary": "Placeholder summary.",
@@ -116,19 +223,19 @@
   {
     "delta": "Placeholder answer.",
     "event": "message.delta",
-    "run_id": "run_0000000000004000800000000000000d",
+    "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",
     "timestamp": 1790000000.0
   },
   {
     "accepted": true,
     "event": "run.steered",
-    "run_id": "run_0000000000004000800000000000000d",
+    "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",
     "timestamp": 1790000000.0
   },
   {
     "event": "run.completed",
     "output": "Placeholder answer.",
-    "run_id": "run_0000000000004000800000000000000d",
+    "run_id": "run_9ec326161f0e4c5687cfcf69c784e9a9",
     "timestamp": 1790000000.0,
     "usage": {
       "input_tokens": 0,
@@ -138,7 +245,7 @@
   },
   {
     "event": "run.cancelled",
-    "run_id": "run_0000000000004000800000000000000e",
+    "run_id": "run_9e4dbe57dfb54b80b39b4e5e1280bf99",
     "timestamp": 1790000000.0
   }
 ]

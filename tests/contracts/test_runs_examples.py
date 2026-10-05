@@ -2,15 +2,20 @@
 
 Every example comes from the adapter's real ``/v1/runs`` routes, registered by
 the existing ``_create_runs_app``. An owner retry run goes through the real
-kernel and its real confirmation; a retry of work outside the Project gets the
-kernel's real refusal and code. A plain run uses a stub agent that calls the
-real progress and stream callbacks, so every event kind is produced without a
-model. Each ``hermes.run`` status is recorded as
+kernel and its real confirmation, answered ``once`` and, for a second Project,
+``deny``; a retry of work outside the Project gets the kernel's real refusal
+and code. Two runs of a stub agent ask the real approval gate for a write,
+answered ``session`` and ``always``. A plain run uses a stub agent that calls
+the real progress and stream callbacks, so every event kind is produced without
+a model. Each ``hermes.run`` status is recorded as
 ``_set_run_status`` returns it, which is what ``GET /v1/runs/{run_id}`` serves
 at that moment; ``queued`` and ``stopping`` last too briefly to poll. The
 restart failure is what the same route serves after the real recovery of a
 run whose executor is gone. What is asserted is described in
-tests/contracts/conftest.py.
+tests/contracts/conftest.py; each closed vocabulary is checked in the live
+answers and in the saved examples alike. The last two tests check the shared
+frozen ids and clock through real producers, as no setup module is among the
+owned paths.
 """
 
 from __future__ import annotations
@@ -18,11 +23,14 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
+import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from cron import jobs as cron_jobs
 from gateway.platforms import api_server
 from tests.gateway import test_api_server_runs as runs_tests
 from tests.gateway.test_api_server_runs import (  # noqa: F401  (an autouse fixture)
@@ -32,6 +40,7 @@ from tests.gateway.test_api_server_runs import (  # noqa: F401  (an autouse fixt
     _owner_retry_run_setup,
     _resolved_owner_task_routes,
 )
+from tools import approval as approval_mod
 
 FAMILY = "runs"
 RUN_STATUSES = {
@@ -43,6 +52,8 @@ EVENT_KINDS = {
     "subagent.complete", "message.delta", "approval.request", "approval.responded",
     "run.steered", "run.completed", "run.failed", "run.cancelled",
 }
+APPROVAL_CHOICES = {"once", "session", "always", "deny"}
+FINISHED = {"completed", "failed", "cancelled"}
 OWNER_CONFIG = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
 # What the delegate tool's relay sends with each subagent event
 # (tools/delegate_tool_progress.py ``_identity_kwargs``), and what a finished
@@ -104,6 +115,22 @@ def _stub_agent(steered: threading.Event):
     return _create_agent
 
 
+def _gated_agent(**_kwargs):
+    """Stands in for ``_create_agent``: a write the real approval gate must allow."""
+    agent = MagicMock()
+    agent.session_prompt_tokens = 0
+    agent.session_completion_tokens = 0
+    agent.session_total_tokens = 0
+
+    def _run_conversation(user_message, **_kwargs):
+        # Each input gives its own reason, so one answer never covers another run.
+        gate = approval_mod.request_tool_approval("write_file", f"Write {user_message}")
+        return {"final_response": json.dumps(gate)}
+
+    agent.run_conversation.side_effect = _run_conversation
+    return agent
+
+
 async def _answer(response) -> dict:
     return {"status": response.status, "body": await response.json()}
 
@@ -131,8 +158,12 @@ async def test_the_run_examples_carry_every_status_event_and_answer(
 ):
     adapter = _make_adapter()
     statuses = _recorded_statuses(adapter, monkeypatch)
+    # An ``always`` answer joins a fresh allowlist, saved to this test's home.
+    monkeypatch.setattr(approval_mod, "_permanent_approved", set())
     key, refused_key = "owner-task-retry-contract", "owner-task-retry-contract-refused"
+    denied_key = "owner-task-retry-contract-denied"
     _created, _task_id, _payload, body = _owner_retry_run_setup(key)
+    denied_body = _owner_retry_run_setup(denied_key)[-1]
     # A retry of work outside the Project: the kernel refuses it with its code.
     refused_body = json.loads(json.dumps(body))
     refused_body["owner_retry_authority"]["idempotency_key"] = refused_key
@@ -140,29 +171,42 @@ async def test_the_run_examples_carry_every_status_event_and_answer(
         idempotency_key=refused_key, task_id="t_outside_the_project")
     steered = threading.Event()
     slow_agent, slow_ready, _interrupted = _make_slow_agent()
-    live: dict = {}
+    live: dict = {"approval_requests": [], "approval_responses": []}
 
     with patch("gateway.run._load_gateway_config", return_value=OWNER_CONFIG):
         async with TestClient(TestServer(_create_runs_app(adapter))) as client:
+
+            async def approve(run_id: str, choice: str) -> list[dict]:
+                """Answer the approval the run waits on; its events once it ends."""
+                waiting = (await _poll(client, run_id, lambda status: (
+                    status["status"] == "waiting_for_approval")))["body"]
+                live["approval_requests"].append(waiting)
+                live["approval_responses"].append(await _answer(await client.post(
+                    f"/v1/runs/{run_id}/approval", json={
+                        "choice": choice,
+                        "approval_id": waiting["pending_approval"]["approval_id"]},
+                )))
+                await _poll(client, run_id, lambda status: status["status"] in FINISHED)
+                return await _events(client, run_id)
+
             with patch.object(adapter, "_create_agent", side_effect=RuntimeError("no model")):
                 started = await client.post(
                     "/v1/runs", json=body, headers={"Idempotency-Key": key})
                 live["run_started"] = await _answer(started)
-                owner_run = live["run_started"]["body"]["run_id"]
-                waiting = await _poll(client, owner_run, lambda status: (
-                    status["status"] == "waiting_for_approval"))
-                live["approval_response"] = await _answer(await client.post(
-                    f"/v1/runs/{owner_run}/approval",
-                    json={"choice": "once",
-                          "approval_id": waiting["body"]["pending_approval"]["approval_id"]},
-                ))
-                await _poll(client, owner_run, lambda status: status["status"] == "completed")
-                events = await _events(client, owner_run)
+                events = await approve(live["run_started"]["body"]["run_id"], "once")
                 refused = await client.post(
                     "/v1/runs", json=refused_body, headers={"Idempotency-Key": refused_key})
                 refused_run = (await refused.json())["run_id"]
                 await _poll(client, refused_run, lambda status: status["status"] == "failed")
                 events += await _events(client, refused_run)
+                denied = await client.post(
+                    "/v1/runs", json=denied_body, headers={"Idempotency-Key": denied_key})
+                events += await approve((await denied.json())["run_id"], "deny")
+
+            with patch.object(adapter, "_create_agent", side_effect=_gated_agent):
+                for choice in ("session", "always"):
+                    gated = await client.post("/v1/runs", json={"input": f"the {choice} plan"})
+                    events += await approve((await gated.json())["run_id"], choice)
 
             with patch.object(adapter, "_create_agent", side_effect=_stub_agent(steered)):
                 plain_run = (await (await client.post(
@@ -187,21 +231,40 @@ async def test_the_run_examples_carry_every_status_event_and_answer(
                 await client.get(f"/v1/runs/run_{'0' * 32}"))
 
     live["events"] = events
+    live["approval_response"] = live["approval_responses"][0]
     live.update({f"status_{status}": record for status, record in statuses.items()})
     saved = {kind: owner_payload_example(FAMILY, kind, body) for kind, body in live.items()}
 
-    assert {
-        kind.removeprefix("status_") for kind in saved if kind.startswith("status_")
-    } == RUN_STATUSES
-    assert "pending_approval" in saved["status_waiting_for_approval"]
-    assert "pending_approval" not in saved["status_completed"]
-    assert {"error", "error_code", "error_reason"} <= set(saved["status_failed"])
-    assert {event["event"] for event in saved["events"]} == EVENT_KINDS
-    assert saved["approval_response"]["body"]["object"] == "hermes.run.approval_response"
-    assert saved["steer"]["body"]["object"] == "hermes.run.steer"
-    assert saved["stop"]["body"]["status"] == "stopping"
-    assert saved["run_not_found"]["body"]["error"]["code"] == "run_not_found"
-    assert saved["run_started"]["status"] == 202
+    for answers in (live, saved):
+        assert {
+            record["status"] for kind, record in answers.items() if kind.startswith("status_")
+        } == RUN_STATUSES
+        assert "pending_approval" in answers["status_waiting_for_approval"]
+        assert "pending_approval" not in answers["status_completed"]
+        assert {"error", "error_code", "error_reason"} <= set(answers["status_failed"])
+        assert {event["event"] for event in answers["events"]} == EVENT_KINDS
+        assert answers["approval_response"]["body"]["object"] == "hermes.run.approval_response"
+        assert answers["steer"]["body"]["object"] == "hermes.run.steer"
+        assert answers["stop"]["body"]["status"] == "stopping"
+        assert answers["run_not_found"]["body"]["error"]["code"] == "run_not_found"
+        assert answers["run_started"]["status"] == 202
+        # Each answer is a choice its own pending approval offered; the stream
+        # announced that approval with the same choices and echoes the answer.
+        offered = {
+            waiting["run_id"]: waiting["pending_approval"]["choices"]
+            for waiting in answers["approval_requests"]
+        }
+        assert offered == {
+            event["run_id"]: event["choices"]
+            for event in answers["events"] if event["event"] == "approval.request"
+        }
+        responses = [response["body"] for response in answers["approval_responses"]]
+        assert all(response["choice"] in offered[response["run_id"]] for response in responses)
+        assert {(response["run_id"], response["choice"]) for response in responses} == {
+            (event["run_id"], event["choice"])
+            for event in answers["events"] if event["event"] == "approval.responded"
+        }
+        assert {response["choice"] for response in responses} == APPROVAL_CHOICES
 
 
 @pytest.mark.asyncio
@@ -223,3 +286,31 @@ async def test_the_restart_failure_example_carries_the_restart_sentence(
     saved = owner_payload_example(FAMILY, "status_failed_restart", live["body"])
     assert saved["status"] == "failed"
     assert saved["error"] == api_server._OWNER_ORPHAN_RUN_MESSAGE
+
+
+def _cron_job() -> dict:
+    # A pinned route, so ``create_job`` does not resolve the configured provider.
+    return cron_jobs.create_job(
+        "Placeholder prompt.", "every 1h", model="placeholder-model",
+        provider="placeholder-provider",
+    )
+
+
+def test_the_frozen_ids_stay_distinct_where_producers_cut_them():
+    """Producers keep 12, 24 or 28 hex characters of a ``uuid4``."""
+    assert _cron_job()["id"] != _cron_job()["id"]
+    drawn = [uuid.uuid4() for _ in range(64)]
+    for width in (12, 24, 28):
+        assert len({value.hex[:width] for value in drawn}) == len(drawn)
+    assert {(value.version, value.variant) for value in drawn} == {(4, uuid.RFC_4122)}
+
+
+def test_the_frozen_clock_holds_still_for_real_producers():
+    """Cron jobs created apart share their timestamps; monotonic time moves."""
+    first, read, started = _cron_job(), cron_jobs._hermes_now(), time.monotonic()
+    time.sleep(0.01)
+    second = _cron_job()
+    assert (second["created_at"], second["next_run_at"]) == (
+        first["created_at"], first["next_run_at"])
+    assert cron_jobs._hermes_now() == read
+    assert time.monotonic() > started
