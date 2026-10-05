@@ -1,11 +1,13 @@
 """Card 2: once CI on the exact published head is done, the dispatcher's delivery step creates that
-head's review cards, requests its one flaky rerun or returns the work for changes; no operator.
+head's review cards, waits on a red test slice or returns the work for changes; no operator.
 Real boards and git; GitHub is the real transport with only its exchange and App token replaced by a
-table, so every call passes the allowlist. The policy's route is pinned to values no code hard-codes."""
+table, so every call passes the allowlist. The team policy's route is an admitted one no code names."""
 
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -17,48 +19,64 @@ from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _event
 
 CHECK = "All required checks pass"
 SLICE = "Python tests / Run tests slice 3/12"
-FLAKY = "tests/tools/test_zombie_process_cleanup.py::TestDelegationCleanup::test_timed_out_child_keeps_relay_session_until_its_turn_exits"
-OTHER = "tests/hermes_cli/test_kanban_db.py::test_a_real_failure"
-ROUTE = {"provider_override": "policy-provider", "model_override": "policy-model", "reasoning_effort": "max"}
-CI_READS = ("check-runs", "/actions/")
+LINT = "Lint / ruff"
+ROUTE = {"provider_override": "openai-codex", "model_override": "gpt-6.1-sol", "reasoning_effort": "max"}
+PAGED = {"check_runs": "/check-runs", "workflow_runs": "/actions/runs", "jobs": "/runs/70/jobs"}
+
+
+def _policy_route(monkeypatch, route):
+    """The team policy resolves the review route to ``route``."""
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    monkeypatch.setattr(model_policy, "resolve_task_assignment", lambda profile, tier: model_policy.ModelAssignment(
+        profile=profile, provider=route["provider_override"], model=route["model_override"], model_label="policy",
+        reasoning_effort=route["reasoning_effort"]))
 
 
 @pytest.fixture
 def world(board, monkeypatch):
     """The board's repository with its GitHub origin, delivery on, the team policy's review route, and
-    GitHub as a table: the pull request, the required check on H, and H's workflow run and jobs."""
+    GitHub as a table: the pull request, the required check on H, and H's workflow run 70 with its jobs.
+    gh["pad"] puts 100 other items before the real ones of a collection, so those are on page 2."""
     kb, root, repo = board
-    from hermes_cli import kanban_delivery as kd
     from hermes_cli import kanban_delivery_github as transport
-    from plugins.dashboard_auth.raphael_workspace import model_policy
 
     _git(repo, "remote", "add", "origin", f"https://github.com/{REPO}.git")
     _write_config(root, enabled=True)
-    gh = {"calls": [], "steps": [], "pull_head": None, "check": ("completed", "success"), "attempt": 1,
-          "failed": None}
+    gh = {"calls": [], "pages": [], "steps": [], "pull_head": None, "check": ("completed", "success"),
+          "failed": None, "job": "completed", "pad": None, "short": None, "move_after": None}
 
-    def jobs(head):  # the slice failed at its test step; the summary check failed only at its evaluation
-        return [{"id": job, "name": name, "head_sha": head, "status": "completed", "conclusion": "failure",
-                 "run_attempt": gh["attempt"], "steps": [{"name": step, "conclusion": "failure"}]}
-                for job, name, step in ((81, SLICE, "Run tests (slice 3/12)"), (82, CHECK, "Evaluate job results"))]
+    def job(job_id, name, head):  # the summary check fails at its evaluation while CI is red
+        status = gh["job"] if name == gh["failed"] else "completed"
+        red = name == gh["failed"] or (name == CHECK and gh["check"][1] == "failure")
+        return {"id": job_id, "name": name, "run_id": 70, "head_sha": head, "status": status,
+                "conclusion": None if status != "completed" else "failure" if red else "success"}
+
+    def listed(key, items, page):
+        if gh["pad"] == key:
+            items = [{"id": 1000 + n, "name": f"other {n}", "run_id": 70, "head_sha": gh["head"],
+                      "status": "completed", "conclusion": "success"} for n in range(100)] + items
+        return 200, {"total_count": len(items) + (gh["short"] == key), key: items[(page - 1) * 100:page * 100]}
 
     def exchange(method, target, authorization, payload=None):
-        path = target.split("?")[0]
+        path, query = urlsplit(target).path, parse_qs(urlsplit(target).query)
+        head, page = gh["head"], int(query.get("page", ["1"])[0])
         gh["calls"].append((method, path))
-        head = gh["head"]
+        gh["pages"].append((path, page))
         if (method, path) == ("GET", f"/repos/{REPO}/pulls/41"):
             return 200, {"number": 41, "state": "open", "head": {"sha": gh["pull_head"] or head}}
+        if gh["move_after"] and path.endswith(gh["move_after"]):  # the pull request moves on while CI is read
+            gh["pull_head"] = "f" * 40
         if method == "GET" and path.endswith("/check-runs"):
             status, conclusion = gh["check"]
-            return 200, {"total_count": 1, "check_runs": [{"id": 900 + gh["attempt"], "name": CHECK,
-                         "head_sha": path.split("/")[-2], "status": status, "conclusion": conclusion}]}
+            return listed("check_runs", [{"id": 900, "name": CHECK, "head_sha": path.split("/")[-2],
+                                          "status": status, "conclusion": conclusion}], page)
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs"):
-            return 200, {"total_count": 1, "workflow_runs": [{"id": 70, "head_sha": head, "run_attempt": gh["attempt"]}]}
+            return listed("workflow_runs", [{"id": 70, "head_sha": head}], page)
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs/70/jobs"):
-            return 200, {"total_count": 2, "jobs": jobs(head)}
-        if method == "POST" and path.endswith("/rerun"):
-            gh["attempt"], gh["check"] = gh["attempt"] + 1, ("queued", None)
-            return 201, {}
+            return listed("jobs", [job(81, SLICE, head), job(83, LINT, head), job(82, CHECK, head)], page)
+        if method == "GET" and path.endswith("/jobs"):
+            return 200, {"total_count": 0, "jobs": []}
         return 404, None
 
     def token(self):  # kept on the transport, as the real one is, so its answers are redacted of it
@@ -68,10 +86,7 @@ def world(board, monkeypatch):
 
     monkeypatch.setattr(transport, "_exchange", exchange)
     monkeypatch.setattr(transport.GitHubTransport, "_installation_token", token)
-    monkeypatch.setattr(kd, "_failed_tests", lambda github, job: gh["failed"] and (list(gh["failed"]), len(gh["failed"])))
-    monkeypatch.setattr(model_policy, "resolve_task_assignment", lambda profile, tier: model_policy.ModelAssignment(
-        profile=profile, provider=ROUTE["provider_override"], model=ROUTE["model_override"], model_label="policy",
-        reasoning_effort=ROUTE["reasoning_effort"]))
+    _policy_route(monkeypatch, ROUTE)
     return kb, root, repo, gh
 
 
@@ -99,6 +114,12 @@ def _ready(world, tier=2, name="feature"):
     return tid, head
 
 
+def _project(db, tid):
+    """The source's project as a worker profile sees it: in no projects.db there, its branch named for it."""
+    _raw(db, "UPDATE tasks SET project_id = 'delivery-project', branch_name = ? WHERE id = ?",
+         f"delivery-project/{tid}", tid)
+
+
 def _raw(db, statement, *params):
     """Read or write the board file past the kernel: the independent count."""
     raw = sqlite3.connect(str(db))
@@ -120,41 +141,30 @@ def _state(kb, head, db=None):
                 "WHERE source_head = ?", head)[0]["pull_request_state"]
 
 
-def _ci_reads(gh):
-    return [call for call in gh["calls"] if any(part in call[1] for part in CI_READS)]
+def _source(kb, tid):
+    return _raw(kb.kanban_db_path(), "SELECT status, assignee FROM tasks WHERE id = ?", tid)[0]
 
 
-@pytest.mark.parametrize("tier", [0, 1])
-def test_tiers_0_and_1_get_one_combined_card_on_the_exact_head(world, tier):
+@pytest.mark.parametrize("tier, lenses", [
+    (0, {"R15": "correctness and security"}), (1, {"R15": "correctness and security"}),
+    (2, {"R12": "security", "R15": "correctness"}), (None, {"R12": "security", "R15": "correctness"})])
+def test_the_recorded_tier_alone_decides_the_cards_of_the_exact_head(world, tier, lenses):
     kb, root, repo, gh = world
     tid, head = _ready(world, tier)
 
     _tick(kb)
 
     cards = _cards(kb)
-    assert [(c["idempotency_key"], c["responsibility"]) for c in cards] == [(f"review:{tid}:{head}:R15", "R15")]
-    assert "correctness and security" in cards[0]["body"] and f"Head: {head}" in cards[0]["body"]
-    assert _state(kb, head) == "review_cards_created"
-    assert _events(kb, tid)[-1] == ("delivery_review_cards_created", {
-        "delivery_id": 1, "head": head, "pull_request_number": 41, "cards": [cards[0]["id"]]})
-
-
-@pytest.mark.parametrize("tier", [2, None])
-def test_tier_2_and_a_missing_tier_get_r15_and_r12_cards(world, tier):
-    kb, root, repo, gh = world
-    tid, head = _ready(world, tier)
-
-    _tick(kb)
-
-    cards = _cards(kb)
-    assert [(c["idempotency_key"], c["responsibility"]) for c in cards] == [
-        (f"review:{tid}:{head}:R12", "R12"), (f"review:{tid}:{head}:R15", "R15")]
-    assert ["security" in c["body"] and "correctness" not in c["body"] for c in cards] == [True, False]
-    assert ("Risk not recorded" in cards[0]["body"]) is (tier is None)
+    assert [(c["idempotency_key"], c["responsibility"], c["title"]) for c in cards] == [
+        (f"review:{tid}:{head}:{r}", r, f"Review ({lens}) of {tid} at {head}") for r, lens in lenses.items()]
+    assert {("Risk not recorded" in c["body"], f"Head: {head}" in c["body"]) for c in cards} == {(tier is None, True)}
+    kind, payload = _events(kb, tid)[-1]
+    assert (kind, payload["head"], sorted(payload["cards"])) == (
+        "delivery_review_cards_created", head, sorted(c["id"] for c in cards))
     assert _state(kb, head) == "review_cards_created"
 
 
-def test_cards_carry_the_command_fields_and_their_own_references(world):
+def test_cards_carry_the_command_fields_after_the_same_route_guard(world):
     kb, root, repo, gh = world
     tid, head = _ready(world)
     project = _raw(kb.kanban_db_path(), "SELECT project_id FROM tasks WHERE id = ?", tid)[0]["project_id"]
@@ -162,11 +172,13 @@ def test_cards_carry_the_command_fields_and_their_own_references(world):
     _tick(kb)
 
     conn = kb.connect()
-    try:  # the review command's own call (section 2(c)), with the team policy's route
+    try:  # the review command's own call (section 2(c)) with the team policy's route, then the same guard
         command = kb.create_task(
             conn, title="command", body="command", assignee=REVIEWER, responsibility="R15", created_by="operator",
             workspace_kind="worktree", execution_tier="routine", board="default", project_id=project, owned_paths=[],
             **ROUTE)
+        with kb.write_txn(conn):
+            assert kb.authorize_executable_transition(conn, command)
         parents = [row[0] for row in conn.execute(
             "SELECT parent_id FROM task_links WHERE child_id IN (SELECT id FROM tasks WHERE idempotency_key "
             "LIKE 'review:%')")]
@@ -175,10 +187,11 @@ def test_cards_carry_the_command_fields_and_their_own_references(world):
     fields = ("assignee", "workspace_kind", "workspace_path", "execution_tier", "model_override",
               "provider_override", "reasoning_effort", "owned_paths", "project_id", "tenant", "model_policy_lock")
     expected = _raw(kb.kanban_db_path(), "SELECT * FROM tasks WHERE id = ?", command)[0]
+    assert expected["model_policy_lock"]
     for card in _cards(kb):
         assert {f: card[f] for f in fields} == {f: expected[f] for f in fields}
-        assert (card["assignee"], card["created_by"], card["execution_tier"]) == (REVIEWER, "kanban-delivery", "routine")
-        assert {f: card[f] for f in ROUTE} == ROUTE
+        assert (card["assignee"], card["created_by"], card["status"]) == (REVIEWER, "kanban-delivery", "ready")
+        assert "pull request 41 on the code host" in card["body"] and "post the review on that commit" in card["body"]
         for reference in (f"Source card: {tid}", f"Head: {head}", f"Base commit: {_git(repo, 'rev-parse', 'main')}",
                           f"Repository: {REPO}", "Pull request: 41", f"Branch: delivery/{tid}", "Risk tier: 2",
                           f"CI on {head}: passed ({CHECK})"):
@@ -186,22 +199,50 @@ def test_cards_carry_the_command_fields_and_their_own_references(world):
     assert parents == [tid, tid]
 
 
-def test_the_route_and_reviewer_come_from_the_team_policy(world, monkeypatch):
+@pytest.mark.parametrize("model, created, after", [
+    (ROUTE["model_override"], ("ready", None, True, []), "running"),
+    ("unadmitted", ("blocked", "needs_input", False, [{"kind": "blocked"}]), "blocked")])
+def test_a_created_card_is_claimed_on_its_admitted_route_and_parked_on_any_other(world, monkeypatch, model, created,
+                                                                                 after):
+    """The kernel's route guard runs in the transaction that creates the card: on the team policy's admitted
+    route the next dispatcher pass claims it, in its own worktree under the source's project; the parking
+    control, on a route the policy does not admit, is parked there with its reason and never spawned."""
+    kb, root, repo, gh = world
+    (root / "profiles" / REVIEWER).mkdir(parents=True)
+    _policy_route(monkeypatch, dict(ROUTE, model_override=model))
+    tid, head = _ready(world, tier=1)
+    _project(kb.kanban_db_path(), tid)
+    _tick(kb)
+    card = _cards(kb)[0]
+    blocked = _raw(kb.kanban_db_path(), "SELECT kind FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+                   card["id"])
+    assert (card["status"], card["block_kind"] or None, bool(card["model_policy_lock"]), blocked) == created
+
+    result = _tick(kb)
+
+    assert [run[:2] for run in result.spawned] == ([(card["id"], REVIEWER)] if after == "running" else [])
+    assert (result.skipped_route_unproven, _state(kb, head), _cards(kb)[0]["status"]) == (
+        [], "review_cards_created", after)
+
+
+def test_the_route_and_reviewer_come_from_the_team_policy_and_delivery_off_does_nothing(world, monkeypatch):
     kb, root, repo, gh = world
     from plugins.dashboard_auth.raphael_workspace import model_policy
 
     tid, head = _ready(world)
+    events = _events(kb, tid)
+    _write_config(root, enabled=False)
+    _tick(kb)
+    _write_config(root, enabled=True)
     monkeypatch.setattr(model_policy, "reviewer_profile_ids", lambda: ())  # the policy names no reviewer
     _tick(kb)
-    assert (_cards(kb), gh["calls"], _state(kb, head)) == ([], [], "open")
+    assert (_cards(kb), gh["calls"], gh["steps"], _state(kb, head), _events(kb, tid)) == ([], [], [], "open", events)
 
     monkeypatch.setattr(model_policy, "reviewer_profile_ids", lambda: (REVIEWER,))
-    ROUTE_NOW = {"provider_override": "policy-provider", "model_override": "policy-model-2", "reasoning_effort": "max"}
-    monkeypatch.setattr(model_policy, "resolve_task_assignment", lambda profile, tier: model_policy.ModelAssignment(
-        profile=profile, provider=ROUTE_NOW["provider_override"], model=ROUTE_NOW["model_override"],
-        model_label="policy", reasoning_effort=ROUTE_NOW["reasoning_effort"]))
+    route = {"provider_override": "anthropic", "model_override": "claude-opus-5-5", "reasoning_effort": "max"}
+    _policy_route(monkeypatch, route)
     _tick(kb)
-    assert [({f: c[f] for f in ROUTE_NOW}, c["assignee"]) for c in _cards(kb)] == [(ROUTE_NOW, REVIEWER)] * 2
+    assert [({f: c[f] for f in route}, c["assignee"], c["status"]) for c in _cards(kb)] == [(route, REVIEWER, "ready")] * 2
 
 
 def test_no_card_while_ci_is_pending(world):
@@ -213,86 +254,112 @@ def test_no_card_while_ci_is_pending(world):
     _tick(kb)
     _tick(kb)
 
-    assert (_cards(kb), _state(kb, head), _events(kb, tid)) == ([], "open", events)
-    assert [call for call in gh["calls"] if call[0] == "POST"] == [] and set(gh["steps"]) == {"read_checks"}
+    assert (_cards(kb), _state(kb, head), _events(kb, tid), set(gh["steps"])) == ([], "open", events, {"read_checks"})
     gh["check"] = ("completed", "success")  # a later delivery step tries again
     _tick(kb)
     assert len(_cards(kb)) == 2 and _state(kb, head) == "review_cards_created"
 
 
-def test_delivery_off_does_nothing(world):
+@pytest.mark.parametrize("moved, failed", [("before", None), (PAGED["jobs"], None), (PAGED["jobs"], LINT)])
+def test_a_head_the_pull_request_left_gets_no_outcome(world, moved, failed):
+    """The pull request left H before CI was read, or while it was read: it is read again right before an
+    outcome is stored, so neither H's cards nor its return for changes is stored."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
+    gh["move_after"], gh["failed"], gh["pull_head"] = moved, failed, "f" * 40 if moved == "before" else None
+    gh["check"] = ("completed", "failure" if failed else "success")
     events = _events(kb, tid)
-    _write_config(root, enabled=False)
 
     _tick(kb)
 
-    assert (_cards(kb), gh["calls"], gh["steps"], _state(kb, head), _events(kb, tid)) == ([], [], [], "open", events)
+    assert (_cards(kb), _state(kb, head), _events(kb, tid), _source(kb, tid)["status"]) == ([], "open", events, "done")
+    pulls = [path for _, path in gh["calls"] if path.endswith("/pulls/41")]
+    assert (len(pulls), len(gh["calls"]) > len(pulls)) == ((1, False) if moved == "before" else (2, True))
 
 
-def test_a_stale_head_gets_no_cards(world):
+@pytest.mark.parametrize("key, short", [("check_runs", False), ("workflow_runs", False), ("jobs", False), ("jobs", True)])
+def test_each_collection_is_read_page_by_page_to_its_total_count(world, key, short):
+    """101 items, the decisive one (the required check, H's workflow run, its jobs) on page 2; a page short
+    of the total count GitHub states is unreadable, so nothing is decided."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
-    gh["pull_head"] = "f" * 40  # the pull request has moved away from the published head
+    gh["pad"], gh["short"] = key, short and key
 
     _tick(kb)
 
-    assert (_cards(kb), _state(kb, head), _ci_reads(gh)) == ([], "open", [])
+    assert (len(_cards(kb)), _state(kb, head)) == ((0, "open") if short else (2, "review_cards_created"))
+    assert [page for path, page in gh["pages"] if path.endswith(PAGED[key])] == [1, 2]
 
 
-@pytest.mark.parametrize("failed", [[OTHER], [FLAKY, OTHER], None])
-def test_ci_failure_goes_to_rework_at_once_with_no_card(world, failed):
-    """Superseding test_ci_failure_is_written_into_the_card (owner decision): a red CI with a failure
-    off the flaky list, or whose failed tests cannot be read, goes back to rework, with no card."""
+@pytest.mark.parametrize("running", ["queued", "in_progress"])
+def test_a_red_test_slice_waits_once_per_head_with_no_rerun_and_no_rework(world, running):
+    """Nothing is decided while the latest attempt of a job on H runs. Then, with no rerun requested and
+    its failed tests unreadable, a red slice leaves the delivery waiting and records failed_tests_unreadable
+    with its job once for H; a green rerun started on the code host then gets H its review cards."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
-    gh["check"], gh["failed"] = ("completed", "failure"), failed
+    gh["check"], gh["failed"], gh["job"] = ("completed", "failure"), SLICE, running
+    events = _events(kb, tid)
+    _tick(kb)
+    assert (_cards(kb), _state(kb, head), _events(kb, tid)) == ([], "open", events)
 
+    gh["job"] = "completed"
     _tick(kb)
     _tick(kb)
 
-    assert _cards(kb) == [] and _state(kb, head) == "returned_for_changes"
-    assert [call for call in gh["calls"] if call[0] == "POST"] == [] and "rerun_flaky" not in gh["steps"]
-    kind, payload = _events(kb, tid)[-1]
-    assert (kind, payload["head"], payload["pull_request_number"]) == ("delivery_returned_for_changes", head, 41)
-    source = kb.get_task(kb.connect(), tid)
-    assert (source.status, source.assignee) == ("ready", IMPLEMENTER)
-
-
-def test_a_flaky_only_red_ci_is_rerun_once_then_a_second_red_goes_to_rework(world):
-    kb, root, repo, gh = world
-    tid, head = _ready(world)
-    gh["check"], gh["failed"] = ("completed", "failure"), [FLAKY]
-
+    assert _events(kb, tid)[len(events):] == [("delivery_review_waiting", {
+        "delivery_id": 1, "head": head, "pull_request_number": 41, "code": "failed_tests_unreadable", "jobs": [81]})]
+    assert (_cards(kb), _state(kb, head), _source(kb, tid)["status"]) == ([], "open", "done")
+    assert [call for call in gh["calls"] if call[0] != "GET"] == [] and set(gh["steps"]) == {"read_checks"}
+    gh["check"], gh["failed"] = ("completed", "success"), None
     _tick(kb)
-
-    assert [call for call in gh["calls"] if call[0] == "POST"] == [("POST", f"/repos/{REPO}/actions/jobs/81/rerun")]
-    assert "rerun_flaky" in gh["steps"] and _cards(kb) == [] and _state(kb, head) == "rerun_requested"
-    assert _events(kb, tid)[-1] == ("delivery_rerun_requested", {
-        "delivery_id": 1, "head": head, "pull_request_number": 41, "jobs": [81], "tests": [FLAKY]})
-    _tick(kb)  # the rerun is still running
-    assert _state(kb, head) == "rerun_requested"
-
-    gh["check"] = ("completed", "failure")  # the one rerun is red again, on the same flaky test
-    _tick(kb)
-    _tick(kb)
-
-    assert len([call for call in gh["calls"] if call[0] == "POST"]) == 1
-    assert _cards(kb) == [] and _state(kb, head) == "returned_for_changes"
-    assert [kind for kind, _ in _events(kb, tid)][-2:] == ["delivery_rerun_requested", "delivery_returned_for_changes"]
-
-
-def test_a_green_rerun_gets_its_review_cards(world):
-    kb, root, repo, gh = world
-    tid, head = _ready(world)
-    gh["check"], gh["failed"] = ("completed", "failure"), [FLAKY]
-    _tick(kb)
-    gh["check"] = ("completed", "success")
-
-    _tick(kb)
-
     assert len(_cards(kb)) == 2 and _state(kb, head) == "review_cards_created"
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_a_red_job_that_runs_no_tests_goes_back_for_changes_once_handed_back(world, monkeypatch, refused):
+    """A red job that runs no tests sends H back for changes, with no card. returned_for_changes is stored
+    only with the source's move back: a refused handback keeps the row open with its reason, once for H,
+    and a later pass hands it back."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["check"], gh["failed"] = ("completed", "failure"), LINT
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("the assignment was refused")
+
+    if refused:
+        with monkeypatch.context() as patched:
+            patched.setattr(kb, "assign_task", refuse)
+            _tick(kb)
+            _tick(kb)
+        assert [(p["head"], p["code"], p["rework"], "was refused" in p["detail"]) for kind, p in _events(kb, tid)
+                if kind == "delivery_review_waiting"] == [(head, "handback_refused", "not_a_listed_flaky_test", True)]
+        assert (_state(kb, head), _source(kb, tid)["status"]) == ("open", "done")
+
+    _tick(kb)
+
+    assert (_cards(kb), _state(kb, head), _source(kb, tid)) == ([], "returned_for_changes", {
+        "status": "ready", "assignee": IMPLEMENTER})
+    kind, payload = _events(kb, tid)[-1]
+    assert (kind, payload["head"], payload["code"]) == ("delivery_returned_for_changes", head, "not_a_listed_flaky_test")
+
+
+def test_a_card_under_the_key_that_this_step_did_not_create_is_refused(world):
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="Not a review", assignee=REVIEWER, created_by="someone-else",
+                               idempotency_key=f"review:{tid}:{head}:R15")
+    finally:
+        conn.close()
+    events = _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert ([card["id"] for card in _cards(kb)], _state(kb, head), _events(kb, tid)) == ([other], "open", events)
 
 
 def test_repeated_passes_create_no_duplicate_cards(world):
@@ -305,7 +372,7 @@ def test_repeated_passes_create_no_duplicate_cards(world):
     _tick(kb)
 
     assert (_cards(kb), len(gh["calls"]), _events(kb, tid)) == (cards, calls, events)  # no GitHub read either
-    # A pass that died after creating the cards and before recording them finds them by their keys.
+    # A pass that died after creating the cards and before recording them adopts its own cards by their keys.
     _raw(kb.kanban_db_path(), "UPDATE kanban_deliveries SET pull_request_state = 'open'")
     _tick(kb)
     assert [c["id"] for c in _cards(kb)] == [c["id"] for c in cards] and _state(kb, head) == "review_cards_created"
@@ -330,7 +397,8 @@ def test_a_new_head_gets_new_cards_and_old_cards_are_untouched(world):
 
 def test_cards_land_on_the_ticked_board_under_the_worker_environment(world, monkeypatch):
     """The dispatcher's worker environment for proj-a (its board pinned, its card set, a profile home
-    under the root) ticks the board other: the cards land on other and on no other board."""
+    under the root) ticks the board other: the cards land on other and on no other board, under the
+    source's project, which that profile's projects.db does not hold."""
     kb, root, repo, gh = world
     kb.create_board("proj-a")
     kb.create_board("other")
@@ -341,6 +409,7 @@ def test_cards_land_on_the_ticked_board_under_the_worker_environment(world, monk
     _write_config(profile_home, enabled=True)
     tid, head = _approved(kb, repo, "beta", board="other")
     _published(kb, repo, gh, tid, head, board="other")
+    _project(other_db, tid)
     conn = kb.connect(board="proj-a")
     try:
         claimed = kb.claim_task(conn, kb.create_task(conn, title="plain work", assignee=IMPLEMENTER))
@@ -361,6 +430,9 @@ def test_cards_land_on_the_ticked_board_under_the_worker_environment(world, monk
 
     count = "SELECT COUNT(*) AS n FROM tasks WHERE idempotency_key LIKE 'review:%'"
     assert [_raw(db, count)[0]["n"] for db in (other_db, own_db, root / "kanban.db")] == [2, 0, 0]
-    assert {c["idempotency_key"] for c in _cards(kb, other_db)} == {
-        f"review:{tid}:{head}:R15", f"review:{tid}:{head}:R12"}
+    cards = _cards(kb, other_db)
+    assert {c["idempotency_key"] for c in cards} == {f"review:{tid}:{head}:R15", f"review:{tid}:{head}:R12"}
+    source = Path(_raw(other_db, "SELECT workspace_path FROM tasks WHERE id = ?", tid)[0]["workspace_path"])
+    assert [(c["project_id"], c["workspace_path"]) for c in cards] == [
+        ("delivery-project", str(source.parent / c["id"])) for c in cards]
     assert _state(kb, head, other_db) == "review_cards_created"
