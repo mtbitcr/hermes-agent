@@ -90,7 +90,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db, projects_db
-from hermes_cli.kanban_risk_tier import parse_risk_tier
+from hermes_cli.kanban_risk_tier import (
+    highest_risk_tier,
+    parse_risk_tier,
+    pinned_reasoning_effort,
+)
 from hermes_cli.sqlite_util import write_txn
 from plugins.dashboard_auth.raphael_workspace.model_policy import (
     configured_assignment_for,
@@ -1657,6 +1661,18 @@ def commit_task_graph(
         "later_milestones": normalized_later,
     }
     digest = _digest(payload)
+    # P5: a new Project's root card takes the highest tier of its tasks, and is
+    # created, pinned and verified at it. Derived after the digest, like the
+    # creation pin; any other root counts as tier 2, as before.
+    root_tier = None
+    root_pin = dict(root_route)
+    if mode == "new":
+        root_tier = highest_risk_tier(task["risk_tier"] for task in normalized_tasks)
+        root_pin["reasoning_effort"] = pinned_reasoning_effort(root_tier, None)
+        root_pin["model_policy_lock"] = kanban_db.mint_policy_lock(
+            root_assignee, root_pin["provider_override"], root_pin["model_override"],
+            root_pin["reasoning_effort"], root_pin["execution_tier"],
+        )
 
     pconn = projects_db.connect()
     try:
@@ -1779,12 +1795,13 @@ def commit_task_graph(
                     board=board_slug,
                     project_id=canonical_project_id,
                     idempotency_key=root_key,
-                    model_override=root_route["model_override"],
-                    provider_override=root_route["provider_override"],
-                    reasoning_effort=root_route["reasoning_effort"],
-                    execution_tier=root_route["execution_tier"],
-                    model_policy_lock=root_route["model_policy_lock"],
+                    model_override=root_pin["model_override"],
+                    provider_override=root_pin["provider_override"],
+                    reasoning_effort=root_pin["reasoning_effort"],
+                    execution_tier=root_pin["execution_tier"],
+                    model_policy_lock=root_pin["model_policy_lock"],
                     receipt_owned=True,
+                    risk_tier=root_tier,
                 )
                 root = kanban_db.get_task(kconn, root_task_id)
                 if (
@@ -1794,11 +1811,12 @@ def commit_task_graph(
                     or root.title != request_title
                     or root.body != root_body
                     or root.assignee != root_assignee
-                    or root.model_policy_lock != root_route["model_policy_lock"]
-                    or root.model_override != root_route["model_override"]
-                    or root.provider_override != root_route["provider_override"]
-                    or root.reasoning_effort != root_route["reasoning_effort"]
-                    or root.execution_tier != root_route["execution_tier"]
+                    or root.model_policy_lock != root_pin["model_policy_lock"]
+                    or root.model_override != root_pin["model_override"]
+                    or root.provider_override != root_pin["provider_override"]
+                    or root.reasoning_effort != root_pin["reasoning_effort"]
+                    or root.execution_tier != root_pin["execution_tier"]
+                    or (root_tier is not None and root.risk_tier != root_tier)
                 ):
                     raise OwnerWorkspaceError(
                         "crash_recovery_failed",
@@ -5660,6 +5678,33 @@ def _inherit_replaced_ownership_scopes(
             replacement["owned_paths"] = scope
 
 
+def _floor_replaced_risk_tiers(
+    kconn: sqlite3.Connection, changes: list[dict], *, project_id: str,
+) -> None:
+    """Lift every card a ``replace``, ``split`` or ``merge`` creates to the
+    highest tier of the cards it replaces (tier plan P5); a higher approved
+    tier is kept. Resolved from committed board state, like the inherited
+    scope above, before the owner is asked. A target that is not a work task
+    of this Project is left to the plan's atomic snapshot check.
+    """
+    for change in changes:
+        action = change["action"]
+        if action not in {"replace", "split", "merge"}:
+            continue
+        targets = change["targets"] if action == "merge" else [change["target"]]
+        replaced = [kanban_db.get_task(kconn, target["task_id"]) for target in targets]
+        tiers = [
+            task.risk_tier
+            for task in replaced
+            if task is not None and task.project_id == project_id
+        ]
+        if not tiers:
+            continue
+        successors = change["replacements"] if action == "split" else [change["replacement"]]
+        for spec in successors:
+            spec["risk_tier"] = highest_risk_tier([spec["risk_tier"], *tiers])
+
+
 def _resolve_existing_project_board(
     pconn: sqlite3.Connection, project_id: str, *, allow_archived: bool = False,
 ):
@@ -6179,6 +6224,9 @@ def commit_project_plan(
             # explicitly approved one and the owner is never asked to approve a
             # plan that cannot be applied.
             _inherit_replaced_ownership_scopes(
+                kconn, normalized_changes, project_id=project_id,
+            )
+            _floor_replaced_risk_tiers(
                 kconn, normalized_changes, project_id=project_id,
             )
             _assert_ownership_scope_repository(

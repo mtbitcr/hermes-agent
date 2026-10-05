@@ -97,6 +97,7 @@ from hermes_cli import kanban_provider_stops as _provider_stops
 from hermes_cli.kanban_risk_tier import (
     active_run_box_seconds,
     card_work_kind,
+    check_raise,
     effective_risk_tier,
     parse_risk_tier,
     pinned_reasoning_effort,
@@ -28556,6 +28557,7 @@ def submit_review_findings(
     findings: Any,
     candidate_digest: str,
     expected_run_id: Optional[int] = None,
+    risk_tier: Any = None,
 ) -> dict:
     """Reviewer handback entry point — the ONLY way typed findings reach an
     implementer.
@@ -28591,6 +28593,12 @@ def submit_review_findings(
     Returns a dict with ``outcome`` in
     ``{"passed", "handed_back", "owner_decision_blocked", "error"}`` plus
     outcome-specific detail (``attachment_id``, ``fingerprints``, ...).
+
+    ``risk_tier`` is the reviewer's tier for the card. It may only raise the
+    tier (:func:`hermes_cli.kanban_risk_tier.check_raise`): a lowering is an
+    ``error`` before anything is written, with no verdict. A raise is written
+    with one ``risk_tier_raised`` event before the verdict, so a handback
+    re-pins the implementer by the raised tier.
     """
     document = build_review_findings_document(findings, candidate_digest=candidate_digest)
     candidate_digest = document["candidate_digest"]
@@ -28624,6 +28632,23 @@ def submit_review_findings(
                 "outcome": "error",
                 "reason": "active run was not claimed from review",
             }
+        try:
+            raised_to = None if risk_tier is None else check_raise(task.risk_tier, risk_tier)
+        except ValueError as exc:
+            return {"outcome": "error", "reason": str(exc)}
+        risk_tier_raised = None
+        if raised_to is not None:
+            risk_tier_raised = {
+                "from": task.risk_tier, "to": raised_to,
+                "reviewer": task.assignee, "run_id": current_run_id,
+            }
+            conn.execute(
+                "UPDATE tasks SET risk_tier = ? WHERE id = ?", (raised_to, task_id),
+            )
+            _append_event(
+                conn, task_id, "risk_tier_raised", risk_tier_raised,
+                run_id=current_run_id,
+            )
 
         # EVERY validated finding the current review reports is outstanding.
         # History is consulted only to note that a finding is being re-raised
@@ -28649,6 +28674,7 @@ def submit_review_findings(
             )
         history = _review_findings_history(conn, task_id)
     re_raised_fingerprints = [f["fingerprint"] for f in re_raised]
+    raised_detail = {"risk_tier_raised": risk_tier_raised} if risk_tier_raised else {}
 
     if not outstanding:
         ok = complete_task(
@@ -28660,6 +28686,7 @@ def submit_review_findings(
         return {
             "outcome": "passed" if ok else "error",
             "re_raised_fingerprints": re_raised_fingerprints,
+            **raised_detail,
         }
 
     outstanding_fingerprints = {f["fingerprint"] for f in outstanding}
@@ -28708,6 +28735,7 @@ def submit_review_findings(
                 "candidate_digest": candidate_digest,
                 "fingerprints": sorted(outstanding_fingerprints),
                 "re_raised_fingerprints": re_raised_fingerprints,
+                **raised_detail,
             }
 
     document_bytes = json.dumps(
@@ -28793,6 +28821,7 @@ def submit_review_findings(
         "implementer": implementer,
         "fingerprints": sorted(outstanding_fingerprints),
         "re_raised_fingerprints": re_raised_fingerprints,
+        **raised_detail,
     }
 
 

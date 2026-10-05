@@ -8,6 +8,10 @@ creates (``add``, ``replace``, ``split``, ``merge`` through
 * a missing or unknown tier is refused as ``invalid_argument`` naming
   ``risk_tier``, before the owner is asked, so nothing is created or archived;
 * an approved tier lands on exactly the card whose specification states it.
+
+P5 (tier plan section h): a ``replace``, ``split`` or ``merge`` never creates
+a card below the highest tier of the cards it replaces, and a new Project's
+root card takes the highest tier of its tasks.
 """
 
 from __future__ import annotations
@@ -66,14 +70,14 @@ def _add_change(title: str, tier) -> dict:
     }
 
 
-def _existing_tasks(setup: dict, *titles: str) -> list[tuple[str, dict]]:
+def _existing_tasks(setup: dict, *titles: str, tiers=None) -> list[tuple[str, dict]]:
     with kb.connect(board=setup["board"]) as conn:
         ids = [
             kb.create_task(
                 conn, title=title, assignee="default",
-                project_id=setup["project_id"],
+                project_id=setup["project_id"], risk_tier=tier,
             )
-            for title in titles
+            for title, tier in zip(titles, tiers or [None] * len(titles))
         ]
         return [(task_id, _project_task_ref(conn, task_id)) for task_id in ids]
 
@@ -193,7 +197,10 @@ def test_each_committed_card_carries_its_own_tier(ctx, path):
         return
 
     setup = _bootstrap_board(ctx)
-    (_, first), (_, second) = _existing_tasks(setup, "First target", "Second target")
+    # Tier-0 targets, so no replacement floor (P5) lifts a stated tier.
+    (_, first), (_, second) = _existing_tasks(
+        setup, "First target", "Second target", tiers=[0, 0],
+    )
     if path == "project_plan":
         changes = [
             _add_change("Added deliverable", 0),
@@ -245,3 +252,97 @@ def test_each_committed_card_carries_its_own_tier(ctx, path):
             kb.get_task(conn, task_id) for task_id in result["created_task_ids"]
         ]
     assert [(task.title, task.risk_tier) for task in created] == expected
+
+
+# ---------------------------------------------------------------------------
+# P5: no replacement, split or merge drops below the work it replaces
+# ---------------------------------------------------------------------------
+
+
+def _row(conn, task_id: str):
+    return conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+
+@pytest.mark.parametrize(
+    ("path", "target_tiers", "stated", "expected"),
+    [
+        ("replace", [2], [0], [2]),
+        ("replace", [None], [1], [2]),
+        ("split", [1], [0, 2], [1, 2]),
+        ("merge", [0, 1], [0], [1]),
+        ("merge", [0, 0], [1], [1]),
+    ],
+    ids=["replace", "replace-untiered", "split", "merge", "merge-above-the-floor"],
+)
+def test_a_replacement_split_or_merge_keeps_the_highest_tier_it_replaces(
+    ctx, path, target_tiers, stated, expected,
+):
+    """A target without a tier counts as tier 2; a higher stated tier is kept."""
+    setup = _bootstrap_board(ctx)
+    titles = [f"Replaced work {index}" for index in range(len(target_tiers))]
+    targets = [ref for _, ref in _existing_tasks(setup, *titles, tiers=target_tiers)]
+    successors = [_spec(f"Successor {index}", tier) for index, tier in enumerate(stated)]
+    if path == "replace":
+        change = {
+            "action": "replace", "reason": "Rescope the stalled task.",
+            "target": targets[0], "replacement": successors[0],
+        }
+    elif path == "split":
+        change = {
+            "action": "split",
+            "reason": "The current task is too broad to verify safely.",
+            "target": targets[0],
+            "replacements": [
+                {**spec, "parents": [] if index == 0 else [0]}
+                for index, spec in enumerate(successors)
+            ],
+        }
+    else:
+        change = {
+            "action": "merge",
+            "reason": "One coherent deliverable is easier to own and verify.",
+            "targets": targets, "replacement": successors[0],
+        }
+    key = "-".join(str(part) for part in ("plan-floor", path, *target_tiers, *stated))
+    approver = _with_approver(ctx.session)
+    try:
+        result = _commit_project_plan(
+            ctx, **_project_plan_args(setup, [change], idempotency_key=key),
+        )
+    finally:
+        approver.join()
+
+    assert result["ok"] is True
+    with kb.connect(board=setup["board"]) as conn:
+        created = [_row(conn, task_id) for task_id in result["created_task_ids"]]
+    assert [row["risk_tier"] for row in created] == expected
+    # Pinned at the tier it got, on a clean seal.
+    assert [row["reasoning_effort"] for row in created] == [
+        "max" if tier == 2 else "high" for tier in expected
+    ]
+    for row in created:
+        assert kb.task_policy_lock_error(row) is None
+
+
+@pytest.mark.parametrize(
+    ("tiers", "root_tier", "effort"),
+    [((0, 1), 1, "high"), ((0, 0), 0, "high"), ((1, 2), 2, "max")],
+    ids=["highest-is-1", "all-0", "highest-is-2"],
+)
+def test_a_new_projects_root_takes_the_highest_tier_of_its_tasks(
+    ctx, tiers, root_tier, effort,
+):
+    args = _task_graph_args(idempotency_key=f"graph-root-tier-{tiers[0]}-{tiers[1]}")
+    for task, tier in zip(args["tasks"], tiers):
+        task["risk_tier"] = tier
+    approver = _with_approver(ctx.session)
+    try:
+        result = _commit_task_graph(ctx, **args)
+    finally:
+        approver.join()
+
+    assert result["ok"] is True
+    with kb.connect(board=result["board"]) as conn:
+        root = _row(conn, result["root_task_id"])
+    assert (root["risk_tier"], root["reasoning_effort"]) == (root_tier, effort)
+    assert kb.task_policy_lock_error(root) is None

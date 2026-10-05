@@ -10,7 +10,7 @@ null, counts as tier 2 and is treated as high risk (owner answer 3).
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 RISK_TIERS = (0, 1, 2)
 # The tier a card without a recorded tier counts as (owner answer 3).
@@ -35,6 +35,29 @@ def effective_risk_tier(value: Optional[int]) -> int:
     if value is None:
         return UNRECORDED_RISK_TIER
     return parse_risk_tier(value)
+
+
+def check_raise(current: Optional[int], proposed: Any) -> Optional[int]:
+    """The tier a reviewer's raise records, or None when the card already
+    counts as *proposed*. A tier may only be raised: a lower one, or anything
+    that is not a tier, raises ``ValueError``."""
+    tier = parse_risk_tier(proposed)
+    counted = effective_risk_tier(current)
+    if tier < counted:
+        raise ValueError(
+            f"risk_tier may only be raised: the card counts as tier {counted}, "
+            f"so tier {tier} would lower it"
+        )
+    return tier if tier > counted else None
+
+
+def highest_risk_tier(tiers: Iterable[Optional[int]]) -> int:
+    """The highest tier among *tiers*, a card without one counting as tier 2.
+
+    The floor of a replacement, split or merge (the cards it replaces) and the
+    tier of a new Project's root card (its tasks).
+    """
+    return max(effective_risk_tier(tier) for tier in tiers)
 
 
 # The only efforts a card is ever pinned at. The model policy admits exactly
