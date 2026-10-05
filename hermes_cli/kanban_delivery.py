@@ -866,7 +866,9 @@ def review_step(db_path: Path) -> None:
 def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Optional[str]:
     """Card 2 for one published row: GitHub is read outside every transaction, and an
     outcome or a waiting reason is stored only while the row and its done source card
-    are as this pass read them before GitHub. Returns the state stored, if any."""
+    are as this pass read them before GitHub. The required check on H, read after the
+    jobs and right before the pull request is read again, alone decides green, red or
+    wait; the jobs only name a red check's failed jobs. Returns the state stored, if any."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head = row["source_task_id"], row["pull_request_head"]
@@ -896,23 +898,21 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         github = GitHubTransport("read_checks", repository)
         if not _open_at_head(github, repository, row):
             return None  # the pull request moved off H or closed: no card for a stale head
-        runs = _listed(github, f"/repos/{repository}/commits/{head}/check-runs", "check_runs", filter="latest")
-        checks = {"check_runs": [run for run in runs if isinstance(run.get("name"), str)], "statuses": []}
         required = policy.required_checks[repository]
-        outcomes = {_required_check(name, head, checks) for name in required} or {"missing"}
-        if outcomes & {"pending", "stale", "missing"}:
-            return None  # CI on H still runs: a later delivery step tries again
         jobs = [job for run in _listed(github, f"/repos/{repository}/actions/runs", "workflow_runs", head_sha=head)
                 for job in _listed(github, f"/repos/{repository}/actions/runs/{run.get('id')}/jobs", "jobs",
-                                   filter="latest")]
-        runs = {job.get("run_id") for job in jobs if job.get("name") in required}  # the runs of H's required checks
-        jobs = [job for job in jobs if job.get("run_id") in runs]
-        if not jobs or any(job.get("status") != "completed" for job in jobs) or not _open_at_head(
-                github, repository, row):
-            return None  # a latest attempt still runs, or the pull request left H while CI was read
+                                   filter="latest")]  # only to name a red check's failed jobs
+        runs = _listed(github, f"/repos/{repository}/commits/{head}/check-runs", "check_runs", filter="latest")
+        checks = {"check_runs": [run for run in runs if isinstance(run.get("name"), str)], "statuses": []}
+        outcomes = {_required_check(name, head, checks) for name in required} or {"missing"}  # read last, it decides
+        if outcomes & {"pending", "stale", "missing"} or not _open_at_head(github, repository, row):
+            return None  # CI on H still runs, or the pull request left H while CI was read: a later step tries again
         if outcomes == {"success"}:
             return _create_review_cards(db_path, row, read, repository, base, required, reviewer, route)
-        failed = [job for job in jobs if job.get("conclusion") not in _PASSED and job.get("name") not in required]
+        runs = {job.get("run_id") for job in jobs if job.get("name") in required}  # the runs of H's required checks
+        failed = [job for job in jobs if job.get("run_id") in runs and job.get("status") == "completed"
+                  and job.get("conclusion") not in _PASSED]
+        failed = [job for job in failed if job.get("name") not in required] or failed  # or the aggregate alone
         with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):  # red: no rerun, no rework, no POST
             if delivery_settings() and _unchanged(conn, row, read):
                 _waiting(conn, row, "red_check_waiting", jobs=sorted(job.get("id") for job in failed))
