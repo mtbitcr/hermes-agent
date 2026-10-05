@@ -19,19 +19,31 @@ from __future__ import annotations
 import contextlib
 import encodings.idna  # noqa: F401  (K6: sockets load it at their first host name)
 import http.client
-import json
 import os
 import re
 import shutil
 import subprocess
+import tomllib  # noqa: F401  (K6: build_info loads it to read the version)
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
+import psutil  # noqa: F401  (K6: gateway.status loads it to ask about a process)
+
+import gateway.control_socket  # noqa: F401  (K6: update_receipt loads it to ask a gateway)
+import gateway.status  # noqa: F401  (K6: update_receipt loads it to read a gateway's record)
+import hermes_cli.build_info  # noqa: F401  (K6: update_receipt loads it for the code identity)
 import hermes_cli.sqlite_safe_read  # noqa: F401  (K6: backup.py loads it when a copy fails)
-from hermes_cli.backup import _copy_quick_snapshot_files
+from hermes_cli.backup import (
+    _copy_quick_snapshot_files,
+    _iter_backup_files,
+    _quick_snapshot_candidates,
+    _safe_copy_db,
+)
 from hermes_cli.profiles import _PROFILE_ID_RE
-from hermes_constants import named_profile_is_deleted
+from hermes_cli.update_receipt import collect_fleet_versions
+from hermes_constants import get_default_hermes_root, named_profile_is_deleted
 from utils import atomic_replace
 
 READBACK_TIMEOUT_SECONDS = 10.0
@@ -42,8 +54,16 @@ STATE, CONFIG = "state", "config"
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _SNAPSHOT_NAME = re.compile(r"[0-9A-Za-z][0-9A-Za-z._-]*")
-# The readbacks ask the host's own addresses, so no proxy from the environment stands between.
-_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs) -> None:
+        return None  # another page, such as a login page, is not the answer: an error status
+
+
+# The readbacks ask the host's own addresses, so no proxy from the environment stands between,
+# and the answer must come from the address itself.
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 
 class ReleaseHostActions:
@@ -123,20 +143,31 @@ class ReleaseHostActions:
     # Snapshots (S-C).
 
     def take_snapshot(self, name: str) -> None:
-        """Copy every served home's databases and files into state/NAME with backup.py's copier.
+        """Copy every application database and file into state/NAME with backup.py's copiers.
 
-        Its online copy reads each database through its write-ahead log, so the copy holds rows
-        not yet checkpointed. A database it cannot copy fails the snapshot.
+        That is each served home's quick-snapshot set and every other database a full backup of
+        the home holds, such as the release record, the board registry and the cron queues. The
+        online copy reads each database through its write-ahead log, so the copy holds rows not
+        yet checkpointed. A file that is not copied fails the snapshot before it is published, and
+        only the owner can read the copies, whatever the umask or the snapshot root's access.
         """
 
         def fill(staging: Path) -> None:
-            failed: list[str] = []
+            missing: list[str] = []
             for home in self._served_homes():
                 rel = home.relative_to(self.root_home)
-                _, failed_dbs, _ = _copy_quick_snapshot_files(home, staging / rel, None)
-                failed += [(rel / db).as_posix() for db in failed_dbs]
-            if failed:
-                raise RuntimeError(f"could not copy {', '.join(failed)}")
+                wanted = [sub for _, sub, _ in _quick_snapshot_candidates(home)]
+                copied, _, _ = _copy_quick_snapshot_files(home, staging / rel, None)
+                missing += [(rel / sub).as_posix() for sub in wanted if sub not in copied]
+                for store in self._other_databases(home, set(wanted)):
+                    copy = staging / rel / store.relative_to(home)
+                    copy.parent.mkdir(parents=True, exist_ok=True)
+                    if not _safe_copy_db(store, copy):
+                        missing.append(copy.relative_to(staging).as_posix())
+            if missing:
+                raise RuntimeError(f"could not copy {', '.join(missing)}")
+            for path in staging.rglob("*"):
+                path.chmod(0o700 if path.is_dir() else 0o600)
 
         self._write_snapshot(STATE, name, fill, replace=False)
 
@@ -156,40 +187,62 @@ class ReleaseHostActions:
         self.config_snapshot = name
 
     def restore_config(self) -> None:
-        """Put back each file of the saved configuration snapshot, each by one atomic replace.
+        """Put back the saved configuration set (S-D): the same files with the same bytes.
 
-        A live file the snapshot does not hold is left alone.
+        Each saved file comes back by one atomic replace, into a private directory made again when
+        it is gone. A configuration file of a served home that the save does not hold is removed.
+        A profile deleted since the save, every other file and the databases stay as they are.
         """
         if not self.config_snapshot:
             raise RuntimeError("no configuration snapshot was saved")
         saved = self._named(CONFIG, self.config_snapshot)
         if not saved.is_dir():
             raise FileNotFoundError(f"the configuration snapshot {self.config_snapshot} is gone")
+        kept = set()
         for copy in sorted(filter(Path.is_file, saved.rglob("*"))):
             live = self.root_home / copy.relative_to(saved)
+            kept.add(live)
+            if live.parent != self.root_home and named_profile_is_deleted(live.parent):
+                continue
+            live.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             temporary = live.with_name(f".{live.name}.release-restore")
             shutil.copy2(copy, temporary)
             atomic_replace(temporary, live)
+        for rel in self._config_files():
+            if self.root_home / rel not in kept:
+                (self.root_home / rel).unlink(missing_ok=True)  # created after the save
 
     def _write_snapshot(
         self, kind: str, name: str, fill: Callable[[Path], None], *, replace: bool
     ) -> None:
         """Fill a staging directory, then rename it to the name, so no name holds half a snapshot.
 
-        The staging directory sits outside state/ and config/, where no snapshot listing sees it.
+        The staging directory sits outside state/ and config/, where no snapshot listing sees it,
+        and is private before anything is copied into it. An earlier snapshot of the name is set
+        aside beside it until the rename is done, and comes back when the rename fails.
         """
         target = self._named(kind, name)
         if target.exists() and not replace:
             raise FileExistsError(f"the {kind} snapshot {name} already exists")
         staging = self.snapshot_root / f".{kind}-{name}.partial"
+        earlier = self.snapshot_root / f".{kind}-{name}.previous"
         shutil.rmtree(staging, ignore_errors=True)
-        staging.mkdir(parents=True)
+        self.snapshot_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target.parent.mkdir(mode=0o700, exist_ok=True)
+        staging.mkdir(mode=0o700)
         try:
             fill(staging)
-            if replace:
-                shutil.rmtree(target, ignore_errors=True)
-            target.parent.mkdir(exist_ok=True)
-            os.replace(staging, target)
+            set_aside = replace and target.exists()
+            if set_aside:
+                shutil.rmtree(earlier, ignore_errors=True)
+                os.replace(target, earlier)
+            try:
+                os.replace(staging, target)
+            except OSError:
+                if set_aside:
+                    os.replace(earlier, target)
+                raise
+            shutil.rmtree(earlier, ignore_errors=True)
         finally:
             shutil.rmtree(staging, ignore_errors=True)  # already gone once renamed
 
@@ -221,6 +274,24 @@ class ReleaseHostActions:
             if (home / name).is_file()
         ]
 
+    def _other_databases(self, home: Path, quick: set[str]) -> list[Path]:
+        """Every *.db that backup.py's full-backup walk keeps in the home, beyond its quick set.
+
+        Left out are the profiles under the root, each served one walked as its own home, the task
+        workspaces and attachments, which hold the tasks' files rather than the platform's stores,
+        and the checkout and the release snapshots themselves.
+        """
+        apart = [self.snapshot_root.resolve(), self.checkout_path.resolve()]
+        return sorted(
+            path
+            for path, rel in _iter_backup_files(home, self.snapshot_root)
+            if path.suffix == ".db"
+            and rel.as_posix() not in quick
+            and not (home == self.root_home and rel.parts[0] == "profiles")
+            and {"workspaces", "attachments"}.isdisjoint(rel.parts)
+            and not any(path.resolve().is_relative_to(place) for place in apart)
+        )
+
     # Readbacks.
 
     def health_ok(self) -> bool:
@@ -230,24 +301,21 @@ class ReleaseHostActions:
         return _answers_ok(self.workspace_check_url)
 
     def fleet_version(self) -> str:
-        """The one code version every live gateway stamped, or "" when none or several do.
+        """The one code version every live gateway reports, or "" when that is not so.
 
-        It reads each served home's gateway_state.json itself: the fleet helper in
-        hermes_cli/update_receipt.py imports lazily, which K6 rules out here.
+        collect_fleet_versions (hermes_cli/update_receipt.py) asks the gateways of this process's
+        root through their own records, the control socket or gateway_state.json, and calls one
+        current only when its stamp is the checkout's own code identity. A stale, unknown or
+        missing identity, no live gateway, or a root other than this host's reads "".
         """
-        versions = {record.get("code_sha") or "" for record in self._live_gateways()}
-        return versions.pop() if len(versions) == 1 else ""
-
-    def _live_gateways(self) -> list[dict]:
-        records = []
-        for home in self._served_homes():
-            try:
-                record = json.loads((home / "gateway_state.json").read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue  # no gateway stamped this home, or the stamp is unreadable
-            if isinstance(record, dict) and _alive(record.get("pid")):
-                records.append(record)
-        return records
+        if get_default_hermes_root().resolve() != self.root_home.resolve():
+            return ""
+        versions = {
+            row.get("code_sha") if row.get("state") == "current" else None
+            for row in collect_fleet_versions()
+        }
+        version = versions.pop() if len(versions) == 1 else None
+        return version if isinstance(version, str) and _FULL_SHA.fullmatch(version) else ""
 
 
 def _run(argv: list[str], **options) -> subprocess.CompletedProcess[str]:
@@ -268,25 +336,14 @@ def _full_sha(commit: str) -> str:
 
 
 def _answers_ok(url: str) -> bool:
-    """A 2xx answer within the timeout. No address, an error status, a timeout or a refused
-    connection reads False."""
+    """A 2xx answer from the address itself within the timeout. No address or one that is not
+    HTTP, a redirect, an error status, a timeout or a refused connection reads False."""
     if not url:
         return False
     try:
+        if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+            return False
         with _DIRECT.open(url, timeout=READBACK_TIMEOUT_SECONDS) as answer:
             return 200 <= answer.status < 300
     except (OSError, ValueError, http.client.HTTPException):
         return False
-
-
-def _alive(pid: object) -> bool:
-    """A positive process id that names a running process. Signal 0 only asks."""
-    if type(pid) is not int or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True  # it runs, as another user
-    except (OSError, OverflowError):
-        return False
-    return True
