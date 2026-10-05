@@ -9,9 +9,10 @@
 Every method only reads. Moving the checkout and taking or restoring snapshots are actions, and
 they belong to card 3. Reading also leaves nothing behind, which is what lets prepare mode keep
 its promise to write nothing: git runs with --no-optional-locks, so `git status` does not
-refresh the index; origin main comes from `git ls-remote`, which updates no local ref; a board
-file is read so that SQLite creates no file and changes none, its -shm included; and the venv
-probe writes no bytecode.
+refresh the index; origin main comes from `git ls-remote`, which updates no local ref; boards
+are read in a child interpreter of their own, so that SQLite creates no file and changes none,
+its -shm included, and this process's own board connections keep their locks; and the venv probe
+writes no bytecode.
 
 Like the runner (K6), this module imports everything when it loads and no method imports
 anything: the readbacks after the stop call the checkout, venv and configuration reads while
@@ -20,18 +21,16 @@ the checkout on disk is being swapped.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
+import json
 import os
 import re
 import shlex
 import shutil
 import signal
-import sqlite3
-import struct
 import subprocess
+import sys
 from collections.abc import Collection, Mapping, Sequence
-from contextlib import closing
 from pathlib import Path
 
 from hermes_cli.kanban_db import (
@@ -56,16 +55,64 @@ _OPEN_RUNS_SQL = (
     "SELECT id, worker_pid, worker_start_time FROM task_runs "
     "WHERE status = 'running' AND ended_at IS NULL ORDER BY id"
 )
-# Bytes 18 and 19 of a SQLite file are its write and read format versions; 2 means WAL.
-_WAL_FORMAT = b"\x02\x02"
-# A struct flock that read-locks the bytes SQLite's shared lock covers. Held as an open file
-# description lock, it keeps every connection, in this process or another, from the exclusive
-# lock it needs to fold a -wal back into the database file and remove it.
-_SHARED_LOCK = struct.pack("hhqqi4x", fcntl.F_RDLCK, os.SEEK_SET, 0x40000002, 510, 0)
+# Boards are read by a child interpreter (-I -B, standard library only), given the query and the
+# board files. A descriptor on a live board never opens in this process: closing it would drop
+# every SQLite lock this process's own connections hold on the file, and a connection here would
+# share their -shm and write its read marks. The child prints, per file, its rows, or null for a
+# board it cannot read. A file whose header is not SQLite 3 in rollback or WAL format never reaches
+# SQLite, which deletes a -wal beside an empty file. A WAL file is read under a read lock on the
+# bytes SQLite's shared lock covers, held as an open file description lock: it keeps every
+# connection from the exclusive lock it needs to fold a -wal back and remove it. With no -wal there
+# is nothing to replay, and the file is opened immutable, which opens no side file; a -wal there
+# after that read was created during it and fails the read. With a -wal, readonly_shm reads its
+# commits and writes to neither file, and a missing -shm fails the read. SQLite must have opened
+# the very file whose header was checked.
+_BOARD_READ = r"""
+import fcntl, json, os, sqlite3, struct, sys
+from pathlib import Path
+LOCK = struct.pack("hhqqi4x", fcntl.F_RDLCK, os.SEEK_SET, 0x40000002, 510, 0)
+def rows(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    try:
+        header = os.pread(fd, 100, 0)
+        if len(header) < 100 or header[:16] != b"SQLite format 3\0" or header[18:20] not in (b"\1\1", b"\2\2"):
+            return None
+        wal = header[18:20] == b"\2\2"
+        if wal:
+            fcntl.fcntl(fd, fcntl.F_OFD_SETLK, LOCK)
+        immutable = wal and not os.path.exists(path + "-wal")
+        mode = "immutable=1" if immutable else "readonly_shm=1"
+        conn = sqlite3.connect(f"{Path(path).as_uri()}?mode=ro&{mode}", uri=True)
+        try:
+            opened, checked = os.stat(path), os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
+                return None
+            found = conn.execute(sys.argv[1]).fetchall()
+        finally:
+            conn.close()
+        return None if immutable and os.path.exists(path + "-wal") else found
+    except (OSError, sqlite3.Error):
+        return None
+    finally:
+        os.close(fd)
+print(json.dumps([rows(os.path.realpath(path)) for path in sys.argv[2:]]))
+"""
 _SIGNAL_NAMES = {sig.value: sig.name for sig in signal.Signals}
 # The gateway unit's start command as `systemctl show` prints it: one interpreter, started by its
-# own path, running hermes_cli.main.
-_GATEWAY_START = re.compile(r"\{ path=(/\S+) ; argv\[\]=\1 -m hermes_cli\.main .*\}")
+# own path with only options whose effect on imports a probe can repeat, running hermes_cli.main.
+_GATEWAY_START = re.compile(r"\{ path=(/\S+) ; argv\[\]=\1((?: -[bBdEIOPqRsSuv]+)*) -m hermes_cli\.main .*\}")
+# A variable of the user manager's environment as `systemctl show-environment` prints it: bare, or
+# in $'...' when it needs quoting. A backslash escape in the quoting is refused, not decoded.
+_MANAGER_VARIABLE = re.compile(r"([^=\s]+)=(?:\$'([^'\\]*)'|([^$'\\]*))")
+# An EnvironmentFiles entry as `systemctl show` prints it, and the one assignment form read from
+# such a file: a plain value, with nothing systemd would unquote, unescape or expand.
+_ENVIRONMENT_FILE = re.compile(r"(/[^*?\[]*) \(ignore_errors=(yes|no)\)")
+_FILE_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s\"'\\$`#;]*)")
 # Run by the live venv's interpreter: its venv, then where it would import hermes_cli from,
 # without importing it.
 _IMPORT_ROOT_PROBE = (
@@ -141,30 +188,79 @@ class LiveHostReader:
 
     def venv_import_root(self) -> str:
         # The live venv is the one whose interpreter the gateway unit starts, as the user manager
-        # shows the unit. A unit that starts no single hermes_cli interpreter, or whose VIRTUAL_ENV
-        # names another venv than that interpreter's, has no live venv to answer for. -I keeps
-        # this process's environment and working directory out of the answer.
+        # shows the unit, and it imports as the unit runs it: with the unit's options, in the
+        # unit's working directory, with only the environment systemd gives the unit, so nothing
+        # of this process's own goes in. A unit whose start or context cannot be repeated
+        # exactly, or whose VIRTUAL_ENV names another venv than its interpreter's, has no live
+        # venv to answer for.
         start = _GATEWAY_START.fullmatch(self.unit_property(GATEWAY_UNIT, "ExecStart"))
         if start is None:
             raise LookupError(f"the {GATEWAY_UNIT} unit starts no single hermes_cli interpreter")
-        prefix, root = _run([start[1], "-I", "-B", "-c", _IMPORT_ROOT_PROBE]).stdout.splitlines()
-        for item in shlex.split(self.unit_property(GATEWAY_UNIT, "Environment")):
-            name, _, value = item.partition("=")
-            if name == "VIRTUAL_ENV" and Path(value).resolve() != Path(prefix).resolve():
-                raise LookupError(f"the {GATEWAY_UNIT} unit's VIRTUAL_ENV is not its interpreter's")
+        argv = [start[1], *start[2].split(), "-B", "-c", _IMPORT_ROOT_PROBE]
+        try:
+            env, directory = self._gateway_context()
+            prefix, root = _run(argv, env=env, cwd=directory).stdout.splitlines()
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            raise LookupError(f"the {GATEWAY_UNIT} unit's interpreter cannot be probed as it runs") from error
+        if "VIRTUAL_ENV" in env and Path(env["VIRTUAL_ENV"]).resolve() != Path(prefix).resolve():
+            raise LookupError(f"the {GATEWAY_UNIT} unit's VIRTUAL_ENV is not its interpreter's")
         return str(Path(root).resolve())
+
+    def _gateway_context(self) -> tuple[dict[str, str], str]:
+        # In systemd's order: the user manager's environment, the unit's Environment=, then its
+        # EnvironmentFile= files, and UnsetEnvironment= last. An unset working directory is the
+        # user's home.
+        env = {}
+        for line in _run(["systemctl", "--user", "show-environment"]).stdout.splitlines():
+            variable = _MANAGER_VARIABLE.fullmatch(line)
+            if variable is None:
+                raise LookupError("the user manager's environment cannot be read exactly")
+            env[variable[1]] = variable[3] if variable[2] is None else variable[2]
+        home = env.get("HOME", "")
+        env.update(item.partition("=")[::2] for item in self._gateway_words("Environment"))
+        for entry in self._unit_values(GATEWAY_UNIT, "EnvironmentFiles"):
+            env.update(_environment_file(entry))
+        for item in self._gateway_words("UnsetEnvironment"):
+            name, assigns, value = item.partition("=")
+            if not assigns or env.get(name) == value:
+                env.pop(name, None)
+        directory = self.unit_property(GATEWAY_UNIT, "WorkingDirectory").removeprefix("!")
+        directory = home if directory in ("", "~") else directory
+        if not (os.path.isabs(directory) and os.path.isdir(directory)):
+            raise LookupError(f"the {GATEWAY_UNIT} unit's working directory cannot be entered")
+        return env, directory
+
+    def _gateway_words(self, name: str) -> list[str]:
+        # systemctl prints a list item that needs quoting in double quotes with backslash escapes,
+        # which shlex reads otherwise, so an escape is refused rather than decoded.
+        text = " ".join(self._unit_values(GATEWAY_UNIT, name))
+        try:
+            if "\\" not in text:
+                return shlex.split(text)
+        except ValueError:
+            pass
+        raise LookupError(f"the {GATEWAY_UNIT} unit's {name} cannot be read exactly")
 
     # Units, disk and snapshots.
 
     def unit_property(self, unit: str, name: str) -> str:
+        values = self._unit_values(unit, name)
+        if len(values) != 1:
+            raise LookupError(f"systemctl reported no single {name} for the {unit} unit")
+        if name.endswith("Signal") and values[0].isdigit():
+            return _SIGNAL_NAMES.get(int(values[0]), values[0])
+        return values[0]
+
+    def _unit_values(self, unit: str, name: str) -> list[str]:
         # S-E: units are driven, and read, only through the user manager.
         argv = ["systemctl", "--user", "show", f"--property={name}", "--", self.units[unit]]
-        key, _, value = _run(argv).stdout.strip().partition("=")
-        if key != name:
-            raise LookupError(f"systemctl reported no {name} for the {unit} unit")
-        if name.endswith("Signal") and value.isdigit():
-            return _SIGNAL_NAMES.get(int(value), value)
-        return value
+        values = []
+        for line in _run(argv).stdout.splitlines():
+            key, _, value = line.partition("=")
+            if key != name:
+                raise LookupError(f"systemctl reported no {name} for the {unit} unit")
+            values.append(value)
+        return values
 
     def free_disk_bytes(self) -> int:
         # Before the first release the snapshot root may not exist yet; its filesystem is then
@@ -185,15 +281,17 @@ class LiveHostReader:
 
     def open_native_runs(self) -> Sequence[OpenRun]:
         home = self._require_root(kanban_home())
-        runs: list[OpenRun] = []
+        slugs, paths = [], []
         # Builder note: boards come from the kanban board listing.
         for board in list_boards(include_archived=True):
-            slug = board["slug"]
+            slugs.append(board["slug"])
             # Not board["db_path"] or kanban_db_path(): both honour HERMES_KANBAN_DB, which the
             # dispatcher pins to a worker's own board, so under a worker's environment they name
             # that one file for every board. The same rule as release_ledger.ledger_path.
-            path = home / "kanban.db" if slug == DEFAULT_BOARD else board_dir(slug) / "kanban.db"
-            runs.extend(_open_runs(slug, path))
+            paths.append(home / "kanban.db" if slugs[-1] == DEFAULT_BOARD else board_dir(slugs[-1]) / "kanban.db")
+        runs: list[OpenRun] = []
+        for slug, rows in zip(slugs, _board_rows(paths)):
+            runs.extend(_open_runs(slug, rows))
         return runs
 
     # Configuration.
@@ -228,7 +326,13 @@ class LiveHostReader:
         return found
 
 
-def _run(argv: Sequence[str], *, accept: Collection[int] = (0,)) -> subprocess.CompletedProcess:
+def _run(
+    argv: Sequence[str],
+    *,
+    accept: Collection[int] = (0,),
+    env: Mapping[str, str] | None = None,
+    cwd: str | None = None,
+) -> subprocess.CompletedProcess:
     done = subprocess.run(
         list(argv),
         stdin=subprocess.DEVNULL,
@@ -238,6 +342,8 @@ def _run(argv: Sequence[str], *, accept: Collection[int] = (0,)) -> subprocess.C
         errors="surrogateescape",
         timeout=_TIMEOUT_SECONDS,
         check=False,
+        env=env,
+        cwd=cwd,
     )
     if done.returncode not in accept:
         # stderr stays out: the runner keeps this message as release evidence, and a remote's
@@ -255,12 +361,46 @@ def _digests(files: Mapping[str, Path]) -> dict[str, str]:
     }
 
 
-def _open_runs(slug: str, path: Path) -> list[OpenRun]:
-    if not path.exists():
-        return []
+def _environment_file(entry: str) -> dict[str, str]:
+    # Comments, blank lines and plain assignments are read as systemd reads them; a glob, any
+    # other form, or a missing file the unit needs, cannot be repeated exactly.
+    refused = LookupError(f"the {GATEWAY_UNIT} unit's environment file {entry} cannot be read exactly")
+    listed = _ENVIRONMENT_FILE.fullmatch(entry)
+    if listed is None:
+        raise refused
     try:
-        rows = _open_run_rows(path)
-    except (OSError, sqlite3.DatabaseError):
+        lines = Path(listed[1]).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        if listed[2] == "yes":
+            return {}
+        raise refused from None
+    except (OSError, ValueError):
+        raise refused from None
+    variables = {}
+    for line in (line.strip() for line in lines):
+        if line and line[0] not in "#;":
+            assignment = _FILE_ASSIGNMENT.fullmatch(line)
+            if assignment is None:
+                raise refused
+            variables[assignment[1]] = assignment[2]
+    return variables
+
+
+def _board_rows(paths: Sequence[Path]) -> list:
+    # Any failure of the child, its timeout, its exit status or output that does not parse,
+    # leaves every board unread.
+    argv = [sys.executable, "-I", "-B", "-c", _BOARD_READ, _OPEN_RUNS_SQL, *map(str, paths)]
+    try:
+        found = json.loads(_run(argv).stdout)
+        if len(found) == len(paths) and all(rows is None or all(len(row) == 3 for row in rows) for rows in found):
+            return found
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        pass
+    return [None] * len(paths)
+
+
+def _open_runs(slug: str, rows: list | None) -> list[OpenRun]:
+    if rows is None:
         # F18: the dispatcher's host-cap count skips a board it cannot read and so fails open.
         # The drain fails closed: a board that cannot be read may hold a live run, so it counts
         # as one.
@@ -275,24 +415,3 @@ def _open_runs(slug: str, path: Path) -> list[OpenRun]:
         )
         for run_id, pid, start in rows
     ]
-
-
-def _open_run_rows(path: Path) -> list[tuple]:
-    # A plain read-only open of a WAL file creates a missing -wal or -shm and writes to a live
-    # -shm. With readonly_shm, SQLite reads the commits in a -wal and writes to neither file; a
-    # -wal whose -shm is gone fails the read. A WAL file with no -wal has nothing to replay and is
-    # opened immutable, which opens no side file. The shared-bytes lock, taken before the -wal is
-    # looked for, keeps a -wal in place until the read is done, so a -wal there after an immutable
-    # read was created during it and fails the read.
-    wal = Path(f"{path}-wal")
-    with path.open("rb") as handle:
-        wal_format = handle.read(20)[18:20] == _WAL_FORMAT
-        if wal_format:
-            fcntl.fcntl(handle, fcntl.F_OFD_SETLK, _SHARED_LOCK)
-        immutable = wal_format and not wal.exists()
-        mode = "immutable=1" if immutable else "readonly_shm=1"
-        with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro&{mode}", uri=True)) as conn:
-            rows = conn.execute(_OPEN_RUNS_SQL).fetchall()
-        if immutable and wal.exists():
-            raise sqlite3.DatabaseError(f"a connection opened {path} while it was read")
-    return rows
