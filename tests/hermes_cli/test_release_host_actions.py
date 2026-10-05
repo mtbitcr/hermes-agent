@@ -227,10 +227,10 @@ def wal_database(
 
 
 def make_store(root: Path, rel: str, rows: int, monkeypatch) -> sqlite3.Connection:
-    """The store at rel with its rows still in its log. A plugin's store is opened by plugin
-    storage itself (plugins/plugin_storage.py), in the home that holds it."""
+    """The store at rel with its rows still in its log. A plugin's store in its own directory is
+    opened by plugin storage itself (plugins/plugin_storage.py), in the home that holds it."""
     home, _, plugin = rel.partition("plugin-data/")
-    if not plugin:
+    if plugin.count("/") != 1:
         return wal_database(root / rel, rows)
     with monkeypatch.context() as patch:
         patch.setenv("HERMES_HOME", str(root / home))
@@ -242,6 +242,11 @@ def published(snapshot: Path) -> dict[str, bytes]:
     opened: opening one makes the copy's own sidecars."""
     files = filter(Path.is_file, snapshot.rglob("*"))
     return {path.relative_to(snapshot).as_posix(): path.read_bytes() for path in files}
+
+
+def walked(root: Path, snapshot: Path) -> list[str]:
+    """The full backup's own list for the root (backup.py), the snapshot directory as out_path."""
+    return sorted(rel.as_posix() for _, rel in backup._iter_backup_files(root, snapshot))
 
 
 # Every application store of a root with two boards and one served profile, where the release
@@ -268,29 +273,18 @@ STORES = (
     "profiles/coder/cron/delivery_records.db",
     "profiles/coder/telemetry/shared_metrics/metrics.sqlite3",
 )
-# Databases inside the root that are no application store: the tasks' workspaces and attachments
-# of the default board and of another board (kanban_db.py), the checkout, the release snapshots,
-# and backup.py's artifacts and infrastructure, at the root or in a plugin's directory.
-NOT_STORES = (
-    "kanban/workspaces/t_root/app.db",
-    "kanban/attachments/t_root/upload.sqlite3",
-    "kanban/boards/sample/workspaces/t_worker/app.db",
-    "kanban/boards/sample/attachments/t_worker/upload.sqlite3",
-    "work/hermes/tests/fixture.db",
-    "release-snapshots/state/OLD/state.db",
-    "state.db.retired-wal-1-2/state.db",
-    "state.db.pre-update-emergency-1.bak",
-    "plugin-data/ordinary/node_modules/cache.db",
-)
+# Plain files beside them: the configuration of the root and of the profile, and a log.
+PLAIN_FILES = ("config.yaml", ".env", "profiles/coder/config.yaml", "logs/agent.log")
 
 
-def test_state_snapshot_reaches_every_store_from_a_worker_environment(tmp_path, monkeypatch):
+def test_state_snapshot_copies_the_walks_list_from_a_worker_environment(tmp_path, monkeypatch):
     root = tmp_path / "root"
     writers = [
         make_store(root, rel, rows, monkeypatch) for rows, rel in enumerate(STORES, start=1)
     ]
-    for rel in NOT_STORES:
-        wal_database(root / rel, 1).close()
+    for rel in PLAIN_FILES:
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(f"{rel}\n")
     # What the dispatcher gives a worker: its own board, task and workspaces, and a profile home.
     board = root / "kanban" / "boards" / "sample"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(board / "kanban.db"))
@@ -298,19 +292,56 @@ def test_state_snapshot_reaches_every_store_from_a_worker_environment(tmp_path, 
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(board / "workspaces"))
     monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "coder"))
+    saved = tmp_path / "snapshots" / "state" / "NEW"
+    expected = walked(root, saved)
     try:
         assert all((root / f"{rel}-wal").stat().st_size > 0 for rel in STORES)
-        make_actions(
-            tmp_path, checkout=root / "work" / "hermes", snapshot_root=root / "release-snapshots"
-        ).take_snapshot("NEW")
+        make_actions(tmp_path).take_snapshot("NEW")
     finally:
         for writer in writers:
             writer.close()
 
-    saved = root / "release-snapshots" / "state" / "NEW"
-    # Against the independent count of the stores made above: no other file and no sidecar.
-    assert sorted(published(saved)) == sorted(STORES)
+    # Against the independent count: the walk's own list, which holds every store and file made.
+    assert set(STORES) | set(PLAIN_FILES) <= set(expected)
+    files = published(saved)
+    assert sorted(files) == expected
+    assert [files[rel] for rel in PLAIN_FILES] == [f"{rel}\n".encode() for rel in PLAIN_FILES]
     for rows, rel in enumerate(STORES, start=1):
+        with contextlib.closing(sqlite3.connect(saved / rel)) as copy:
+            assert copy.execute("SELECT count(*) FROM notes").fetchone() == (rows,), rel
+
+
+# Names that start like backup.py's artifacts, in a plugin's directory of the root and of a profile:
+# stores inside directories by such names and a store file by one, which the walk yields, and last
+# the control, a file name the walk leaves out.
+ARTIFACT_LIKE = (
+    "state.db.retired-wal-1-2/data.db",
+    "state.db.pre-update-emergency-1/data.db",
+    "state.db.pre-update-emergency.db",
+    "state.db.pre-update-emergency-1.bak",
+)
+
+
+@pytest.mark.parametrize(
+    "place", ["plugin-data/ordinary/", "profiles/coder/plugin-data/ordinary/"]
+)
+def test_state_snapshot_holds_a_store_named_like_an_artifact_when_the_walk_yields_it(
+    tmp_path, monkeypatch, place
+):
+    root, rels = tmp_path / "root", [place + name for name in ARTIFACT_LIKE]
+    writers = [make_store(root, rel, rows, monkeypatch) for rows, rel in enumerate(rels, start=1)]
+    saved = tmp_path / "snapshots" / "state" / "NEW"
+    expected = walked(root, saved)
+    try:
+        assert all((root / f"{rel}-wal").stat().st_size > 0 for rel in rels)
+        make_actions(tmp_path).take_snapshot("NEW")
+    finally:
+        for writer in writers:
+            writer.close()
+
+    assert sorted(published(saved)) == expected
+    assert [rel in expected for rel in rels] == [True, True, True, False]
+    for rows, rel in enumerate(rels[:-1], start=1):
         with contextlib.closing(sqlite3.connect(saved / rel)) as copy:
             assert copy.execute("SELECT count(*) FROM notes").fetchone() == (rows,), rel
 
@@ -331,23 +362,27 @@ STORE_NAMES = ("audit-wal", "audit-shm", "audit-journal", "facts.sqlite", "facts
     [f"plugin-data/{name}/data.db" for name in PLUGIN_NAMES]
     + [f"plugin-data/ordinary/{name}" for name in STORE_NAMES],
 )
-def test_state_snapshot_keeps_a_plugin_store_under_any_name(tmp_path, monkeypatch, rel):
+def test_state_snapshot_holds_a_plugin_store_exactly_when_the_walk_yields_it(
+    tmp_path, monkeypatch, rel
+):
     root = tmp_path / "root"
     writer = make_store(root, rel, 3, monkeypatch)
+    saved = tmp_path / "snapshots" / "state" / "NEW"
+    expected = walked(root, saved)
     try:
         assert (root / f"{rel}-wal").stat().st_size > 0
         make_actions(tmp_path).take_snapshot("NEW")
     finally:
         writer.close()
 
-    saved = tmp_path / "snapshots" / "state" / "NEW"
-    assert sorted(published(saved)) == [rel]  # none of the store's own sidecars
-    with contextlib.closing(sqlite3.connect(saved / rel)) as copy:
-        assert copy.execute("SELECT count(*) FROM notes").fetchone() == (3,)
+    assert sorted(published(saved)) == expected  # a store not named .db with its own log and index
+    if rel in expected:
+        with contextlib.closing(sqlite3.connect(saved / rel)) as copy:
+            assert copy.execute("SELECT count(*) FROM notes").fetchone() == (3,)
 
 
-# A store whose image is damaged, by a database name: the metrics store of the root and of a
-# profile (observability/shared_metrics.py) and a plugin's store. A .db name is the control.
+# A store whose image is damaged: the metrics store of the root and of a profile
+# (observability/shared_metrics.py) and a plugin's stores, under any name.
 @pytest.mark.parametrize(
     "rel",
     [
@@ -357,47 +392,46 @@ def test_state_snapshot_keeps_a_plugin_store_under_any_name(tmp_path, monkeypatc
         "plugin-data/ordinary/data.db",
     ],
 )
-def test_state_snapshot_is_not_published_without_a_damaged_store(tmp_path, monkeypatch, rel):
-    root = tmp_path / "root"
+def test_state_snapshot_refuses_a_damaged_database_and_copies_a_file_without_the_header(
+    tmp_path, monkeypatch, rel
+):
+    root, snapshots = tmp_path / "root", tmp_path / "snapshots"
     make_store(root, rel, 3, monkeypatch).close()
-    (root / rel).write_bytes(bytes(4096))  # the header and the first page overwritten
+    header = backup._SQLITE_HEADER
+    (root / rel).write_bytes(header + bytes(4096 - len(header)))  # the header, then no database
     writer = wal_database(root / "state.db", 2)
+    actions = make_actions(tmp_path)
     try:
         with pytest.raises(RuntimeError, match=f"could not copy {rel}$"):
-            make_actions(tmp_path).take_snapshot("NEW")
+            actions.take_snapshot("NEW")
+        assert list(snapshots.rglob("*")) == [snapshots / "state"]  # nothing published or staged
+        (root / rel).write_bytes(bytes(4096))  # the header overwritten too: a file like any other
+        actions.take_snapshot("NEW")
     finally:
         writer.close()
-    snapshots = tmp_path / "snapshots"
-    assert list(snapshots.rglob("*")) == [snapshots / "state"]  # nothing published or staged
+    assert published(snapshots / "state" / "NEW")[rel] == bytes(4096)
 
 
-@pytest.mark.parametrize(
-    "setting, name", [("snapshot_root", "release-snapshots"), ("checkout", "checkout")]
-)
-@pytest.mark.parametrize("container", ["kanban/boards/example", "pairing", "platforms/pairing"])
-def test_state_snapshot_leaves_out_the_snapshots_and_the_checkout(
-    tmp_path, container, setting, name
-):
-    """Also inside a directory that a quick snapshot copies whole (backup.py): a board's
-    directory and both pairing directories."""
-    root, place = tmp_path / "root", tmp_path / "root" / container / name
-    wal_database(place / "fixtures" / "example.db", 1).close()
-    (place / "placeholder.txt").write_text("placeholder\n")
-    (root / "config.yaml").write_bytes(b"model: root\n")
-    actions = make_actions(tmp_path, **{setting: place})
+def test_state_snapshot_inside_the_root_copies_the_walks_list_from_before_its_first_copy(tmp_path):
+    root = tmp_path / "root"
     writer = wal_database(root / "state.db", 2)
+    (root / "config.yaml").write_bytes(b"model: root\n")
+    actions = make_actions(tmp_path, snapshot_root=root / "release-snapshots")
+    state = actions.snapshot_root / "state"
     try:
         actions.save_config_snapshot("CONFIG")
         actions.take_snapshot("OLD")
+        expected = walked(root, state / "NEW")
         actions.take_snapshot("NEW")
     finally:
         writer.close()
 
-    state, live = actions.snapshot_root / "state", ["config.yaml", "state.db"]
-    assert {snapshot: sorted(published(state / snapshot)) for snapshot in ("OLD", "NEW")} == {
-        "OLD": live,
-        "NEW": live,
-    }
+    files = sorted(published(state / "NEW"))
+    assert files == expected
+    # The earlier snapshot is in it, as the walk yields it, and nothing of its own staging or copy.
+    assert "release-snapshots/state/OLD/state.db" in files
+    own = ("release-snapshots/.state-NEW", "release-snapshots/state/NEW/")
+    assert [rel for rel in files if rel.startswith(own)] == []
 
 
 def test_state_snapshot_is_not_published_when_a_file_is_not_copied(tmp_path, monkeypatch):
@@ -418,25 +452,16 @@ def test_state_snapshot_is_not_published_when_a_file_is_not_copied(tmp_path, mon
     assert not (tmp_path / "snapshots" / "state" / "NEW").exists()
 
 
-def test_state_snapshot_is_not_published_when_a_directory_cannot_be_listed(tmp_path, monkeypatch):
-    state, native = tmp_path / "snapshots" / "state", tmp_path / "root" / "plugin-data" / "native"
-    wal_database(native / "data.db", 3).close()
+def test_state_snapshot_of_a_missing_root_home_raises_and_publishes_nothing(tmp_path):
+    snapshots = tmp_path / "snapshots"
+    wal_database(tmp_path / "root" / "state.db", 1).close()
     actions = make_actions(tmp_path)
-    actions.take_snapshot("OLD")  # the control: listed, the subtree's database is saved
-    earlier = published(state / "OLD")
-    assert list(earlier) == ["plugin-data/native/data.db"]
-    denied, real_scandir = os.path.realpath(native), os.scandir
-
-    def scandir(path="."):
-        if not isinstance(path, int) and os.path.realpath(path) == denied:
-            raise PermissionError(13, "Permission denied", os.fspath(path))
-        return real_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", scandir)
-    with pytest.raises(PermissionError, match="native"):
+    actions.take_snapshot("OLD")
+    shutil.rmtree(tmp_path / "root")  # the walk would yield nothing: an empty snapshot
+    with pytest.raises(OSError):
         actions.take_snapshot("NEW")
-    assert not (state / "NEW").exists()
-    assert published(state / "OLD") == earlier
+    assert [path.name for path in snapshots.iterdir()] == ["state"]  # nothing staged either
+    assert [path.name for path in (snapshots / "state").iterdir()] == ["OLD"]
 
 
 def test_state_snapshot_never_pairs_a_safe_copy_with_later_sidecars(tmp_path, monkeypatch):
@@ -451,7 +476,8 @@ def test_state_snapshot_never_pairs_a_safe_copy_with_later_sidecars(tmp_path, mo
         " BEGIN; UPDATE x SET v = 2; UPDATE y SET v = 2; COMMIT;"
     )
     notes = wal_database(board / "notes.sqlite3", 5)  # another database name, rows in its log
-    real_copy, moved = backup._safe_copy_db, []
+    snapshot = tmp_path / "snapshots" / "state" / "NEW"
+    expected, real_copy, moved = walked(tmp_path / "root", snapshot), backup._safe_copy_db, []
 
     def copy_then_write(src, dst, **options):
         done = real_copy(src, dst, **options)
@@ -467,6 +493,7 @@ def test_state_snapshot_never_pairs_a_safe_copy_with_later_sidecars(tmp_path, mo
         monkeypatch.setattr(module, "_safe_copy_db", copy_then_write)
     try:
         make_actions(tmp_path).take_snapshot("NEW")
+        log = (board / "notes.sqlite3-wal").read_bytes()  # as it was when it was copied
     finally:
         writer.close()
         notes.close()
@@ -475,15 +502,19 @@ def test_state_snapshot_never_pairs_a_safe_copy_with_later_sidecars(tmp_path, mo
         with contextlib.closing(sqlite3.connect(path)) as db:
             return db.execute("SELECT (SELECT v FROM x), (SELECT v FROM y)").fetchone()
 
-    saved = tmp_path / "snapshots" / "state" / "NEW" / "kanban" / "boards" / "example"
-    names = sorted(published(saved))  # before a copy is opened
+    files = published(snapshot)  # before a copy is opened
+    saved = snapshot / "kanban" / "boards" / "example"
     with contextlib.closing(sqlite3.connect(saved / "notes.sqlite3")) as copy:
         rows = copy.execute("SELECT count(*) FROM notes").fetchone()
     assert moved
-    # The safe image alone, as it was copied, with every row of the other database's log.
-    assert (names, read(saved / "kanban.db"), rows, read(live)) == (
-        ["kanban.db", "notes.sqlite3"], (2, 2), (5,), (3, 1)
+    assert sorted(files) == expected
+    # The safe image alone, as it was copied. Another database name has its own log and index
+    # beside its image, the log as it was, and every row of that log.
+    names = ["kanban.db", "notes.sqlite3", "notes.sqlite3-shm", "notes.sqlite3-wal"]
+    assert (expected, read(saved / "kanban.db"), rows, read(live)) == (
+        [f"kanban/boards/example/{name}" for name in names], (2, 2), (5,), (3, 1)
     )
+    assert files["kanban/boards/example/notes.sqlite3-wal"] == log
 
 
 @contextlib.contextmanager

@@ -5,7 +5,8 @@ the guards' reads; this class takes the actions and runs the readbacks the runne
 Every move is one process call whose exit status is checked: `systemctl --user` for the units,
 which only the user manager drives (S-E), and git for the checkout (S-H). Snapshots live under one
 release snapshot directory, state snapshots as state/NAME and configuration snapshots as
-config/NAME (S-C).
+config/NAME (S-C). A state snapshot copies the files that the full backup's own walk yields for the
+root home (hermes_cli/backup.py).
 
 The actions raise when the host refuses them, so the runner's failure rule takes the host back.
 The readbacks answer False instead, as the runner's protocol asks.
@@ -35,14 +36,9 @@ import psutil  # noqa: F401  (K6: gateway.status loads it to ask about a process
 import gateway.control_socket  # noqa: F401  (K6: update_receipt loads it to ask a gateway)
 import gateway.status  # noqa: F401  (K6: update_receipt loads it to read a gateway's record)
 import hermes_cli.build_info  # noqa: F401  (K6: update_receipt loads it for the code identity)
-from hermes_cli.backup import (
-    _EXCLUDED_PREFIXES,
-    _SQLITE_HEADER,
-    _quick_snapshot_candidates,
-    _safe_copy_db,
-    _should_exclude,
-)
+from hermes_cli.backup import _SQLITE_HEADER, _iter_backup_files, _safe_copy_db
 from hermes_cli.profiles import _PROFILE_ID_RE
+from hermes_cli.sqlite_safe_read import has_live_connection, read_header_bytes_preopen
 from hermes_cli.update_receipt import collect_fleet_versions
 from hermes_constants import get_default_hermes_root, named_profile_is_deleted
 from utils import atomic_replace
@@ -55,13 +51,6 @@ STATE, CONFIG = "state", "config"
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _SNAPSHOT_NAME = re.compile(r"[0-9A-Za-z][0-9A-Za-z._-]*")
-# SQLite's sidecars, beside a database of any name. One copied beside a database's standalone copy
-# would be read into it at the next open, so none is ever copied. No sidecar begins with SQLite's
-# header, which tells them from a database whose own name ends the same way.
-_SIDECARS = ("-wal", "-shm", "-journal")
-# SQLite's file names: each known store has one (.db or .sqlite3, as the metrics store), and a
-# store by one of them stays a store when its header is damaged, so that its copy fails.
-_DATABASE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -151,26 +140,33 @@ class ReleaseHostActions:
     # Snapshots (S-C).
 
     def take_snapshot(self, name: str) -> None:
-        """Copy every application database and file of each served home into state/NAME.
+        """Copy every file of the root home that the full backup holds into state/NAME.
 
-        That is the home's quick-snapshot set and every other SQLite database in it (`_inventory`),
-        such as the release record, the board registry, the cron queues, the metrics store and the
-        plugins' stores. backup.py's online copy reads each database through its write-ahead log
-        into one standalone image, which holds the rows not yet checkpointed, and no -wal, -shm or
-        -journal file is ever copied beside it. A directory that cannot be listed, a file that
-        cannot be read or a file that is not copied fails the snapshot before it is published, and
-        only the owner can read the copies, whatever the umask or the snapshot root's access.
+        Those are the files backup.py's own walk (`_iter_backup_files`) yields for the root home,
+        whose profile homes lie under it, with state/NAME as its output; its exclusions are the
+        only ones, and its whole list is taken before the first copy. A file that starts with
+        SQLite's header goes through backup.py's online copy, which reads it through its
+        write-ahead log into one standalone image, and every other file is copied as it is. A
+        root home that is not a directory, or a listed file that is not copied, fails the snapshot
+        before it is published, and only the owner can read the copies, whatever the umask or the
+        snapshot root's access.
         """
+        target = self._named(STATE, name)
+        if not self.root_home.is_dir():  # the walk would yield nothing: an empty snapshot
+            raise NotADirectoryError(f"the root home {self.root_home} is not a directory")
 
         def fill(staging: Path) -> None:
             missing: list[str] = []
-            for home in self._served_homes():
-                rel = home.relative_to(self.root_home)
-                for sub, (source, database) in sorted(self._inventory(home).items()):
-                    copy = staging / rel / sub
-                    copy.parent.mkdir(parents=True, exist_ok=True)
-                    if not (_safe_copy_db(source, copy) if database else _copied(source, copy)):
-                        missing.append(copy.relative_to(staging).as_posix())
+            # Sorted, so a database's image is made before its own -wal is copied beside it:
+            # SQLite deletes a -wal it finds beside the empty file it starts the image in.
+            for source, rel in sorted(_iter_backup_files(self.root_home, target)):
+                copy = staging / rel
+                copy.parent.mkdir(parents=True, exist_ok=True)
+                database = _starts_with_header(source)
+                if database is None or not (
+                    _safe_copy_db(source, copy) if database else _copied(source, copy)
+                ):
+                    missing.append(rel.as_posix())
             if missing:
                 raise RuntimeError(f"could not copy {', '.join(missing)}")
             for path in staging.rglob("*"):
@@ -281,46 +277,6 @@ class ReleaseHostActions:
             if (home / name).is_file()
         ]
 
-    def _inventory(self, home: Path) -> dict[str, tuple[Path, bool]]:
-        """Each file of the home that a state snapshot copies, by its path in the home, and
-        whether it is a database: the quick-snapshot set and every other database of the home.
-
-        One rule bounds both, whichever finds a file (`kept`): nothing under the release snapshots,
-        their staging and set-aside directories included, or under the checkout, by where the path
-        really leads, and, at the root, nothing under the profiles, each served one walked as its
-        own home, or under the tasks' workspaces and attachments. Any other directory of those
-        names, such as a plugin's, holds application data. The walk for the databases also keeps
-        backup.py's excluded directories, its rules for the top of a home, its artifacts' names
-        and no links, but never takes a plugin's own directory for an excluded one (`_excluded`).
-        `_database` tells the stores from every other file, sidecars included. A directory that
-        cannot be listed or a file that cannot be read raises; only a file gone since it was
-        listed is passed over.
-        """
-        base, at_root = home.resolve(), home == self.root_home
-        apart = (self.snapshot_root.resolve(), self.checkout_path.resolve())
-
-        def kept(rel: Path) -> bool:
-            real = (base / rel).resolve()
-            return not any(real.is_relative_to(place) for place in apart) and not (
-                at_root and (rel.parts[:1] == ("profiles",) or _task_files(rel))
-            )
-
-        if not kept(Path()):  # every file of the home would be left out
-            raise ValueError(f"the home {home} lies in the release snapshots or the checkout")
-        found: dict[str, tuple[Path, bool]] = {}
-        for source, sub, _ in _quick_snapshot_candidates(home):
-            database = _database(source) if kept(Path(sub)) else None
-            if database is not None:
-                found[sub] = (source, database)
-        for top, dirs, files in os.walk(base, onerror=_raise):
-            here = Path(top)
-            rel = here.relative_to(base)
-            dirs[:] = [name for name in dirs if not _excluded(rel / name) and kept(rel / name)]
-            for name in files:
-                if not name.startswith(_EXCLUDED_PREFIXES) and _database(here / name, walked=True):
-                    found.setdefault((rel / name).as_posix(), (here / name, True))
-        return found
-
     # Readbacks.
 
     def health_ok(self) -> bool:
@@ -364,55 +320,25 @@ def _full_sha(commit: str) -> str:
     return commit
 
 
-def _raise(error: OSError) -> None:
-    raise error  # a directory that cannot be listed would leave stores out of the snapshot
-
-
-def _database(path: Path, *, walked: bool = False) -> bool | None:
-    """Whether a listed file is a database: a database name, which stays one when its header is
-    damaged, so that the copy refuses it, or SQLite's header under any other name.
-
-    None for a file that is not copied at all: a sidecar, by its name and no such header, a file
-    gone since it was listed and, in the walk, a link or a file that is not regular, which
-    backup.py's walk leaves out too. Any other error reading the file raises.
-    """
+def _starts_with_header(path: Path) -> bool | None:
+    """Whether a listed file starts with SQLite's header, or None when its first bytes cannot be
+    read: then it cannot be copied. A file this process holds a SQLite connection to is a database
+    and is not opened raw, as closing a raw descriptor would drop the locks SQLite holds on it
+    (sqlite_safe_read.py). A file that is not regular, such as a leftover socket or a pipe, is
+    never opened."""
     try:
-        if walked and not stat.S_ISREG(os.lstat(path).st_mode):
+        if not stat.S_ISREG(os.lstat(path).st_mode):
             return None
-        if path.suffix in _DATABASE_SUFFIXES:
-            return True
-        with open(path, "rb") as file:
-            if file.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER:
-                return True
-    except FileNotFoundError:
+    except OSError:
         return None
-    return None if path.name.endswith(_SIDECARS) else False
-
-
-def _excluded(rel: Path) -> bool:
-    """backup.py's rule for a directory of a home, except that a plugin's own directory,
-    plugin-data/NAME (plugins/plugin_storage.py), holds application data whatever NAME is. The
-    directories inside it keep the rule."""
-    parts = rel.parts
-    if parts[:1] == ("plugin-data",):
-        rel = Path(*parts[:1], *parts[2:])
-    return _should_exclude(rel)
-
-
-def _task_files(rel: Path) -> bool:
-    """Whether a path of a root lies in the tasks' workspaces or attachments (kanban_db.py):
-    kanban/NAME for the default board and kanban/boards/SLUG/NAME for the others. They hold the
-    tasks' files, not stores."""
-    parts = rel.parts
-    return any(
-        name in ("workspaces", "attachments")
-        and (parts[:at] == ("kanban",) or (at == 3 and parts[:2] == ("kanban", "boards")))
-        for at, name in enumerate(parts)
-    )
+    if has_live_connection(path):
+        return True
+    head = read_header_bytes_preopen(path, length=len(_SQLITE_HEADER))
+    return None if head is None else head == _SQLITE_HEADER
 
 
 def _copied(source: Path, copy: Path) -> bool:
-    """Copy a file that is no database, as backup.py's quick snapshot does."""
+    """Copy a file that does not start with SQLite's header as it is."""
     try:
         shutil.copy2(source, copy)
     except OSError:
