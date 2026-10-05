@@ -18091,11 +18091,17 @@ def _migrate_add_optional_columns(
     # Additive: the T1 publish ledger (hermes_cli/kanban_delivery.py), the
     # delivery's one pull request, the head it was published at, its state and
     # its branch. A row recorded before slice 4 has no pull request yet.
+    # Then the dispatcher's publish lease: the holder token and when it runs
+    # out, so one publisher holds a row and a crashed one's row is taken over;
+    # and the refusal that parked the row. A row from before has neither.
     for column, ddl in (
         ("pull_request_number", "pull_request_number INTEGER"),
         ("pull_request_head", "pull_request_head TEXT"),
         ("pull_request_state", "pull_request_state TEXT"),
         ("pull_request_branch", "pull_request_branch TEXT"),
+        ("publish_lease", "publish_lease TEXT"),
+        ("publish_lease_until", "publish_lease_until INTEGER"),
+        ("publish_refusal", "publish_refusal TEXT"),
     ):
         _add_column_if_missing(conn, "kanban_deliveries", column, ddl)
     notify_table_exists = conn.execute(
@@ -36439,6 +36445,7 @@ def dispatch_once(
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
+    ticked = False
     with _dispatch_tick_lock(db_path) as held:
         board_metadata = read_board_metadata(board)
         if not held:
@@ -36479,11 +36486,20 @@ def dispatch_once(
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
             _maybe_checkpoint_wal(conn, db_path)
+            ticked = not dry_run
     # The dispatch lock has been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
     _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    if ticked:
+        # Also outside the lock, and after the observer, so neither waits on
+        # GitHub: the delivery step publishes at most one approved build of
+        # the board this tick ran on, read from the ticked connection's own
+        # file (hermes_cli/kanban_delivery.py).
+        from hermes_cli import kanban_delivery
+
+        kanban_delivery.publish_step(_conn_main_db_path(conn))
     return result
 
 

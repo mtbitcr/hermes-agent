@@ -433,18 +433,6 @@ TOOLSETS = {
         "includes": [],
     },
 
-    # Default-off: the kernel's delivery steps for an integration card. Not in
-    # the default tool list; each tool's check function also hides it from every
-    # run but the integration card's current one, with kanban.delivery on.
-    "kanban_delivery": {
-        "description": (
-            "Kanban delivery steps for a kernel integration card: publish the "
-            "approved head as its one pull request"
-        ),
-        "tools": ["kanban_delivery_publish"],
-        "includes": [],
-    },
-
     "discord": {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],
