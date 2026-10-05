@@ -462,8 +462,9 @@ def _shape(value):
     no ``event`` pair among themselves), so a record that loses a key cannot
     hide behind another record's shape. The kind only pairs records; events of
     different kinds may interleave differently from run to run. A scalar in a
-    list has no keys and is left out. A string holding JSON, like a stored
-    owner reply, is compared by its decoded shape.
+    list has no keys and is left out. A list's shape is marked as a list, so
+    an empty list and an empty object differ. A string holding JSON, like a
+    stored owner reply, is compared by its decoded shape.
     """
     if isinstance(value, dict):
         return {key: _shape(item) for key, item in value.items()}
@@ -475,7 +476,7 @@ def _shape(value):
                 continue
             kind = item.get("event") if isinstance(item, dict) else None
             records.setdefault(kind if isinstance(kind, str) else None, []).append(shape)
-        return records
+        return ("list", records)
     if isinstance(value, str) and value[:1] in ("{", "["):
         try:
             return _shape(json.loads(value))
