@@ -33,6 +33,18 @@ from tests.hermes_cli.test_cron_history_delivery import (  # noqa: F401  (two fi
 
 FAMILY = "automations"
 PROFILE = "worker_alpha"
+# The saved examples name the profile home with this placeholder: the real value is a path of
+# the machine that ran the test.
+NEUTRAL_HOME = "PROFILE_HOME"
+
+
+def _homes(value):
+    """Every hermes_home value in a JSON value."""
+    if isinstance(value, dict):
+        return [v for k, v in value.items() if k == "hermes_home"] + [h for v in value.values() for h in _homes(v)]
+    if isinstance(value, list):
+        return [h for v in value for h in _homes(v)]
+    return []
 JOB = {"prompt": "Send the weekly numbers", "schedule": "every 1h", "name": "Weekly numbers"}
 ROW_COLUMNS = ("job_id", "status", "claimed_at", "started_at", "finished_at", "delivery_outcome")
 # Each run's answer by chat, and whether the run finished.
@@ -102,6 +114,8 @@ def test_the_automations_examples_carry_every_route_answer_and_error(
         "POST", f"/executions/{run_ids[0]}/resend", {"request_id": "contract-resend-0001"})
 
     saved = {kind: owner_payload_example(FAMILY, kind, answer) for kind, answer in live.items()}
+    # No saved example keeps a path of the machine that wrote it.
+    assert {home for answer in saved.values() for home in _homes(answer)} == {NEUTRAL_HOME}
 
     [eligible] = [
         row["delivery"]["resend"] for row in live["executions"]["body"]["executions"]
