@@ -157,7 +157,7 @@ for name, path in mods.items():
         for t in targets:
             static[name] |= {c for c in [t] + parents(t) if c in mods}
 
-with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:
+with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:  # windows-footgun: ok - binary mode, as tomllib.load needs
     project = tomllib.load(fh).get("project", {})
 groups = [project.get("scripts", {}), project.get("gui-scripts", {})] + list(project.get("entry-points", {}).values())
 roots = {v.partition(":")[0].strip() for g in groups for v in g.values()}
