@@ -7,7 +7,7 @@ change-detector tests. scripts/fork_dormant_modules.py regenerates
 fork_freeze/dormant_modules.json during an upstream sync.
 """
 
-import hashlib
+import importlib.util
 import json
 from pathlib import Path
 
@@ -28,19 +28,28 @@ def _line_count(data: bytes) -> int:
     return data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
 
 
-def test_dormant_modules_keep_their_recorded_hash():
+def _dormant_modules():
+    """The dormant list that scripts/fork_dormant_modules.py computes on this tree."""
+    spec = importlib.util.spec_from_file_location(
+        "fork_dormant_modules", ROOT / "scripts" / "fork_dormant_modules.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.dormant_modules()
+
+
+def test_dormant_modules_match_the_recorded_list():
     recorded = json.loads((FREEZE / "dormant_modules.json").read_text(encoding="utf-8"))
-    changed = []
-    for path, digest in sorted(recorded.items()):
-        target = ROOT / path
-        if not target.is_file():
-            changed.append(f"{path} (missing)")
-        elif hashlib.sha256(target.read_bytes()).hexdigest() != digest:
-            changed.append(path)
-    if changed:
+    current = _dormant_modules()
+    problems = (
+        [f"{path} (changed)" for path in sorted(recorded.keys() & current.keys()) if recorded[path] != current[path]]
+        + [f"{path} (listed, but live or missing)" for path in sorted(recorded.keys() - current.keys())]
+        + [f"{path} (dormant, but not listed)" for path in sorted(current.keys() - recorded.keys())]
+    )
+    if problems:
         pytest.fail(
-            "an unused upstream copy changed; make the change in the live module, or regenerate the list with the script during an upstream sync.\n"
-            + "\n".join(changed),
+            "the dormant module list differs from the tree: make the change in the live module, or regenerate the list with scripts/fork_dormant_modules.py and state the reason in the pull request.\n"
+            + "\n".join(problems),
             pytrace=False,
         )
 
