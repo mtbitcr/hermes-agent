@@ -2,21 +2,24 @@
 
 `LiveHostReader` is the real `HostReader` of `hermes_cli.release_guards`. It reads:
 - the checkout and its history, with origin main read from the remote itself (S-H);
+- the code identity each live gateway stamps, for G6;
 - systemd unit properties through the user manager, free disk and the state snapshot names;
 - the open runs on every board;
 - digests of the configuration set (S-D), live and in the named configuration snapshot (S-C).
 
-Every method only reads. Moving the checkout and taking or restoring snapshots are actions, and
-they belong to card 3. Reading also leaves nothing behind, which is what lets prepare mode keep
-its promise to write nothing: git runs with --no-optional-locks, so `git status` does not
-refresh the index; origin main comes from `git ls-remote`, which updates no local ref; boards
-are read in a child interpreter of their own, so that SQLite creates no file and changes none,
-its -shm included, and this process's own board connections keep their locks; and the venv probe
-writes no bytecode.
+Every method only reads. Moving the checkout, fetching objects and taking or restoring snapshots
+are actions, and they belong to card 3. Reading also leaves nothing behind, which is what lets
+prepare mode keep its promise to write nothing: git runs with --no-optional-locks, so `git status`
+does not refresh the index; every git read but `git ls-remote` runs with no transport allowed, so
+a partial clone fetches no missing object; origin main comes from `git ls-remote`, which updates
+no local ref; and boards are read in a child interpreter of their own, so that SQLite creates no
+file and changes none, its -shm included, and this process's own board connections keep their
+locks.
 
 Like the runner (K6), this module imports everything when it loads and no method imports
-anything: the readbacks after the stop call the checkout, venv and configuration reads while
-the checkout on disk is being swapped.
+anything: the readbacks after the stop call the checkout, gateway and configuration reads while
+the checkout on disk is being swapped. So the Hermes modules that the fleet scan of
+`hermes_cli.update_receipt` imports inside its functions are imported here too.
 """
 
 from __future__ import annotations
@@ -24,8 +27,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -33,6 +34,10 @@ import sys
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
+# K6: the fleet scan imports these inside its functions.
+import gateway.control_socket  # noqa: F401
+import gateway.status  # noqa: F401
+import hermes_cli.build_info  # noqa: F401
 from hermes_cli.kanban_db import (
     DEFAULT_BOARD,
     HolderPresence,
@@ -42,7 +47,8 @@ from hermes_cli.kanban_db import (
     list_boards,
 )
 from hermes_cli.profiles import profiles_to_serve
-from hermes_cli.release_guards import GATEWAY_UNIT, OpenRun
+from hermes_cli.release_guards import OpenRun
+from hermes_cli.update_receipt import collect_fleet_versions
 from hermes_constants import get_default_hermes_root
 
 # S-D: the configuration set is these files of the root home and of every served profile home.
@@ -103,24 +109,6 @@ def rows(path):
 print(json.dumps([rows(os.path.realpath(path)) for path in sys.argv[2:]]))
 """
 _SIGNAL_NAMES = {sig.value: sig.name for sig in signal.Signals}
-# The gateway unit's start command as `systemctl show` prints it: one interpreter, started by its
-# own path with only options whose effect on imports a probe can repeat, running hermes_cli.main.
-_GATEWAY_START = re.compile(r"\{ path=(/\S+) ; argv\[\]=\1((?: -[bBdEIOPqRsSuv]+)*) -m hermes_cli\.main .*\}")
-# A variable of the user manager's environment as `systemctl show-environment` prints it: bare, or
-# in $'...' when it needs quoting. A backslash escape in the quoting is refused, not decoded.
-_MANAGER_VARIABLE = re.compile(r"([^=\s]+)=(?:\$'([^'\\]*)'|([^$'\\]*))")
-# An EnvironmentFiles entry as `systemctl show` prints it, and the one assignment form read from
-# such a file: a plain value, with nothing systemd would unquote, unescape or expand.
-_ENVIRONMENT_FILE = re.compile(r"(/[^*?\[]*) \(ignore_errors=(yes|no)\)")
-_FILE_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s\"'\\$`#;]*)")
-# Run by the live venv's interpreter: its venv, then where it would import hermes_cli from,
-# without importing it.
-_IMPORT_ROOT_PROBE = (
-    "import importlib.util, os, sys; "
-    "origin = importlib.util.find_spec('hermes_cli').origin; "
-    "print(sys.prefix); "
-    "print(os.path.dirname(os.path.dirname(os.path.realpath(origin))))"
-)
 
 
 class LiveHostReader:
@@ -187,71 +175,22 @@ class LiveHostReader:
         return str(Path(self._git("rev-parse", "--show-toplevel").stdout.strip()).resolve())
 
     def venv_import_root(self) -> str:
-        # The live venv is the one whose interpreter the gateway unit starts, as the user manager
-        # shows the unit, and it imports as the unit runs it: with the unit's options, in the
-        # unit's working directory, with only the environment systemd gives the unit, so nothing
-        # of this process's own goes in. A unit whose start or context cannot be repeated
-        # exactly, or whose VIRTUAL_ENV names another venv than its interpreter's, has no live
-        # venv to answer for.
-        start = _GATEWAY_START.fullmatch(self.unit_property(GATEWAY_UNIT, "ExecStart"))
-        if start is None:
-            raise LookupError(f"the {GATEWAY_UNIT} unit starts no single hermes_cli interpreter")
-        argv = [start[1], *start[2].split(), "-B", "-c", _IMPORT_ROOT_PROBE]
-        try:
-            env, directory = self._gateway_context()
-            prefix, root = _run(argv, env=env, cwd=directory).stdout.splitlines()
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
-            raise LookupError(f"the {GATEWAY_UNIT} unit's interpreter cannot be probed as it runs") from error
-        if "VIRTUAL_ENV" in env and Path(env["VIRTUAL_ENV"]).resolve() != Path(prefix).resolve():
-            raise LookupError(f"the {GATEWAY_UNIT} unit's VIRTUAL_ENV is not its interpreter's")
-        return str(Path(root).resolve())
-
-    def _gateway_context(self) -> tuple[dict[str, str], str]:
-        # In systemd's order: the user manager's environment, the unit's Environment=, then its
-        # EnvironmentFile= files, and UnsetEnvironment= last. An unset working directory is the
-        # user's home.
-        env = {}
-        for line in _run(["systemctl", "--user", "show-environment"]).stdout.splitlines():
-            variable = _MANAGER_VARIABLE.fullmatch(line)
-            if variable is None:
-                raise LookupError("the user manager's environment cannot be read exactly")
-            env[variable[1]] = variable[3] if variable[2] is None else variable[2]
-        home = env.get("HOME", "")
-        env.update(item.partition("=")[::2] for item in self._gateway_words("Environment"))
-        for entry in self._unit_values(GATEWAY_UNIT, "EnvironmentFiles"):
-            env.update(_environment_file(entry))
-        for item in self._gateway_words("UnsetEnvironment"):
-            name, assigns, value = item.partition("=")
-            if not assigns or env.get(name) == value:
-                env.pop(name, None)
-        directory = self.unit_property(GATEWAY_UNIT, "WorkingDirectory").removeprefix("!")
-        directory = home if directory in ("", "~") else directory
-        if not (os.path.isabs(directory) and os.path.isdir(directory)):
-            raise LookupError(f"the {GATEWAY_UNIT} unit's working directory cannot be entered")
-        return env, directory
-
-    def _gateway_words(self, name: str) -> list[str]:
-        # systemctl prints a list item that needs quoting in double quotes with backslash escapes,
-        # which shlex reads otherwise, so an escape is refused rather than decoded.
-        text = " ".join(self._unit_values(GATEWAY_UNIT, name))
-        try:
-            if "\\" not in text:
-                return shlex.split(text)
-        except ValueError:
-            pass
-        raise LookupError(f"the {GATEWAY_UNIT} unit's {name} cannot be read exactly")
+        # Owner rule for G6: the running gateways answer. The fleet scan reads each gateway's
+        # control-socket identity, or its live gateway_state.json record, in the root home and in
+        # every named profile home. The checkout is the live import root only when a gateway is
+        # live and every live gateway is stamped with the checkout's head; no live gateway, or a
+        # stale, unknown or missing stamp, gives "", so G6 fails closed. A row's own state is not
+        # used: the scan computes it against this process's source tree, which need not be the
+        # checkout.
+        self._require_root(get_default_hermes_root())
+        head, rows = self.checkout_head(), collect_fleet_versions()
+        if rows and all(row.get("code_sha") == head for row in rows):
+            return self.checkout_root()
+        return ""
 
     # Units, disk and snapshots.
 
     def unit_property(self, unit: str, name: str) -> str:
-        values = self._unit_values(unit, name)
-        if len(values) != 1:
-            raise LookupError(f"systemctl reported no single {name} for the {unit} unit")
-        if name.endswith("Signal") and values[0].isdigit():
-            return _SIGNAL_NAMES.get(int(values[0]), values[0])
-        return values[0]
-
-    def _unit_values(self, unit: str, name: str) -> list[str]:
         # S-E: units are driven, and read, only through the user manager.
         argv = ["systemctl", "--user", "show", f"--property={name}", "--", self.units[unit]]
         values = []
@@ -260,7 +199,11 @@ class LiveHostReader:
             if key != name:
                 raise LookupError(f"systemctl reported no {name} for the {unit} unit")
             values.append(value)
-        return values
+        if len(values) != 1:
+            raise LookupError(f"systemctl reported no single {name} for the {unit} unit")
+        if name.endswith("Signal") and values[0].isdigit():
+            return _SIGNAL_NAMES.get(int(values[0]), values[0])
+        return values[0]
 
     def free_disk_bytes(self) -> int:
         # Before the first release the snapshot root may not exist yet; its filesystem is then
@@ -315,12 +258,17 @@ class LiveHostReader:
         return _digests(files)
 
     def _git(self, *argv: str, accept: Collection[int] = (0,)) -> subprocess.CompletedProcess:
-        return _run(["git", "-C", str(self.checkout), "--no-optional-locks", *argv], accept=accept)
+        # An empty GIT_ALLOW_PROTOCOL allows no transport. In a partial clone, a read that needs a
+        # missing object then fails before it reaches the promisor remote, instead of fetching
+        # the object: fetching is card 3's (S-H). ls-remote alone asks the remote, and it writes
+        # no object and no ref.
+        env = None if argv[0] == "ls-remote" else {**os.environ, "GIT_ALLOW_PROTOCOL": ""}
+        return _run(["git", "-C", str(self.checkout), "--no-optional-locks", *argv], accept=accept, env=env)
 
     def _require_root(self, found: Path) -> Path:
-        # The board listing and the profile scan find the root through this process's
-        # environment. A root other than the one this reader was built for would answer for
-        # another platform, so it is refused.
+        # The board listing, the profile scan and the fleet scan find the root through this
+        # process's environment. A root other than the one this reader was built for would answer
+        # for another platform, so it is refused.
         if found.resolve() != self.root_home.resolve():
             raise RuntimeError(f"this process resolves the Hermes root to {found}, not {self.root_home}")
         return found
@@ -331,7 +279,6 @@ def _run(
     *,
     accept: Collection[int] = (0,),
     env: Mapping[str, str] | None = None,
-    cwd: str | None = None,
 ) -> subprocess.CompletedProcess:
     done = subprocess.run(
         list(argv),
@@ -343,7 +290,6 @@ def _run(
         timeout=_TIMEOUT_SECONDS,
         check=False,
         env=env,
-        cwd=cwd,
     )
     if done.returncode not in accept:
         # stderr stays out: the runner keeps this message as release evidence, and a remote's
@@ -359,31 +305,6 @@ def _digests(files: Mapping[str, Path]) -> dict[str, str]:
         for key, path in sorted(files.items())
         if path.is_file()
     }
-
-
-def _environment_file(entry: str) -> dict[str, str]:
-    # Comments, blank lines and plain assignments are read as systemd reads them; a glob, any
-    # other form, or a missing file the unit needs, cannot be repeated exactly.
-    refused = LookupError(f"the {GATEWAY_UNIT} unit's environment file {entry} cannot be read exactly")
-    listed = _ENVIRONMENT_FILE.fullmatch(entry)
-    if listed is None:
-        raise refused
-    try:
-        lines = Path(listed[1]).read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        if listed[2] == "yes":
-            return {}
-        raise refused from None
-    except (OSError, ValueError):
-        raise refused from None
-    variables = {}
-    for line in (line.strip() for line in lines):
-        if line and line[0] not in "#;":
-            assignment = _FILE_ASSIGNMENT.fullmatch(line)
-            if assignment is None:
-                raise refused
-            variables[assignment[1]] = assignment[2]
-    return variables
 
 
 def _board_rows(paths: Sequence[Path]) -> list:

@@ -1,13 +1,15 @@
 """Release card 2: the live-host reader, read against temporary stand-ins only.
 
-Each test builds what the reader reads under tmp_path: a git repository with a bare remote, a
-stand-in systemctl first on PATH, boards made by the real kanban kernel, and Hermes homes.
-Nothing here reaches the real host, the real HERMES_HOME, systemd or the network. What a test
-expects is read back without the module under test.
+Each test builds what the reader reads under tmp_path: a git repository with a bare remote, or a
+partial clone of one; a stand-in systemctl first on PATH; boards made by the real kanban kernel;
+and Hermes homes, with the state records of their gateways. Nothing here reaches the real host,
+the real HERMES_HOME, systemd or the network. What a test expects is read back without the module
+under test.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -129,19 +131,16 @@ def _repository(tmp_path):
 
 
 def _systemctl(tmp_path, monkeypatch):
-    """A stand-in systemctl first on PATH: it logs its arguments and answers like `show`, from
-    unit/NAME, and like `show-environment`, from unit/manager."""
-    calls, script, unit = tmp_path / "systemctl.calls", tmp_path / "bin" / "systemctl", tmp_path / "unit"
+    """A stand-in systemctl first on PATH: it logs its arguments and answers `show` for KillSignal
+    and KillMode; it prints nothing for any other property."""
+    calls, script = tmp_path / "systemctl.calls", tmp_path / "bin" / "systemctl"
     script.parent.mkdir()
     script.write_text(
         "#!/bin/sh\n"
         f'echo "$*" >> "{calls}"\n'
-        'for arg; do case "$arg" in --property=*) name="${arg#--property=}" ;; esac; done\n'
         'case "$*" in\n'
-        f'  *show-environment*) cat "{unit}/manager" ;;\n'
         "  *--property=KillSignal*) echo KillSignal=2 ;;\n"
         "  *--property=KillMode*) echo KillMode=mixed ;;\n"
-        f'  *--property=*) cat "{unit}/$name" ;;\n'
         "esac\n",
         encoding="utf-8",
     )
@@ -150,25 +149,15 @@ def _systemctl(tmp_path, monkeypatch):
     return calls
 
 
-def _gateway_unit(tmp_path, venv, *, virtual_env=None, environment="", working_directory=None):
-    """The gateway unit as the stand-in shows it, shaped as generate_systemd_unit writes it: its
-    command run by venv's python, its Environment, and the Hermes home as its working directory.
-    The user manager's own environment holds HOME and PATH."""
-    unit, python, home = tmp_path / "unit", venv / "bin" / "python", tmp_path / "home"
-    (home / ".hermes").mkdir(parents=True, exist_ok=True)
-    unit.mkdir(exist_ok=True)
-    shown = {
-        "ExecStart": f"{{ path={python} ; argv[]={python} -m hermes_cli.main gateway run ; ignore_errors=no ; "
-        "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }",
-        "Environment": f"PATH=/usr/bin:/bin VIRTUAL_ENV={virtual_env or venv} HERMES_HOME={home / '.hermes'} "
-        f"HERMES_SUPERVISED_CHILD=1 {environment}".rstrip(),
-        "WorkingDirectory": str(working_directory or home / ".hermes"),
-        "UnsetEnvironment": "",
-    }
-    for name, value in shown.items():
-        (unit / name).write_text(f"{name}={value}\n", encoding="utf-8")
-    (unit / "EnvironmentFiles").write_text("", encoding="utf-8")  # none: systemctl prints no line
-    (unit / "manager").write_text(f"HOME={home}\nLANG=C.UTF-8\nPATH=/usr/bin:/bin\n", encoding="utf-8")
+def _gateway_record(home, pid, code_sha=None):
+    """The gateway_state.json of a running gateway of *home*, with *pid* and no start time, stamped
+    with *code_sha* unless it is None. Returns the record."""
+    record = {"pid": pid, "gateway_state": "running"}
+    if code_sha is not None:
+        record["code_sha"] = code_sha
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "gateway_state.json").write_text(json.dumps(record), encoding="utf-8")
+    return record
 
 
 def _homes(root, *profiles):
@@ -208,15 +197,6 @@ def _independent_open_runs(root):
             ).fetchall()
         runs |= {(f"{slug}:{run_id}", pid_is_alive(pid)) for run_id, pid in rows}
     return runs
-
-
-def _live_venv(checkout, name="venv", imports=None):
-    """A real venv at checkout/name whose interpreter imports hermes_cli from *imports*, else the checkout."""
-    venv = checkout / name
-    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True, timeout=120)
-    site_packages = next(venv.glob("lib/python3*/site-packages"))
-    (site_packages / "hermes_checkout.pth").write_text(f"{imports or checkout}\n", encoding="utf-8")
-    return venv
 
 
 def _tree_bytes(*roots):
@@ -287,6 +267,33 @@ def test_git_reads_answer_from_a_real_repository(tmp_path):
     assert host.checkout_root() == str(checkout.resolve())
 
 
+def test_git_reads_fetch_nothing_from_a_promisor_remote(tmp_path):
+    checkout, remote, seed = tmp_path / "checkout", tmp_path / "origin.git", tmp_path / "seed"
+    git(tmp_path, "init", "--bare", "--initial-branch=main", str(remote))
+    git(remote, "config", "uploadpack.allowFilter", "true")
+    make_git_repo(seed)
+    git(seed, "push", str(remote), "main")
+    # A partial clone: origin is its promisor remote, which serves each missing tree on demand.
+    git(tmp_path, "clone", "--filter=tree:0", remote.as_uri(), str(checkout))
+    prev = git(checkout, "rev-parse", "HEAD")
+    (seed / "new.txt").write_text("new\n", encoding="utf-8")
+    git(seed, "add", "new.txt")
+    git(seed, "commit", "-m", "new", author=DEFAULT_GIT_IDENTITY)
+    git(seed, "push", str(remote), "main")
+    git(checkout, "fetch", "origin")  # NEW's commit only: its tree stays on the remote
+    new = git(checkout, "rev-parse", "refs/remotes/origin/main")
+    host, packs = _reader(tmp_path, tmp_path / "root"), checkout / ".git" / "objects" / "pack"
+
+    before, pack_files = _tree_bytes(checkout), set(packs.iterdir())
+    # A missing object is refused, not fetched: fetching is card 3's (S-H).
+    with pytest.raises(subprocess.CalledProcessError):
+        host.changed_paths(prev, new)
+    with pytest.raises(subprocess.CalledProcessError):
+        host.commit_tree(new)
+    assert set(packs.iterdir()) == pack_files
+    assert _tree_bytes(checkout) == before
+
+
 def test_unit_property_returns_signal_names(tmp_path, monkeypatch):
     calls = _systemctl(tmp_path, monkeypatch)
     host = _reader(tmp_path, tmp_path / "root")
@@ -300,53 +307,35 @@ def test_unit_property_returns_signal_names(tmp_path, monkeypatch):
         assert argv[-1] == "hermes-gateway"
 
 
-def test_venv_import_root_probes_the_interpreter_the_gateway_unit_starts(tmp_path, monkeypatch):
-    checkout, other = tmp_path / "checkout", tmp_path / "other"
-    make_git_repo(checkout)
-    for root in (checkout, other):
-        (root / "hermes_cli").mkdir(parents=True)
-        (root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
-    _live_venv(checkout)  # the runtime-repair pick, which imports this checkout but is not run
-    dot_venv = _live_venv(checkout, ".venv", imports=other)
-    _systemctl(tmp_path, monkeypatch)
-    _gateway_unit(tmp_path, dot_venv)
-    host = _reader(tmp_path, tmp_path / "root")
+@pytest.mark.parametrize("case", ["current", "stale", "unknown", "none", "every"])
+def test_venv_import_root_asks_the_live_gateways(tmp_path, fence_home, monkeypatch, case):
+    checkout, prev, (m1, _m2) = _repository(tmp_path)
+    worker, coder = fence_home / "profiles" / "worker", fence_home / "profiles" / "coder"
+    worker.mkdir(parents=True)
+    # A live gateway, in this process's pid, in the root home and in the coder profile; for none,
+    # only a dead one in the root home.
+    pid = dead_pid() if case == "none" else os.getpid()
+    records = [_gateway_record(fence_home, pid, {"stale": m1, "unknown": None}.get(case, prev))]
+    if case != "none":
+        records.append(_gateway_record(coder, pid, m1 if case == "every" else prev))
+    stamps = {record.get("code_sha") for record in records if pid_is_alive(record["pid"])}
+    expected = str(checkout.resolve()) if stamps == {prev} else ""
+    # The environment the dispatcher gives a worker of the beta board, in the worker profile.
+    monkeypatch.setenv("HERMES_HOME", str(worker))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(fence_home / "kanban" / "boards" / "beta" / "kanban.db"))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_0123abcd")
+    calls = _systemctl(tmp_path, monkeypatch)  # whatever G6 asks, no real user manager answers
+    host = _reader(tmp_path, fence_home)
 
-    assert host.venv_import_root() == str(other.resolve())
-    assert _check(host, "G6") is False
-    # Fail closed: the unit's VIRTUAL_ENV names another venv, or the unit starts nothing.
-    _gateway_unit(tmp_path, dot_venv, virtual_env=checkout / "venv")
-    with pytest.raises(LookupError):
-        host.venv_import_root()
-    _gateway_unit(tmp_path, dot_venv)  # or an environment file the unit needs is missing
-    missing = f"EnvironmentFiles={tmp_path / 'gateway.env'} (ignore_errors=no)\n"
-    (tmp_path / "unit" / "EnvironmentFiles").write_text(missing, encoding="utf-8")
-    with pytest.raises(LookupError):
-        host.venv_import_root()
-    (tmp_path / "unit" / "ExecStart").write_text("ExecStart=\n", encoding="utf-8")
-    with pytest.raises(LookupError):
-        host.venv_import_root()
-
-
-@pytest.mark.parametrize("context", ["PYTHONPATH", "WorkingDirectory"])
-def test_venv_import_root_probes_in_the_unit_s_own_context(tmp_path, monkeypatch, context):
-    # The unit's interpreter on its own imports the checkout; the unit's PYTHONPATH, or its working
-    # directory, puts another checkout first.
-    checkout, other = tmp_path / "checkout", tmp_path / "other"
-    make_git_repo(checkout)
-    for root in (checkout, other):
-        (root / "hermes_cli").mkdir(parents=True)
-        (root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
-    venv = _live_venv(checkout)
-    _systemctl(tmp_path, monkeypatch)
-    if context == "PYTHONPATH":
-        _gateway_unit(tmp_path, venv, environment=f"PYTHONPATH={other}")
-    else:
-        _gateway_unit(tmp_path, venv, working_directory=other)
-    host = _reader(tmp_path, tmp_path / "root")
-
-    assert host.venv_import_root() == str(other.resolve())
-    assert _check(host, "G6") is False
+    loaded = set(sys.modules)
+    found = host.venv_import_root()
+    imported = set(sys.modules) - loaded
+    if case == "current":
+        assert imported == set(), " ".join(sorted(imported))  # K6: a G6 read imports nothing
+    assert found == expected
+    assert _check(host, "G6") is (case == "current")
+    assert not calls.exists()  # the gateways answer, not their unit
 
 
 def test_open_runs_cover_every_board_under_a_worker_env(tmp_path, fence_home, monkeypatch):
@@ -504,12 +493,11 @@ def test_config_digests_cover_root_and_profiles_and_match_the_named_snapshot(
 
 def test_reader_writes_nothing(tmp_path, fence_home, monkeypatch):
     checkout, prev, (m1, m2) = _repository(tmp_path)
-    venv = _live_venv(checkout)
     # A tracked file whose stat no longer matches the index: a plain `git status` would rewrite it.
     os.utime(checkout / "README.md", (time.time() + 3600,) * 2)
     _systemctl(tmp_path, monkeypatch)
-    _gateway_unit(tmp_path, venv)
     _homes(fence_home, "coder", "writer")
+    _gateway_record(fence_home, os.getpid(), prev)  # G6: the root home's live gateway runs PREV
     snapshot_root = tmp_path / "snapshots"
     _save_config_snapshot(fence_home, snapshot_root, m2)
     for age, name in ((200, "f" * 40), (100, "a" * 40)):
