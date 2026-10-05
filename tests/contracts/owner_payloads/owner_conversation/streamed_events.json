@@ -1,0 +1,195 @@
+[
+  {
+    "data": {
+      "response": {
+        "created_at": 1790000000,
+        "id": "resp_09dfb269bed64864a4d76680f5b9",
+        "model": "hermes-agent",
+        "object": "response",
+        "output": [],
+        "status": "in_progress"
+      },
+      "sequence_number": 0,
+      "type": "response.created"
+    },
+    "event": "response.created"
+  },
+  {
+    "data": {
+      "item": {
+        "arguments": "{\"path\": \"plan.md\"}",
+        "call_id": "call_contract",
+        "id": "fc_136d9fda60264db581102444",
+        "name": "read_file",
+        "status": "in_progress",
+        "type": "function_call"
+      },
+      "output_index": 0,
+      "sequence_number": 1,
+      "type": "response.output_item.added"
+    },
+    "event": "response.output_item.added"
+  },
+  {
+    "data": {
+      "item": {
+        "arguments": "{\"path\": \"plan.md\"}",
+        "call_id": "call_contract",
+        "id": "fc_136d9fda60264db581102444",
+        "name": "read_file",
+        "status": "completed",
+        "type": "function_call"
+      },
+      "output_index": 0,
+      "sequence_number": 2,
+      "type": "response.output_item.done"
+    },
+    "event": "response.output_item.done"
+  },
+  {
+    "data": {
+      "item": {
+        "call_id": "call_contract",
+        "id": "fco_8e3861d2fa664d66ad44f14e",
+        "output": [
+          {
+            "text": "Placeholder text.",
+            "type": "input_text"
+          }
+        ],
+        "status": "completed",
+        "type": "function_call_output"
+      },
+      "output_index": 1,
+      "sequence_number": 3,
+      "type": "response.output_item.added"
+    },
+    "event": "response.output_item.added"
+  },
+  {
+    "data": {
+      "item": {
+        "call_id": "call_contract",
+        "id": "fco_8e3861d2fa664d66ad44f14e",
+        "output": [
+          {
+            "text": "Placeholder text.",
+            "type": "input_text"
+          }
+        ],
+        "status": "completed",
+        "type": "function_call_output"
+      },
+      "output_index": 1,
+      "sequence_number": 4,
+      "type": "response.output_item.done"
+    },
+    "event": "response.output_item.done"
+  },
+  {
+    "data": {
+      "item": {
+        "content": [],
+        "id": "msg_0d869764040d46f6a6be277b",
+        "role": "assistant",
+        "status": "in_progress",
+        "type": "message"
+      },
+      "output_index": 2,
+      "sequence_number": 5,
+      "type": "response.output_item.added"
+    },
+    "event": "response.output_item.added"
+  },
+  {
+    "data": {
+      "content_index": 0,
+      "delta": "{\"schema_version\": 1, \"kind\": \"question\", \"message\": \"Which outcome first?\"}",
+      "item_id": "msg_0d869764040d46f6a6be277b",
+      "logprobs": [],
+      "output_index": 2,
+      "sequence_number": 6,
+      "type": "response.output_text.delta"
+    },
+    "event": "response.output_text.delta"
+  },
+  {
+    "data": {
+      "content_index": 0,
+      "item_id": "msg_0d869764040d46f6a6be277b",
+      "logprobs": [],
+      "output_index": 2,
+      "sequence_number": 7,
+      "text": "{\"schema_version\": 1, \"kind\": \"question\", \"message\": \"Which outcome first?\"}",
+      "type": "response.output_text.done"
+    },
+    "event": "response.output_text.done"
+  },
+  {
+    "data": {
+      "item": {
+        "content": [
+          {
+            "text": "{\"schema_version\": 1, \"kind\": \"question\", \"message\": \"Which outcome first?\"}",
+            "type": "output_text"
+          }
+        ],
+        "id": "msg_0d869764040d46f6a6be277b",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      },
+      "output_index": 2,
+      "sequence_number": 8,
+      "type": "response.output_item.done"
+    },
+    "event": "response.output_item.done"
+  },
+  {
+    "data": {
+      "response": {
+        "created_at": 1790000000,
+        "id": "resp_09dfb269bed64864a4d76680f5b9",
+        "model": "hermes-agent",
+        "object": "response",
+        "output": [
+          {
+            "arguments": "{\"path\": \"plan.md\"}",
+            "call_id": "call_contract",
+            "name": "read_file",
+            "type": "function_call"
+          },
+          {
+            "call_id": "call_contract",
+            "output": [
+              {
+                "text": "Placeholder text.",
+                "type": "input_text"
+              }
+            ],
+            "type": "function_call_output"
+          },
+          {
+            "content": [
+              {
+                "text": "{\"schema_version\": 1, \"kind\": \"question\", \"message\": \"Which outcome first?\"}",
+                "type": "output_text"
+              }
+            ],
+            "role": "assistant",
+            "type": "message"
+          }
+        ],
+        "status": "completed",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 1,
+          "total_tokens": 2
+        }
+      },
+      "sequence_number": 9,
+      "type": "response.completed"
+    },
+    "event": "response.completed"
+  }
+]

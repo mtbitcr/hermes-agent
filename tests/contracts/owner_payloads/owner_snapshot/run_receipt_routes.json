@@ -1,0 +1,282 @@
+[
+  {
+    "finished_at": "2023-11-14T22:15:00Z",
+    "has_newer_run": false,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "completed",
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "summary": "Work finished."
+    },
+    "retry_origin": "unattributed",
+    "started_at": "2023-11-14T22:13:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2023-11-14T22:15:00Z",
+    "has_newer_run": false,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "completed",
+      "runtime": {
+        "engine": "hermes",
+        "model": "gpt-5.6-sol",
+        "profile": "raphael-verifier",
+        "provider": "openai-codex",
+        "reasoning_effort": "max",
+        "state": "known"
+      },
+      "summary": "Work finished."
+    },
+    "retry_origin": "unattributed",
+    "started_at": "2023-11-14T22:13:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2023-11-14T22:15:00Z",
+    "has_newer_run": false,
+    "receipt": {
+      "cost": {
+        "amount": 0.0123,
+        "currency": "USD",
+        "state": "estimated",
+        "summary": "Estimated model usage for this recorded route."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "completed",
+      "runtime": {
+        "engine": "hermes",
+        "model": "gpt-5.6-sol",
+        "profile": "raphael-verifier",
+        "provider": "openai-codex",
+        "reasoning_effort": "max",
+        "state": "known"
+      },
+      "summary": "Work finished."
+    },
+    "retry_origin": "unattributed",
+    "started_at": "2023-11-14T22:13:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2023-11-14T22:15:00Z",
+    "has_newer_run": false,
+    "receipt": {
+      "cost": {
+        "amount": 0.0123,
+        "currency": "USD",
+        "state": "exact",
+        "summary": "Recorded model usage cost for this route."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "completed",
+      "runtime": {
+        "engine": "hermes",
+        "model": "gpt-5.6-sol",
+        "profile": "raphael-verifier",
+        "provider": "openai-codex",
+        "reasoning_effort": "max",
+        "state": "known"
+      },
+      "summary": "Work finished."
+    },
+    "retry_origin": "unattributed",
+    "started_at": "2023-11-14T22:13:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2023-11-14T22:15:00Z",
+    "has_newer_run": false,
+    "receipt": {
+      "cost": {
+        "amount": 0.0123,
+        "currency": "USD",
+        "state": "reported",
+        "summary": "Provider-reported model usage cost for this route."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "completed",
+      "runtime": {
+        "engine": "hermes",
+        "model": "gpt-5.6-sol",
+        "profile": "raphael-verifier",
+        "provider": "openai-codex",
+        "reasoning_effort": "max",
+        "state": "known"
+      },
+      "summary": "Work finished."
+    },
+    "retry_origin": "unattributed",
+    "started_at": "2023-11-14T22:13:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2023-11-14T22:15:00Z",
+    "has_newer_run": false,
+    "receipt": {
+      "cost": {
+        "amount": 0.0123,
+        "currency": "USD",
+        "state": "included",
+        "summary": "Included in the connected provider plan."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "completed",
+      "runtime": {
+        "engine": "hermes",
+        "model": "gpt-5.6-sol",
+        "profile": "raphael-verifier",
+        "provider": "openai-codex",
+        "reasoning_effort": "max",
+        "state": "known"
+      },
+      "summary": "Work finished."
+    },
+    "retry_origin": "unattributed",
+    "started_at": "2023-11-14T22:13:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2023-11-14T22:15:00Z",
+    "has_newer_run": false,
+    "receipt": {
+      "cost": {
+        "amount": 0.0123,
+        "currency": "USD",
+        "state": "estimated",
+        "summary": "Estimated model usage for this recorded route."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "completed",
+      "runtime": {
+        "capability": {
+          "connections": [],
+          "connections_truncated": false,
+          "skills": [],
+          "skills_truncated": false,
+          "state": "known",
+          "tools": [
+            "read_file"
+          ],
+          "tools_truncated": false,
+          "truncated": false
+        },
+        "engine": "hermes",
+        "model": "gpt-5.6-sol",
+        "profile": "raphael-verifier",
+        "provider": "openai-codex",
+        "reasoning_effort": "max",
+        "state": "known"
+      },
+      "summary": "Work finished."
+    },
+    "retry_origin": "unattributed",
+    "started_at": "2023-11-14T22:13:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2023-11-14T22:15:00Z",
+    "has_newer_run": false,
+    "receipt": {
+      "cost": {
+        "amount": 0.0123,
+        "currency": "USD",
+        "state": "estimated",
+        "summary": "Estimated model usage for this recorded route."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "completed",
+      "runtime": {
+        "capability": {
+          "connections": [],
+          "connections_truncated": false,
+          "skills": [],
+          "skills_truncated": false,
+          "state": "unknown",
+          "tools": [
+            "read_file"
+          ],
+          "tools_truncated": false,
+          "truncated": false
+        },
+        "engine": "hermes",
+        "model": "gpt-5.6-sol",
+        "profile": "raphael-verifier",
+        "provider": "openai-codex",
+        "reasoning_effort": "max",
+        "state": "known"
+      },
+      "summary": "Work finished."
+    },
+    "retry_origin": "unattributed",
+    "started_at": "2023-11-14T22:13:20Z",
+    "task_title": "Draft the workshop agenda"
+  }
+]

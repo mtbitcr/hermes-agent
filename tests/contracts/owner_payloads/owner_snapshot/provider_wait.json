@@ -1,0 +1,239 @@
+{
+  "body": {
+    "data": {
+      "attachments": [],
+      "board": {
+        "counts": {
+          "archived": 0,
+          "blocked": 1,
+          "done": 0,
+          "ready": 1,
+          "review": 0,
+          "running": 0,
+          "scheduled": 0,
+          "todo": 0,
+          "triage": 0
+        },
+        "name": "Wait Pilot",
+        "project_id": "p_97a99226918384c4dcc48163",
+        "slug": "wait-pilot",
+        "total": 2
+      },
+      "columns": [
+        {
+          "name": "triage",
+          "tasks": []
+        },
+        {
+          "name": "todo",
+          "tasks": []
+        },
+        {
+          "name": "scheduled",
+          "tasks": []
+        },
+        {
+          "name": "ready",
+          "tasks": [
+            {
+              "assignee_name": "worker",
+              "child_ids": [],
+              "event_revision": 8,
+              "id": "t_cc2dc8d8",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "stopped_work": "provider_wait",
+              "title": "Draft the placeholder brief",
+              "updated_at": "2030-03-17T17:46:40Z"
+            }
+          ]
+        },
+        {
+          "name": "running",
+          "tasks": []
+        },
+        {
+          "name": "blocked",
+          "tasks": [
+            {
+              "assignee_name": "worker",
+              "child_ids": [],
+              "event_revision": 11,
+              "id": "t_112a104b",
+              "owner_wait": {
+                "reason": "The AI provider refused this work as worded; it is parked instead of being retried unchanged.",
+                "since": "2030-03-17T17:46:40Z"
+              },
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "stopped_work": "capability",
+              "title": "Word the placeholder notice",
+              "updated_at": "2030-03-17T17:46:40Z"
+            }
+          ]
+        },
+        {
+          "name": "review",
+          "tasks": []
+        },
+        {
+          "name": "done",
+          "tasks": []
+        }
+      ],
+      "planning_context": {
+        "actionable_count": 2,
+        "actionable_truncated": false,
+        "omitted_terminal_count": 0,
+        "relations_truncated": false,
+        "schema_version": 1,
+        "tasks": [
+          {
+            "assignee_name": "worker",
+            "child_ids": [],
+            "event_revision": 11,
+            "id": "t_112a104b",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "blocked",
+            "title": "Word the placeholder notice",
+            "updated_at": "2030-03-17T17:46:40Z"
+          },
+          {
+            "assignee_name": "worker",
+            "child_ids": [],
+            "event_revision": 8,
+            "id": "t_cc2dc8d8",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "ready",
+            "title": "Draft the placeholder brief",
+            "updated_at": "2030-03-17T17:46:40Z"
+          }
+        ]
+      },
+      "project": {
+        "archived": false,
+        "board": "wait-pilot",
+        "description": null,
+        "id": "p_97a99226918384c4dcc48163",
+        "name": "Wait Pilot",
+        "slug": "wait-pilot"
+      },
+      "runs": [
+        {
+          "finished_at": "2030-03-17T17:46:40Z",
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "unknown",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "The AI provider declined this work as worded. It waits for you."
+          },
+          "retry_origin": "none",
+          "started_at": "2030-03-17T17:46:40Z",
+          "task_title": "Word the placeholder notice"
+        },
+        {
+          "finished_at": "2030-03-17T17:46:40Z",
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "waiting",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Waiting for the AI provider. Work resumes by itself after 2030-03-17 17:56:40 UTC."
+          },
+          "retry_origin": "none",
+          "started_at": "2030-03-17T17:46:40Z",
+          "task_title": "Draft the placeholder brief"
+        }
+      ],
+      "steward": {
+        "active_work": [
+          {
+            "state": "Ready",
+            "title": "Draft the placeholder brief"
+          }
+        ],
+        "counts": {
+          "awaiting_review": 0,
+          "completed_in_window": 0,
+          "needs_attention": 0,
+          "open": 2
+        },
+        "decisions_needed": [
+          {
+            "reason": "The AI provider refused this work as worded; it is parked instead of being retried unchanged.",
+            "state": "Waiting for your answer",
+            "title": "Word the placeholder notice",
+            "waiting_since": "2030-03-17T17:46:40Z"
+          }
+        ],
+        "execution": {
+          "paused": false,
+          "state": "waiting_for_you",
+          "summary": "Raphael needs your answer before the plan can continue."
+        },
+        "generated_at": "2030-03-17T17:47:40Z",
+        "lookback_days": 7,
+        "needs_attention": [],
+        "progress": [],
+        "project": {
+          "name": "Wait Pilot"
+        },
+        "schema_version": 2,
+        "stale_candidates": [],
+        "truncated": {
+          "active_work": false,
+          "decisions_needed": false,
+          "needs_attention": false,
+          "progress": false,
+          "stale_candidates": false
+        }
+      },
+      "truncated": {
+        "attachments": false,
+        "runs": false,
+        "tasks": false,
+        "workers": false
+      },
+      "workers": []
+    },
+    "object": "hermes.owner_workspace.project_snapshot"
+  },
+  "status": 200
+}

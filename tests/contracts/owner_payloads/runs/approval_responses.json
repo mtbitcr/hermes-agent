@@ -1,0 +1,38 @@
+[
+  {
+    "body": {
+      "choice": "once",
+      "object": "hermes.run.approval_response",
+      "resolved": 1,
+      "run_id": "run_1f83b976acfb4a56ac5f591d10f21614"
+    },
+    "status": 200
+  },
+  {
+    "body": {
+      "choice": "deny",
+      "object": "hermes.run.approval_response",
+      "resolved": 1,
+      "run_id": "run_557fdd2f4c82464a8942d004e6243585"
+    },
+    "status": 200
+  },
+  {
+    "body": {
+      "choice": "session",
+      "object": "hermes.run.approval_response",
+      "resolved": 1,
+      "run_id": "run_1a0e7b4650944375944664eaf6063657"
+    },
+    "status": 200
+  },
+  {
+    "body": {
+      "choice": "always",
+      "object": "hermes.run.approval_response",
+      "resolved": 1,
+      "run_id": "run_73e9f633606b4b51983826e0937b025e"
+    },
+    "status": 200
+  }
+]

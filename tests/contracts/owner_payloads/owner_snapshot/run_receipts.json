@@ -1,0 +1,331 @@
+[
+  {
+    "finished_at": null,
+    "has_newer_run": false,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "running",
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "summary": "Work is still in progress."
+    },
+    "retry_origin": "none",
+    "started_at": "2026-09-23T13:43:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2026-09-23T14:00:00Z",
+    "has_newer_run": true,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "completed",
+      "owner_retry": {
+        "reason": "The key was added.",
+        "state": "requested"
+      },
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "summary": "Work finished."
+    },
+    "retry_origin": "automatic",
+    "started_at": "2026-09-23T13:43:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2026-09-23T14:00:00Z",
+    "has_newer_run": true,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "completed",
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "summary": "Work finished and is awaiting review."
+    },
+    "retry_origin": "owner",
+    "started_at": "2026-09-23T13:43:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2026-09-23T14:00:00Z",
+    "has_newer_run": true,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "unknown",
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "summary": "Work is scheduled for later."
+    },
+    "retry_origin": "unattributed",
+    "started_at": "2026-09-23T13:43:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2026-09-23T14:00:00Z",
+    "has_newer_run": false,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "waiting",
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "summary": "Waiting for the AI provider. Work resumes by itself after 2026-09-23 16:00:00 UTC."
+    },
+    "retry_origin": "none",
+    "started_at": "2026-09-23T13:43:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2026-09-23T14:00:00Z",
+    "has_newer_run": true,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "attention",
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "summary": "Work stopped at the AI provider's usage limit and will start again by itself."
+    },
+    "retry_origin": "automatic",
+    "started_at": "2026-09-23T13:43:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2026-09-23T14:00:00Z",
+    "has_newer_run": true,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "attention",
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "summary": "Work stopped at the AI provider's usage limit and will start again by itself after 2026-09-23 16:00 UTC."
+    },
+    "retry_origin": "owner",
+    "started_at": "2026-09-23T13:43:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2026-09-23T14:00:00Z",
+    "has_newer_run": true,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "unknown",
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "summary": "The AI provider declined this work as worded. It waits for you."
+    },
+    "retry_origin": "unattributed",
+    "started_at": "2026-09-23T13:43:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2026-09-23T14:00:00Z",
+    "has_newer_run": false,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "attention",
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "summary": "Work stopped and needs attention."
+    },
+    "retry_origin": "none",
+    "started_at": "2026-09-23T13:43:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2026-09-23T14:00:00Z",
+    "has_newer_run": true,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "attention",
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "summary": "The review asked for changes; the work went back for rework."
+    },
+    "retry_origin": "automatic",
+    "started_at": "2026-09-23T13:43:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2026-09-23T14:00:00Z",
+    "has_newer_run": true,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "attention",
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "stop_reason": "Work stopped and needs attention.",
+      "summary": "Work stopped and needs attention."
+    },
+    "retry_origin": "owner",
+    "started_at": "2026-09-23T13:43:20Z",
+    "task_title": "Draft the workshop agenda"
+  },
+  {
+    "finished_at": "2026-09-23T14:00:00Z",
+    "has_newer_run": true,
+    "receipt": {
+      "cost": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative cost."
+      },
+      "evidence": {
+        "kind": "project_activity",
+        "state": "available"
+      },
+      "external_effect": {
+        "state": "unknown",
+        "summary": "This record does not confirm whether an external service changed."
+      },
+      "outcome": "unknown",
+      "runtime": {
+        "state": "unknown",
+        "summary": "This record does not contain an authoritative model route."
+      },
+      "summary": "The final outcome could not be confirmed."
+    },
+    "retry_origin": "unattributed",
+    "started_at": "2026-09-23T13:43:20Z",
+    "task_title": "Draft the workshop agenda"
+  }
+]

@@ -1,0 +1,22 @@
+{
+  "body": {
+    "active_run_id": null,
+    "completed_run_id": null,
+    "conversation_closed": false,
+    "data": [],
+    "head_response_id": null,
+    "incomplete": false,
+    "latest_response_id": null,
+    "object": "hermes.response.owner_history",
+    "pending": {
+      "owner": "Prepare the workshop",
+      "response_id": "resp_pending_turn"
+    },
+    "proposal_claimed": false,
+    "proposal_consumed": false,
+    "recovery": null,
+    "released_run_id": null,
+    "truncated": false
+  },
+  "status": 200
+}

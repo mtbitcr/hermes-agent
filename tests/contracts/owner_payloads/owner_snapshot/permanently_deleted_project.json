@@ -1,0 +1,135 @@
+{
+  "body": {
+    "data": {
+      "attachments": [],
+      "board": {
+        "counts": {
+          "archived": 0,
+          "blocked": 0,
+          "done": 0,
+          "ready": 0,
+          "review": 0,
+          "running": 0,
+          "scheduled": 0,
+          "todo": 0,
+          "triage": 0
+        },
+        "name": "RP",
+        "project_id": "p_30b7ec04",
+        "slug": "rp2",
+        "total": 0
+      },
+      "columns": [
+        {
+          "name": "triage",
+          "tasks": []
+        },
+        {
+          "name": "todo",
+          "tasks": []
+        },
+        {
+          "name": "scheduled",
+          "tasks": []
+        },
+        {
+          "name": "ready",
+          "tasks": []
+        },
+        {
+          "name": "running",
+          "tasks": []
+        },
+        {
+          "name": "blocked",
+          "tasks": []
+        },
+        {
+          "name": "review",
+          "tasks": []
+        },
+        {
+          "name": "done",
+          "tasks": []
+        }
+      ],
+      "project": {
+        "archived": false,
+        "board": "rp2",
+        "description": null,
+        "id": "p_30b7ec04",
+        "name": "RP",
+        "slug": "rp2"
+      },
+      "removal_state": {
+        "accepted_at": 1790000000,
+        "applied_at": 1790000000,
+        "cancelable": false,
+        "completed_at": 1790000000,
+        "consequences": null,
+        "consequences_digest": "f068e0f544f1b638b65b70f52edbef2da3e31e7d1b19859136521e93cf1316a4",
+        "last_error": null,
+        "mode": "permanent",
+        "phase": "done",
+        "receipt_id": "contract2",
+        "restorable": false,
+        "retained_copy_id": null
+      },
+      "runs": [],
+      "steward": {
+        "active_work": [],
+        "counts": {
+          "awaiting_review": 0,
+          "completed_in_window": 0,
+          "needs_attention": 0,
+          "open": 0
+        },
+        "decisions_needed": [],
+        "execution": {
+          "paused": false,
+          "state": "deleted",
+          "summary": "This Project was deleted."
+        },
+        "generated_at": "2026-09-21T14:13:20Z",
+        "lookback_days": 7,
+        "needs_attention": [],
+        "progress": [],
+        "project": {
+          "name": "RP"
+        },
+        "removal_state": {
+          "accepted_at": 1790000000,
+          "applied_at": 1790000000,
+          "cancelable": false,
+          "completed_at": 1790000000,
+          "consequences": null,
+          "consequences_digest": "f068e0f544f1b638b65b70f52edbef2da3e31e7d1b19859136521e93cf1316a4",
+          "last_error": null,
+          "mode": "permanent",
+          "phase": "done",
+          "receipt_id": "contract2",
+          "restorable": false,
+          "retained_copy_id": null
+        },
+        "schema_version": 2,
+        "stale_candidates": [],
+        "truncated": {
+          "active_work": false,
+          "decisions_needed": false,
+          "needs_attention": false,
+          "progress": false,
+          "stale_candidates": false
+        }
+      },
+      "truncated": {
+        "attachments": false,
+        "runs": false,
+        "tasks": false,
+        "workers": false
+      },
+      "workers": []
+    },
+    "object": "hermes.owner_workspace.project_snapshot"
+  },
+  "status": 200
+}

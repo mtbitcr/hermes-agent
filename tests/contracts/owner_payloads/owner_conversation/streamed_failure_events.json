@@ -1,0 +1,52 @@
+[
+  {
+    "data": {
+      "response": {
+        "created_at": 1790000000,
+        "id": "resp_d5a6443639634878b141bd7b848c",
+        "model": "hermes-agent",
+        "object": "response",
+        "output": [],
+        "status": "in_progress"
+      },
+      "sequence_number": 0,
+      "type": "response.created"
+    },
+    "event": "response.created"
+  },
+  {
+    "data": {
+      "response": {
+        "created_at": 1790000000,
+        "error": {
+          "message": "agent died mid-stream",
+          "type": "server_error"
+        },
+        "id": "resp_d5a6443639634878b141bd7b848c",
+        "model": "hermes-agent",
+        "object": "response",
+        "output": [
+          {
+            "content": [
+              {
+                "text": "agent died mid-stream",
+                "type": "output_text"
+              }
+            ],
+            "role": "assistant",
+            "type": "message"
+          }
+        ],
+        "status": "failed",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "total_tokens": 0
+        }
+      },
+      "sequence_number": 1,
+      "type": "response.failed"
+    },
+    "event": "response.failed"
+  }
+]

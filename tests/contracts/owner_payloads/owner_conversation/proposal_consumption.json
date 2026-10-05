@@ -1,0 +1,7 @@
+{
+  "body": {
+    "consumed": true,
+    "object": "hermes.response.owner_proposal_consumption"
+  },
+  "status": 200
+}
