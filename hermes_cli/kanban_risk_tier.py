@@ -60,6 +60,21 @@ def highest_risk_tier(tiers: Iterable[Optional[int]]) -> int:
     return max(effective_risk_tier(tier) for tier in tiers)
 
 
+def recovered_root_risk_tier(recorded: Optional[int], derived: int) -> int:
+    """The tier a new Project's root card, found already written when its
+    commit is replayed, is verified at.
+
+    The root is created at *derived*, the highest tier of its tasks. The code
+    before that created it without a tier, which the creation pin records as
+    tier 2 with tier 2's effort and seal. A root recorded at tier 2 is
+    verified at tier 2, so that root is accepted exactly as written and never
+    rewritten; any other root is verified at *derived*.
+    """
+    if recorded == UNRECORDED_RISK_TIER:
+        return UNRECORDED_RISK_TIER
+    return derived
+
+
 # The only efforts a card is ever pinned at. The model policy admits exactly
 # these next to each other on a lane's own model, and nothing wider.
 PINNED_EFFORTS = ("high", "max")
@@ -75,6 +90,21 @@ def pinned_reasoning_effort(tier: Optional[int], responsibility: Optional[str]) 
     if str(responsibility or "").strip().upper() == SECURITY_REVIEW_RESPONSIBILITY:
         return "max"
     return "high"
+
+
+def raised_reasoning_effort(
+    pinned_effort: Optional[str], tier: int, responsibility: Optional[str],
+) -> Optional[str]:
+    """The effort a raise to *tier* re-pins the role holding a card at, or None
+    when it re-pins nothing.
+
+    A card pinned at creation (its ``pinned_effort`` recorded) runs every later
+    run at the effort its new tier pins, whichever verdict follows the raise
+    (decision 1). A card without that record keeps each role's own effort.
+    """
+    if pinned_effort is None:
+        return None
+    return pinned_reasoning_effort(tier, responsibility)
 
 
 # Seconds per run for each kind of work (the plan's owner summary and

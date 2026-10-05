@@ -11,10 +11,13 @@ creates (``add``, ``replace``, ``split``, ``merge`` through
 
 P5 (tier plan section h): a ``replace``, ``split`` or ``merge`` never creates
 a card below the highest tier of the cards it replaces, and a new Project's
-root card takes the highest tier of its tasks.
+root card takes the highest tier of its tasks. A replay keeps a root its
+crashed commit already wrote, as written.
 """
 
 from __future__ import annotations
+
+import contextlib
 
 import pytest
 
@@ -26,14 +29,19 @@ from hermes_cli import projects_db
 # canonical payloads) is reused verbatim, so every commit here goes through
 # the REAL kernel entry point.
 from tests.hermes_cli.test_owner_workspace import (  # noqa: F401
+    _CrashInjected,
+    _board_for_project,
     _bootstrap_board,
     _commit_project_plan,
     _commit_task_graph,
     _configured_provider,
+    _expire_lock,
     _project_plan_args,
     _project_task_ref,
     _task_graph_args,
+    _temporarily_patch,
     _with_approver,
+    _work_rows,
     ctx,
 )
 from tools import approval
@@ -346,3 +354,110 @@ def test_a_new_projects_root_takes_the_highest_tier_of_its_tasks(
         root = _row(conn, result["root_task_id"])
     assert (root["risk_tier"], root["reasoning_effort"]) == (root_tier, effort)
     assert kb.task_policy_lock_error(root) is None
+
+
+# ---------------------------------------------------------------------------
+# P5 recovery: a replay keeps the root its crashed commit wrote
+# ---------------------------------------------------------------------------
+
+
+def _graph_root(ctx, args: dict):
+    """The root a task-graph commit wrote, read on a fresh connection."""
+    root_key = "owgraph_" + ow._derive_id(ctx, args["idempotency_key"], "graph-root")
+    board = _board_for_project(args["project_name"])
+    with contextlib.closing(kb.connect(board=board)) as conn:
+        return conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?", (root_key,),
+        ).fetchone()
+
+
+def _crash_at_the_terminal_receipt(ctx, args: dict, *, before_p5: bool):
+    """Commit *args*, crash at its terminal receipt, expire its lease and
+    return the root it wrote. The replay runs in the same HERMES_HOME, on
+    fresh connections.
+
+    *before_p5* patches only the new root-tier seam, so the root goes to the
+    kernel without a tier, exactly as the code before P5 wrote it.
+    """
+    def crash(*_args, **_kwargs):
+        raise _CrashInjected("at the terminal receipt")
+
+    root_tier = (lambda tiers: None) if before_p5 else ow.highest_risk_tier
+    approver = _with_approver(ctx.session)
+    with _temporarily_patch(ow, "highest_risk_tier", root_tier):
+        with _temporarily_patch(ow, "_finalize_receipt", crash):
+            with pytest.raises(_CrashInjected):
+                _commit_task_graph(ctx, **args)
+    approver.join()
+    _expire_lock(ctx, args["idempotency_key"])
+    return _graph_root(ctx, args)
+
+
+def _pin(row) -> tuple:
+    return (row["id"], row["risk_tier"], row["reasoning_effort"], row["model_policy_lock"])
+
+
+@pytest.mark.parametrize(
+    ("written_by", "tier", "effort"),
+    [(None, 1, "high"), ("code-before-p5", 2, "max"), ("this-code", 1, "high")],
+    ids=["fresh-root", "base-to-head", "head-to-head"],
+)
+def test_a_replay_keeps_the_root_its_crashed_commit_wrote(ctx, written_by, tier, effort):
+    """Tasks at tiers 1 and 1. A fresh root takes tier 1. A replay keeps the
+    root the crashed commit wrote, at tier 1 or, written before P5, at tier 2,
+    with its effort and seal unchanged, and creates nothing twice."""
+    args = _task_graph_args(idempotency_key="graph-root-recovery")
+    written = None
+    if written_by is not None:
+        written = _crash_at_the_terminal_receipt(
+            ctx, args, before_p5=written_by == "code-before-p5",
+        )
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+
+    assert (result["ok"], result["task_count"]) == (True, 2)
+    # The root and its two children, none of them twice.
+    assert len(_work_rows(result["board"], result["project_id"])) == 3
+    root = _graph_root(ctx, args)
+    assert root["id"] == result["root_task_id"]
+    assert (root["risk_tier"], root["reasoning_effort"]) == (tier, effort)
+    assert kb.task_policy_lock_error(root) is None
+    if written is not None:
+        assert _pin(root) == _pin(written)
+
+
+@pytest.mark.parametrize(
+    ("before_p5", "column", "value"),
+    [
+        (False, "risk_tier", 0),
+        (False, "risk_tier", 2),
+        (True, "reasoning_effort", "high"),
+        (True, "model_policy_lock", "high"),
+    ],
+    ids=["tier-0", "tier-2-on-a-tier-1-pin", "effort-high-at-tier-2", "seal-for-high-at-tier-2"],
+)
+def test_a_replay_refuses_a_root_matching_neither_derivation(ctx, before_p5, column, value):
+    """Neither this code's root (tier 1, high, its seal) nor the one written
+    before P5 (tier 2, max, its seal): the replay fails closed and rewrites
+    nothing."""
+    args = _task_graph_args(idempotency_key="graph-root-tampered")
+    root = _crash_at_the_terminal_receipt(ctx, args, before_p5=before_p5)
+    if column == "model_policy_lock":
+        # The seal minted for *value* on the root's own route.
+        value = kb.mint_policy_lock(
+            root["assignee"], root["provider_override"], root["model_override"],
+            value, root["execution_tier"],
+        )
+    board = _board_for_project(args["project_name"])
+    with contextlib.closing(kb.connect(board=board)) as conn:
+        conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, root["id"]))
+        conn.commit()
+
+    approver = _with_approver(ctx.session)
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        _commit_task_graph(ctx, **args)
+    approver.join()
+
+    assert excinfo.value.code == "crash_recovery_failed"
+    assert _graph_root(ctx, args)[column] == value

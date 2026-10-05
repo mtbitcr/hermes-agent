@@ -329,3 +329,109 @@ def test_a_raise_to_tier_2_repins_effort_at_handback(reviewing, pinned, effort):
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
     assert (row["status"], row["reasoning_effort"]) == ("running", effort)
     assert kb.task_policy_lock_error(row) is None
+
+
+# ---------------------------------------------------------------------------
+# Decision 1 without a handback: the raise re-pins the role holding the card
+# ---------------------------------------------------------------------------
+
+PINNED_OR_LEGACY = pytest.mark.parametrize(
+    "pinned", [True, False], ids=["pinned-card", "card-from-before-the-pins"],
+)
+
+_ABORT_DELIVERED = (
+    "CREATE TRIGGER abort_delivered BEFORE INSERT ON task_events "
+    "WHEN NEW.kind = 'review_findings_delivered' "
+    "BEGIN SELECT RAISE(ABORT, 'simulated storage fault'); END"
+)
+
+
+def _row(conn, tid: str):
+    return conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+
+
+def _review_again(reviewing, monkeypatch, conn, tid: str, n: int) -> None:
+    review = kb.claim_review_task(conn, tid, claimer=f"{reviewing.host}:r{n}")
+    assert review is not None
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+
+
+def _assert_next_review_holds_the_raise(conn, tid: str, before, pinned: bool) -> None:
+    """Tier 2 at max on a card pinned at creation, the role's own effort on a
+    card from before the pins; sealed either way, on the same time box."""
+    row = _row(conn, tid)
+    assert (row["status"], row["assignee"], row["risk_tier"]) == (
+        "running", before["assignee"], 2,
+    )
+    assert (row["model_override"], row["max_runtime_seconds"]) == (
+        before["model_override"], before["max_runtime_seconds"],
+    )
+    if pinned:
+        assert before["reasoning_effort"] == "high"
+        assert (row["reasoning_effort"], row["pinned_effort"]) == ("max", "max")
+    else:
+        assert (row["reasoning_effort"], row["pinned_effort"]) == (
+            before["reasoning_effort"], None,
+        )
+        assert row["model_policy_lock"] == before["model_policy_lock"]
+    assert kb.task_policy_lock_error(row) is None
+
+
+@PINNED_OR_LEGACY
+def test_a_raise_on_a_repeat_block_holds_for_the_next_review(reviewing, monkeypatch, pinned):
+    conn, tid, head, review = reviewing(1, pinned=pinned)
+    findings = [_finding(head)]
+    assert _dispatch({"findings": findings})["outcome"] == "handed_back"
+    run = kb.claim_task(conn, tid, claimer=f"{reviewing.host}:w1")
+    assert run is not None
+    # The implementer resubmits the unchanged candidate.
+    assert kb.request_review(
+        conn, tid, summary="unchanged", reviewer=kb.policy_resolved_reviewer(),
+        expected_run_id=run.current_run_id,
+    )
+    _review_again(reviewing, monkeypatch, conn, tid, 1)
+    before = _row(conn, tid)
+
+    out = _dispatch({"findings": findings, "risk_tier": 2})
+
+    assert out.get("ok") is True, out
+    assert out["outcome"] == "owner_decision_blocked"
+    assert out["risk_tier_raised"]["to"] == 2
+    assert kb.unblock_task(conn, tid)
+    _review_again(reviewing, monkeypatch, conn, tid, 2)
+    _assert_next_review_holds_the_raise(conn, tid, before, pinned)
+
+
+@PINNED_OR_LEGACY
+def test_a_raise_on_a_failed_verdict_holds_for_the_next_review(reviewing, monkeypatch, pinned):
+    conn, tid, head, review = reviewing(1, pinned=pinned)
+    before = _row(conn, tid)
+    conn.execute(_ABORT_DELIVERED)
+    conn.commit()
+
+    out = _dispatch({"findings": [_finding(head)], "risk_tier": 2})
+
+    assert out.get("ok") is not True, out
+    assert "simulated storage fault" in out["error"]
+    conn.execute("DROP TRIGGER abort_delivered")
+    conn.commit()
+    assert _events(conn, tid, "changes_requested") == []
+    assert kb.reclaim_task(conn, tid, reason="operator retry")
+    _review_again(reviewing, monkeypatch, conn, tid, 1)
+    _assert_next_review_holds_the_raise(conn, tid, before, pinned)
+
+
+@PINNED_OR_LEGACY
+def test_a_raise_on_a_refused_document_holds_for_the_next_review(reviewing, monkeypatch, pinned):
+    conn, tid, head, review = reviewing(1, pinned=pinned)
+    before = _row(conn, tid)
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 64)
+
+    out = _dispatch({"findings": [_finding(head)], "risk_tier": 2})
+
+    assert out.get("ok") is not True, out
+    assert "attachment exceeds" in out["error"]
+    assert _events(conn, tid, "changes_requested") == []
+    assert kb.reclaim_task(conn, tid, reason="operator retry")
+    _review_again(reviewing, monkeypatch, conn, tid, 1)
+    _assert_next_review_holds_the_raise(conn, tid, before, pinned)

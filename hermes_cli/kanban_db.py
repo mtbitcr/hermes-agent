@@ -102,6 +102,7 @@ from hermes_cli.kanban_risk_tier import (
     parse_risk_tier,
     pinned_reasoning_effort,
     pinned_time_box_seconds,
+    raised_reasoning_effort,
     requires_independent_review,
     review_run_box_seconds,
 )
@@ -28597,8 +28598,10 @@ def submit_review_findings(
     ``risk_tier`` is the reviewer's tier for the card. It may only raise the
     tier (:func:`hermes_cli.kanban_risk_tier.check_raise`): a lowering is an
     ``error`` before anything is written, with no verdict. A raise is written
-    with one ``risk_tier_raised`` event before the verdict, so a handback
-    re-pins the implementer by the raised tier.
+    with one ``risk_tier_raised`` event before the verdict, together with the
+    re-pin of the role holding a card pinned at creation
+    (:func:`hermes_cli.kanban_risk_tier.raised_reasoning_effort`), so every
+    later run, after any verdict, runs at the raised tier's effort.
     """
     document = build_review_findings_document(findings, candidate_digest=candidate_digest)
     candidate_digest = document["candidate_digest"]
@@ -28642,9 +28645,30 @@ def submit_review_findings(
                 "from": task.risk_tier, "to": raised_to,
                 "reviewer": task.assignee, "run_id": current_run_id,
             }
-            conn.execute(
-                "UPDATE tasks SET risk_tier = ? WHERE id = ?", (raised_to, task_id),
-            )
+            pinned = conn.execute(
+                "SELECT pinned_effort FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()["pinned_effort"]
+            effort = raised_reasoning_effort(pinned, raised_to, task.responsibility)
+            if effort is None:
+                conn.execute(
+                    "UPDATE tasks SET risk_tier = ? WHERE id = ?", (raised_to, task_id),
+                )
+            else:
+                # The role holding the card is re-pinned with the raise and
+                # sealed again on its own route, so no later run, whichever
+                # verdict follows, runs below the raised tier.
+                conn.execute(
+                    "UPDATE tasks SET risk_tier = ?, reasoning_effort = ?, "
+                    "model_policy_lock = ?, pinned_effort = ? WHERE id = ?",
+                    (
+                        raised_to, effort,
+                        mint_policy_lock(
+                            task.assignee, task.provider_override,
+                            task.model_override, effort, task.execution_tier,
+                        ),
+                        effort, task_id,
+                    ),
+                )
             _append_event(
                 conn, task_id, "risk_tier_raised", risk_tier_raised,
                 run_id=current_run_id,

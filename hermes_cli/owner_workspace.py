@@ -94,6 +94,7 @@ from hermes_cli.kanban_risk_tier import (
     highest_risk_tier,
     parse_risk_tier,
     pinned_reasoning_effort,
+    recovered_root_risk_tier,
 )
 from hermes_cli.sqlite_util import write_txn
 from plugins.dashboard_auth.raphael_workspace.model_policy import (
@@ -1131,6 +1132,17 @@ def _graph_root_route(tasks: list[dict], root_assignee: str) -> dict:
     return _resolved_route_pin(root_assignee, tier, "root_assignee")
 
 
+def _graph_root_pin(root_route: dict, root_assignee: str, risk_tier: Optional[int]) -> dict:
+    """The root's route pinned at *risk_tier*: its effort, sealed again (P5)."""
+    pin = dict(root_route)
+    pin["reasoning_effort"] = pinned_reasoning_effort(risk_tier, None)
+    pin["model_policy_lock"] = kanban_db.mint_policy_lock(
+        root_assignee, pin["provider_override"], pin["model_override"],
+        pin["reasoning_effort"], pin["execution_tier"],
+    )
+    return pin
+
+
 def _normalize_ownership_scope(value: Any, field: str) -> Optional[list[str]]:
     """Canonicalise one task's explicit repository write boundary.
 
@@ -1662,17 +1674,13 @@ def commit_task_graph(
     }
     digest = _digest(payload)
     # P5: a new Project's root card takes the highest tier of its tasks, and is
-    # created, pinned and verified at it. Derived after the digest, like the
-    # creation pin; any other root counts as tier 2, as before.
+    # created and pinned at it. Derived after the digest, like the creation
+    # pin; any other root counts as tier 2, as before.
     root_tier = None
     root_pin = dict(root_route)
     if mode == "new":
         root_tier = highest_risk_tier(task["risk_tier"] for task in normalized_tasks)
-        root_pin["reasoning_effort"] = pinned_reasoning_effort(root_tier, None)
-        root_pin["model_policy_lock"] = kanban_db.mint_policy_lock(
-            root_assignee, root_pin["provider_override"], root_pin["model_override"],
-            root_pin["reasoning_effort"], root_pin["execution_tier"],
-        )
+        root_pin = _graph_root_pin(root_route, root_assignee, root_tier)
 
     pconn = projects_db.connect()
     try:
@@ -1804,6 +1812,11 @@ def commit_task_graph(
                     risk_tier=root_tier,
                 )
                 root = kanban_db.get_task(kconn, root_task_id)
+                if root is not None and root_tier is not None:
+                    # A root a crashed commit wrote before P5, at tier 2, is
+                    # verified as written and never rewritten.
+                    root_tier = recovered_root_risk_tier(root.risk_tier, root_tier)
+                    root_pin = _graph_root_pin(root_route, root_assignee, root_tier)
                 if (
                     root is None
                     or root.project_id != canonical_project_id
