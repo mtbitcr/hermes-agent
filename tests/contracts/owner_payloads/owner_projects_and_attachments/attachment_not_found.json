@@ -1,0 +1,11 @@
+{
+  "body": {
+    "error": {
+      "code": "attachment_not_found",
+      "message": "Owner workspace attachment was not found",
+      "param": null,
+      "type": "invalid_request_error"
+    }
+  },
+  "status": 404
+}

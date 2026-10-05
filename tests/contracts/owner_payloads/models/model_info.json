@@ -1,0 +1,6 @@
+{
+  "fallback_disabled": true,
+  "model": "gpt-6.1-sol",
+  "provider": "openai-codex",
+  "reasoning_effort": "max"
+}
