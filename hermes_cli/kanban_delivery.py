@@ -19,8 +19,8 @@ the remote facts read through :mod:`hermes_cli.kanban_delivery_github` decide
 whether the approved head becomes the delivery's one pull request.
 
 :func:`review_step`, run by the same step, waits for CI on each published head:
-on green it creates that head's review cards; on red it waits while the failed
-tests cannot be read, or returns the work for changes.
+on green it creates that head's review cards; while a required check is red it
+waits, and a later pass reads CI again.
 """
 
 from __future__ import annotations
@@ -40,9 +40,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_risk_tier import RISK_NOT_RECORDED, UNRECORDED_RISK_TIER, effective_risk_tier
-from hermes_cli.kanban_delivery_fences import (
-    TEST_JOB_STEPS, Decision, _required_check, decide_publish, load_policy,
-)
+from hermes_cli.kanban_delivery_fences import Decision, _required_check, decide_publish, load_policy
 
 logger = logging.getLogger(__name__)
 
@@ -806,27 +804,27 @@ def _open_at_head(github, repository: str, row: dict) -> bool:
     return (pull.get("state"), pulled) == ("open", row["pull_request_head"])
 
 
-def _unchanged(conn: sqlite3.Connection, row: dict) -> bool:
-    """The delivery row still names the pull request, head, state and lease this pass read."""
+def _source_read(conn: sqlite3.Connection, source: str) -> tuple:
+    """The source card's event revision, status, head and risk tier. The owner workspace
+    writes a tier with no event, so the tier is read itself."""
+    revision = kb.task_event_revision(conn, source)
+    task = conn.execute("SELECT status, head_commit, risk_tier FROM tasks WHERE id = ?", (source,)).fetchone()
+    return (revision, *(task or (None, None, None)))
+
+
+def _unchanged(conn: sqlite3.Connection, row: dict, read: tuple) -> bool:
+    """The delivery row still names the pull request, head, state and lease this pass read,
+    and the source card is as ``read``, its :func:`_source_read` before the network calls."""
     keys = ("pull_request_number", "pull_request_head", "pull_request_state", "publish_lease")
     now = conn.execute(f"SELECT {', '.join(keys)} FROM kanban_deliveries WHERE id = ?", (row["id"],)).fetchall()
-    return [tuple(record) for record in now] == [tuple(row[key] for key in keys)]
+    return [tuple(record) for record in now] == [tuple(row[key] for key in keys)] and (
+        _source_read(conn, row["source_task_id"]) == read)
 
 
 def _outcome(row: dict, **details) -> dict:
     """An outcome's event payload: the delivery and the head it applied to."""
     return {"delivery_id": row["id"], "head": row["pull_request_head"],
             "pull_request_number": row["pull_request_number"], **details}
-
-
-def _record(conn: sqlite3.Connection, row: dict, state: str, kind: Optional[str], **details) -> str:
-    """``state`` on the delivery row and, unless ``kind`` is None, its event on the
-    source card, inside the caller's write transaction."""
-    conn.execute("UPDATE kanban_deliveries SET pull_request_state = ?, publish_lease = NULL, "
-                 "publish_lease_until = NULL WHERE id = ?", (state, row["id"]))
-    if kind is not None:
-        kb._append_event(conn, row["source_task_id"], kind, _outcome(row, **details))
-    return state
 
 
 def _waiting(conn: sqlite3.Connection, row: dict, code: str, **details) -> None:
@@ -841,9 +839,9 @@ def _waiting(conn: sqlite3.Connection, row: dict, code: str, **details) -> None:
 
 def review_step(db_path: Path) -> None:
     """Card 2 on the board whose file is ``db_path``: each published head whose CI is
-    done gets its review cards or its return for changes; one whose CI still runs, or
-    whose red test slices cannot be read, waits for a later pass. With no reviewer from
-    the team policy nothing is read or created. Raises no error, so the tick goes on."""
+    green gets its review cards; one whose CI still runs or is red waits, and a later
+    pass reads CI again. With no reviewer from the team policy nothing is read or
+    created. Raises no error, so the tick goes on."""
     try:
         reviewer, route = _review_route() if delivery_settings() else (None, None)
         if reviewer is None:
@@ -867,15 +865,19 @@ def review_step(db_path: Path) -> None:
 
 def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Optional[str]:
     """Card 2 for one published row: GitHub is read outside every transaction, and an
-    outcome is stored only while the row is unchanged. Returns the state stored, if any."""
+    outcome or a waiting reason is stored only while the row and its done source card
+    are as this pass read them before GitHub. Returns the state stored, if any."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head = row["source_task_id"], row["pull_request_head"]
     with kb.connect_closing(db_path=db_path) as conn:
+        read = _source_read(conn, source)
         task = conn.execute("SELECT * FROM tasks WHERE id = ?", (source,)).fetchone()
         bound = [event[0] for event in conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'delivery_bound' "
             "ORDER BY id DESC", (source,))]
+    if (read[1], _sha(read[2])) != ("done", head):
+        return None  # the source card is not done at H: nothing to decide for it
     repository = _origin_repository(_repository(task["workspace_path"])) if task is not None else None
     try:
         policy = load_policy(_POLICY_FILE.read_text(encoding="utf-8"))
@@ -909,36 +911,41 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
                 github, repository, row):
             return None  # a latest attempt still runs, or the pull request left H while CI was read
         if outcomes == {"success"}:
-            return _create_review_cards(db_path, row, task, repository, base, required, reviewer, route)
+            return _create_review_cards(db_path, row, read, repository, base, required, reviewer, route)
         failed = [job for job in jobs if job.get("conclusion") not in _PASSED and job.get("name") not in required]
-        other = [str(job.get("name")) for job in failed if job.get("name") not in TEST_JOB_STEPS]
-        if other:  # a red job that runs no tests: no flaky test explains it
-            return _return_for_changes(db_path, row, "not_a_listed_flaky_test", ", ".join(other))
-        with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):  # no rerun and no rework
-            if delivery_settings() and _unchanged(conn, row):
-                _waiting(conn, row, "failed_tests_unreadable", jobs=sorted(job.get("id") for job in failed))
+        with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):  # red: no rerun, no rework, no POST
+            if delivery_settings() and _unchanged(conn, row, read):
+                _waiting(conn, row, "red_check_waiting", jobs=sorted(job.get("id") for job in failed))
         return None
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None
 
 
-def _create_review_cards(db_path, row, task, repository, base, checks, reviewer, route) -> Optional[str]:
+def _create_review_cards(db_path, row, read, repository, base, checks, reviewer, route) -> Optional[str]:
     """H's review cards as the review command makes them, each past the kernel's route guard,
-    created with the row's outcome and its event in one transaction. A key already used is
-    adopted only for the card this step made for the same source, head, lens and route."""
+    created with the row's outcome and its event in one transaction, with the tier and project
+    the source card has there. No card is adopted by its key: when a key of H already names a
+    card, none is created and the conflict is recorded once for H."""
     source, head = row["source_task_id"], row["pull_request_head"]
-    try:
-        tier, recorded = effective_risk_tier(task["risk_tier"]), task["risk_tier"] is not None
-    except ValueError:  # not a tier: tier 2, never a lower one
-        tier, recorded = UNRECORDED_RISK_TIER, False
-    text = {"source": source, "head": head, "base": base, "repository": repository, "checks": ", ".join(checks),
-            "number": row["pull_request_number"], "branch": row["pull_request_branch"],
-            "tier": tier if recorded else f"{tier}. {RISK_NOT_RECORDED}"}
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
-        if not delivery_settings() or not _unchanged(conn, row):
+        if not delivery_settings() or not _unchanged(conn, row, read):
+            return None
+        task = conn.execute("SELECT risk_tier, project_id FROM tasks WHERE id = ?", (source,)).fetchone()
+        try:
+            tier, recorded = effective_risk_tier(task["risk_tier"]), task["risk_tier"] is not None
+        except ValueError:  # not a tier: tier 2, never a lower one
+            tier, recorded = UNRECORDED_RISK_TIER, False
+        text = {"source": source, "head": head, "base": base, "repository": repository, "checks": ", ".join(checks),
+                "number": row["pull_request_number"], "branch": row["pull_request_branch"],
+                "tier": tier if recorded else f"{tier}. {RISK_NOT_RECORDED}"}
+        lenses = _COMBINED if tier < 2 else _SPLIT
+        taken = sorted(card for responsibility in lenses for (card,) in conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ?", (review_key(source, head, responsibility),)))
+        if taken:
+            _waiting(conn, row, "review_key_conflict", cards=taken)
             return None
         cards = []
-        for responsibility, lens in (_COMBINED if tier < 2 else _SPLIT).items():
+        for responsibility, lens in lenses.items():
             title = _REVIEW_TITLE.format(lens=lens, **text)
             card = kb.create_task(
                 conn, title=title, body=_REVIEW_BODY.format(lens=lens, **text), assignee=reviewer,
@@ -946,40 +953,9 @@ def _create_review_cards(db_path, row, task, repository, base, checks, reviewer,
                 execution_tier=_REVIEW_TIER, board=_board_slug(db_path), project_id=task["project_id"],
                 project_source_task_id=source, owned_paths=[], parents=[source],
                 idempotency_key=review_key(source, head, responsibility), **route)
-            made = conn.execute(f"SELECT created_by, title, responsibility, {', '.join(route)} FROM tasks WHERE id = ?",
-                                (card,)).fetchone()
-            if tuple(made) != (_REVIEW_CREATOR, title, responsibility, *route.values()) or not conn.execute(
-                    "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?", (source, card)).fetchone():
-                raise PublishRefused("review_key_taken", f"{card} holds the key of the {lens} review of {source}")
             kb.authorize_executable_transition(conn, card)  # its route lock, or the card parked with why
             cards.append(card)
-        return _record(conn, row, "review_cards_created", "delivery_review_cards_created", cards=cards)
-
-
-def _return_for_changes(db_path, row, code: str, detail: str) -> Optional[str]:
-    """H goes back for changes with no review card: the done source card is handed back
-    to the implementer its latest handover recorded and returns to ready, the row's
-    outcome stored in that move's transaction. A refused handback keeps the row open
-    with its reason, so a later pass tries again."""
-    source = row["source_task_id"]
-    with kb.connect_closing(db_path=db_path) as conn:
-        if not delivery_settings() or not _unchanged(conn, row):
-            return None
-        implementer, refusal = kb._latest_review_provenance(conn, source)[0], None
-        try:  # while it is done, so no pass can claim it for its reviewer first
-            if not (implementer and kb.get_task(conn, source).status == "done"
-                    and kb.assign_task(conn, source, implementer)):
-                refusal = f"{source} is not done with an implementer to hand it back to"
-        except (RuntimeError, ValueError) as error:
-            refusal = f"{source} was not handed back to {implementer}: {error}"
-        with kb.write_txn(conn):
-            if not _unchanged(conn, row):
-                return None
-            if refusal is None and kb._cas_transition_task_in_txn(
-                    conn, source, expected_status="done", expected_revision=kb.task_event_revision(conn, source),
-                    to_status=kb._landing_status_after_parents(conn, source),
-                    event_kind="delivery_returned_for_changes", event_payload=_outcome(row, code=code, detail=detail),
-            )["moved"]:
-                return _record(conn, row, "returned_for_changes", None)
-            _waiting(conn, row, "handback_refused", rework=code, detail=refusal or f"{source} did not leave done")
-            return None
+        conn.execute("UPDATE kanban_deliveries SET pull_request_state = 'review_cards_created', "
+                     "publish_lease = NULL, publish_lease_until = NULL WHERE id = ?", (row["id"],))
+        kb._append_event(conn, source, "delivery_review_cards_created", _outcome(row, cards=cards))
+        return "review_cards_created"

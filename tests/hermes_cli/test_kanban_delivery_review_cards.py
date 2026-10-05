@@ -1,5 +1,5 @@
 """Card 2: once CI on the exact published head is done, the dispatcher's delivery step creates that
-head's review cards, waits on a red test slice or returns the work for changes; no operator.
+head's review cards, or waits while a required check is red; no operator.
 Real boards and git; GitHub is the real transport with only its exchange and App token replaced by a
 table, so every call passes the allowlist. The team policy's route is an admitted one no code names."""
 
@@ -20,6 +20,7 @@ from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _event
 CHECK = "All required checks pass"
 SLICE = "Python tests / Run tests slice 3/12"
 LINT = "Lint / ruff"
+ODD = "Python tests / Run tests slice 3/16"  # a test job of a name no list holds
 ROUTE = {"provider_override": "openai-codex", "model_override": "gpt-6.1-sol", "reasoning_effort": "max"}
 PAGED = {"check_runs": "/check-runs", "workflow_runs": "/actions/runs", "jobs": "/runs/70/jobs"}
 
@@ -44,7 +45,7 @@ def world(board, monkeypatch):
     _git(repo, "remote", "add", "origin", f"https://github.com/{REPO}.git")
     _write_config(root, enabled=True)
     gh = {"calls": [], "pages": [], "steps": [], "pull_head": None, "check": ("completed", "success"),
-          "failed": None, "job": "completed", "pad": None, "short": None, "move_after": None}
+          "failed": None, "job": "completed", "pad": None, "short": None, "move_after": None, "during": None}
 
     def job(job_id, name, head):  # the summary check fails at its evaluation while CI is red
         status = gh["job"] if name == gh["failed"] else "completed"
@@ -67,6 +68,8 @@ def world(board, monkeypatch):
             return 200, {"number": 41, "state": "open", "head": {"sha": gh["pull_head"] or head}}
         if gh["move_after"] and path.endswith(gh["move_after"]):  # the pull request moves on while CI is read
             gh["pull_head"] = "f" * 40
+        if gh["during"] and path.endswith(PAGED["jobs"]):  # the source card changes while CI is read
+            gh["during"]()
         if method == "GET" and path.endswith("/check-runs"):
             status, conclusion = gh["check"]
             return listed("check_runs", [{"id": 900, "name": CHECK, "head_sha": path.split("/")[-2],
@@ -74,7 +77,8 @@ def world(board, monkeypatch):
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs"):
             return listed("workflow_runs", [{"id": 70, "head_sha": head}], page)
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs/70/jobs"):
-            return listed("jobs", [job(81, SLICE, head), job(83, LINT, head), job(82, CHECK, head)], page)
+            jobs = [job(81, SLICE, head), job(83, LINT, head), job(84, ODD, head), job(82, CHECK, head)]
+            return listed("jobs", jobs, page)
         if method == "GET" and path.endswith("/jobs"):
             return 200, {"total_count": 0, "jobs": []}
         return 404, None
@@ -142,7 +146,7 @@ def _state(kb, head, db=None):
 
 
 def _source(kb, tid):
-    return _raw(kb.kanban_db_path(), "SELECT status, assignee FROM tasks WHERE id = ?", tid)[0]
+    return _raw(kb.kanban_db_path(), "SELECT * FROM tasks WHERE id = ?", tid)[0]
 
 
 @pytest.mark.parametrize("tier, lenses", [
@@ -263,7 +267,7 @@ def test_no_card_while_ci_is_pending(world):
 @pytest.mark.parametrize("moved, failed", [("before", None), (PAGED["jobs"], None), (PAGED["jobs"], LINT)])
 def test_a_head_the_pull_request_left_gets_no_outcome(world, moved, failed):
     """The pull request left H before CI was read, or while it was read: it is read again right before an
-    outcome is stored, so neither H's cards nor its return for changes is stored."""
+    outcome is stored, so neither H's cards nor its waiting reason is stored."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
     gh["move_after"], gh["failed"], gh["pull_head"] = moved, failed, "f" * 40 if moved == "before" else None
@@ -291,15 +295,16 @@ def test_each_collection_is_read_page_by_page_to_its_total_count(world, key, sho
     assert [page for path, page in gh["pages"] if path.endswith(PAGED[key])] == [1, 2]
 
 
-@pytest.mark.parametrize("running", ["queued", "in_progress"])
-def test_a_red_test_slice_waits_once_per_head_with_no_rerun_and_no_rework(world, running):
-    """Nothing is decided while the latest attempt of a job on H runs. Then, with no rerun requested and
-    its failed tests unreadable, a red slice leaves the delivery waiting and records failed_tests_unreadable
-    with its job once for H; a green rerun started on the code host then gets H its review cards."""
+@pytest.mark.parametrize("failed, running", [(SLICE, "queued"), (LINT, "in_progress"), (ODD, "queued")])
+def test_a_red_check_waits_once_per_head_until_a_green_rerun(world, failed, running):
+    """Nothing is decided while the latest attempt of a job on H runs. Then a red required check, whatever
+    job failed (a listed test slice, lint, or a test job of a name no list holds), leaves the delivery
+    waiting: red_check_waiting with the failed job, once for H, with no POST and the source card unchanged.
+    Later passes read CI again, so a green rerun on the code host gets H its review cards."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
-    gh["check"], gh["failed"], gh["job"] = ("completed", "failure"), SLICE, running
-    events = _events(kb, tid)
+    gh["check"], gh["failed"], gh["job"] = ("completed", "failure"), failed, running
+    events, source = _events(kb, tid), _source(kb, tid)
     _tick(kb)
     assert (_cards(kb), _state(kb, head), _events(kb, tid)) == ([], "open", events)
 
@@ -308,61 +313,42 @@ def test_a_red_test_slice_waits_once_per_head_with_no_rerun_and_no_rework(world,
     _tick(kb)
 
     assert _events(kb, tid)[len(events):] == [("delivery_review_waiting", {
-        "delivery_id": 1, "head": head, "pull_request_number": 41, "code": "failed_tests_unreadable", "jobs": [81]})]
-    assert (_cards(kb), _state(kb, head), _source(kb, tid)["status"]) == ([], "open", "done")
+        "delivery_id": 1, "head": head, "pull_request_number": 41, "code": "red_check_waiting",
+        "jobs": [{SLICE: 81, LINT: 83, ODD: 84}[failed]]})]
+    assert (_cards(kb), _state(kb, head), _source(kb, tid)) == ([], "open", source)
     assert [call for call in gh["calls"] if call[0] != "GET"] == [] and set(gh["steps"]) == {"read_checks"}
     gh["check"], gh["failed"] = ("completed", "success"), None
     _tick(kb)
     assert len(_cards(kb)) == 2 and _state(kb, head) == "review_cards_created"
 
 
-@pytest.mark.parametrize("refused", [False, True])
-def test_a_red_job_that_runs_no_tests_goes_back_for_changes_once_handed_back(world, monkeypatch, refused):
-    """A red job that runs no tests sends H back for changes, with no card. returned_for_changes is stored
-    only with the source's move back: a refused handback keeps the row open with its reason, once for H,
-    and a later pass hands it back."""
+@pytest.mark.parametrize("holder", ["someone-else", "archived", "this-step"])
+def test_a_key_that_names_any_card_gives_a_conflict_and_no_new_card(world, holder):
+    """No card is adopted by its key. When a review key of H already names a card (another's, an archived
+    one, or the step's own after its row was opened again), no card is made, review_key_conflict with
+    those cards is recorded once for H, and the delivery waits."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
-    gh["check"], gh["failed"] = ("completed", "failure"), LINT
-
-    def refuse(*args, **kwargs):
-        raise RuntimeError("the assignment was refused")
-
-    if refused:
-        with monkeypatch.context() as patched:
-            patched.setattr(kb, "assign_task", refuse)
-            _tick(kb)
-            _tick(kb)
-        assert [(p["head"], p["code"], p["rework"], "was refused" in p["detail"]) for kind, p in _events(kb, tid)
-                if kind == "delivery_review_waiting"] == [(head, "handback_refused", "not_a_listed_flaky_test", True)]
-        assert (_state(kb, head), _source(kb, tid)["status"]) == ("open", "done")
-
-    _tick(kb)
-
-    assert (_cards(kb), _state(kb, head), _source(kb, tid)) == ([], "returned_for_changes", {
-        "status": "ready", "assignee": IMPLEMENTER})
-    kind, payload = _events(kb, tid)[-1]
-    assert (kind, payload["head"], payload["code"]) == ("delivery_returned_for_changes", head, "not_a_listed_flaky_test")
-
-
-def test_a_card_under_the_key_that_this_step_did_not_create_is_refused(world):
-    kb, root, repo, gh = world
-    tid, head = _ready(world)
-    conn = kb.connect()
-    try:
-        other = kb.create_task(conn, title="Not a review", assignee=REVIEWER, created_by="someone-else",
-                               idempotency_key=f"review:{tid}:{head}:R15")
-    finally:
-        conn.close()
-    events = _events(kb, tid)
+    if holder == "this-step":
+        _tick(kb)
+        _raw(kb.kanban_db_path(), "UPDATE kanban_deliveries SET pull_request_state = 'open'")
+    else:
+        with kb.connect_closing() as conn:
+            other = kb.create_task(conn, title="Not a review", assignee=REVIEWER, created_by="someone-else",
+                                   idempotency_key=f"review:{tid}:{head}:R15")
+            assert holder != "archived" or kb.archive_task(conn, other)
+    cards, events = [c["id"] for c in _cards(kb)], _events(kb, tid)
 
     _tick(kb)
     _tick(kb)
 
-    assert ([card["id"] for card in _cards(kb)], _state(kb, head), _events(kb, tid)) == ([other], "open", events)
+    assert ([c["id"] for c in _cards(kb)], _state(kb, head)) == (cards, "open")
+    assert _events(kb, tid)[len(events):] == [("delivery_review_waiting", {
+        "delivery_id": 1, "head": head, "pull_request_number": 41, "code": "review_key_conflict",
+        "cards": sorted(cards)})]
 
 
-def test_repeated_passes_create_no_duplicate_cards(world):
+def test_a_normal_pass_creates_the_cards_and_records_them_once(world):
     kb, root, repo, gh = world
     tid, head = _ready(world)
     _tick(kb)
@@ -372,10 +358,41 @@ def test_repeated_passes_create_no_duplicate_cards(world):
     _tick(kb)
 
     assert (_cards(kb), len(gh["calls"]), _events(kb, tid)) == (cards, calls, events)  # no GitHub read either
-    # A pass that died after creating the cards and before recording them adopts its own cards by their keys.
-    _raw(kb.kanban_db_path(), "UPDATE kanban_deliveries SET pull_request_state = 'open'")
+    assert [(kind, sorted(p["cards"])) for kind, p in events if kind.startswith("delivery_review")] == [
+        ("delivery_review_cards_created", sorted(c["id"] for c in cards))]
+
+
+@pytest.mark.parametrize("change, made", [
+    ("left_done", []), ("tier_raised", []), ("project_moved", [("R15", "delivery-project")])])
+def test_the_source_is_read_again_where_the_outcome_is_stored(world, change, made):
+    """The transaction that would store the outcome reads the source card again. One that left done, or
+    whose tier was raised the owner workspace's way (with no event), while CI was read gets no card and no
+    record in that pass, and the next pass decides on the fresh card. The cards take their tier and project
+    from that read, so a project moved meanwhile, which nothing compares, is theirs."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world, tier=0)
+    db, events = kb.kanban_db_path(), _events(kb, tid)
+
+    def during():
+        if change == "tier_raised":
+            _raw(db, "UPDATE tasks SET risk_tier = 2 WHERE id = ?", tid)  # as the owner workspace does: no event
+        elif change == "project_moved":
+            _project(db, tid)
+        else:
+            with kb.connect_closing() as conn:
+                assert kb.cas_transition_task(conn, tid, expected_status="done", to_status="blocked",
+                                              expected_revision=kb.task_event_revision(conn, tid))["moved"]
+
+    gh["during"] = during
     _tick(kb)
-    assert [c["id"] for c in _cards(kb)] == [c["id"] for c in cards] and _state(kb, head) == "review_cards_created"
+    gh["during"] = None
+
+    assert [(c["responsibility"], c["project_id"]) for c in _cards(kb)] == made
+    assert (_state(kb, head), len(_events(kb, tid)) - len(events)) == (
+        ("review_cards_created", 1) if made else ("open", 0))
+    _tick(kb)
+    assert [(c["responsibility"], "Risk tier: 2" in c["body"]) for c in _cards(kb)] == (
+        [("R12", True), ("R15", True)] if change == "tier_raised" else [(r, False) for r, _ in made])
 
 
 def test_a_new_head_gets_new_cards_and_old_cards_are_untouched(world):
