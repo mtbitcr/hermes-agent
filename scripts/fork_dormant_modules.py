@@ -40,8 +40,6 @@ LAUNCHER_EXT = (".ts", ".tsx", ".js", ".mjs", ".cjs", ".sh", ".nix", ".ps1", ".c
 LAUNCH_RX = re.compile(r"""(?:-m['"]?\s*,?\s*['"]?|\bimport\s+|\bfrom\s+)([A-Za-z_]\w*(?:\.\w+)+)""")
 DYNAMIC_CALLS = {"import_module", "__import__", "run_module", "find_spec"}
 
-if sys.argv[1:]:
-    sys.exit("usage: python scripts/fork_dormant_modules.py (no arguments)")
 
 
 def walk(top_skip):
@@ -210,13 +208,27 @@ for m in sorted(set(mods) - live):
     if rel(mods[m]).split("/")[0] in FROZEN:
         with open(mods[m], "rb") as fh:
             dormant[rel(mods[m])] = hashlib.sha256(fh.read()).hexdigest()
-os.makedirs(os.path.dirname(OUT), exist_ok=True)
-with open(OUT, "w", encoding="utf-8", newline="\n") as fh:
-    fh.write(json.dumps(dormant, indent=2, sort_keys=True) + "\n")
 
-print(f"modules scanned={len(mods)} live={len(live)} dormant={len(mods) - len(live)} listed={len(dormant)}")
-print("live only by name (module <- live code that names it; '(import)' = imported by a module live by name):")
-for m in sorted(live - statically, key=lambda m: rel(mods[m])):
-    if rel(mods[m]).split("/")[0] in FROZEN:
-        why = sorted(namers[m]) or [f"(import) {p}" for p in sorted(importers[m])] or ["(package of a module live by name)"]
-        print(f"  {rel(mods[m])} <- {', '.join(why)}")
+
+def dormant_modules():
+    """The dormant list of this tree, {repository path: SHA-256}. Reads only."""
+    return dict(dormant)
+
+
+def main():
+    if sys.argv[1:]:
+        sys.exit("usage: python scripts/fork_dormant_modules.py (no arguments)")
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    with open(OUT, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(dormant, indent=2, sort_keys=True) + "\n")
+
+    print(f"modules scanned={len(mods)} live={len(live)} dormant={len(mods) - len(live)} listed={len(dormant)}")
+    print("live only by name (module <- live code that names it; '(import)' = imported by a module live by name):")
+    for m in sorted(live - statically, key=lambda m: rel(mods[m])):
+        if rel(mods[m]).split("/")[0] in FROZEN:
+            why = sorted(namers[m]) or [f"(import) {p}" for p in sorted(importers[m])] or ["(package of a module live by name)"]
+            print(f"  {rel(mods[m])} <- {', '.join(why)}")
+
+
+if __name__ == "__main__":
+    main()
