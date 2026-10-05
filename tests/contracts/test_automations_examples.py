@@ -45,6 +45,15 @@ def _homes(value):
     if isinstance(value, list):
         return [h for v in value for h in _homes(v)]
     return []
+
+
+def _without_host_paths(value):
+    """The answer with every hermes_home value replaced by NEUTRAL_HOME."""
+    if isinstance(value, dict):
+        return {k: NEUTRAL_HOME if k == "hermes_home" else _without_host_paths(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_without_host_paths(v) for v in value]
+    return value
 JOB = {"prompt": "Send the weekly numbers", "schedule": "every 1h", "name": "Weekly numbers"}
 ROW_COLUMNS = ("job_id", "status", "claimed_at", "started_at", "finished_at", "delivery_outcome")
 # Each run's answer by chat, and whether the run finished.
@@ -113,7 +122,7 @@ def test_the_automations_examples_carry_every_route_answer_and_error(
     live["gateway_unavailable"] = automations(
         "POST", f"/executions/{run_ids[0]}/resend", {"request_id": "contract-resend-0001"})
 
-    saved = {kind: owner_payload_example(FAMILY, kind, answer) for kind, answer in live.items()}
+    saved = {kind: owner_payload_example(FAMILY, kind, _without_host_paths(answer)) for kind, answer in live.items()}
     # No saved example keeps a path of the machine that wrote it.
     assert {home for answer in saved.values() for home in _homes(answer)} == {NEUTRAL_HOME}
 
