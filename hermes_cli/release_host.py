@@ -10,7 +10,8 @@ Every method only reads. Moving the checkout and taking or restoring snapshots a
 they belong to card 3. Reading also leaves nothing behind, which is what lets prepare mode keep
 its promise to write nothing: git runs with --no-optional-locks, so `git status` does not
 refresh the index; origin main comes from `git ls-remote`, which updates no local ref; a board
-file is opened so that SQLite creates no side files; and the venv probe writes no bytecode.
+file is read so that SQLite creates no file and changes none, its -shm included; and the venv
+probe writes no bytecode.
 
 Like the runner (K6), this module imports everything when it loads and no method imports
 anything: the readbacks after the stop call the checkout, venv and configuration reads while
@@ -19,10 +20,15 @@ the checkout on disk is being swapped.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import os
+import re
+import shlex
 import shutil
 import signal
 import sqlite3
+import struct
 import subprocess
 from collections.abc import Collection, Mapping, Sequence
 from contextlib import closing
@@ -36,9 +42,8 @@ from hermes_cli.kanban_db import (
     kanban_home,
     list_boards,
 )
-from hermes_cli.managed_uv import _default_live_venv, _venv_python
 from hermes_cli.profiles import profiles_to_serve
-from hermes_cli.release_guards import OpenRun
+from hermes_cli.release_guards import GATEWAY_UNIT, OpenRun
 from hermes_constants import get_default_hermes_root
 
 # S-D: the configuration set is these files of the root home and of every served profile home.
@@ -53,11 +58,20 @@ _OPEN_RUNS_SQL = (
 )
 # Bytes 18 and 19 of a SQLite file are its write and read format versions; 2 means WAL.
 _WAL_FORMAT = b"\x02\x02"
+# A struct flock that read-locks the bytes SQLite's shared lock covers. Held as an open file
+# description lock, it keeps every connection, in this process or another, from the exclusive
+# lock it needs to fold a -wal back into the database file and remove it.
+_SHARED_LOCK = struct.pack("hhqqi4x", fcntl.F_RDLCK, os.SEEK_SET, 0x40000002, 510, 0)
 _SIGNAL_NAMES = {sig.value: sig.name for sig in signal.Signals}
-# Run by the live venv's interpreter: where it would import hermes_cli from, without importing it.
+# The gateway unit's start command as `systemctl show` prints it: one interpreter, started by its
+# own path, running hermes_cli.main.
+_GATEWAY_START = re.compile(r"\{ path=(/\S+) ; argv\[\]=\1 -m hermes_cli\.main .*\}")
+# Run by the live venv's interpreter: its venv, then where it would import hermes_cli from,
+# without importing it.
 _IMPORT_ROOT_PROBE = (
-    "import importlib.util, os; "
+    "import importlib.util, os, sys; "
     "origin = importlib.util.find_spec('hermes_cli').origin; "
+    "print(sys.prefix); "
     "print(os.path.dirname(os.path.dirname(os.path.realpath(origin))))"
 )
 
@@ -126,11 +140,19 @@ class LiveHostReader:
         return str(Path(self._git("rev-parse", "--show-toplevel").stdout.strip()).resolve())
 
     def venv_import_root(self) -> str:
-        # The live venv as runtime repair finds it: venv when it holds an interpreter, else
-        # .venv. -I keeps this process's environment and working directory out of the answer.
-        python = _venv_python(_default_live_venv(self.checkout))
-        done = _run([str(python), "-I", "-B", "-c", _IMPORT_ROOT_PROBE])
-        return str(Path(done.stdout.strip()).resolve())
+        # The live venv is the one whose interpreter the gateway unit starts, as the user manager
+        # shows the unit. A unit that starts no single hermes_cli interpreter, or whose VIRTUAL_ENV
+        # names another venv than that interpreter's, has no live venv to answer for. -I keeps
+        # this process's environment and working directory out of the answer.
+        start = _GATEWAY_START.fullmatch(self.unit_property(GATEWAY_UNIT, "ExecStart"))
+        if start is None:
+            raise LookupError(f"the {GATEWAY_UNIT} unit starts no single hermes_cli interpreter")
+        prefix, root = _run([start[1], "-I", "-B", "-c", _IMPORT_ROOT_PROBE]).stdout.splitlines()
+        for item in shlex.split(self.unit_property(GATEWAY_UNIT, "Environment")):
+            name, _, value = item.partition("=")
+            if name == "VIRTUAL_ENV" and Path(value).resolve() != Path(prefix).resolve():
+                raise LookupError(f"the {GATEWAY_UNIT} unit's VIRTUAL_ENV is not its interpreter's")
+        return str(Path(root).resolve())
 
     # Units, disk and snapshots.
 
@@ -237,8 +259,7 @@ def _open_runs(slug: str, path: Path) -> list[OpenRun]:
     if not path.exists():
         return []
     try:
-        with closing(_read_only(path)) as conn:
-            rows = conn.execute(_OPEN_RUNS_SQL).fetchall()
+        rows = _open_run_rows(path)
     except (OSError, sqlite3.DatabaseError):
         # F18: the dispatcher's host-cap count skips a board it cannot read and so fails open.
         # The drain fails closed: a board that cannot be read may hold a live run, so it counts
@@ -256,12 +277,22 @@ def _open_runs(slug: str, path: Path) -> list[OpenRun]:
     ]
 
 
-def _read_only(path: Path) -> sqlite3.Connection:
-    # A plain read-only open of a WAL database whose last writer closed cleanly creates its -wal
-    # and -shm files and leaves them behind. With no -wal file there is nothing to replay, so
-    # such a file is opened immutable, which creates nothing.
+def _open_run_rows(path: Path) -> list[tuple]:
+    # A plain read-only open of a WAL file creates a missing -wal or -shm and writes to a live
+    # -shm. With readonly_shm, SQLite reads the commits in a -wal and writes to neither file; a
+    # -wal whose -shm is gone fails the read. A WAL file with no -wal has nothing to replay and is
+    # opened immutable, which opens no side file. The shared-bytes lock, taken before the -wal is
+    # looked for, keeps a -wal in place until the read is done, so a -wal there after an immutable
+    # read was created during it and fails the read.
+    wal = Path(f"{path}-wal")
     with path.open("rb") as handle:
-        header = handle.read(20)
-    immutable = header[18:20] == _WAL_FORMAT and not Path(f"{path}-wal").exists()
-    mode = "mode=ro&immutable=1" if immutable else "mode=ro"
-    return sqlite3.connect(f"{path.resolve().as_uri()}?{mode}", uri=True)
+        wal_format = handle.read(20)[18:20] == _WAL_FORMAT
+        if wal_format:
+            fcntl.fcntl(handle, fcntl.F_OFD_SETLK, _SHARED_LOCK)
+        immutable = wal_format and not wal.exists()
+        mode = "immutable=1" if immutable else "readonly_shm=1"
+        with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro&{mode}", uri=True)) as conn:
+            rows = conn.execute(_OPEN_RUNS_SQL).fetchall()
+        if immutable and wal.exists():
+            raise sqlite3.DatabaseError(f"a connection opened {path} while it was read")
+    return rows

@@ -33,6 +33,7 @@ from tests.hermes_cli._kanban_fence_support import (
 )
 from tests.hermes_cli._kanban_worker_identity_support import dead_pid, live_child, pid_is_alive
 
+REPO = Path(__file__).resolve().parents[2]
 UNITS = {"gateway": "hermes-gateway", "serve": "hermes-serve", "sandbox-tunnel": "hermes-sandbox-tunnel"}
 NEW = "1" * 40
 SECRET = "sk-release-host-test-secret"
@@ -42,6 +43,23 @@ CONFIG_KEYS = {
     for home in ("", "profiles/coder/", "profiles/writer/")
     for name in ("config.yaml", ".env")
 }
+# A beta board writer in a process of its own, since SQLite shares one -shm mapping between the
+# connections of a process. It commits an open run whose worker is the given pid, then exits
+# without closing the board, or idles with it open until its input ends and then closes it.
+BOARD_WRITER = """
+import os, sys
+from hermes_cli import kanban_db as kb
+from tests.hermes_cli._kanban_fence_support import ready_task
+conn = kb.connect(board="beta")
+task_id = ready_task(conn)
+assert kb.claim_task(conn, task_id) is not None
+kb._set_worker_pid(conn, task_id, int(sys.argv[1]))
+if sys.argv[2] == "crash":
+    os._exit(0)
+print("idle", flush=True)
+sys.stdin.readline()
+conn.close()
+"""
 
 
 @pytest.fixture(autouse=True)
@@ -98,7 +116,7 @@ def _repository(tmp_path):
 
 def _systemctl(tmp_path, monkeypatch):
     """A stand-in systemctl first on PATH: it logs its arguments and answers like `show`."""
-    calls, script = tmp_path / "systemctl.calls", tmp_path / "bin" / "systemctl"
+    calls, script, unit = tmp_path / "systemctl.calls", tmp_path / "bin" / "systemctl", tmp_path / "unit"
     script.parent.mkdir()
     script.write_text(
         "#!/bin/sh\n"
@@ -106,12 +124,29 @@ def _systemctl(tmp_path, monkeypatch):
         'case "$*" in\n'
         "  *--property=KillSignal*) echo KillSignal=2 ;;\n"
         "  *--property=KillMode*) echo KillMode=mixed ;;\n"
+        f'  *--property=ExecStart*) cat "{unit}/ExecStart" ;;\n'
+        f'  *--property=Environment*) cat "{unit}/Environment" ;;\n'
         "esac\n",
         encoding="utf-8",
     )
     script.chmod(0o755)
     monkeypatch.setenv("PATH", f"{script.parent}{os.pathsep}{os.environ['PATH']}")
     return calls
+
+
+def _gateway_unit(tmp_path, venv, *, virtual_env=None):
+    """The gateway unit as the stand-in shows it: generate_systemd_unit's command, run by venv's python."""
+    unit, python = tmp_path / "unit", venv / "bin" / "python"
+    unit.mkdir(exist_ok=True)
+    (unit / "ExecStart").write_text(
+        f"ExecStart={{ path={python} ; argv[]={python} -m hermes_cli.main gateway run ; ignore_errors=no ; "
+        "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n",
+        encoding="utf-8",
+    )
+    (unit / "Environment").write_text(
+        f"Environment=PATH=/usr/bin:/bin VIRTUAL_ENV={virtual_env or venv} HERMES_SUPERVISED_CHILD=1\n",
+        encoding="utf-8",
+    )
 
 
 def _homes(root, *profiles):
@@ -153,12 +188,13 @@ def _independent_open_runs(root):
     return runs
 
 
-def _live_venv(checkout):
-    """A real venv at checkout/venv whose interpreter imports hermes_cli from the checkout."""
-    venv = checkout / "venv"
+def _live_venv(checkout, name="venv", imports=None):
+    """A real venv at checkout/name whose interpreter imports hermes_cli from *imports*, else the checkout."""
+    venv = checkout / name
     subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True, timeout=120)
     site_packages = next(venv.glob("lib/python3*/site-packages"))
-    (site_packages / "hermes_checkout.pth").write_text(f"{checkout}\n", encoding="utf-8")
+    (site_packages / "hermes_checkout.pth").write_text(f"{imports or checkout}\n", encoding="utf-8")
+    return venv
 
 
 def _tree_bytes(*roots):
@@ -208,6 +244,29 @@ def test_unit_property_returns_signal_names(tmp_path, monkeypatch):
         assert argv[-1] == "hermes-gateway"
 
 
+def test_venv_import_root_probes_the_interpreter_the_gateway_unit_starts(tmp_path, monkeypatch):
+    checkout, other = tmp_path / "checkout", tmp_path / "other"
+    make_git_repo(checkout)
+    for root in (checkout, other):
+        (root / "hermes_cli").mkdir(parents=True)
+        (root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    _live_venv(checkout)  # the runtime-repair pick, which imports this checkout but is not run
+    dot_venv = _live_venv(checkout, ".venv", imports=other)
+    _systemctl(tmp_path, monkeypatch)
+    _gateway_unit(tmp_path, dot_venv)
+    host = _reader(tmp_path, tmp_path / "root")
+
+    assert host.venv_import_root() == str(other.resolve())
+    assert _check(host, "G6") is False
+    # Fail closed: the unit's VIRTUAL_ENV names another venv, or the unit starts nothing.
+    _gateway_unit(tmp_path, dot_venv, virtual_env=checkout / "venv")
+    with pytest.raises(LookupError):
+        host.venv_import_root()
+    (tmp_path / "unit" / "ExecStart").write_text("ExecStart=\n", encoding="utf-8")
+    with pytest.raises(LookupError):
+        host.venv_import_root()
+
+
 def test_open_runs_cover_every_board_under_a_worker_env(tmp_path, fence_home, monkeypatch):
     kb.init_db()
     create_fenced_board("beta")
@@ -250,6 +309,70 @@ def test_unreadable_board_counts_as_an_open_live_run(tmp_path, fence_home):
     assert kb.count_running_tasks_other_boards("default") == 0  # the host-cap count fails open (F18)
 
 
+def test_a_run_committed_between_wal_detection_and_open_fails_the_drain(tmp_path, fence_home, monkeypatch):
+    kb.init_db()
+    create_fenced_board("beta")
+    beta_db = fence_home / "kanban" / "boards" / "beta" / "kanban.db"
+    with closing(sqlite3.connect(beta_db)) as conn:  # a WAL board whose last connection closed
+        conn.execute("PRAGMA journal_mode=WAL")
+    assert not Path(f"{beta_db}-wal").exists()
+    real_connect, writers = sqlite3.connect, []
+
+    def connect(database, *args, **kwargs):
+        # The reader has looked for the -wal file and opens the board read-only. Just before, a
+        # second connection commits a run of this live process and stays open; with no
+        # checkpoint, the run is in the WAL only.
+        if str(database).startswith(f"{beta_db.resolve().as_uri()}?mode=ro") and not writers:
+            writers.append(kb.connect(board="beta"))
+            writers[0].execute("PRAGMA wal_autocheckpoint=0")
+            _open_run(writers[0], os.getpid())
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    try:
+        assert _check(_reader(tmp_path, fence_home), "G10") is False
+        assert Path(f"{beta_db}-wal").stat().st_size > 0
+    finally:
+        for conn in writers:
+            conn.close()
+    assert len(writers) == 1
+    assert [alive for _run_id, alive in _independent_open_runs(fence_home)] == [True]
+
+
+@pytest.mark.parametrize("writer", ["crash", "idle", "closing"])
+def test_reading_a_wal_board_changes_none_of_its_files(tmp_path, fence_home, monkeypatch, writer):
+    kb.init_db()
+    create_fenced_board("beta")
+    beta_db = fence_home / "kanban" / "boards" / "beta" / "kanban.db"
+    with closing(sqlite3.connect(beta_db)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+    argv = [sys.executable, "-c", BOARD_WRITER, str(os.getpid()), writer]
+    with subprocess.Popen(argv, cwd=REPO, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as proc:
+        if writer == "crash":  # a committed WAL left by an unclean exit, without its -shm
+            assert proc.wait(timeout=120) == 0
+            Path(f"{beta_db}-shm").unlink()
+        else:  # a live -shm, its writer idle with the board open
+            assert proc.stdout.readline() == "idle\n"
+        if writer == "closing":  # then, as the board's last connection, it closes after the -wal check
+            real_connect = sqlite3.connect
+
+            def connect(database, *args, **kwargs):
+                if str(database).startswith(f"{beta_db.resolve().as_uri()}?mode=ro"):
+                    proc.stdin.close()
+                    proc.wait(timeout=120)
+                return real_connect(database, *args, **kwargs)
+
+            monkeypatch.setattr(sqlite3, "connect", connect)
+        assert Path(f"{beta_db}-wal").stat().st_size > 0
+        before = _tree_bytes(fence_home)
+        found = {(run.run_id, run.worker_alive) for run in _reader(tmp_path, fence_home).open_native_runs()}
+        assert _tree_bytes(fence_home) == before
+        expected = _independent_open_runs(fence_home)
+    assert [alive for _run_id, alive in expected] == [True]
+    # The committed run stays visible, or the board fails closed; either way the drain refuses.
+    assert found in (expected, {("beta:unreadable", True)})
+
+
 def test_config_digests_cover_root_and_profiles_and_match_the_named_snapshot(
     tmp_path, fence_home, monkeypatch, caplog
 ):
@@ -276,10 +399,11 @@ def test_config_digests_cover_root_and_profiles_and_match_the_named_snapshot(
 
 def test_reader_writes_nothing(tmp_path, fence_home, monkeypatch):
     checkout, prev, (m1, m2) = _repository(tmp_path)
-    _live_venv(checkout)
+    venv = _live_venv(checkout)
     # A tracked file whose stat no longer matches the index: a plain `git status` would rewrite it.
     os.utime(checkout / "README.md", (time.time() + 3600,) * 2)
     _systemctl(tmp_path, monkeypatch)
+    _gateway_unit(tmp_path, venv)
     _homes(fence_home, "coder", "writer")
     snapshot_root = tmp_path / "snapshots"
     _save_config_snapshot(fence_home, snapshot_root, m2)
