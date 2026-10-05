@@ -485,8 +485,9 @@ def test_task_graph_resolves_and_locks_model_routes_before_approval(ctx):
 
     # 'default'/anthropic admits claude-opus-5-5 on BOTH lanes, so the digest —
     # not the model — is what distinguishes the deep pin from the routine one.
-    # The effort follows the risk tier: high for the tier-1 build, max for the
-    # tier-1 security review (R12) and for the root, which records tier 2.
+    # The effort follows the risk tier: high for the tier-1 build and max for the
+    # tier-1 security review (R12). The root takes the highest tier of its tasks,
+    # tier 1, so its effort is high.
     assert route(first) == (
         "anthropic", "claude-opus-5-5", "high",
         lock("default", "claude-opus-5-5", "deep", "high"),
@@ -500,8 +501,8 @@ def test_task_graph_resolves_and_locks_model_routes_before_approval(ctx):
     # The executable root reviews a milestone containing deep work, so it is
     # pinned too — and on the deep lane.
     assert route(root) == (
-        "anthropic", "claude-opus-5-5", "max",
-        lock("default", "claude-opus-5-5", "deep"),
+        "anthropic", "claude-opus-5-5", "high",
+        lock("default", "claude-opus-5-5", "deep", "high"),
     )
     # Every persisted lock is one the dispatcher would actually accept.
     with kanban_db.connect(board=result["board"]) as conn:
@@ -523,7 +524,7 @@ def test_task_graph_root_is_pinned_on_the_routine_lane_for_routine_work(ctx):
     assert (root.execution_tier, root.model_policy_lock) == (
         "routine",
         kanban_db.mint_policy_lock(
-            "default", "anthropic", root.model_override, "max", "routine",
+            "default", "anthropic", root.model_override, "high", "routine",
         ),
     )
 
@@ -554,9 +555,10 @@ def test_committed_owner_task_route_cannot_be_mutated_afterwards(ctx):
     approver.join()
 
     # The pinned effort follows each card's risk tier: high for the tier-1
-    # build, max for the tier-1 security review (R12) and for the root.
+    # build, max for the tier-1 security review (R12), and high for the root,
+    # which takes the highest tier of its tasks (tier 1).
     pinned = {
-        result["root_task_id"]: "max",
+        result["root_task_id"]: "high",
         result["task_ids"][0]: "high",
         result["task_ids"][1]: "max",
     }
@@ -4073,10 +4075,10 @@ def test_project_plan_replace_carries_an_explicit_ownership_scope(ctx, tmp_path)
         assert replacement.workspace_path == str(
             repo / ".worktrees" / replacement_id
         )
-        # The route lock still binds the whole approved route tuple, with
-        # the effort that the replacement's tier 1 pins.
+        # The route lock still binds the whole approved route tuple, with the
+        # effort of the highest tier among the cards it replaces (tier 2): max.
         assert replacement.model_policy_lock == kanban_db.mint_policy_lock(
-            "default", "anthropic", "claude-opus-5-5", "high", "deep",
+            "default", "anthropic", "claude-opus-5-5", "max", "deep",
         )
         assert replacement.responsibility == "R09"
         with pytest.raises(RuntimeError, match="owner-governed"):
