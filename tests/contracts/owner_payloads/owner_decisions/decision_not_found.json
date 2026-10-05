@@ -1,0 +1,11 @@
+{
+  "body": {
+    "error": {
+      "code": "decision_not_found",
+      "message": "Owner decision was not found",
+      "param": null,
+      "type": "invalid_request_error"
+    }
+  },
+  "status": 404
+}

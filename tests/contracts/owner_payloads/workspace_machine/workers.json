@@ -1,0 +1,12 @@
+{
+  "body": {
+    "workers": [
+      {
+        "profile": "coder",
+        "started_at": 1790000000,
+        "task_title": "Running work"
+      }
+    ]
+  },
+  "status": 200
+}

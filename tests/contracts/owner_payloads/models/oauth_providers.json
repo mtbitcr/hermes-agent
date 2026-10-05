@@ -1,0 +1,20 @@
+{
+  "providers": [
+    {
+      "flow": "pkce",
+      "id": "anthropic",
+      "name": "Anthropic",
+      "status": {
+        "logged_in": true
+      }
+    },
+    {
+      "flow": "device_code",
+      "id": "openai-codex",
+      "name": "OpenAI",
+      "status": {
+        "logged_in": false
+      }
+    }
+  ]
+}

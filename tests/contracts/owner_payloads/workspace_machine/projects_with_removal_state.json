@@ -1,0 +1,13 @@
+{
+  "body": {
+    "projects": [
+      {
+        "id": "p_2f169f9b",
+        "name": "Raphael Workspace",
+        "removal_state": null,
+        "slug": "raphael-workspace"
+      }
+    ]
+  },
+  "status": 200
+}

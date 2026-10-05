@@ -1,0 +1,55 @@
+{
+  "body": {
+    "base_url": null,
+    "context_from": null,
+    "created_at": "2026-09-21T14:13:20+00:00",
+    "deliver": "local",
+    "enabled": false,
+    "enabled_toolsets": null,
+    "failure_streak": 0,
+    "hermes_home": "/tmp/hermes-pytest-tmproot-0h6fq6s5/pytest-of-root/pytest-0/test_the_automations_examples_0/.hermes/profiles/worker_alpha",
+    "id": "08946cd494a2",
+    "idempotency": {
+      "key_hash": "fd53f6a7e4558bb5e7d2e1c936d4a37b93d7395ef750963507c77a2fd561abc3",
+      "request_hash": "f13fa7f3646b450afe7677e20ae5459a0868e4ad45b916f72b8ef806608bf351"
+    },
+    "is_default_profile": false,
+    "last_delivery_error": null,
+    "last_error": null,
+    "last_run_at": null,
+    "last_status": null,
+    "max_turns": null,
+    "model": null,
+    "model_snapshot": "test-model",
+    "monitor_script": null,
+    "monitor_state": null,
+    "monitor_url": null,
+    "name": "Weekly numbers",
+    "next_run_at": "2026-09-21T15:13:20+00:00",
+    "no_agent": false,
+    "origin": null,
+    "paused_at": "2026-09-21T14:13:20+00:00",
+    "paused_reason": null,
+    "profile": "worker_alpha",
+    "profile_name": "worker_alpha",
+    "prompt": "Send the weekly numbers",
+    "provider": null,
+    "provider_snapshot": null,
+    "repeat": {
+      "completed": 0,
+      "times": null
+    },
+    "schedule": {
+      "display": "every 60m",
+      "kind": "interval",
+      "minutes": 60
+    },
+    "schedule_display": "every 60m",
+    "script": null,
+    "skill": null,
+    "skills": [],
+    "state": "paused",
+    "workdir": null
+  },
+  "status": 200
+}

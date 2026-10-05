@@ -1,0 +1,39 @@
+{
+  "body": {
+    "columns": [
+      {
+        "name": "triage",
+        "tasks": []
+      },
+      {
+        "name": "todo",
+        "tasks": []
+      },
+      {
+        "name": "scheduled",
+        "tasks": []
+      },
+      {
+        "name": "ready",
+        "tasks": []
+      },
+      {
+        "name": "running",
+        "tasks": []
+      },
+      {
+        "name": "blocked",
+        "tasks": []
+      },
+      {
+        "name": "review",
+        "tasks": []
+      },
+      {
+        "name": "done",
+        "tasks": []
+      }
+    ]
+  },
+  "status": 200
+}
