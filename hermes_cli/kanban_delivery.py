@@ -2,23 +2,21 @@
 
 When a review-required build card is approved from the review lane and
 ``kanban.delivery.enabled`` is true, :func:`record_approved_delivery` records
-ONE delivery for the source card and its approved head, and nothing else: no
-card is created. ``complete_task`` calls it once, from its approval branch,
-inside the approval's own transaction, so the approval and the record commit
-or roll back together. With the setting off it returns before touching
-anything and the approval behaves exactly as before.
+ONE delivery for the source card and its approved head; no card is created.
+``complete_task`` calls it once, from its approval branch, inside the
+approval's own transaction, so the approval and the record commit
+or roll back together. With the setting off it
+returns before touching anything and the approval behaves exactly as before.
 
 The approval proof is the T1 fence of :mod:`hermes_cli.kanban_delivery_fences`
 applied to facts read only from the kernel's own records: the task row, its
 event log, its runs and the git repository the card was built in. Worker
 prose (handover text, comments, summaries, run metadata) is never read.
 
-:func:`publish_step` is T1 itself, run by ``dispatch_once`` after the tick
-lock is released, on the board that was ticked; no model runs any part of it.
-It leases at most one delivery row per tick, and the same approval facts, the
-publish ledger kept on the delivery row and the remote facts read through
-:mod:`hermes_cli.kanban_delivery_github` decide whether the approved head
-becomes the delivery's one pull request.
+:func:`publish_delivery` is T1 itself, run by :func:`publish_step` from
+``dispatch_once``: the same approval facts, the publish ledger kept on the delivery row and
+the remote facts read through :mod:`hermes_cli.kanban_delivery_github` decide
+whether the approved head becomes the delivery's one pull request.
 """
 
 from __future__ import annotations
@@ -66,9 +64,10 @@ def delivery_settings() -> bool:
         from hermes_cli.config import load_config
 
         section = (load_config() or {}).get("kanban", {}).get("delivery") or {}
-        return section.get("enabled") is True
+        enabled = section.get("enabled") is True
     except Exception:
         return False
+    return enabled
 
 
 def _sha(value) -> Optional[str]:
@@ -232,9 +231,8 @@ def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional
     Returns the delivery row id, or ``None`` when delivery is off, the card
     carries no review requirement, or the approval proof refuses. A second call
     for the same source card and head returns the row the first one recorded.
-    Every older row of the same source card is marked returned for changes, so
-    only the newest approved head is published, as a fast-forward of the one
-    pull request when an older head already has it.
+    Older rows of the source card are returned for changes, and a new approval
+    re-arms the row of its head while no pull request is recorded on it.
     """
     if not delivery_settings():
         return None
@@ -265,8 +263,17 @@ def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional
             "VALUES (?, ?, ?, ?)",
             (task_id, head, approval["run_id"], int(time.time())),
         )
+        # A new approval of a head with no pull request recorded re-arms its row
+        # and ends any lease on it, so a pass still holding one stores nothing.
+        conn.execute(
+            "UPDATE kanban_deliveries SET approval_run_id = ?, publish_refusal = NULL, "
+            "publish_lease = NULL, publish_lease_until = NULL WHERE source_task_id = ? "
+            "AND source_head = ? AND pull_request_number IS NULL AND approval_run_id IS NOT ?",
+            (approval["run_id"], task_id, head, approval["run_id"]),
+        )
         record = conn.execute(
-            "SELECT id FROM kanban_deliveries WHERE source_task_id = ? AND source_head = ?",
+            "SELECT id FROM kanban_deliveries "
+            "WHERE source_task_id = ? AND source_head = ?",
             (task_id, head),
         ).fetchone()
         conn.execute(
@@ -308,17 +315,13 @@ _PULL_REQUEST_BODY = (
     "Delivery key: {key}\n"
 )
 
-# How long one step holds a delivery row. A pass that crashes or hangs loses
+# How long one pass holds a delivery row. A pass that crashes or hangs loses
 # the row once its lease runs out, and a later pass takes it over.
 _LEASE_SECONDS = 600
 
-# Refusals that can pass on their own: the step logs them and stores nothing,
-# and the row is tried again once its lease runs out. Every other refusal
-# parks the row and is recorded once on the source card.
-_RETRIED = frozenset({
-    "delivery_disabled", "transport_failed", "pulls_unreadable",
-    "lease_lost", "record_changed", "source_changed",
-})
+# Refusals that can pass on their own: nothing is stored, and the row is tried
+# again once its lease runs out. Any other refusal parks the row, recorded once.
+_RETRIED = frozenset({"delivery_disabled", "transport_failed", "lease_lost", "source_changed"})
 
 
 class PublishRefused(Exception):
@@ -354,22 +357,27 @@ def _policy_repositories() -> frozenset[str]:
     return frozenset(policy.required_checks)
 
 
+def _held(conn: sqlite3.Connection, delivery_id: int, holder: str):
+    """Delivery row ``delivery_id`` while ``holder``'s lease holds: the row names
+    this holder, its deadline is later than a fresh clock and no pull request is
+    recorded. Otherwise raises ``lease_lost``."""
+    records = conn.execute(
+        "SELECT * FROM kanban_deliveries WHERE id = ? AND publish_lease = ? "
+        "AND publish_lease_until > ? AND pull_request_number IS NULL",
+        (delivery_id, holder, int(time.time())),
+    ).fetchall()
+    if len(records) != 1:
+        raise PublishRefused("lease_lost", f"the lease of delivery {delivery_id} ran out or was taken over")
+    return records[0]
+
+
 def _bind(conn: sqlite3.Connection, delivery_id: int, holder: str) -> tuple:
-    """C1 and C2: delivery is on, ``delivery_id`` is a delivery row with no pull
-    request recorded whose publish lease ``holder`` holds, and the source card's
+    """C1 and C2: delivery is on, ``holder``'s lease on delivery row
+    ``delivery_id`` holds, and the source card's
     repository is in the policy. Returns ``(record, workdir, repository)``."""
     if not delivery_settings():
         raise PublishRefused("delivery_disabled", "kanban.delivery.enabled is not true")
-    records = conn.execute(
-        "SELECT * FROM kanban_deliveries WHERE id = ? AND publish_lease = ? "
-        "AND pull_request_number IS NULL",
-        (delivery_id, holder),
-    ).fetchall()
-    if len(records) != 1:
-        raise PublishRefused(
-            "lease_lost", f"this pass no longer holds the lease of delivery {delivery_id}",
-        )
-    record = records[0]
+    record = _held(conn, delivery_id, holder)
     source = conn.execute(
         "SELECT workspace_path FROM tasks WHERE id = ?", (record["source_task_id"],),
     ).fetchall()
@@ -384,8 +392,8 @@ def _bind(conn: sqlite3.Connection, delivery_id: int, holder: str) -> tuple:
 
 
 def _snapshot(conn: sqlite3.Connection, source: str) -> list:
-    """What must be unchanged for a result to be stored: every delivery row of
-    the source card, its publish lease included."""
+    """What must be unchanged for a result to be stored: every delivery record
+    of the source card, its publish lease included."""
     return [tuple(row) for row in conn.execute(
         "SELECT * FROM kanban_deliveries WHERE source_task_id = ? ORDER BY id", (source,),
     )]
@@ -420,6 +428,15 @@ def _lease_refusal(error, code: str, detail: str) -> Exception:
     return PublishRefused("transport_failed", error.reason)
 
 
+def _answered(answer: dict) -> dict:
+    """GitHub's answer, read as evidence only when it is not a temporary one: a
+    rate limit (403, 429), a timeout (408) or an outage (5xx) proves nothing, so
+    it stores nothing and the row is tried again once its lease runs out."""
+    if answer["status"] in (403, 408, 429) or answer["status"] >= 500:
+        raise PublishRefused("transport_failed", f"GitHub answered {answer['status']}")
+    return answer
+
+
 def _take_lease(db_path: Path) -> Optional[tuple]:
     """Lease the oldest delivery row still to publish: no pull request
     recorded, not returned for changes, not parked, and no lease that still
@@ -443,16 +460,10 @@ def _take_lease(db_path: Path) -> Optional[tuple]:
 
 
 def _park(db_path: Path, delivery_id: int, holder: str, refusal: PublishRefused) -> None:
-    """Park a delivery row this pass still holds: it is not tried again, and
-    its refusal is recorded once on the source card."""
+    """Park a delivery row while this pass's lease on it holds: it is not tried
+    again, and its refusal is recorded once on the source card."""
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
-        row = conn.execute(
-            "SELECT source_task_id, source_head FROM kanban_deliveries "
-            "WHERE id = ? AND publish_lease = ? AND pull_request_number IS NULL",
-            (delivery_id, holder),
-        ).fetchone()
-        if row is None:
-            return  # another pass took the row over; it is not this pass's to park
+        row = _held(conn, delivery_id, holder)
         conn.execute(
             "UPDATE kanban_deliveries SET publish_refusal = ?, publish_lease = NULL, "
             "publish_lease_until = NULL WHERE id = ?",
@@ -467,14 +478,8 @@ def _park(db_path: Path, delivery_id: int, holder: str, refusal: PublishRefused)
 
 
 def publish_step(db_path: Optional[Path]) -> Optional[dict]:
-    """The dispatcher's delivery step for the board whose file is ``db_path``:
-    lease at most one approved delivery row and publish it.
-
-    Returns what :func:`publish_delivery` returns, or ``None``. A refusal that
-    can pass on its own is logged and the row is tried again once its lease
-    runs out; any other refusal parks the row. Raises no error, so the tick
-    goes on.
-    """
+    """The dispatcher's delivery step for the board whose file is ``db_path``: lease at
+    most one approved delivery row and publish it. Raises no error, so the tick goes on."""
     if db_path is None or not delivery_settings():
         return None
     try:
@@ -489,7 +494,8 @@ def publish_step(db_path: Optional[Path]) -> Optional[dict]:
                 leased[0], refusal.code, refusal.detail,
             )
             if refusal.code not in _RETRIED:
-                _park(db_path, *leased, refusal)
+                with contextlib.suppress(PublishRefused):  # a lease that ran out parks nothing
+                    _park(db_path, *leased, refusal)
     except Exception:
         # The tick goes on; a row this pass leased is tried again once its lease runs out.
         logger.exception("kanban delivery: the publish step failed")
@@ -497,21 +503,25 @@ def publish_step(db_path: Optional[Path]) -> Optional[dict]:
 
 
 def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
-    """T1: publish the approved head of delivery row ``delivery_id``, whose
-    publish lease ``holder`` holds, as the source card's one pull request.
+    """T1: publish the approved head of delivery row ``delivery_id`` as its one
+    pull request, while ``holder``'s publish lease on the row holds.
 
     Returns ``{state, head, pull_request_number, branch}`` or raises
     :class:`PublishRefused`. Every fact is captured first, the GitHub work runs
     outside every transaction and connection, and the ledger and the events are
-    stored only if the source card's delivery rows, the lease included, and the
-    source card are unchanged (C4), and only once GitHub, read again after the
-    publish, shows the pull request open at H against main on the branch at H.
+    stored only if the delivery records, the lease and the source card are
+    unchanged (C4), and only once GitHub, read again after any push or creation,
+    shows the pull request open at H on the branch at H.
     """
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
+    def hold() -> None:  # right before each change on GitHub, on its own connection
+        with kb.connect_closing(db_path=db_path) as conn:
+            _held(conn, delivery_id, holder)
+
     # The admission, the approval and ledger reads and the snapshot are one read, so a
-    # takeover after the admission cannot put the new lease into the snapshot that the
-    # final write compares against. The read ends before any GitHub call.
+    # takeover after the admission cannot put the new lease into the snapshot that
+    # the final write compares against. The read ends before any GitHub call.
     with kb.connect_closing(db_path=db_path) as conn, _one_read(conn):
         record, workdir, repository = _bind(conn, delivery_id, holder)
         source = record["source_task_id"]
@@ -550,9 +560,9 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
     pulls_path = f"/repos/{repository}/pulls"
     try:
         github = GitHubTransport("publish", repository)
-        listed = github.request("GET", pulls_path, query={
+        listed = _answered(github.request("GET", pulls_path, query={
             "state": "open", "head": f"{repository.split('/')[0]}:{branch}", "per_page": 100,
-        })
+        }))
         pulls = listed["data"]
         if listed["status"] != 200 or not isinstance(pulls, list) or not all(
             isinstance(pull, dict) for pull in pulls
@@ -573,20 +583,22 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
             state = "adopted"  # the branch already holds H, so nothing is pushed
             if decision.code == "push_and_create":
                 try:
+                    hold()
                     pushed = github.push(workdir, branch, head, expected="")
                 except GitHubTransportError as error:
                     raise _lease_refusal(
                         error, "foreign_branch", f"{branch} holds a head other than {head}",
                     ) from None
                 state = "adopted" if pushed["state"] == "up_to_date" else "created"
-            created = github.request("POST", pulls_path, body={
+            hold()
+            created = _answered(github.request("POST", pulls_path, body={
                 "title": _PULL_REQUEST_TITLE.format(source=source, head=head),
                 "head": branch,
                 "base": _PULL_REQUEST_BASE,
                 "body": _PULL_REQUEST_BODY.format(
                     source=source, head=head, key=delivery_key(source, head),
                 ),
-            })
+            }))
             pull = created["data"] if isinstance(created["data"], dict) else {}
             number = pull.get("number")
             pulled = pull["head"].get("sha") if isinstance(pull.get("head"), dict) else None
@@ -596,64 +608,72 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
                 )
         elif decision.code == "push_fast_forward":
             try:
+                hold()
                 github.push(workdir, branch, head, expected=ledger["head"])
             except GitHubTransportError as error:
                 raise _lease_refusal(
                     error, "head_moved", f"{branch} no longer holds {ledger['head']}",
                 ) from None
             number, state = ledger["pull_request"], "fast_forwarded"
-        else:  # adopt_pull_request, adopt_fast_forward or already_published: GitHub holds H
-            number = ledger["pull_request"] or open_pulls[0]["number"]
-            state = "fast_forwarded" if decision.code == "adopt_fast_forward" else "adopted"
-        # Read again, still outside every transaction: only the pull request open at H
-        # against main, on the branch at H, is a success.
-        again = github.request("GET", f"{pulls_path}/{number}")
-        reread = again["data"] if again["status"] == 200 and isinstance(again["data"], dict) else {}
-        reread_head = reread["head"].get("sha") if isinstance(reread.get("head"), dict) else None
-        reread_base = reread["base"].get("ref") if isinstance(reread.get("base"), dict) else None
-        if (reread.get("state"), reread_head, reread_base, github.branch_head(branch)) != (
-            "open", head, _PULL_REQUEST_BASE, head,
-        ):
-            raise PublishRefused(
-                "head_moved",
-                f"pull request {number} is not open at {head} against {_PULL_REQUEST_BASE}, "
-                f"or {branch} is not at {head}",
-            )
+        elif decision.code == "adopt_pull_request":  # no ledger, and one pull request open at H
+            number, state = open_pulls[0]["number"], "adopted"
+        else:  # already_published or adopt_fast_forward: GitHub already holds H
+            number = ledger["pull_request"]
+            state = "already_published" if decision.code == "already_published" else "fast_forwarded"
+        if decision.code in ("push_and_create", "adopt_and_create", "push_fast_forward", "adopt_pull_request"):
+            # GitHub changed or holds an unrecorded pull request, so both are read again, outside every
+            # transaction: only the pull request open at H against main on the branch at H is a success.
+            again = _answered(github.request("GET", f"{pulls_path}/{number}"))
+            reread = again["data"] if again["status"] == 200 and isinstance(again["data"], dict) else {}
+            reread_head = reread["head"].get("sha") if isinstance(reread.get("head"), dict) else None
+            reread_base = reread["base"].get("ref") if isinstance(reread.get("base"), dict) else None
+            if (reread.get("state"), reread_head, reread_base, github.branch_head(branch)) != (
+                    "open", head, _PULL_REQUEST_BASE, head):
+                raise PublishRefused(
+                    "head_moved",
+                    f"pull request {number} or {branch} is not open at {head} after the publish",
+                )
     except GitHubTransportError as error:
         raise PublishRefused("transport_failed", error.reason) from None
 
-    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
-        if _snapshot(conn, source) != snapshot:
-            raise PublishRefused(
-                "record_changed",
-                "a delivery row of the source card changed or its lease was taken over; "
-                "nothing was stored",
-            )
-        if _source_state(conn, source) != approved_source:
-            raise PublishRefused(
-                "source_changed",
-                "the source card changed after its approval was proven; nothing was stored",
-            )
-        conn.execute(
-            "UPDATE kanban_deliveries SET pull_request_number = ?, pull_request_head = ?, "
-            "pull_request_state = 'open', pull_request_branch = ?, publish_lease = NULL, "
-            "publish_lease_until = NULL WHERE id = ?",
-            (number, head, branch, delivery_id),
-        )
-        kb._append_event(conn, source, "delivery_bound", {
-            "source_task_id": source,
-            "head": head,
-            "base_commit": approval["base"],
-            "reviewer": approval["reviewer"],
-            "implementer": approval["implementer"],
-            "approval_event_id": approval_event,
-            "base_is_ancestor": approval["base_is_ancestor"],
-        })
-        kb._append_event(conn, source, "delivery_published", {
-            "repository": repository,
-            "branch": branch,
-            "pull_request_number": number,
-            "head": head,
-            "state": state,
-        })
-    return {"state": state, "head": head, "pull_request_number": number, "branch": branch}
+    with kb.connect_closing(db_path=db_path) as conn:
+        with kb.write_txn(conn):
+            _held(conn, delivery_id, holder)
+            if _snapshot(conn, source) != snapshot:
+                raise PublishRefused(
+                    "lease_lost", "the delivery records or the lease changed; nothing was stored",
+                )
+            if _source_state(conn, source) != approved_source:
+                raise PublishRefused(
+                    "source_changed",
+                    "the source card changed after its approval was proven; nothing was stored",
+                )
+            if state != "already_published":
+                conn.execute(
+                    "UPDATE kanban_deliveries SET pull_request_number = ?, pull_request_head = ?, "
+                    "pull_request_state = 'open', pull_request_branch = ?, publish_lease = NULL, "
+                    "publish_lease_until = NULL WHERE id = ?",
+                    (number, head, branch, record["id"]),
+                )
+                kb._append_event(conn, source, "delivery_bound", {
+                    "source_task_id": source,
+                    "head": head,
+                    "base_commit": approval["base"],
+                    "reviewer": approval["reviewer"],
+                    "implementer": approval["implementer"],
+                    "approval_event_id": approval_event,
+                    "base_is_ancestor": approval["base_is_ancestor"],
+                })
+            kb._append_event(conn, source, "delivery_published", {
+                "repository": repository,
+                "branch": branch,
+                "pull_request_number": number,
+                "head": head,
+                "state": state,
+            })
+    return {
+        "state": "created" if state == "adopted" else state,
+        "head": head,
+        "pull_request_number": number,
+        "branch": branch,
+    }
