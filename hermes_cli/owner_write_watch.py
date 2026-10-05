@@ -7,9 +7,9 @@ under the same ``/p/<profile>`` prefix the owner app uses and with this profile'
 API_SERVER_KEY. Every request names something that does not exist, so a healthy route answers
 "not found" or "not valid" and nothing changes; only the exact healthy status and code passes, and
 a refusal (401, 403, 404 owner_workspace_not_enabled, 503) fails. The default profile's job also
-runs the page check and asks the deployed route policy whether each Connections and Models route
-the owner app calls is still registered for its key (indirect signals: those keys stay with the
-owner app).
+runs the page check and asks the deployed route policy whether each Automations, Connections and
+Models route the owner app calls is still registered for its key (indirect signals: those keys stay
+with the owner app, and no request is sent to those routes).
 
 Printed output is the job's message: nothing while the state stays the same, one alert when checks
 start to fail, one update when the failing set changes, one recovery message. Exit 0 whenever the
@@ -117,6 +117,11 @@ PROBES: Dict[str, tuple] = {
         Probe("conversation_close", "Closing a conversation (route 9)", "POST",
               f"{_PLANNER}{_CONVERSATION}/authority", {}, 400,
               message="Invalid owner proposal authority request"),
+        # Start over is the authority call with the action close (applyConversationAuthority, from
+        # closeConversation), not a DELETE: without its response id it is refused before any lookup.
+        Probe("conversation_history", "Clearing conversation history: Start over (route 12)", "POST",
+              f"{_PLANNER}{_CONVERSATION}/authority", {"action": "close"}, 400,
+              message="Invalid owner proposal authority request"),
         Probe("conversation_recovery", "Conversation recovery (route 10)", "POST",
               f"{_PLANNER}{_CONVERSATION}/recovery", {}, 400,
               message="Invalid owner recovery acknowledgement"),
@@ -126,14 +131,24 @@ PROBES: Dict[str, tuple] = {
     ),
 }
 
+_AUTOMATIONS_SCOPE = "cron.automations.manage"
 _CONNECTIONS_SCOPE = "mcp.connections.manage"
 _MODELS_SCOPE = "models.manage"
+_JOB = "0" * 12
 _ROLES = ("default", "raphael-planner", "raphael-business", "raphael-designer",
           "raphael-claude-worker", "raphael-builder", "raphael-verifier")
 
-# Each method and path the owner app's Connections and Models clients send (main 7419773d).
+# Each method and path the owner app's Automations, Connections and Models clients send (main 7419773d).
 SIGNALS = tuple(
-    [Signal("connections", method, path, _CONNECTIONS_SCOPE) for method, path in (
+    [Signal("automations", method, path, _AUTOMATIONS_SCOPE) for method, path in (
+        ("GET", "/api/cron/jobs"),
+        ("GET", "/api/cron/executions"),
+        ("POST", "/api/cron/jobs"),
+        ("POST", f"/api/cron/jobs/{_JOB}/pause"),
+        ("POST", f"/api/cron/jobs/{_JOB}/resume"),
+        ("POST", f"/api/cron/executions/{_ZEROS}/resend"),
+    )]
+    + [Signal("connections", method, path, _CONNECTIONS_SCOPE) for method, path in (
         ("GET", "/api/mcp/catalog"),
         ("GET", "/api/mcp/servers"),
         ("POST", "/api/mcp/catalog/install"),
@@ -159,6 +174,7 @@ SIGNALS = tuple(
     )]
 )
 _WIRING = (
+    ("automations", "Automations permission wiring (routes 13 to 15)"),
     ("connections", "Connections permission wiring (route 16)"),
     ("models", "Models permission wiring (route 17)"),
 )
@@ -212,8 +228,11 @@ def run(
     delivery_state: Optional[Callable[[Dict[str, Any]], str]] = None,
     route_policy: Optional[Callable[[str, str], Any]] = None,
     now: Optional[Callable[[], datetime]] = None,
+    job_id: Optional[str] = None,
 ) -> Outcome:
-    """One hourly run. Every argument after ``page_check`` defaults to the production one."""
+    """One hourly run. Every argument after ``page_check`` defaults to the production one.
+    ``job_id`` is the watch job's own cron job id: without it no delivery can be read, so every
+    announcement reads unknown and never prints again."""
     clock = now or (lambda: datetime.now(timezone.utc))
     if profile is None:
         from hermes_cli.profiles import get_active_profile_name
@@ -241,7 +260,8 @@ def run(
     if indirect:
         results.append(_page_check(page_check, run_page_check or _run_page_check, clock))
         results.extend(_wiring(route_policy or _deployed_route_policy, clock))
-    state, kind, text = _decide(previous, results, moment, profile, delivery_state or _previous_delivery)
+    reader = delivery_state or (lambda announced: _previous_delivery(announced, job_id))
+    state, kind, text = _decide(previous, results, moment, profile, reader)
     try:
         _write(report_path(), {"profile": profile, "run_at": moment.isoformat(), "state": state["state"],
                                "checks": [asdict(result) for result in results]})
@@ -415,12 +435,20 @@ def _own_profile_key() -> Optional[str]:
 
 
 def _listener_base() -> str:
-    """The local listener, found as the gateway finds its port: config, API_SERVER_PORT, 8642."""
+    """The one local listener serving every profile under ``/p/<profile>``. Its port comes from the
+    root profile's own listener configuration (config.yaml over gateway.json, merged as the gateway
+    merges them), else API_SERVER_PORT, else 8642. Nothing else of the root profile is read: never
+    its .env or its key, and this process's environment is left as it was."""
     import os
-    from gateway.config import Platform, load_gateway_config
+    from gateway import config_loader
+    from hermes_constants import get_default_hermes_root
 
-    platform = load_gateway_config().platforms.get(Platform.API_SERVER)
-    raw = (platform.extra if platform is not None else {}).get("port") or os.environ.get("API_SERVER_PORT")
+    root = get_default_hermes_root()
+    data = config_loader.load_legacy_gateway_json(root)
+    layers = config_loader.read_yaml_layers(root)
+    listener = config_loader.merge_platform_sections(layers, layers.get("gateway"), data).get("api_server")
+    extra = listener.get("extra") if isinstance(listener, dict) else None
+    raw = (extra if isinstance(extra, dict) else {}).get("port") or os.environ.get("API_SERVER_PORT")
     port = 8642 if raw in (None, "") else int(raw)
     if not 0 < port < 65536:
         raise ValueError("port out of range")
@@ -462,6 +490,7 @@ def _deployed_route_policy(method: str, path: str):
     from hermes_cli.dashboard_auth.token_auth import get_token_route_policy
 
     if not _ROUTE_POLICIES_LOADED:
+        import hermes_cli.web_routers.cron  # noqa: F401  registers the Automations routes on import
         import hermes_cli.web_routers.mcp  # noqa: F401  registers the Connections routes on import
         from plugins.dashboard_auth.raphael_workspace.model_policy import register_models_machine_routes
 
@@ -470,27 +499,52 @@ def _deployed_route_policy(method: str, path: str):
     return get_token_route_policy(method, path)
 
 
-def _previous_delivery(announced: Dict[str, Any]) -> str:
-    """Delivery state of the latest run whose report holds the announced text, from this profile's
-    delivery record: ``failed`` only when every chat failed and nobody re-sent it; else ``delivered``
-    or ``unknown``."""
+_EXECUTION_PAGE = 500
+
+
+def _previous_delivery(announced: Dict[str, Any], job_id: Optional[str]) -> str:
+    """Delivery state of the announcement, read only from the watch job's own execution that printed
+    it: the newest execution of ``job_id`` claimed at or before the announcement, paged newest first
+    with no fixed window. Other jobs' executions are never read. ``unknown`` without the job id or
+    when that execution's record cannot be read or does not hold the announced text."""
+    at = _moment(announced.get("at"))
+    if not job_id or at is None or not isinstance(announced.get("text"), str):
+        return UNKNOWN
     try:
         from cron import delivery_record
         from cron.executions import list_executions
 
-        rows = list_executions(limit=50)
-        records = delivery_record.load_many([row["id"] for row in rows])
+        cursor = None
+        while True:
+            rows = list_executions(job_id=job_id, limit=_EXECUTION_PAGE, before_claimed_at=cursor)
+            for row in rows:
+                claimed = _moment(row["claimed_at"])
+                if claimed is None:
+                    return UNKNOWN
+                if claimed <= at:
+                    record = delivery_record.load_many([row["id"]]).get(row["id"])
+                    return _delivery_outcome(record, announced["text"])
+            if len(rows) < _EXECUTION_PAGE:
+                return UNKNOWN
+            cursor = rows[-1]["claimed_at"]
     except Exception:
         return UNKNOWN
-    for row in rows:
-        record = records.get(row["id"])
-        if not record or not isinstance(record.get("text"), str) or announced["text"] not in record["text"]:
-            continue
-        states = {target.get("state") for target in record.get("targets") or ()}
-        if record.get("attempts") or not states:
-            return UNKNOWN
-        return states.pop() if len(states) == 1 and states <= {"failed", "delivered"} else UNKNOWN
-    return UNKNOWN
+
+
+def _delivery_outcome(record: Optional[Dict[str, Any]], text: str) -> str:
+    """How one execution's report ended for its chats, re-sends included: ``failed`` only when every
+    chat ended failed (a re-send whose every chat was refused keeps it failed), ``delivered`` when
+    every chat was delivered; a re-send in progress or unreadable, or any unknown outcome, reads
+    ``unknown``."""
+    from cron import delivery_record
+
+    if not record or not isinstance(record.get("text"), str) or text not in record["text"]:
+        return UNKNOWN
+    if any(attempt["chats"] is None or attempt["state"] == "in_progress" for attempt in record["attempts"]):
+        return UNKNOWN
+    # The targets as the re-send attempts left them, by the same rule the re-send view applies.
+    states = {target["state"] for target in delivery_record._latest_targets(record)}
+    return states.pop() if len(states) == 1 and states <= {"failed", "delivered"} else UNKNOWN
 
 
 def main(argv: Optional[List[str]] = None) -> int:

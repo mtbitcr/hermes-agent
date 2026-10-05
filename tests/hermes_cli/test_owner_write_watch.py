@@ -1,9 +1,15 @@
-"""Hourly check of the owner write routes: plan section (e), tests 1 to 9.
+"""Hourly check of the owner write routes: plan section (e), tests 1 to 9, and the owner note's
+regression tests for the four review findings (round 1).
 
-The listener, the page check, the clock and the delivery record are fakes:
-nothing here reaches a network or a real service.
+Tests 1 to 9 fake the listener, the page check, the clock and the delivery record. The regression
+tests use a real HTTP server on 127.0.0.1 and the real execution and delivery stores in the test's
+temporary HERMES_HOME: nothing here reaches another host or a production service.
 """
 
+import asyncio
+import http.server
+import json
+import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -59,7 +65,7 @@ class Host:
     def send(self, method, url, body, key):
         self.requests.append((method, url, body, key))
         for probe in watch.PROBES[self.profile]:
-            if probe.method == method and url.endswith(probe.path):
+            if probe.method == method and url.endswith(probe.path) and body == probe.body:
                 return self.answers[probe.name]
         raise AssertionError(f"request outside the probe table: {method} {url}")
 
@@ -270,3 +276,327 @@ def test_9_an_undelivered_alert(tmp_path, delivery, printed_again):
     assert alert.kind == "alert"
     assert again.code == 0
     assert again.text == (alert.text if printed_again else "")
+
+
+# --- Owner note, round 1: regression tests for the four review findings ---------------------------
+
+AUTOMATIONS_SCOPE = "cron.automations.manage"
+WATCH_JOB = "a1b2c3d4e5f6"
+OTHER_JOB = "f6e5d4c3b2a1"
+MINUTE = timedelta(minutes=1)
+
+
+def automations_signals():
+    return [signal for signal in watch.SIGNALS if signal.group == "automations"]
+
+
+def clear_history_probe():
+    return next(probe for probe in watch.PROBES["raphael-planner"] if probe.name == "conversation_history")
+
+
+def test_finding1_automations_write_calls_are_bound_from_the_automations_client():
+    """Each write call of the owner app's Automations client is a wiring signal with the
+    Automations key's scope: create, pause, resume and resend, plus the two reads it makes."""
+    zeros = "0" * 32
+    assert {(signal.method, signal.path, signal.scope) for signal in automations_signals()} == {
+        ("GET", "/api/cron/jobs", AUTOMATIONS_SCOPE),
+        ("GET", "/api/cron/executions", AUTOMATIONS_SCOPE),
+        ("POST", "/api/cron/jobs", AUTOMATIONS_SCOPE),
+        ("POST", "/api/cron/jobs/000000000000/pause", AUTOMATIONS_SCOPE),
+        ("POST", "/api/cron/jobs/000000000000/resume", AUTOMATIONS_SCOPE),
+        ("POST", f"/api/cron/executions/{zeros}/resend", AUTOMATIONS_SCOPE),
+    }
+
+
+def test_finding1_removed_automations_write_permissions_fail_and_unchanged_pass():
+    """Removed Automations write permissions give a failure, and unchanged permissions pass:
+    read from the route policy the deployed dashboard code registers, cron routes included."""
+    asked = []
+
+    def deployed(method, path):
+        asked.append((method, path))
+        return watch._deployed_route_policy(method, path)
+
+    unchanged = {result.name: result for result in watch._wiring(deployed, lambda: START)}
+    assert {name: result.outcome for name, result in unchanged.items()} == {
+        "automations": watch.PASS, "connections": watch.PASS, "models": watch.PASS,
+    }
+    assert {(signal.method, signal.path) for signal in automations_signals()} <= set(asked)
+
+    writes = [signal for signal in automations_signals() if signal.method == "POST"]
+    assert len(writes) == 4
+    for removed in writes:
+        def without(method, path, removed=removed):
+            if (method, path) == (removed.method, removed.path):
+                return None
+            return watch._deployed_route_policy(method, path)
+
+        results = {result.name: result for result in watch._wiring(without, lambda: START)}
+        assert results["automations"].outcome == watch.FAIL, removed.path
+        assert f"{removed.method} {removed.path}" in results["automations"].detail
+        assert results["connections"].outcome == results["models"].outcome == watch.PASS
+
+
+def test_finding1_a_removed_automations_permission_alerts_without_an_automations_request(tmp_path):
+    """The default profile's job alerts on a removed Automations write permission and sends no
+    request to any Automations route: no machine-key write request, no key."""
+    host = Host(tmp_path)
+    assert host.run().kind == "active"
+    removed = next(signal for signal in automations_signals() if signal.path.endswith("/resend"))
+
+    def narrowed(method, path):
+        if (method, path) == (removed.method, removed.path):
+            return SimpleNamespace(method=method, path=path, required_scope="cron.automations.read")
+        return host.route_policy(method, path)
+
+    alert = host.run(route_policy=narrowed)
+    assert alert.kind == "alert"
+    assert "Automations permission wiring" in alert.text
+    assert all("/api/" not in request[1] for request in host.requests)
+
+
+def test_finding1_clear_history_is_probed_as_the_authority_close_call():
+    """Clear history is not a DELETE: Start over calls POST .../authority with the action close
+    (applyConversationAuthority, from closeConversation), probed with an unknown conversation."""
+    probe = clear_history_probe()
+    conversation = "raphael-owner-" + "0" * 32
+    assert (probe.method, probe.path) == (
+        "POST", f"/p/raphael-planner/v1/responses/conversations/{conversation}/authority")
+    assert probe.body == {"action": "close"}
+    assert (probe.status, probe.code, probe.message) == (400, None, "Invalid owner proposal authority request")
+    assert "route 12" in probe.label
+    assert all(probe.method != "DELETE" for probe in every_probe())
+
+
+def test_finding1_clear_history_probe_is_refused_before_any_lookup():
+    """The platform's own authority handler refuses the clear history probe at its shape check:
+    the response store, where the lookup and the close would run, is never reached."""
+    from gateway.platforms.api_server import APIServerAdapter
+
+    class Unreachable:
+        def __getattr__(self, name):
+            raise AssertionError(f"lookup reached: {name}")
+
+    probe = clear_history_probe()
+
+    async def body():
+        return dict(probe.body)
+
+    adapter = SimpleNamespace(_check_auth=lambda request: None, _response_store=Unreachable(),
+                              _run_statuses=Unreachable())
+    request = SimpleNamespace(json=body, match_info={"conversation": probe.path.split("/")[6]})
+    response = asyncio.run(APIServerAdapter._handle_owner_conversation_authority(adapter, request))
+    assert watch.classify(probe, response.status, json.loads(response.text)) == watch.PASS
+
+
+class Listener:
+    """A real HTTP server on 127.0.0.1 that answers each probe of ``profile`` as a healthy route."""
+
+    def __init__(self, profile):
+        self.requests = []
+        table, seen = watch.PROBES[profile], self.requests
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"null")
+                seen.append((self.command, self.path, self.headers.get("Authorization"), body))
+                probe = next((p for p in table if (p.path, p.body) == (self.path, body)), None)
+                status, payload = healthy(probe) if probe else (418, None)
+                data = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def listener():
+    servers = []
+
+    def start(profile):
+        servers.append(Listener(profile))
+        return servers[-1]
+
+    yield start
+    for server in servers:
+        server.close()
+
+
+def root_profile(tmp_path, port):
+    """A root profile whose own config sets the shared listener's port, with its own key."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "config.yaml").write_text(
+        f"gateway:\n  api_server:\n    enabled: true\n    port: {port}\n", encoding="utf-8")
+    (root / ".env").write_text("API_SERVER_KEY=" + "r" * 40 + "\n", encoding="utf-8")
+    return root
+
+
+def assert_reached(server, profile, key):
+    table = watch.PROBES[profile]
+    assert sorted((m, p) for m, p, _, _ in server.requests) == sorted((pr.method, pr.path) for pr in table)
+    assert all(path.startswith(f"/p/{profile}/") for _, path, _, _ in server.requests)
+    assert {auth for _, _, auth, _ in server.requests} == {f"Bearer {key}"}
+
+
+def test_finding2_the_planner_job_reaches_the_listener_only_the_root_profile_configures(
+        tmp_path, monkeypatch, listener):
+    """One listener serves every profile under /p/PROFILE/: with only the root profile configuring
+    the port, the planner job reaches it with its own key and its exact /p/ prefix."""
+    monkeypatch.delenv("API_SERVER_PORT", raising=False)
+    server = listener("raphael-planner")
+    planner = root_profile(tmp_path, server.port) / "profiles" / "raphael-planner"
+    planner.mkdir(parents=True)
+    (planner / ".env").write_text("API_SERVER_KEY=" + "p" * 40 + "\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(planner))
+
+    outcome = Host(tmp_path, profile="raphael-planner").run(base=None, send=None, read_key=None)
+
+    assert (outcome.code, outcome.kind) == (0, "active"), outcome.text
+    assert_reached(server, "raphael-planner", "p" * 40)
+
+
+def test_finding2_default_profile_control_on_the_same_listener(tmp_path, monkeypatch, listener):
+    """The default profile's job reaches the same listener with the default profile's own key."""
+    monkeypatch.delenv("API_SERVER_PORT", raising=False)
+    server = listener("default")
+    monkeypatch.setenv("HERMES_HOME", str(root_profile(tmp_path, server.port)))
+
+    outcome = Host(tmp_path).run(base=None, send=None, read_key=None)
+
+    assert (outcome.code, outcome.kind) == (0, "active"), outcome.text
+    assert_reached(server, "default", "r" * 40)
+
+
+def execution(monkeypatch, job_id, moment, *, finished=True):
+    """One real execution of ``job_id`` claimed at ``moment``; the current run is left unfinished."""
+    from cron import executions
+
+    monkeypatch.setattr(executions, "_hermes_now", lambda: moment)
+    row = executions.create_execution(job_id, source="schedule")
+    if finished:
+        executions.finish_execution(row["id"], success=True)
+    return row["id"]
+
+
+def deliver(execution_id, job_id, text, *states):
+    """A real delivery record of ``text`` for one execution, one Telegram chat per state."""
+    from cron import delivery_record
+
+    with delivery_record.recording(execution_id, job_id):
+        recorder = delivery_record.active_recorder()
+        chats = [{"platform": "telegram", "chat_id": f"-10010000000{n}"} for n in range(len(states))]
+        recorder.begin(text, [], chats)
+        for state in states:
+            recorder.next_target()
+            if state == "failed":
+                recorder.note_failed("platform_refused")
+            elif state == "delivered":
+                recorder.note_sent(True)
+            else:
+                recorder.note_unknown("timeout")
+
+
+def watch_alert(tmp_path, monkeypatch):
+    """The watch job's runs up to its alert; returns the host, the alert and the alert's execution."""
+    host = Host(tmp_path)
+    assert host.run(job_id=WATCH_JOB, delivery_state=None).kind == "active"
+    host.refuse(decisions_probe(), 403, "route_not_allowed")
+    alert_execution = execution(monkeypatch, WATCH_JOB, host.clock - MINUTE)
+    alert = host.run(job_id=WATCH_JOB, delivery_state=None)
+    assert alert.kind == "alert"
+    return host, alert, alert_execution
+
+
+def next_watch_run(host, monkeypatch):
+    execution(monkeypatch, WATCH_JOB, host.clock - MINUTE, finished=False)
+    return host.run(job_id=WATCH_JOB, delivery_state=None)
+
+
+def test_finding3_a_failed_alert_repeats_though_a_delivered_unrelated_report_quotes_it(
+        tmp_path, monkeypatch):
+    """An announcement belongs to the execution that printed it, never to a text match in another
+    job's output: a failed watch alert followed by a delivered unrelated report quoting it repeats."""
+    host, alert, alert_execution = watch_alert(tmp_path, monkeypatch)
+    deliver(alert_execution, WATCH_JOB, alert.text, "failed")
+    report = execution(monkeypatch, OTHER_JOB, host.clock - 30 * MINUTE)
+    deliver(report, OTHER_JOB, "Daily digest. Quoted from the owner chat:\n" + alert.text, "delivered")
+
+    again = next_watch_run(host, monkeypatch)
+
+    assert (again.code, again.kind, again.text) == (0, "repeat", alert.text)
+
+
+def test_finding3_a_delivered_alert_does_not_repeat_for_a_failed_unrelated_report_quoting_it(
+        tmp_path, monkeypatch):
+    """A delivered watch alert followed by a failed unrelated report quoting it does not repeat."""
+    host, alert, alert_execution = watch_alert(tmp_path, monkeypatch)
+    deliver(alert_execution, WATCH_JOB, alert.text, "delivered")
+    report = execution(monkeypatch, OTHER_JOB, host.clock - 30 * MINUTE)
+    deliver(report, OTHER_JOB, "Weekly summary. Quoted:\n" + alert.text, "failed")
+
+    outcomes = [next_watch_run(host, monkeypatch), next_watch_run(host, monkeypatch)]
+
+    assert [(outcome.code, outcome.text) for outcome in outcomes] == [(0, ""), (0, "")]
+
+
+def test_finding3_more_than_50_newer_unrelated_executions_do_not_hide_the_watch_delivery(
+        tmp_path, monkeypatch):
+    """The watch job's own executions are read by its id, newest first, with no fixed window."""
+    host, alert, alert_execution = watch_alert(tmp_path, monkeypatch)
+    deliver(alert_execution, WATCH_JOB, alert.text, "failed")
+    for n in range(60):
+        execution(monkeypatch, OTHER_JOB, host.clock - 40 * MINUTE + timedelta(seconds=n))
+
+    again = next_watch_run(host, monkeypatch)
+
+    assert (again.kind, again.text) == ("repeat", alert.text)
+
+
+def test_finding3_without_the_watch_job_id_no_other_output_is_searched(tmp_path, monkeypatch):
+    """Without the watch job's id the delivery reads unknown and nothing repeats: no text search
+    of other jobs' output stands in for it."""
+    host, alert, alert_execution = watch_alert(tmp_path, monkeypatch)
+    deliver(alert_execution, WATCH_JOB, alert.text, "failed")
+    report = execution(monkeypatch, OTHER_JOB, host.clock - 30 * MINUTE)
+    deliver(report, OTHER_JOB, alert.text, "failed")
+    execution(monkeypatch, WATCH_JOB, host.clock - MINUTE, finished=False)
+
+    again = host.run(job_id=None, delivery_state=None)
+
+    assert (again.code, again.text) == (0, "")
+
+
+@pytest.mark.parametrize("resend,printed_again", [
+    ("failed", True), ("delivered", False), ("in_progress", False), ("unknown", False),
+])
+def test_finding4_a_resend_counts_by_how_its_targets_ended(tmp_path, monkeypatch, resend, printed_again):
+    """A resend whose every target ended failed counts as failed, so the hourly repeat goes on. A
+    delivered resend settles the announcement. A resend in progress or with an unknown outcome
+    stops the repeat."""
+    from cron import delivery_record, executions
+
+    host, alert, alert_execution = watch_alert(tmp_path, monkeypatch)
+    deliver(alert_execution, WATCH_JOB, alert.text, "failed")
+    claim = delivery_record.claim_resend(executions.get_execution(alert_execution), "send-again-1")
+    assert claim["claimed"], claim
+    if resend != "in_progress":
+        reason = "platform_refused" if resend == "failed" else None
+        result = {"position": 0, "state": resend, "reason": reason}
+        assert delivery_record.finish_resend(claim["attempt"]["attempt_id"], [result])
+
+    again = next_watch_run(host, monkeypatch)
+
+    assert (again.code, again.text) == (0, alert.text if printed_again else "")
