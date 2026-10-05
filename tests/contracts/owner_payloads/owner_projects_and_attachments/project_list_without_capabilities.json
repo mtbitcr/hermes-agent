@@ -1,0 +1,26 @@
+{
+  "body": {
+    "data": [
+      {
+        "archived": false,
+        "board": "rp1",
+        "description": null,
+        "has_repository": true,
+        "name": "RP",
+        "project_id": "p_cc2dc8d8",
+        "slug": "rp1"
+      },
+      {
+        "archived": false,
+        "board": "workshop-pilot",
+        "description": null,
+        "has_repository": false,
+        "name": "Workshop Pilot",
+        "project_id": "p_787fde8aa1f51ec773a73a1c",
+        "slug": "workshop-pilot"
+      }
+    ],
+    "object": "hermes.owner_workspace.project_list"
+  },
+  "status": 200
+}

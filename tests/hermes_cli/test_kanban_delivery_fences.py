@@ -175,7 +175,7 @@ def test_publish_refuses_a_second_pull_request():
     recorded = ledger(7, H, "published")
     d = fences.decide_publish(approval(), recorded, remote(H, (7, H)))
     assert (d.allowed, d.code) == (True, "already_published")
-    for facts, pulls in ((ledger(), [(8, H)]), (recorded, [(7, H), (8, H)])):
+    for facts, pulls in ((ledger(), [(8, OTHER)]), (recorded, [(7, H), (8, H)])):
         d = fences.decide_publish(approval(), facts, remote(H, *pulls))
         assert (d.allowed, d.code) == (False, "second_pull_request")
     d = fences.decide_publish(approval(), recorded, remote(H))
@@ -184,6 +184,20 @@ def test_publish_refuses_a_second_pull_request():
     unrelated = ledger(7, OTHER, "returned_for_changes")
     d = fences.decide_publish(approval(), unrelated, remote(OTHER, (7, OTHER)))
     assert (d.allowed, d.code) == (False, "not_fast_forward")
+
+
+def test_no_ledger_and_one_open_pull_at_h_is_adopted():
+    # The crash window: the pull request was opened and the ledger was lost. With no ledger, the
+    # one open pull request at H on the branch at H is recorded rather than refused.
+    d = fences.decide_publish(approval(), ledger(), remote(H, (8, H)))
+    assert (d.allowed, d.code) == (True, "adopt_pull_request")
+    # Anything else open for the branch is still a second pull request.
+    for branch, pulls in ((H, [(8, OTHER)]), (H, [(8, H), (9, H)]), (OTHER, [(8, H)]), (None, [(8, H)])):
+        d = fences.decide_publish(approval(), ledger(), remote(branch, *pulls))
+        assert (d.allowed, d.code) == (False, "second_pull_request"), (branch, pulls)
+    # The approval half still answers first.
+    d = fences.decide_publish(approval(reopened_after_approval=True), ledger(), remote(H, (8, H)))
+    assert (d.allowed, d.code) == (False, "reopened_after_approval")
 
 
 def test_publish_refuses_a_head_not_approved_by_the_kernel():

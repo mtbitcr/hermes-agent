@@ -2604,6 +2604,7 @@ def _handle_review_findings(args: dict, **kw) -> str:
                     findings=findings,
                     candidate_digest=kernel_head,
                     expected_run_id=run_id,
+                    risk_tier=args.get("risk_tier"),
                 )
             except kb.ReviewFindingsError as e:
                 return tool_error(
@@ -3182,6 +3183,9 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
+    # Validated by the one card writer (create_task), so a bad tier is refused
+    # before anything is written.
+    risk_tier = args.get("risk_tier")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
     if isinstance(skills, str):
@@ -3244,6 +3248,11 @@ def _handle_create(args: dict, **kw) -> str:
                     f"database this worker is pinned to ('{effective_board or 'a file outside the boards tree'}')"
                 )
             governed_board = kb._board_owner_project_id(effective_board)
+            if risk_tier is not None and governed_board is None:
+                return tool_error(
+                    "kanban_create: risk_tier is accepted only on an "
+                    "owner-governed board"
+                )
             if governed_board is not None:
                 if model_override or provider_override:
                     return tool_error(
@@ -3294,6 +3303,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                risk_tier=risk_tier,
                 **route_fields,
             )
             new_task = kb.get_task(conn, new_tid)
@@ -3303,6 +3313,11 @@ def _handle_create(args: dict, **kw) -> str:
                 status=new_task.status if new_task else None,
                 execution_tier=new_task.execution_tier if new_task else None,
                 route_pinned=bool(new_task.model_policy_lock) if new_task else False,
+                risk_tier=new_task.risk_tier if new_task else None,
+                reasoning_effort=new_task.reasoning_effort if new_task else None,
+                max_runtime_seconds=(
+                    new_task.max_runtime_seconds if new_task else None
+                ),
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
@@ -3953,7 +3968,8 @@ KANBAN_REVIEW_FINDINGS_SCHEMA = {
         "through this tool at all. Reporting the SAME findings against an "
         "unchanged candidate twice in a row blocks the task for an owner "
         "decision instead of re-running the implementer. Only valid from a "
-        "task claimed from the review column, and only for your own task."
+        "task claimed from the review column, and only for your own task. "
+        "risk_tier may raise the card's tier, never lower it."
     ),
     "parameters": {
         "type": "object",
@@ -4001,6 +4017,15 @@ KANBAN_REVIEW_FINDINGS_SCHEMA = {
                     "automatically. A value that disagrees with the "
                     "kernel-parked head is refused; this tool never binds "
                     "a candidate the kernel did not itself park."
+                ),
+            },
+            "risk_tier": {
+                "type": "integer",
+                "enum": [0, 1, 2],
+                "description": (
+                    "Optional. Raise the card's risk tier when the work is "
+                    "riskier than its tier says. A tier may only be raised: "
+                    "a lower one is refused and nothing is recorded."
                 ),
             },
             "board": _board_schema_prop(),
@@ -4503,6 +4528,16 @@ KANBAN_CREATE_SCHEMA = {
                     "provider, model and effort from it through the Raphael "
                     "model policy; defaults to the creator's own tier, else "
                     "routine."
+                ),
+            },
+            "risk_tier": {
+                "type": "integer",
+                "enum": [0, 1, 2],
+                "description": (
+                    "The card's risk tier: 0 low, 1 medium, 2 high. Accepted "
+                    "only on an owner-governed board. Hermes pins the card's "
+                    "effort from it: high, or max for tier 2 and security "
+                    "review. A card without a tier counts as tier 2."
                 ),
             },
             "model": {

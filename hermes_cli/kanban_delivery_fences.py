@@ -191,6 +191,10 @@ def decide_publish(approval: dict, ledger: dict, remote: dict) -> Decision:
     if not (approval["head_exists"] and approval["base_is_ancestor"] and approval["base"] != head):
         return _refuse("head_unconfirmed", "git does not confirm H with the base as a distinct ancestor")
     recorded, branch, pulls = ledger["pull_request"], remote["branch_head"], remote["open_pulls"]
+    # A crash between opening the pull request and recording it leaves nothing recorded and exactly
+    # one open pull request, at H, on the branch at H: the delivery's own, so it is adopted.
+    if recorded is None and branch == head and [pull["head"] for pull in pulls] == [head]:
+        return Decision(True, "adopt_pull_request", f"pull request {pulls[0]['number']} is open at {head}; record it")
     if any(pull["number"] != recorded for pull in pulls):
         return _refuse("second_pull_request", "an open pull request other than the recorded one exists")
     if recorded is None:

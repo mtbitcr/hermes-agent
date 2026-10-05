@@ -1,12 +1,11 @@
-"""Delivery records, the approval proof and the integration-card hook.
+"""Delivery records, the approval proof and the dispatcher's publish step.
 
 When a review-required build card is approved from the review lane and
 ``kanban.delivery.enabled`` is true, :func:`record_approved_delivery` records
-ONE delivery for the source card and its approved head and creates ONE
-integration card, assigned to ``kanban.delivery.integration_profile``.
+ONE delivery for the source card and its approved head; no card is created.
 ``complete_task`` calls it once, from its approval branch, inside the
-approval's own transaction, so the approval, the record and the card commit
-or roll back together. With the setting off, or no integration profile, it
+approval's own transaction, so the approval and the record commit
+or roll back together. With the setting off it
 returns before touching anything and the approval behaves exactly as before.
 
 The approval proof is the T1 fence of :mod:`hermes_cli.kanban_delivery_fences`
@@ -14,8 +13,8 @@ applied to facts read only from the kernel's own records: the task row, its
 event log, its runs and the git repository the card was built in. Worker
 prose (handover text, comments, summaries, run metadata) is never read.
 
-:func:`publish_delivery` is T1 itself, run by the integration card's current
-run: the same approval facts, the publish ledger kept on the delivery row and
+:func:`publish_delivery` is T1 itself, run by :func:`publish_step` from
+``dispatch_once``: the same approval facts, the publish ledger kept on the delivery row and
 the remote facts read through :mod:`hermes_cli.kanban_delivery_github` decide
 whether the approved head becomes the delivery's one pull request.
 """
@@ -27,6 +26,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -39,13 +39,10 @@ from hermes_cli.kanban_delivery_fences import Decision, decide_publish, load_pol
 
 logger = logging.getLogger(__name__)
 
-# The integration card's idempotency key (plan section 5) is this prefix, the
+# The delivery key the pull request carries (plan section 5) is this prefix, the
 # owner-confirmed value, + source card id + ":" + approved head, so one source
-# card and head can only ever name one card.
+# card and head can only ever name one delivery.
 DELIVERY_KEY_PREFIX = "delivery:"
-
-# The creator every kernel-made integration card carries.
-_CREATED_BY = "kanban-delivery"
 
 _SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -61,67 +58,16 @@ def delivery_key(source_task_id: str, head: str) -> str:
     return DELIVERY_KEY_PREFIX + source_task_id + ":" + head
 
 
-# The integration card's body (plan section 5) is this fixed kernel text: the
-# steps in order and where it stops. Only the source card id, the approved head
-# and the delivery key are filled in, so no worker prose can reach the card.
-_INTEGRATION_CARD_BODY = (
-    "Kernel integration card for an approved build.\n"
-    "Approved source card: {source}\n"
-    "Approved head: {head}\n"
-    "Delivery key: {key}\n"
-    "\n"
-    "Steps, in this order:\n"
-    "1. T1 kanban_delivery_publish: publish the approved head.\n"
-    "2. T2 kanban_delivery_read_checks: read the required checks on the head.\n"
-    "3. T3 kanban_delivery_rerun_flaky: only for an eligible flaky failure, the one\n"
-    "   rerun, then T2 again.\n"
-    "4. T4 kanban_delivery_request_lenses: once the checks pass, request the lenses.\n"
-    "5. T6 kanban_delivery_merge: once both lenses approve the head, merge it.\n"
-    "6. T7 kanban_delivery_handoff: record the handoff of the merge.\n"
-    "\n"
-    "Where it stops:\n"
-    "- T1 refused (not approved, head mismatch, foreign branch, unknown pull\n"
-    "  request): block (needs_input) for Delivery and infrastructure and the\n"
-    "  owner. The source card is untouched.\n"
-    "- Checks pending: wait (blocked, transient); nothing moves.\n"
-    "- GitHub started zero jobs: stop and block for Delivery and infrastructure\n"
-    "  and the owner.\n"
-    "- Ineligible failure, or a failure after the one rerun: stop and complete as\n"
-    "  returned for changes with the evidence; the source card goes back to its\n"
-    "  implementer.\n"
-    "- Cancelled, timed out or infrastructure failure: stop and block\n"
-    "  (needs_input) for Delivery and infrastructure, not the authors.\n"
-    "- The review-labels gate (CI files touched): stop and block for the owner.\n"
-    "- A lens asks for changes: complete as returned for changes; the source card\n"
-    "  returns to Software engineering with the findings document.\n"
-    "- Identical findings twice on an identical head: stop for an owner decision.\n"
-    "- Head moved: all evidence and approvals for the head are void; stop and\n"
-    "  block for Delivery and infrastructure.\n"
-    "- Merge refused (not clean, or a GitHub refusal): stop and block for\n"
-    "  Delivery and infrastructure.\n"
-    "- Handoff error: retry; block as transient.\n"
-)
-
-
-def integration_card_body(source_task_id: str, head: str) -> str:
-    """The integration card's fixed kernel text for ``source_task_id`` at ``head``."""
-    return _INTEGRATION_CARD_BODY.format(
-        source=source_task_id, head=head, key=delivery_key(source_task_id, head),
-    )
-
-
-def delivery_settings() -> tuple[bool, Optional[str]]:
-    """``(enabled, integration_profile)`` from ``kanban.delivery``; off on any doubt."""
+def delivery_settings() -> bool:
+    """``kanban.delivery.enabled``; off on any doubt."""
     try:
         from hermes_cli.config import load_config
 
         section = (load_config() or {}).get("kanban", {}).get("delivery") or {}
         enabled = section.get("enabled") is True
-        profile = section.get("integration_profile")
     except Exception:
-        return False, None
-    profile = profile.strip() if isinstance(profile, str) else ""
-    return enabled, profile or None
+        return False
+    return enabled
 
 
 def _sha(value) -> Optional[str]:
@@ -279,17 +225,17 @@ def prove_approval(
     )
 
 
-def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Record the delivery of an approved card's head and create its one integration card.
+def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Record the delivery of an approved card's head; no card is created.
 
-    Returns the integration card id, or ``None`` when delivery is off, the card
+    Returns the delivery row id, or ``None`` when delivery is off, the card
     carries no review requirement, or the approval proof refuses. A second call
-    for the same source card and head returns the card the first one created.
-    A card that only carries the delivery key is never adopted: the call raises
-    instead, so the approval, the record and any new card roll back together.
+    for the same source card and head returns the row the first one recorded.
+    Every other row of the source card is returned for changes, and a new
+    approval re-arms the row of its head, parked or returned for changes, while
+    no pull request is recorded on it.
     """
-    enabled, profile = delivery_settings()
-    if not enabled or profile is None:
+    if not delivery_settings():
         return None
     with kb.write_txn(conn, allow_nested=True):
         row = conn.execute(
@@ -318,44 +264,32 @@ def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional
             "VALUES (?, ?, ?, ?)",
             (task_id, head, approval["run_id"], int(time.time())),
         )
+        # A new approval of a head with no pull request recorded re-arms its row
+        # and ends any lease on it, so a pass still holding one stores nothing.
+        conn.execute(
+            "UPDATE kanban_deliveries SET approval_run_id = ?, pull_request_state = NULL, "
+            "publish_refusal = NULL, publish_lease = NULL, publish_lease_until = NULL "
+            "WHERE source_task_id = ? AND source_head = ? AND pull_request_number IS NULL "
+            "AND approval_run_id IS NOT ?",
+            (approval["run_id"], task_id, head, approval["run_id"]),
+        )
         record = conn.execute(
-            "SELECT id, integration_task_id FROM kanban_deliveries "
+            "SELECT id FROM kanban_deliveries "
             "WHERE source_task_id = ? AND source_head = ?",
             (task_id, head),
         ).fetchone()
-        if record["integration_task_id"]:
-            return record["integration_task_id"]
-        body = integration_card_body(task_id, head)
-        integration_id = kb.create_task(
-            conn,
-            title=f"Integrate {task_id} at {head[:12]}",
-            body=body,
-            assignee=profile,
-            created_by=_CREATED_BY,
-            owned_paths=[],
-            idempotency_key=delivery_key(task_id, head),
-        )
-        # create_task answers a key that is already taken with that card, whoever
-        # made it. Nothing is adopted by its key alone: the card must be this
-        # delivery's own kernel card, or the approval, the record and any new
-        # card roll back together.
-        card = kb.get_task(conn, integration_id)
-        if card is None or (
-            card.created_by, card.assignee, card.owned_paths, card.body,
-        ) != (_CREATED_BY, kb._canonical_assignee(profile), [], body):
-            raise RuntimeError(
-                f"kanban delivery: the integration card {integration_id} for "
-                f"{task_id} at {head} is not this delivery's kernel card"
-            )
+        # The approval is the source card's latest, so every other head of it,
+        # older or newer, is returned for changes.
         conn.execute(
-            "UPDATE kanban_deliveries SET integration_task_id = ? WHERE id = ?",
-            (integration_id, record["id"]),
+            "UPDATE kanban_deliveries SET pull_request_state = 'returned_for_changes' "
+            "WHERE source_task_id = ? AND source_head != ?",
+            (task_id, head),
         )
-        return integration_id
+        return record["id"]
 
 
 # ---------------------------------------------------------------------------
-# T1 kanban_delivery_publish
+# T1: the dispatcher's publish step
 # ---------------------------------------------------------------------------
 
 # The one branch T1 publishes for a source card (plan section 4): this prefix
@@ -383,12 +317,26 @@ _PULL_REQUEST_BODY = (
     "Approved source card: {source}\n"
     "Approved head: {head}\n"
     "Delivery key: {key}\n"
-    "Integration card: {card}\n"
 )
+
+# How long one pass holds a delivery row. A pass that crashes or hangs loses
+# the row once its lease runs out, and a later pass takes it over.
+_LEASE_SECONDS = 600
+
+# Refusals that can pass on their own: nothing is stored, and the row is tried
+# again once its lease runs out. Any other refusal parks the row, recorded once.
+_RETRIED = frozenset({"delivery_disabled", "transport_failed", "lease_lost", "source_changed"})
+
+# Transport reasons that are GitHub's own answer, one the step cannot use: a
+# successful status whose body is not a JSON object or list, or a token of
+# another scope. They are refusals. Every other reason is a request that did not
+# complete, the transport's own refusal before any request, or a failure it does
+# not tell apart from a temporary one, so it is ``transport_failed``.
+_REFUSED_REASONS = frozenset({"bad_response", "token_scope_mismatch"})
 
 
 class PublishRefused(Exception):
-    """T1 refused. ``code`` is the fixed reason the tool reports; nothing was stored."""
+    """T1 refused. ``code`` is the fixed reason; nothing was stored."""
 
     def __init__(self, code: str, detail: str = ""):
         super().__init__(code)
@@ -420,35 +368,27 @@ def _policy_repositories() -> frozenset[str]:
     return frozenset(policy.required_checks)
 
 
-def _bind(conn: sqlite3.Connection, task_id: str, run_id: int) -> tuple:
-    """C1 and C2: delivery is on, ``task_id`` is the kernel integration card a
-    delivery record names, ``run_id`` is its current run, and the source card's
-    repository is in the policy. Returns ``(record, workdir, repository)``."""
-    enabled, _ = delivery_settings()
-    if not enabled:
-        raise PublishRefused("delivery_disabled", "kanban.delivery.enabled is not true")
+def _held(conn: sqlite3.Connection, delivery_id: int, holder: str):
+    """Delivery row ``delivery_id`` while ``holder``'s lease holds: the row names
+    this holder, its deadline is later than a fresh clock and no pull request is
+    recorded. Otherwise raises ``lease_lost``."""
     records = conn.execute(
-        "SELECT * FROM kanban_deliveries WHERE integration_task_id = ?", (task_id,),
+        "SELECT * FROM kanban_deliveries WHERE id = ? AND publish_lease = ? "
+        "AND publish_lease_until > ? AND pull_request_number IS NULL",
+        (delivery_id, holder, int(time.time())),
     ).fetchall()
-    card = conn.execute(
-        "SELECT created_by, idempotency_key FROM tasks WHERE id = ?", (task_id,),
-    ).fetchall()
-    if len(records) != 1 or len(card) != 1 or (
-        card[0]["created_by"], card[0]["idempotency_key"],
-    ) != (_CREATED_BY, delivery_key(records[0]["source_task_id"], records[0]["source_head"])):
-        raise PublishRefused(
-            "not_integration_card", f"{task_id} is not the integration card of a delivery",
-        )
-    current = conn.execute(
-        "SELECT 1 FROM tasks t "
-        "JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
-        "WHERE t.id = ? AND r.id = ? AND t.status = 'running' "
-        "AND r.status = 'running' AND r.ended_at IS NULL",
-        (task_id, run_id),
-    ).fetchall()
-    if not current:
-        raise PublishRefused("not_current_run", f"run {run_id} is not the current run of {task_id}")
-    record = records[0]
+    if len(records) != 1:
+        raise PublishRefused("lease_lost", f"the lease of delivery {delivery_id} ran out or was taken over")
+    return records[0]
+
+
+def _bind(conn: sqlite3.Connection, delivery_id: int, holder: str) -> tuple:
+    """C1 and C2: delivery is on, ``holder``'s lease on delivery row
+    ``delivery_id`` holds, and the source card's
+    repository is in the policy. Returns ``(record, workdir, repository)``."""
+    if not delivery_settings():
+        raise PublishRefused("delivery_disabled", "kanban.delivery.enabled is not true")
+    record = _held(conn, delivery_id, holder)
     source = conn.execute(
         "SELECT workspace_path FROM tasks WHERE id = ?", (record["source_task_id"],),
     ).fetchall()
@@ -462,28 +402,12 @@ def _bind(conn: sqlite3.Connection, task_id: str, run_id: int) -> tuple:
     return record, workdir, repository
 
 
-def publish_available(task_id: str, run_id: int) -> bool:
-    """C1 and C2 for the check function: may run ``run_id`` of ``task_id`` see T1?"""
-    try:
-        with kb.connect_closing(board=os.environ.get("HERMES_KANBAN_BOARD")) as conn:
-            _bind(conn, task_id, run_id)
-    except Exception:
-        return False
-    return True
-
-
-def _snapshot(conn: sqlite3.Connection, task_id: str, run_id: int, source: str) -> tuple:
+def _snapshot(conn: sqlite3.Connection, source: str) -> list:
     """What must be unchanged for a result to be stored: every delivery record
-    of the source card, and the integration card's run."""
-    records = [tuple(row) for row in conn.execute(
+    of the source card, its publish lease included."""
+    return [tuple(row) for row in conn.execute(
         "SELECT * FROM kanban_deliveries WHERE source_task_id = ? ORDER BY id", (source,),
     )]
-    run = [tuple(row) for row in conn.execute(
-        "SELECT t.status, t.current_run_id, r.status, r.ended_at FROM tasks t "
-        "LEFT JOIN task_runs r ON r.id = ? AND r.task_id = t.id WHERE t.id = ?",
-        (run_id, task_id),
-    )]
-    return records, run
 
 
 def _source_state(conn: sqlite3.Connection, source: str) -> tuple:
@@ -507,39 +431,139 @@ def _one_read(conn: sqlite3.Connection):
             conn.execute("ROLLBACK")
 
 
-def _lease_refusal(error, code: str, detail: str) -> Exception:
-    """A lease that GitHub refuses is the fence's ``code``; any other transport
-    failure is reported by its reason alone."""
-    if error.reason == "push_lease_mismatch":
-        return PublishRefused(code, detail)
+def _transport_refusal(error) -> PublishRefused:
+    """A transport failure, classified by its reason."""
+    if error.reason in _REFUSED_REASONS:
+        return PublishRefused(error.reason, "GitHub answered with a body the step cannot use")
     return PublishRefused("transport_failed", error.reason)
 
 
-def publish_delivery(task_id: str, run_id: int) -> dict:
-    """T1: publish the approved head of the delivery whose integration card is
-    ``task_id`` as its one pull request, for the card's current run ``run_id``.
+def _lease_refusal(error, code: str, detail: str) -> Exception:
+    """A lease that GitHub refuses is the fence's ``code``; any other transport
+    failure is classified by its reason."""
+    if error.reason == "push_lease_mismatch":
+        return PublishRefused(code, detail)
+    return _transport_refusal(error)
+
+
+def _answered(answer: dict) -> dict:
+    """GitHub's answer, read as evidence only when it is not a temporary one: a
+    rate limit (429) or an outage (5xx) proves nothing, so it stores nothing and
+    the row is tried again once its lease runs out. Any other answer the step
+    cannot use is a refusal."""
+    if answer["status"] == 429 or answer["status"] >= 500:
+        raise PublishRefused("transport_failed", f"GitHub answered {answer['status']}")
+    return answer
+
+
+def _branch_head(github, branch: str) -> Optional[str]:
+    """The commit ``branch`` holds on GitHub, or ``None`` when GitHub answers 404.
+    Read through ``request``: the transport's ``branch_head`` raises one reason
+    for a temporary answer and for a malformed one alike."""
+    answer = _answered(github.request("GET", f"/repos/{github.repository}/git/ref/heads/{branch}"))
+    if answer["status"] == 404:
+        return None
+    target = answer["data"].get("object") if isinstance(answer["data"], dict) else None
+    sha = target.get("sha") if isinstance(target, dict) else None
+    if answer["status"] != 200 or not isinstance(sha, str) or not _SHA.fullmatch(sha):
+        raise PublishRefused("branch_unreadable", f"GitHub answered {answer['status']}")
+    return sha
+
+
+def _take_lease(db_path: Path) -> Optional[tuple]:
+    """Lease the oldest delivery row still to publish: no pull request
+    recorded, not returned for changes, not parked, and no lease that still
+    holds. Returns ``(delivery_id, holder)``, or ``None``."""
+    holder, now = secrets.token_hex(16), int(time.time())
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT id FROM kanban_deliveries WHERE pull_request_number IS NULL "
+            "AND pull_request_state IS NULL AND publish_refusal IS NULL "
+            "AND (publish_lease_until IS NULL OR publish_lease_until <= ?) "
+            "ORDER BY id LIMIT 1",
+            (now,),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            "UPDATE kanban_deliveries SET publish_lease = ?, publish_lease_until = ? WHERE id = ?",
+            (holder, now + _LEASE_SECONDS, row["id"]),
+        )
+    return row["id"], holder
+
+
+def _park(db_path: Path, delivery_id: int, holder: str, refusal: PublishRefused) -> None:
+    """Park a delivery row while this pass's lease on it holds: it is not tried
+    again, and its refusal is recorded once on the source card."""
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        row = _held(conn, delivery_id, holder)
+        conn.execute(
+            "UPDATE kanban_deliveries SET publish_refusal = ?, publish_lease = NULL, "
+            "publish_lease_until = NULL WHERE id = ?",
+            (refusal.code, delivery_id),
+        )
+        kb._append_event(conn, row["source_task_id"], "delivery_refused", {
+            "delivery_id": delivery_id,
+            "head": row["source_head"],
+            "code": refusal.code,
+            "detail": refusal.detail,
+        })
+
+
+def publish_step(db_path: Optional[Path]) -> Optional[dict]:
+    """The dispatcher's delivery step for the board whose file is ``db_path``: lease at
+    most one approved delivery row and publish it. Raises no error, so the tick goes on."""
+    if db_path is None or not delivery_settings():
+        return None
+    try:
+        leased = _take_lease(db_path)
+        if leased is None:
+            return None
+        try:
+            return publish_delivery(db_path, *leased)
+        except PublishRefused as refusal:
+            logger.warning(
+                "kanban delivery: delivery %s not published: %s (%s)",
+                leased[0], refusal.code, refusal.detail,
+            )
+            if refusal.code not in _RETRIED:
+                with contextlib.suppress(PublishRefused):  # a lease that ran out parks nothing
+                    _park(db_path, *leased, refusal)
+    except Exception:
+        # The tick goes on; a row this pass leased is tried again once its lease runs out.
+        logger.exception("kanban delivery: the publish step failed")
+    return None
+
+
+def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
+    """T1: publish the approved head of delivery row ``delivery_id`` as its one
+    pull request, while ``holder``'s publish lease on the row holds.
 
     Returns ``{state, head, pull_request_number, branch}`` or raises
     :class:`PublishRefused`. Every fact is captured first, the GitHub work runs
     outside every transaction and connection, and the ledger and the events are
-    stored only if the delivery records, the run and the source card are
+    stored only if the delivery records, the lease and the source card are
     unchanged (C4), and only once GitHub, read again after any push or creation,
     shows the pull request open at H on the branch at H.
     """
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
-    board = os.environ.get("HERMES_KANBAN_BOARD")
+    def hold() -> None:  # right before each change on GitHub, on its own connection
+        if not delivery_settings():  # switched off after the admission: change nothing
+            raise PublishRefused("delivery_disabled", "kanban.delivery.enabled is not true")
+        with kb.connect_closing(db_path=db_path) as conn:
+            _held(conn, delivery_id, holder)
+
     # The admission, the approval and ledger reads and the snapshot are one read, so a
-    # reclaim after the admission cannot put the reclaimed run into the snapshot that
+    # takeover after the admission cannot put the new lease into the snapshot that
     # the final write compares against. The read ends before any GitHub call.
-    with kb.connect_closing(board=board) as conn, _one_read(conn):
-        record, workdir, repository = _bind(conn, task_id, run_id)
+    with kb.connect_closing(db_path=db_path) as conn, _one_read(conn):
+        record, workdir, repository = _bind(conn, delivery_id, holder)
         source = record["source_task_id"]
-        if conn.execute(
-            "SELECT 1 FROM kanban_deliveries WHERE source_task_id = ? AND id > ?",
-            (source, record["id"]),
-        ).fetchall():
-            raise PublishRefused("superseded", f"a newer approved head of {source} has its own delivery")
+        # Each approval returns every other head of the source card for changes, so
+        # only the row of its latest approval is still pending.
+        if record["pull_request_state"] is not None:
+            raise PublishRefused("superseded", f"a later approval of {source} returned this head for changes")
         # Captured before the approval is proven, so the final write sees any later change.
         approved_source = _source_state(conn, source)
         approval = approval_facts(conn, source, record["source_head"])
@@ -564,15 +588,15 @@ def publish_delivery(task_id: str, run_id: int) -> dict:
                 "pull_request": recorded_number, "head": old, "state": recorded_state,
                 "head_is_ancestor": _git_proof(workdir, head, _sha(old))[1],
             }
-        snapshot = _snapshot(conn, task_id, run_id, source)
+        snapshot = _snapshot(conn, source)
 
     branch = delivery_branch(source)
     pulls_path = f"/repos/{repository}/pulls"
     try:
         github = GitHubTransport("publish", repository)
-        listed = github.request("GET", pulls_path, query={
+        listed = _answered(github.request("GET", pulls_path, query={
             "state": "open", "head": f"{repository.split('/')[0]}:{branch}", "per_page": 100,
-        })
+        }))
         pulls = listed["data"]
         if listed["status"] != 200 or not isinstance(pulls, list) or not all(
             isinstance(pull, dict) for pull in pulls
@@ -581,9 +605,14 @@ def publish_delivery(task_id: str, run_id: int) -> dict:
         open_pulls = [{
             "number": pull.get("number"),
             "head": pull["head"].get("sha") if isinstance(pull.get("head"), dict) else None,
+            "base": pull["base"].get("ref") if isinstance(pull.get("base"), dict) else None,
         } for pull in pulls]
+        # A pull request of the delivery branch that targets another base, or none, is not the
+        # delivery's own: nothing is updated, adopted or bound, before any decision.
+        if any(pull["base"] != _PULL_REQUEST_BASE for pull in open_pulls):
+            raise PublishRefused("wrong_base", "an open pull request of the delivery branch does not target main")
         remote = {
-            "branch_head": github.branch_head(branch),  # None when GitHub has no such branch
+            "branch_head": _branch_head(github, branch),  # None when GitHub has no such branch
             "open_pulls": open_pulls,
         }
         decision = decide_publish(approval, ledger, remote)
@@ -593,20 +622,22 @@ def publish_delivery(task_id: str, run_id: int) -> dict:
             state = "adopted"  # the branch already holds H, so nothing is pushed
             if decision.code == "push_and_create":
                 try:
+                    hold()
                     pushed = github.push(workdir, branch, head, expected="")
                 except GitHubTransportError as error:
                     raise _lease_refusal(
                         error, "foreign_branch", f"{branch} holds a head other than {head}",
                     ) from None
                 state = "adopted" if pushed["state"] == "up_to_date" else "created"
-            created = github.request("POST", pulls_path, body={
+            hold()
+            created = _answered(github.request("POST", pulls_path, body={
                 "title": _PULL_REQUEST_TITLE.format(source=source, head=head),
                 "head": branch,
                 "base": _PULL_REQUEST_BASE,
                 "body": _PULL_REQUEST_BODY.format(
-                    source=source, head=head, key=delivery_key(source, head), card=task_id,
+                    source=source, head=head, key=delivery_key(source, head),
                 ),
-            })
+            }))
             pull = created["data"] if isinstance(created["data"], dict) else {}
             number = pull.get("number")
             pulled = pull["head"].get("sha") if isinstance(pull.get("head"), dict) else None
@@ -616,34 +647,42 @@ def publish_delivery(task_id: str, run_id: int) -> dict:
                 )
         elif decision.code == "push_fast_forward":
             try:
+                hold()
                 github.push(workdir, branch, head, expected=ledger["head"])
             except GitHubTransportError as error:
                 raise _lease_refusal(
                     error, "head_moved", f"{branch} no longer holds {ledger['head']}",
                 ) from None
             number, state = ledger["pull_request"], "fast_forwarded"
+        elif decision.code == "adopt_pull_request":  # no ledger, and one pull request open at H
+            number, state = open_pulls[0]["number"], "adopted"
         else:  # already_published or adopt_fast_forward: GitHub already holds H
             number = ledger["pull_request"]
             state = "already_published" if decision.code == "already_published" else "fast_forwarded"
-        if decision.code in ("push_and_create", "adopt_and_create", "push_fast_forward"):
-            # GitHub changed, so both are read again, still outside every transaction:
-            # only the pull request open at H on the branch at H is a success.
-            again = github.request("GET", f"{pulls_path}/{number}")
+        if decision.code in (
+            "push_and_create", "adopt_and_create", "push_fast_forward", "adopt_pull_request", "adopt_fast_forward",
+        ):
+            # GitHub changed or holds an unrecorded pull request, so both are read again, outside every
+            # transaction: only the pull request open at H against main on the branch at H is a success.
+            again = _answered(github.request("GET", f"{pulls_path}/{number}"))
             reread = again["data"] if again["status"] == 200 and isinstance(again["data"], dict) else {}
             reread_head = reread["head"].get("sha") if isinstance(reread.get("head"), dict) else None
-            if (reread.get("state"), reread_head, github.branch_head(branch)) != ("open", head, head):
+            reread_base = reread["base"].get("ref") if isinstance(reread.get("base"), dict) else None
+            if (reread.get("state"), reread_head, reread_base, _branch_head(github, branch)) != (
+                    "open", head, _PULL_REQUEST_BASE, head):
                 raise PublishRefused(
                     "head_moved",
                     f"pull request {number} or {branch} is not open at {head} after the publish",
                 )
     except GitHubTransportError as error:
-        raise PublishRefused("transport_failed", error.reason) from None
+        raise _transport_refusal(error) from None
 
-    with kb.connect_closing(board=board) as conn:
+    with kb.connect_closing(db_path=db_path) as conn:
         with kb.write_txn(conn):
-            if _snapshot(conn, task_id, run_id, source) != snapshot:
+            _held(conn, delivery_id, holder)
+            if _snapshot(conn, source) != snapshot:
                 raise PublishRefused(
-                    "stale_run", "the delivery record or the run changed; nothing was stored",
+                    "lease_lost", "the delivery records or the lease changed; nothing was stored",
                 )
             if _source_state(conn, source) != approved_source:
                 raise PublishRefused(
@@ -653,10 +692,11 @@ def publish_delivery(task_id: str, run_id: int) -> dict:
             if state != "already_published":
                 conn.execute(
                     "UPDATE kanban_deliveries SET pull_request_number = ?, pull_request_head = ?, "
-                    "pull_request_state = 'open', pull_request_branch = ? WHERE id = ?",
+                    "pull_request_state = 'open', pull_request_branch = ?, publish_lease = NULL, "
+                    "publish_lease_until = NULL WHERE id = ?",
                     (number, head, branch, record["id"]),
                 )
-                kb._append_event(conn, task_id, "delivery_bound", {
+                kb._append_event(conn, source, "delivery_bound", {
                     "source_task_id": source,
                     "head": head,
                     "base_commit": approval["base"],
@@ -664,14 +704,14 @@ def publish_delivery(task_id: str, run_id: int) -> dict:
                     "implementer": approval["implementer"],
                     "approval_event_id": approval_event,
                     "base_is_ancestor": approval["base_is_ancestor"],
-                }, run_id=run_id)
-            kb._append_event(conn, task_id, "delivery_published", {
+                })
+            kb._append_event(conn, source, "delivery_published", {
                 "repository": repository,
                 "branch": branch,
                 "pull_request_number": number,
                 "head": head,
                 "state": state,
-            }, run_id=run_id)
+            })
     return {
         "state": "created" if state == "adopted" else state,
         "head": head,

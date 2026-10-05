@@ -94,7 +94,18 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli import kanban_provider_stops as _provider_stops
-from hermes_cli.kanban_risk_tier import parse_risk_tier
+from hermes_cli.kanban_risk_tier import (
+    active_run_box_seconds,
+    card_work_kind,
+    check_raise,
+    effective_risk_tier,
+    parse_risk_tier,
+    pinned_reasoning_effort,
+    pinned_time_box_seconds,
+    raised_reasoning_effort,
+    requires_independent_review,
+    review_run_box_seconds,
+)
 from hermes_cli.sqlite_util import (
     InitLockDirectoryAbsent,
     InitLockUnavailable,
@@ -278,6 +289,47 @@ def policy_lock_error(
     """
     return _model_policy().policy_lock_error(
         lock, assignee, provider, model, effort, execution_tier
+    )
+
+
+def _pin_new_card(
+    assignee: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    effort: Optional[str],
+    execution_tier: Optional[str],
+    lock: Optional[str],
+    risk_tier: Optional[int],
+    responsibility: Optional[str],
+    owned_paths: Optional[list],
+    max_runtime_seconds: Optional[int],
+    integrates_parent_heads: bool,
+    requires_review: bool,
+) -> tuple[Optional[str], Optional[str], Optional[int], bool, Optional[int], Optional[str]]:
+    """Return a new card's ``(effort, lock, max_runtime_seconds, requires_review,
+    risk_tier, pinned_effort)``.
+
+    Only a card with a route lock is pinned; a CLI or other unlocked card keeps
+    what its creator passed. The time box follows the card's kind of work, and
+    a build is always reviewed (owner decision 4). The effort follows the
+    card's risk tier, a new card without one counting as tier 2 (owner
+    decision 3), and is sealed again on the same model. The tier the card
+    counts as is returned for its writer to record. ``pinned_effort`` is the
+    effort pinned here, recorded with the row so a review round trip keeps it;
+    it is None for an unlocked card. Only new cards are pinned here. The rules
+    live in :mod:`hermes_cli.kanban_risk_tier`.
+    """
+    if lock is None:
+        return effort, lock, max_runtime_seconds, requires_review, risk_tier, None
+    kind = card_work_kind(assignee, owned_paths, execution_tier, integrates_parent_heads)
+    tier = effective_risk_tier(risk_tier)
+    pinned = pinned_reasoning_effort(tier, responsibility)
+    if pinned != effort:
+        lock = mint_policy_lock(assignee, provider, model, pinned, execution_tier)
+    return (
+        pinned, lock, pinned_time_box_seconds(kind),
+        requires_review or requires_independent_review(assignee, kind), tier,
+        pinned,
     )
 
 
@@ -16060,6 +16112,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- tier 2 and is treated as high risk (hermes_cli.kanban_risk_tier). It
     -- changes no routing, effort or time box.
     risk_tier            INTEGER,
+    -- The effort pinned from the risk tier when the card was created. Its
+    -- presence marks a card pinned at creation, which re-pins by its current
+    -- tier on a review round trip. NULL for every card written before the
+    -- pins and every unlocked card: a recorded tier alone does not prove a
+    -- pin, so such a card keeps each role's own effort.
+    pinned_effort        TEXT,
     -- Discriminates ordinary work tasks ('work', the create_task default) from native
     -- recommendation cards (see create_recommendation). recommendation_* / target_profile /
     -- review_policy / provenance_* are populated only when task_kind='recommendation' (NULL otherwise).
@@ -17773,6 +17831,10 @@ def _migrate_add_optional_columns(
         # Approved-plan risk tier (see SCHEMA_SQL). Existing rows get NULL: no
         # tier is recorded, so they count as tier 2 and change no behaviour.
         _add_column_if_missing(conn, "tasks", "risk_tier", "risk_tier INTEGER")
+    if "pinned_effort" not in cols:
+        # Creation-time effort pin (see SCHEMA_SQL). Existing rows get NULL and
+        # keep each role's own effort on a review round trip.
+        _add_column_if_missing(conn, "tasks", "pinned_effort", "pinned_effort TEXT")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
@@ -18091,11 +18153,17 @@ def _migrate_add_optional_columns(
     # Additive: the T1 publish ledger (hermes_cli/kanban_delivery.py), the
     # delivery's one pull request, the head it was published at, its state and
     # its branch. A row recorded before slice 4 has no pull request yet.
+    # Then the dispatcher's publish lease: the holder token and when it runs
+    # out, so one publisher holds a row and a crashed one's row is taken over;
+    # and the refusal that parked the row. A row from before has neither.
     for column, ddl in (
         ("pull_request_number", "pull_request_number INTEGER"),
         ("pull_request_head", "pull_request_head TEXT"),
         ("pull_request_state", "pull_request_state TEXT"),
         ("pull_request_branch", "pull_request_branch TEXT"),
+        ("publish_lease", "publish_lease TEXT"),
+        ("publish_lease_until", "publish_lease_until INTEGER"),
+        ("publish_refusal", "publish_refusal TEXT"),
     ):
         _add_column_if_missing(conn, "kanban_deliveries", column, ddl)
     notify_table_exists = conn.execute(
@@ -19405,8 +19473,8 @@ def create_task(
             "work, not for a control anchor or a read-only reviewer task"
         )
     if risk_tier is not None:
-        # The one writer validates the tier, so no path stores a bad one. None
-        # stays None: legacy and CLI cards record no tier.
+        # The one writer validates the tier, so no path stores a bad one. A
+        # CLI card without one records none; a locked card records its pin's.
         risk_tier = parse_risk_tier(risk_tier)
     responsibility = normalize_responsibility(responsibility)
     owned_paths_list = normalize_owned_paths(owned_paths)
@@ -19422,6 +19490,15 @@ def create_task(
         raise ValueError(
             "integrates_parent_heads requires a mutating owned_paths scope"
         )
+    (
+        reasoning_effort, model_policy_lock, max_runtime_seconds, requires_review,
+        risk_tier, pinned_effort,
+    ) = _pin_new_card(
+        assignee, provider_override, model_override, reasoning_effort,
+        execution_tier, model_policy_lock, risk_tier, responsibility,
+        owned_paths_list, max_runtime_seconds, integrates_parent_heads,
+        requires_review,
+    )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -19712,8 +19789,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, execution_tier, model_policy_lock,
                         goal_mode, goal_max_turns, session_id, task_kind,
-                        owner_receipt_bound, requires_review, risk_tier
-                    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{gate_sql}
+                        owner_receipt_bound, requires_review, risk_tier, pinned_effort
+                    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{gate_sql}
                     """,
                     (
                         task_id,
@@ -19748,6 +19825,7 @@ def create_task(
                         1 if receipt_owned else 0,
                         1 if requires_review else 0,
                         risk_tier,
+                        pinned_effort,
                         *gate_params,
                     ),
                 )
@@ -21477,22 +21555,31 @@ def _live_policy_route_assignments(
     already carries the review requirement, which is what authorizes the
     re-pin: the owner approved review for this exact card, so handing it to the
     reviewer and back is approved work, not a silent re-route.
+
+    A card pinned at creation (its pinned_effort is recorded) keeps the
+    effort its current tier pins, on the new role's model, so the round trip
+    never moves it back to the role's base effort and a raised tier re-pins.
+    A card without that record, also one with a tier recorded before the pins,
+    keeps each role's own effort (:mod:`hermes_cli.kanban_risk_tier`).
     """
     policy = _model_policy()
     tier = policy.normalize_execution_tier(row["execution_tier"])
     assignment = policy.resolve_task_assignment(target, tier)
+    effort = assignment.reasoning_effort
+    if row["pinned_effort"] is not None:
+        effort = pinned_reasoning_effort(row["risk_tier"], row["responsibility"])
     lock = mint_policy_lock(
         target,
         assignment.provider,
         assignment.model,
-        assignment.reasoning_effort,
+        effort,
         tier,
     )
     return (
         [
             ("model_override", assignment.model),
             ("provider_override", assignment.provider),
-            ("reasoning_effort", assignment.reasoning_effort),
+            ("reasoning_effort", effort),
             ("execution_tier", tier),
             ("model_policy_lock", lock),
         ],
@@ -21500,7 +21587,7 @@ def _live_policy_route_assignments(
             "assignee": target,
             "model": assignment.model,
             "provider": assignment.provider,
-            "reasoning_effort": assignment.reasoning_effort,
+            "reasoning_effort": effort,
             "execution_tier": tier,
             "source": "committed_review_requirement",
         },
@@ -21594,7 +21681,7 @@ def role_transition_route(
     row = conn.execute(
         "SELECT assignee, execution_tier, model_policy_lock, model_override, "
         "provider_override, reasoning_effort, owner_receipt_bound, "
-        "requires_review FROM tasks "
+        "requires_review, risk_tier, pinned_effort, responsibility FROM tasks "
         "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
@@ -24560,8 +24647,8 @@ def claim_review_task(
         if cur.rowcount != 1:
             return None
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
-            "FROM tasks WHERE id = ?",
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "model_policy_lock FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         run_cur = conn.execute(
@@ -24578,7 +24665,10 @@ def claim_review_task(
                 trow["current_step_key"] if trow else None,
                 lock,
                 expires,
-                trow["max_runtime_seconds"] if trow else None,
+                # The review box for this run; the card keeps its own box.
+                review_run_box_seconds(
+                    trow["max_runtime_seconds"], bool(trow["model_policy_lock"]),
+                ) if trow else None,
                 now,
             ),
         )
@@ -25823,8 +25913,9 @@ def _review_approval_head(
 class _SavedResultHandoverRefused(Exception):
     """Internal: the review transition refused a saved-result handover.
 
-    Raised by :func:`complete_task` in place of ``False``, and only for
-    :func:`_hand_over_saved_patch`, so that the run it parks records
+    Raised by :func:`complete_task` in place of ``False``, and only for the
+    kernel's saved-patch handovers (:func:`_hand_over_saved_patch` and
+    :func:`_complete_run_handover_before_timeout`), so that each records
     :func:`request_review`'s own reason rather than a bare refusal.
     """
 
@@ -25941,12 +26032,13 @@ def complete_task(
     ``integrates_parent_heads=true``. Neither option grants the worker host
     filesystem or shell access.
 
-    ``_saved_result_attachment_id`` is KERNEL-INTERNAL: only
-    :func:`_hand_over_saved_patch` passes it, and the review park hands it on
-    unchanged to :func:`request_review`, which records that handover in the
-    transaction that parks the card. When that review transition refuses,
-    :class:`_SavedResultHandoverRefused` carries ``request_review``'s reason
-    instead of ``False``.
+    ``_saved_result_attachment_id`` is KERNEL-INTERNAL: only the kernel's
+    saved-patch handovers (:func:`_hand_over_saved_patch` and
+    :func:`_complete_run_handover_before_timeout`) pass it, and the review
+    park hands it on unchanged to :func:`request_review`, which records that
+    handover in the transaction that parks the card. When that review
+    transition refuses, :class:`_SavedResultHandoverRefused` carries
+    ``request_review``'s reason instead of ``False``.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
@@ -27803,10 +27895,12 @@ def request_review(
     exact git object id.
 
     ``_saved_result_attachment_id`` is KERNEL-INTERNAL too: nothing outside
-    this module may pass it. It exists so the dead-worker scan's handover of a
-    saved patch (:func:`_hand_over_saved_patch`, through :func:`complete_task`)
-    records its ``saved_result_handed_over`` event in the SAME transaction as
-    this transition, bound to the implementation run it closes. Appended in a
+    this module may pass it. It exists so the kernel's handovers of a saved
+    patch (the dead-worker scan's :func:`_hand_over_saved_patch` and the
+    budget's :func:`_complete_run_handover_before_timeout`, both through
+    :func:`complete_task`) record their ``saved_result_handed_over`` event in
+    the SAME transaction as this transition, bound to the implementation run
+    it closes. Appended in a
     transaction of its own afterwards, a process stop in between lost the
     event for good: the next scan no longer sees a running task to record it
     for.
@@ -28464,6 +28558,7 @@ def submit_review_findings(
     findings: Any,
     candidate_digest: str,
     expected_run_id: Optional[int] = None,
+    risk_tier: Any = None,
 ) -> dict:
     """Reviewer handback entry point — the ONLY way typed findings reach an
     implementer.
@@ -28499,6 +28594,14 @@ def submit_review_findings(
     Returns a dict with ``outcome`` in
     ``{"passed", "handed_back", "owner_decision_blocked", "error"}`` plus
     outcome-specific detail (``attachment_id``, ``fingerprints``, ...).
+
+    ``risk_tier`` is the reviewer's tier for the card. It may only raise the
+    tier (:func:`hermes_cli.kanban_risk_tier.check_raise`): a lowering is an
+    ``error`` before anything is written, with no verdict. A raise is written
+    with one ``risk_tier_raised`` event before the verdict, together with the
+    re-pin of the role holding a card pinned at creation
+    (:func:`hermes_cli.kanban_risk_tier.raised_reasoning_effort`), so every
+    later run, after any verdict, runs at the raised tier's effort.
     """
     document = build_review_findings_document(findings, candidate_digest=candidate_digest)
     candidate_digest = document["candidate_digest"]
@@ -28532,6 +28635,44 @@ def submit_review_findings(
                 "outcome": "error",
                 "reason": "active run was not claimed from review",
             }
+        try:
+            raised_to = None if risk_tier is None else check_raise(task.risk_tier, risk_tier)
+        except ValueError as exc:
+            return {"outcome": "error", "reason": str(exc)}
+        risk_tier_raised = None
+        if raised_to is not None:
+            risk_tier_raised = {
+                "from": task.risk_tier, "to": raised_to,
+                "reviewer": task.assignee, "run_id": current_run_id,
+            }
+            pinned = conn.execute(
+                "SELECT pinned_effort FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()["pinned_effort"]
+            effort = raised_reasoning_effort(pinned, raised_to, task.responsibility)
+            if effort is None:
+                conn.execute(
+                    "UPDATE tasks SET risk_tier = ? WHERE id = ?", (raised_to, task_id),
+                )
+            else:
+                # The role holding the card is re-pinned with the raise and
+                # sealed again on its own route, so no later run, whichever
+                # verdict follows, runs below the raised tier.
+                conn.execute(
+                    "UPDATE tasks SET risk_tier = ?, reasoning_effort = ?, "
+                    "model_policy_lock = ?, pinned_effort = ? WHERE id = ?",
+                    (
+                        raised_to, effort,
+                        mint_policy_lock(
+                            task.assignee, task.provider_override,
+                            task.model_override, effort, task.execution_tier,
+                        ),
+                        effort, task_id,
+                    ),
+                )
+            _append_event(
+                conn, task_id, "risk_tier_raised", risk_tier_raised,
+                run_id=current_run_id,
+            )
 
         # EVERY validated finding the current review reports is outstanding.
         # History is consulted only to note that a finding is being re-raised
@@ -28557,6 +28698,7 @@ def submit_review_findings(
             )
         history = _review_findings_history(conn, task_id)
     re_raised_fingerprints = [f["fingerprint"] for f in re_raised]
+    raised_detail = {"risk_tier_raised": risk_tier_raised} if risk_tier_raised else {}
 
     if not outstanding:
         ok = complete_task(
@@ -28568,6 +28710,7 @@ def submit_review_findings(
         return {
             "outcome": "passed" if ok else "error",
             "re_raised_fingerprints": re_raised_fingerprints,
+            **raised_detail,
         }
 
     outstanding_fingerprints = {f["fingerprint"] for f in outstanding}
@@ -28616,6 +28759,7 @@ def submit_review_findings(
                 "candidate_digest": candidate_digest,
                 "fingerprints": sorted(outstanding_fingerprints),
                 "re_raised_fingerprints": re_raised_fingerprints,
+                **raised_detail,
             }
 
     document_bytes = json.dumps(
@@ -28701,6 +28845,7 @@ def submit_review_findings(
         "implementer": implementer,
         "fingerprints": sorted(outstanding_fingerprints),
         "re_raised_fingerprints": re_raised_fingerprints,
+        **raised_detail,
     }
 
 
@@ -30001,14 +30146,22 @@ def decompose_triage_task(
                     f"child[{idx}] read-only reviewer work cannot itself "
                     "require review"
                 )
-            # The approved risk tier, validated like create_task's: None stays
-            # None (no tier recorded).
+            # The approved risk tier, validated like create_task's. A locked
+            # child without one records the tier its pin counts it as.
             risk_tier = child.get("risk_tier")
             if risk_tier is not None:
                 try:
                     risk_tier = parse_risk_tier(risk_tier)
                 except ValueError as exc:
                     raise ValueError(f"child[{idx}] {exc}") from None
+            (
+                reasoning_effort, model_policy_lock, max_runtime_seconds,
+                requires_review, risk_tier, pinned_effort,
+            ) = _pin_new_card(
+                assignee, provider_override, model_override, reasoning_effort,
+                execution_tier, model_policy_lock, risk_tier, responsibility,
+                owned_paths, None, integrates_parent_heads, requires_review,
+            )
             # Written with the row but never part of the approved children,
             # so the owner graph digest that names them is unchanged.
             skills = (
@@ -30060,8 +30213,8 @@ def decompose_triage_task(
                 " integrates_parent_heads, skills, model_override, provider_override, "
                 " reasoning_effort, execution_tier, model_policy_lock, "
                 " owner_receipt_bound, requires_review, risk_tier, park_generation, "
-                " created_at, created_by) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " created_at, created_by, max_runtime_seconds, pinned_effort) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -30087,6 +30240,8 @@ def decompose_triage_task(
                     generation,
                     now,
                     (author or "decomposer"),
+                    max_runtime_seconds,
+                    pinned_effort,
                 ),
             )
             _append_event(
@@ -30519,6 +30674,8 @@ def apply_owner_project_plan(
                 reasoning_effort=spec.get("reasoning_effort"),
                 execution_tier=spec.get("execution_tier"),
                 model_policy_lock=spec.get("model_policy_lock"),
+                # The approved tier pins the card's effort at creation.
+                risk_tier=spec.get("risk_tier"),
                 # Absent means legacy fail-closed whole-repository ownership,
                 # exactly as before this key existed; a present value is the
                 # owner-approved explicit write boundary and forces the
@@ -33883,6 +34040,12 @@ def _complete_run_handover_before_timeout(
     """Complete a run that already delivered its handover, instead of timing
     it out. Returns True only when the completion landed.
 
+    A handover is the run's own patch and report. On a card that requires
+    review the run's one saved patch is enough (owner decision 4): it goes
+    over as the existing saved-result handover does, the one candidate of
+    :func:`_saved_patch_ids_for_review` passed to :func:`complete_task` as
+    ``_saved_result_attachment_id``, whose review park records it.
+
     THE single place any expiring budget consults the handover, so the two
     exits that can end a run on a budget cannot disagree about it:
 
@@ -33900,7 +34063,7 @@ def _complete_run_handover_before_timeout(
 
     Materialization is :func:`complete_task` with ``patch_attachment_id`` —
     the SAME single path every other completion uses, never a second forked
-    materialization. The report's bytes become the completion summary. On
+    materialization. A report's bytes become the completion summary. On
     success a ``run_handover_completed`` event marks the handover; if
     completion fails for any reason a ``run_handover_failed`` event records
     why and ``False`` is returned, so the caller falls back to its ordinary
@@ -33926,27 +34089,35 @@ def _complete_run_handover_before_timeout(
             return False
         run_id = int(row["current_run_id"])
     handover = _run_handover_artifacts(conn, task_id, int(run_id))
-    if handover is None:
-        return False
-    patch_attachment, report_attachment = handover
+    if handover is not None:
+        patch_id, report_attachment = handover[0].id, handover[1]
+    else:
+        # Without a report, only the one patch a reviewed card's run saved.
+        patches = _saved_patch_ids_for_review(conn, task_id, int(run_id))
+        if len(patches) != 1:
+            return False
+        patch_id, report_attachment = patches[0], None
     if stop_worker is not None:
         stop_worker()
-    try:
-        report_text = read_attachment_bytes(report_attachment).decode(
-            "utf-8", errors="replace",
-        ).strip()
-    except (OSError, ValueError):
-        report_text = ""
+    summary: Optional[str] = _BUDGET_PATCH_HANDOVER_SUMMARY
+    report_id = report_attachment.id if report_attachment is not None else None
+    if report_attachment is not None:
+        try:
+            summary = read_attachment_bytes(report_attachment).decode(
+                "utf-8", errors="replace",
+            ).strip()[:4000] or None
+        except (OSError, ValueError):
+            summary = None
     metadata: dict[str, Any] = {
         "handover": handover_reason,
-        "report_attachment_id": report_attachment.id,
+        "report_attachment_id": report_id,
     }
     if metadata_extra:
         metadata.update(metadata_extra)
     payload: dict[str, Any] = {
         "handover": handover_reason,
-        "patch_attachment_id": patch_attachment.id,
-        "report_attachment_id": report_attachment.id,
+        "patch_attachment_id": patch_id,
+        "report_attachment_id": report_id,
     }
     if event_payload_extra:
         payload.update(event_payload_extra)
@@ -33955,10 +34126,13 @@ def _complete_run_handover_before_timeout(
     try:
         handover_ok = complete_task(
             conn, task_id,
-            summary=report_text[:4000] or None,
+            summary=summary,
             metadata=metadata,
-            patch_attachment_id=patch_attachment.id,
+            patch_attachment_id=patch_id,
             expected_run_id=int(run_id),
+            # A lone saved patch is the saved-result handover: its review park
+            # records it, and a refusal carries the park's own reason.
+            _saved_result_attachment_id=patch_id if report_id is None else None,
         )
         if not handover_ok:
             handover_error = "task changed during handover completion"
@@ -34016,13 +34190,19 @@ def enforce_max_runtime(
     ``run_handover_completed`` event marks the handover. If
     materialization/completion fails for any reason, this falls back to
     the ordinary timeout behavior below (never silently loses the task)
-    and records why via a ``run_handover_failed`` event.
+    and records why via a ``run_handover_failed`` event. On a card that
+    requires review the run's one saved patch is enough without a report:
+    the same completion parks it in the review lane.
 
     Otherwise: sends SIGTERM, waits a short grace window, then SIGKILL.
     Emits a ``timed_out`` event and restores the task's source phase so
     the next dispatcher tick re-spawns the same kind of worker — unless
     the circuit breaker has already given up, in which case the task
     stays blocked where ``_record_spawn_failure`` parked it.
+
+    A review run is held to the review box pinned on it when it was claimed
+    (:func:`claim_review_task`), any other run to its card's
+    ``max_runtime_seconds`` (``kanban_risk_tier.active_run_box_seconds``).
 
     Runs host-local: only tasks claimed by this host are candidates
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
@@ -34041,7 +34221,8 @@ def enforce_max_runtime(
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_start_time, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, "
+        "       r.max_runtime_seconds AS run_max_runtime_seconds "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -34056,7 +34237,13 @@ def enforce_max_runtime(
         # intentionally records the first time a task ever started, so retries
         # must be measured from the active task_runs row when present.
         elapsed = now - int(row["active_started_at"])
-        if elapsed < int(row["max_runtime_seconds"]):
+        # A review run is held to its own box, any other run to its card's.
+        limit = active_run_box_seconds(
+            row["max_runtime_seconds"], row["run_max_runtime_seconds"],
+            row["current_run_id"] is not None
+            and run_claimed_from_review(conn, row["id"], int(row["current_run_id"])),
+        )
+        if elapsed < int(limit):
             continue
         if _saved_patch_handover_pending(conn, row):
             continue
@@ -34093,12 +34280,12 @@ def enforce_max_runtime(
             event_payload_extra={
                 "pid": pid,
                 "elapsed_seconds": int(elapsed),
-                "limit_seconds": int(row["max_runtime_seconds"]),
+                "limit_seconds": int(limit),
                 **identity,
             },
             metadata_extra={
                 "elapsed_seconds": int(elapsed),
-                "limit_seconds": int(row["max_runtime_seconds"]),
+                "limit_seconds": int(limit),
             },
         ):
             continue
@@ -34134,7 +34321,7 @@ def enforce_max_runtime(
 
         error_text = (
             f"elapsed {int(elapsed)}s > "
-            f"limit {int(row['max_runtime_seconds'])}s"
+            f"limit {int(limit)}s"
         )
         if pid_reused:
             # Saying nothing here would leave the history claiming we stopped
@@ -34159,7 +34346,7 @@ def enforce_max_runtime(
                 payload = {
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
-                    "limit_seconds": int(row["max_runtime_seconds"]),
+                    "limit_seconds": int(limit),
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
@@ -34584,6 +34771,10 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
 _SAVED_PATCH_HANDOVER_SUMMARY = (
     "The kernel handed the saved patch to review because the worker exited "
     "without reporting its result."
+)
+_BUDGET_PATCH_HANDOVER_SUMMARY = (
+    "The kernel handed the saved patch to review because the run used up its "
+    "budget without reporting its result."
 )
 
 
@@ -36439,6 +36630,7 @@ def dispatch_once(
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
+    ticked = False
     with _dispatch_tick_lock(db_path) as held:
         board_metadata = read_board_metadata(board)
         if not held:
@@ -36479,11 +36671,20 @@ def dispatch_once(
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
             _maybe_checkpoint_wal(conn, db_path)
+            ticked = not dry_run
     # The dispatch lock has been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
     _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    if ticked:
+        # Also outside the lock, and after the observer, so neither waits on
+        # GitHub: the delivery step publishes at most one approved build of
+        # the board this tick ran on, read from the ticked connection's own
+        # file (hermes_cli/kanban_delivery.py).
+        from hermes_cli import kanban_delivery
+
+        kanban_delivery.publish_step(_conn_main_db_path(conn))
     return result
 
 

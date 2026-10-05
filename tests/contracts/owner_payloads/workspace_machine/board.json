@@ -1,0 +1,157 @@
+{
+  "body": {
+    "columns": [
+      {
+        "name": "triage",
+        "tasks": [
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 22,
+            "id": "t_3a414ff6",
+            "parent_ids": [
+              "t_69a8bd1d"
+            ],
+            "responsibility": null,
+            "review_state": "none",
+            "stopped_work": "none",
+            "title": "Rework: Review the changes outline",
+            "updated_at": "2026-09-21T14:13:20Z"
+          }
+        ]
+      },
+      {
+        "name": "todo",
+        "tasks": []
+      },
+      {
+        "name": "scheduled",
+        "tasks": []
+      },
+      {
+        "name": "ready",
+        "tasks": [
+          {
+            "assignee_name": "coder",
+            "child_ids": [],
+            "event_revision": 9,
+            "id": "t_1d8a904c",
+            "parent_ids": [],
+            "responsibility": "B03",
+            "review_state": "none",
+            "stopped_work": "none",
+            "title": "Ready work",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 17,
+            "id": "t_3c850dcf",
+            "parent_ids": [],
+            "responsibility": null,
+            "review_state": "none",
+            "stopped_work": "none",
+            "title": "Record the workshop runs",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [
+              "t_3a414ff6"
+            ],
+            "event_revision": 23,
+            "id": "t_69a8bd1d",
+            "parent_ids": [],
+            "responsibility": null,
+            "review_state": "changes_requested",
+            "stopped_work": "none",
+            "title": "Review the changes outline",
+            "updated_at": "2026-09-21T14:13:20Z"
+          }
+        ]
+      },
+      {
+        "name": "running",
+        "tasks": [
+          {
+            "assignee_name": "coder",
+            "child_ids": [],
+            "event_revision": 3,
+            "id": "t_172f84a6",
+            "parent_ids": [],
+            "responsibility": null,
+            "review_state": "none",
+            "stopped_work": "none",
+            "title": "Running work",
+            "updated_at": "2026-09-21T14:13:20Z"
+          }
+        ]
+      },
+      {
+        "name": "blocked",
+        "tasks": [
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 14,
+            "id": "t_348578f3",
+            "parent_ids": [],
+            "responsibility": null,
+            "review_state": "none",
+            "stopped_work": "capability",
+            "title": "Connect the payment provider",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 11,
+            "id": "t_8e3861d2",
+            "parent_ids": [],
+            "responsibility": null,
+            "review_state": "none",
+            "stopped_work": "gave_up",
+            "title": "Print the workshop handouts",
+            "updated_at": "2026-09-21T14:13:20Z"
+          }
+        ]
+      },
+      {
+        "name": "review",
+        "tasks": [
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 18,
+            "id": "t_d5a64436",
+            "parent_ids": [],
+            "responsibility": null,
+            "review_state": "awaiting_review",
+            "stopped_work": "none",
+            "title": "Review the awaiting outline",
+            "updated_at": "2026-09-21T14:13:20Z"
+          }
+        ]
+      },
+      {
+        "name": "done",
+        "tasks": [
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 7,
+            "id": "t_136d9fda",
+            "parent_ids": [],
+            "responsibility": null,
+            "review_state": "approved",
+            "stopped_work": "none",
+            "title": "Review the approved outline",
+            "updated_at": "2026-09-21T14:13:20Z"
+          }
+        ]
+      }
+    ]
+  },
+  "status": 200
+}

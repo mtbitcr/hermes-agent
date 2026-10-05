@@ -49,6 +49,7 @@ from hermes_cli.dashboard_auth.token_auth import (
     register_token_route_template,
     transport_peer_ip,
 )
+from hermes_cli.kanban_risk_tier import PINNED_EFFORTS
 from plugins.dashboard_auth.raphael_workspace import token_store
 
 
@@ -518,7 +519,7 @@ def mint_policy_lock(
     parts = _normalized_lock_parts(
         assignee, provider, model, reasoning_effort, execution_tier
     )
-    error = _route_authority_error(*parts)
+    error = _route_authority_error(*parts, admit_pinned_effort=True)
     if error:
         raise ValueError(error)
     return f"{POLICY_LOCK_AUTHORITY}:v{POLICY_LOCK_VERSION}:{_lock_digest(*parts)}"
@@ -544,12 +545,19 @@ def _route_authority_error(
     execution_tier: str,
     *,
     admit_superseded: bool = False,
+    admit_pinned_effort: bool = False,
 ) -> Optional[str]:
     """Return why this five-tuple is not an admitted locked route, else None.
 
     ``admit_superseded`` additionally accepts a route recorded in
     ``_SUPERSEDED_ROUTES`` for this exact assignee/provider/tier.  Only lock
     validation passes it; minting always requires the current route.
+
+    ``admit_pinned_effort`` additionally accepts the route's own model at
+    every effort a card can be pinned at by its risk tier (high next to max,
+    so max also on a lane whose base effort is high). Only a card's seal
+    passes it; a role's configured route and an unpinned run's history stay
+    exactly the base route.
     """
     if not assignee or not provider or not model or not reasoning_effort:
         return (
@@ -574,6 +582,8 @@ def _route_authority_error(
             f"{assignee!r}/{provider!r}/{execution_tier or None!r}"
         )
     admitted = {(expected.model, expected.reasoning_effort)}
+    if admit_pinned_effort:
+        admitted |= {(expected.model, effort) for effort in PINNED_EFFORTS}
     if admit_superseded:
         admitted |= _SUPERSEDED_ROUTES.get(
             (expected.profile, expected.provider, execution_tier), frozenset()
@@ -622,7 +632,9 @@ def policy_lock_error(
     parts = _normalized_lock_parts(
         assignee, provider, model, reasoning_effort, execution_tier
     )
-    error = _route_authority_error(*parts, admit_superseded=True)
+    error = _route_authority_error(
+        *parts, admit_superseded=True, admit_pinned_effort=True
+    )
     if error:
         return error
     if digest != _lock_digest(*parts):

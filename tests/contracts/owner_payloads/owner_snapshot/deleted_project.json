@@ -1,0 +1,141 @@
+{
+  "body": {
+    "data": {
+      "attachments": [],
+      "board": {
+        "counts": {
+          "archived": 0,
+          "blocked": 0,
+          "done": 0,
+          "ready": 0,
+          "review": 0,
+          "running": 0,
+          "scheduled": 0,
+          "todo": 0,
+          "triage": 0
+        },
+        "name": "RP",
+        "project_id": "p_9669536a",
+        "slug": "rp1",
+        "total": 0
+      },
+      "columns": [
+        {
+          "name": "triage",
+          "tasks": []
+        },
+        {
+          "name": "todo",
+          "tasks": []
+        },
+        {
+          "name": "scheduled",
+          "tasks": []
+        },
+        {
+          "name": "ready",
+          "tasks": []
+        },
+        {
+          "name": "running",
+          "tasks": []
+        },
+        {
+          "name": "blocked",
+          "tasks": []
+        },
+        {
+          "name": "review",
+          "tasks": []
+        },
+        {
+          "name": "done",
+          "tasks": []
+        }
+      ],
+      "project": {
+        "archived": false,
+        "board": "rp1",
+        "description": null,
+        "id": "p_9669536a",
+        "name": "RP",
+        "slug": "rp1"
+      },
+      "removal_state": {
+        "accepted_at": 1790000000,
+        "applied_at": 1790000000,
+        "cancelable": false,
+        "completed_at": 1790000000,
+        "consequences": {
+          "digest": "f068e0f544f1b638b65b70f52edbef2da3e31e7d1b19859136521e93cf1316a4",
+          "text": "Removal of project “RP”.\nBoard epoch: 2.\nA retained copy of the board will be preserved.\nWhat is deleted: board data, task content, and worker state.\nWhat stays: Git refs and history, shared transcripts, and receipts.\nRestoration reattaches only what the provenance ledger records as the project’s own; anything unattributable is reported unverified and is not acted on."
+        },
+        "consequences_digest": "f068e0f544f1b638b65b70f52edbef2da3e31e7d1b19859136521e93cf1316a4",
+        "last_error": null,
+        "mode": "recoverable",
+        "phase": "done",
+        "receipt_id": "contract1",
+        "restorable": true,
+        "retained_copy_id": "d2e8c6f6e2b1a68c44a28aa7b291e3e5"
+      },
+      "runs": [],
+      "steward": {
+        "active_work": [],
+        "counts": {
+          "awaiting_review": 0,
+          "completed_in_window": 0,
+          "needs_attention": 0,
+          "open": 0
+        },
+        "decisions_needed": [],
+        "execution": {
+          "paused": false,
+          "state": "deleted",
+          "summary": "This Project was deleted. Its retained copy can be restored."
+        },
+        "generated_at": "2026-09-21T14:13:20Z",
+        "lookback_days": 7,
+        "needs_attention": [],
+        "progress": [],
+        "project": {
+          "name": "RP"
+        },
+        "removal_state": {
+          "accepted_at": 1790000000,
+          "applied_at": 1790000000,
+          "cancelable": false,
+          "completed_at": 1790000000,
+          "consequences": {
+            "digest": "f068e0f544f1b638b65b70f52edbef2da3e31e7d1b19859136521e93cf1316a4",
+            "text": "Removal of project “RP”.\nBoard epoch: 2.\nA retained copy of the board will be preserved.\nWhat is deleted: board data, task content, and worker state.\nWhat stays: Git refs and history, shared transcripts, and receipts.\nRestoration reattaches only what the provenance ledger records as the project’s own; anything unattributable is reported unverified and is not acted on."
+          },
+          "consequences_digest": "f068e0f544f1b638b65b70f52edbef2da3e31e7d1b19859136521e93cf1316a4",
+          "last_error": null,
+          "mode": "recoverable",
+          "phase": "done",
+          "receipt_id": "contract1",
+          "restorable": true,
+          "retained_copy_id": "d2e8c6f6e2b1a68c44a28aa7b291e3e5"
+        },
+        "schema_version": 2,
+        "stale_candidates": [],
+        "truncated": {
+          "active_work": false,
+          "decisions_needed": false,
+          "needs_attention": false,
+          "progress": false,
+          "stale_candidates": false
+        }
+      },
+      "truncated": {
+        "attachments": false,
+        "runs": false,
+        "tasks": false,
+        "workers": false
+      },
+      "workers": []
+    },
+    "object": "hermes.owner_workspace.project_snapshot"
+  },
+  "status": 200
+}

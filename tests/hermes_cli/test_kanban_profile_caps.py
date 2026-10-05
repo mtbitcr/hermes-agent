@@ -203,6 +203,99 @@ def test_listed_profile_cap_counts_running_task_on_another_board(
     assert _status(kb, capped_next) == "ready"
 
 
+# b. the running task that fills the cap lives on a board the owner paused
+def test_listed_profile_cap_counts_running_task_on_a_paused_board(
+    kb, spawns, monkeypatch
+):
+    # A pause stops new claims on its board; its running worker still runs.
+    for board in (kb.DEFAULT_BOARD, SECOND_BOARD):
+        kb.write_board_metadata(board, dispatch_enabled=True)
+    _running(kb, CAPPED, board=SECOND_BOARD)
+    kb.write_board_metadata(SECOND_BOARD, dispatch_paused_by_owner=True)
+    capped_next = _ready(kb, CAPPED)
+    other_next = _ready(kb, OTHER)
+
+    _run_dispatcher(
+        monkeypatch,
+        {
+            "max_in_progress_by_profile": {CAPPED: 1},
+            "dispatch_require_board_activation": True,
+        },
+        ticks=1,
+    )
+
+    assert [(a, t) for _, a, t in spawns] == [(OTHER, other_next)]
+    assert _status(kb, capped_next) == "ready"
+
+
+# b. a board whose DB cannot be opened is unknown, not empty: the listed
+# profile waits for that tick
+def test_listed_profile_waits_when_a_board_db_cannot_be_opened(
+    kb, spawns, monkeypatch
+):
+    _running(kb, CAPPED, board=SECOND_BOARD)
+    capped_next = _ready(kb, CAPPED)
+    other_next = _ready(kb, OTHER)
+    # board.json keeps the board listed; its DB becomes a symlink loop, which
+    # fails every stat and open with ELOOP, not with a missing file.
+    kb.write_board_metadata(SECOND_BOARD, name="Two")
+    db = kb.kanban_db_path(board=SECOND_BOARD)
+    db.rename(db.with_name("kanban.db.moved"))
+    db.symlink_to(db.name)
+
+    _run_dispatcher(
+        monkeypatch, {"max_in_progress_by_profile": {CAPPED: 1}}, ticks=1
+    )
+
+    assert [(a, t) for _, a, t in spawns] == [(OTHER, other_next)]
+    assert _status(kb, capped_next) == "ready"
+
+
+# b. counting reads a paused board without changing it: no migration, no
+# repair, no log line with its path, and no DB for a board that has none
+def test_counting_reads_boards_without_changing_them(
+    kb, spawns, monkeypatch, caplog
+):
+    legacy, empty = "board-legacy", "board-empty"
+    kb.write_board_metadata(kb.DEFAULT_BOARD, dispatch_enabled=True)
+    capped_next = _ready(kb, CAPPED)
+    # An older paused board: only the columns the count reads, one running
+    # task of the capped profile, written without the platform's opener.
+    legacy_db = kb.kanban_db_path(board=legacy)
+    legacy_db.parent.mkdir(parents=True)
+    with sqlite3.connect(legacy_db) as conn:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, "
+            "assignee TEXT, task_kind TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO tasks VALUES ('t_old', 'running', ?, 'work')", (CAPPED,)
+        )
+    conn.close()
+    kb.write_board_metadata(
+        legacy, name="Legacy", dispatch_enabled=True, dispatch_paused_by_owner=True
+    )
+    # A board that was never activated and has no DB yet.
+    kb.write_board_metadata(empty, name="Empty")
+    legacy_before = legacy_db.read_bytes()
+
+    with caplog.at_level(logging.DEBUG):
+        _run_dispatcher(
+            monkeypatch,
+            {
+                "max_in_progress_by_profile": {CAPPED: 1},
+                "dispatch_require_board_activation": True,
+            },
+            ticks=1,
+        )
+
+    assert spawns == []
+    assert _status(kb, capped_next) == "ready"
+    assert legacy_db.read_bytes() == legacy_before
+    assert not kb.kanban_db_path(board=empty).exists()
+    assert not any(str(legacy_db) in r.getMessage() for r in caplog.records)
+
+
 # b. a spawn on one board holds the same profile's card on the next board
 def test_listed_profile_spawn_on_one_board_holds_card_on_next_board(
     kb, spawns, monkeypatch

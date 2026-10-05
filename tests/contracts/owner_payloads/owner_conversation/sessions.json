@@ -1,0 +1,17 @@
+{
+  "body": {
+    "current_session_id": "88888888888888888888888888888888",
+    "data": [
+      {
+        "available": true,
+        "preview": "Placeholder request 0.",
+        "session_id": "88888888888888888888888888888888",
+        "updated_at": 800,
+        "visible_turn_count": 1
+      }
+    ],
+    "object": "hermes.response.owner_sessions",
+    "truncated": false
+  },
+  "status": 200
+}

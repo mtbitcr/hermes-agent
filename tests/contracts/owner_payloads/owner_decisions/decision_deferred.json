@@ -1,0 +1,10 @@
+{
+  "body": {
+    "data": {
+      "decision": "deferred",
+      "decision_ref": "decision_6a29b1c480322112b25824f7243ebf78"
+    },
+    "object": "hermes.owner_workspace.decision"
+  },
+  "status": 200
+}

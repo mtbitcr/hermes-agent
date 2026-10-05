@@ -1,0 +1,31 @@
+{
+  "created_at": 1790000000.0,
+  "last_event": "approval.request",
+  "model": "hermes-agent",
+  "object": "hermes.run",
+  "owner_workspace_context": {
+    "mode": "existing",
+    "profile": "default",
+    "project_name": "Workshop pilot",
+    "project_slug": "workshop-pilot"
+  },
+  "pending_approval": {
+    "approval_id": "ed6006fdde984412b7d29509e18c162d",
+    "choices": [
+      "once",
+      "deny"
+    ],
+    "description": "Try 'Connect the payment provider' again",
+    "operation": "owner_task_retry"
+  },
+  "run_id": "run_1f83b976acfb4a56ac5f591d10f21614",
+  "runtime": {
+    "effort": "",
+    "engine": "",
+    "model": "",
+    "provider": ""
+  },
+  "session_id": "run_1f83b976acfb4a56ac5f591d10f21614",
+  "status": "waiting_for_approval",
+  "updated_at": 1790000000.0
+}
