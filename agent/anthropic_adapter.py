@@ -89,7 +89,9 @@ _NO_XHIGH_CLAUDE_SUBSTRINGS = ("claude-opus-4-6", "claude-opus-4.6", "claude-son
 # 400s the turn, a spurious one only leaves thinking on — so when in doubt, add the family.
 # Opus 5.5 is listed in both spellings (``claude-opus-5-5`` / ``claude-opus-5.5``); neither is a
 # substring of ``claude-opus-5``, so Opus 5.0 keeps accepting the disable.
-_MANDATORY_THINKING_CLAUDE_SUBSTRINGS = ("claude-fable", "claude-opus-5-5", "claude-opus-5.5")
+_MANDATORY_THINKING_CLAUDE_SUBSTRINGS = (
+    "claude-fable", "claude-opus-5-5", "claude-opus-5.5", "claude-sonnet-5-5", "claude-sonnet-5.5",
+)
 _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-8", "opus-4.8", "opus-5")
 
 

@@ -7317,11 +7317,11 @@ def test_real_profile_config_resolves_and_locks_owner_task_routes(ctx, real_reso
     and effort, and the lock is minted, persisted and then re-validated exactly
     as ``_default_spawn`` does.
     """
-    # raphael-business is the Anthropic role whose current matrix really does
-    # give routine and deep work different lanes (Sonnet 5 vs Opus 5.5), so
+    # raphael-business is an Anthropic role whose current matrix really does
+    # give routine and deep work different lanes (Sonnet 5.5 vs Opus 5.5), so
     # the pins below can only be right if the matrix chose them.
     _write_real_profile_config(
-        "raphael-business", "anthropic", "claude-sonnet-5", "high"
+        "raphael-business", "anthropic", "claude-sonnet-5-5", "high"
     )
     args = _task_graph_args(
         idempotency_key="graph-real-config",
@@ -7360,7 +7360,7 @@ def test_real_profile_config_resolves_and_locks_owner_task_routes(ctx, real_reso
         routine_row["execution_tier"],
         routine_row["model_override"],
         routine_row["reasoning_effort"],
-    ) == ("routine", "claude-sonnet-5", "high")
+    ) == ("routine", "claude-sonnet-5-5", "high")
     # Every persisted lock is one the dispatcher would honour.
     for task_id, row in rows.items():
         assert row["model_policy_lock"], task_id
@@ -7441,7 +7441,7 @@ def test_locked_review_handoff_is_refused_rather_than_silently_repinned(ctx):
         before = conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
-        assert before["model_override"] == "claude-opus-5-5"
+        assert before["model_override"] == "claude-sonnet-5-5"
         with kanban_db.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,)

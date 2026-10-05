@@ -629,18 +629,18 @@ def test_kanban_create_carries_the_tier_under_the_worker_environment(
     assert not (profile_home / "kanban.db").exists()
     assert not (profile_home / "kanban").exists()
     # Decision 5: tier-2 work on the high-base lane (business routine on
-    # Sonnet 5) runs at max; tier 0 stays high. Both seals read back clean.
+    # Sonnet 5.5) runs at max; tier 0 stays high. Both seals read back clean.
     assert _count(
         worker_db,
         "risk_tier = 2 AND reasoning_effort = 'max' AND model_override = ? "
         "AND max_runtime_seconds = ? AND id = ?",
-        ("claude-sonnet-5", ROUTINE_BOX, created["task_id"]),
+        ("claude-sonnet-5-5", ROUTINE_BOX, created["task_id"]),
     ) == 1
     assert _count(
         worker_db,
         "risk_tier = 0 AND reasoning_effort = 'high' AND model_override = ? "
         "AND max_runtime_seconds = ? AND id = ?",
-        ("claude-sonnet-5", ROUTINE_BOX, routine["task_id"]),
+        ("claude-sonnet-5-5", ROUTINE_BOX, routine["task_id"]),
     ) == 1
     for answer in (created, routine):
         assert kb.task_policy_lock_error(_raw_row(worker_db, answer["task_id"])) is None
@@ -658,8 +658,8 @@ def test_a_new_card_without_a_tier_is_pinned_as_tier_2(fence_home, monkeypatch):
 
     assert created["ok"] is True, created
     row = _raw_row(kb.kanban_db_path(board=WORKER_BOARD), created["task_id"])
-    # Business routine is the one lane whose own effort is high (Sonnet 5).
-    assert (row["risk_tier"], row["model_override"]) == (2, "claude-sonnet-5")
+    # Business routine is the one lane whose own effort is high (Sonnet 5.5).
+    assert (row["risk_tier"], row["model_override"]) == (2, "claude-sonnet-5-5")
     assert (row["reasoning_effort"], row["max_runtime_seconds"]) == ("max", ROUTINE_BOX)
     assert kb.task_policy_lock_error(row) is None
 
@@ -716,7 +716,7 @@ def test_kanban_create_keeps_the_tier_effort_through_review(
     build_repo, risk_tier, recorded, effort,
 ):
     """An omitted tier is recorded as tier 2 and keeps max; tier 1 keeps high."""
-    # Business routine is the one lane whose own effort is high (Sonnet 5).
+    # Business routine is the one lane whose own effort is high (Sonnet 5.5).
     args = {
         "title": "Write the pricing page", "assignee": "raphael-business",
         "execution_tier": "routine", "owned_paths": [OWNED],
@@ -733,7 +733,7 @@ def test_kanban_create_keeps_the_tier_effort_through_review(
         (recorded, effort),
     ] * 3
     assert created["risk_tier"] == recorded
-    assert rows[-1]["model_override"] == "claude-sonnet-5"
+    assert rows[-1]["model_override"] == "claude-sonnet-5-5"
 
 
 def test_a_native_security_review_card_keeps_max_through_review(build_repo):
@@ -748,7 +748,7 @@ def test_a_native_security_review_card_keeps_max_through_review(build_repo):
     assert [(row["risk_tier"], row["reasoning_effort"]) for row in rows] == [
         (2, "max"),
     ] * 3
-    assert rows[-1]["model_override"] == "claude-sonnet-5"
+    assert rows[-1]["model_override"] == "claude-sonnet-5-5"
 
 
 def test_a_legacy_card_keeps_its_base_effort_and_saved_box_through_review(build_repo):

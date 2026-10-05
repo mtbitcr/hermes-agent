@@ -116,7 +116,7 @@ _ASSIGNMENTS = {
         "default", "openai-codex", "gpt-6.1-sol", "GPT-6.1 Sol", "max"
     ),
     ("raphael-business", "anthropic"): _assignment(
-        "raphael-business", "anthropic", "claude-sonnet-5", "Claude Sonnet 5", "high"
+        "raphael-business", "anthropic", "claude-sonnet-5-5", "Claude Sonnet 5.5", "high"
     ),
     ("raphael-business", "openai-codex"): _assignment(
         "raphael-business", "openai-codex", "gpt-5.6-terra", "GPT-5.6 Terra", "max"
@@ -125,10 +125,10 @@ _ASSIGNMENTS = {
         "raphael-designer", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"
     ),
     ("raphael-claude-worker", "anthropic"): _assignment(
-        "raphael-claude-worker", "anthropic", "claude-opus-5-5", "Claude Opus 5.5 + Claude Code", "max"
+        "raphael-claude-worker", "anthropic", "claude-sonnet-5-5", "Claude Sonnet 5.5 + Claude Code", "max"
     ),
     ("raphael-builder", "anthropic"): _assignment(
-        "raphael-builder", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"
+        "raphael-builder", "anthropic", "claude-sonnet-5-5", "Claude Sonnet 5.5", "max"
     ),
     # There is deliberately NO builder route on the OpenAI family. The builder
     # integrates verified work and operates infrastructure, so its deep lane is
@@ -454,7 +454,9 @@ _FORBIDDEN_EFFORTS = frozenset({"ultra"})
 # admitted on, so a historical route never verifies for a different role,
 # provider or tier.  Pairs whose route never changed have no entry.
 _OPUS_5_MAX = ("claude-opus-5", "max")
+_OPUS_55_MAX = ("claude-opus-5-5", "max")
 _SONNET_5_MAX = ("claude-sonnet-5", "max")
+_SONNET_5_HIGH = ("claude-sonnet-5", "high")
 _SOL_56_MAX = ("gpt-5.6-sol", "max")
 _SOL_6_MAX = ("gpt-6-sol", "max")
 _ASTRA_6_XHIGH = ("gpt-6-astra", "xhigh")
@@ -468,12 +470,13 @@ _SUPERSEDED_ROUTES: Mapping[tuple[str, str, str], frozenset[tuple[str, str]]] = 
     ("raphael-planner", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
     ("raphael-planner", "openai-codex", "routine"): frozenset({_SOL_56_MAX, _SOL_6_MAX}),
     ("raphael-planner", "openai-codex", "deep"): frozenset({_SOL_56_MAX, _SOL_6_MAX}),
+    ("raphael-business", "anthropic", "routine"): frozenset({_SONNET_5_HIGH}),
     ("raphael-business", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
     ("raphael-designer", "anthropic", "routine"): frozenset({_OPUS_5_MAX}),
     ("raphael-designer", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
-    ("raphael-claude-worker", "anthropic", "routine"): frozenset({_SONNET_5_MAX}),
+    ("raphael-claude-worker", "anthropic", "routine"): frozenset({_SONNET_5_MAX, _OPUS_55_MAX}),
     ("raphael-claude-worker", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
-    ("raphael-builder", "anthropic", "routine"): frozenset({_SONNET_5_MAX}),
+    ("raphael-builder", "anthropic", "routine"): frozenset({_SONNET_5_MAX, _OPUS_55_MAX}),
     ("raphael-builder", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
     ("raphael-verifier", "openai-codex", "routine"): frozenset({_SOL_56_MAX, _SOL_6_MAX}),
     ("raphael-verifier", "openai-codex", "deep"): frozenset({_SOL_56_MAX, _ASTRA_6_XHIGH}),
