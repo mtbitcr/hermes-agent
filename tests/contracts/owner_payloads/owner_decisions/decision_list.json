@@ -1,0 +1,119 @@
+{
+  "body": {
+    "data": [
+      {
+        "authority": "task",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_d14802b1d0afd12f951331355fbbc0c9",
+        "kind": "owner_input",
+        "project_name": "Workshop Pilot",
+        "project_slug": "workshop-pilot",
+        "reason": "Raphael needs your answer before this work can continue.",
+        "title": "Choose the workshop date"
+      },
+      {
+        "authority": "recommendation",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_06c769c5be3543582566c5bf2409be25",
+        "kind": "capability",
+        "project_name": "Workshop Pilot",
+        "project_slug": "workshop-pilot",
+        "reason": "The current milestone needs public-source research.",
+        "title": "Add workshop research support"
+      },
+      {
+        "authority": "recommendation",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_2c8ef98ab278c0648b9477152e4e9376",
+        "kind": "capability",
+        "project_name": "Workshop Pilot",
+        "project_slug": "workshop-pilot",
+        "reason": "The current milestone needs public-source research.",
+        "title": "Add workshop research support"
+      },
+      {
+        "authority": "recommendation",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_6a29b1c480322112b25824f7243ebf78",
+        "kind": "capability",
+        "project_name": "Workshop Pilot",
+        "project_slug": "workshop-pilot",
+        "reason": "The current milestone needs public-source research.",
+        "title": "Add workshop research support"
+      },
+      {
+        "authority": "run",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_b1cb52d34e39f81757e91f5e539ae1f3",
+        "kind": "run_approval",
+        "project_name": "Workshop Sequel",
+        "project_slug": null,
+        "reason": "Raphael is waiting for your confirmation before changing this Project.",
+        "title": "Approve the new Project"
+      },
+      {
+        "authority": "run",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_87033374d4bda1e539c12c3f56e248a6",
+        "kind": "run_approval",
+        "project_name": "Workshop Pilot",
+        "project_slug": "workshop-pilot",
+        "reason": "Raphael is waiting for your confirmation before changing this Project.",
+        "title": "Approve the first Project milestone"
+      },
+      {
+        "authority": "run",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_4380778e3d1049ecd019d3c984b1aec8",
+        "kind": "run_approval",
+        "project_name": "Workshop Pilot",
+        "project_slug": "workshop-pilot",
+        "reason": "Raphael is waiting for your confirmation before changing this Project.",
+        "title": "Approve Project changes"
+      },
+      {
+        "authority": "run",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_305eb5c8f7873addb2e840191540593f",
+        "kind": "run_approval",
+        "project_name": "Workshop Pilot",
+        "project_slug": "workshop-pilot",
+        "reason": "Raphael is waiting for your confirmation before changing this Project.",
+        "title": "Approve a work-state change"
+      },
+      {
+        "authority": "run",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_dc3728d7801687ed543d5fadf91a3152",
+        "kind": "run_approval",
+        "project_name": "Workshop Pilot",
+        "project_slug": "workshop-pilot",
+        "reason": "Raphael is waiting for your confirmation before changing this Project.",
+        "title": "Approve an owner reply"
+      },
+      {
+        "authority": "run",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_9bfb6f8507f16f359fd605123a3141b1",
+        "kind": "run_approval",
+        "project_name": "Workshop Pilot",
+        "project_slug": "workshop-pilot",
+        "reason": "Raphael is waiting for your confirmation before changing this Project.",
+        "title": "Approve trying stopped work again"
+      },
+      {
+        "authority": "run",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_cdf8d7034f08df5caa9cf771064db3bb",
+        "kind": "run_approval",
+        "project_name": "Workshop Pilot",
+        "project_slug": "workshop-pilot",
+        "reason": "Raphael is waiting for your confirmation before changing this Project.",
+        "title": "Approve the Project lifecycle change"
+      }
+    ],
+    "object": "hermes.owner_workspace.decision_list",
+    "truncated": false
+  },
+  "status": 200
+}
