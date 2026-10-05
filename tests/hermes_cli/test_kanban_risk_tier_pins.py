@@ -773,10 +773,62 @@ def test_a_legacy_card_keeps_its_base_effort_and_saved_box_through_review(build_
                 LEGACY_BOX, task_id,
             ),
         )
+        _as_written_before_the_pins(conn, task_id)
         rows = _review_round_trip(conn, task_id)
 
     # Each role's own effort: high for business, max for the reviewer.
     assert [row["reasoning_effort"] for row in rows] == ["high", "max", "high"]
     assert [(row["risk_tier"], row["max_runtime_seconds"]) for row in rows] == [
         (None, LEGACY_BOX),
+    ] * 3
+
+
+def _as_written_before_the_pins(conn, task_id):
+    """Clear the creation-pin record that rows written before it never got."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "pinned_effort" in columns:
+        conn.execute("UPDATE tasks SET pinned_effort = NULL WHERE id = ?", (task_id,))
+
+
+@pytest.mark.parametrize(
+    ("assignee", "lane", "risk_tier", "responsibility", "efforts"),
+    [
+        ("raphael-business", "routine", 2, None, ["high", "max", "high"]),
+        ("raphael-business", "routine", 0, "R12", ["high", "max", "high"]),
+        ("raphael-claude-worker", "deep", 1, None, ["max", "max", "max"]),
+    ],
+    ids=["tier-2-business", "tier-0-security-review", "tier-1-build"],
+)
+def test_a_card_with_a_tier_from_before_the_pins_keeps_its_base_effort_through_review(
+    build_repo, assignee, lane, risk_tier, responsibility, efforts,
+):
+    """A tier recorded before the creation-time pins is not proof of a pin."""
+    route = mp.task_assignment_for(assignee, "anthropic", lane)
+    with closing(kb.connect(board=SLUG)) as conn:
+        task_id = _locked_card(
+            conn, assignee, lane, risk_tier=None, responsibility=responsibility,
+            owned_paths=[OWNED], workspace_path=str(build_repo),
+        )
+        # The row as the earlier tier-carrying kernel wrote it: a tier, the
+        # lane's own effort sealed and the box it was given then.
+        conn.execute(
+            "UPDATE tasks SET risk_tier = ?, reasoning_effort = ?, "
+            "model_policy_lock = ?, max_runtime_seconds = ? WHERE id = ?",
+            (
+                risk_tier,
+                route.reasoning_effort,
+                kb.mint_policy_lock(
+                    assignee, route.provider, route.model,
+                    route.reasoning_effort, lane,
+                ),
+                LEGACY_BOX, task_id,
+            ),
+        )
+        _as_written_before_the_pins(conn, task_id)
+        rows = _review_round_trip(conn, task_id)
+
+    # Each role's own effort, as before the pins.
+    assert [row["reasoning_effort"] for row in rows] == efforts
+    assert [(row["risk_tier"], row["max_runtime_seconds"]) for row in rows] == [
+        (risk_tier, LEGACY_BOX),
     ] * 3
