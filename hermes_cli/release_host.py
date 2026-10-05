@@ -96,7 +96,7 @@ def rows(path):
     except OSError:
         return None
     try:
-        fcntl.fcntl(fd, fcntl.F_OFD_SETLK, LOCK)
+        fcntl.fcntl(fd, getattr(fcntl, "F_OFD_SETLK", 37), LOCK)  # Python 3.11 has no name for it; 37 on Linux
         header, info = os.pread(fd, 100, 0), os.fstat(fd)
         if len(header) < 100 or header[:16] != b"SQLite format 3\0" or header[18:20] not in (b"\1\1", b"\2\2"):
             return None
