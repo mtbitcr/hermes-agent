@@ -4004,12 +4004,14 @@ def _run_job_script_with_claim_heartbeat(
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     job_id = str(job.get("id") or "")
+    # Only a script-only job tells its script its own id; an agent job's pre-check script gets none.
+    script_job_id = job_id if job.get("no_agent") else None
     if not (
         isinstance(schedule, dict)
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job_id=job_id)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job_id=script_job_id)
 
     stop = threading.Event()
     heartbeat_context = contextvars.copy_context()
@@ -4039,10 +4041,10 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job_id=job_id)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job_id=script_job_id)
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job_id=job_id)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job_id=script_job_id)
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
