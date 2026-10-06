@@ -113,7 +113,7 @@ _TIME_BOX_SECONDS = {
     "build": 7200,
     "analysis": 2700,
     "proposal": 1800,
-    "review": 2700,
+    "review": 5400,
     "release": 2700,
     "coordinator_deep": 2700,
     "coordinator_routine": 1800,
