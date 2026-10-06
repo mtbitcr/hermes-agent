@@ -1,5 +1,5 @@
-"""Hourly check of the owner write routes: plan section (e), tests 1 to 9, and the owner note's
-regression tests for the four review findings (round 1).
+"""Hourly check of the owner write routes: plan section (e), tests 1 to 9, and the owner notes'
+regression tests for the four review findings of round 1 and the two of round 2.
 
 Tests 1 to 9 fake the listener, the page check, the clock and the delivery record. The regression
 tests use a real HTTP server on 127.0.0.1 and the real execution and delivery stores in the test's
@@ -390,18 +390,20 @@ def test_finding1_clear_history_probe_is_refused_before_any_lookup():
 
 
 class Listener:
-    """A real HTTP server on 127.0.0.1 that answers each probe of ``profile`` as a healthy route."""
+    """A real HTTP server on 127.0.0.1 that answers each probe of ``profile`` as a healthy route, or
+    with the ``(status, payload)`` set for its name in ``refusals``."""
 
     def __init__(self, profile):
         self.requests = []
-        table, seen = watch.PROBES[profile], self.requests
+        self.refusals = {}
+        table, seen, refusals = watch.PROBES[profile], self.requests, self.refusals
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"null")
                 seen.append((self.command, self.path, self.headers.get("Authorization"), body))
                 probe = next((p for p in table if (p.path, p.body) == (self.path, body)), None)
-                status, payload = healthy(probe) if probe else (418, None)
+                status, payload = (refusals.get(probe.name) or healthy(probe)) if probe else (418, None)
                 data = json.dumps(payload).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -481,10 +483,12 @@ def test_finding2_default_profile_control_on_the_same_listener(tmp_path, monkeyp
 
 
 def execution(monkeypatch, job_id, moment, *, finished=True):
-    """One real execution of ``job_id`` claimed at ``moment``; the current run is left unfinished."""
+    """One real execution of ``job_id`` claimed at ``moment``, a time or the claimed_at text stored as
+    given; the current run is left unfinished."""
     from cron import executions
 
-    monkeypatch.setattr(executions, "_hermes_now", lambda: moment)
+    stamp = SimpleNamespace(isoformat=lambda: moment) if isinstance(moment, str) else moment
+    monkeypatch.setattr(executions, "_hermes_now", lambda: stamp)
     row = executions.create_execution(job_id, source="schedule")
     if finished:
         executions.finish_execution(row["id"], success=True)
@@ -600,3 +604,147 @@ def test_finding4_a_resend_counts_by_how_its_targets_ended(tmp_path, monkeypatch
     again = next_watch_run(host, monkeypatch)
 
     assert (again.code, again.text) == (0, alert.text if printed_again else "")
+
+
+# --- Owner note, round 2: regression tests for the two review findings ----------------------------
+
+REPEAT_OFF = "The hourly repeat is off: if this alert is not delivered, it is not sent again."
+
+
+def planner_job(tmp_path, monkeypatch, listener):
+    """The planner's watch job as the scheduler starts it, with a real listener that refuses the
+    planner turn route: HERMES_HOME is the planner profile, whose own .env holds its key, and only the
+    root profile configures the listener's port. Returns main()'s one argument."""
+    monkeypatch.delenv("API_SERVER_PORT", raising=False)
+    server = listener("raphael-planner")
+    server.refusals["planner_turn"] = (403, envelope("route_not_allowed"))
+    planner = root_profile(tmp_path, server.port) / "profiles" / "raphael-planner"
+    planner.mkdir(parents=True)
+    (planner / ".env").write_text("API_SERVER_KEY=" + "p" * 40 + "\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(planner))
+    page_check = tmp_path / "page-check.sh"
+    page_check.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    return page_check
+
+
+def main_run(monkeypatch, capsys, page_check, at):
+    """One run of the job through main(): its own execution is claimed a minute before ``at`` and the
+    watch's clock reads ``at``. Returns that execution, the exit code and the printed output."""
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at.astimezone(tz)
+
+    own = execution(monkeypatch, WATCH_JOB, at - MINUTE, finished=False)
+    monkeypatch.setattr(watch, "datetime", Clock)
+    code = watch.main([str(page_check)])
+    return own, code, capsys.readouterr().out
+
+
+def test_finding1_main_with_the_job_id_repeats_a_failed_own_alert_an_hour_later(
+        tmp_path, monkeypatch, capsys, listener):
+    """With HERMES_CRON_JOB_ID set to the watch job's own id, an alert whose own execution ended with
+    its only target failed is printed again by main(), identical, one hour later."""
+    page_check = planner_job(tmp_path, monkeypatch, listener)
+    monkeypatch.setenv("HERMES_CRON_JOB_ID", WATCH_JOB)
+
+    alert_execution, alert_code, alert = main_run(monkeypatch, capsys, page_check, START)
+    deliver(alert_execution, WATCH_JOB, alert.strip(), "failed")
+    _, again_code, again = main_run(monkeypatch, capsys, page_check, START + HOUR)
+
+    assert (alert_code, again_code) == (0, 0)
+    assert alert.startswith(f"Owner actions check: 1 failing since {watch.format_time(START)}.\n")
+    assert REPEAT_OFF not in alert
+    assert again == alert
+
+
+@pytest.mark.parametrize("job_id", [None, ""])
+def test_finding1_main_without_the_job_id_says_the_repeat_is_off_and_never_repeats(
+        tmp_path, monkeypatch, capsys, listener, job_id):
+    """Without HERMES_CRON_JOB_ID, unset or empty, the first alert's output ends with one plain
+    sentence that the hourly repeat is off; one hour later, with the same failed delivery, main()
+    prints nothing."""
+    page_check = planner_job(tmp_path, monkeypatch, listener)
+    if job_id is None:
+        monkeypatch.delenv("HERMES_CRON_JOB_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_CRON_JOB_ID", job_id)
+
+    alert_execution, alert_code, alert = main_run(monkeypatch, capsys, page_check, START)
+    deliver(alert_execution, WATCH_JOB, alert.strip(), "failed")
+    _, again_code, again = main_run(monkeypatch, capsys, page_check, START + HOUR)
+
+    assert (alert_code, again_code) == (0, 0)
+    assert alert.startswith(f"Owner actions check: 1 failing since {watch.format_time(START)}.\n")
+    assert alert.splitlines()[-1] == REPEAT_OFF
+    assert again == ""
+
+
+def own_run(host, monkeypatch, claimed_at):
+    """One hourly run of the watch job a minute after its own execution's claimed_at, stored as the
+    text the scheduler writes in its local offset; the watch's clock is UTC, as in production."""
+    own = execution(monkeypatch, WATCH_JOB, claimed_at, finished=False)
+    host.clock = datetime.fromisoformat(claimed_at).astimezone(timezone.utc) + MINUTE
+    return own, host.run(job_id=WATCH_JOB, delivery_state=None)
+
+
+FAILED_ALERT_DELIVERED_REPEAT = (("alert", "failed"), ("repeat", "delivered"))
+
+
+@pytest.mark.parametrize("claims,first_two,third", [
+    # The review's regression: the daylight saving rollback repeats 02:49:59, so the failed alert's
+    # claim sorts above the delivered repeat's by text, though it is an hour older.
+    pytest.param(("2026-10-25T02:49:59+02:00", "2026-10-25T02:49:59+01:00", "2026-10-25T03:49:59+01:00"),
+                 FAILED_ALERT_DELIVERED_REPEAT, None, id="daylight-saving-rollback"),
+    pytest.param(("2026-10-25T00:49:59+00:00", "2026-10-25T01:49:59+00:00", "2026-10-25T02:49:59+00:00"),
+                 FAILED_ALERT_DELIVERED_REPEAT, None, id="utc-control"),
+    # The server's time zone changed from +05:30 to +01:00, not for daylight saving.
+    pytest.param(("2026-10-06T15:19:59+05:30", "2026-10-06T11:49:59+01:00", "2026-10-06T12:49:59+01:00"),
+                 FAILED_ALERT_DELIVERED_REPEAT, None, id="time-zone-change"),
+    # Reverse: the older own execution, delivered, sorts first by text; the newer holds the failed alert.
+    pytest.param(("2026-10-25T02:49:59+02:00", "2026-10-25T02:49:59+01:00", "2026-10-25T03:49:59+01:00"),
+                 (("active", "delivered"), ("alert", "failed")), "repeat", id="reverse"),
+])
+def test_finding2_the_newest_own_execution_by_instant_holds_the_announcement(
+        tmp_path, monkeypatch, claims, first_two, third):
+    """The watch job's own executions are ordered by the instant of claimed_at in UTC, never by its
+    text. The first two hourly runs print and are delivered as ``first_two`` says; one hour after the
+    second, the alert prints again only when the second run's own delivery failed."""
+    host = Host(tmp_path)
+    for claimed_at, (kind, delivery) in zip(claims, first_two):
+        if kind == "alert":
+            host.refuse(decisions_probe(), 403, "route_not_allowed")
+        own, printed = own_run(host, monkeypatch, claimed_at)
+        assert printed.kind == kind
+        deliver(own, WATCH_JOB, printed.text, delivery)
+
+    _, later = own_run(host, monkeypatch, claims[2])
+
+    # The second run printed the alert, the first time or again.
+    assert (later.code, later.kind, later.text) == (0, third, printed.text if third else "")
+
+
+@pytest.mark.parametrize("alert_claim,other_claim", [
+    pytest.param("2026-10-05T08:59:00", None, id="no-utc-offset"),
+    # Sorts below every ISO claimed_at by text: only a reader of all own executions meets it.
+    pytest.param("2026-10-05T08:59:00+00:00", "1 October 2026", id="cannot-be-parsed"),
+    pytest.param("2026-10-05T10:59:00+02:00", "2026-10-05T09:59:00+01:00", id="same-instant-twice"),
+])
+def test_finding2_an_own_execution_without_one_clear_instant_stops_the_repeat(
+        tmp_path, monkeypatch, alert_claim, other_claim):
+    """An own claimed_at that cannot be parsed or has no UTC offset, or two own executions sharing the
+    newest instant at or before the announcement, read unknown: the alert, though its own delivery
+    failed, does not print again."""
+    host = Host(tmp_path)
+    host.refuse(decisions_probe(), 403, "route_not_allowed")
+    alert_execution = execution(monkeypatch, WATCH_JOB, alert_claim)
+    alert = host.run(job_id=WATCH_JOB, delivery_state=None)
+    deliver(alert_execution, WATCH_JOB, alert.text, "failed")
+    if other_claim:
+        execution(monkeypatch, WATCH_JOB, other_claim)
+
+    again = next_watch_run(host, monkeypatch)
+
+    assert alert.kind == "alert"
+    assert (again.code, again.text) == (0, "")

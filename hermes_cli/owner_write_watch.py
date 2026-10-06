@@ -12,7 +12,9 @@ Models route the owner app calls is still registered for its key (indirect signa
 with the owner app, and no request is sent to those routes).
 
 Printed output is the job's message: nothing while the state stays the same, one alert when checks
-start to fail, one update when the failing set changes, one recovery message. Exit 0 whenever the
+start to fail, one update when the failing set changes, one recovery message. A message whose
+delivery failed prints again hourly when HERMES_CRON_JOB_ID gives the job's own id; without it
+nothing prints twice, and the first alert says that the hourly repeat is off. Exit 0 whenever the
 checks ran; non-zero only when they could not run (no key, unreadable state file, page check
 missing). The key is only ever the request's bearer: never printed, logged or written.
 """
@@ -36,6 +38,8 @@ REPORT_FILE = "owner_write_watch_report.json"
 GAP = timedelta(hours=2)
 # A failed announcement prints again at most once an hour; the margin absorbs scheduler jitter.
 REPEAT_AFTER = timedelta(minutes=50)
+# Added to the first alert when the job runs without its own job id.
+REPEAT_OFF = "The hourly repeat is off: if this alert is not delivered, it is not sent again."
 REQUEST_TIMEOUT_SECONDS = 30.0
 PAGE_CHECK_TIMEOUT_SECONDS = 600
 # The dashboard serving Connections and Models runs as the default profile; one job runs the
@@ -231,8 +235,8 @@ def run(
     job_id: Optional[str] = None,
 ) -> Outcome:
     """One hourly run. Every argument after ``page_check`` defaults to the production one.
-    ``job_id`` is the watch job's own cron job id: without it no delivery can be read, so every
-    announcement reads unknown and never prints again."""
+    ``job_id`` is the watch job's own cron job id, which main() reads from HERMES_CRON_JOB_ID:
+    without it no delivery can be read, so every announcement reads unknown and never prints again."""
     clock = now or (lambda: datetime.now(timezone.utc))
     if profile is None:
         from hermes_cli.profiles import get_active_profile_name
@@ -504,9 +508,12 @@ _EXECUTION_PAGE = 500
 
 def _previous_delivery(announced: Dict[str, Any], job_id: Optional[str]) -> str:
     """Delivery state of the announcement, read only from the watch job's own execution that printed
-    it: the newest execution of ``job_id`` claimed at or before the announcement, paged newest first
-    with no fixed window. Other jobs' executions are never read. ``unknown`` without the job id or
-    when that execution's record cannot be read or does not hold the announced text."""
+    it: of every execution of ``job_id``, paged with no fixed window, the one whose claimed_at is the
+    newest instant at or before the announcement, compared in UTC and never as text (a daylight
+    saving or time zone change puts the scheduler's local text out of order). Other jobs' executions
+    are never read. ``unknown`` without the job id; when any own claimed_at is not ISO text with a
+    UTC offset, or two own executions share that newest instant; or when that execution's record
+    cannot be read or does not hold the announced text."""
     at = _moment(announced.get("at"))
     if not job_id or at is None or not isinstance(announced.get("text"), str):
         return UNKNOWN
@@ -514,21 +521,38 @@ def _previous_delivery(announced: Dict[str, Any], job_id: Optional[str]) -> str:
         from cron import delivery_record
         from cron.executions import list_executions
 
-        cursor = None
+        newest, tied, cursor = None, False, None
         while True:
             rows = list_executions(job_id=job_id, limit=_EXECUTION_PAGE, before_claimed_at=cursor)
             for row in rows:
-                claimed = _moment(row["claimed_at"])
+                claimed = _instant(row["claimed_at"])
                 if claimed is None:
                     return UNKNOWN
-                if claimed <= at:
-                    record = delivery_record.load_many([row["id"]]).get(row["id"])
-                    return _delivery_outcome(record, announced["text"])
+                if claimed > at:
+                    continue
+                if newest is None or claimed > newest[0]:
+                    newest, tied = (claimed, row["id"]), False
+                elif claimed == newest[0]:
+                    tied = True
             if len(rows) < _EXECUTION_PAGE:
-                return UNKNOWN
+                break
             cursor = rows[-1]["claimed_at"]
+        if newest is None or tied:
+            return UNKNOWN
+        record = delivery_record.load_many([newest[1]]).get(newest[1])
+        return _delivery_outcome(record, announced["text"])
     except Exception:
         return UNKNOWN
+
+
+def _instant(value: Any) -> Optional[datetime]:
+    """An own execution's claimed_at as its instant in UTC; None unless it is ISO text with a UTC
+    offset. Only the reader above reads a time this way."""
+    try:
+        moment = datetime.fromisoformat(value)
+        return moment.astimezone(timezone.utc) if moment.utcoffset() is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _delivery_outcome(record: Optional[Dict[str, Any]], text: str) -> str:
@@ -548,13 +572,20 @@ def _delivery_outcome(record: Optional[Dict[str, Any]], text: str) -> str:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    import os
+
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 1:
         print("usage: python -m hermes_cli.owner_write_watch <page check path>", file=sys.stderr)
         return 2
-    outcome = run(args[0])
-    if outcome.text:
-        print(outcome.text)
+    # The job's own id, which the scheduler gives a script-only job; unset or empty, it is absent.
+    job_id = os.environ.get("HERMES_CRON_JOB_ID") or None
+    outcome = run(args[0], job_id=job_id)
+    text = outcome.text
+    if outcome.kind == "alert" and job_id is None:
+        text += "\n" + REPEAT_OFF
+    if text:
+        print(text)
     return outcome.code
 
 
