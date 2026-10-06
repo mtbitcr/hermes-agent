@@ -9,7 +9,12 @@ own instead of the whole file at collection.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import os
+import sqlite3
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,6 +31,8 @@ def _commit(label: str) -> str:
 
 
 PREV, NEW, FEATURE, TREE = (_commit(label) for label in ("prev", "new", "feature", "tree"))
+LATER = _commit("later")
+WROTE_NOTHING = "Nothing in the release state was written."
 CHECKOUT = "/srv/hermes/checkout"
 CONFIG = {"config.yaml": "digest"}
 PAGE_REF = "decisions-page:release"
@@ -36,6 +43,36 @@ SETTINGS = {
     "workspace_check_url": "http://127.0.0.1:8650/api/projects",
 }
 UNITS = {"gateway": "hermes-gateway", "serve": "hermes-serve", **SETTINGS["units"]}
+_REPO = Path(__file__).resolve().parents[2]
+# The real CLI as the hermes script runs it, with a FakeHost of the kill mode in argv[2] standing
+# in for both live adapters, as in _command: there is no real release host here.
+_CLI = (
+    "import sys\n"
+    "sys.path.insert(0, sys.argv.pop(1))\n"
+    "from test_release_cmd import FakeHost\n"
+    "from hermes_cli import release_cmd\n"
+    "host = FakeHost(kill_mode=sys.argv.pop(1))\n"
+    "release_cmd.LiveHostReader = release_cmd.ReleaseHostActions = host.build\n"
+    "from hermes_cli.main import main\n"
+    "sys.argv[0] = 'hermes'\n"
+    "sys.exit(main())\n"
+)
+# A writer of the release record in its own process, as the merge step is. It turns the record to
+# WAL mode, commits an accepted batch for NEW and a later change to the -wal alone, says ready and
+# keeps its connection until its input closes. That -wal holds no frame of page 1, the header.
+_WRITER = (
+    "import sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "import test_release_cmd as t\n"
+    "conn = t.ledger.connect()\n"
+    "conn.execute('PRAGMA journal_mode=WAL')\n"
+    "conn.execute('PRAGMA wal_autocheckpoint=0')\n"
+    "t._accept(conn, t._merge(conn, t.NEW))\n"
+    "t._merge(conn, t.LATER, 2)\n"
+    "print('ready', flush=True)\n"
+    "sys.stdin.read()\n"
+    "conn.close()\n"
+)
 
 
 @dataclass
@@ -186,6 +223,63 @@ def _files(top: Path) -> dict[str, tuple[bytes, int]]:
         str(path): (path.read_bytes() if path.is_file() else b"", path.stat().st_mtime_ns)
         for path in top.rglob("*")
     }
+
+
+def _release_state(top: Path) -> dict[str, bytes | None]:
+    """The release record, the snapshot directory and the homes' configuration files and
+    databases under ``top``, each path with its bytes, None for a directory. The generic start of
+    every hermes command (logs, caches, the persona file, locks) is no part of it."""
+    return {
+        str(path): path.read_bytes() if path.is_file() else None
+        for path in top.rglob("*")
+        if "release-snapshots" in path.relative_to(top).parts
+        or path.name in ("config.yaml", ".env")
+        or ".db" in path.name
+    }
+
+
+def _live_files(path: Path) -> dict[str, bytes | None]:
+    """The live record's database file and side files, each with its bytes, or None if absent."""
+    files = {side: Path(f"{path}{side}") for side in ("", "-wal", "-shm", "-journal")}
+    return {side: file.read_bytes() if file.exists() else None for side, file in files.items()}
+
+
+def _env(top: Path, home: Path) -> dict[str, str]:
+    """The environment of a child process: HOME at ``top`` and HERMES_HOME at ``home``, both
+    temporary, never a real home."""
+    return {
+        **os.environ,
+        "HOME": str(top),
+        "HERMES_HOME": str(home),
+        "PYTHONPATH": str(_REPO),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+
+def _cli(top: Path, home: Path, *argv: str, kill_mode: str = "mixed"):
+    """``hermes *argv`` in a child process (see _CLI)."""
+    return subprocess.run(
+        [sys.executable, "-c", _CLI, str(Path(__file__).parent), kill_mode, *argv],
+        cwd=_REPO,
+        env=_env(top, home),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+@contextlib.contextmanager
+def _wal_writer(top: Path, home: Path):
+    """_WRITER, from the moment its changes are committed until the block ends."""
+    with subprocess.Popen(
+        [sys.executable, "-c", _WRITER, str(Path(__file__).parent)],
+        env=_env(top, home),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    ) as writer:
+        assert writer.stdout.readline() == "ready\n"
+        yield writer
 
 
 def test_prepare_runs_every_guard_and_writes_nothing(root, tmp_path, monkeypatch, capsys):
@@ -357,3 +451,123 @@ def test_release_is_registered_with_its_subcommands(monkeypatch):
     assert "Check a release before it runs" in parser.format_help()
     args = parser.parse_args(["release", "status"])
     assert args.release_command == "status" and callable(args.func)
+
+
+@pytest.mark.parametrize(
+    ("case", "code", "tail"),
+    [
+        ("passing prepare", 0, [f"All {len(GUARDS)} release guards passed. {WROTE_NOTHING}"]),
+        ("failed guard", 1, [f"Refused: 1 of {len(GUARDS)} release guards failed.", WROTE_NOTHING]),
+        (
+            "unset settings",
+            1,
+            [
+                "Refused: the sandbox tunnel unit is not set: set release.units.sandbox-tunnel in"
+                " {root}/config.yaml.",
+                WROTE_NOTHING,
+            ],
+        ),
+        (
+            "profile home",
+            1,
+            [
+                "Refused: a release runs only from the root Hermes home {root}, not from"
+                " {root}/profiles/coder.",
+                WROTE_NOTHING,
+            ],
+        ),
+        (
+            "status",
+            0,
+            ["No batch is waiting for a decision.", "Last outcome: no release has finished yet."],
+        ),
+    ],
+)
+def test_the_real_command_writes_nothing_to_the_release_state(root, tmp_path, case, code, tail):
+    # Through the CLI in a child process, its generic start included.
+    profile = root / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    for home in (root, profile):
+        (home / "config.yaml").write_text(yaml.safe_dump({"release": SETTINGS}))
+        (home / ".env").write_text("HERMES_RELEASE_TEST=kept\n")
+        with contextlib.closing(sqlite3.connect(home / "state.db")) as db:
+            db.execute("CREATE TABLE kept (value)")
+    for kind in ("state", "config"):
+        (root / "release-snapshots" / kind / PREV).mkdir(parents=True)
+        (root / "release-snapshots" / kind / PREV / "kept").write_text(kind)
+    if case == "unset settings":
+        (root / "config.yaml").write_text(yaml.safe_dump({"release": {**SETTINGS, "units": {}}}))
+    _accepted_batch(NEW)
+    before = _release_state(tmp_path)
+
+    done = _cli(
+        tmp_path,
+        profile if case == "profile home" else root,
+        "release",
+        "status" if case == "status" else "prepare",
+        kill_mode="control-group" if case == "failed guard" else "mixed",
+    )
+
+    assert done.returncode == code, done.stderr
+    assert done.stdout.splitlines()[-len(tail):] == [line.format(root=root) for line in tail]
+    # The release record, the snapshot directory and the homes' configuration files and
+    # databases are unchanged, byte for byte.
+    assert _release_state(tmp_path) == before
+
+
+@pytest.mark.parametrize("command", ["prepare", "status"])
+@pytest.mark.parametrize("writing", [False, True], ids=["closed-wal-ledger", "live-writer"])
+def test_the_release_record_is_read_from_a_private_copy(
+    root, tmp_path, monkeypatch, capsys, command, writing
+):
+    release_cmd = _command(monkeypatch, FakeHost())
+    path = ledger.ledger_path()
+    with _wal_writer(tmp_path, root) as writer:
+        if not writing:
+            writer.stdin.close()
+            writer.wait(timeout=30)  # it folds the -wal back and removes it and the -shm
+        before = _live_files(path)
+        assert before[""][18:20] == b"\2\2"  # the record is in WAL mode
+        assert (before["-wal"] is not None, before["-shm"] is not None) == (writing, writing)
+
+        assert getattr(release_cmd, command)() == 0
+
+        assert _live_files(path) == before
+    # Every committed change is read, those still only in the -wal too.
+    out = capsys.readouterr().out
+    if command == "prepare":
+        assert f"PREV {PREV}, NEW {NEW}" in out
+    else:
+        assert "waiting for the owner's decision: 1 change" in out
+
+
+@pytest.mark.parametrize("command", ["prepare", "status"])
+@pytest.mark.parametrize(
+    ("damage", "cause"),
+    [
+        pytest.param(
+            "empty", "OperationalError: no such table: release_batches", id="empty-main-file"
+        ),
+        pytest.param("header", "DatabaseError: file is not a database", id="damaged-header"),
+    ],
+)
+def test_a_record_copy_sqlite_cannot_read_fails_closed(
+    root, tmp_path, monkeypatch, capsys, command, damage, cause
+):
+    host = FakeHost()
+    release_cmd = _command(monkeypatch, host)
+    path = ledger.ledger_path()
+    with _wal_writer(tmp_path, root):
+        wal = Path(f"{path}-wal").read_bytes()  # a valid -wal of this record
+    main = path.read_bytes()
+    path.write_bytes(b"" if damage == "empty" else bytes(100) + main[100:])
+    Path(f"{path}-wal").write_bytes(wal)
+    before = _live_files(path)
+
+    assert getattr(release_cmd, command)() == 1
+
+    assert capsys.readouterr().out.splitlines() == [
+        f"Refused: the release record {path} could not be read ({cause}).",
+        WROTE_NOTHING,
+    ]
+    assert (_live_files(path), host.built) == (before, [])

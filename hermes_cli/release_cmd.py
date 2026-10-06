@@ -2,14 +2,18 @@
 
 ``prepare`` works out PREV and NEW (S-B), builds both live adapters from the ``release`` settings
 (S-E) and asks the host every merged guard, printing each result in plain words. It writes
-nothing: config.yaml is read as it is on disk, the release record is opened read-only, and the
-guards only read. ``status`` prints the waiting batch and the last outcome. The release itself,
-under the pause (S-A) and in its own unit (S-F), belongs to a later card.
+nothing to the release state: config.yaml is read as it is on disk, the release record is read
+from a private copy, and the guards only read. ``status`` prints the waiting batch and the last
+outcome. The release itself, under the pause (S-A) and in its own unit (S-F), belongs to a later
+card.
 """
 
 from __future__ import annotations
 
+import contextlib
+import shutil
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +56,16 @@ _ROLLED_BACK = (
 _LAST_FINISHED_SQL = (
     "SELECT batch_id FROM release_events WHERE kind = 'release_finished' ORDER BY id DESC LIMIT 1"
 )
+# release_ledger.last_released's query. The ledger's readers refuse a connection to anything but
+# the live store itself, so the copy is read with these queries and release_ledger._snapshot.
+_LAST_RELEASED_SQL = (
+    "SELECT new FROM release_batches JOIN release_events ON batch_id = release_batches.id "
+    "WHERE state = 'released' AND kind = 'release_finished' ORDER BY release_events.id DESC LIMIT 1"
+)
+
+
+class _UnreadableRecord(Exception):
+    """The copy of the release record could not be read; the message is the plain reason."""
 
 
 def cmd_release(args) -> int:
@@ -77,7 +91,10 @@ def prepare() -> int:
         config = root / "config.yaml"
         return _refuse(*(f"{name} is not set: set release.{key} in {config}" for key, name in unset))
 
-    batches, live, _finished = _record()
+    try:
+        batches, live, _finished = _record()
+    except _UnreadableRecord as error:
+        return _refuse(str(error))
     accepted = [batch for batch in batches if batch["state"] == "accepted"]
     if not accepted:
         return _refuse("no batch is accepted, so there is nothing to release")
@@ -115,13 +132,16 @@ def prepare() -> int:
         failed += not ok
     if failed:
         return _refuse(f"{failed} of {len(GUARDS)} release guards failed")
-    print(f"All {len(GUARDS)} release guards passed. Nothing was written.")
+    print(f"All {len(GUARDS)} release guards passed. Nothing in the release state was written.")
     return 0
 
 
 def status() -> int:
     """Print the waiting batch and the last outcome in plain words; write nothing."""
-    batches, _live, finished = _record()
+    try:
+        batches, _live, finished = _record()
+    except _UnreadableRecord as error:
+        return _refuse(str(error))
     waiting = next((batch for batch in batches if batch["state"] in _WAITING), None)
     if waiting is None:
         print("No batch is waiting for a decision.")
@@ -144,7 +164,7 @@ def status() -> int:
 def _refuse(*reasons: str) -> int:
     for reason in reasons:
         print(f"Refused: {reason}.")
-    print("Nothing was written.")
+    print("Nothing in the release state was written.")
     return 1
 
 
@@ -182,23 +202,37 @@ def _adapters(
 
 def _record() -> tuple[list[dict[str, Any]], str | None, int | None]:
     """Every batch, the NEW of the last released batch and the batch whose release finished last,
-    all from one snapshot of the release record.
+    all from a private copy of the release record.
 
-    The record is opened read-only, never through release_ledger.connect(), which creates and
-    upgrades it; a record that does not exist yet reads as empty.
+    The database file, and its -wal when one exists, are copied into a private temporary
+    directory; the copy is opened there read-only, read and removed. SQLite never opens the live
+    files, so it cannot create, change or delete their side files, and what was committed to the
+    -wal is still read. A record that does not exist yet reads as empty; a copy SQLite cannot
+    read raises _UnreadableRecord.
     """
     path = release_ledger.ledger_path()
     if not path.is_file():
         return [], None, None
-    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, isolation_level=None)
-    conn.row_factory = sqlite3.Row
     try:
-        conn.execute("BEGIN")
-        finished = conn.execute(_LAST_FINISHED_SQL).fetchone()
-        return (
-            release_ledger.list_batches(conn),
-            release_ledger.last_released(conn),
-            None if finished is None else finished["batch_id"],
-        )
-    finally:
-        conn.close()
+        with tempfile.TemporaryDirectory(prefix="hermes-release-record-") as private:
+            copy = Path(private) / path.name
+            shutil.copyfile(path, copy)
+            with contextlib.suppress(FileNotFoundError):
+                shutil.copyfile(f"{path}-wal", f"{copy}-wal")
+            conn = sqlite3.connect(f"{copy.as_uri()}?mode=ro", uri=True, isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            try:
+                ids = conn.execute("SELECT id FROM release_batches ORDER BY id").fetchall()
+                live = conn.execute(_LAST_RELEASED_SQL).fetchone()
+                finished = conn.execute(_LAST_FINISHED_SQL).fetchone()
+                return (
+                    [release_ledger._snapshot(conn, row["id"]) for row in ids],
+                    None if live is None else live["new"],
+                    None if finished is None else finished["batch_id"],
+                )
+            finally:
+                conn.close()
+    except (OSError, sqlite3.Error) as error:
+        raise _UnreadableRecord(
+            f"the release record {path} could not be read ({type(error).__name__}: {error})"
+        ) from error
