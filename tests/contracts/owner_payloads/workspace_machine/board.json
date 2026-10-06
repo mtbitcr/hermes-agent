@@ -7,13 +7,15 @@
           {
             "assignee_name": "default",
             "child_ids": [],
-            "event_revision": 22,
-            "id": "t_3a414ff6",
+            "event_revision": 26,
+            "id": "t_ed6006fd",
             "parent_ids": [
               "t_69a8bd1d"
             ],
             "responsibility": null,
             "review_state": "none",
+            "risk_tier": null,
+            "risk_tier_raised": false,
             "stopped_work": "none",
             "title": "Rework: Review the changes outline",
             "updated_at": "2026-09-21T14:13:20Z"
@@ -39,8 +41,38 @@
             "parent_ids": [],
             "responsibility": "B03",
             "review_state": "none",
+            "risk_tier": null,
+            "risk_tier_raised": false,
             "stopped_work": "none",
             "title": "Ready work",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 21,
+            "id": "t_1f83b976",
+            "parent_ids": [],
+            "responsibility": null,
+            "review_state": "none",
+            "risk_tier": 1,
+            "risk_tier_raised": true,
+            "stopped_work": "none",
+            "title": "Tier 1 work",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 18,
+            "id": "t_3a414ff6",
+            "parent_ids": [],
+            "responsibility": null,
+            "review_state": "none",
+            "risk_tier": 0,
+            "risk_tier_raised": false,
+            "stopped_work": "none",
+            "title": "Tier 0 work",
             "updated_at": "2026-09-21T14:13:20Z"
           },
           {
@@ -51,20 +83,38 @@
             "parent_ids": [],
             "responsibility": null,
             "review_state": "none",
+            "risk_tier": null,
+            "risk_tier_raised": false,
             "stopped_work": "none",
             "title": "Record the workshop runs",
             "updated_at": "2026-09-21T14:13:20Z"
           },
           {
             "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 20,
+            "id": "t_3f9f880f",
+            "parent_ids": [],
+            "responsibility": null,
+            "review_state": "none",
+            "risk_tier": 2,
+            "risk_tier_raised": false,
+            "stopped_work": "none",
+            "title": "Tier 2 work",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
             "child_ids": [
-              "t_3a414ff6"
+              "t_ed6006fd"
             ],
-            "event_revision": 23,
+            "event_revision": 27,
             "id": "t_69a8bd1d",
             "parent_ids": [],
             "responsibility": null,
             "review_state": "changes_requested",
+            "risk_tier": null,
+            "risk_tier_raised": false,
             "stopped_work": "none",
             "title": "Review the changes outline",
             "updated_at": "2026-09-21T14:13:20Z"
@@ -82,6 +132,8 @@
             "parent_ids": [],
             "responsibility": null,
             "review_state": "none",
+            "risk_tier": null,
+            "risk_tier_raised": false,
             "stopped_work": "none",
             "title": "Running work",
             "updated_at": "2026-09-21T14:13:20Z"
@@ -99,6 +151,8 @@
             "parent_ids": [],
             "responsibility": null,
             "review_state": "none",
+            "risk_tier": null,
+            "risk_tier_raised": false,
             "stopped_work": "capability",
             "title": "Connect the payment provider",
             "updated_at": "2026-09-21T14:13:20Z"
@@ -111,6 +165,8 @@
             "parent_ids": [],
             "responsibility": null,
             "review_state": "none",
+            "risk_tier": null,
+            "risk_tier_raised": false,
             "stopped_work": "gave_up",
             "title": "Print the workshop handouts",
             "updated_at": "2026-09-21T14:13:20Z"
@@ -123,11 +179,13 @@
           {
             "assignee_name": "default",
             "child_ids": [],
-            "event_revision": 18,
+            "event_revision": 22,
             "id": "t_d5a64436",
             "parent_ids": [],
             "responsibility": null,
             "review_state": "awaiting_review",
+            "risk_tier": null,
+            "risk_tier_raised": false,
             "stopped_work": "none",
             "title": "Review the awaiting outline",
             "updated_at": "2026-09-21T14:13:20Z"
@@ -145,6 +203,8 @@
             "parent_ids": [],
             "responsibility": null,
             "review_state": "approved",
+            "risk_tier": null,
+            "risk_tier_raised": false,
             "stopped_work": "none",
             "title": "Review the approved outline",
             "updated_at": "2026-09-21T14:13:20Z"
