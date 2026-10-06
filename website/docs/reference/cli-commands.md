@@ -1842,7 +1842,7 @@ hermes release <prepare|status>
 | `prepare` | Work out PREV (the NEW of the last released batch; before the first release, the checkout's head) and NEW (the merge commit of the accepted batch's last member), ask the host every release guard and print each result. Writes nothing. Exits non-zero when a guard fails or the release is refused, for example from a profile home: it runs only from the root Hermes home. |
 | `status` | Show the batch waiting for the owner's decision and the outcome of the last release. Writes nothing. |
 
-The `release` section of the root `config.yaml` describes the release host: `units` (user unit names for the `gateway`, `serve` and `sandbox-tunnel` roles; defaults `hermes-gateway`, `hermes-serve` and empty), `health_url` and `workspace_check_url` (the readback addresses, empty by default), `snapshot_dir` (empty means `release-snapshots` under the root home) and `drain_poll_seconds` (30). `prepare` refuses while a unit name or an address is empty.
+The `release` section of the root `config.yaml` describes the release host: `units` (user unit names for the `gateway`, `serve` and `sandbox-tunnel` roles; defaults `hermes-gateway`, `hermes-serve` and empty), `health_url` and `workspace_check_url` (the readback addresses, empty by default), `snapshot_dir` (empty means `release-snapshots` under the root home) and `drain_poll_seconds` (30). `${VAR}` and `${env:VAR}` references in this section are resolved first, and `prepare` refuses while a unit name or an address is empty, or while one of them or `snapshot_dir` refers to a variable that is not set.
 
 ## Maintenance commands
 

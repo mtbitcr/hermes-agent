@@ -23,6 +23,7 @@ import yaml
 
 from hermes_cli import release_ledger as ledger
 from hermes_cli.release_guards import GUARDS
+from hermes_cli.release_host import LiveHostReader
 
 
 def _commit(label: str) -> str:
@@ -43,6 +44,18 @@ SETTINGS = {
     "workspace_check_url": "http://127.0.0.1:8650/api/projects",
 }
 UNITS = {"gateway": "hermes-gateway", "serve": "hermes-serve", **SETTINGS["units"]}
+# Each required setting and the plain name its refusal gives it.
+REQUIRED = [
+    pytest.param("units.gateway", "the gateway unit", id="gateway-unit"),
+    pytest.param("units.serve", "the serve unit", id="serve-unit"),
+    pytest.param("units.sandbox-tunnel", "the sandbox tunnel unit", id="sandbox-tunnel-unit"),
+    pytest.param("health_url", "the health address", id="health-address"),
+    pytest.param(
+        "workspace_check_url", "the owner-page check address", id="owner-page-check-address"
+    ),
+]
+# The two forms of a reference in config.yaml; a test puts its own variable's name for VAR.
+REFERENCE_FORMS = [pytest.param("${VAR}", id="var"), pytest.param("${env:VAR}", id="env-var")]
 _REPO = Path(__file__).resolve().parents[2]
 # The real CLI as the hermes script runs it, with a FakeHost of the kill mode in argv[2] standing
 # in for both live adapters, as in _command: there is no real release host here.
@@ -80,13 +93,16 @@ class FakeHost:
     """A healthy release host in memory, at PREV, on which every guard passes for NEW.
 
     It stands in for both live adapters and keeps the keywords each was built with. Any other call
-    is one of the host's moves or readbacks, which prepare never asks; it is only noted.
+    is one of the host's moves or readbacks, which prepare never asks; it is only noted. With
+    live_snapshots, the state snapshots are what the real LiveHostReader, built with the reader's
+    keywords, finds on disk, instead of snapshot_dirs.
     """
 
     head: str = PREV
     snapshot_dirs: list[str] = field(default_factory=list)
     kill_mode: str = "mixed"
     runs_readable: bool = True
+    live_snapshots: bool = False
     built: list[dict] = field(default_factory=list)
     chains: list[tuple[str, str]] = field(default_factory=list)
     asked: list[str] = field(default_factory=list)
@@ -137,6 +153,9 @@ class FakeHost:
         return 5 * 1024**3
 
     def snapshots(self):
+        if self.live_snapshots:
+            [reader] = [settings for settings in self.built if "snapshot_name" in settings]
+            return LiveHostReader(**reader).snapshots()
         return list(self.snapshot_dirs)
 
     def open_native_runs(self):
@@ -160,6 +179,14 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HERMES_HOME", str(home))
     (home / "config.yaml").write_text(yaml.safe_dump({"release": SETTINGS}))
     return home
+
+
+def _settings_with(key: str, value: str) -> dict:
+    """SETTINGS with the dotted ``key`` set to ``value``."""
+    section, _, leaf = key.partition(".")
+    if leaf:
+        return {**SETTINGS, section: {**SETTINGS[section], leaf: value}}
+    return {**SETTINGS, key: value}
 
 
 def _command(monkeypatch: pytest.MonkeyPatch, host: FakeHost | None = None):
@@ -404,6 +431,128 @@ def test_unset_required_settings_refuse(root, monkeypatch, capsys, settings, rea
 
     assert f"Refused: {reason} in {root / 'config.yaml'}." in capsys.readouterr().out
     assert host.built == []
+
+
+@pytest.mark.parametrize("form", REFERENCE_FORMS)
+@pytest.mark.parametrize(("key", "name"), REQUIRED)
+def test_a_reference_that_resolves_to_an_empty_value_refuses(
+    root, monkeypatch, capsys, key, name, form
+):
+    host = FakeHost()
+    release_cmd = _command(monkeypatch, host)
+    monkeypatch.setenv("RELEASE_REF_TEST_EMPTY", "")
+    reference = form.replace("VAR", "RELEASE_REF_TEST_EMPTY")
+    (root / "config.yaml").write_text(yaml.safe_dump({"release": _settings_with(key, reference)}))
+    _accepted_batch(NEW)
+
+    assert release_cmd.prepare() != 0
+
+    # The refusal of a literal empty value, before any adapter is built.
+    assert capsys.readouterr().out.splitlines() == [
+        f"Refused: {name} is not set: set release.{key} in {root / 'config.yaml'}.",
+        WROTE_NOTHING,
+    ]
+    assert host.built == []
+
+
+@pytest.mark.parametrize("form", REFERENCE_FORMS)
+@pytest.mark.parametrize(
+    ("key", "name"),
+    [*REQUIRED, pytest.param("snapshot_dir", "the snapshot directory", id="snapshot-dir")],
+)
+def test_a_reference_to_a_variable_that_is_not_set_refuses(
+    root, monkeypatch, capsys, key, name, form
+):
+    # The reference is kept as written; its placeholder must reach neither adapter.
+    host = FakeHost()
+    release_cmd = _command(monkeypatch, host)
+    monkeypatch.delenv("RELEASE_REF_TEST_UNSET", raising=False)
+    reference = form.replace("VAR", "RELEASE_REF_TEST_UNSET")
+    (root / "config.yaml").write_text(yaml.safe_dump({"release": _settings_with(key, reference)}))
+    _accepted_batch(NEW)
+
+    assert release_cmd.prepare() != 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        f"Refused: {name} refers to a variable that is not set: set the variable, or change"
+        f" release.{key} in {root / 'config.yaml'}.",
+        WROTE_NOTHING,
+    ]
+    assert host.built == []
+
+
+@pytest.mark.parametrize("form", REFERENCE_FORMS)
+def test_both_adapters_are_built_from_the_resolved_settings(root, monkeypatch, form):
+    host = FakeHost()
+    release_cmd = _command(monkeypatch, host)
+
+    def ref(variable: str, value: str) -> str:
+        monkeypatch.setenv(variable, value)
+        return form.replace("VAR", variable)
+
+    settings = {
+        "units": {
+            "gateway": ref("RELEASE_REF_TEST_GATEWAY", "hermes-gateway-blue"),
+            "serve": ref("RELEASE_REF_TEST_SERVE", "hermes-serve-blue"),
+            "sandbox-tunnel": ref("RELEASE_REF_TEST_TUNNEL", "hermes-sandbox-tunnel-blue"),
+        },
+        "health_url": ref("RELEASE_REF_TEST_HEALTH", "http://127.0.0.1:9642/health"),
+        "workspace_check_url": ref("RELEASE_REF_TEST_CHECK", "http://127.0.0.1:9650/api/projects"),
+        # An empty snapshot_dir, here from a reference, means release-snapshots under the root.
+        "snapshot_dir": ref("RELEASE_REF_TEST_EMPTY", ""),
+    }
+    (root / "config.yaml").write_text(yaml.safe_dump({"release": settings}))
+    _accepted_batch(NEW)
+
+    assert release_cmd.prepare() == 0
+
+    shared = {
+        "checkout": Path(release_cmd.__file__).resolve().parents[1],
+        "root_home": root,
+        "units": {
+            "gateway": "hermes-gateway-blue",
+            "serve": "hermes-serve-blue",
+            "sandbox-tunnel": "hermes-sandbox-tunnel-blue",
+        },
+        "snapshot_root": root / "release-snapshots",
+    }
+    assert host.built == [
+        {**shared, "snapshot_name": NEW},
+        {
+            **shared,
+            "health_url": "http://127.0.0.1:9642/health",
+            "workspace_check_url": "http://127.0.0.1:9650/api/projects",
+        },
+    ]
+
+
+@pytest.mark.parametrize("form", REFERENCE_FORMS)
+def test_g9_looks_for_new_under_the_resolved_snapshot_dir(
+    root, tmp_path, monkeypatch, capsys, form
+):
+    # A real directory, named by a reference, with an earlier release's state snapshot in it.
+    snapshots = tmp_path / "resolved-snapshots"
+    (snapshots / "state" / PREV).mkdir(parents=True)
+    monkeypatch.setenv("RELEASE_REF_TEST_SNAPSHOTS", str(snapshots))
+    reference = form.replace("VAR", "RELEASE_REF_TEST_SNAPSHOTS")
+    (root / "config.yaml").write_text(
+        yaml.safe_dump({"release": _settings_with("snapshot_dir", reference)})
+    )
+    _accepted_batch(NEW)
+
+    host = FakeHost(live_snapshots=True)
+    assert _command(monkeypatch, host).prepare() == 0
+    assert "G9 passed: this release's state snapshot does not exist yet" in capsys.readouterr().out
+    # Both adapters have the resolved root, and the real reader looked under it.
+    assert [settings["snapshot_root"] for settings in host.built] == [snapshots, snapshots]
+
+    # A release of these very changes took NEW's state snapshot there, then rolled back.
+    (snapshots / "state" / NEW).mkdir()
+    host = FakeHost(live_snapshots=True)
+    assert _command(monkeypatch, host).prepare() != 0
+    out = capsys.readouterr().out
+    assert "G9 failed: this release's state snapshot does not exist yet" in out
+    assert "already tried and rolled back" in out and "a new change is needed" in out
 
 
 def test_status_prints_the_waiting_batch_and_last_outcome_in_plain_words(

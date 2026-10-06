@@ -20,7 +20,9 @@ from typing import Any
 from hermes_cli import release_ledger
 from hermes_cli.config import (
     DEFAULT_CONFIG,
+    _ENV_REF_RE,
     _deep_merge,
+    _expand_env_vars,
     cfg_get,
     get_project_root,
     read_raw_config,
@@ -40,6 +42,9 @@ _REQUIRED = {
     "health_url": "the health address",
     "workspace_check_url": "the owner-page check address",
 }
+# A required value or snapshot_dir that keeps a reference whose variable is not set refuses too:
+# its placeholder would reach the adapters, and G9 would look for NEW's state snapshot under it.
+_RESOLVED = {**_REQUIRED, "snapshot_dir": "the snapshot directory"}
 _WAITING = {"open": "waiting for the owner's decision", "deferred": "put off by the owner"}
 _OUTCOMES = {
     "released": "was released",
@@ -81,15 +86,19 @@ def prepare() -> int:
     root, home = get_default_hermes_root(), get_hermes_home()
     if home.resolve() != root.resolve():  # S-A
         return _refuse(f"a release runs only from the root Hermes home {root}, not from {home}")
-    settings = _settings()
-    unset = [
-        (key, name)
-        for key, name in _REQUIRED.items()
-        if not str(cfg_get(settings, *key.split(".")) or "").strip()
-    ]
-    if unset:
-        config = root / "config.yaml"
-        return _refuse(*(f"{name} is not set: set release.{key} in {config}" for key, name in unset))
+    settings, config = _settings(), root / "config.yaml"
+    reasons = []
+    for key, name in _RESOLVED.items():
+        value = str(cfg_get(settings, *key.split(".")) or "")
+        if key in _REQUIRED and not value.strip():
+            reasons.append(f"{name} is not set: set release.{key} in {config}")
+        elif _ENV_REF_RE.search(value):
+            reasons.append(
+                f"{name} refers to a variable that is not set: set the variable, or change"
+                f" release.{key} in {config}"
+            )
+    if reasons:
+        return _refuse(*reasons)
 
     try:
         batches, live, _finished = _record()
@@ -170,9 +179,13 @@ def _refuse(*reasons: str) -> int:
 
 def _settings() -> dict[str, Any]:
     """The ``release`` settings over their defaults, from config.yaml as it is on disk: loading
-    the full configuration would create the home's directories and files."""
+    the full configuration would create the home's directories and files. Their ``${VAR}`` and
+    ``${env:VAR}`` references are resolved as load_config resolves them; one whose variable is
+    not set is kept as written."""
     raw = read_raw_config().get("release")
-    return _deep_merge(DEFAULT_CONFIG["release"], raw if isinstance(raw, dict) else {})
+    return _expand_env_vars(
+        _deep_merge(DEFAULT_CONFIG["release"], raw if isinstance(raw, dict) else {})
+    )
 
 
 def _adapters(
