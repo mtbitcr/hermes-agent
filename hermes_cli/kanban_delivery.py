@@ -745,8 +745,6 @@ _REVIEW_CREATOR, _REVIEW_TIER = "kanban-delivery", "routine"
 _COMBINED = {"R15": "correctness and security"}
 _SPLIT = {"R15": "correctness", "R12": "security"}
 
-_PASSED = ("success", "skipped", "neutral")  # what the rerun fence reads as passing
-
 # Fixed kernel text with ids only, like the pull request's.
 _REVIEW_TITLE = "Review ({lens}) of {source} at {head}"
 _REVIEW_BODY = (
@@ -792,24 +790,6 @@ def _page(github, path: str, key: str, **query) -> tuple:
             len({item["id"] for item in page}) != len(page)):
         raise PublishRefused("ci_unreadable", f"GitHub answered {answer['status']} for {path}")
     return page, count
-
-
-def _latest_jobs(github, repository: str, head: str) -> tuple:
-    """``(jobs, partial)``: the latest jobs of H's workflow runs, from one page of each list, read only to
-    name a red check's failed jobs. A list that does not fit its page, or cannot be read, makes the jobs
-    partial; they never decide anything."""
-    from hermes_cli.kanban_delivery_github import GitHubTransportError
-
-    jobs = []
-    try:
-        runs, count = _page(github, f"/repos/{repository}/actions/runs", "workflow_runs", head_sha=head)
-        partial = len(runs) != count
-        for run in runs:
-            listed, count = _page(github, f"/repos/{repository}/actions/runs/{run['id']}/jobs", "jobs", filter="latest")
-            jobs, partial = jobs + listed, partial or len(listed) != count
-    except (PublishRefused, GitHubTransportError):
-        return jobs, True
-    return jobs, partial
 
 
 def _open_at_head(github, repository: str, row: dict) -> bool:
@@ -883,8 +863,9 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
     """Card 2 for one published row: GitHub is read outside every transaction, and an
     outcome or a waiting reason is stored only while the row and its done source card
     are as this pass read them before GitHub. The required check on H, in one request read
-    after the jobs page and right before the pull request is read again, alone decides green,
-    red or wait; the jobs only name a red check's failed jobs. Returns the state stored, if any."""
+    right before the pull request is read again, alone decides green, red or wait; a red
+    decision's waiting record holds the id and conclusion of each red required check run,
+    as that request answered them. Returns the state stored, if any."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head = row["source_task_id"], row["pull_request_head"]
@@ -915,7 +896,6 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         if not _open_at_head(github, repository, row):
             return None  # the pull request moved off H or closed: no card for a stale head
         required = policy.required_checks[repository]
-        jobs, partial = _latest_jobs(github, repository, head)  # only to name a red check's failed jobs
         runs, count = _page(github, f"/repos/{repository}/commits/{head}/check-runs", "check_runs", filter="latest")
         if count > 100 or len(runs) != count:  # the one decision request, read last: whole on its one page
             raise PublishRefused("ci_unreadable", f"{count} check runs on {head}, {len(runs)} in the answer")
@@ -927,14 +907,11 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
             return None  # CI on H still runs, or the pull request left H while CI was read: a later step tries again
         if outcomes == {"success"}:
             return _create_review_cards(db_path, row, read, repository, base, required, reviewer, route)
-        runs = {job.get("run_id") for job in jobs if job.get("name") in required}  # the runs of H's required checks
-        failed = [job for job in jobs if job.get("run_id") in runs and job.get("status") == "completed"
-                  and job.get("conclusion") not in _PASSED]
-        failed = [job for job in failed if job.get("name") not in required] or failed  # or the aggregate alone
+        failed = [{"id": run["id"], "conclusion": run.get("conclusion")} for (run,) in named.values()
+                  if run.get("conclusion") != "success"]  # the red required checks, as the decision request read them
         with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):  # red: no rerun, no rework, no POST
             if delivery_settings() and _unchanged(conn, row, read):
-                _waiting(conn, row, "red_check_waiting", jobs=sorted({job["id"] for job in failed}),
-                         **({"partial": True} if partial else {}))
+                _waiting(conn, row, "red_check_waiting", check_runs=failed)
         return None
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None
