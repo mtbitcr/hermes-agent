@@ -20,6 +20,7 @@ P2 of the risk tier plan (tests P2-1 to P2-6), through the real kernel:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -629,18 +630,18 @@ def test_kanban_create_carries_the_tier_under_the_worker_environment(
     assert not (profile_home / "kanban.db").exists()
     assert not (profile_home / "kanban").exists()
     # Decision 5: tier-2 work on the high-base lane (business routine on
-    # Sonnet 5) runs at max; tier 0 stays high. Both seals read back clean.
+    # Sonnet 5.5) runs at max; tier 0 stays high. Both seals read back clean.
     assert _count(
         worker_db,
         "risk_tier = 2 AND reasoning_effort = 'max' AND model_override = ? "
         "AND max_runtime_seconds = ? AND id = ?",
-        ("claude-sonnet-5", ROUTINE_BOX, created["task_id"]),
+        ("claude-sonnet-5-5", ROUTINE_BOX, created["task_id"]),
     ) == 1
     assert _count(
         worker_db,
         "risk_tier = 0 AND reasoning_effort = 'high' AND model_override = ? "
         "AND max_runtime_seconds = ? AND id = ?",
-        ("claude-sonnet-5", ROUTINE_BOX, routine["task_id"]),
+        ("claude-sonnet-5-5", ROUTINE_BOX, routine["task_id"]),
     ) == 1
     for answer in (created, routine):
         assert kb.task_policy_lock_error(_raw_row(worker_db, answer["task_id"])) is None
@@ -658,8 +659,8 @@ def test_a_new_card_without_a_tier_is_pinned_as_tier_2(fence_home, monkeypatch):
 
     assert created["ok"] is True, created
     row = _raw_row(kb.kanban_db_path(board=WORKER_BOARD), created["task_id"])
-    # Business routine is the one lane whose own effort is high (Sonnet 5).
-    assert (row["risk_tier"], row["model_override"]) == (2, "claude-sonnet-5")
+    # Business routine is the one lane whose own effort is high (Sonnet 5.5).
+    assert (row["risk_tier"], row["model_override"]) == (2, "claude-sonnet-5-5")
     assert (row["reasoning_effort"], row["max_runtime_seconds"]) == ("max", ROUTINE_BOX)
     assert kb.task_policy_lock_error(row) is None
 
@@ -716,7 +717,7 @@ def test_kanban_create_keeps_the_tier_effort_through_review(
     build_repo, risk_tier, recorded, effort,
 ):
     """An omitted tier is recorded as tier 2 and keeps max; tier 1 keeps high."""
-    # Business routine is the one lane whose own effort is high (Sonnet 5).
+    # Business routine is the one lane whose own effort is high (Sonnet 5.5).
     args = {
         "title": "Write the pricing page", "assignee": "raphael-business",
         "execution_tier": "routine", "owned_paths": [OWNED],
@@ -733,7 +734,7 @@ def test_kanban_create_keeps_the_tier_effort_through_review(
         (recorded, effort),
     ] * 3
     assert created["risk_tier"] == recorded
-    assert rows[-1]["model_override"] == "claude-sonnet-5"
+    assert rows[-1]["model_override"] == "claude-sonnet-5-5"
 
 
 def test_a_native_security_review_card_keeps_max_through_review(build_repo):
@@ -748,7 +749,7 @@ def test_a_native_security_review_card_keeps_max_through_review(build_repo):
     assert [(row["risk_tier"], row["reasoning_effort"]) for row in rows] == [
         (2, "max"),
     ] * 3
-    assert rows[-1]["model_override"] == "claude-sonnet-5"
+    assert rows[-1]["model_override"] == "claude-sonnet-5-5"
 
 
 def test_a_legacy_card_keeps_its_base_effort_and_saved_box_through_review(build_repo):
@@ -832,3 +833,93 @@ def test_a_card_with_a_tier_from_before_the_pins_keeps_its_base_effort_through_r
     assert [(row["risk_tier"], row["max_runtime_seconds"]) for row in rows] == [
         (risk_tier, LEGACY_BOX),
     ] * 3
+
+
+# ---------------------------------------------------------------------------
+# A card sealed on a routine route Sonnet 5.5 replaced still claims
+# ---------------------------------------------------------------------------
+
+
+def _sealed(assignee, provider, model, effort, execution_tier) -> str:
+    """A stored route lock in its documented canonical form, built here:
+    minting refuses a route this build replaced."""
+    canonical = json.dumps(
+        {
+            "authority": "raphael",
+            "version": 1,
+            "assignee": assignee,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": effort,
+            "execution_tier": execution_tier,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"raphael:v1:{digest}"
+
+
+def _card_sealed_before(conn, assignee, model, effort, risk_tier) -> str:
+    """A routine card as the earlier kernel wrote it: its tier, the route it
+    pinned then, and that route's seal."""
+    task_id = _locked_card(
+        conn, assignee, "routine", risk_tier=risk_tier, owned_paths=[],
+    )
+    conn.execute(
+        "UPDATE tasks SET model_override = ?, reasoning_effort = ?, "
+        "risk_tier = ?, model_policy_lock = ? WHERE id = ?",
+        (
+            model, effort, risk_tier,
+            _sealed(assignee, "anthropic", model, effort, "routine"),
+            task_id,
+        ),
+    )
+    return task_id
+
+
+@pytest.mark.parametrize(("assignee", "model", "effort", "risk_tier"), [
+    ("raphael-claude-worker", "claude-opus-5-5", "high", 1),
+    ("raphael-claude-worker", "claude-opus-5-5", "max", 2),
+    ("raphael-builder", "claude-opus-5-5", "high", 0),
+    ("raphael-builder", "claude-opus-5-5", "max", 2),
+    ("raphael-business", "claude-sonnet-5", "high", 1),
+    ("raphael-business", "claude-sonnet-5", "max", 2),
+])
+def test_a_card_sealed_on_a_replaced_routine_route_still_claims(
+    kanban_home, assignee, model, effort, risk_tier,
+):
+    """Moving a routine lane to Sonnet 5.5 leaves a card sealed on its old
+    route, at either effort a tier pinned, verifiable and claimable."""
+    with kb.connect() as conn:
+        task_id = _card_sealed_before(conn, assignee, model, effort, risk_tier)
+        row = _row(conn, task_id)
+
+        assert (row["model_override"], row["reasoning_effort"]) == (model, effort)
+        assert kb.task_policy_lock_error(row) is None
+        kb.assert_claimable_route(conn, task_id)
+        # Still history only: no new card can be sealed on it.
+        with pytest.raises(ValueError):
+            kb.mint_policy_lock(assignee, "anthropic", model, effort, "routine")
+
+
+@pytest.mark.parametrize(("assignee", "model", "effort"), [
+    # The older routes these roles left predate the pins: never high there.
+    ("raphael-claude-worker", "claude-sonnet-5", "high"),
+    ("raphael-builder", "claude-sonnet-5", "high"),
+    # The implementation lanes' replaced route was never business's.
+    ("raphael-business", "claude-opus-5-5", "high"),
+    # No tier pins any other effort.
+    ("raphael-claude-worker", "claude-opus-5-5", "medium"),
+])
+def test_a_card_sealed_on_a_never_admitted_routine_variant_is_refused(
+    kanban_home, assignee, model, effort,
+):
+    with kb.connect() as conn:
+        task_id = _card_sealed_before(conn, assignee, model, effort, 1)
+
+        error = kb.task_policy_lock_error(_row(conn, task_id))
+        assert error is not None and "is not the admitted route for" in error
+        with pytest.raises(RuntimeError, match="is not the admitted route for"):
+            kb.assert_claimable_route(conn, task_id)
