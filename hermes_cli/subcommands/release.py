@@ -1,0 +1,28 @@
+"""``hermes release`` subcommand parser: ``prepare`` and ``status``."""
+
+from __future__ import annotations
+
+
+def build_release_parser(subparsers) -> None:
+    """Attach the ``release`` subcommand, with ``prepare`` and ``status``, to ``subparsers``."""
+    release_parser = subparsers.add_parser(
+        "release", help="Check a release before it runs: prepare, status",
+        description="Check the accepted release batch before it runs. prepare works out PREV "
+            "and NEW, asks the host every release guard and prints each result; it writes "
+            "nothing. status shows the waiting batch and the last outcome. Run it from the "
+            "root Hermes home.")
+    release_subparsers = release_parser.add_subparsers(dest="release_command")
+    release_subparsers.add_parser(
+        "prepare", help="Run every release guard for the accepted batch; writes nothing")
+    release_subparsers.add_parser("status", help="Show the waiting batch and the last outcome")
+
+    def _dispatch_release(args):  # noqa: ANN001
+        if getattr(args, "release_command", None) is None:
+            release_parser.print_help()
+            return 0
+        # Lazy import: the release host modules load the gateway's own modules.
+        from hermes_cli.release_cmd import cmd_release
+
+        return cmd_release(args)
+
+    release_parser.set_defaults(func=_dispatch_release)
