@@ -54,6 +54,7 @@ from tests.hermes_cli.test_kanban_committed_review_requirement import _finding
 _PROVIDER = {"raphael-verifier": "openai-codex"}
 BUILD_BOX = 7200
 DEEP_BOX = 2700
+REVIEW_BOX = 5400
 ROUTINE_BOX = 1800
 
 
@@ -215,9 +216,9 @@ def test_a_security_review_card_is_pinned_at_max(ctx, path, tier):
     ("raphael-planner", "deep", [], DEEP_BOX),
     ("raphael-business", "routine", [], ROUTINE_BOX),
     ("raphael-designer", "routine", [], ROUTINE_BOX),
-    # Review cards: 45 minutes (decision 2).
-    ("raphael-verifier", "routine", None, DEEP_BOX),
-    ("raphael-verifier", "deep", None, DEEP_BOX),
+    # Review cards: 90 minutes (decision 2).
+    ("raphael-verifier", "routine", None, REVIEW_BOX),
+    ("raphael-verifier", "deep", None, REVIEW_BOX),
     # Release, integration and infrastructure cards: 45 minutes per run.
     ("raphael-builder", "deep", ["."], DEEP_BOX),
     ("raphael-builder", "routine", ["."], DEEP_BOX),
@@ -506,7 +507,7 @@ def test_the_build_box_hands_over_instead_of_retrying(build_repo, saved):
 
 
 def test_a_review_run_gets_the_review_box(build_repo):
-    """Decision 2: a review run gets 45 minutes; its card keeps two hours."""
+    """Decision 2: a review run gets 90 minutes; its card keeps two hours."""
     with closing(kb.connect(board=SLUG)) as conn:
         task_id = _locked_card(
             conn, "raphael-claude-worker", "deep", risk_tier=1, owned_paths=[OWNED],
@@ -516,7 +517,7 @@ def test_a_review_run_gets_the_review_box(build_repo):
         host = kb._claimer_id().split(":", 1)[0]
         review = kb.claim_review_task(conn, task_id, claimer=f"{host}:r0")
         timed_out, signalled = _outlast(
-            conn, task_id, review.current_run_id, DEEP_BOX, WORKER_PID + 1,
+            conn, task_id, review.current_run_id, REVIEW_BOX, WORKER_PID + 1,
         )
         boxes = [
             row["max_runtime_seconds"] for row in conn.execute(
@@ -530,8 +531,121 @@ def test_a_review_run_gets_the_review_box(build_repo):
     assert set(signalled) == {WORKER_PID + 1}
     # The build run kept the build box and the review run got the review box;
     # the card keeps its own box for an implementation handback.
-    assert boxes == [BUILD_BOX, DEEP_BOX]
+    assert boxes == [BUILD_BOX, REVIEW_BOX]
     assert (task.max_runtime_seconds, task.status) == (BUILD_BOX, "review")
+
+
+def _claimed_review_run(conn, task_id: str):
+    """Save a build, claim its review, and return the review run's id."""
+    _build_past_its_box(conn, task_id, (PATCH, REPORT))
+    host = kb._claimer_id().split(":", 1)[0]
+    return kb.claim_review_task(conn, task_id, claimer=f"{host}:r0").current_run_id
+
+
+def _run_box(conn, run_id: int):
+    return conn.execute(
+        "SELECT max_runtime_seconds FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()[0]
+
+
+@pytest.mark.parametrize("execution_tier", ["routine", "deep"])
+def test_a_new_independent_review_card_gets_the_review_box(
+    kanban_home, execution_tier,
+):
+    with kb.connect() as conn:
+        task_id = _locked_card(
+            conn, "raphael-verifier", execution_tier, risk_tier=1,
+        )
+        row = _row(conn, task_id)
+
+    assert row["max_runtime_seconds"] == REVIEW_BOX == 5400
+    assert kb.task_policy_lock_error(row) is None
+
+
+def test_a_new_review_run_of_a_build_card_gets_the_review_box(build_repo):
+    with closing(kb.connect(board=SLUG)) as conn:
+        task_id = _locked_card(
+            conn, "raphael-claude-worker", "deep", risk_tier=1, owned_paths=[OWNED],
+            workspace_path=str(build_repo), requires_review=True,
+        )
+        review_run_id = _claimed_review_run(conn, task_id)
+        run_box = _run_box(conn, review_run_id)
+
+    assert run_box == REVIEW_BOX == 5400
+
+
+def test_a_claimed_review_run_keeps_the_box_it_recorded(build_repo):
+    """A run recorded at the older review box is not raised after the fact."""
+    assert kb.active_run_box_seconds(BUILD_BOX, DEEP_BOX, True) == DEEP_BOX
+    assert kb.active_run_box_seconds(BUILD_BOX, REVIEW_BOX, True) == REVIEW_BOX
+    with closing(kb.connect(board=SLUG)) as conn:
+        task_id = _locked_card(
+            conn, "raphael-claude-worker", "deep", risk_tier=1, owned_paths=[OWNED],
+            workspace_path=str(build_repo), requires_review=True,
+        )
+        review_run_id = _claimed_review_run(conn, task_id)
+        conn.execute(
+            "UPDATE task_runs SET max_runtime_seconds = ? WHERE id = ?",
+            (DEEP_BOX, review_run_id),
+        )
+        timed_out, signalled = _outlast(
+            conn, task_id, review_run_id, DEEP_BOX, WORKER_PID + 2,
+        )
+        recorded = _run_box(conn, review_run_id)
+
+    assert recorded == DEEP_BOX
+    assert timed_out == [task_id]
+    assert set(signalled) == {WORKER_PID + 2}
+
+
+def test_the_other_time_boxes_keep_their_values():
+    boxes = {
+        kind: kb.pinned_time_box_seconds(kind) for kind in (
+            "build", "analysis", "proposal", "review", "release",
+            "coordinator_deep", "coordinator_routine",
+        )
+    }
+
+    assert boxes == {
+        "build": 7200, "analysis": 2700, "proposal": 1800, "review": 5400,
+        "release": 2700, "coordinator_deep": 2700, "coordinator_routine": 1800,
+    }
+    assert (BUILD_BOX, DEEP_BOX, ROUTINE_BOX) == (7200, 2700, 1800)
+
+
+def test_deep_box_stays_for_analysis_and_coordinator_work(kanban_home):
+    with kb.connect() as conn:
+        analysis = _locked_card(
+            conn, "raphael-claude-worker", "deep", risk_tier=1, owned_paths=[],
+        )
+        coordinator = _locked_card(conn, "default", "deep", risk_tier=1)
+        boxes = [_row(conn, task_id)["max_runtime_seconds"] for task_id in (
+            analysis, coordinator,
+        )]
+
+    assert DEEP_BOX == 2700
+    assert boxes == [DEEP_BOX, DEEP_BOX]
+
+
+def test_a_card_returned_to_the_implementer_keeps_its_build_box(build_repo):
+    with closing(kb.connect(board=SLUG)) as conn:
+        task_id = _locked_card(
+            conn, "raphael-claude-worker", "deep", risk_tier=1, owned_paths=[OWNED],
+            workspace_path=str(build_repo), requires_review=True,
+        )
+        rows = _review_round_trip(conn, task_id)
+
+    assert rows[-1]["assignee"] == "raphael-claude-worker"
+    assert [row["max_runtime_seconds"] for row in rows] == [BUILD_BOX] * 3
+
+
+def test_without_a_route_lock_or_a_box_the_card_box_is_unchanged():
+    assert kb.review_run_box_seconds(LEGACY_BOX, False) == LEGACY_BOX
+    assert kb.review_run_box_seconds(None, True) is None
+    assert kb.review_run_box_seconds(None, False) is None
+    assert kb.review_run_box_seconds(BUILD_BOX, True) == REVIEW_BOX
+    assert kb.active_run_box_seconds(BUILD_BOX, None, True) == BUILD_BOX
+    assert kb.active_run_box_seconds(LEGACY_BOX, REVIEW_BOX, False) == LEGACY_BOX
 
 
 # ---------------------------------------------------------------------------
