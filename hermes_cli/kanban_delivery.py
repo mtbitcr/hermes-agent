@@ -781,19 +781,35 @@ def _review_route() -> tuple:
                       "reasoning_effort": chosen.reasoning_effort}
 
 
-def _listed(github, path: str, key: str, **query) -> list:
-    """The objects under ``key`` of GitHub's 200 answers, read page by page until they are
-    as many as the ``total_count`` every page states, or a refusal."""
-    items, total = [], None
-    while total is None or len(items) < total:
-        answer = _answered(github.request("GET", path, query=dict(query, per_page=100, page=len(items) // 100 + 1)))
-        data = answer["data"] if answer["status"] == 200 and isinstance(answer["data"], dict) else {}
-        page, count = data.get(key), data.get("total_count")
-        if not isinstance(page, list) or not all(isinstance(item, dict) for item in page) or type(count) is not int or (
-                total not in (None, count) or len(page) != min(100, count - len(items))):
-            raise PublishRefused("ci_unreadable", f"GitHub answered {answer['status']} for {path}")
-        items, total = items + page, count
-    return items
+def _page(github, path: str, key: str, **query) -> tuple:
+    """``(objects, total_count)`` of GitHub's one answer of up to 100 objects under ``key``; no other
+    page is read. An answer that is not a 200 listing objects of distinct ids is a refusal."""
+    answer = _answered(github.request("GET", path, query=dict(query, per_page=100)))
+    data = answer["data"] if answer["status"] == 200 and isinstance(answer["data"], dict) else {}
+    page, count = data.get(key), data.get("total_count")
+    if type(count) is not int or not isinstance(page, list) or not all(
+            isinstance(item, dict) and type(item.get("id")) is int for item in page) or (
+            len({item["id"] for item in page}) != len(page)):
+        raise PublishRefused("ci_unreadable", f"GitHub answered {answer['status']} for {path}")
+    return page, count
+
+
+def _latest_jobs(github, repository: str, head: str) -> tuple:
+    """``(jobs, partial)``: the latest jobs of H's workflow runs, from one page of each list, read only to
+    name a red check's failed jobs. A list that does not fit its page, or cannot be read, makes the jobs
+    partial; they never decide anything."""
+    from hermes_cli.kanban_delivery_github import GitHubTransportError
+
+    jobs = []
+    try:
+        runs, count = _page(github, f"/repos/{repository}/actions/runs", "workflow_runs", head_sha=head)
+        partial = len(runs) != count
+        for run in runs:
+            listed, count = _page(github, f"/repos/{repository}/actions/runs/{run['id']}/jobs", "jobs", filter="latest")
+            jobs, partial = jobs + listed, partial or len(listed) != count
+    except (PublishRefused, GitHubTransportError):
+        return jobs, True
+    return jobs, partial
 
 
 def _open_at_head(github, repository: str, row: dict) -> bool:
@@ -866,9 +882,9 @@ def review_step(db_path: Path) -> None:
 def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Optional[str]:
     """Card 2 for one published row: GitHub is read outside every transaction, and an
     outcome or a waiting reason is stored only while the row and its done source card
-    are as this pass read them before GitHub. The required check on H, read after the
-    jobs and right before the pull request is read again, alone decides green, red or
-    wait; the jobs only name a red check's failed jobs. Returns the state stored, if any."""
+    are as this pass read them before GitHub. The required check on H, in one request read
+    after the jobs page and right before the pull request is read again, alone decides green,
+    red or wait; the jobs only name a red check's failed jobs. Returns the state stored, if any."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head = row["source_task_id"], row["pull_request_head"]
@@ -899,13 +915,15 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         if not _open_at_head(github, repository, row):
             return None  # the pull request moved off H or closed: no card for a stale head
         required = policy.required_checks[repository]
-        jobs = [job for run in _listed(github, f"/repos/{repository}/actions/runs", "workflow_runs", head_sha=head)
-                for job in _listed(github, f"/repos/{repository}/actions/runs/{run.get('id')}/jobs", "jobs",
-                                   filter="latest")]  # only to name a red check's failed jobs
-        runs = _listed(github, f"/repos/{repository}/commits/{head}/check-runs", "check_runs", filter="latest")
-        checks = {"check_runs": [run for run in runs if isinstance(run.get("name"), str)], "statuses": []}
-        outcomes = {_required_check(name, head, checks) for name in required} or {"missing"}  # read last, it decides
-        if outcomes & {"pending", "stale", "missing"} or not _open_at_head(github, repository, row):
+        jobs, partial = _latest_jobs(github, repository, head)  # only to name a red check's failed jobs
+        runs, count = _page(github, f"/repos/{repository}/commits/{head}/check-runs", "check_runs", filter="latest")
+        if count > 100 or len(runs) != count:  # the one decision request, read last: whole on its one page
+            raise PublishRefused("ci_unreadable", f"{count} check runs on {head}, {len(runs)} in the answer")
+        named = {name: [run for run in runs if run.get("name") == name] for name in required}
+        if not named or any(len(found) != 1 for found in named.values()):
+            return None  # a required check that is not in the answer exactly once decides nothing
+        outcomes = {_required_check(name, head, {"check_runs": found, "statuses": []}) for name, found in named.items()}
+        if outcomes & {"pending", "stale"} or not _open_at_head(github, repository, row):
             return None  # CI on H still runs, or the pull request left H while CI was read: a later step tries again
         if outcomes == {"success"}:
             return _create_review_cards(db_path, row, read, repository, base, required, reviewer, route)
@@ -915,7 +933,8 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         failed = [job for job in failed if job.get("name") not in required] or failed  # or the aggregate alone
         with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):  # red: no rerun, no rework, no POST
             if delivery_settings() and _unchanged(conn, row, read):
-                _waiting(conn, row, "red_check_waiting", jobs=sorted(job.get("id") for job in failed))
+                _waiting(conn, row, "red_check_waiting", jobs=sorted({job["id"] for job in failed}),
+                         **({"partial": True} if partial else {}))
         return None
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None

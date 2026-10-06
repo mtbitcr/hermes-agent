@@ -37,16 +37,18 @@ def _policy_route(monkeypatch, route):
 @pytest.fixture
 def world(board, monkeypatch):
     """The board's repository with its GitHub origin, delivery on, the team policy's review route, and
-    GitHub as a table: the pull request, the required check on H, and H's workflow run 70 with its jobs.
-    gh["pad"] puts 100 other items before the real ones of a collection, so those are on page 2."""
+    GitHub as a table: the pull request, the required check on H (as often as gh["copies"] lists it), and
+    H's workflow run 70 with its jobs. gh["pad"] puts 100 other items after the real ones of a collection,
+    so its total_count is over one page; gh["short"] states one more than it holds; gh["broken"] answers 502.
+    gh["each"] runs at every request."""
     kb, root, repo = board
     from hermes_cli import kanban_delivery_github as transport
 
     _git(repo, "remote", "add", "origin", f"https://github.com/{REPO}.git")
     _write_config(root, enabled=True)
-    gh = {"calls": [], "pages": [], "steps": [], "pull_head": None, "check": ("completed", "success"),
-          "failed": None, "job": "completed", "attempt": 1, "pad": None, "short": None, "move_after": None,
-          "during": None}
+    gh = {"calls": [], "queries": [], "steps": [], "pull_head": None, "check": ("completed", "success"),
+          "copies": None, "failed": None, "job": "completed", "attempt": 1, "pad": None, "short": None,
+          "broken": None, "move_after": None, "during": None, "each": None}
 
     def job(job_id, name, head):  # the summary check fails at its evaluation while CI is red; a rerun renumbers
         status = gh["job"] if name == gh["failed"] else "completed"
@@ -56,16 +58,20 @@ def world(board, monkeypatch):
                 "conclusion": None if status != "completed" else "failure" if red else "success"}
 
     def listed(key, items, page):
+        if gh["broken"] == key:
+            return 502, None
         if gh["pad"] == key:
-            items = [{"id": 1000 + n, "name": f"other {n}", "run_id": 70, "head_sha": gh["head"],
-                      "status": "completed", "conclusion": "success"} for n in range(100)] + items
+            items = items + [{"id": 5000 + n, "name": f"other {n}", "run_id": 70, "head_sha": gh["head"],
+                              "status": "completed", "conclusion": "success"} for n in range(100)]
         return 200, {"total_count": len(items) + (gh["short"] == key), key: items[(page - 1) * 100:page * 100]}
 
     def exchange(method, target, authorization, payload=None):
         path, query = urlsplit(target).path, parse_qs(urlsplit(target).query)
         head, page = gh["head"], int(query.get("page", ["1"])[0])
         gh["calls"].append((method, path))
-        gh["pages"].append((path, page))
+        gh["queries"].append((path, query))
+        if gh["each"]:
+            gh["each"]()
         if (method, path) == ("GET", f"/repos/{REPO}/pulls/41"):
             return 200, {"number": 41, "state": "open", "head": {"sha": gh["pull_head"] or head}}
         if gh["move_after"] and path.endswith(gh["move_after"]):  # the pull request moves on while CI is read
@@ -73,9 +79,10 @@ def world(board, monkeypatch):
         if gh["during"] and path.endswith(PAGED["jobs"]):  # the source card or CI changes while the jobs are read
             gh["during"]()
         if method == "GET" and path.endswith("/check-runs"):
-            status, conclusion = gh["check"]
-            return listed("check_runs", [{"id": 900, "name": CHECK, "head_sha": path.split("/")[-2],
-                                          "status": status, "conclusion": conclusion}], page)
+            copies = [gh["check"]] if gh["copies"] is None else gh["copies"]
+            return listed("check_runs", [{"id": 900 + n, "name": CHECK, "head_sha": path.split("/")[-2],
+                                          "status": status, "conclusion": conclusion}
+                                         for n, (status, conclusion) in enumerate(copies)], page)
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs"):
             return listed("workflow_runs", [{"id": 70, "head_sha": head}], page)
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs/70/jobs"):
@@ -288,18 +295,92 @@ def test_a_head_the_pull_request_left_gets_no_outcome(world, moved, failed):
     assert (len(pulls), len(gh["calls"]) > len(pulls)) == ((1, False) if moved == "before" else (2, True))
 
 
-@pytest.mark.parametrize("key, short", [("check_runs", False), ("workflow_runs", False), ("jobs", False), ("jobs", True)])
-def test_each_collection_is_read_page_by_page_to_its_total_count(world, key, short):
-    """101 items, the real ones (the required check, H's workflow run, its jobs) on page 2; a page short
-    of the total count GitHub states is unreadable, so nothing is decided."""
+@pytest.mark.parametrize("answer, conclusion", [
+    ("pad", "success"), ("pad", "failure"), ("short", "success"), ("broken", "success")])
+def test_a_decision_answer_over_100_check_runs_or_unreadable_waits_with_no_record(world, answer, conclusion):
+    """The decision is one request: H's check runs, latest, 100 per page. When its total_count is above 100
+    (the required check completed on that page among 99 others), it holds fewer than its total_count, or it
+    cannot be read, the pass records nothing and makes no card, and reads no other page. A later pass whose
+    one answer is whole decides."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
-    gh["pad"], gh["short"] = key, short and key
+    gh[answer], gh["check"] = "check_runs", ("completed", conclusion)
+    events = _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_cards(kb), _state(kb, head), _events(kb, tid)) == ([], "open", events)
+    assert [query for path, query in gh["queries"] if path.endswith("/check-runs")] == [
+        {"filter": ["latest"], "per_page": ["100"]}] * 2
+    gh[answer], gh["check"] = None, ("completed", "success")
+    _tick(kb)
+    assert len(_cards(kb)) == 2 and _state(kb, head) == "review_cards_created"
+
+
+@pytest.mark.parametrize("copies", [
+    [], [("completed", "success")] * 2, [("completed", "success"), ("completed", "failure")]])
+def test_the_required_check_must_appear_exactly_once_in_the_decision_answer(world, copies):
+    """Absent from the one decision answer, or in it twice (both green, or green and red), the required
+    check decides nothing: no card and no record. Once it appears exactly once, a later pass decides by it."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["copies"], events = copies, _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_cards(kb), _state(kb, head), _events(kb, tid)) == ([], "open", events)
+    gh["copies"] = None
+    _tick(kb)
+    assert len(_cards(kb)) == 2 and _state(kb, head) == "review_cards_created"
+
+
+@pytest.mark.parametrize("option, collection, conclusion, named", [
+    ("pad", "jobs", "failure", [81]), ("pad", "workflow_runs", "failure", [81]), ("pad", "jobs", "success", None),
+    ("broken", "jobs", "failure", [])])
+def test_a_jobs_list_over_one_page_is_partial_and_never_decides(world, option, collection, conclusion, named):
+    """Failed job ids come from one page of H's workflow runs and of each run's latest jobs, read before the
+    decision. A list over one page is taken as partial: a red check's waiting record names the failed jobs
+    that page holds and says it is partial, once for H; a jobs answer that cannot be read leaves them partial
+    too. A green check gets its cards all the same. No other page is read."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh[option], gh["check"] = collection, ("completed", conclusion)
+    gh["failed"] = SLICE if conclusion == "failure" else None
+    events = _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    if named is None:
+        assert (len(_cards(kb)), _state(kb, head)) == (2, "review_cards_created")
+    else:
+        assert _events(kb, tid)[len(events):] == [("delivery_review_waiting", {
+            "delivery_id": 1, "head": head, "pull_request_number": 41, "code": "red_check_waiting",
+            "jobs": named, "partial": True})]
+        assert (_cards(kb), _state(kb, head)) == ([], "open")
+    assert all("page" not in query for _, query in gh["queries"])
+
+
+@pytest.mark.parametrize("conclusion", ["success", "failure"])
+def test_one_pass_reads_the_jobs_then_decides_then_reads_the_pull_request_then_writes(world, conclusion):
+    """The order of one pass: the jobs page, then the one decision request (H's check runs, latest, 100 per
+    page), then the final pull request read, then the write transaction: the cards or the waiting record are
+    stored after every read."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["check"] = ("completed", conclusion)
+    stored, seen = "SELECT COUNT(*) AS n FROM task_events WHERE kind LIKE 'delivery_review%'", []
+    gh["each"] = lambda: seen.append(_raw(kb.kanban_db_path(), stored)[0]["n"])
 
     _tick(kb)
 
-    assert (len(_cards(kb)), _state(kb, head)) == ((0, "open") if short else (2, "review_cards_created"))
-    assert [page for path, page in gh["pages"] if path.endswith(PAGED[key])] == [1, 2]
+    one_page, runs, pull = {"per_page": ["100"]}, f"/repos/{REPO}/actions/runs", f"/repos/{REPO}/pulls/41"
+    assert gh["queries"] == [
+        (pull, {}), (runs, dict(one_page, head_sha=[head])), (f"{runs}/70/jobs", dict(one_page, filter=["latest"])),
+        (f"/repos/{REPO}/commits/{head}/check-runs", dict(one_page, filter=["latest"])), (pull, {})]
+    assert (seen, _raw(kb.kanban_db_path(), stored)[0]["n"]) == ([0] * 5, 1)
 
 
 @pytest.mark.parametrize("failed", [SLICE, LINT, ODD, CHECK])
