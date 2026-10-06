@@ -11,8 +11,10 @@ card.
 from __future__ import annotations
 
 import contextlib
+import os
 import shutil
 import sqlite3
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -70,7 +72,7 @@ _LAST_RELEASED_SQL = (
 
 
 class _UnreadableRecord(Exception):
-    """The copy of the release record could not be read; the message is the plain reason."""
+    """The release record could not be read; the message is the plain reason."""
 
 
 def cmd_release(args) -> int:
@@ -217,16 +219,32 @@ def _record() -> tuple[list[dict[str, Any]], str | None, int | None]:
     """Every batch, the NEW of the last released batch and the batch whose release finished last,
     all from a private copy of the release record.
 
-    The database file, and its -wal when one exists, are copied into a private temporary
-    directory; the copy is opened there read-only, read and removed. SQLite never opens the live
-    files, so it cannot create, change or delete their side files, and what was committed to the
-    -wal is still read. A record that does not exist yet reads as empty; a copy SQLite cannot
-    read raises _UnreadableRecord.
+    The record has two shapes. When none of its four names exists, the database file and its
+    -wal, -shm and -journal files, it does not exist yet and reads as empty. When the database
+    file is a regular file, not a link, it and its -wal when one exists are copied into a private
+    temporary directory; the copy is opened there read-only, read and removed. SQLite never opens
+    the live files, so it cannot create, change or delete their side files, and what was
+    committed to the -wal is still read. Any other state, an error while the names are looked at
+    and a copy SQLite cannot read raise _UnreadableRecord.
     """
     path = release_ledger.ledger_path()
-    if not path.is_file():
-        return [], None, None
+    unreadable = f"the release record {path} could not be read"
     try:
+        # Each name is looked at with lstat, as os.path.lexists does, so a broken link exists.
+        # lexists takes every error for a missing name, a folder that cannot be searched too;
+        # here only a missing name is, and any other error refuses.
+        found = {}
+        for side in ("", "-wal", "-shm", "-journal"):
+            with contextlib.suppress(FileNotFoundError):
+                found[side] = os.lstat(f"{path}{side}").st_mode
+        if not found:
+            return [], None, None
+        if "" not in found:
+            beside = ", ".join(f"{path.name}{side}" for side in found)
+            raise _UnreadableRecord(f"{unreadable} (there is no database file beside {beside})")
+        if not stat.S_ISREG(found[""]):
+            link = "a symbolic link, " if stat.S_ISLNK(found[""]) else ""
+            raise _UnreadableRecord(f"{unreadable} (it is {link}not a regular file)")
         with tempfile.TemporaryDirectory(prefix="hermes-release-record-") as private:
             copy = Path(private) / path.name
             shutil.copyfile(path, copy)
@@ -246,6 +264,4 @@ def _record() -> tuple[list[dict[str, Any]], str | None, int | None]:
             finally:
                 conn.close()
     except (OSError, sqlite3.Error) as error:
-        raise _UnreadableRecord(
-            f"the release record {path} could not be read ({type(error).__name__}: {error})"
-        ) from error
+        raise _UnreadableRecord(f"{unreadable} ({type(error).__name__}: {error})") from error

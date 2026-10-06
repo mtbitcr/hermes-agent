@@ -13,8 +13,10 @@ import contextlib
 import hashlib
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -173,9 +175,14 @@ class FakeHost:
 @pytest.fixture
 def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """The root Hermes home at ``<tmp>/.hermes``, with the release settings this host needs."""
-    home = tmp_path / ".hermes"
+    return _root_at(tmp_path, monkeypatch)
+
+
+def _root_at(top: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The root Hermes home at ``<top>/.hermes``, with the release settings this host needs."""
+    home = top / ".hermes"
     home.mkdir()
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(Path, "home", lambda: top)
     monkeypatch.setenv("HERMES_HOME", str(home))
     (home / "config.yaml").write_text(yaml.safe_dump({"release": SETTINGS}))
     return home
@@ -265,10 +272,21 @@ def _release_state(top: Path) -> dict[str, bytes | None]:
     }
 
 
-def _live_files(path: Path) -> dict[str, bytes | None]:
-    """The live record's database file and side files, each with its bytes, or None if absent."""
-    files = {side: Path(f"{path}{side}") for side in ("", "-wal", "-shm", "-journal")}
-    return {side: file.read_bytes() if file.exists() else None for side, file in files.items()}
+def _live_files(path: Path) -> dict[str, bytes | tuple[str, str | None] | None]:
+    """The live record's database file and side files: a regular file with its bytes, any other
+    name with its kind and permissions and a link's target, None if absent. A pipe is never opened
+    and a link never followed."""
+
+    def look(name: Path) -> bytes | tuple[str, str | None] | None:
+        try:
+            mode = name.lstat().st_mode
+        except FileNotFoundError:
+            return None
+        if stat.S_ISREG(mode):
+            return name.read_bytes()
+        return stat.filemode(mode), (os.readlink(name) if stat.S_ISLNK(mode) else None)
+
+    return {side: look(Path(f"{path}{side}")) for side in ("", "-wal", "-shm", "-journal")}
 
 
 def _env(top: Path, home: Path) -> dict[str, str]:
@@ -283,8 +301,11 @@ def _env(top: Path, home: Path) -> dict[str, str]:
     }
 
 
-def _cli(top: Path, home: Path, *argv: str, kill_mode: str = "mixed"):
-    """``hermes *argv`` in a child process (see _CLI)."""
+def _cli(
+    top: Path, home: Path, *argv: str, kill_mode: str = "mixed", user: tuple[int, int] | None = None
+):
+    """``hermes *argv`` in a child process (see _CLI), as ``user``'s uid and gid when given."""
+    as_user = {} if user is None else {"user": user[0], "group": user[1], "extra_groups": []}
     return subprocess.run(
         [sys.executable, "-c", _CLI, str(Path(__file__).parent), kill_mode, *argv],
         cwd=_REPO,
@@ -292,7 +313,22 @@ def _cli(top: Path, home: Path, *argv: str, kill_mode: str = "mixed"):
         capture_output=True,
         text=True,
         timeout=120,
+        **as_user,
     )
+
+
+def _unprivileged() -> tuple[int, int] | None:
+    """The user nobody and its group when the tests run as root, which searches any folder; None,
+    the current user, otherwise."""
+    if os.geteuid() != 0:
+        return None
+    import pwd
+
+    try:
+        entry = pwd.getpwnam("nobody")
+    except KeyError:
+        pytest.skip("the tests run as root and there is no user nobody to run a check as")
+    return entry.pw_uid, entry.pw_gid
 
 
 @contextlib.contextmanager
@@ -720,3 +756,135 @@ def test_a_record_copy_sqlite_cannot_read_fails_closed(
         WROTE_NOTHING,
     ]
     assert (_live_files(path), host.built) == (before, [])
+
+
+@pytest.mark.parametrize(
+    ("command", "code", "lines"),
+    [
+        (
+            "prepare",
+            1,
+            ["Refused: no batch is accepted, so there is nothing to release.", WROTE_NOTHING],
+        ),
+        (
+            "status",
+            0,
+            ["No batch is waiting for a decision.", "Last outcome: no release has finished yet."],
+        ),
+    ],
+)
+def test_a_record_none_of_whose_names_exists_reads_as_empty(
+    root, monkeypatch, capsys, command, code, lines
+):
+    release_cmd = _command(monkeypatch, FakeHost())
+    path = ledger.ledger_path()
+    path.parent.mkdir(parents=True)  # the record's folder, with none of its four names in it
+
+    assert getattr(release_cmd, command)() == code
+
+    assert capsys.readouterr().out.splitlines() == lines
+    assert set(_live_files(path).values()) == {None}  # and none was made
+
+
+@pytest.mark.parametrize("command", ["prepare", "status"])
+def test_a_record_whose_database_file_is_a_regular_file_is_read(
+    root, monkeypatch, capsys, command
+):
+    release_cmd = _command(monkeypatch, FakeHost())
+    path = ledger.ledger_path()
+    conn = ledger.connect()
+    accepted = _accept(conn, _merge(conn, NEW))
+    waiting = _merge(conn, LATER, 2)
+    conn.close()
+    before = _live_files(path)
+
+    assert getattr(release_cmd, command)() == 0
+
+    assert capsys.readouterr().out.splitlines() == {
+        "prepare": [
+            f"Batch {accepted['batch_id']}: PREV {PREV}, NEW {NEW}",
+            *(f"{guard} passed: {rule}" for guard, rule, _check in GUARDS),
+            f"All {len(GUARDS)} release guards passed. {WROTE_NOTHING}",
+        ],
+        "status": [
+            f"Waiting batch {waiting['batch_id']}, waiting for the owner's decision: 1 change",
+            f"  - t_{LATER[:8]} (https://github.com/mtbitcr/hermes-agent/pull/2)",
+            "Last outcome: no release has finished yet.",
+        ],
+    }[command]
+    assert _live_files(path) == before
+
+
+# Each state of the live record that is neither of its two shapes, and the cause its refusal gives.
+@pytest.mark.parametrize("command", ["prepare", "status"])
+@pytest.mark.parametrize(
+    ("state", "cause"),
+    [
+        pytest.param("directory", "it is not a regular file", id="directory"),
+        pytest.param("link", "it is a symbolic link, not a regular file", id="broken-link"),
+        pytest.param("pipe", "it is not a regular file", id="pipe"),
+        *(
+            pytest.param(
+                side,
+                f"there is no database file beside release_ledger.db{side}",
+                id=f"orphan{side}",
+            )
+            for side in ("-wal", "-shm", "-journal")
+        ),
+    ],
+)
+def test_every_other_state_of_the_record_fails_closed(
+    root, monkeypatch, capsys, command, state, cause
+):
+    host = FakeHost()
+    release_cmd = _command(monkeypatch, host)
+    path = ledger.ledger_path()
+    path.parent.mkdir(parents=True)
+    if state == "directory":
+        path.mkdir()
+    elif state == "link":
+        path.symlink_to(path.with_name("moved.db"))  # broken: nothing is there
+    elif state == "pipe":
+        os.mkfifo(path)  # a read of it would wait for a writer
+    else:  # a side file without the database file
+        Path(f"{path}{state}").write_bytes(b"left behind")
+    before = _live_files(path)
+
+    assert getattr(release_cmd, command)() == 1
+
+    assert capsys.readouterr().out.splitlines() == [
+        f"Refused: the release record {path} could not be read ({cause}).",
+        WROTE_NOTHING,
+    ]
+    assert (_live_files(path), host.built) == (before, [])
+
+
+@pytest.mark.parametrize("command", ["prepare", "status"])
+def test_a_record_in_a_folder_that_cannot_be_searched_fails_closed(monkeypatch, command):
+    # Through the CLI in a child process, as nobody when the tests run as root, since root searches
+    # any folder. Pytest's own temporary root may be closed to nobody, so the public parent is made
+    # here, and nobody is given the home as an ordinary user has their own.
+    user = _unprivileged()
+    with tempfile.TemporaryDirectory(prefix="release-record-") as name:
+        top = Path(name)
+        top.chmod(0o755)
+        home = _root_at(top, monkeypatch)
+        _accepted_batch(NEW)
+        path = ledger.ledger_path()
+        if user is not None:
+            for item in [top, *top.rglob("*")]:
+                os.chown(item, *user)
+        before = _live_files(path)
+        path.parent.chmod(0)
+        try:
+            done = _cli(top, home, "release", command, user=user)
+        finally:
+            path.parent.chmod(0o755)
+
+        assert done.returncode == 1, done.stderr
+        assert done.stdout.splitlines()[-2:] == [
+            f"Refused: the release record {path} could not be read (PermissionError: [Errno 13]"
+            f" Permission denied: '{path}').",
+            WROTE_NOTHING,
+        ]
+        assert _live_files(path) == before
