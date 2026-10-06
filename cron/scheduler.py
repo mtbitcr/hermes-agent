@@ -3791,6 +3791,7 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    job_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -3921,6 +3922,8 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        if job_id:
+            env["HERMES_CRON_JOB_ID"] = job_id
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
@@ -4000,14 +4003,16 @@ def _run_job_script_with_claim_heartbeat(
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    job_id = str(job.get("id") or "")
+    # Only a script-only job tells its script its own id; an agent job's pre-check script gets none.
+    script_job_id = job_id if job.get("no_agent") else None
     if not (
         isinstance(schedule, dict)
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job_id=script_job_id)
 
-    job_id = str(job.get("id") or "")
     stop = threading.Event()
     heartbeat_context = contextvars.copy_context()
 
@@ -4036,10 +4041,10 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job_id=script_job_id)
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job_id=script_job_id)
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
