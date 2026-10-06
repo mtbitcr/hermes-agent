@@ -433,11 +433,12 @@ def resolve_task_assignment(profile: str, execution_tier: str) -> ModelAssignmen
 # validate.  Validation additionally re-derives the route from this module's
 # matrix: a lock is valid only for the route the current policy admits for
 # that exact assignee/provider/tier, or for a route this policy lineage
-# admitted there before and has since superseded (``_SUPERSEDED_ROUTES``), so
-# already-minted receipts stay verifiable after a matrix migration while a
-# route that was never admitted there is invalid.  Minting never consults the
-# superseded table.  There is exactly one authority name and one version:
-# anything else is unknown provenance and fails closed.
+# admitted there before and has since superseded (``_SUPERSEDED_ROUTES``,
+# ``_SUPERSEDED_PINNED_ROUTES``), so already-minted receipts stay verifiable
+# after a matrix migration while a route that was never admitted there is
+# invalid.  Minting never consults a superseded table.  There is exactly one
+# authority name and one version: anything else is unknown provenance and
+# fails closed.
 
 POLICY_LOCK_AUTHORITY = "raphael"
 POLICY_LOCK_VERSION = 1
@@ -482,6 +483,16 @@ _SUPERSEDED_ROUTES: Mapping[tuple[str, str, str], frozenset[tuple[str, str]]] = 
     ("raphael-verifier", "openai-codex", "deep"): frozenset({_SOL_56_MAX, _ASTRA_6_XHIGH}),
     ("raphael-verifier", "anthropic", "routine"): frozenset({_OPUS_5_MAX}),
     ("raphael-verifier", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
+}
+
+# Seals minted at a risk-tier pinned effort (``PINNED_EFFORTS``) on a routine
+# route Sonnet 5.5 replaced, beside its base effort above.  Seal validation
+# only: never a configured route, a run's history or mintable.  Older
+# superseded routes predate the pins and gain no pinned effort.
+_SUPERSEDED_PINNED_ROUTES: Mapping[tuple[str, str, str], frozenset[tuple[str, str]]] = {
+    ("raphael-business", "anthropic", "routine"): frozenset({_SONNET_5_MAX}),
+    ("raphael-claude-worker", "anthropic", "routine"): frozenset({("claude-opus-5-5", "high")}),
+    ("raphael-builder", "anthropic", "routine"): frozenset({("claude-opus-5-5", "high")}),
 }
 
 _LOCK_RE = re.compile(r"\A([a-z][a-z0-9-]{0,31}):v(\d{1,4}):([0-9a-f]{64})\Z")
@@ -561,6 +572,10 @@ def _route_authority_error(
     so max also on a lane whose base effort is high). Only a card's seal
     passes it; a role's configured route and an unpinned run's history stay
     exactly the base route.
+
+    Both together, which only seal validation (:func:`policy_lock_error`)
+    passes, also accept ``_SUPERSEDED_PINNED_ROUTES`` for this exact
+    assignee/provider/tier.
     """
     if not assignee or not provider or not model or not reasoning_effort:
         return (
@@ -589,6 +604,10 @@ def _route_authority_error(
         admitted |= {(expected.model, effort) for effort in PINNED_EFFORTS}
     if admit_superseded:
         admitted |= _SUPERSEDED_ROUTES.get(
+            (expected.profile, expected.provider, execution_tier), frozenset()
+        )
+    if admit_superseded and admit_pinned_effort:
+        admitted |= _SUPERSEDED_PINNED_ROUTES.get(
             (expected.profile, expected.provider, execution_tier), frozenset()
         )
     if (model, reasoning_effort) not in admitted:

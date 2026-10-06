@@ -341,8 +341,17 @@ _HISTORICAL_ROUTES = [
     ("raphael-builder", "anthropic", "claude-opus-5-5", "max", "routine"),
 ]
 
+# The seals a card's risk tier pinned on those replaced routine lanes beside
+# their base efforts: high next to max on the role's own model, so max on
+# business's high lane. Seal history only, never a route or a run's history.
+_PINNED_HISTORICAL_ROUTES = [
+    ("raphael-claude-worker", "anthropic", "claude-opus-5-5", "high", "routine"),
+    ("raphael-builder", "anthropic", "claude-opus-5-5", "high", "routine"),
+    ("raphael-business", "anthropic", "claude-sonnet-5", "max", "routine"),
+]
 
-@pytest.mark.parametrize("route", _HISTORICAL_ROUTES)
+
+@pytest.mark.parametrize("route", _HISTORICAL_ROUTES + _PINNED_HISTORICAL_ROUTES)
 def test_a_historical_seal_still_verifies_but_can_no_longer_be_minted(route):
     """A migration never invalidates an already-claimed receipt, and never
     lets a superseded route become a new selection."""
@@ -350,6 +359,29 @@ def test_a_historical_seal_still_verifies_but_can_no_longer_be_minted(route):
     assert model_policy.policy_lock_error(lock, *route) is None
     with pytest.raises(ValueError):
         model_policy.mint_policy_lock(*route)
+
+
+@pytest.mark.parametrize("route", _PINNED_HISTORICAL_ROUTES)
+def test_a_pinned_historical_seal_grants_no_other_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, route
+):
+    """A replaced lane's pinned seal is receipt history only: never the role's
+    configured route, never an unpinned run's history, and never its model at
+    an effort no risk tier pins."""
+    profile, provider, model, effort, tier = route
+    assert model_policy._superseded_configured_assignment(
+        profile, provider, model, effort, disable_fallbacks=True,
+    ) is None
+    _on_disk_route(monkeypatch, tmp_path, provider, model, effort)
+    with pytest.raises(ValueError):
+        configured_assignment_for(profile)
+    with pytest.raises(ValueError):
+        validate_runtime_assignment(
+            profile, provider, model, effort, disable_fallbacks=True
+        )
+    for other in ("none", "minimal", "low", "medium", "xhigh", "ultra"):
+        moved = (profile, provider, model, other, tier)
+        assert model_policy.policy_lock_error(_sealed(*moved), *moved) is not None
 
 
 @pytest.mark.parametrize("route", [
@@ -431,17 +463,27 @@ def test_tier_2_work_runs_at_max_on_the_high_base_lane_but_the_role_does_not():
 
 @pytest.mark.parametrize("route", [
     # High is admitted only on the lane's own model: never on another lane's
-    # model, a superseded model, or a tier the model does not serve.
+    # model, a superseded model that predates the risk-tier pins, or a tier the
+    # model does not serve.
     ("raphael-business", "anthropic", "claude-opus-5-5", "high", "routine"),
     ("raphael-verifier", "anthropic", "claude-sonnet-5", "high", "routine"),
     ("default", "anthropic", "claude-opus-5", "high", "routine"),
     ("raphael-claude-worker", "anthropic", "claude-sonnet-5", "high", "routine"),
+    ("raphael-builder", "anthropic", "claude-sonnet-5", "high", "routine"),
+    ("raphael-planner", "anthropic", "claude-sonnet-5", "high", "routine"),
+    ("raphael-claude-worker", "anthropic", "claude-opus-5", "high", "deep"),
     ("raphael-verifier", "openai-codex", "gpt-6-sol", "high", "routine"),
     # Business's Terra lane is not a verifier route.
     ("raphael-verifier", "openai-codex", "gpt-5.6-terra", "max", "routine"),
     # A historical route on a tier it was never admitted on.
     ("raphael-business", "anthropic", "claude-opus-5", "max", "routine"),
     ("raphael-claude-worker", "anthropic", "claude-sonnet-5", "max", "deep"),
+    # Business's pinned Sonnet 5 / max seal holds for no other role, provider
+    # or tier.
+    ("raphael-designer", "anthropic", "claude-sonnet-5", "max", "routine"),
+    ("default", "anthropic", "claude-sonnet-5", "max", "routine"),
+    ("raphael-business", "openai-codex", "claude-sonnet-5", "max", "routine"),
+    ("raphael-business", "anthropic", "claude-sonnet-5", "max", "deep"),
     # The verifier's superseded Astra lane was deep-only, and the verifier's
     # only; its GPT-6 Sol lane was never its deep route.
     ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh", "routine"),

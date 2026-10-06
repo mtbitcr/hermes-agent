@@ -20,6 +20,7 @@ P2 of the risk tier plan (tests P2-1 to P2-6), through the real kernel:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -832,3 +833,93 @@ def test_a_card_with_a_tier_from_before_the_pins_keeps_its_base_effort_through_r
     assert [(row["risk_tier"], row["max_runtime_seconds"]) for row in rows] == [
         (risk_tier, LEGACY_BOX),
     ] * 3
+
+
+# ---------------------------------------------------------------------------
+# A card sealed on a routine route Sonnet 5.5 replaced still claims
+# ---------------------------------------------------------------------------
+
+
+def _sealed(assignee, provider, model, effort, execution_tier) -> str:
+    """A stored route lock in its documented canonical form, built here:
+    minting refuses a route this build replaced."""
+    canonical = json.dumps(
+        {
+            "authority": "raphael",
+            "version": 1,
+            "assignee": assignee,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": effort,
+            "execution_tier": execution_tier,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"raphael:v1:{digest}"
+
+
+def _card_sealed_before(conn, assignee, model, effort, risk_tier) -> str:
+    """A routine card as the earlier kernel wrote it: its tier, the route it
+    pinned then, and that route's seal."""
+    task_id = _locked_card(
+        conn, assignee, "routine", risk_tier=risk_tier, owned_paths=[],
+    )
+    conn.execute(
+        "UPDATE tasks SET model_override = ?, reasoning_effort = ?, "
+        "risk_tier = ?, model_policy_lock = ? WHERE id = ?",
+        (
+            model, effort, risk_tier,
+            _sealed(assignee, "anthropic", model, effort, "routine"),
+            task_id,
+        ),
+    )
+    return task_id
+
+
+@pytest.mark.parametrize(("assignee", "model", "effort", "risk_tier"), [
+    ("raphael-claude-worker", "claude-opus-5-5", "high", 1),
+    ("raphael-claude-worker", "claude-opus-5-5", "max", 2),
+    ("raphael-builder", "claude-opus-5-5", "high", 0),
+    ("raphael-builder", "claude-opus-5-5", "max", 2),
+    ("raphael-business", "claude-sonnet-5", "high", 1),
+    ("raphael-business", "claude-sonnet-5", "max", 2),
+])
+def test_a_card_sealed_on_a_replaced_routine_route_still_claims(
+    kanban_home, assignee, model, effort, risk_tier,
+):
+    """Moving a routine lane to Sonnet 5.5 leaves a card sealed on its old
+    route, at either effort a tier pinned, verifiable and claimable."""
+    with kb.connect() as conn:
+        task_id = _card_sealed_before(conn, assignee, model, effort, risk_tier)
+        row = _row(conn, task_id)
+
+        assert (row["model_override"], row["reasoning_effort"]) == (model, effort)
+        assert kb.task_policy_lock_error(row) is None
+        kb.assert_claimable_route(conn, task_id)
+        # Still history only: no new card can be sealed on it.
+        with pytest.raises(ValueError):
+            kb.mint_policy_lock(assignee, "anthropic", model, effort, "routine")
+
+
+@pytest.mark.parametrize(("assignee", "model", "effort"), [
+    # The older routes these roles left predate the pins: never high there.
+    ("raphael-claude-worker", "claude-sonnet-5", "high"),
+    ("raphael-builder", "claude-sonnet-5", "high"),
+    # The implementation lanes' replaced route was never business's.
+    ("raphael-business", "claude-opus-5-5", "high"),
+    # No tier pins any other effort.
+    ("raphael-claude-worker", "claude-opus-5-5", "medium"),
+])
+def test_a_card_sealed_on_a_never_admitted_routine_variant_is_refused(
+    kanban_home, assignee, model, effort,
+):
+    with kb.connect() as conn:
+        task_id = _card_sealed_before(conn, assignee, model, effort, 1)
+
+        error = kb.task_policy_lock_error(_row(conn, task_id))
+        assert error is not None and "is not the admitted route for" in error
+        with pytest.raises(RuntimeError, match="is not the admitted route for"):
+            kb.assert_claimable_route(conn, task_id)
