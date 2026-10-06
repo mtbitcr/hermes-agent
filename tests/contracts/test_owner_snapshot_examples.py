@@ -117,7 +117,14 @@ async def test_the_snapshot_examples_carry_every_task_state_and_capability(
     # The breaker trips on every ready or review card, so this comes next.
     _gave_up_task(board, project["project_id"], "Print the workshop handouts")
     _capability_stopped_task(board, project["project_id"], "Connect the payment provider")
-    _task(board, project, "Draft the workshop agenda")
+    drafted = _task(board, project, "Draft the workshop agenda", risk_tier=0)
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        with kanban_db.write_txn(conn):
+            conn.execute("UPDATE tasks SET risk_tier = 1 WHERE id = ?", (drafted,))
+            kanban_db._append_event(
+                conn, drafted, "risk_tier_raised",
+                {"from": 0, "to": 1, "reviewer": "default", "run_id": 1},
+            )
     reviews = {
         state: _task(board, project, f"Review the {state} outline")
         for state in ("awaiting", "changes")
@@ -165,6 +172,9 @@ async def test_the_snapshot_examples_carry_every_task_state_and_capability(
     for answers in (live, saved):
         tasks = _tasks(answers["project_snapshot"])
         assert any("owner_wait" in task for task in tasks)
+        assert all(type(task["risk_tier_raised"]) is bool for task in tasks)
+        assert {task["risk_tier"] for task in tasks} == {1, None}
+        assert [task["risk_tier_raised"] for task in tasks].count(True) == 1
         assert not any("owner_wait" in task for task in _tasks(
             answers["project_snapshot_without_capabilities"]))
         data = answers["project_snapshot"]["body"]["data"]

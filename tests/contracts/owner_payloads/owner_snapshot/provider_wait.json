@@ -43,6 +43,8 @@
               "parent_ids": [],
               "responsibility": null,
               "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
               "stopped_work": "provider_wait",
               "title": "Draft the placeholder brief",
               "updated_at": "2030-03-17T17:46:40Z"
@@ -68,6 +70,8 @@
               "parent_ids": [],
               "responsibility": null,
               "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
               "stopped_work": "capability",
               "title": "Word the placeholder notice",
               "updated_at": "2030-03-17T17:46:40Z"
