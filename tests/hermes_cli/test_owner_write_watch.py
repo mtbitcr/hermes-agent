@@ -1,6 +1,7 @@
 """Hourly check of the owner write routes: plan section (e), tests 1 to 9, the owner notes'
-regression tests for the four review findings of round 1 and the two of round 2, and round 4's
-regression tests for own executions that share a claimed_at across a page boundary.
+regression tests for the four review findings of round 1 and the two of round 2, round 4's
+regression tests for own executions that share a claimed_at across a page boundary, and round 5's
+tests of the owner rule for the listener address.
 
 Tests 1 to 9 fake the listener, the page check, the clock and the delivery record. The regression
 tests use a real HTTP server on 127.0.0.1 and the real execution and delivery stores in the test's
@@ -854,3 +855,88 @@ def test_round4_the_reader_creates_and_changes_no_store(monkeypatch):
 
     assert watch._previous_delivery(announced, WATCH_JOB) == "failed"
     assert [(store.read_bytes(), store.stat().st_mtime_ns) for store in stores] == before
+
+
+# --- Round 5: the owner rule for the listener address ---------------------------------------------
+
+OWN_KEYS = {"default": "r" * 40, "raphael-planner": "p" * 40}
+# The root profile's own listener section in its config.yaml; ``{port}`` is the test listener's port.
+API_SERVER = "gateway:\n  api_server:\n    enabled: true\n    port: {port}\n"
+
+
+def listener_job(tmp_path, monkeypatch, server, profile, config, env=None):
+    """One run of ``profile``'s watch job with its own key from its own .env, ``config`` as the root
+    profile's config.yaml and ``env`` in the job's environment, ``{port}`` in either being the port of
+    the real test listener ``server`` on 127.0.0.1. Returns the outcome and every URL the job tried: a
+    URL outside ``server`` is refused here and never sent, so no run reaches anything else."""
+    root = tmp_path / "root"
+    home = root if profile == "default" else root / "profiles" / profile
+    home.mkdir(parents=True)
+    (root / "config.yaml").write_text(config.format(port=server.port), encoding="utf-8")
+    (home / ".env").write_text(f"API_SERVER_KEY={OWN_KEYS[profile]}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for name, value in (env or {}).items():
+        monkeypatch.setenv(name, value.format(port=server.port))
+    tried = []
+
+    def send(method, url, body, key):
+        tried.append(url)
+        if not url.startswith(f"http://127.0.0.1:{server.port}/"):
+            raise ConnectionRefusedError("not the test listener")
+        return watch._http_send(method, url, body, key)
+
+    return Host(tmp_path, profile=profile).run(base=None, send=send, read_key=None), tried
+
+
+@pytest.mark.parametrize("host", ["", "    host: 0.0.0.0\n"], ids=["no-host", "host-0.0.0.0"])
+@pytest.mark.parametrize("profile", ["default", "raphael-planner"])
+def test_round5_1_both_serving_profiles_in_the_supported_shape_reach_the_listener(
+        tmp_path, monkeypatch, listener, profile, host):
+    """Both serving profiles in the supported shape reach a real local test listener with their own
+    key and exact /p/ prefix: the root profile's own listener section gives the port and no host, or
+    the host 0.0.0.0; config.yaml has no top-level api_server section; and the job's environment has
+    no API_SERVER_HOST and no API_SERVER_PORT."""
+    server = listener(profile)
+
+    outcome, _ = listener_job(tmp_path, monkeypatch, server, profile, API_SERVER + host)
+
+    assert (outcome.code, outcome.kind) == (0, "active"), outcome.text
+    assert_reached(server, profile, OWN_KEYS[profile])
+
+
+@pytest.mark.parametrize("config,env,shape", [
+    pytest.param(API_SERVER + "    host: 127.0.0.2\n", None, "the host '127.0.0.2'", id="host-127.0.0.2"),
+    pytest.param(API_SERVER + "    host: '::1'\n", None, "the host '::1'", id="host-ipv6-loopback"),
+    # The review's variant: the port only in the top-level api_server form.
+    pytest.param("api_server:\n  enabled: true\n  port: {port}\n", None, "a top-level api_server section",
+                 id="top-level-api_server-section"),
+    # The review's variant: a configured port, and the listener's port in API_SERVER_PORT.
+    pytest.param(API_SERVER.replace("{port}", "1"), {"API_SERVER_PORT": "{port}"},
+                 "API_SERVER_PORT in this job's environment", id="API_SERVER_PORT-set"),
+    pytest.param(API_SERVER, {"API_SERVER_HOST": "127.0.0.2"}, "API_SERVER_HOST in this job's environment",
+                 id="API_SERVER_HOST-set"),
+    pytest.param(API_SERVER.replace("{port}", "0"), None, "the port 0", id="port-0"),
+])
+@pytest.mark.parametrize("profile", ["default", "raphael-planner"])
+def test_round5_2_every_other_shape_cannot_run_and_the_listener_gets_no_request(
+        tmp_path, monkeypatch, capsys, listener, profile, config, env, shape):
+    """Every other shape stops the run before the first request, with the cannot-run outcome of a
+    missing key and the reason "listener address unknown" naming the shape: the test listener receives
+    zero requests, and nothing is sent anywhere else."""
+    server = listener(profile)
+
+    outcome, tried = listener_job(tmp_path, monkeypatch, server, profile, config, env)
+
+    assert outcome == watch.Outcome(1)
+    assert f"checks not run: listener address unknown: {shape}" in capsys.readouterr().err
+    assert (server.requests, tried) == ([], [])
+
+
+def test_round5_3_8642_and_127_0_0_1_are_the_api_servers_defaults():
+    """8642 and 127.0.0.1, the port of a root listener section that gives none and the address every
+    request goes to, equal DEFAULT_PORT and DEFAULT_HOST in gateway/platforms/api_server.py."""
+    from gateway.platforms import api_server
+
+    assert (watch.DEFAULT_PORT, watch.DEFAULT_HOST) == (8642, "127.0.0.1") == (
+        api_server.DEFAULT_PORT, api_server.DEFAULT_HOST)
+    assert watch._listener_base() == "http://127.0.0.1:8642"

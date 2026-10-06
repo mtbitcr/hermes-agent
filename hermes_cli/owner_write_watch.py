@@ -16,7 +16,8 @@ start to fail, one update when the failing set changes, one recovery message. A 
 delivery failed prints again hourly when HERMES_CRON_JOB_ID gives the job's own id; without it
 nothing prints twice, and the first alert says that the hourly repeat is off. Exit 0 whenever the
 checks ran; non-zero only when they could not run (no key, unreadable state file, page check
-missing). The key is only ever the request's bearer: never printed, logged or written.
+missing, listener address unknown). The key is only ever the request's bearer: never printed,
+logged or written.
 """
 
 from __future__ import annotations
@@ -47,6 +48,10 @@ PAGE_CHECK_TIMEOUT_SECONDS = 600
 # The dashboard serving Connections and Models runs as the default profile; one job runs the
 # indirect signals so a failure there alerts once, not once per profile.
 INDIRECT_PROFILE = "default"
+# The API server's DEFAULT_PORT and DEFAULT_HOST (gateway/platforms/api_server.py; a test keeps them
+# equal): the port when the root listener section gives none, and the address every request goes to.
+DEFAULT_PORT = 8642
+DEFAULT_HOST = "127.0.0.1"
 
 
 class Inconclusive(Exception):
@@ -55,6 +60,10 @@ class Inconclusive(Exception):
 
 class StateUnreadable(Exception):
     pass
+
+
+class ListenerUnknown(Exception):
+    """The listener is not in the one shape this check supports; the message names the shape."""
 
 
 @dataclass(frozen=True)
@@ -258,8 +267,10 @@ def run(
         return _cannot_run("no usable API_SERVER_KEY in this profile's own .env; nothing was sent")
     try:
         base = base or _listener_base()
+    except ListenerUnknown as exc:
+        return _cannot_run(f"listener address unknown: {exc}")
     except Exception as exc:
-        return _cannot_run(f"listener address unreadable: {type(exc).__name__}")
+        return _cannot_run(f"listener address unknown: root configuration unreadable ({type(exc).__name__})")
 
     moment = clock()
     results = [_probe(probe, base, key, send or _http_send, clock) for probe in probes]
@@ -441,24 +452,35 @@ def _own_profile_key() -> Optional[str]:
 
 
 def _listener_base() -> str:
-    """The one local listener serving every profile under ``/p/<profile>``. Its port comes from the
-    root profile's own listener configuration (config.yaml over gateway.json, merged as the gateway
-    merges them), else API_SERVER_PORT, else 8642. Nothing else of the root profile is read: never
-    its .env or its key, and this process's environment is left as it was."""
+    """The one local listener serving every profile under ``/p/<profile>``, in the one shape this
+    check supports: the root profile's own listener section (config.yaml over gateway.json, merged as
+    the gateway merges them) gives the port, or none and the port is DEFAULT_PORT, and gives no host
+    or 127.0.0.1, localhost or 0.0.0.0; the root config.yaml has no top-level api_server section; and
+    this job's environment has neither API_SERVER_HOST nor API_SERVER_PORT, which the gateway applies
+    over its configuration. Any other shape raises ListenerUnknown naming it. Nothing else of the root
+    profile is read: never its .env or its key, and this process's environment is left as it was."""
     import os
     from gateway import config_loader
     from hermes_constants import get_default_hermes_root
 
+    for name in ("API_SERVER_HOST", "API_SERVER_PORT"):
+        if name in os.environ:
+            raise ListenerUnknown(f"{name} in this job's environment")
     root = get_default_hermes_root()
     data = config_loader.load_legacy_gateway_json(root)
     layers = config_loader.read_yaml_layers(root)
     listener = config_loader.merge_platform_sections(layers, layers.get("gateway"), data).get("api_server")
+    if "api_server" in layers:
+        raise ListenerUnknown("a top-level api_server section in the root config.yaml")
     extra = listener.get("extra") if isinstance(listener, dict) else None
-    raw = (extra if isinstance(extra, dict) else {}).get("port") or os.environ.get("API_SERVER_PORT")
-    port = 8642 if raw in (None, "") else int(raw)
-    if not 0 < port < 65536:
-        raise ValueError("port out of range")
-    return f"http://127.0.0.1:{port}"
+    extra = extra if isinstance(extra, dict) else {}
+    if extra.get("host") not in (None, DEFAULT_HOST, "localhost", "0.0.0.0"):
+        raise ListenerUnknown(f"the host {extra['host']!r}")
+    raw = extra.get("port")
+    port = DEFAULT_PORT if raw is None else int(raw) if isinstance(raw, str) and raw.isdecimal() else raw
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+        raise ListenerUnknown(f"the port {raw!r}, not an integer from 1 to 65535")
+    return f"http://{DEFAULT_HOST}:{port}"
 
 
 def _http_send(method: str, url: str, body: Dict[str, Any], key: str):
