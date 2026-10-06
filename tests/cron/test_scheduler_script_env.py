@@ -54,27 +54,56 @@ def _job_id_seen_by(result):
     return json.loads(output)
 
 
-@pytest.mark.parametrize(
-    ("job", "heartbeat_start_fails"),
-    [
-        pytest.param(RECURRING_JOB, False, id="job-without-one-shot-claim"),
-        pytest.param(ONE_SHOT_JOB, False, id="one-shot-heartbeat-starts"),
-        pytest.param(ONE_SHOT_JOB, True, id="one-shot-heartbeat-fails-to-start"),
-    ],
-)
+# The three ways the claim-heartbeat wrapper runs a job's script.
+WRAPPER_PATHS = [
+    pytest.param(RECURRING_JOB, False, id="job-without-one-shot-claim"),
+    pytest.param(ONE_SHOT_JOB, False, id="one-shot-heartbeat-starts"),
+    pytest.param(ONE_SHOT_JOB, True, id="one-shot-heartbeat-fails-to-start"),
+]
+
+
+def _fail_heartbeat_start(monkeypatch):
+    start = MagicMock(side_effect=RuntimeError("can't start new thread"))
+    monkeypatch.setattr(threading.Thread, "start", start)
+    return start
+
+
+@pytest.mark.parametrize(("job", "heartbeat_start_fails"), WRAPPER_PATHS)
 def test_script_run_for_a_job_sees_its_job_id(
     probe_script, monkeypatch, job, heartbeat_start_fails
 ):
     """Each way the claim-heartbeat wrapper runs a job's script passes the id."""
     if heartbeat_start_fails:
-        start = MagicMock(side_effect=RuntimeError("can't start new thread"))
-        monkeypatch.setattr(threading.Thread, "start", start)
+        start = _fail_heartbeat_start(monkeypatch)
 
     result = scheduler._run_job_script_with_claim_heartbeat(job, probe_script)
 
     assert _job_id_seen_by(result) == job["id"]
     if heartbeat_start_fails:
         start.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "agent_job",
+    [
+        pytest.param(lambda job: {**job, "no_agent": False}, id="no-agent-false"),
+        pytest.param(
+            lambda job: {key: value for key, value in job.items() if key != "no_agent"},
+            id="no-agent-missing",
+        ),
+    ],
+)
+@pytest.mark.parametrize(("job", "heartbeat_start_fails"), WRAPPER_PATHS)
+def test_pre_check_script_of_an_agent_job_sees_no_job_id(
+    probe_script, monkeypatch, job, heartbeat_start_fails, agent_job
+):
+    """Only a script-only job tells its script its id; an agent job's pre-check script gets none."""
+    if heartbeat_start_fails:
+        _fail_heartbeat_start(monkeypatch)
+
+    result = scheduler._run_job_script_with_claim_heartbeat(agent_job(job), probe_script)
+
+    assert _job_id_seen_by(result) is None
 
 
 def test_script_run_without_a_job_sees_no_job_id(probe_script):
