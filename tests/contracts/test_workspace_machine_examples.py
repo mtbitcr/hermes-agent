@@ -106,7 +106,15 @@ def test_the_workspace_machine_examples_carry_every_route_state_and_error(
         for state in ("awaiting", "changes")
     }
     recorded = _card(s["project_id"], "Record the workshop runs")
+    tiered = {
+        tier: _card(s["project_id"], f"Tier {tier} work", owned_paths=[], risk_tier=tier)
+        for tier in (0, 1, 2)
+    }
     with contextlib.closing(kb.connect(board=BOARD)) as conn:
+        kb._append_event(
+            conn, tiered[1], "risk_tier_raised",
+            {"from": 0, "to": 1, "reviewer": "default", "run_id": 1},
+        )
         for task_id in reviews.values():
             assert kb.request_review(conn, task_id, summary="Ready.")
         assert kb.claim_review_task(conn, reviews["changes"]) is not None
@@ -159,6 +167,9 @@ def test_the_workspace_machine_examples_carry_every_route_state_and_error(
             for assignee in answers["assignees"]["body"]["assignees"]
             for status, count in assignee["counts"].items()
         }
+        assert all(type(task["risk_tier_raised"]) is bool for _name, task in tasks)
+        assert contract.closed_values(answers["board"]["body"], ("risk_tier",)) == {0, 1, 2, None}
+        assert {task["risk_tier"] for _name, task in tasks if task["risk_tier_raised"]} == {1}
         titles = {worker["task_title"] for worker in answers["workers"]["body"]["workers"]}
         assert titles and titles <= {task["title"] for name, task in tasks if name == "running"}
         [attachment] = answers["task_attachments"]["body"]["attachments"]

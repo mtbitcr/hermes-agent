@@ -3843,7 +3843,7 @@ def _workspace_validate_media_type(content_type: Optional[str]) -> str:
 def _workspace_task_event_state(
     conn: sqlite3.Connection, task_ids: list[str]
 ) -> dict[str, dict[str, int]]:
-    """Latest event timestamp and exact event revision per task, batched.
+    """Latest event time, exact revision and risk-raise flag per task, batched.
 
     Tasks have no ``updated_at`` column (see ``kanban_db.Task``) — this is
     the same "derive freshness from task_events" approach the interactive
@@ -3854,7 +3854,8 @@ def _workspace_task_event_state(
         return {}
     placeholders = ",".join("?" for _ in task_ids)
     rows = conn.execute(
-        f"SELECT task_id, MAX(created_at) AS latest, MAX(id) AS revision FROM task_events "
+        f"SELECT task_id, MAX(created_at) AS latest, MAX(id) AS revision, "
+        f"MAX(kind = 'risk_tier_raised') AS raised FROM task_events "
         f"WHERE task_id IN ({placeholders}) GROUP BY task_id",
         task_ids,
     ).fetchall()
@@ -3862,6 +3863,7 @@ def _workspace_task_event_state(
         r["task_id"]: {
             "latest": int(r["latest"]),
             "revision": int(r["revision"]),
+            "raised": int(r["raised"]),
         }
         for r in rows
     }
@@ -3988,6 +3990,8 @@ def _workspace_board_response(*, owner_titles: bool = False) -> dict:
                     "stopped_work": stopped_work.get(
                         t.id, kanban_db.STOPPED_WORK_NONE
                     ),
+                    "risk_tier": t.risk_tier,
+                    "risk_tier_raised": bool(state and state["raised"]),
                     "parent_ids": parent_map[t.id],
                     "child_ids": child_map[t.id],
                 }
