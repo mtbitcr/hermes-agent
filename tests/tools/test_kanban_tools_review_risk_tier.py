@@ -321,7 +321,7 @@ def test_a_raise_to_tier_2_repins_effort_at_handback(reviewing, pinned, effort):
     assert (out["outcome"], out["implementer"]) == ("handed_back", IMPLEMENTER)
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
     assert (row["status"], row["assignee"], row["risk_tier"]) == ("ready", IMPLEMENTER, 2)
-    assert (row["model_override"], row["reasoning_effort"]) == ("claude-sonnet-5", effort)
+    assert (row["model_override"], row["reasoning_effort"]) == ("claude-sonnet-5-5", effort)
     assert kb.task_policy_lock_error(row) is None
     # The implementer's next run starts on that seal.
     run = kb.claim_task(conn, tid, claimer=f"{reviewing.host}:w1")
