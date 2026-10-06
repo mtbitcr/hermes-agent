@@ -22,8 +22,10 @@ missing). The key is only ever the request's bearer: never printed, logged or wr
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -503,46 +505,70 @@ def _deployed_route_policy(method: str, path: str):
     return get_token_route_policy(method, path)
 
 
-_EXECUTION_PAGE = 500
-
-
 def _previous_delivery(announced: Dict[str, Any], job_id: Optional[str]) -> str:
     """Delivery state of the announcement, read only from the watch job's own execution that printed
-    it: of every execution of ``job_id``, paged with no fixed window, the one whose claimed_at is the
-    newest instant at or before the announcement, compared in UTC and never as text (a daylight
-    saving or time zone change puts the scheduler's local text out of order). Other jobs' executions
-    are never read. ``unknown`` without the job id; when any own claimed_at is not ISO text with a
-    UTC offset, or two own executions share that newest instant; or when that execution's record
-    cannot be read or does not hold the announced text."""
+    it: of every execution of ``job_id``, all read at once with no page and no fixed window, the one
+    whose claimed_at is the newest instant at or before the announcement, compared in UTC and never
+    as text (a daylight saving or time zone change puts the scheduler's local text out of order).
+    Other jobs' executions are never read. ``unknown`` without the job id; when any own claimed_at is
+    not ISO text with a UTC offset, or two own executions share that newest instant; or when that
+    execution's record cannot be read or does not hold the announced text. Both stores are only
+    read: a missing store reads unknown, and no store is created, set up, migrated or written."""
     at = _moment(announced.get("at"))
     if not job_id or at is None or not isinstance(announced.get("text"), str):
         return UNKNOWN
     try:
-        from cron import delivery_record
-        from cron.executions import list_executions
-
-        newest, tied, cursor = None, False, None
-        while True:
-            rows = list_executions(job_id=job_id, limit=_EXECUTION_PAGE, before_claimed_at=cursor)
-            for row in rows:
-                claimed = _instant(row["claimed_at"])
-                if claimed is None:
-                    return UNKNOWN
-                if claimed > at:
-                    continue
-                if newest is None or claimed > newest[0]:
-                    newest, tied = (claimed, row["id"]), False
-                elif claimed == newest[0]:
-                    tied = True
-            if len(rows) < _EXECUTION_PAGE:
-                break
-            cursor = rows[-1]["claimed_at"]
+        newest, tied = None, False
+        for execution_id, claimed_at in _own_executions(job_id):
+            claimed = _instant(claimed_at)
+            if claimed is None:
+                return UNKNOWN
+            if claimed > at:
+                continue
+            if newest is None or claimed > newest[0]:
+                newest, tied = (claimed, execution_id), False
+            elif claimed == newest[0]:
+                tied = True
         if newest is None or tied:
             return UNKNOWN
-        record = delivery_record.load_many([newest[1]]).get(newest[1])
-        return _delivery_outcome(record, announced["text"])
+        return _delivery_outcome(_delivery_record(newest[1]), announced["text"])
     except Exception:
         return UNKNOWN
+
+
+def _own_executions(job_id: str) -> List[tuple]:
+    """``(id, claimed_at)`` of every execution of ``job_id``, newest first in the store's order, read in
+    one query over one snapshot. No page and no cursor: list_executions pages by ``claimed_at < cursor``,
+    which drops the rest of the executions sharing the claimed_at a full page ends on; here all of them
+    are read, however many there are, and the read always ends."""
+    from cron import executions
+
+    path = Path(executions.EXECUTIONS_FILE or get_hermes_home().resolve() / "cron" / "executions.db")
+    with closing(_read_only(path)) as conn:
+        return conn.execute(
+            "SELECT id, claimed_at FROM executions WHERE job_id=? ORDER BY claimed_at DESC, id DESC",
+            (job_id,),
+        ).fetchall()
+
+
+def _delivery_record(execution_id: str) -> Optional[Dict[str, Any]]:
+    """One execution's delivery record with its re-send attempts, read by delivery_record's own rules,
+    as load_many reads it, but over a read-only connection and in one snapshot: load_many also sets up
+    the store it reads."""
+    from cron import delivery_record
+
+    delivery_record._platform_keys()  # imported before the store is read, as load_many does
+    with closing(_read_only(delivery_record._path())) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.text_factory = delivery_record._decoded
+        conn.execute("BEGIN")
+        return delivery_record._load_unlocked(conn, [execution_id], True).get(execution_id)
+
+
+def _read_only(path: Path) -> sqlite3.Connection:
+    """A connection that can only read the SQLite store at ``path``: a missing store raises instead of
+    being created, and nothing in the store is set up, migrated or written."""
+    return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
 
 
 def _instant(value: Any) -> Optional[datetime]:

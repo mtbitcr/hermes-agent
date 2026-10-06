@@ -1,5 +1,6 @@
-"""Hourly check of the owner write routes: plan section (e), tests 1 to 9, and the owner notes'
-regression tests for the four review findings of round 1 and the two of round 2.
+"""Hourly check of the owner write routes: plan section (e), tests 1 to 9, the owner notes'
+regression tests for the four review findings of round 1 and the two of round 2, and round 4's
+regression tests for own executions that share a claimed_at across a page boundary.
 
 Tests 1 to 9 fake the listener, the page check, the clock and the delivery record. The regression
 tests use a real HTTP server on 127.0.0.1 and the real execution and delivery stores in the test's
@@ -9,7 +10,10 @@ temporary HERMES_HOME: nothing here reaches another host or a production service
 import asyncio
 import http.server
 import json
+import sqlite3
 import threading
+import uuid
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -748,3 +752,105 @@ def test_finding2_an_own_execution_without_one_clear_instant_stops_the_repeat(
 
     assert alert.kind == "alert"
     assert (again.code, again.text) == (0, "")
+
+
+# --- Round 4: own executions that share a claimed_at across a page boundary -----------------------
+
+# The most executions one call of the store's list_executions returns: one page.
+PAGE = 500
+
+
+def copies(execution_id, claimed_ats):
+    """More real executions of the job of the unfinished ``execution_id``, one claimed at each of
+    ``claimed_ats``: the row create_execution wrote for it, copied with a new id each into the same
+    store in one transaction, as one create_execution call each takes about 30 ms. Returns the ids."""
+    ids = [uuid.uuid4().hex for _ in claimed_ats]
+    with closing(sqlite3.connect(get_hermes_home().resolve() / "cron" / "executions.db")) as conn, conn:
+        conn.executemany(
+            "INSERT INTO executions (id, job_id, source, process_id, pid, process_started_at, status,"
+            " claimed_at, scheduled_instant) SELECT ?, job_id, source, process_id, pid,"
+            " process_started_at, status, ?, scheduled_instant FROM executions WHERE id=?",
+            [(new_id, claimed_at, execution_id) for new_id, claimed_at in zip(ids, claimed_ats)],
+        )
+    return ids
+
+
+def alert_with_history(tmp_path, monkeypatch, twins, newer):
+    """The watch job's alert, printed at START by a run whose own execution was claimed a minute
+    before. ``twins`` own executions in all are claimed at that same text, the alert's own among
+    them, and ``newer`` own executions are claimed after the alert, the last being the next hourly
+    run's own. Returns the host, the alert and the twins' ids, lowest first."""
+    host = Host(tmp_path)
+    host.refuse(decisions_probe(), 403, "route_not_allowed")
+    claimed_at = (START - MINUTE).isoformat()
+    tied = [execution(monkeypatch, WATCH_JOB, claimed_at)]
+    alert = host.run(job_id=WATCH_JOB, delivery_state=None)
+    assert alert.kind == "alert"
+    if twins > 1:
+        tied.append(execution(monkeypatch, WATCH_JOB, claimed_at))
+    later = execution(monkeypatch, WATCH_JOB, host.clock - MINUTE, finished=False)
+    tied += copies(later, [claimed_at] * (twins - len(tied)))
+    copies(later, [(START + timedelta(seconds=n)).isoformat() for n in range(1, newer)])
+    return host, alert, sorted(tied)
+
+
+def announcement():
+    return json.loads(watch.state_path().read_text(encoding="utf-8"))["announced"]
+
+
+@pytest.mark.parametrize("twins,newer", [
+    # The review's case: 499 newer own executions and the higher-id twin fill the first page, and
+    # the lower-id twin is the first row after it.
+    pytest.param(2, PAGE - 1, id="tie-spanning-the-page-boundary"),
+    pytest.param(PAGE + 1, PAGE - 1, id="more-than-a-full-page-tied-across-the-boundary"),
+    pytest.param(2, 1, id="tie-wholly-inside-one-page"),
+])
+@pytest.mark.parametrize("higher,lower", [("failed", "delivered"), ("delivered", "failed")])
+def test_round4_own_executions_tied_at_the_newest_instant_read_unknown_and_stay_quiet(
+        tmp_path, monkeypatch, twins, newer, higher, lower):
+    """Own executions tied at the newest eligible claimed_at read unknown wherever the page boundary
+    falls, in both delivery directions (higher-id eligible row failed and lower-id row delivered; then
+    reversed), and the next hourly decision is quiet: the tie that spans the page boundary, more than
+    a full page of tied rows, and the same tie wholly inside one page."""
+    host, alert, tied = alert_with_history(tmp_path, monkeypatch, twins, newer)
+    deliver(tied[-1], WATCH_JOB, alert.text, higher)
+    deliver(tied[0], WATCH_JOB, alert.text, lower)
+
+    reader = watch._previous_delivery(announcement(), WATCH_JOB)
+    again = host.run(job_id=WATCH_JOB, delivery_state=None)
+
+    assert (reader, again.code, again.kind, again.text) == (watch.UNKNOWN, 0, None, "")
+
+
+@pytest.mark.parametrize("delivery,kind", [("failed", "repeat"), ("delivered", None)])
+def test_round4_more_than_a_full_page_with_a_unique_newest_instant_keeps_its_outcome(
+        tmp_path, monkeypatch, delivery, kind):
+    """More than one full page of newer own executions and a unique newest eligible instant give
+    that execution's correct definite outcome: failed prints the alert again an hour later,
+    delivered prints nothing."""
+    host, alert, (own,) = alert_with_history(tmp_path, monkeypatch, 1, PAGE)
+    deliver(own, WATCH_JOB, alert.text, delivery)
+
+    reader = watch._previous_delivery(announcement(), WATCH_JOB)
+    again = host.run(job_id=WATCH_JOB, delivery_state=None)
+
+    assert (reader, again.code, again.kind, again.text) == (delivery, 0, kind, alert.text if kind else "")
+
+
+def test_round4_the_reader_creates_and_changes_no_store(monkeypatch):
+    """The reader only reads: without the stores it reads unknown and creates neither, and with them
+    it reads the failed delivery and leaves both store files byte for byte as they were."""
+    cron = get_hermes_home().resolve() / "cron"
+    stores = [cron / "executions.db", cron / "delivery_records.db"]
+    announced = {"text": "Owner actions check: 1 failing.", "at": START.isoformat()}
+
+    assert watch._previous_delivery(announced, WATCH_JOB) == watch.UNKNOWN
+    assert [store.exists() for store in stores] == [False, False]
+    own = execution(monkeypatch, WATCH_JOB, START - MINUTE)
+    assert watch._previous_delivery(announced, WATCH_JOB) == watch.UNKNOWN
+    assert [store.exists() for store in stores] == [True, False]
+    deliver(own, WATCH_JOB, announced["text"], "failed")
+    before = [(store.read_bytes(), store.stat().st_mtime_ns) for store in stores]
+
+    assert watch._previous_delivery(announced, WATCH_JOB) == "failed"
+    assert [(store.read_bytes(), store.stat().st_mtime_ns) for store in stores] == before
