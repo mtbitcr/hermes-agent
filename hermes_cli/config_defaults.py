@@ -2394,6 +2394,15 @@ DEFAULT_CONFIG = {
         # Extra ports detection probes for an external llama-server (besides 8080).
         "detect_ports": [],
     },
+    # `hermes release` on the release host. Its unit names and readback addresses are not in the
+    # repository, so an empty required value refuses. Units are user units, keyed by role.
+    "release": {
+        "units": {"gateway": "hermes-gateway", "serve": "hermes-serve", "sandbox-tunnel": ""},
+        "health_url": "",
+        "workspace_check_url": "",
+        "snapshot_dir": "",  # Empty = release-snapshots under the root Hermes home.
+        "drain_poll_seconds": 30,
+    },
     "_config_version": 43,  # Config schema version - bump this when adding new required fields
 }
 
