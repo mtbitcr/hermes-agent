@@ -333,6 +333,12 @@ def github(tmp_path):
                                          "documentation_url": f"https://docs.example/{TOKEN}"})
             if path.endswith("/logs"):
                 return self._reply(302, None, [("Location", f"https://storage.example/log?sig={TOKEN}")])
+            if method == "GET" and path.endswith("/reviews"):  # Link: a next page (7), the last (8), none (9), cut (10)
+                url = f"<https://api.github.com/repositories/1/pulls/7/reviews?page=3&t={TOKEN}>"
+                link = {"7": f'{url}; rel="next", {url}; rel="last"', "8": f'{url}; rel="prev", {url}; rel="first"',
+                        "10": f'{url[:-1]}; rel="next"'}.get(path.split("/")[-2])
+                return self._reply(200, [{"id": 1, "state": "APPROVED", "commit_id": HEAD, "user": {"login": "b"}}],
+                                   [("Link", link)] if link else ())
             if method == "GET" and "/git/ref/heads/" in path:  # one branch exists; any other is absent
                 if path == f"/repos/{REPO}/git/ref/heads/delivery/card-1":
                     return self._reply(200, {"ref": "refs/heads/delivery/card-1", "node_id": TOKEN, "url": TOKEN,
@@ -360,7 +366,7 @@ def test_no_administration_call_is_possible(github, monkeypatch):
     forbidden = ("protection", "rules", "settings", "hooks", "collaborators", "keys", "admin",
                  "permissions", "branches", "installation")
     for entry in mod.REST_ALLOWLIST:
-        assert entry.method in {"GET", "POST", "PUT"}
+        assert entry.method in {"GET", "POST", "PUT", "PATCH"}
         if (entry.method, entry.template) == ("POST", "/app/installations/{installation}/access_tokens"):
             continue  # the App's own call that mints a narrowed token
         segments = entry.template.strip("/").split("/")
@@ -381,7 +387,7 @@ def test_no_administration_call_is_possible(github, monkeypatch):
                 transport.request(entry.method, entry.template.format(**SAMPLE),
                                   query={k: SAMPLE[k] for k in entry.required_query})
             except mod.GitHubTransportError as exc:
-                assert exc.reason in {"step_not_permitted", "endpoint_not_allowed"}
+                assert exc.reason in {"step_not_permitted", "endpoint_not_allowed", "body_not_allowed"}
     allowed = [(e.method, _template_regex(e.template)) for e in mod.REST_ALLOWLIST]
     assert github["calls"]
     for method, path in github["calls"]:  # everything that reached the network was allowlisted
@@ -547,7 +553,7 @@ def test_no_token_request_names_administration(github, monkeypatch):
                     transport.request(entry.method, entry.template.format(**{**SAMPLE, "repo": repository}),
                                       query={k: SAMPLE[k] for k in entry.required_query})
                 except mod.GitHubTransportError as exc:
-                    assert exc.reason in {"step_not_permitted", "endpoint_not_allowed"}
+                    assert exc.reason in {"step_not_permitted", "endpoint_not_allowed", "body_not_allowed"}
 
     requests = github["token_requests"]
     assert len(requests) == transports  # the stand-in's own count: one per step and repository
@@ -1084,3 +1090,49 @@ def test_branch_head_is_none_when_github_answers_404(github, monkeypatch):
 
     assert head is None
     assert github["calls"] == [("GET", f"/repos/{REPO}/git/ref/heads/delivery/card-2")]
+
+
+@pytest.mark.parametrize("read, sends", [({"state": "open", "head": {"sha": HEAD}}, True), (None, False),
+                                         ({"state": "closed", "head": {"sha": HEAD}}, False),
+                                         ({"state": "open", "head": {"sha": "f" * 40}}, False)])
+def test_the_arm_reads_nothing_and_sends_only_on_the_transports_own_read_of_the_open_head(monkeypatch, read, sends):
+    """Owner rule 2 of round 2: the arm makes no read and mints no token. It sends the one mutation, with the
+    token the transport's earlier reads minted, only when its own read of the pull request showed it open at
+    the head. A reviews read keeps each review's author login, state, commit and body's first line only."""
+    mod = _module()
+    sent, mints = [], []
+    answers = {f"/repos/{REPO}/pulls/41": dict(read or {}, number=41, node_id="PR_kw"),
+               f"/repos/{REPO}/pulls/41/reviews": [{"id": 3, "state": "APPROVED", "commit_id": HEAD, "html_url": STRAY,
+                                                    "body": "Review card t_1 \r\nfine", "user": {"login": "b", "id": 9}}]}
+    monkeypatch.setattr(mod, "_exchange", lambda method, target, authorization, payload=None: (
+        sent.append((method, target.split("?")[0], authorization)) or (200, answers.get(target.split("?")[0], {}))))
+    monkeypatch.setattr(mod.GitHubTransport, "_installation_token", lambda self: (
+        mints.append(self) or setattr(self, "_token", DUMMY) or DUMMY))
+    github = mod.GitHubTransport("publish", REPO)
+    assert github.request("GET", f"/repos/{REPO}/pulls/41/reviews", query={"per_page": 100})["data"] == [
+        {"user": {"login": "b"}, "state": "APPROVED", "commit_id": HEAD, "body": "Review card t_1"}]
+    if read is not None:
+        github.request("GET", f"/repos/{REPO}/pulls/41")
+    reads = len(sent)
+
+    if sends:
+        github.arm_auto_merge(41, HEAD)
+    for number, head in ((41, BASE), (42, HEAD)) + (() if sends else ((41, HEAD),)):
+        with pytest.raises(mod.GitHubTransportError):
+            github.arm_auto_merge(number, head)
+
+    assert sent[reads:] == ([("POST", "/graphql", f"Bearer {DUMMY}")] if sends else []) and len(mints) == reads
+
+
+def test_the_reviews_read_says_only_whether_github_names_a_next_page(github, monkeypatch):
+    """The fenced reviews read keeps one fact of the answer's Link header, whether it names a next page
+    (rel="next"): True when it does, False when it names none or sends no Link header, None when it cannot be read.
+    The header itself, its URLs and the token they carry included, never comes back."""
+    mod = _transport_module(monkeypatch, github)
+    transport = mod.GitHubTransport("publish", REPO, key_path=github["key_file"])
+
+    answers = [transport.request("GET", f"/repos/{REPO}/pulls/{number}/reviews", query={"per_page": 100, "page": 2})
+               for number in (7, 8, 9, 10)]
+
+    assert answers == [{"status": 200, "data": [{"user": {"login": "b"}, "state": "APPROVED", "commit_id": HEAD,
+                                                 "body": ""}], "next_page": more} for more in (True, False, False, None)]

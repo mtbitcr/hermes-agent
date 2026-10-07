@@ -88,7 +88,8 @@ def world(board, monkeypatch):
 
 
 def _published(kb, repo, gh, tid, head, board=None):
-    """What card 1's publish stores for H: the ledger on the row and delivery_bound on the source card."""
+    """What card 1's publish stores for H: the ledger on the row, delivery_bound and its delivery_published
+    record of the repository on the source card."""
     conn = kb.connect(board=board)
     try:
         with kb.write_txn(conn):
@@ -98,6 +99,8 @@ def _published(kb, repo, gh, tid, head, board=None):
                 (head, "delivery/" + tid, tid, head))
             kb._append_event(conn, tid, "delivery_bound", {
                 "source_task_id": tid, "head": head, "base_commit": _git(repo, "rev-parse", "main")})
+            kb._append_event(conn, tid, "delivery_published", {"repository": REPO, "branch": "delivery/" + tid,
+                                                              "pull_request_number": 41, "head": head, "state": "created"})
     finally:
         conn.close()
     gh["head"] = head
@@ -153,7 +156,7 @@ def test_the_recorded_tier_alone_decides_the_cards_of_the_exact_head(world, tier
 
     cards = _cards(kb)
     assert [(c["idempotency_key"], c["responsibility"], c["title"]) for c in cards] == [
-        (f"review:{tid}:{head}:{r}", r, f"Review ({lens}) of {tid} at {head}") for r, lens in lenses.items()]
+        (f"review:{tid}:{head}:{r}", r, f"Review ({lens}) of build feature") for r, lens in lenses.items()]
     assert {("Risk not recorded" in c["body"], f"Head: {head}" in c["body"]) for c in cards} == {(tier is None, True)}
     kind, payload = _events(kb, tid)[-1]
     assert (kind, payload["head"], sorted(payload["cards"])) == (
@@ -216,6 +219,19 @@ def test_cards_carry_the_command_fields_after_the_same_route_guard(world):
                           f"CI on {head}: passed ({CHECK})"):
             assert reference in card["body"]
     assert parents == [tid, tid]
+
+
+def test_each_card_tells_the_reviewer_to_start_its_github_review_with_the_cards_own_line(world):
+    """Owner rule 1 of round 2: the reviewer bot's GitHub review names the one card it decides, by the
+    first line of its body; the id stays out of the title."""
+    kb, root, repo, gh = world
+    _ready(world)
+
+    _tick(kb)
+
+    cards = _cards(kb)
+    assert len(cards) == 2 and all(f"exact line:\nReview card {card['id']}\n" in card["body"]
+                                   and card["id"] not in card["title"] for card in cards)
 
 
 @pytest.mark.parametrize("model, created, after", [
