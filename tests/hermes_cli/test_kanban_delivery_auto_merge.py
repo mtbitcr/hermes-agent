@@ -1,10 +1,12 @@
 """Card 5: the delivery step arms GitHub auto-merge on exactly the published head H once every review card
-the tier requires is done and its own review approves H, and closes the earlier pull request once when a
-rework card continues a delivered head. Real boards and git; GitHub is the real transport with only its
-exchange and App token replaced by a table, so every call passes the allowlist."""
+the tier requires is done and approves H and the reviewer bot's latest review approves H, and closes the
+earlier pull request once when a rework card continues a delivered head. Real boards and git; GitHub is the
+real transport with only its exchange and App token replaced by a table, so every call passes the allowlist."""
 
 from __future__ import annotations
 
+import inspect
+import json
 from urllib.parse import urlsplit
 
 import pytest
@@ -20,18 +22,21 @@ from tests.hermes_cli.test_kanban_delivery_review_cards import (  # noqa: F401  
 
 ARMED = {"data": {"enablePullRequestAutoMerge": {"clientMutationId": None}}}
 OTHER = "e" * 40
+BOT = "raphael-reviewer-mtbitcr[bot]"
+ELSEWHERE = "mtbitcr/raphael-workspace"  # the policy's other repository
 
 
 @pytest.fixture
 def armed(world, monkeypatch):
     """The review-card world, where GitHub also lists each pull request's reviews (gh["reviews"] by number),
-    answers the auto-merge mutation with gh["arm"] and a close with gh["close"], and keeps each write's body.
-    Pull request 41 is open at H, and each one in gh["pulls"] at the head given there."""
+    answers the auto-merge mutation with gh["arm"] and a close with gh["close"] ("timeout": no answer), keeps
+    each write's body and runs gh["hooks"]["GET"] once during a reviews read, ["PATCH"] during a close.
+    Pull request 41 of REPO is open at H, and each one in gh["pulls"] at the head given there."""
     kb, root, repo, gh = world
     from hermes_cli import kanban_delivery_github as transport
 
     table = transport._exchange
-    gh.update(reviews={}, pulls={}, writes=[], arm=(200, ARMED), close=(200, {"number": 41, "state": "closed"}))
+    gh.update(reviews={}, pulls={}, writes=[], hooks={}, arm=(200, ARMED), close=(200, {"number": 41, "state": "closed"}))
 
     def exchange(method, target, authorization, payload=None):
         path = urlsplit(target).path
@@ -39,18 +44,23 @@ def armed(world, monkeypatch):
         pull = len(parts) >= 6 and parts[4] == "pulls" and parts[5].isdigit()
         if method in ("POST", "PATCH") or pull:
             gh["calls"].append((method, path))
+        if method == "PATCH" or path.endswith("/reviews"):
+            gh["hooks"].pop(method, lambda: None)()
         if method in ("POST", "PATCH"):
             gh["writes"].append((method, path, payload))
-            return gh["arm"] if path == "/graphql" else gh["close"]
+            answer = gh["arm"] if path == "/graphql" else gh["close"]
+            if answer == "timeout":
+                raise transport.GitHubTransportError("network_error")
+            return answer
         if pull and path.endswith("/reviews"):
             return 200, gh["reviews"].get(int(parts[5]), [])
         if pull and len(parts) == 6:
+            number, owner = int(parts[5]), "/".join(parts[2:4])
             heads = {41: gh["pull_head"] or gh["head"], **gh["pulls"]}
-            number = int(parts[5])
-            if number not in heads:
+            if (number if owner == REPO else (owner, number)) not in heads:
                 return 404, None
             return 200, {"number": number, "node_id": f"PR_node{number}", "state": "open",
-                         "head": {"sha": heads[number]}, "user": {"login": "someone"}}
+                         "head": {"sha": heads[number if owner == REPO else (owner, number)]}}
         return table(method, target, authorization, payload)
 
     monkeypatch.setattr(transport, "_exchange", exchange)
@@ -58,9 +68,11 @@ def armed(world, monkeypatch):
 
 
 def _reviews(gh, *reviews, number=41):
-    """The reviewer bot's reviews of a pull request, oldest first: (state, commit) each."""
+    """A pull request's reviews, oldest first: (state, commit), by the reviewer bot unless a third item
+    names another account."""
     gh["reviews"][number] = [{"id": 700 + n, "state": state, "commit_id": commit, "body": "text",
-                              "user": {"login": "raphael-reviewer[bot]"}} for n, (state, commit) in enumerate(reviews)]
+                              "user": {"login": (who or [BOT])[0], "type": "Bot"}}
+                             for n, (state, commit, *who) in enumerate(reviews)]
 
 
 def _done(db, *cards):
@@ -73,16 +85,21 @@ def _arms(gh):
     return [body for method, path, body in gh["writes"] if path == "/graphql"]
 
 
-def _published_as(db, gh, tid, head, number):
-    """A raw ledger of ``tid`` at ``head`` as pull request ``number``, open at that head on GitHub."""
+def _published_as(db, gh, tid, head, number, repository=REPO):
+    """A raw ledger of ``tid`` at ``head`` as pull request ``number`` of ``repository``, with the publish
+    step's record of it, open at that head on GitHub."""
     _raw(db, "UPDATE kanban_deliveries SET pull_request_number = ?, pull_request_head = ?, pull_request_state = "
          "'open', pull_request_branch = ? WHERE source_task_id = ? AND source_head = ?",
          number, head, "delivery/" + tid, tid, head)
-    gh["pulls"][number] = head
+    _raw(db, "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'delivery_published', ?, 0)",
+         tid, json.dumps({"repository": repository, "branch": "delivery/" + tid, "pull_request_number": number,
+                          "head": head, "state": "created"}))
+    gh["pulls"][number if repository == REPO else (repository, number)] = head
 
 
 @pytest.mark.parametrize("case", ["open", "changes_on_github", "changes_on_card"])
 def test_no_arm_while_a_required_card_is_open_or_returned_changes(armed, case):
+    """One lens's card done, even with two approvals of H, arms nothing: each lens is its own card."""
     kb, root, repo, gh = armed
     tid, head = _ready(armed)
     _tick(kb)
@@ -102,7 +119,7 @@ def test_no_arm_while_a_required_card_is_open_or_returned_changes(armed, case):
 
     assert _arms(gh) == [] and _state(kb, head) == "review_cards_created"
     assert not [kind for kind, _ in _events(kb, tid) if "auto_merge" in kind]
-    # Finished, or approved again by both lenses, H arms; a card that returned changes never counts.
+    # Finished, or approved again by the bot, H arms; a card that returned changes never counts.
     _done(kb.kanban_db_path())
     gh["reviews"][41] += [dict(review, id=800 + n, state="APPROVED") for n, review in enumerate(gh["reviews"][41])]
     _tick(kb)
@@ -110,51 +127,60 @@ def test_no_arm_while_a_required_card_is_open_or_returned_changes(armed, case):
 
 
 @pytest.mark.parametrize("reviews", [
-    [("APPROVED", "H")],
-    [("APPROVED", OTHER), ("APPROVED", "H")],
+    [("APPROVED", "H", "someone"), ("APPROVED", "H", "raphael-reviewer[bot]")],
+    [("CHANGES_REQUESTED", "H"), ("APPROVED", "H", "someone"), ("APPROVED", "H", "another")],
     [("APPROVED", "H"), ("APPROVED", OTHER)],
-    [("APPROVED", "H"), ("APPROVED", "H"), ("DISMISSED", "H")],
+    [("APPROVED", "H"), ("COMMENTED", "H")],
     [],
 ])
-def test_a_one_lens_approval_on_a_tier_2_head_does_not_arm(armed, reviews):
-    """Both lenses post from one account: each needs its own approval of H, so one approval, or two where
-    one is of another commit or no longer the latest, arms nothing."""
+def test_only_the_reviewer_bots_latest_review_approving_h_confirms_the_done_cards(armed, reviews):
+    """The done cards are the approval; GitHub is read only to confirm that the reviewer bot's latest
+    review of the pull request approves H. Any other account's review never counts."""
     kb, root, repo, gh = armed
     tid, head = _ready(armed, tier=2)
     _tick(kb)
     _done(kb.kanban_db_path())
-    _reviews(gh, *[(state, head if commit == "H" else commit) for state, commit in reviews])
+    given = [(state, head if commit == "H" else commit, *who) for state, commit, *who in reviews]
+    _reviews(gh, *given)
 
     _tick(kb)
 
     assert _arms(gh) == [] and _state(kb, head) == "review_cards_created"
-    _reviews(gh, *[(state, head if commit == "H" else commit) for state, commit in reviews], *[("APPROVED", head)] * 2)
+    _reviews(gh, *given, ("APPROVED", head))
     _tick(kb)
-    assert [body["variables"]["expectedHeadOid"] for body in _arms(gh)] == [head]  # each lens's own approval of H
+    assert [body["variables"]["expectedHeadOid"] for body in _arms(gh)] == [head]
 
 
-def test_the_allowlist_accepts_exactly_the_two_new_calls_and_refuses_every_other(monkeypatch):
+def test_the_allowlist_holds_exactly_the_three_new_entries_and_refuses_every_other(monkeypatch):
     from hermes_cli import kanban_delivery_github as transport
 
     sent = []
+    answers = {f"/repos/{REPO}/pulls/41": {"number": 41, "node_id": "PR_kwDOAbc", "state": "open", "head": {"sha": HEAD}},
+               f"/repos/{REPO}/pulls/41/reviews": [{"id": 1, "state": "APPROVED", "commit_id": HEAD, "body": "text",
+                                                     "user": {"login": BOT, "avatar_url": "https://x"}}]}
     monkeypatch.setattr(transport, "_exchange", lambda method, target, authorization, payload=None: (
-        sent.append((method, target, payload)) or (200, {})))
-    monkeypatch.setattr(transport.GitHubTransport, "_installation_token", lambda self: "token")
+        sent.append((method, target, payload)) or (200, answers.get(urlsplit(target).path, {}))))
+    monkeypatch.setattr(transport.GitHubTransport, "_installation_token", lambda self: setattr(self, "_token", "ghs_0") or "ghs_0")
     document = transport.AUTO_MERGE_MUTATION
     arm = {"query": document, "variables": {"pullRequestId": "PR_kwDOAbc", "expectedHeadOid": HEAD}}
     github = transport.GitHubTransport("publish", REPO)
 
+    assert github.request("GET", f"/repos/{REPO}/pulls/41/reviews", query={"per_page": 100})["data"] == [
+        {"id": 1, "state": "APPROVED", "commit_id": HEAD, "user": {"login": BOT}}]
     github.request("PATCH", f"/repos/{REPO}/pulls/41", body={"state": "closed"})
-    github.request("POST", "/graphql", body=arm)
+    github.arm_auto_merge(41, HEAD)
 
-    assert sent == [("PATCH", f"/repos/{REPO}/pulls/41", {"state": "closed"}), ("POST", "/graphql", arm)]
+    assert sent[1:] == [("PATCH", f"/repos/{REPO}/pulls/41", {"state": "closed"}),
+                        ("GET", f"/repos/{REPO}/pulls/41", None), ("POST", "/graphql", arm)]
     assert "mergeMethod: MERGE" in document and "expectedHeadOid: $expectedHeadOid" in document
-    assert [e.template for e in transport.GRAPHQL_ALLOWLIST] == ["/graphql"]
-    writes = {(e.method, e.template) for e in transport.REST_ALLOWLIST if e.method != "GET"}
-    assert writes == {("POST", "/repos/{repo}/pulls"), ("PUT", "/repos/{repo}/pulls/{number}/merge"),
-                      ("POST", "/repos/{repo}/pulls/{number}/reviews"), ("POST", "/repos/{repo}/actions/jobs/{id}/rerun"),
-                      ("POST", "/app/installations/{installation}/access_tokens"), ("PATCH", "/repos/{repo}/pulls/{number}")}
-    literal = document.replace("$expectedHeadOid", f'"{OTHER}"').replace(", $expectedHeadOid: GitObjectID!", "")
+    assert {(e.method, e.template) for e in transport.REST_ALLOWLIST + transport.GRAPHQL_ALLOWLIST} == {
+        ("GET", "/repos/{repo}/pulls"), ("POST", "/repos/{repo}/pulls"), ("GET", "/repos/{repo}/pulls/{number}"),
+        ("PUT", "/repos/{repo}/pulls/{number}/merge"), ("POST", "/repos/{repo}/pulls/{number}/reviews"),
+        ("GET", "/repos/{repo}/git/ref/heads/{branch}"), ("GET", "/repos/{repo}/commits/{sha}/check-runs"),
+        ("GET", "/repos/{repo}/actions/runs"), ("GET", "/repos/{repo}/actions/runs/{id}/jobs"),
+        ("GET", "/repos/{repo}/actions/jobs/{id}/logs"), ("POST", "/repos/{repo}/actions/jobs/{id}/rerun"),
+        ("POST", "/app/installations/{installation}/access_tokens"),  # the twelve before this card, and its three:
+        ("GET", "/repos/{repo}/pulls/{number}/reviews"), ("PATCH", "/repos/{repo}/pulls/{number}"), ("POST", "/graphql")}
     refused = [
         ("PATCH", f"/repos/{REPO}/pulls/41", {"state": "closed", "title": "replaced"}),
         ("PATCH", f"/repos/{REPO}/pulls/41", {"state": "open"}),
@@ -165,31 +191,34 @@ def test_the_allowlist_accepts_exactly_the_two_new_calls_and_refuses_every_other
         ("PATCH", f"/repos/{REPO}", {"state": "closed"}),
         ("POST", f"/repos/{REPO}/pulls/41", {"state": "closed"}),
         ("DELETE", f"/repos/{REPO}/pulls/41", None),
+        ("GET", f"/repos/{REPO}/pulls/41/comments", None),
+        ("GET", f"/repos/{REPO}/pulls/41/reviews/1", None),
+        ("GET", f"/repos/other/repo/pulls/41/reviews", None),
         ("GET", "/graphql", None),
         ("PATCH", "/graphql", arm),
+        ("POST", "/graphql", arm),  # the arm is the transport's own call: no caller sends a document
         ("POST", "/graphql", None),
         ("POST", "/graphql", {"query": "query { viewer { login } }"}),
         ("POST", "/graphql", dict(arm, query=document.replace("MERGE", "SQUASH"))),
-        ("POST", "/graphql", dict(arm, query=document.replace("MERGE", "REBASE"))),
-        ("POST", "/graphql", dict(arm, query=document.replace("expectedHeadOid: $expectedHeadOid, ", ""))),
-        ("POST", "/graphql", {"query": literal, "variables": {"pullRequestId": "PR_kwDOAbc"}}),
         ("POST", "/graphql", {"query": document, "variables": {"pullRequestId": "PR_kwDOAbc"}}),
-        ("POST", "/graphql", {"query": document, "variables": {"pullRequestId": "PR_kwDOAbc", "expectedHeadOid": "main"}}),
-        ("POST", "/graphql", {"query": document, "variables": dict(arm["variables"], mergeMethod="SQUASH")}),
-        ("POST", "/graphql", dict(arm, operationName="arm")),
+        ("POST", "/graphql", {"query": document, "variables": dict(arm["variables"], expectedHeadOid=OTHER)}),
         ("POST", "/graphql", {"query": "mutation { mergePullRequest(input: {pullRequestId: \"PR_kwDOAbc\"}) { clientMutationId } }"}),
-        ("POST", "/graphql", {"query": document + " ", "variables": arm["variables"]}),
         ("POST", f"/repos/{REPO}/graphql", arm),
         ("PUT", f"/repos/{REPO}/branches/main/protection", {}),
     ]
     for method, path, body in refused:
         with pytest.raises(transport.GitHubTransportError):
             github.request(method, path, body=body)
-    assert len(sent) == 2
-    for step in ("read_checks", "rerun_flaky", "handoff"):  # no step that cannot write pull requests can call them
+    assert len(sent) == 4
+    # The caller names the pull request and H only; a head it does not hold, or no head, sends no mutation.
+    assert list(inspect.signature(transport.GitHubTransport.arm_auto_merge).parameters) == ["self", "number", "head"]
+    for number, head in ((41, OTHER), (41, None), (41, "main"), ("41", HEAD), (True, HEAD)):
         with pytest.raises(transport.GitHubTransportError):
-            transport.GitHubTransport(step, REPO).request("POST", "/graphql", body=arm)
-    assert len(sent) == 2
+            github.arm_auto_merge(number, head)
+    for step in ("read_checks", "rerun_flaky", "handoff"):  # no step that cannot write pull requests can arm
+        with pytest.raises(transport.GitHubTransportError):
+            transport.GitHubTransport(step, REPO).arm_auto_merge(41, HEAD)
+    assert sent[4:] == [("GET", f"/repos/{REPO}/pulls/41", None)]
 
 
 @pytest.mark.parametrize("tier", [0, 2])
@@ -207,7 +236,7 @@ def test_a_publish_arms_once_on_the_exact_head_and_a_second_pass_makes_no_call(a
 
     assert _arms(gh) == [{"query": transport.AUTO_MERGE_MUTATION,
                           "variables": {"pullRequestId": "PR_node41", "expectedHeadOid": head}}]
-    assert gh["calls"][-3:] == [("GET", f"/repos/{REPO}/pulls/41"), ("GET", f"/repos/{REPO}/pulls/41/reviews"),
+    assert gh["calls"][-3:] == [("GET", f"/repos/{REPO}/pulls/41/reviews"), ("GET", f"/repos/{REPO}/pulls/41"),
                                 ("POST", "/graphql")]
     assert _state(kb, head) == "auto_merge_armed"
     events = _events(kb, tid)
@@ -221,11 +250,13 @@ def test_a_publish_arms_once_on_the_exact_head_and_a_second_pass_makes_no_call(a
     assert (len(gh["calls"]), _events(kb, tid), _state(kb, head)) == (calls, events, "auto_merge_armed")
 
 
-@pytest.mark.parametrize("answer", [
-    (200, {"errors": [{"type": "UNPROCESSABLE", "message": "Pull request is in clean status"}]}),
-    (200, {"data": {"enablePullRequestAutoMerge": None}, "errors": [{"message": "auto-merge is not allowed"}]}),
-    (403, None), (422, None)])
-def test_a_refused_arm_is_recorded_once_for_its_head(armed, answer):
+@pytest.mark.parametrize("answer, state", [
+    ((200, {"errors": [{"type": "UNPROCESSABLE", "message": "Pull request is in clean status"}]}), "refused"),
+    ((200, {"data": {"enablePullRequestAutoMerge": None}, "errors": [{"message": "auto-merge is not allowed"}]}),
+     "refused"),
+    ((403, None), "refused"), ((422, None), "refused"), ((429, None), "refused"), ((500, None), "refused"),
+    ((503, None), "refused"), ("timeout", "unknown")])
+def test_a_refused_arm_is_recorded_once_for_its_head(armed, answer, state):
     kb, root, repo, gh = armed
     tid, head = _ready(armed)
     _tick(kb)
@@ -237,9 +268,10 @@ def test_a_refused_arm_is_recorded_once_for_its_head(armed, answer):
     _tick(kb)
     _tick(kb)
 
-    assert len(_arms(gh)) == 1 and _state(kb, head) == "auto_merge_refused"
+    assert len(_arms(gh)) == 1 and _state(kb, head) == f"auto_merge_{state}"
     refused = [(kind, p) for kind, p in _events(kb, tid) if "auto_merge" in kind]
-    assert [(kind, p["head"], p["status"]) for kind, p in refused] == [("delivery_auto_merge_refused", head, answer[0])]
+    assert [(kind, p["head"], p.get("status")) for kind, p in refused] == [
+        (f"delivery_auto_merge_{state}", head, None if answer == "timeout" else answer[0])]
     assert "message" not in str(refused) and "clean status" not in str(refused)
 
 
@@ -267,24 +299,75 @@ def test_a_new_head_starts_fresh_after_a_refused_arm(armed):
     assert _state(kb, second) == "auto_merge_armed"
 
 
-def test_a_rework_card_that_continues_a_delivered_head_closes_the_earlier_pull_request_once(armed):
+@pytest.mark.parametrize("change",["card_reopened", "changes_requested", "source_head", "tier_raised", "row_moved",
+                                    "overlap"])
+def test_evidence_that_changes_while_github_is_read_sends_no_arm(armed, change):
+    """The pass that sends the arm first reads the cards, the source card and the row again and records the
+    attempt for H, in one write transaction: a change sends nothing, an overlapping pass no second arm."""
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head = _ready(armed, tier=0)
+    _tick(kb)
+    _done(db)
+    _reviews(gh, ("APPROVED", head))
+    card = _cards(kb)[0]["id"]
+    gh["hooks"]["GET"] = {
+        "card_reopened": lambda: _raw(db, "UPDATE tasks SET status = 'ready' WHERE id = ?", card),
+        "changes_requested": lambda: _raw(db, "INSERT INTO task_events (task_id, kind, created_at) "
+                                              "VALUES (?, 'changes_requested', 0)", card),
+        "source_head": lambda: _raw(db, "UPDATE tasks SET head_commit = ? WHERE id = ?", OTHER, tid),
+        "tier_raised": lambda: _raw(db, "UPDATE tasks SET risk_tier = 2 WHERE id = ?", tid),
+        "row_moved": lambda: _raw(db, "UPDATE kanban_deliveries SET pull_request_number = 42 WHERE source_head = ?",
+                                  head),
+        "overlap": lambda: _tick(kb)}[change]
+
+    _tick(kb)
+    _tick(kb)
+
+    assert len(_arms(gh)) == (change == "overlap")
+    assert len([kind for kind, _ in _events(kb, tid) if "auto_merge" in kind]) == (change == "overlap")
+
+
+def test_a_new_head_is_never_pushed_to_an_armed_pull_request(armed):
+    kb, root, repo, gh = armed
+    tid, head = _ready(armed, tier=0)
+    _tick(kb)
+    _done(kb.kanban_db_path())
+    _reviews(gh, ("APPROVED", head))
+    _tick(kb)
+    calls = list(gh["calls"])
+
+    second = _rework(kb, repo, tid)
+    _tick(kb)
+    _tick(kb)
+
+    assert gh["calls"] == calls and _state(kb, head) == "auto_merge_armed"
+    assert [(p["code"], p["head"]) for kind, p in _events(kb, tid) if kind == "delivery_refused"] == [
+        ("auto_merge_armed", second)]
+
+
+@pytest.mark.parametrize("case", ["same", "origin_changed", "base_elsewhere", "number_elsewhere"])
+def test_a_rework_card_that_continues_a_delivered_head_closes_the_earlier_pull_request_once(armed, case):
+    """A pull request is its repository and number as the publish step recorded them, never the git origin:
+    a continuation published in another repository replaces nothing, and its numbers hold back no close."""
     kb, root, repo, gh = armed
     db = kb.kanban_db_path()
     first, delivered = _ready(armed)
     rework, continued = _approved(kb, repo, "rework")
     other, unrelated = _approved(kb, repo, "unrelated")
     _raw(db, "UPDATE tasks SET base_commit = ? WHERE id = ?", delivered, rework)
-    _published_as(db, gh, rework, continued, 42)
-    _published_as(db, gh, other, unrelated, 43)
+    _published_as(db, gh, rework, continued, 42, ELSEWHERE if case == "base_elsewhere" else REPO)
+    _published_as(db, gh, other, unrelated, *((41, ELSEWHERE) if case == "number_elsewhere" else (43, REPO)))
+    if case == "origin_changed":
+        _git(repo, "remote", "set-url", "origin", f"https://github.com/{ELSEWHERE}.git")
 
     _tick(kb)
 
     closes = [write for write in gh["writes"] if write[0] == "PATCH"]
-    assert closes == [("PATCH", f"/repos/{REPO}/pulls/41", {"state": "closed"})]
+    assert closes == ([] if case == "base_elsewhere" else [("PATCH", f"/repos/{REPO}/pulls/41", {"state": "closed"})])
     assert [(kind, p["pull_request_number"], p["replaced_by"]) for kind, p in _events(kb, first)
-            if kind == "delivery_replaced"] == [("delivery_replaced", 41, rework)]
-    assert _state(kb, delivered) == "replaced"
-    assert (_state(kb, continued), _state(kb, unrelated)) == ("review_cards_created", "review_cards_created")
+            if kind == "delivery_replaced"] == ([] if case == "base_elsewhere" else [("delivery_replaced", 41, rework)])
+    assert (_state(kb, delivered) == "replaced") is (case != "base_elsewhere")
 
     _tick(kb)
     _raw(db, "UPDATE kanban_deliveries SET pull_request_state = 'returned_for_changes' WHERE source_head = ?",
@@ -292,7 +375,31 @@ def test_a_rework_card_that_continues_a_delivered_head_closes_the_earlier_pull_r
     _tick(kb)
 
     assert [write for write in gh["writes"] if write[0] == "PATCH"] == closes
-    assert len([kind for kind, _ in _events(kb, first) if kind == "delivery_replaced"]) == 1
+
+
+@pytest.mark.parametrize("answer", [(403, None), (200, {"number": 41, "state": "open"}), (200, None), (429, None),
+                                    (200, {"number": 42, "state": "closed"}), (503, None), "timeout", "overlap"])
+def test_a_close_is_done_only_when_the_answer_shows_that_pull_request_closed(armed, answer):
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    first, delivered = _ready(armed)
+    rework, continued = _approved(kb, repo, "rework")
+    _raw(db, "UPDATE tasks SET base_commit = ? WHERE id = ?", delivered, rework)
+    _published_as(db, gh, rework, continued, 42)
+    if answer == "overlap":
+        gh["hooks"]["PATCH"] = lambda: _tick(kb)
+    else:
+        gh["close"] = answer
+
+    _tick(kb)
+    _tick(kb)
+
+    assert [write[1] for write in gh["writes"] if write[0] == "PATCH"] == [f"/repos/{REPO}/pulls/41"]
+    outcome = [(kind, p.get("status")) for kind, p in _events(kb, first) if kind.startswith(("delivery_replaced",
+                                                                                            "delivery_close"))]
+    assert outcome[-1:] == ([("delivery_replaced", 200)] if answer == "overlap" else [
+        ("delivery_close_refused", None if answer == "timeout" else answer[0])])
+    assert _state(kb, delivered) == ("replaced" if answer == "overlap" else "close_refused")
 
 
 def test_the_review_card_title_carries_the_source_title_and_no_raw_identifier(armed):

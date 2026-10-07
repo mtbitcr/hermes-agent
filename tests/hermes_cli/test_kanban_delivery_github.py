@@ -520,10 +520,7 @@ def test_path_outside_the_allowlist_is_refused_before_any_socket(monkeypatch, tm
         for method, path in outside:
             with pytest.raises(mod.GitHubTransportError) as refused:
                 transport.request(method, path)
-            # /graphql is listed for its one fixed document only, so a bare call fails a later check.
-            assert refused.value.reason in {"endpoint_not_allowed", "query_not_allowed"} or (
-                path == "/graphql" and refused.value.reason in {"step_not_permitted", "body_not_allowed"}), (
-                step, method, path)
+            assert refused.value.reason in {"endpoint_not_allowed", "query_not_allowed"}, (step, method, path)
         with pytest.raises(mod.GitHubTransportError) as refused:
             transport.request("GET", f"/repos/{REPO}/pulls", query={"per_page": "100", "q": "is:open"})
         assert refused.value.reason == "query_not_allowed"

@@ -88,7 +88,8 @@ def world(board, monkeypatch):
 
 
 def _published(kb, repo, gh, tid, head, board=None):
-    """What card 1's publish stores for H: the ledger on the row and delivery_bound on the source card."""
+    """What card 1's publish stores for H: the ledger on the row, delivery_bound and its delivery_published
+    record of the repository on the source card."""
     conn = kb.connect(board=board)
     try:
         with kb.write_txn(conn):
@@ -98,6 +99,8 @@ def _published(kb, repo, gh, tid, head, board=None):
                 (head, "delivery/" + tid, tid, head))
             kb._append_event(conn, tid, "delivery_bound", {
                 "source_task_id": tid, "head": head, "base_commit": _git(repo, "rev-parse", "main")})
+            kb._append_event(conn, tid, "delivery_published", {"repository": REPO, "branch": "delivery/" + tid,
+                                                              "pull_request_number": 41, "head": head, "state": "created"})
     finally:
         conn.close()
     gh["head"] = head

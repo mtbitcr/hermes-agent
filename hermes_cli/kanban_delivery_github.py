@@ -82,6 +82,7 @@ _TOKEN_ENDPOINT = Endpoint("POST", "/app/installations/{installation}/access_tok
 
 # GitHub's REST interface has no call that arms auto-merge, so this fixed mutation is the one GraphQL
 # document there is: a merge commit, only while the pull request still holds the head the caller names.
+# Only GitHubTransport.arm_auto_merge sends it, with variables it builds: request() never reaches it.
 AUTO_MERGE_MUTATION = (
     "mutation($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) { enablePullRequestAutoMerge(input: "
     "{pullRequestId: $pullRequestId, expectedHeadOid: $expectedHeadOid, mergeMethod: MERGE}) { clientMutationId } }")
@@ -132,13 +133,13 @@ REST_ALLOWLIST = (
     _TOKEN_ENDPOINT,
 )
 
-# Fixed fields only: ids, SHAs, refs, states and counts. Titles, bodies, messages, URLs and users
-# never pass, and neither do response headers.
+# Fixed fields only: ids, SHAs, refs, states and counts, and of a user only its login (a review's
+# author). Titles, bodies, messages and URLs never pass, and neither do response headers.
 _FIELDS = frozenset({
     "id", "number", "name", "state", "status", "conclusion", "merged", "mergeable", "mergeable_state",
     "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app", "object",
     "total_count", "check_runs", "workflow_runs", "jobs", "steps", "run_id", "run_attempt",
-    "node_id", "data", "errors", "enablePullRequestAutoMerge", "clientMutationId",
+    "node_id", "data", "errors", "enablePullRequestAutoMerge", "clientMutationId", "user", "login",
 })
 _MAX_TEXT = 256
 
@@ -296,8 +297,7 @@ class GitHubTransport:
         # profile HERMES_HOME a worker runs with.
         self._key_path = Path(key_path) if key_path is not None else (
             get_default_hermes_root() / "secrets" / "github-app" / "raphael-agent-factory.pem")
-        self._routes = [(e, _path_pattern(e.template, repository))
-                        for e in REST_ALLOWLIST + GRAPHQL_ALLOWLIST if e.permission]
+        self._routes = [(e, _path_pattern(e.template, repository)) for e in REST_ALLOWLIST if e.permission]
         self._token: str | None = None
 
     def request(self, method: str, path: str, *, query=None, body=None) -> dict:
@@ -317,6 +317,25 @@ class GitHubTransport:
             raise GitHubTransportError("body_not_allowed")
         target = f"{path}?{urlencode(values)}" if values else path
         status, value = _exchange(method, target, f"Bearer {self._installation_token()}", body)
+        return {"status": status, "data": None if value is None else self._project(value)}
+
+    def arm_auto_merge(self, number: int, head: str) -> dict:
+        """The one GraphQL call: arm auto-merge, a merge commit, on pull request ``number`` of this
+        repository at ``head``, both from its delivery record. The document and its variables are
+        built here, never passed in; the pull request is read first and must be open at ``head``,
+        else no mutation is sent. Returns {"status", "data"} as :meth:`request` does."""
+        endpoint = GRAPHQL_ALLOWLIST[0]
+        if type(number) is not int or number < 1 or not _is_sha(head):
+            raise GitHubTransportError("bad_arm_target")
+        if not _holds(self._permissions, endpoint.permission):
+            raise GitHubTransportError("step_not_permitted")
+        pull = self.request("GET", f"/repos/{self.repository}/pulls/{number}")
+        data = pull["data"] if pull["status"] == 200 and isinstance(pull["data"], dict) else {}
+        held = data["head"].get("sha") if isinstance(data.get("head"), dict) else None
+        body = {"query": AUTO_MERGE_MUTATION, "variables": {"pullRequestId": data.get("node_id"), "expectedHeadOid": head}}
+        if (data.get("number"), data.get("state"), held) != (number, "open", head) or not endpoint.body(body):
+            raise GitHubTransportError("pull_request_not_at_head")
+        status, value = _exchange(endpoint.method, endpoint.template, f"Bearer {self._installation_token()}", body)
         return {"status": status, "data": None if value is None else self._project(value)}
 
     def branch_head(self, branch: str) -> str | None:
