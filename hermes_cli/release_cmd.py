@@ -110,7 +110,16 @@ def prepare() -> int:
     if not accepted:
         return _refuse("no batch is accepted, so there is nothing to release")
     batch = accepted[0]
-    new = batch["members"][-1]["merge_commit"]
+    # What the guards read from the record is decoded before the adapters are built or anything
+    # is printed: the batch's changes, NEW, the last one's merge commit, and PREV, the NEW of the
+    # last released batch once one was released (S-B).
+    try:
+        merges = _merges(batch)
+        if any(other["state"] == "released" for other in batches):
+            live = _text(live, "the last released batch has no NEW")
+    except _UnreadableRecord as error:
+        return _refuse(str(error))
+    new = merges[-1].commit
     # The guards only read; the actions are built from the same settings, as the release will.
     reader, _actions = _adapters(root, settings, new)
     try:
@@ -121,12 +130,6 @@ def prepare() -> int:
             f" ({type(error).__name__}: {error})"
         )
     pins = Pins(new=new, prev=prev)
-    merges = [
-        RecordedMerge(
-            m["merge_commit"], m["reviewed_base"], m["reviewed_head"], m["reviewed_tree"]
-        )
-        for m in batch["members"]
-    ]
 
     print(f"Batch {batch['batch_id']}: PREV {prev}, NEW {new}")
     failed = 0
@@ -149,22 +152,28 @@ def prepare() -> int:
 
 def status() -> int:
     """Print the waiting batch and the last outcome in plain words; write nothing."""
+    # What is shown is decoded from the record before anything is printed.
     try:
         batches, _live, finished = _record()
+        waiting = next((batch for batch in batches if batch["state"] in _WAITING), None)
+        changes = [] if waiting is None else [_change(waiting, m) for m in waiting["members"]]
+        last = next((batch for batch in batches if batch["batch_id"] == finished), None)
+        if finished is not None and (last is None or last["outcome"] not in _OUTCOMES):
+            raise _unreadable(
+                f"batch {finished}, whose release finished last, has no known outcome"
+            )
     except _UnreadableRecord as error:
         return _refuse(str(error))
-    waiting = next((batch for batch in batches if batch["state"] in _WAITING), None)
     if waiting is None:
         print("No batch is waiting for a decision.")
     else:
-        count = len(waiting["members"])
+        count = len(changes)
         print(
             f"Waiting batch {waiting['batch_id']}, {_WAITING[waiting['state']]}: "
             f"{count} change{'s' * (count != 1)}"
         )
-        for member in waiting["members"]:
-            print(f"  - {member['title'] or member['card_id']} ({member['pr_url']})")
-    last = next((batch for batch in batches if batch["batch_id"] == finished), None)
+        for change in changes:
+            print(f"  - {change}")
     if last is None:
         print("Last outcome: no release has finished yet.")
     else:
@@ -221,14 +230,14 @@ def _record() -> tuple[list[dict[str, Any]], str | None, int | None]:
 
     The record has two shapes. When none of its four names exists, the database file and its
     -wal, -shm and -journal files, it does not exist yet and reads as empty. When the database
-    file is a regular file, not a link, it and its -wal when one exists are copied into a private
-    temporary directory; the copy is opened there read-only, read and removed. SQLite never opens
-    the live files, so it cannot create, change or delete their side files, and what was
-    committed to the -wal is still read. Any other state, an error while the names are looked at
-    and a copy SQLite cannot read raise _UnreadableRecord.
+    file is a regular file, not a link, it and its -wal, when that name exists, are copied into a
+    private temporary directory; the copy is opened there read-only, read and removed. SQLite
+    never opens the live files, so it cannot create, change or delete their side files, and what
+    was committed to the -wal is still read. Any other state, an error while the names are looked
+    at, a -wal that exists but cannot be copied, a copy SQLite cannot read and a batch the
+    record's own snapshot cannot decode raise _UnreadableRecord.
     """
     path = release_ledger.ledger_path()
-    unreadable = f"the release record {path} could not be read"
     try:
         # Each name is looked at with lstat, as os.path.lexists does, so a broken link exists.
         # lexists takes every error for a missing name, a folder that cannot be searched too;
@@ -241,14 +250,16 @@ def _record() -> tuple[list[dict[str, Any]], str | None, int | None]:
             return [], None, None
         if "" not in found:
             beside = ", ".join(f"{path.name}{side}" for side in found)
-            raise _UnreadableRecord(f"{unreadable} (there is no database file beside {beside})")
+            raise _unreadable(f"there is no database file beside {beside}")
         if not stat.S_ISREG(found[""]):
             link = "a symbolic link, " if stat.S_ISLNK(found[""]) else ""
-            raise _UnreadableRecord(f"{unreadable} (it is {link}not a regular file)")
+            raise _unreadable(f"it is {link}not a regular file")
         with tempfile.TemporaryDirectory(prefix="hermes-release-record-") as private:
             copy = Path(private) / path.name
             shutil.copyfile(path, copy)
-            with contextlib.suppress(FileNotFoundError):
+            # A -wal seen above may hold committed changes, so failing to copy it refuses, also
+            # when it has gone since or is a broken link. Only a -wal not seen is skipped.
+            if "-wal" in found:
                 shutil.copyfile(f"{path}-wal", f"{copy}-wal")
             conn = sqlite3.connect(f"{copy.as_uri()}?mode=ro", uri=True, isolation_level=None)
             conn.row_factory = sqlite3.Row
@@ -257,11 +268,61 @@ def _record() -> tuple[list[dict[str, Any]], str | None, int | None]:
                 live = conn.execute(_LAST_RELEASED_SQL).fetchone()
                 finished = conn.execute(_LAST_FINISHED_SQL).fetchone()
                 return (
-                    [release_ledger._snapshot(conn, row["id"]) for row in ids],
+                    [_batch(conn, row["id"]) for row in ids],
                     None if live is None else live["new"],
                     None if finished is None else finished["batch_id"],
                 )
             finally:
                 conn.close()
     except (OSError, sqlite3.Error) as error:
-        raise _UnreadableRecord(f"{unreadable} ({type(error).__name__}: {error})") from error
+        raise _unreadable(f"{type(error).__name__}: {error}") from error
+
+
+def _batch(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
+    """A batch in the copy as the record's own snapshot reads it. One it cannot decode, a field
+    missing or a commit that is not ASCII, cannot be read."""
+    try:
+        return release_ledger._snapshot(conn, batch_id)
+    except (LookupError, ValueError) as error:
+        raise _unreadable(
+            f"batch {batch_id} could not be decoded: {type(error).__name__}: {error}"
+        ) from error
+
+
+def _merges(batch: dict[str, Any]) -> list[RecordedMerge]:
+    """The accepted batch's changes in merge order, as the guards read them. A batch without
+    changes, or a change without one of its four commits, cannot be read."""
+    if not batch["members"]:
+        raise _unreadable(f"accepted batch {batch['batch_id']} has no changes")
+    missing = f"a change in batch {batch['batch_id']} has no"
+    names = ("merge_commit", "reviewed_base", "reviewed_head", "reviewed_tree")
+    return [
+        RecordedMerge(*(_text(member.get(name), f"{missing} {name}") for name in names))
+        for member in batch["members"]
+    ]
+
+
+def _change(batch: dict[str, Any], member: dict[str, Any]) -> str:
+    """A waiting change as status shows it: its title, or its card id when the title is empty,
+    and its pull request. A change without one of those it shows cannot be read; a card id that
+    is not shown is not needed."""
+    missing = f"a change in batch {batch['batch_id']} has no"
+    title = _text(member.get("title"), f"{missing} title", empty=True)
+    name = title or _text(member.get("card_id"), f"{missing} card_id")
+    pr_url = _text(member.get("pr_url"), f"{missing} pr_url")
+    return f"{name} ({pr_url})"
+
+
+def _text(value: Any, reason: str, *, empty: bool = False) -> str:
+    """value when it is text, and not empty unless empty is allowed; otherwise the record cannot
+    be read, for reason."""
+    if not isinstance(value, str) or not (value or empty):
+        raise _unreadable(reason)
+    return value
+
+
+def _unreadable(reason: str) -> _UnreadableRecord:
+    """The plain refusal of a release record that cannot be read, with its reason."""
+    return _UnreadableRecord(
+        f"the release record {release_ledger.ledger_path()} could not be read ({reason})"
+    )

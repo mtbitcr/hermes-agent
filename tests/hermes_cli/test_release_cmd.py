@@ -888,3 +888,194 @@ def test_a_record_in_a_folder_that_cannot_be_searched_fails_closed(monkeypatch, 
             WROTE_NOTHING,
         ]
         assert _live_files(path) == before
+
+
+@pytest.mark.parametrize("command", ["prepare", "status"])
+@pytest.mark.parametrize("wal", ["absent", "ordinary", "broken-link"])
+def test_a_wal_that_exists_but_cannot_be_copied_fails_closed(root, tmp_path, command, wal):
+    # Through the CLI in a child process. The record is in WAL mode: while its writer is open, the
+    # writer's changes are only in the -wal, and once it has closed there is no -wal.
+    path = ledger.ledger_path()
+    with _wal_writer(tmp_path, root) as writer:
+        if wal != "ordinary":
+            writer.stdin.close()
+            writer.wait(timeout=30)
+        if wal == "broken-link":
+            Path(f"{path}-wal").symlink_to(path.with_name("moved.db-wal"))  # nothing is there
+        before = _live_files(path)
+
+        done = _cli(tmp_path, root, "release", command)
+
+        assert _live_files(path) == before
+    tail = {
+        "prepare": [
+            f"Batch 1: PREV {PREV}, NEW {NEW}",
+            *(f"{guard} passed: {rule}" for guard, rule, _check in GUARDS),
+            f"All {len(GUARDS)} release guards passed. {WROTE_NOTHING}",
+        ],
+        "status": [
+            "Waiting batch 2, waiting for the owner's decision: 1 change",
+            f"  - t_{LATER[:8]} (https://github.com/mtbitcr/hermes-agent/pull/2)",
+            "Last outcome: no release has finished yet.",
+        ],
+    }[command]
+    if wal == "broken-link":
+        # A -wal that was seen may hold committed changes, so failing to copy it refuses.
+        tail = [
+            f"Refused: the release record {path} could not be read (FileNotFoundError: [Errno 2]"
+            f" No such file or directory: '{path}-wal').",
+            WROTE_NOTHING,
+        ]
+    assert done.returncode == (1 if wal == "broken-link" else 0), done.stderr
+    assert "Traceback" not in done.stderr
+    assert done.stdout.splitlines()[-len(tail):] == tail
+
+
+# Damage to a record that is otherwise well formed, and the plain reason each command that reads
+# the damaged part refuses with; a command that does not read it runs as usual. The record holds
+# a released batch, an accepted one and a waiting one (see the test below).
+MALFORMED = [
+    # Both commands read every batch as the record's own snapshot decodes it.
+    pytest.param(
+        "ALTER TABLE release_batches RENAME COLUMN version TO damaged_version",
+        dict.fromkeys(
+            ("prepare", "status"),
+            "batch {released} could not be decoded: IndexError: No item with that key",
+        ),
+        id="missing-batch-version",
+    ),
+    *(
+        pytest.param(
+            f"ALTER TABLE release_members RENAME COLUMN {name} TO damaged_{name}",
+            dict.fromkeys(
+                ("prepare", "status"),
+                f"batch {{released}} could not be decoded: KeyError: '{name}'",
+            ),
+            id=f"missing-member-{name}",
+        )
+        for name in ("tier_recorded", "merge_commit")
+    ),
+    pytest.param(
+        "UPDATE release_members SET merge_commit = char(233) || substr(merge_commit, 2)"
+        " WHERE batch_id = (SELECT id FROM release_batches WHERE state = 'open')",
+        dict.fromkeys(
+            ("prepare", "status"),
+            "batch {waiting} could not be decoded: UnicodeEncodeError: 'ascii' codec can't encode"
+            " character '\\xe9' in position 0: ordinal not in range(128)",
+        ),
+        id="merge-commit-not-ascii",
+    ),
+    # prepare reads NEW, PREV and the accepted batch's changes as the guards read them.
+    pytest.param(
+        "DELETE FROM release_members"
+        " WHERE batch_id = (SELECT id FROM release_batches WHERE state = 'accepted')",
+        {"prepare": "accepted batch {accepted} has no changes"},
+        id="accepted-batch-without-changes",
+    ),
+    pytest.param(
+        "UPDATE release_members SET merge_commit = ''"
+        " WHERE batch_id = (SELECT id FROM release_batches WHERE state = 'accepted')",
+        {"prepare": "a change in batch {accepted} has no merge_commit"},
+        id="empty-new",
+    ),
+    *(
+        pytest.param(
+            f"ALTER TABLE release_members RENAME COLUMN {name} TO damaged_{name}",
+            {"prepare": f"a change in batch {{accepted}} has no {name}"},
+            id=f"missing-member-{name}",
+        )
+        for name in ("reviewed_base", "reviewed_head", "reviewed_tree")
+    ),
+    pytest.param(
+        "UPDATE release_batches SET new = NULL WHERE state = 'released'",
+        {"prepare": "the last released batch has no NEW"},
+        id="released-batch-without-new",
+    ),
+    # status reads the waiting batch's changes as it shows them, and the last outcome. The waiting
+    # change has no title, so its card id is shown.
+    *(
+        pytest.param(
+            f"ALTER TABLE release_members RENAME COLUMN {name} TO damaged_{name}",
+            {"status": f"a change in batch {{waiting}} has no {name}"},
+            id=f"missing-member-{name}",
+        )
+        for name in ("title", "card_id", "pr_url")
+    ),
+    pytest.param(
+        "UPDATE release_batches SET outcome = NULL WHERE state = 'released'",
+        {"status": "batch {released}, whose release finished last, has no known outcome"},
+        id="last-outcome-missing",
+    ),
+    pytest.param(
+        "INSERT INTO release_events (batch_id, kind, payload, created_at)"
+        " VALUES (99, 'release_finished', '{}', 0)",
+        {"status": "batch 99, whose release finished last, has no known outcome"},
+        id="last-finished-batch-missing",
+    ),
+]
+
+
+@pytest.mark.parametrize(("damage", "refusals"), MALFORMED)
+def test_a_malformed_record_refuses_in_plain_words(root, monkeypatch, capsys, damage, refusals):
+    path = ledger.ledger_path()
+    conn = ledger.connect()
+    released = _accept(conn, _merge(conn, PREV))
+    _release(conn, released, prev=_commit("older"), outcome="released")  # its NEW is PREV now
+    accepted = _accept(conn, _merge(conn, NEW))
+    waiting = _merge(conn, LATER, 2)
+    conn.close()
+    with contextlib.closing(sqlite3.connect(path)) as damaged:
+        damaged.executescript(damage)
+    before = _live_files(path)
+    batches = {
+        "released": released["batch_id"],
+        "accepted": accepted["batch_id"],
+        "waiting": waiting["batch_id"],
+    }
+    usual = {
+        "prepare": [
+            f"Batch {accepted['batch_id']}: PREV {PREV}, NEW {NEW}",
+            *(f"{guard} passed: {rule}" for guard, rule, _check in GUARDS),
+            f"All {len(GUARDS)} release guards passed. {WROTE_NOTHING}",
+        ],
+        "status": [
+            f"Waiting batch {waiting['batch_id']}, waiting for the owner's decision: 1 change",
+            f"  - t_{LATER[:8]} (https://github.com/mtbitcr/hermes-agent/pull/2)",
+            f"Last outcome: batch {released['batch_id']} was released.",
+        ],
+    }
+
+    for command in ("prepare", "status"):
+        host = FakeHost()
+        reason = refusals.get(command)
+        assert getattr(_command(monkeypatch, host), command)() == (0 if reason is None else 1)
+        out = capsys.readouterr().out.splitlines()
+        if reason is None:  # it does not read the damaged part
+            assert out == usual[command]
+        else:  # the plain refusal alone: no other line came first and no adapter was built
+            assert out == [
+                f"Refused: the release record {path} could not be read"
+                f" ({reason.format(**batches)}).",
+                WROTE_NOTHING,
+            ]
+            assert host.built == []
+    assert _live_files(path) == before
+
+
+def test_status_needs_a_card_id_only_for_a_change_without_a_title(root, monkeypatch, capsys):
+    # A change's card id is shown only when it has no title: while every waiting change has one,
+    # status asks for no card id.
+    path = ledger.ledger_path()
+    conn = ledger.connect()
+    waiting = _merge(conn, LATER, 2, "Later changes")
+    conn.close()
+    with contextlib.closing(sqlite3.connect(path)) as damaged:
+        damaged.execute("ALTER TABLE release_members RENAME COLUMN card_id TO damaged_card_id")
+
+    assert _command(monkeypatch).status() == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        f"Waiting batch {waiting['batch_id']}, waiting for the owner's decision: 1 change",
+        "  - Later changes (https://github.com/mtbitcr/hermes-agent/pull/2)",
+        "Last outcome: no release has finished yet.",
+    ]
