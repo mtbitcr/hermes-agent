@@ -1,20 +1,23 @@
-"""``hermes release`` subcommand parser: ``prepare`` and ``status``."""
+"""``hermes release`` subcommand parser: ``prepare``, ``status`` and ``run``."""
 
 from __future__ import annotations
 
 
 def build_release_parser(subparsers) -> None:
-    """Attach the ``release`` subcommand, with ``prepare`` and ``status``, to ``subparsers``."""
+    """Attach the ``release`` subcommand, with ``prepare``, ``status`` and ``run``, to
+    ``subparsers``."""
     release_parser = subparsers.add_parser(
-        "release", help="Check a release before it runs: prepare, status",
-        description="Check the accepted release batch before it runs. prepare works out PREV "
-            "and NEW, asks the host every release guard and prints each result; it writes "
-            "nothing. status shows the waiting batch and the last outcome. Run it from the "
-            "root Hermes home.")
+        "release", help="Check a release before it runs, and run it: prepare, status, run",
+        description="Check the accepted release batch before it runs, and run it. prepare works "
+            "out PREV and NEW, asks the host every release guard and prints each result; it "
+            "writes nothing. status shows the waiting batch and the last outcome. run releases "
+            "the accepted batch between a pause and a resume. Run it from the root Hermes home.")
     release_subparsers = release_parser.add_subparsers(dest="release_command")
     release_subparsers.add_parser(
         "prepare", help="Run every release guard for the accepted batch; writes nothing")
     release_subparsers.add_parser("status", help="Show the waiting batch and the last outcome")
+    release_subparsers.add_parser(
+        "run", help="Release the accepted batch between a pause and a resume")
 
     def _dispatch_release(args):  # noqa: ANN001
         if getattr(args, "release_command", None) is None:

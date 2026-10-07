@@ -1,23 +1,29 @@
-"""``hermes release``: check a release before it runs (release card 4).
+"""``hermes release``: check a release before it runs (release card 4), and run it (card 5).
 
 ``prepare`` works out PREV and NEW (S-B), builds both live adapters from the ``release`` settings
 (S-E) and asks the host every merged guard, printing each result in plain words. It writes
 nothing to the release state: config.yaml is read as it is on disk, the release record is opened
 read-only, and the guards only read. ``status`` prints the waiting batch and the last
-outcome. The release itself, under the pause (S-A) and in its own unit (S-F), belongs to a later
-card.
+outcome. ``run`` releases the accepted batch after the same preflight, under the pause (S-A), in
+its own unit (S-F), whose stop ends a release that has not cut over yet.
+
+Design rule (K6), as in the runner: everything ``run`` needs is imported when this module loads,
+so nothing is imported once the units stop and the checkout moves under the running process.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import sqlite3
 import stat
+import time
 from pathlib import Path
 from typing import Any
 
-from hermes_cli import release_ledger
+from agent import estop
+from hermes_cli import release_guards, release_ledger
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     _ENV_REF_RE,
@@ -30,7 +36,7 @@ from hermes_cli.config import (
 from hermes_cli.release_guards import GATEWAY_UNIT, GUARDS, SERVE_UNIT, Pins, RecordedMerge
 from hermes_cli.release_host import LiveHostReader
 from hermes_cli.release_host_actions import ReleaseHostActions
-from hermes_cli.release_runner import SANDBOX_TUNNEL_UNIT
+from hermes_cli.release_runner import SANDBOX_TUNNEL_UNIT, run_release
 from hermes_constants import get_default_hermes_root, get_hermes_home
 
 # The host's unit names and readback addresses are not in the repository, so an empty one refuses
@@ -70,7 +76,9 @@ class _UnreadableRecord(Exception):
 
 
 def cmd_release(args) -> int:
-    """``hermes release prepare`` or ``hermes release status``."""
+    """``hermes release prepare``, ``hermes release status`` or ``hermes release run``."""
+    if args.release_command == "run":
+        return run()
     return prepare() if args.release_command == "prepare" else status()
 
 
@@ -79,6 +87,22 @@ def prepare() -> int:
 
     Returns 0 when every guard passed, 1 when one failed or the release was refused before them.
     """
+    inputs = _inputs()
+    if isinstance(inputs, int):  # refused before the guards
+        return inputs
+    batch, merges, pins, reader, _actions, _settings = inputs
+    failed = _preflight(batch, merges, pins, reader)
+    if failed:
+        return _refuse(f"{len(failed)} of {len(GUARDS)} release guards failed")
+    print(f"All {len(GUARDS)} release guards passed. Nothing in the release state was written.")
+    return 0
+
+
+def _inputs() -> int | tuple[
+    dict[str, Any], list[RecordedMerge], Pins, LiveHostReader, ReleaseHostActions, dict[str, Any]
+]:
+    """What prepare and run work on: the accepted batch, its changes, both versions, the live
+    reader and actions, and the release settings; or, once a refusal is printed, its exit code."""
     root, home = get_default_hermes_root(), get_hermes_home()
     if home.resolve() != root.resolve():  # S-A
         return _refuse(f"a release runs only from the root Hermes home {root}, not from {home}")
@@ -115,7 +139,7 @@ def prepare() -> int:
         return _refuse(str(error))
     new = merges[-1].commit
     # The guards only read; the actions are built from the same settings, as the release will.
-    reader, _actions = _adapters(root, settings, new)
+    reader, actions = _adapters(root, settings, new)
     try:
         prev = live or reader.checkout_head()
     except Exception as error:
@@ -124,9 +148,16 @@ def prepare() -> int:
             f" ({type(error).__name__}: {error})"
         )
     pins = Pins(new=new, prev=prev)
+    return batch, merges, pins, reader, actions, settings
 
-    print(f"Batch {batch['batch_id']}: PREV {prev}, NEW {new}")
-    failed = 0
+
+def _preflight(
+    batch: dict[str, Any], merges: list[RecordedMerge], pins: Pins, reader: LiveHostReader
+) -> list[str]:
+    """Card 4's preflight: print both versions, then ask the host every guard and print each
+    result in plain words. Returns the guards that failed."""
+    print(f"Batch {batch['batch_id']}: PREV {pins.prev}, NEW {pins.new}")
+    failed = []
     for guard, rule, check in GUARDS:
         # Every guard is asked, as in release_guards.prepare. A read that raises fails its guard
         # and keeps its cause, as a readback does in the runner.
@@ -137,11 +168,113 @@ def prepare() -> int:
         print(f"{guard} {'passed' if ok else 'failed'}: {rule}{cause}")
         if guard == "G9" and not ok and not cause:
             print(f"    {_ROLLED_BACK}")
-        failed += not ok
-    if failed:
-        return _refuse(f"{failed} of {len(GUARDS)} release guards failed")
-    print(f"All {len(GUARDS)} release guards passed. Nothing in the release state was written.")
-    return 0
+        if not ok:
+            failed.append(guard)
+    return failed
+
+
+def run() -> int:
+    """Release the accepted batch between a pause and a resume, in card 5's order.
+
+    Mark the batch releasing with both versions, fetch NEW and save the named configuration
+    snapshot, and run prepare's preflight. A pause already in place, or a failed guard other than
+    G10, refuses the release and pauses nothing. Otherwise pause with the release reason (S-A),
+    wait until the merged G10 holds, and run the merged runner for the batch's tier: tier 2 when
+    a change has tier 2 or no recorded tier, forward only otherwise. The runner asks every guard
+    again before it stops anything. Then record the outcome and resume, except after a failed
+    outcome: the platform stays paused for a person.
+
+    Returns 0 when the batch was released, 1 otherwise.
+    """
+    inputs = _inputs()
+    if isinstance(inputs, int):  # refused before anything was written
+        return inputs
+    batch, merges, pins, reader, actions, settings = inputs
+    batch_id, reason = batch["batch_id"], f"release {batch['batch_id']}"
+    try:
+        conn = release_ledger.connect()
+    except (OSError, sqlite3.Error) as error:
+        return _refuse(f"the release record could not be opened ({type(error).__name__}: {error})")
+    with contextlib.closing(conn):
+        try:
+            release_ledger.begin_release(conn, batch_id, prev=pins.prev, new=pins.new)
+        except (ValueError, sqlite3.Error) as error:
+            return _refuse(f"batch {batch_id} could not begin its release ({error})")
+        refusals, result = [], None
+        previous = signal.signal(signal.SIGTERM, _stop)
+        try:
+            actions.fetch(pins.new)
+            actions.save_config_snapshot(pins.new)
+            failed = [guard for guard in _preflight(batch, merges, pins, reader) if guard != "G10"]
+            if estop.is_engaged():
+                refusals.append("the platform is already paused")
+            if failed:
+                refusals.append(_guards_failed(failed))
+            if not refusals:
+                estop.engage(reason)
+                _drain(reader, pins, merges, settings["drain_poll_seconds"])
+                tier = max(m["tier"] if m["tier_recorded"] else 2 for m in batch["members"])
+                result = run_release(_Host(reader, actions), pins, tier, merges)
+        except _Stopped as stop:
+            refusals.append(str(stop))
+        except Exception as error:  # an action, or a read in the drain or the fresh guards (F5)
+            refusals.append(f"a step before the cutover failed ({type(error).__name__}: {error})")
+        finally:
+            signal.signal(signal.SIGTERM, previous or signal.SIG_DFL)
+        if result is not None and result.outcome == "refused":
+            fresh = [check.guard for check in result.guards if not check.ok]
+            refusals.append(f"{_guards_failed(fresh)} when asked again before the stop")
+        outcome = "refused" if result is None else result.outcome
+        for refusal in refusals:
+            print(f"Refused: {refusal}.")
+        if result is not None and result.error:
+            print(f"The release failed after the cutover ({result.error}).")
+            for error in result.restore_errors:
+                print(f"    Going back, a step failed too: {error}")
+        release_ledger.finish_release(conn, batch_id, outcome=outcome)
+    # S-A: lift only the release's own pause; an owner's pause, set before or during the release,
+    # stays. After a failed outcome the release's own pause stays too.
+    state = estop.get_state()
+    lift = outcome != "failed" and state is not None and state["reason"] == reason
+    if lift:
+        estop.disengage()
+    print(f"Batch {batch_id} {_OUTCOMES[outcome]}.")
+    if state is not None and not lift:
+        print(f"The platform stays paused ({state['reason'] or 'no reason given'}).")
+    return 0 if outcome == "released" else 1
+
+
+def _guards_failed(guards: list[str]) -> str:
+    return f"release guard{'s' * (len(guards) > 1)} {', '.join(guards)} failed"
+
+
+def _drain(
+    reader: LiveHostReader, pins: Pins, merges: list[RecordedMerge], seconds: float
+) -> None:
+    """Wait until the merged G10 holds, asking it every ``seconds``. The wait has no time limit
+    of its own (decision B): stopping the release unit ends it."""
+    [check] = [check for guard, _rule, check in release_guards.GUARDS if guard == "G10"]
+    while not check(reader, pins, merges):
+        time.sleep(seconds)
+
+
+class _Host:
+    """The live reader and actions as the one release host the runner asks. A name the actions
+    have is theirs, so ``checkout`` is the move; every other name is the reader's."""
+
+    def __init__(self, reader: LiveHostReader, actions: ReleaseHostActions) -> None:
+        self._reader, self._actions = reader, actions
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._actions if hasattr(self._actions, name) else self._reader, name)
+
+
+class _Stopped(BaseException):
+    """The release unit was stopped (S-F). Like an interrupt, no ``except Exception`` takes it."""
+
+
+def _stop(signum: int, frame: Any) -> None:
+    raise _Stopped("stopped before cutover")
 
 
 def status() -> int:
