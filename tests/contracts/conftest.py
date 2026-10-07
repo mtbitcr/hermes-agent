@@ -311,11 +311,13 @@ CLOSED_VOCABULARIES = (
     })),
 
     # workspace_machine (the next card): the board and run receipt routes.
-    # kanban_db.py:29419-29422, read at plugin_api.py:3962
+    # kanban_db.py:29419-29422, read at plugin_api.py:3964
     ("workspace_machine", ("review_state",), _REVIEW_STATES),
-    # kanban_db.py:28848-28850, read at plugin_api.py:3966
+    # kanban_db.py:28848-28850, read at plugin_api.py:3968
     ("workspace_machine", ("stopped_work",), _KERNEL_STOPPED_WORK),
-    # owner_workspace.py:2977-3000, built at plugin_api.py:4213 with no
+    # kanban_risk_tier.py RISK_TIERS; null where no tier is recorded
+    ("workspace_machine", ("risk_tier",), frozenset({0, 1, 2, None})),
+    # owner_workspace.py:2977-3000, built at plugin_api.py:4217 with no
     # provider or owner wait
     ("workspace_machine", ("receipt", "outcome"),
      frozenset({"running", "completed", "attention", "unknown"})),

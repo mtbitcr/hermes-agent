@@ -3456,12 +3456,14 @@ def read_project_snapshot(
         if task_ids:
             placeholders = ",".join("?" for _ in task_ids)
             for row in conn.execute(
-                f"SELECT task_id, MAX(created_at) AS latest, MAX(id) AS revision "
+                f"SELECT task_id, MAX(created_at) AS latest, MAX(id) AS revision, "
+                f"MAX(kind = 'risk_tier_raised') AS raised "
                 f"FROM task_events WHERE task_id IN ({placeholders}) GROUP BY task_id",
                 task_ids,
             ):
                 event_state[str(row["task_id"])] = {
                     "latest": int(row["latest"]), "revision": int(row["revision"]),
+                    "raised": int(row["raised"]),
                 }
 
         parent_map = {task_id: [] for task_id in task_ids}
@@ -3520,6 +3522,8 @@ def read_project_snapshot(
                 "stopped_work": stopped_work.get(
                     task.id, kanban_db.STOPPED_WORK_NONE
                 ),
+                "risk_tier": task.risk_tier,
+                "risk_tier_raised": bool(state and state["raised"]),
                 "parent_ids": parent_map[task.id],
                 "child_ids": child_map[task.id],
             })

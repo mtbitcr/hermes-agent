@@ -245,7 +245,7 @@ def test_exact_workspace_projection_is_current_scoped_and_read_only(workspace_su
     assert all(
         set(task) == {
             "id", "title", "assignee_name", "responsibility", "updated_at", "event_revision",
-            "review_state", "stopped_work", "parent_ids", "child_ids",
+            "review_state", "stopped_work", "parent_ids", "child_ids", "risk_tier", "risk_tier_raised",
         }
         for task in task_items
     )

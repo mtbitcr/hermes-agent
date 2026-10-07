@@ -35,13 +35,15 @@
             {
               "assignee_name": "default",
               "child_ids": [],
-              "event_revision": 22,
+              "event_revision": 23,
               "id": "t_d5a64436",
               "parent_ids": [
                 "t_8e3861d2"
               ],
               "responsibility": null,
               "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
               "stopped_work": "none",
               "title": "Rework: Review the changes outline",
               "updated_at": "2026-09-21T14:13:20Z"
@@ -54,13 +56,15 @@
             {
               "assignee_name": "default",
               "child_ids": [],
-              "event_revision": 27,
+              "event_revision": 28,
               "id": "t_3c850dcf",
               "parent_ids": [
                 "t_348578f3"
               ],
               "responsibility": null,
               "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
               "stopped_work": "none",
               "title": "Book the workshop room",
               "updated_at": "2026-09-21T14:13:20Z"
@@ -73,11 +77,13 @@
             {
               "assignee_name": "default",
               "child_ids": [],
-              "event_revision": 29,
+              "event_revision": 30,
               "id": "t_3a414ff6",
               "parent_ids": [],
               "responsibility": null,
               "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
               "stopped_work": "none",
               "title": "Send the invitations",
               "updated_at": "2026-09-21T14:13:20Z"
@@ -90,11 +96,13 @@
             {
               "assignee_name": "default",
               "child_ids": [],
-              "event_revision": 14,
+              "event_revision": 15,
               "id": "t_0d869764",
               "parent_ids": [],
               "responsibility": null,
               "review_state": "none",
+              "risk_tier": 1,
+              "risk_tier_raised": true,
               "stopped_work": "none",
               "title": "Draft the workshop agenda",
               "updated_at": "2026-09-21T14:13:20Z"
@@ -104,11 +112,13 @@
               "child_ids": [
                 "t_d5a64436"
               ],
-              "event_revision": 23,
+              "event_revision": 24,
               "id": "t_8e3861d2",
               "parent_ids": [],
               "responsibility": null,
               "review_state": "changes_requested",
+              "risk_tier": null,
+              "risk_tier_raised": false,
               "stopped_work": "none",
               "title": "Review the changes outline",
               "updated_at": "2026-09-21T14:13:20Z"
@@ -123,11 +133,13 @@
               "child_ids": [
                 "t_3c850dcf"
               ],
-              "event_revision": 26,
+              "event_revision": 27,
               "id": "t_348578f3",
               "parent_ids": [],
               "responsibility": null,
               "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
               "stopped_work": "none",
               "title": "Rehearse the workshop",
               "updated_at": "2026-09-21T14:13:20Z"
@@ -149,6 +161,8 @@
               "parent_ids": [],
               "responsibility": null,
               "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
               "stopped_work": "capability",
               "title": "Connect the payment provider",
               "updated_at": "2026-09-21T14:13:20Z"
@@ -161,6 +175,8 @@
               "parent_ids": [],
               "responsibility": null,
               "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
               "stopped_work": "gave_up",
               "title": "Print the workshop handouts",
               "updated_at": "2026-09-21T14:13:20Z"
@@ -173,11 +189,13 @@
             {
               "assignee_name": "default",
               "child_ids": [],
-              "event_revision": 18,
+              "event_revision": 19,
               "id": "t_136d9fda",
               "parent_ids": [],
               "responsibility": null,
               "review_state": "awaiting_review",
+              "risk_tier": null,
+              "risk_tier_raised": false,
               "stopped_work": "none",
               "title": "Review the awaiting outline",
               "updated_at": "2026-09-21T14:13:20Z"
@@ -195,6 +213,8 @@
               "parent_ids": [],
               "responsibility": null,
               "review_state": "approved",
+              "risk_tier": null,
+              "risk_tier_raised": false,
               "stopped_work": "none",
               "title": "Review the approved outline",
               "updated_at": "2026-09-21T14:13:20Z"
@@ -226,7 +246,7 @@
           {
             "assignee_name": "default",
             "child_ids": [],
-            "event_revision": 14,
+            "event_revision": 15,
             "id": "t_0d869764",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,
@@ -254,7 +274,7 @@
           {
             "assignee_name": "default",
             "child_ids": [],
-            "event_revision": 18,
+            "event_revision": 19,
             "id": "t_136d9fda",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,
@@ -270,7 +290,7 @@
             "child_ids": [
               "t_3c850dcf"
             ],
-            "event_revision": 26,
+            "event_revision": 27,
             "id": "t_348578f3",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,
@@ -284,7 +304,7 @@
           {
             "assignee_name": "default",
             "child_ids": [],
-            "event_revision": 29,
+            "event_revision": 30,
             "id": "t_3a414ff6",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,
@@ -298,7 +318,7 @@
           {
             "assignee_name": "default",
             "child_ids": [],
-            "event_revision": 27,
+            "event_revision": 28,
             "id": "t_3c850dcf",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,
@@ -316,7 +336,7 @@
             "child_ids": [
               "t_d5a64436"
             ],
-            "event_revision": 23,
+            "event_revision": 24,
             "id": "t_8e3861d2",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,
@@ -330,7 +350,7 @@
           {
             "assignee_name": "default",
             "child_ids": [],
-            "event_revision": 22,
+            "event_revision": 23,
             "id": "t_d5a64436",
             "omitted_child_count": 0,
             "omitted_parent_count": 0,

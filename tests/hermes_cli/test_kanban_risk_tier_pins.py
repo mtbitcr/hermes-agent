@@ -20,6 +20,7 @@ P2 of the risk tier plan (tests P2-1 to P2-6), through the real kernel:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -53,6 +54,7 @@ from tests.hermes_cli.test_kanban_committed_review_requirement import _finding
 _PROVIDER = {"raphael-verifier": "openai-codex"}
 BUILD_BOX = 7200
 DEEP_BOX = 2700
+REVIEW_BOX = 5400
 ROUTINE_BOX = 1800
 
 
@@ -214,9 +216,9 @@ def test_a_security_review_card_is_pinned_at_max(ctx, path, tier):
     ("raphael-planner", "deep", [], DEEP_BOX),
     ("raphael-business", "routine", [], ROUTINE_BOX),
     ("raphael-designer", "routine", [], ROUTINE_BOX),
-    # Review cards: 45 minutes (decision 2).
-    ("raphael-verifier", "routine", None, DEEP_BOX),
-    ("raphael-verifier", "deep", None, DEEP_BOX),
+    # Review cards: 90 minutes (decision 2).
+    ("raphael-verifier", "routine", None, REVIEW_BOX),
+    ("raphael-verifier", "deep", None, REVIEW_BOX),
     # Release, integration and infrastructure cards: 45 minutes per run.
     ("raphael-builder", "deep", ["."], DEEP_BOX),
     ("raphael-builder", "routine", ["."], DEEP_BOX),
@@ -505,7 +507,7 @@ def test_the_build_box_hands_over_instead_of_retrying(build_repo, saved):
 
 
 def test_a_review_run_gets_the_review_box(build_repo):
-    """Decision 2: a review run gets 45 minutes; its card keeps two hours."""
+    """Decision 2: a review run gets 90 minutes; its card keeps two hours."""
     with closing(kb.connect(board=SLUG)) as conn:
         task_id = _locked_card(
             conn, "raphael-claude-worker", "deep", risk_tier=1, owned_paths=[OWNED],
@@ -515,7 +517,7 @@ def test_a_review_run_gets_the_review_box(build_repo):
         host = kb._claimer_id().split(":", 1)[0]
         review = kb.claim_review_task(conn, task_id, claimer=f"{host}:r0")
         timed_out, signalled = _outlast(
-            conn, task_id, review.current_run_id, DEEP_BOX, WORKER_PID + 1,
+            conn, task_id, review.current_run_id, REVIEW_BOX, WORKER_PID + 1,
         )
         boxes = [
             row["max_runtime_seconds"] for row in conn.execute(
@@ -529,8 +531,121 @@ def test_a_review_run_gets_the_review_box(build_repo):
     assert set(signalled) == {WORKER_PID + 1}
     # The build run kept the build box and the review run got the review box;
     # the card keeps its own box for an implementation handback.
-    assert boxes == [BUILD_BOX, DEEP_BOX]
+    assert boxes == [BUILD_BOX, REVIEW_BOX]
     assert (task.max_runtime_seconds, task.status) == (BUILD_BOX, "review")
+
+
+def _claimed_review_run(conn, task_id: str):
+    """Save a build, claim its review, and return the review run's id."""
+    _build_past_its_box(conn, task_id, (PATCH, REPORT))
+    host = kb._claimer_id().split(":", 1)[0]
+    return kb.claim_review_task(conn, task_id, claimer=f"{host}:r0").current_run_id
+
+
+def _run_box(conn, run_id: int):
+    return conn.execute(
+        "SELECT max_runtime_seconds FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()[0]
+
+
+@pytest.mark.parametrize("execution_tier", ["routine", "deep"])
+def test_a_new_independent_review_card_gets_the_review_box(
+    kanban_home, execution_tier,
+):
+    with kb.connect() as conn:
+        task_id = _locked_card(
+            conn, "raphael-verifier", execution_tier, risk_tier=1,
+        )
+        row = _row(conn, task_id)
+
+    assert row["max_runtime_seconds"] == REVIEW_BOX == 5400
+    assert kb.task_policy_lock_error(row) is None
+
+
+def test_a_new_review_run_of_a_build_card_gets_the_review_box(build_repo):
+    with closing(kb.connect(board=SLUG)) as conn:
+        task_id = _locked_card(
+            conn, "raphael-claude-worker", "deep", risk_tier=1, owned_paths=[OWNED],
+            workspace_path=str(build_repo), requires_review=True,
+        )
+        review_run_id = _claimed_review_run(conn, task_id)
+        run_box = _run_box(conn, review_run_id)
+
+    assert run_box == REVIEW_BOX == 5400
+
+
+def test_a_claimed_review_run_keeps_the_box_it_recorded(build_repo):
+    """A run recorded at the older review box is not raised after the fact."""
+    assert kb.active_run_box_seconds(BUILD_BOX, DEEP_BOX, True) == DEEP_BOX
+    assert kb.active_run_box_seconds(BUILD_BOX, REVIEW_BOX, True) == REVIEW_BOX
+    with closing(kb.connect(board=SLUG)) as conn:
+        task_id = _locked_card(
+            conn, "raphael-claude-worker", "deep", risk_tier=1, owned_paths=[OWNED],
+            workspace_path=str(build_repo), requires_review=True,
+        )
+        review_run_id = _claimed_review_run(conn, task_id)
+        conn.execute(
+            "UPDATE task_runs SET max_runtime_seconds = ? WHERE id = ?",
+            (DEEP_BOX, review_run_id),
+        )
+        timed_out, signalled = _outlast(
+            conn, task_id, review_run_id, DEEP_BOX, WORKER_PID + 2,
+        )
+        recorded = _run_box(conn, review_run_id)
+
+    assert recorded == DEEP_BOX
+    assert timed_out == [task_id]
+    assert set(signalled) == {WORKER_PID + 2}
+
+
+def test_the_other_time_boxes_keep_their_values():
+    boxes = {
+        kind: kb.pinned_time_box_seconds(kind) for kind in (
+            "build", "analysis", "proposal", "review", "release",
+            "coordinator_deep", "coordinator_routine",
+        )
+    }
+
+    assert boxes == {
+        "build": 7200, "analysis": 2700, "proposal": 1800, "review": 5400,
+        "release": 2700, "coordinator_deep": 2700, "coordinator_routine": 1800,
+    }
+    assert (BUILD_BOX, DEEP_BOX, ROUTINE_BOX) == (7200, 2700, 1800)
+
+
+def test_deep_box_stays_for_analysis_and_coordinator_work(kanban_home):
+    with kb.connect() as conn:
+        analysis = _locked_card(
+            conn, "raphael-claude-worker", "deep", risk_tier=1, owned_paths=[],
+        )
+        coordinator = _locked_card(conn, "default", "deep", risk_tier=1)
+        boxes = [_row(conn, task_id)["max_runtime_seconds"] for task_id in (
+            analysis, coordinator,
+        )]
+
+    assert DEEP_BOX == 2700
+    assert boxes == [DEEP_BOX, DEEP_BOX]
+
+
+def test_a_card_returned_to_the_implementer_keeps_its_build_box(build_repo):
+    with closing(kb.connect(board=SLUG)) as conn:
+        task_id = _locked_card(
+            conn, "raphael-claude-worker", "deep", risk_tier=1, owned_paths=[OWNED],
+            workspace_path=str(build_repo), requires_review=True,
+        )
+        rows = _review_round_trip(conn, task_id)
+
+    assert rows[-1]["assignee"] == "raphael-claude-worker"
+    assert [row["max_runtime_seconds"] for row in rows] == [BUILD_BOX] * 3
+
+
+def test_without_a_route_lock_or_a_box_the_card_box_is_unchanged():
+    assert kb.review_run_box_seconds(LEGACY_BOX, False) == LEGACY_BOX
+    assert kb.review_run_box_seconds(None, True) is None
+    assert kb.review_run_box_seconds(None, False) is None
+    assert kb.review_run_box_seconds(BUILD_BOX, True) == REVIEW_BOX
+    assert kb.active_run_box_seconds(BUILD_BOX, None, True) == BUILD_BOX
+    assert kb.active_run_box_seconds(LEGACY_BOX, REVIEW_BOX, False) == LEGACY_BOX
 
 
 # ---------------------------------------------------------------------------
@@ -629,18 +744,18 @@ def test_kanban_create_carries_the_tier_under_the_worker_environment(
     assert not (profile_home / "kanban.db").exists()
     assert not (profile_home / "kanban").exists()
     # Decision 5: tier-2 work on the high-base lane (business routine on
-    # Sonnet 5) runs at max; tier 0 stays high. Both seals read back clean.
+    # Sonnet 5.5) runs at max; tier 0 stays high. Both seals read back clean.
     assert _count(
         worker_db,
         "risk_tier = 2 AND reasoning_effort = 'max' AND model_override = ? "
         "AND max_runtime_seconds = ? AND id = ?",
-        ("claude-sonnet-5", ROUTINE_BOX, created["task_id"]),
+        ("claude-sonnet-5-5", ROUTINE_BOX, created["task_id"]),
     ) == 1
     assert _count(
         worker_db,
         "risk_tier = 0 AND reasoning_effort = 'high' AND model_override = ? "
         "AND max_runtime_seconds = ? AND id = ?",
-        ("claude-sonnet-5", ROUTINE_BOX, routine["task_id"]),
+        ("claude-sonnet-5-5", ROUTINE_BOX, routine["task_id"]),
     ) == 1
     for answer in (created, routine):
         assert kb.task_policy_lock_error(_raw_row(worker_db, answer["task_id"])) is None
@@ -658,8 +773,8 @@ def test_a_new_card_without_a_tier_is_pinned_as_tier_2(fence_home, monkeypatch):
 
     assert created["ok"] is True, created
     row = _raw_row(kb.kanban_db_path(board=WORKER_BOARD), created["task_id"])
-    # Business routine is the one lane whose own effort is high (Sonnet 5).
-    assert (row["risk_tier"], row["model_override"]) == (2, "claude-sonnet-5")
+    # Business routine is the one lane whose own effort is high (Sonnet 5.5).
+    assert (row["risk_tier"], row["model_override"]) == (2, "claude-sonnet-5-5")
     assert (row["reasoning_effort"], row["max_runtime_seconds"]) == ("max", ROUTINE_BOX)
     assert kb.task_policy_lock_error(row) is None
 
@@ -716,7 +831,7 @@ def test_kanban_create_keeps_the_tier_effort_through_review(
     build_repo, risk_tier, recorded, effort,
 ):
     """An omitted tier is recorded as tier 2 and keeps max; tier 1 keeps high."""
-    # Business routine is the one lane whose own effort is high (Sonnet 5).
+    # Business routine is the one lane whose own effort is high (Sonnet 5.5).
     args = {
         "title": "Write the pricing page", "assignee": "raphael-business",
         "execution_tier": "routine", "owned_paths": [OWNED],
@@ -733,7 +848,7 @@ def test_kanban_create_keeps_the_tier_effort_through_review(
         (recorded, effort),
     ] * 3
     assert created["risk_tier"] == recorded
-    assert rows[-1]["model_override"] == "claude-sonnet-5"
+    assert rows[-1]["model_override"] == "claude-sonnet-5-5"
 
 
 def test_a_native_security_review_card_keeps_max_through_review(build_repo):
@@ -748,7 +863,7 @@ def test_a_native_security_review_card_keeps_max_through_review(build_repo):
     assert [(row["risk_tier"], row["reasoning_effort"]) for row in rows] == [
         (2, "max"),
     ] * 3
-    assert rows[-1]["model_override"] == "claude-sonnet-5"
+    assert rows[-1]["model_override"] == "claude-sonnet-5-5"
 
 
 def test_a_legacy_card_keeps_its_base_effort_and_saved_box_through_review(build_repo):
@@ -832,3 +947,93 @@ def test_a_card_with_a_tier_from_before_the_pins_keeps_its_base_effort_through_r
     assert [(row["risk_tier"], row["max_runtime_seconds"]) for row in rows] == [
         (risk_tier, LEGACY_BOX),
     ] * 3
+
+
+# ---------------------------------------------------------------------------
+# A card sealed on a routine route Sonnet 5.5 replaced still claims
+# ---------------------------------------------------------------------------
+
+
+def _sealed(assignee, provider, model, effort, execution_tier) -> str:
+    """A stored route lock in its documented canonical form, built here:
+    minting refuses a route this build replaced."""
+    canonical = json.dumps(
+        {
+            "authority": "raphael",
+            "version": 1,
+            "assignee": assignee,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": effort,
+            "execution_tier": execution_tier,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"raphael:v1:{digest}"
+
+
+def _card_sealed_before(conn, assignee, model, effort, risk_tier) -> str:
+    """A routine card as the earlier kernel wrote it: its tier, the route it
+    pinned then, and that route's seal."""
+    task_id = _locked_card(
+        conn, assignee, "routine", risk_tier=risk_tier, owned_paths=[],
+    )
+    conn.execute(
+        "UPDATE tasks SET model_override = ?, reasoning_effort = ?, "
+        "risk_tier = ?, model_policy_lock = ? WHERE id = ?",
+        (
+            model, effort, risk_tier,
+            _sealed(assignee, "anthropic", model, effort, "routine"),
+            task_id,
+        ),
+    )
+    return task_id
+
+
+@pytest.mark.parametrize(("assignee", "model", "effort", "risk_tier"), [
+    ("raphael-claude-worker", "claude-opus-5-5", "high", 1),
+    ("raphael-claude-worker", "claude-opus-5-5", "max", 2),
+    ("raphael-builder", "claude-opus-5-5", "high", 0),
+    ("raphael-builder", "claude-opus-5-5", "max", 2),
+    ("raphael-business", "claude-sonnet-5", "high", 1),
+    ("raphael-business", "claude-sonnet-5", "max", 2),
+])
+def test_a_card_sealed_on_a_replaced_routine_route_still_claims(
+    kanban_home, assignee, model, effort, risk_tier,
+):
+    """Moving a routine lane to Sonnet 5.5 leaves a card sealed on its old
+    route, at either effort a tier pinned, verifiable and claimable."""
+    with kb.connect() as conn:
+        task_id = _card_sealed_before(conn, assignee, model, effort, risk_tier)
+        row = _row(conn, task_id)
+
+        assert (row["model_override"], row["reasoning_effort"]) == (model, effort)
+        assert kb.task_policy_lock_error(row) is None
+        kb.assert_claimable_route(conn, task_id)
+        # Still history only: no new card can be sealed on it.
+        with pytest.raises(ValueError):
+            kb.mint_policy_lock(assignee, "anthropic", model, effort, "routine")
+
+
+@pytest.mark.parametrize(("assignee", "model", "effort"), [
+    # The older routes these roles left predate the pins: never high there.
+    ("raphael-claude-worker", "claude-sonnet-5", "high"),
+    ("raphael-builder", "claude-sonnet-5", "high"),
+    # The implementation lanes' replaced route was never business's.
+    ("raphael-business", "claude-opus-5-5", "high"),
+    # No tier pins any other effort.
+    ("raphael-claude-worker", "claude-opus-5-5", "medium"),
+])
+def test_a_card_sealed_on_a_never_admitted_routine_variant_is_refused(
+    kanban_home, assignee, model, effort,
+):
+    with kb.connect() as conn:
+        task_id = _card_sealed_before(conn, assignee, model, effort, 1)
+
+        error = kb.task_policy_lock_error(_row(conn, task_id))
+        assert error is not None and "is not the admitted route for" in error
+        with pytest.raises(RuntimeError, match="is not the admitted route for"):
+            kb.assert_claimable_route(conn, task_id)

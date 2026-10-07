@@ -6,7 +6,7 @@
           "archived": 0,
           "blocked": 2,
           "done": 1,
-          "ready": 3,
+          "ready": 6,
           "review": 1,
           "running": 1,
           "scheduled": 0,
@@ -16,7 +16,7 @@
         "name": "Raphael Workspace",
         "project_id": "p_2f169f9b",
         "slug": "raphael-workspace",
-        "total": 9
+        "total": 12
       }
     ]
   },

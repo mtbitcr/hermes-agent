@@ -116,7 +116,7 @@ _ASSIGNMENTS = {
         "default", "openai-codex", "gpt-6.1-sol", "GPT-6.1 Sol", "max"
     ),
     ("raphael-business", "anthropic"): _assignment(
-        "raphael-business", "anthropic", "claude-sonnet-5", "Claude Sonnet 5", "high"
+        "raphael-business", "anthropic", "claude-sonnet-5-5", "Claude Sonnet 5.5", "high"
     ),
     ("raphael-business", "openai-codex"): _assignment(
         "raphael-business", "openai-codex", "gpt-5.6-terra", "GPT-5.6 Terra", "max"
@@ -125,10 +125,10 @@ _ASSIGNMENTS = {
         "raphael-designer", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"
     ),
     ("raphael-claude-worker", "anthropic"): _assignment(
-        "raphael-claude-worker", "anthropic", "claude-opus-5-5", "Claude Opus 5.5 + Claude Code", "max"
+        "raphael-claude-worker", "anthropic", "claude-sonnet-5-5", "Claude Sonnet 5.5 + Claude Code", "max"
     ),
     ("raphael-builder", "anthropic"): _assignment(
-        "raphael-builder", "anthropic", "claude-opus-5-5", "Claude Opus 5.5", "max"
+        "raphael-builder", "anthropic", "claude-sonnet-5-5", "Claude Sonnet 5.5", "max"
     ),
     # There is deliberately NO builder route on the OpenAI family. The builder
     # integrates verified work and operates infrastructure, so its deep lane is
@@ -433,11 +433,12 @@ def resolve_task_assignment(profile: str, execution_tier: str) -> ModelAssignmen
 # validate.  Validation additionally re-derives the route from this module's
 # matrix: a lock is valid only for the route the current policy admits for
 # that exact assignee/provider/tier, or for a route this policy lineage
-# admitted there before and has since superseded (``_SUPERSEDED_ROUTES``), so
-# already-minted receipts stay verifiable after a matrix migration while a
-# route that was never admitted there is invalid.  Minting never consults the
-# superseded table.  There is exactly one authority name and one version:
-# anything else is unknown provenance and fails closed.
+# admitted there before and has since superseded (``_SUPERSEDED_ROUTES``,
+# ``_SUPERSEDED_PINNED_ROUTES``), so already-minted receipts stay verifiable
+# after a matrix migration while a route that was never admitted there is
+# invalid.  Minting never consults a superseded table.  There is exactly one
+# authority name and one version: anything else is unknown provenance and
+# fails closed.
 
 POLICY_LOCK_AUTHORITY = "raphael"
 POLICY_LOCK_VERSION = 1
@@ -454,7 +455,9 @@ _FORBIDDEN_EFFORTS = frozenset({"ultra"})
 # admitted on, so a historical route never verifies for a different role,
 # provider or tier.  Pairs whose route never changed have no entry.
 _OPUS_5_MAX = ("claude-opus-5", "max")
+_OPUS_55_MAX = ("claude-opus-5-5", "max")
 _SONNET_5_MAX = ("claude-sonnet-5", "max")
+_SONNET_5_HIGH = ("claude-sonnet-5", "high")
 _SOL_56_MAX = ("gpt-5.6-sol", "max")
 _SOL_6_MAX = ("gpt-6-sol", "max")
 _ASTRA_6_XHIGH = ("gpt-6-astra", "xhigh")
@@ -468,17 +471,28 @@ _SUPERSEDED_ROUTES: Mapping[tuple[str, str, str], frozenset[tuple[str, str]]] = 
     ("raphael-planner", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
     ("raphael-planner", "openai-codex", "routine"): frozenset({_SOL_56_MAX, _SOL_6_MAX}),
     ("raphael-planner", "openai-codex", "deep"): frozenset({_SOL_56_MAX, _SOL_6_MAX}),
+    ("raphael-business", "anthropic", "routine"): frozenset({_SONNET_5_HIGH}),
     ("raphael-business", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
     ("raphael-designer", "anthropic", "routine"): frozenset({_OPUS_5_MAX}),
     ("raphael-designer", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
-    ("raphael-claude-worker", "anthropic", "routine"): frozenset({_SONNET_5_MAX}),
+    ("raphael-claude-worker", "anthropic", "routine"): frozenset({_SONNET_5_MAX, _OPUS_55_MAX}),
     ("raphael-claude-worker", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
-    ("raphael-builder", "anthropic", "routine"): frozenset({_SONNET_5_MAX}),
+    ("raphael-builder", "anthropic", "routine"): frozenset({_SONNET_5_MAX, _OPUS_55_MAX}),
     ("raphael-builder", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
     ("raphael-verifier", "openai-codex", "routine"): frozenset({_SOL_56_MAX, _SOL_6_MAX}),
     ("raphael-verifier", "openai-codex", "deep"): frozenset({_SOL_56_MAX, _ASTRA_6_XHIGH}),
     ("raphael-verifier", "anthropic", "routine"): frozenset({_OPUS_5_MAX}),
     ("raphael-verifier", "anthropic", "deep"): frozenset({_OPUS_5_MAX}),
+}
+
+# Seals minted at a risk-tier pinned effort (``PINNED_EFFORTS``) on a routine
+# route Sonnet 5.5 replaced, beside its base effort above.  Seal validation
+# only: never a configured route, a run's history or mintable.  Older
+# superseded routes predate the pins and gain no pinned effort.
+_SUPERSEDED_PINNED_ROUTES: Mapping[tuple[str, str, str], frozenset[tuple[str, str]]] = {
+    ("raphael-business", "anthropic", "routine"): frozenset({_SONNET_5_MAX}),
+    ("raphael-claude-worker", "anthropic", "routine"): frozenset({("claude-opus-5-5", "high")}),
+    ("raphael-builder", "anthropic", "routine"): frozenset({("claude-opus-5-5", "high")}),
 }
 
 _LOCK_RE = re.compile(r"\A([a-z][a-z0-9-]{0,31}):v(\d{1,4}):([0-9a-f]{64})\Z")
@@ -558,6 +572,10 @@ def _route_authority_error(
     so max also on a lane whose base effort is high). Only a card's seal
     passes it; a role's configured route and an unpinned run's history stay
     exactly the base route.
+
+    Both together, which only seal validation (:func:`policy_lock_error`)
+    passes, also accept ``_SUPERSEDED_PINNED_ROUTES`` for this exact
+    assignee/provider/tier.
     """
     if not assignee or not provider or not model or not reasoning_effort:
         return (
@@ -586,6 +604,10 @@ def _route_authority_error(
         admitted |= {(expected.model, effort) for effort in PINNED_EFFORTS}
     if admit_superseded:
         admitted |= _SUPERSEDED_ROUTES.get(
+            (expected.profile, expected.provider, execution_tier), frozenset()
+        )
+    if admit_superseded and admit_pinned_effort:
+        admitted |= _SUPERSEDED_PINNED_ROUTES.get(
             (expected.profile, expected.provider, execution_tier), frozenset()
         )
     if (model, reasoning_effort) not in admitted:
