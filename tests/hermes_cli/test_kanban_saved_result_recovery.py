@@ -277,17 +277,46 @@ def test_card_without_a_review_requirement_still_parks(running_build, monkeypatc
     assert "handover_refusal" not in unreported
 
 
-def test_run_with_two_patches_still_parks(running_build, monkeypatch):
+def test_run_with_two_patches_hands_the_newest_to_review(running_build, monkeypatch):
     setup = running_build()
-    _save_patch(setup, "x.patch", _new_file_patch(f"{OWNED}/one.py", "one = 1"))
-    _save_patch(setup, "y.patch", _new_file_patch(f"{OWNED}/two.py", "two = 2"))
+    conn, task_id, run_id = setup["conn"], setup["task"], setup["run"]
+    older = _save_patch(
+        setup, "x.patch", _new_file_patch(f"{OWNED}/one.py", "one = 1"),
+    )
+    newest = _save_patch(
+        setup, "y.patch", _new_file_patch(f"{OWNED}/two.py", "two = 2"),
+    )
+    assert kb.saved_patch_ids_for_review(conn, task_id, run_id) == [older, newest]
     _exit_cleanly_without_reporting(setup, monkeypatch)
 
-    kb.detect_crashed_workers(setup["conn"])
+    assert kb.detect_crashed_workers(conn) == []
 
-    unreported = _assert_parked_for_a_person(setup)
-    assert unreported["attachments_at_exit"] == 2
-    assert "handover_refusal" not in unreported
+    task = kb.get_task(conn, task_id)
+    assert (task.status, task.block_kind) == ("review", None)
+    assert task.completed_at is None
+    # The head the review park holds is one kernel commit on the base, and it
+    # materialized the newest attachment alone; the older one never reached it.
+    head = git(setup["repo"], "rev-parse", setup["branch"])
+    assert git(setup["repo"], "log", "-1", "--format=%P", head) == setup["base"]
+    message = git(setup["repo"], "log", "-1", "--format=%B", head)
+    assert [
+        line for line in message.splitlines()
+        if line.startswith("Hermes-Patch-Attachment:")
+    ] == [f"Hermes-Patch-Attachment: {newest}"]
+    assert git(setup["repo"], "diff", "--name-status", setup["base"], head) == (
+        f"A\t{OWNED}/two.py"
+    )
+    assert git(setup["repo"], "show", f"{head}:{OWNED}/two.py") == "two = 2"
+    assert git(setup["repo"], "ls-tree", "--name-only", head, f"{OWNED}/one.py") == ""
+    assert kb._latest_review_head_provenance(conn, task_id) == head
+    run = kb.get_run(conn, run_id)
+    assert run.metadata["execution_receipt"]["head_commit"] == head
+    assert _handed_over(setup) == [
+        (run_id, {"run_id": run_id, "attachment_id": newest}),
+    ]
+    kinds = [event.kind for event in kb.list_events(conn, task_id)]
+    assert "blocked" not in kinds
+    assert "protocol_violation" not in kinds
 
 
 def test_card_that_already_moved_on_is_never_overwritten(
