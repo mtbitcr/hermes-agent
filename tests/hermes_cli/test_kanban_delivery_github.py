@@ -333,6 +333,12 @@ def github(tmp_path):
                                          "documentation_url": f"https://docs.example/{TOKEN}"})
             if path.endswith("/logs"):
                 return self._reply(302, None, [("Location", f"https://storage.example/log?sig={TOKEN}")])
+            if method == "GET" and path.endswith("/reviews"):  # Link: a next page (7), the last (8), none (9), cut (10)
+                url = f"<https://api.github.com/repositories/1/pulls/7/reviews?page=3&t={TOKEN}>"
+                link = {"7": f'{url}; rel="next", {url}; rel="last"', "8": f'{url}; rel="prev", {url}; rel="first"',
+                        "10": f'{url[:-1]}; rel="next"'}.get(path.split("/")[-2])
+                return self._reply(200, [{"id": 1, "state": "APPROVED", "commit_id": HEAD, "user": {"login": "b"}}],
+                                   [("Link", link)] if link else ())
             if method == "GET" and "/git/ref/heads/" in path:  # one branch exists; any other is absent
                 if path == f"/repos/{REPO}/git/ref/heads/delivery/card-1":
                     return self._reply(200, {"ref": "refs/heads/delivery/card-1", "node_id": TOKEN, "url": TOKEN,
@@ -1116,3 +1122,17 @@ def test_the_arm_reads_nothing_and_sends_only_on_the_transports_own_read_of_the_
             github.arm_auto_merge(number, head)
 
     assert sent[reads:] == ([("POST", "/graphql", f"Bearer {DUMMY}")] if sends else []) and len(mints) == reads
+
+
+def test_the_reviews_read_says_only_whether_github_names_a_next_page(github, monkeypatch):
+    """The fenced reviews read keeps one fact of the answer's Link header, whether it names a next page
+    (rel="next"): True when it does, False when it names none or sends no Link header, None when it cannot be read.
+    The header itself, its URLs and the token they carry included, never comes back."""
+    mod = _transport_module(monkeypatch, github)
+    transport = mod.GitHubTransport("publish", REPO, key_path=github["key_file"])
+
+    answers = [transport.request("GET", f"/repos/{REPO}/pulls/{number}/reviews", query={"per_page": 100, "page": 2})
+               for number in (7, 8, 9, 10)]
+
+    assert answers == [{"status": 200, "data": [{"user": {"login": "b"}, "state": "APPROVED", "commit_id": HEAD,
+                                                 "body": ""}], "next_page": more} for more in (True, False, False, None)]

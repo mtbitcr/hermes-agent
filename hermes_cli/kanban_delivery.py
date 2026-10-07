@@ -1025,13 +1025,15 @@ def arm_step(db_path: Path) -> None:
 
 def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
     """Each published row (or row ``old_id``) whose pull request, its repository and number,
-    another card's work continues: that card's recorded base is the row's head and its own
-    published pull request is another one of the same repository. The row is still the latest
-    on its pull request, and no close of it was sent."""
+    another card's work continues: that card is a task_links child of the row's source card,
+    its recorded base is the row's head and its own published pull request is another one of
+    the same repository. The row is still the latest on its pull request, and no close of it
+    was sent."""
     old, new, later = (_RECEIPT.format(name) for name in ("old", "new", "later"))
     return [dict(row) for row in conn.execute(
         f"SELECT old.*, {old} AS repository, MIN(rework.id) AS replaced_by FROM kanban_deliveries AS old "
         "JOIN tasks AS rework ON rework.base_commit = old.pull_request_head AND rework.id != old.source_task_id "
+        "JOIN task_links AS link ON link.parent_id = old.source_task_id AND link.child_id = rework.id "
         "JOIN kanban_deliveries AS new ON new.source_task_id = rework.id AND new.pull_request_number IS NOT NULL "
         f"AND new.pull_request_number != old.pull_request_number AND {new} = {old} "
         "WHERE old.pull_request_number IS NOT NULL AND (? IS NULL OR old.id = ?) "
@@ -1089,7 +1091,8 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
     read comes first: the pull request, open at H, then its reviews, which approve H lens by
     lens. One write transaction then reads the complete evidence again, finds the pull request
     unclaimed and reserves the arm under this attempt. The arm is the one call after it, and
-    its answer is written to this attempt only. Ten full pages of reviews refuse H once instead."""
+    its answer is written to this attempt only. A full tenth page of reviews that GitHub does not
+    show to be the last refuses H once instead."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head, number, repository = (row[key] for key in (
@@ -1104,12 +1107,12 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
         github = GitHubTransport("publish", repository)
         if not _open_at_head(github, repository, row):
             return None  # the pull request left H or is closed: nothing to arm
-        for page in range(1, _REVIEW_PAGES + 1):  # oldest first; a page of fewer than 100 is the last
+        for page in range(1, _REVIEW_PAGES + 1):  # oldest first; the last is not full or names no next page
             listed = _answered(github.request("GET", f"/repos/{repository}/pulls/{number}/reviews",
                                               query={"per_page": 100, "page": page}))
             if listed["status"] != 200 or not isinstance(listed["data"], list):
                 return None  # a page GitHub does not list: nothing is armed or recorded on this pass
-            reviews, whole = reviews + listed["data"], len(listed["data"]) < 100
+            reviews, whole = reviews + listed["data"], len(listed["data"]) < 100 or listed.get("next_page") is False
             if whole:
                 break
     except GitHubTransportError as error:
@@ -1120,7 +1123,7 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or _arm_evidence(conn, row) != evidence or _claimed(conn, repository, number):
             return None  # the evidence changed while GitHub was read: nothing is sent
-        if not whole:  # ten full pages: more may follow, past the bound, so H is refused once and never sent
+        if not whole:  # a full tenth page, a next page named or unknown: H is refused once and never sent
             conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (_ARM_REFUSED, row["id"]))
             kb._append_event(conn, source, f"delivery_{_ARM_REFUSED}", _outcome(
                 row, repository=repository, status=None, reason="review_history_over_10_pages",

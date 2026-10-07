@@ -32,7 +32,8 @@ def armed(world, monkeypatch):
     answers the auto-merge mutation with gh["arm"] and a close with gh["close"] ("timeout": no answer), keeps
     each write's body and runs gh["hooks"]["GET"] once during a reviews read, ["PULL"] during a pull request
     read, ["POST"] during an arm and ["PATCH"] during a close. Pull request 41 of REPO is open at H, and each
-    one in gh["pulls"] at the head given there, unless gh["ended"] reports it closed (merged or not)."""
+    one in gh["pulls"] at the head given there, unless gh["ended"] reports it closed (merged or not). As GitHub
+    does, a reviews page names a next page exactly when more reviews follow it."""
     kb, root, repo, gh = world
     from hermes_cli import kanban_delivery_github as transport
 
@@ -57,8 +58,8 @@ def armed(world, monkeypatch):
         if pull and path.endswith("/reviews"):
             query = parse_qs(urlsplit(target).query)  # listed 100 a page, each read's query kept
             gh["queries"].append((path, query))
-            page = int(query.get("page", ["1"])[0])
-            return 200, gh["reviews"].get(int(parts[5]), [])[(page - 1) * 100:page * 100]
+            page, listed = int(query.get("page", ["1"])[0]), gh["reviews"].get(int(parts[5]), [])
+            return 200, listed[(page - 1) * 100:page * 100], len(listed) > page * 100
         if pull and len(parts) == 6:
             number, owner = int(parts[5]), "/".join(parts[2:4])
             heads = {41: gh["pull_head"] or gh["head"], **gh["pulls"]}
@@ -106,6 +107,14 @@ def _published_as(db, gh, tid, head, number, repository=REPO):
          tid, json.dumps({"repository": repository, "branch": "delivery/" + tid, "pull_request_number": number,
                           "head": head, "state": "created"}))
     gh["pulls"][number if repository == REPO else (repository, number)] = head
+
+
+def _continues(db, rework, head, source=None):
+    """``rework`` records ``head`` as its base, and ``source``, when named, is its task_links parent, as the
+    source of a linked rework card is."""
+    _raw(db, "UPDATE tasks SET base_commit = ? WHERE id = ?", head, rework)
+    if source:
+        _raw(db, "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", source, rework)
 
 
 @pytest.mark.parametrize("case", ["open", "changes_on_github", "changes_on_card"])
@@ -323,18 +332,26 @@ def test_a_new_head_starts_fresh_after_a_refused_arm(armed):
 
 
 @pytest.mark.parametrize("total, last, pages, outcome", [
-    (99, None, 1, "armed"), (100, None, 2, "armed"), (101, None, 2, "armed"), (200, None, 3, "armed"),
-    (150, "bot", 2, None), (150, "lens", 2, None), (1000, None, 10, "refused"), (1050, None, 10, "refused")])
-def test_every_review_page_is_read_up_to_ten_and_a_longer_history_refuses_h_once(armed, total, last, pages, outcome):
-    """Owner rule 2 of round 3: reviews are read 100 a page until one is not full, ten pages at most, and judged
-    over them all, so a later page can revoke. Ten full pages refuse H once: nothing is sent, then or later."""
+    (99, None, 1, "armed"), (100, None, 1, "armed"), (101, None, 2, "armed"), (200, None, 2, "armed"),
+    (150, "bot", 2, None), (150, "lens", 2, None), (1000, None, 10, "armed"), (1000, "unknown", 10, "refused"),
+    (1001, None, 10, "refused"), (1050, None, 10, "refused")])
+def test_every_review_page_is_read_up_to_ten_and_a_longer_history_refuses_h_once(armed, monkeypatch, total, last,
+                                                                                 pages, outcome):
+    """Owner rule 2 of round 3: reviews are read 100 a page until one is not full or GitHub names no next page,
+    ten pages at most, and judged over them all, so a later page can revoke. A full tenth page with a next page
+    named, or with no word on one, refuses H once: nothing is sent, then or later. No eleventh page is read."""
+    from hermes_cli import kanban_delivery_github as transport
+
     kb, root, repo, gh = armed
-    tid, head = _ready(armed, tier=0)
+    tid, head = _ready(armed)
+    if last == "unknown":  # answers that do not say whether a next page follows
+        exchange = transport._exchange
+        monkeypatch.setattr(transport, "_exchange", lambda *args: exchange(*args)[:2])
     _tick(kb)
     _done(kb.kanban_db_path())
-    lens = _lenses(kb, head)  # the bot's approval of H for the one card: last of all, or first before a revocation
-    first, tail = {None: ([], lens), "bot": (lens, [("CHANGES_REQUESTED", head)]),
-                   "lens": (lens, [("CHANGES_REQUESTED", head, lens[0][2]), ("APPROVED", head)])}[last]
+    lens = _lenses(kb, head)  # the bot's approval of H for each card: last of all, or first before a revocation
+    first, tail = {"bot": (lens, [("CHANGES_REQUESTED", head)]),
+                   "lens": (lens, [("CHANGES_REQUESTED", head, lens[0][2]), ("APPROVED", head)])}.get(last, ([], lens))
     _reviews(gh, *first, *[("APPROVED", head, None, "someone")] * (total - len(first) - len(tail)), *tail)
     _tick(kb)
     reads = [(query["per_page"], query.get("page")) for path, query in gh["queries"] if path.endswith("/reviews")]
@@ -426,7 +443,7 @@ def test_a_rework_card_that_continues_a_delivered_head_closes_the_earlier_pull_r
     first, delivered = _ready(armed)
     rework, continued = _approved(kb, repo, "rework")
     other, unrelated = _approved(kb, repo, "unrelated")
-    _raw(db, "UPDATE tasks SET base_commit = ? WHERE id = ?", delivered, rework)
+    _continues(db, rework, delivered, first)
     _published_as(db, gh, rework, continued, 42, ELSEWHERE if case == "base_elsewhere" else REPO)
     _published_as(db, gh, other, unrelated, *((41, ELSEWHERE) if case == "number_elsewhere" else (43, REPO)))
     if case == "origin_changed":
@@ -455,7 +472,7 @@ def test_a_close_is_done_only_when_the_answer_shows_that_pull_request_closed(arm
     db = kb.kanban_db_path()
     first, delivered = _ready(armed)
     rework, continued = _approved(kb, repo, "rework")
-    _raw(db, "UPDATE tasks SET base_commit = ? WHERE id = ?", delivered, rework)
+    _continues(db, rework, delivered, first)
     _published_as(db, gh, rework, continued, 42)
     if answer == "overlap":
         gh["hooks"]["PATCH"] = lambda: _tick(kb)
@@ -473,15 +490,45 @@ def test_a_close_is_done_only_when_the_answer_shows_that_pull_request_closed(arm
     assert _state(kb, delivered) == ("replaced" if answer == "overlap" else "close_refused")
 
 
+@pytest.mark.parametrize("linked", ["first", "second", None])  # the continuation's task_links parent, if any
+def test_a_continuation_closes_only_the_pull_request_of_the_source_card_it_is_linked_to(armed, linked):
+    """Owner rule 4 of round 1: a replacement is matched by the repository, the number and the source card, never
+    by a base commit alone. Two source cards are published at the same H as 41 and 43, and a continuation of base
+    H as 42: only the pull request of its task_links parent is closed, once, and with no parent none is."""
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    first, head = _ready(armed)
+    second, _ = _approved(kb, repo, "second")
+    _raw(db, "UPDATE kanban_deliveries SET source_head = ? WHERE source_task_id = ?", head, second)
+    _raw(db, "UPDATE tasks SET head_commit = ? WHERE id = ?", head, second)  # an independent source done at H too
+    _published_as(db, gh, second, head, 43)
+    rework, continued = _approved(kb, repo, "rework")
+    _published_as(db, gh, rework, continued, 42)
+    source, closed = {"first": (first, 41), "second": (second, 43)}.get(linked, (None, None))
+    _continues(db, rework, head, source)
+    gh["close"] = (200, {"number": closed, "state": "closed"})
+
+    _tick(kb)
+    _tick(kb)
+
+    assert [write for write in gh["writes"] if write[0] == "PATCH"] == (
+        [("PATCH", f"/repos/{REPO}/pulls/{closed}", {"state": "closed"})] if linked else [])
+    assert [(tid, kind, p["pull_request_number"], p["replaced_by"]) for tid in (first, second)
+            for kind, p in _events(kb, tid) if kind.startswith(("delivery_close", "delivery_replaced"))] == [
+        (source, kind, closed, rework) for kind in ("delivery_close_pending", "delivery_replaced") if linked]
+    assert _raw(db, "SELECT pull_request_number FROM kanban_deliveries WHERE pull_request_state = 'replaced'") == (
+        [{"pull_request_number": closed}] if linked else [])
+
+
 def _continued(armed, tier=2):
     """H delivered as pull request 41 and a rework card published as 42, both past their review step; the rework
-    card's recorded base is then H. Returns the source card, H and the rework card."""
+    card then continues H as a linked rework card does. Returns the source card, H and the rework card."""
     kb, root, repo, gh = armed
     first, delivered = _ready(armed, tier=tier)
     rework, continued = _approved(kb, repo, "rework")
     _published_as(kb.kanban_db_path(), gh, rework, continued, 42)
     _tick(kb)
-    _raw(kb.kanban_db_path(), "UPDATE tasks SET base_commit = ? WHERE id = ?", delivered, rework)
+    _continues(kb.kanban_db_path(), rework, delivered, first)
     return first, delivered, rework
 
 

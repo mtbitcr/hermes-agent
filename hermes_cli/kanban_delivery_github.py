@@ -162,8 +162,20 @@ def _connect() -> http.client.HTTPConnection:
     return http.client.HTTPSConnection(API_HOST, timeout=30, context=context)
 
 
-def _exchange(method: str, target: str, authorization: str, payload=None) -> tuple[int, object]:
-    """One request to GitHub: the status, and the decoded body of a 2xx answer (else None)."""
+def _names_next_page(link: str | None) -> bool | None:
+    """Whether GitHub's Link header names a next page (rel="next"): False when it names none or
+    there is none, None when it cannot be read. Only this fact leaves the transport, never the header."""
+    if link is None:
+        return False
+    rels = [re.fullmatch(r'\s*<[^<>]*>\s*;\s*rel="([\w ]+)"\s*', value) for value in link.split(",")]
+    if not all(rels):
+        return None
+    return any("next" in rel[1].lower().split() for rel in rels)
+
+
+def _exchange(method: str, target: str, authorization: str, payload=None) -> tuple[int, object, bool | None]:
+    """One request to GitHub: the status, the decoded body of a 2xx answer (else None), and whether
+    its Link header names a next page (:func:`_names_next_page`). No header is passed on."""
     body = None if payload is None else json.dumps(payload).encode()
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
                "User-Agent": "hermes-kanban-delivery", "Authorization": authorization}
@@ -176,9 +188,9 @@ def _exchange(method: str, target: str, authorization: str, payload=None) -> tup
     try:
         connection.request(method, target, body=body, headers=headers)
         response = connection.getresponse()
-        status, raw = response.status, response.read()
+        status, raw, more = response.status, response.read(), _names_next_page(response.getheader("Link"))
     except (OSError, http.client.HTTPException):
-        status = raw = None
+        status = raw = more = None
     finally:
         connection.close()
     # Raised after the handler, not inside it: a chained IncompleteRead or JSONDecodeError would
@@ -186,14 +198,14 @@ def _exchange(method: str, target: str, authorization: str, payload=None) -> tup
     if status is None:
         raise GitHubTransportError("network_error")
     if not 200 <= status < 300 or not raw:
-        return status, None  # GitHub's error text and redirect targets are never passed on
+        return status, None, more  # GitHub's error text and redirect targets are never passed on
     try:
         value = json.loads(raw)
     except ValueError:
         value = None
     if not isinstance(value, (dict, list)):
         raise GitHubTransportError("bad_response")
-    return status, value
+    return status, value, more
 
 
 def _app_jwt(key_path: Path) -> str:
@@ -303,7 +315,8 @@ class GitHubTransport:
 
     def request(self, method: str, path: str, *, query=None, body=None) -> dict:
         """Call one allowlisted endpoint. Returns {"status", "data"}, where data holds the fixed
-        fields of a 2xx JSON answer and is None for anything else."""
+        fields of a 2xx JSON answer and is None for anything else. A listed page of reviews also
+        says whether GitHub names a next page: "next_page" is True, False, or None when unknown."""
         endpoint = next((e for e, pattern in self._routes if e.method == method
                          and isinstance(path, str) and pattern.fullmatch(path)), None)
         if endpoint is None:
@@ -319,9 +332,10 @@ class GitHubTransport:
         target = f"{path}?{urlencode(values)}" if values else path
         pull = (method, endpoint.template) == ("GET", "/repos/{repo}/pulls/{number}")
         self._pull = None if pull else self._pull
-        status, value = _exchange(method, target, f"Bearer {self._installation_token()}", body)
+        status, value, *paging = _exchange(method, target, f"Bearer {self._installation_token()}", body)
         if endpoint.template.endswith("/reviews") and method == "GET" and isinstance(value, list):
-            return {"status": status, "data": [self._review(review) for review in value]}
+            return {"status": status, "data": [self._review(review) for review in value],
+                    "next_page": paging[0] if paging and isinstance(paging[0], bool) else None}
         data = None if value is None else self._project(value)
         if pull and status == 200 and isinstance(data, dict) and isinstance(data.get("head"), dict):
             self._pull = (data.get("number"), data.get("state"), data["head"].get("sha"), data.get("node_id"))
@@ -342,7 +356,7 @@ class GitHubTransport:
         body = {"query": AUTO_MERGE_MUTATION, "variables": {"pullRequestId": node, "expectedHeadOid": head}}
         if (held, state, pulled) != (number, "open", head) or not endpoint.body(body) or self._token is None:
             raise GitHubTransportError("pull_request_not_at_head")
-        status, value = _exchange(endpoint.method, endpoint.template, f"Bearer {self._token}", body)
+        status, value, *_ = _exchange(endpoint.method, endpoint.template, f"Bearer {self._token}", body)
         return {"status": status, "data": None if value is None else self._project(value)}
 
     def branch_head(self, branch: str) -> str | None:
@@ -402,7 +416,7 @@ class GitHubTransport:
         """One installation token naming only this step's permissions and this one repository."""
         request = {"repositories": [self.repository.split("/")[1]], "permissions": dict(self._permissions)}
         target = _TOKEN_ENDPOINT.template.format(installation=INSTALLATION_ID)
-        status, value = _exchange("POST", target, f"Bearer {_app_jwt(self._key_path)}", request)
+        status, value, *_ = _exchange("POST", target, f"Bearer {_app_jwt(self._key_path)}", request)
         token = value.get("token") if status == 201 and isinstance(value, dict) else None
         if not isinstance(token, str) or not _TOKEN.fullmatch(token):
             raise GitHubTransportError("token_request_failed")
