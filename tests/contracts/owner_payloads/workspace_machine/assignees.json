@@ -1,0 +1,26 @@
+{
+  "body": {
+    "assignees": [
+      {
+        "counts": {
+          "ready": 1,
+          "running": 1
+        },
+        "name": "coder",
+        "on_disk": true
+      },
+      {
+        "counts": {
+          "blocked": 2,
+          "done": 1,
+          "ready": 5,
+          "review": 1,
+          "triage": 1
+        },
+        "name": "default",
+        "on_disk": true
+      }
+    ]
+  },
+  "status": 200
+}

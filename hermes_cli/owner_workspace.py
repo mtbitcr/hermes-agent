@@ -90,7 +90,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db, projects_db
-from hermes_cli.kanban_risk_tier import parse_risk_tier
+from hermes_cli.kanban_risk_tier import (
+    highest_risk_tier,
+    parse_risk_tier,
+    pinned_reasoning_effort,
+    recovered_root_risk_tier,
+)
 from hermes_cli.sqlite_util import write_txn
 from plugins.dashboard_auth.raphael_workspace.model_policy import (
     configured_assignment_for,
@@ -1127,6 +1132,17 @@ def _graph_root_route(tasks: list[dict], root_assignee: str) -> dict:
     return _resolved_route_pin(root_assignee, tier, "root_assignee")
 
 
+def _graph_root_pin(root_route: dict, root_assignee: str, risk_tier: Optional[int]) -> dict:
+    """The root's route pinned at *risk_tier*: its effort, sealed again (P5)."""
+    pin = dict(root_route)
+    pin["reasoning_effort"] = pinned_reasoning_effort(risk_tier, None)
+    pin["model_policy_lock"] = kanban_db.mint_policy_lock(
+        root_assignee, pin["provider_override"], pin["model_override"],
+        pin["reasoning_effort"], pin["execution_tier"],
+    )
+    return pin
+
+
 def _normalize_ownership_scope(value: Any, field: str) -> Optional[list[str]]:
     """Canonicalise one task's explicit repository write boundary.
 
@@ -1657,6 +1673,14 @@ def commit_task_graph(
         "later_milestones": normalized_later,
     }
     digest = _digest(payload)
+    # P5: a new Project's root card takes the highest tier of its tasks, and is
+    # created and pinned at it. Derived after the digest, like the creation
+    # pin; any other root counts as tier 2, as before.
+    root_tier = None
+    root_pin = dict(root_route)
+    if mode == "new":
+        root_tier = highest_risk_tier(task["risk_tier"] for task in normalized_tasks)
+        root_pin = _graph_root_pin(root_route, root_assignee, root_tier)
 
     pconn = projects_db.connect()
     try:
@@ -1779,14 +1803,20 @@ def commit_task_graph(
                     board=board_slug,
                     project_id=canonical_project_id,
                     idempotency_key=root_key,
-                    model_override=root_route["model_override"],
-                    provider_override=root_route["provider_override"],
-                    reasoning_effort=root_route["reasoning_effort"],
-                    execution_tier=root_route["execution_tier"],
-                    model_policy_lock=root_route["model_policy_lock"],
+                    model_override=root_pin["model_override"],
+                    provider_override=root_pin["provider_override"],
+                    reasoning_effort=root_pin["reasoning_effort"],
+                    execution_tier=root_pin["execution_tier"],
+                    model_policy_lock=root_pin["model_policy_lock"],
                     receipt_owned=True,
+                    risk_tier=root_tier,
                 )
                 root = kanban_db.get_task(kconn, root_task_id)
+                if root is not None and root_tier is not None:
+                    # A root a crashed commit wrote before P5, at tier 2, is
+                    # verified as written and never rewritten.
+                    root_tier = recovered_root_risk_tier(root.risk_tier, root_tier)
+                    root_pin = _graph_root_pin(root_route, root_assignee, root_tier)
                 if (
                     root is None
                     or root.project_id != canonical_project_id
@@ -1794,11 +1824,12 @@ def commit_task_graph(
                     or root.title != request_title
                     or root.body != root_body
                     or root.assignee != root_assignee
-                    or root.model_policy_lock != root_route["model_policy_lock"]
-                    or root.model_override != root_route["model_override"]
-                    or root.provider_override != root_route["provider_override"]
-                    or root.reasoning_effort != root_route["reasoning_effort"]
-                    or root.execution_tier != root_route["execution_tier"]
+                    or root.model_policy_lock != root_pin["model_policy_lock"]
+                    or root.model_override != root_pin["model_override"]
+                    or root.provider_override != root_pin["provider_override"]
+                    or root.reasoning_effort != root_pin["reasoning_effort"]
+                    or root.execution_tier != root_pin["execution_tier"]
+                    or (root_tier is not None and root.risk_tier != root_tier)
                 ):
                     raise OwnerWorkspaceError(
                         "crash_recovery_failed",
@@ -3425,12 +3456,14 @@ def read_project_snapshot(
         if task_ids:
             placeholders = ",".join("?" for _ in task_ids)
             for row in conn.execute(
-                f"SELECT task_id, MAX(created_at) AS latest, MAX(id) AS revision "
+                f"SELECT task_id, MAX(created_at) AS latest, MAX(id) AS revision, "
+                f"MAX(kind = 'risk_tier_raised') AS raised "
                 f"FROM task_events WHERE task_id IN ({placeholders}) GROUP BY task_id",
                 task_ids,
             ):
                 event_state[str(row["task_id"])] = {
                     "latest": int(row["latest"]), "revision": int(row["revision"]),
+                    "raised": int(row["raised"]),
                 }
 
         parent_map = {task_id: [] for task_id in task_ids}
@@ -3489,6 +3522,8 @@ def read_project_snapshot(
                 "stopped_work": stopped_work.get(
                     task.id, kanban_db.STOPPED_WORK_NONE
                 ),
+                "risk_tier": task.risk_tier,
+                "risk_tier_raised": bool(state and state["raised"]),
                 "parent_ids": parent_map[task.id],
                 "child_ids": child_map[task.id],
             })
@@ -5660,6 +5695,33 @@ def _inherit_replaced_ownership_scopes(
             replacement["owned_paths"] = scope
 
 
+def _floor_replaced_risk_tiers(
+    kconn: sqlite3.Connection, changes: list[dict], *, project_id: str,
+) -> None:
+    """Lift every card a ``replace``, ``split`` or ``merge`` creates to the
+    highest tier of the cards it replaces (tier plan P5); a higher approved
+    tier is kept. Resolved from committed board state, like the inherited
+    scope above, before the owner is asked. A target that is not a work task
+    of this Project is left to the plan's atomic snapshot check.
+    """
+    for change in changes:
+        action = change["action"]
+        if action not in {"replace", "split", "merge"}:
+            continue
+        targets = change["targets"] if action == "merge" else [change["target"]]
+        replaced = [kanban_db.get_task(kconn, target["task_id"]) for target in targets]
+        tiers = [
+            task.risk_tier
+            for task in replaced
+            if task is not None and task.project_id == project_id
+        ]
+        if not tiers:
+            continue
+        successors = change["replacements"] if action == "split" else [change["replacement"]]
+        for spec in successors:
+            spec["risk_tier"] = highest_risk_tier([spec["risk_tier"], *tiers])
+
+
 def _resolve_existing_project_board(
     pconn: sqlite3.Connection, project_id: str, *, allow_archived: bool = False,
 ):
@@ -6179,6 +6241,9 @@ def commit_project_plan(
             # explicitly approved one and the owner is never asked to approve a
             # plan that cannot be applied.
             _inherit_replaced_ownership_scopes(
+                kconn, normalized_changes, project_id=project_id,
+            )
+            _floor_replaced_risk_tiers(
                 kconn, normalized_changes, project_id=project_id,
             )
             _assert_ownership_scope_repository(

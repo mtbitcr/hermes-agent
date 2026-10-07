@@ -178,7 +178,7 @@ def test_unadmitted_route_is_refused_at_the_shared_boundary(override):
 def test_a_deep_task_lane_is_not_a_valid_base_route():
     """Base configs use validate_assignment; deep lanes are task authority only.
 
-    ``raphael-business``/anthropic admits ``claude-sonnet-5`` / high as its
+    ``raphael-business``/anthropic admits ``claude-sonnet-5-5`` / high as its
     BASE route and ``claude-opus-5-5`` / max only as its deep TASK lane.
     Accepting the deep lane as a base route would erase the routine/deep
     separation. (This pair is used because the current matrix really does give
@@ -187,7 +187,7 @@ def test_a_deep_task_lane_is_not_a_valid_base_route():
     show this.)
     """
     base = {
-        "model": {"provider": "anthropic", "default": "claude-sonnet-5"},
+        "model": {"provider": "anthropic", "default": "claude-sonnet-5-5"},
         "agent": {"reasoning_effort": "high"},
         "fallback_providers": [],
     }
@@ -195,7 +195,7 @@ def test_a_deep_task_lane_is_not_a_valid_base_route():
     model_policy.enroll_profile("raphael-business")
     routine = model_policy.task_assignment_for("raphael-business", "anthropic", "routine")
     deep = model_policy.task_assignment_for("raphael-business", "anthropic", "deep")
-    assert (routine.model, routine.reasoning_effort) == ("claude-sonnet-5", "high")
+    assert (routine.model, routine.reasoning_effort) == ("claude-sonnet-5-5", "high")
     assert (deep.model, deep.reasoning_effort) == ("claude-opus-5-5", "max")
     # Neither the deep model alone nor the exact deep lane is a base route.
     for deep_route in (
@@ -208,7 +208,7 @@ def test_a_deep_task_lane_is_not_a_valid_base_route():
     ):
         with pytest.raises(ValueError, match="unadmitted Raphael model assignment"):
             _scoped_save("raphael-business", deep_route)
-        assert _written("raphael-business")["model"]["default"] == "claude-sonnet-5"
+        assert _written("raphael-business")["model"]["default"] == "claude-sonnet-5-5"
         assert _written("raphael-business")["agent"]["reasoning_effort"] == "high"
     # The same route IS admitted as a task pin.
     assert model_policy.validate_runtime_assignment(

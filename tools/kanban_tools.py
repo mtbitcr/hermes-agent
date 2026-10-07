@@ -2604,6 +2604,7 @@ def _handle_review_findings(args: dict, **kw) -> str:
                     findings=findings,
                     candidate_digest=kernel_head,
                     expected_run_id=run_id,
+                    risk_tier=args.get("risk_tier"),
                 )
             except kb.ReviewFindingsError as e:
                 return tool_error(
@@ -3967,7 +3968,8 @@ KANBAN_REVIEW_FINDINGS_SCHEMA = {
         "through this tool at all. Reporting the SAME findings against an "
         "unchanged candidate twice in a row blocks the task for an owner "
         "decision instead of re-running the implementer. Only valid from a "
-        "task claimed from the review column, and only for your own task."
+        "task claimed from the review column, and only for your own task. "
+        "risk_tier may raise the card's tier, never lower it."
     ),
     "parameters": {
         "type": "object",
@@ -4015,6 +4017,15 @@ KANBAN_REVIEW_FINDINGS_SCHEMA = {
                     "automatically. A value that disagrees with the "
                     "kernel-parked head is refused; this tool never binds "
                     "a candidate the kernel did not itself park."
+                ),
+            },
+            "risk_tier": {
+                "type": "integer",
+                "enum": [0, 1, 2],
+                "description": (
+                    "Optional. Raise the card's risk tier when the work is "
+                    "riskier than its tier says. A tier may only be raised: "
+                    "a lower one is refused and nothing is recorded."
                 ),
             },
             "board": _board_schema_prop(),

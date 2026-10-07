@@ -1,0 +1,8 @@
+{
+  "body": {
+    "detail": {
+      "code": "gateway_unavailable"
+    }
+  },
+  "status": 503
+}

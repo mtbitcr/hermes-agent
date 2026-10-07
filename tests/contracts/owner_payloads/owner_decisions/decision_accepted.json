@@ -1,0 +1,10 @@
+{
+  "body": {
+    "data": {
+      "decision": "accepted",
+      "decision_ref": "decision_06c769c5be3543582566c5bf2409be25"
+    },
+    "object": "hermes.owner_workspace.decision"
+  },
+  "status": 200
+}

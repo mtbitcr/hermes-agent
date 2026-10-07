@@ -485,8 +485,9 @@ def test_task_graph_resolves_and_locks_model_routes_before_approval(ctx):
 
     # 'default'/anthropic admits claude-opus-5-5 on BOTH lanes, so the digest —
     # not the model — is what distinguishes the deep pin from the routine one.
-    # The effort follows the risk tier: high for the tier-1 build, max for the
-    # tier-1 security review (R12) and for the root, which records tier 2.
+    # The effort follows the risk tier: high for the tier-1 build and max for the
+    # tier-1 security review (R12). The root takes the highest tier of its tasks,
+    # tier 1, so its effort is high.
     assert route(first) == (
         "anthropic", "claude-opus-5-5", "high",
         lock("default", "claude-opus-5-5", "deep", "high"),
@@ -500,8 +501,8 @@ def test_task_graph_resolves_and_locks_model_routes_before_approval(ctx):
     # The executable root reviews a milestone containing deep work, so it is
     # pinned too — and on the deep lane.
     assert route(root) == (
-        "anthropic", "claude-opus-5-5", "max",
-        lock("default", "claude-opus-5-5", "deep"),
+        "anthropic", "claude-opus-5-5", "high",
+        lock("default", "claude-opus-5-5", "deep", "high"),
     )
     # Every persisted lock is one the dispatcher would actually accept.
     with kanban_db.connect(board=result["board"]) as conn:
@@ -523,7 +524,7 @@ def test_task_graph_root_is_pinned_on_the_routine_lane_for_routine_work(ctx):
     assert (root.execution_tier, root.model_policy_lock) == (
         "routine",
         kanban_db.mint_policy_lock(
-            "default", "anthropic", root.model_override, "max", "routine",
+            "default", "anthropic", root.model_override, "high", "routine",
         ),
     )
 
@@ -554,9 +555,10 @@ def test_committed_owner_task_route_cannot_be_mutated_afterwards(ctx):
     approver.join()
 
     # The pinned effort follows each card's risk tier: high for the tier-1
-    # build, max for the tier-1 security review (R12) and for the root.
+    # build, max for the tier-1 security review (R12), and high for the root,
+    # which takes the highest tier of its tasks (tier 1).
     pinned = {
-        result["root_task_id"]: "max",
+        result["root_task_id"]: "high",
         result["task_ids"][0]: "high",
         result["task_ids"][1]: "max",
     }
@@ -840,7 +842,7 @@ def test_project_snapshot_is_exact_receipt_backed_and_read_only(ctx):
     assert all(set(task) == {
         "id", "title", "assignee_name", "responsibility", "updated_at",
         "event_revision", "review_state", "stopped_work",
-        "parent_ids", "child_ids",
+        "risk_tier", "risk_tier_raised", "parent_ids", "child_ids",
     } for task in tasks)
     # None of these three fresh tasks ever entered review.
     assert all(task["review_state"] == "none" for task in tasks)
@@ -1003,6 +1005,118 @@ def test_project_snapshot_marks_foreign_work_relations_without_disclosing_them(
     assert by_id[dependent]["parent_ids"] == []
     assert by_id[dependent]["omitted_parent_count"] == 1
     assert foreign_parent not in json.dumps(context)
+
+
+def _risk_snapshot_project(ctx, key: str):
+    args = _task_graph_args(idempotency_key=key, project_name="Risk Project")
+    approver = _with_approver(ctx.session)
+    result = _commit_task_graph(ctx, **args)
+    approver.join()
+    return result
+
+
+def _snapshot_tasks(snapshot: dict) -> dict:
+    return {
+        task["id"]: task
+        for column in snapshot["columns"]
+        for task in column["tasks"]
+    }
+
+
+def _risk_task(conn, project_id: str, title: str, tier):
+    return kanban_db.create_task(
+        conn, title=title, project_id=project_id, owned_paths=[], risk_tier=tier,
+    )
+
+
+def test_project_snapshot_carries_each_tasks_stored_risk_tier(ctx):
+    result = _risk_snapshot_project(ctx, "graph-risk-tier")
+    with kanban_db.connect(board=result["board"]) as conn:
+        ids = {
+            tier: _risk_task(conn, result["project_id"], f"Risk {tier}", tier)
+            for tier in (0, 1, 2, None)
+        }
+
+    tasks = _snapshot_tasks(ow.read_project_snapshot(ctx, result["project_slug"]))
+
+    for tier, task_id in ids.items():
+        assert tasks[task_id]["risk_tier"] == tier
+        assert type(tasks[task_id]["risk_tier"]) is (type(None) if tier is None else int)
+        assert tasks[task_id]["risk_tier_raised"] is False
+
+
+def test_project_snapshot_risk_raised_survives_a_newer_non_risk_event(ctx):
+    result = _risk_snapshot_project(ctx, "graph-risk-raised")
+    with kanban_db.connect(board=result["board"]) as conn:
+        raised = _risk_task(conn, result["project_id"], "Raised", 0)
+        plain = _risk_task(conn, result["project_id"], "Plain", 1)
+        with kanban_db.write_txn(conn):
+            conn.execute("UPDATE tasks SET risk_tier = 1 WHERE id = ?", (raised,))
+            kanban_db._append_event(
+                conn, raised, "risk_tier_raised",
+                {"from": 0, "to": 1, "reviewer": "coder", "run_id": 1},
+            )
+    first = _snapshot_tasks(ow.read_project_snapshot(ctx, result["project_slug"]))
+    assert first[raised]["risk_tier"] == 1
+    assert first[raised]["risk_tier_raised"] is True
+    assert first[plain]["risk_tier_raised"] is False
+
+    with kanban_db.connect(board=result["board"]) as conn:
+        with kanban_db.write_txn(conn):
+            kanban_db._append_event(conn, raised, "commented", {"len": 3})
+    later = _snapshot_tasks(ow.read_project_snapshot(ctx, result["project_slug"]))
+    assert later[raised]["event_revision"] > first[raised]["event_revision"]
+    assert later[raised]["risk_tier_raised"] is True
+    assert later[plain]["risk_tier_raised"] is False
+
+
+def test_project_snapshot_risk_never_discloses_another_projects_work(ctx):
+    result = _risk_snapshot_project(ctx, "graph-risk-foreign")
+    with kanban_db.connect(board=result["board"]) as conn:
+        own = _risk_task(conn, result["project_id"], "Own", 0)
+        foreign = _risk_task(conn, "p_foreign", "Foreign secret", 2)
+        with kanban_db.write_txn(conn):
+            kanban_db._append_event(
+                conn, foreign, "risk_tier_raised",
+                {"from": 1, "to": 2, "reviewer": "coder", "run_id": 1},
+            )
+
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+    tasks = _snapshot_tasks(snapshot)
+
+    assert foreign not in json.dumps(snapshot)
+    assert "Foreign secret" not in json.dumps(snapshot)
+    assert own in tasks
+    assert tasks[own]["risk_tier"] == 0
+    assert tasks[own]["risk_tier_raised"] is False
+    assert all(task["risk_tier_raised"] is False for task in tasks.values())
+
+
+def test_project_snapshot_risk_read_performs_no_writes(ctx):
+    result = _risk_snapshot_project(ctx, "graph-risk-read-only")
+    with kanban_db.connect(board=result["board"]) as conn:
+        raised = _risk_task(conn, result["project_id"], "Raised", 0)
+        with kanban_db.write_txn(conn):
+            kanban_db._append_event(
+                conn, raised, "risk_tier_raised",
+                {"from": 0, "to": 1, "reviewer": "coder", "run_id": 1},
+            )
+    board_db = kanban_db.board_dir(result["board"]) / "kanban.db"
+
+    def state():
+        with kanban_db.connect(board=result["board"]) as conn:
+            return (
+                [tuple(r) for r in conn.execute("SELECT * FROM tasks ORDER BY id")],
+                [tuple(r) for r in conn.execute("SELECT * FROM task_events ORDER BY id")],
+                board_db.stat().st_mtime_ns,
+            )
+
+    before = state()
+    snapshot = ow.read_project_snapshot(ctx, result["project_slug"])
+    after = state()
+
+    assert _snapshot_tasks(snapshot)[raised]["risk_tier_raised"] is True
+    assert before == after
 
 
 def test_owner_title_projection_vectors_are_shared_with_the_owner_workspace():
@@ -4073,10 +4187,10 @@ def test_project_plan_replace_carries_an_explicit_ownership_scope(ctx, tmp_path)
         assert replacement.workspace_path == str(
             repo / ".worktrees" / replacement_id
         )
-        # The route lock still binds the whole approved route tuple, with
-        # the effort that the replacement's tier 1 pins.
+        # The route lock still binds the whole approved route tuple, with the
+        # effort of the highest tier among the cards it replaces (tier 2): max.
         assert replacement.model_policy_lock == kanban_db.mint_policy_lock(
-            "default", "anthropic", "claude-opus-5-5", "high", "deep",
+            "default", "anthropic", "claude-opus-5-5", "max", "deep",
         )
         assert replacement.responsibility == "R09"
         with pytest.raises(RuntimeError, match="owner-governed"):
@@ -7315,11 +7429,11 @@ def test_real_profile_config_resolves_and_locks_owner_task_routes(ctx, real_reso
     and effort, and the lock is minted, persisted and then re-validated exactly
     as ``_default_spawn`` does.
     """
-    # raphael-business is the Anthropic role whose current matrix really does
-    # give routine and deep work different lanes (Sonnet 5 vs Opus 5.5), so
+    # raphael-business is an Anthropic role whose current matrix really does
+    # give routine and deep work different lanes (Sonnet 5.5 vs Opus 5.5), so
     # the pins below can only be right if the matrix chose them.
     _write_real_profile_config(
-        "raphael-business", "anthropic", "claude-sonnet-5", "high"
+        "raphael-business", "anthropic", "claude-sonnet-5-5", "high"
     )
     args = _task_graph_args(
         idempotency_key="graph-real-config",
@@ -7358,7 +7472,7 @@ def test_real_profile_config_resolves_and_locks_owner_task_routes(ctx, real_reso
         routine_row["execution_tier"],
         routine_row["model_override"],
         routine_row["reasoning_effort"],
-    ) == ("routine", "claude-sonnet-5", "high")
+    ) == ("routine", "claude-sonnet-5-5", "high")
     # Every persisted lock is one the dispatcher would honour.
     for task_id, row in rows.items():
         assert row["model_policy_lock"], task_id
@@ -7439,7 +7553,7 @@ def test_locked_review_handoff_is_refused_rather_than_silently_repinned(ctx):
         before = conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
-        assert before["model_override"] == "claude-opus-5-5"
+        assert before["model_override"] == "claude-sonnet-5-5"
         with kanban_db.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,)

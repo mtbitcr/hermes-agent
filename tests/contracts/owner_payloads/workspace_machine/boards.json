@@ -1,0 +1,24 @@
+{
+  "body": {
+    "boards": [
+      {
+        "counts": {
+          "archived": 0,
+          "blocked": 2,
+          "done": 1,
+          "ready": 6,
+          "review": 1,
+          "running": 1,
+          "scheduled": 0,
+          "todo": 0,
+          "triage": 1
+        },
+        "name": "Raphael Workspace",
+        "project_id": "p_2f169f9b",
+        "slug": "raphael-workspace",
+        "total": 12
+      }
+    ]
+  },
+  "status": 200
+}
