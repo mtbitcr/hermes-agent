@@ -34041,8 +34041,8 @@ def _complete_run_handover_before_timeout(
     it out. Returns True only when the completion landed.
 
     A handover is the run's own patch and report. On a card that requires
-    review the run's one saved patch is enough (owner decision 4): it goes
-    over as the existing saved-result handover does, the one candidate of
+    review the run's newest saved patch is enough (owner decision 4): it goes
+    over as the existing saved-result handover does, the last candidate of
     :func:`_saved_patch_ids_for_review` passed to :func:`complete_task` as
     ``_saved_result_attachment_id``, whose review park records it.
 
@@ -34092,11 +34092,11 @@ def _complete_run_handover_before_timeout(
     if handover is not None:
         patch_id, report_attachment = handover[0].id, handover[1]
     else:
-        # Without a report, only the one patch a reviewed card's run saved.
+        # Without a report, the newest patch a reviewed card's run saved.
         patches = _saved_patch_ids_for_review(conn, task_id, int(run_id))
-        if len(patches) != 1:
+        if not patches:
             return False
-        patch_id, report_attachment = patches[0], None
+        patch_id, report_attachment = patches[-1], None
     if stop_worker is not None:
         stop_worker()
     summary: Optional[str] = _BUDGET_PATCH_HANDOVER_SUMMARY
@@ -34130,8 +34130,8 @@ def _complete_run_handover_before_timeout(
             metadata=metadata,
             patch_attachment_id=patch_id,
             expected_run_id=int(run_id),
-            # A lone saved patch is the saved-result handover: its review park
-            # records it, and a refusal carries the park's own reason.
+            # A saved patch with no report is the saved-result handover: its
+            # review park records it; a refusal carries the park's own reason.
             _saved_result_attachment_id=patch_id if report_id is None else None,
         )
         if not handover_ok:
@@ -34191,7 +34191,7 @@ def enforce_max_runtime(
     materialization/completion fails for any reason, this falls back to
     the ordinary timeout behavior below (never silently loses the task)
     and records why via a ``run_handover_failed`` event. On a card that
-    requires review the run's one saved patch is enough without a report:
+    requires review the run's newest saved patch is enough without a report:
     the same completion parks it in the review lane.
 
     Otherwise: sends SIGTERM, waits a short grace window, then SIGKILL.
@@ -34789,8 +34789,8 @@ def _saved_patch_ids_for_review(
     existing handover then parks the work in the review lane, so the kernel
     never finishes a card on a worker's behalf. A run claimed from review is
     the reviewer's own, and ``complete_task`` would read it as an approval.
-    Counted from the run's own agent ``attached`` receipts; with several
-    patches the kernel does not pick one.
+    Counted from the run's own agent ``attached`` receipts in receipt order;
+    with several patches the newest, the last id, is the one handed over.
 
     This is the one copy of these rules: every other caller, inside the
     kernel or out, takes its candidates from here.
@@ -34821,7 +34821,7 @@ def saved_patch_ids_for_review(
 
     This is their entry point: it returns
     :func:`_saved_patch_ids_for_review`'s list unchanged, oldest first. A
-    caller decides by the list's length alone and keeps no copy of the rules.
+    caller hands over the last, newest id and keeps no copy of the rules.
     """
     return _saved_patch_ids_for_review(conn, task_id, run_id)
 
@@ -34832,16 +34832,16 @@ def _saved_patch_for_review_handover(
     run_id: Optional[int],
     unreported: dict,
 ) -> Optional[int]:
-    """The one patch a quietly exited run saved for review, or ``None``.
+    """The newest patch a quietly exited run saved for review, or ``None``.
 
     Applies the quiet-exit gate, takes its candidates from
-    :func:`_saved_patch_ids_for_review`, and with several patches does not
-    pick one.
+    :func:`_saved_patch_ids_for_review`, and with several patches picks the
+    newest by receipt order, the last id.
     """
     if unreported.get("evidence") != "deliverable_present":
         return None
     patches = _saved_patch_ids_for_review(conn, task_id, run_id)
-    return patches[0] if len(patches) == 1 else None
+    return patches[-1] if patches else None
 
 
 def _saved_patch_handover_marker(
@@ -34887,7 +34887,7 @@ def _saved_patch_handover_pending(
     scan. It also recognizes the unmarked row the scan sets aside later on
     the same tick, in the scan's own terms: the reap registry saw its worker
     exit cleanly, its identity proves it gone, and
-    :func:`_saved_patch_for_review_handover` finds the one patch its run saved
+    :func:`_saved_patch_for_review_handover` finds a patch its run saved
     for review. Its claim or heartbeat can lapse before the first scan has
     marked it. The runtime cap runs after the scan, which has handed such a
     row over or marked it by then, and does not pass it.
@@ -35207,8 +35207,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     classifies it instead (:func:`_known_provider_stop`), and the run is
     booked as that stop.
 
-    A clean exit whose run saved exactly one patch of its own, on a card that
-    requires review, is handed to review through :func:`complete_task` -- the
+    A clean exit whose run saved patches of its own, on a card that requires
+    review, hands the newest to review through :func:`complete_task` -- the
     existing handover -- once the main transaction has committed, instead of
     being parked for a person to hand over by hand; a refused handover parks it
     exactly as before. Until then the task stays running with its run open,

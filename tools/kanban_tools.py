@@ -2227,7 +2227,7 @@ def _handle_block(args: dict, **kw) -> str:
 def _hand_saved_patch_to_review(
     kb, conn, tid, patch_attachment_id, summary, metadata, run_id,
 ) -> str:
-    """Hand the run's one saved patch to review through ``complete_task``.
+    """Hand the run's newest saved patch to review through ``complete_task``.
 
     ``complete_task`` takes no ``reviewer``: it parks the card for the
     reviewer the policy resolves, so the tool's ``reviewer`` argument does
@@ -2324,19 +2324,9 @@ def _handle_request_review(args: dict, **kw) -> str:
                 )
             run_id = _worker_run_id(tid)
             saved_patches = kb.saved_patch_ids_for_review(conn, tid, run_id)
-            if len(saved_patches) > 1:
-                ids = ", ".join(str(patch) for patch in saved_patches)
-                return tool_error(
-                    f"could not request review for {tid}: {len(saved_patches)} "
-                    "saved patches were found for this run (attachment ids "
-                    f"{ids}) and none was handed over, so no review was "
-                    "requested. Keep exactly one saved patch and ask for review "
-                    "again, or hand over the one you mean with kanban_complete "
-                    "and its patch_attachment_id."
-                )
-            if len(saved_patches) == 1:
+            if saved_patches:
                 return _hand_saved_patch_to_review(
-                    kb, conn, tid, saved_patches[0], summary, metadata, run_id,
+                    kb, conn, tid, saved_patches[-1], summary, metadata, run_id,
                 )
             ok, fail_reason = kb.request_review(
                 conn, tid,
