@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import inspect
 import json
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -55,7 +55,10 @@ def armed(world, monkeypatch):
                 raise transport.GitHubTransportError("network_error")
             return answer
         if pull and path.endswith("/reviews"):
-            return 200, gh["reviews"].get(int(parts[5]), [])
+            query = parse_qs(urlsplit(target).query)  # listed 100 a page, each read's query kept
+            gh["queries"].append((path, query))
+            page = int(query.get("page", ["1"])[0])
+            return 200, gh["reviews"].get(int(parts[5]), [])[(page - 1) * 100:page * 100]
         if pull and len(parts) == 6:
             number, owner = int(parts[5]), "/".join(parts[2:4])
             heads = {41: gh["pull_head"] or gh["head"], **gh["pulls"]}
@@ -317,6 +320,35 @@ def test_a_new_head_starts_fresh_after_a_refused_arm(armed):
     assert [(kind, p["head"]) for kind, p in _events(kb, tid) if "auto_merge" in kind] == [
         ("delivery_auto_merge_refused", first), ("delivery_auto_merge_armed", second)]
     assert _state(kb, second) == "auto_merge_armed"
+
+
+@pytest.mark.parametrize("total, last, pages, outcome", [
+    (99, None, 1, "armed"), (100, None, 2, "armed"), (101, None, 2, "armed"), (200, None, 3, "armed"),
+    (150, "bot", 2, None), (150, "lens", 2, None), (1000, None, 10, "refused"), (1050, None, 10, "refused")])
+def test_every_review_page_is_read_up_to_ten_and_a_longer_history_refuses_h_once(armed, total, last, pages, outcome):
+    """Owner rule 2 of round 3: reviews are read 100 a page until one is not full, ten pages at most, and judged
+    over them all, so a later page can revoke. Ten full pages refuse H once: nothing is sent, then or later."""
+    kb, root, repo, gh = armed
+    tid, head = _ready(armed, tier=0)
+    _tick(kb)
+    _done(kb.kanban_db_path())
+    lens = _lenses(kb, head)  # the bot's approval of H for the one card: last of all, or first before a revocation
+    first, tail = {None: ([], lens), "bot": (lens, [("CHANGES_REQUESTED", head)]),
+                   "lens": (lens, [("CHANGES_REQUESTED", head, lens[0][2]), ("APPROVED", head)])}[last]
+    _reviews(gh, *first, *[("APPROVED", head, None, "someone")] * (total - len(first) - len(tail)), *tail)
+    _tick(kb)
+    reads = [(query["per_page"], query.get("page")) for path, query in gh["queries"] if path.endswith("/reviews")]
+    assert reads == [(["100"], [str(n)]) for n in range(1, pages + 1)]
+    assert ([body["variables"]["expectedHeadOid"] for body in _arms(gh)], _state(kb, head)) == (
+        [head] if outcome == "armed" else [], f"auto_merge_{outcome}" if outcome else "review_cards_created")
+    assert [(kind, p["head"], p["status"], p["reason"]) for kind, p in _events(kb, tid) if "auto_merge" in kind] == {
+        "armed": [("delivery_auto_merge_armed", head, 200, None)], None: [],
+        "refused": [("delivery_auto_merge_refused", head, None, "review_history_over_10_pages")]}[outcome]
+    assert _raw(kb.kanban_db_path(), "SELECT id FROM kanban_deliveries WHERE publish_lease IS NOT NULL") == []
+    calls, events, arms, state = len(gh["calls"]), _events(kb, tid), _arms(gh), _state(kb, head)
+    _tick(kb)
+    assert (_events(kb, tid), _arms(gh), _state(kb, head)) == (events, arms, state)  # nothing more sent or recorded
+    assert (len(gh["calls"]) == calls) is (outcome is not None)  # only a waiting H is read again
 
 
 @pytest.mark.parametrize("read", ["PULL", "GET"])  # changed while the pull request is read, or its reviews

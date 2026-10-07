@@ -990,6 +990,7 @@ _PENDING, _ARMED, _ARM_REFUSED, _ARM_UNKNOWN = (
     "auto_merge_pending", "auto_merge_armed", "auto_merge_refused", "auto_merge_unknown")
 _ARM_HELD = (_PENDING, _ARMED, _ARM_UNKNOWN)
 _REPLACED, _CLOSE_REFUSED = "replaced", "close_refused"
+_REVIEW_PAGES = 10  # owner rule 2 of round 3: a pull request's reviews are read up to 10 pages of 100
 # A row's repository: the publish step's own record of the pull request it published,
 # never the current git origin. No record, no repository, and nothing is sent.
 _RECEIPT = ("(SELECT json_extract(payload, '$.repository') FROM task_events WHERE task_id = {0}.source_task_id "
@@ -1088,7 +1089,7 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
     read comes first: the pull request, open at H, then its reviews, which approve H lens by
     lens. One write transaction then reads the complete evidence again, finds the pull request
     unclaimed and reserves the arm under this attempt. The arm is the one call after it, and
-    its answer is written to this attempt only."""
+    its answer is written to this attempt only. Ten full pages of reviews refuse H once instead."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head, number, repository = (row[key] for key in (
@@ -1098,21 +1099,33 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
         claimed = _claimed(conn, repository, number)
     if claimed or not evidence[2] or repository not in _policy_repositories() or not delivery_settings():
         return None  # claimed, a required card is missing, open or returned changes, or no repository recorded
+    reviews, whole = [], False
     try:
         github = GitHubTransport("publish", repository)
         if not _open_at_head(github, repository, row):
             return None  # the pull request left H or is closed: nothing to arm
-        listed = _answered(github.request("GET", f"/repos/{repository}/pulls/{number}/reviews",
-                                          query={"per_page": 100}))
+        for page in range(1, _REVIEW_PAGES + 1):  # oldest first; a page of fewer than 100 is the last
+            listed = _answered(github.request("GET", f"/repos/{repository}/pulls/{number}/reviews",
+                                              query={"per_page": 100, "page": page}))
+            if listed["status"] != 200 or not isinstance(listed["data"], list):
+                return None  # a page GitHub does not list: nothing is armed or recorded on this pass
+            reviews, whole = reviews + listed["data"], len(listed["data"]) < 100
+            if whole:
+                break
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None
-    reviews = listed["data"] if listed["status"] == 200 and isinstance(listed["data"], list) else []
-    if len(reviews) >= 100 or not _lenses_approve(reviews, head, evidence[2]):
-        return None  # a lens or the bot's latest review does not approve H, or not every review was read
+    if whole and not _lenses_approve(reviews, head, evidence[2]):
+        return None  # a lens or the bot's latest review does not approve H
     attempt = secrets.token_hex(8)
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or _arm_evidence(conn, row) != evidence or _claimed(conn, repository, number):
             return None  # the evidence changed while GitHub was read: nothing is sent
+        if not whole:  # ten full pages: more may follow, past the bound, so H is refused once and never sent
+            conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (_ARM_REFUSED, row["id"]))
+            kb._append_event(conn, source, f"delivery_{_ARM_REFUSED}", _outcome(
+                row, repository=repository, status=None, reason="review_history_over_10_pages",
+                cards=[card[0] for card in evidence[2]]))
+            return _ARM_REFUSED
         conn.execute("UPDATE kanban_deliveries SET pull_request_state = ?, publish_lease = ? WHERE id = ?",
                      (_PENDING, attempt, row["id"]))
     answer = _sent(github, "arm_auto_merge", number, head)
@@ -1152,7 +1165,7 @@ def _claimed(conn: sqlite3.Connection, repository: str, number: int) -> bool:
 def _close_replaced(db_path: Path, row: dict) -> None:
     """Close, once, the pull request of a head a rework card continues (owner rules 2 and 3 of
     round 2). GitHub must show it open at that head; one write transaction then reads the
-    complete replacement proof again, finds the pull request unclaimed and reserves the close
+    replacement proof again, finds the pull request unclaimed and reserves the close
     under this attempt, and the one call setting its state to closed follows. Done only when
     the answer shows that pull request closed; else a close refusal, which keeps an armed hold."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
@@ -1191,7 +1204,8 @@ def _close_replaced(db_path: Path, row: dict) -> None:
 
 
 def _close_proof(conn: sqlite3.Connection, row: dict) -> tuple:
-    """The complete replacement proof, read at once: the row still replaced as ``row`` holds it
+    """The replacement proof, read at once, by design not covering every change of the source or
+    continuation evidence (owner rule 1 of round 3): the row still replaced as ``row`` holds it
     (its repository, number, head and state), its source card's status, head and tier, and the
     continuing card's status and head and its deliveries' heads, repositories and numbers."""
     if _replaced(conn, row["id"]) != [row]:
