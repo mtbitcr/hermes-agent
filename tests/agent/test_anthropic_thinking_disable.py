@@ -46,6 +46,13 @@ OPUS_55_SPELLINGS = [
     "anthropic/claude-opus-5.5",
 ]
 
+# Sonnet 5.5 is reasoning-mandatory too, in both spellings. Plain Sonnet 5 is
+# not, so it keeps receiving the disable.
+SONNET_55_SPELLINGS = [
+    "claude-sonnet-5-5",
+    "claude-sonnet-5.5",
+]
+
 
 def _kwargs(model: str, reasoning_config: dict | None, **extra):
     return build_anthropic_kwargs(
@@ -108,6 +115,21 @@ class TestThinkingOffIsSentExplicitly:
         for model in ("claude-opus-5", "anthropic/claude-opus-5"):
             kwargs = _kwargs(model, {"enabled": False}, preserve_dots=preserve_dots)
             assert kwargs["thinking"] == {"type": "disabled"}, model
+
+    @pytest.mark.parametrize("preserve_dots", [False, True])
+    @pytest.mark.parametrize("model", SONNET_55_SPELLINGS)
+    def test_sonnet_5_5_omits_the_disable_while_sonnet_5_0_keeps_it(
+        self, model: str, preserve_dots: bool
+    ) -> None:
+        """Sonnet 5.5 400s on the disable, so a thinking-off request on it
+        carries no ``thinking`` field at all; the same request on plain
+        Sonnet 5 still sends the disable."""
+        kwargs = _kwargs(model, {"enabled": False}, preserve_dots=preserve_dots)
+        assert "thinking" not in kwargs
+        older = _kwargs(
+            "claude-sonnet-5", {"enabled": False}, preserve_dots=preserve_dots
+        )
+        assert older["thinking"] == {"type": "disabled"}
 
     def test_legacy_manual_thinking_models_keep_the_omission(self) -> None:
         """Pre-4.6 thinking is opt-in via budget_tokens: absence IS off."""

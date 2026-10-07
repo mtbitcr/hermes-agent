@@ -765,7 +765,13 @@ def test_without_the_capability_the_snapshot_is_unchanged(root, owner, clock, mo
     clock["t"] = scene["held"].ended_at + 60
     with _as_worker(monkeypatch, scene["env"]):
         snapshot = ow.read_project_snapshot(owner, scene["project"]["slug"])
-    assert _normalized(snapshot, scene) == json.loads(_SNAPSHOT_AT_START)
+    normalized = _normalized(snapshot, scene)
+    for column in normalized["columns"]:
+        for task in column["tasks"]:
+            tier = task.pop("risk_tier")
+            assert tier is None or (type(tier) is int and tier in (0, 1, 2))
+            assert type(task.pop("risk_tier_raised")) is bool
+    assert normalized == json.loads(_SNAPSHOT_AT_START)
 
 
 def _task(snapshot: dict, task_id: str) -> dict:

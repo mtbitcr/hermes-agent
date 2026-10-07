@@ -1215,3 +1215,24 @@ def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
         ev = _events(conn, tid, kind="review_requested")[0][1]
         assert ev["reviewer"] == "lead-reviewer"
         assert ev["implementer"] == "worker"
+
+
+def test_active_pr_guard_skips_a_read_only_reviewer_in_the_ready_lane(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """t_69eba6ff: a read-only role cannot open a pull request, so a PR URL in a
+    standalone review task's comments is its review input, not duplicate work.
+    The same comment still defers a ready task of a role that can write."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    pr_comment = "Review https://github.com/example/repo/pull/165 at its exact head."
+
+    with kb.connect() as conn:
+        reviewer_id = kb.create_task(conn, title="standalone review", assignee="raphael-verifier")
+        kb.add_comment(conn, reviewer_id, author="operator", body=pr_comment)
+        writer_id = kb.create_task(conn, title="build", assignee="raphael-claude-worker")
+        kb.add_comment(conn, writer_id, author="operator", body=pr_comment)
+
+        assert kb.check_respawn_guard(conn, reviewer_id) is None
+        assert kb.check_respawn_guard(conn, writer_id) == "active_pr"

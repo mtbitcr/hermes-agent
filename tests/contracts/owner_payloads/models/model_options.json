@@ -1,0 +1,46 @@
+{
+  "profile": "raphael-builder",
+  "providers": [
+    {
+      "assignment": {
+        "model": "claude-opus-5-5",
+        "model_label": "Claude Opus 5.5",
+        "profile": "raphael-builder",
+        "provider": "anthropic",
+        "reasoning_effort": "max",
+        "recommended": true
+      },
+      "authenticated": true,
+      "models": [
+        "claude-opus-5-5"
+      ],
+      "slug": "anthropic",
+      "task_routes": {
+        "deep": {
+          "model": "claude-opus-5-5",
+          "model_label": "Claude Opus 5.5",
+          "profile": "raphael-builder",
+          "provider": "anthropic",
+          "reasoning_effort": "max",
+          "recommended": true
+        },
+        "routine": {
+          "model": "claude-opus-5-5",
+          "model_label": "Claude Opus 5.5",
+          "profile": "raphael-builder",
+          "provider": "anthropic",
+          "reasoning_effort": "max",
+          "recommended": true
+        }
+      }
+    },
+    {
+      "assignment": null,
+      "authenticated": false,
+      "models": [],
+      "slug": "openai-codex",
+      "task_routes": null
+    }
+  ],
+  "revision": "298eb42f2a07c6e7e7815cb8e1194c97"
+}

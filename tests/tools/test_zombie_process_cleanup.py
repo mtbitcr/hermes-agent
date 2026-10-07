@@ -481,6 +481,29 @@ class TestDelegationCleanup:
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
         monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
 
+        from tools import daemon_pool
+
+        real_executor_cls = daemon_pool.DaemonThreadPoolExecutor
+        test_thread = threading.current_thread()
+
+        class _StartedGatedExecutor(real_executor_cls):
+            """Make the 0.1s timeout count only once the child's turn has begun."""
+
+            def submit(self, fn, /, *args, **kwargs):
+                future = super().submit(fn, *args, **kwargs)
+                if threading.current_thread() is not test_thread:
+                    return future
+                real_result = future.result
+
+                def gated_result(timeout=None):
+                    assert child_started.wait(timeout=30)
+                    return real_result(timeout=timeout)
+
+                future.result = gated_result
+                return future
+
+        monkeypatch.setattr(daemon_pool, "DaemonThreadPoolExecutor", _StartedGatedExecutor)
+
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -494,7 +517,7 @@ class TestDelegationCleanup:
             )
             child_started.set()
             try:
-                release_child.wait(timeout=5)
+                release_child.wait(timeout=30)
                 return {
                     "final_response": "late result",
                     "completed": True,
@@ -528,7 +551,7 @@ class TestDelegationCleanup:
             relay_host.unregister_subagent.assert_not_called()
 
             release_child.set()
-            assert child_finished.wait(timeout=5)
+            assert child_finished.wait(timeout=30)
             assert not relay_runtime.SESSION_COORDINATOR.has_active_turn(
                 profile_key=str(profile_home),
                 session_id=child.session_id,

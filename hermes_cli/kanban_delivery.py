@@ -17,6 +17,10 @@ prose (handover text, comments, summaries, run metadata) is never read.
 ``dispatch_once``: the same approval facts, the publish ledger kept on the delivery row and
 the remote facts read through :mod:`hermes_cli.kanban_delivery_github` decide
 whether the approved head becomes the delivery's one pull request.
+
+:func:`review_step`, run by the same step, waits for CI on each published head:
+on green it creates that head's review cards; while a required check is red it
+waits, and a later pass reads CI again.
 """
 
 from __future__ import annotations
@@ -35,7 +39,8 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_delivery_fences import Decision, decide_publish, load_policy
+from hermes_cli.kanban_risk_tier import RISK_NOT_RECORDED, UNRECORDED_RISK_TIER, effective_risk_tier
+from hermes_cli.kanban_delivery_fences import Decision, _required_check, decide_publish, load_policy
 
 logger = logging.getLogger(__name__)
 
@@ -511,10 +516,12 @@ def _park(db_path: Path, delivery_id: int, holder: str, refusal: PublishRefused)
 
 
 def publish_step(db_path: Optional[Path]) -> Optional[dict]:
-    """The dispatcher's delivery step for the board whose file is ``db_path``: lease at
-    most one approved delivery row and publish it. Raises no error, so the tick goes on."""
+    """The dispatcher's delivery step for the board whose file is ``db_path``: act on the
+    published heads whose CI is done, then lease at most one approved delivery row and
+    publish it. Raises no error, so the tick goes on."""
     if db_path is None or not delivery_settings():
         return None
+    review_step(db_path)
     try:
         leased = _take_lease(db_path)
         if leased is None:
@@ -718,3 +725,240 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
         "pull_request_number": number,
         "branch": branch,
     }
+
+
+# ---------------------------------------------------------------------------
+# Card 2: the review cards of a published head, once its CI is done
+# ---------------------------------------------------------------------------
+
+# This prefix + source card id + ":" + head + ":" + responsibility is a review
+# card's idempotency key, so each head gets each of its review cards once.
+REVIEW_KEY_PREFIX = "review:"
+
+# The review command's own fields (plan section 2(c)); the reviewer and the
+# route are the team policy's, resolved on each pass.
+_REVIEW_CREATOR, _REVIEW_TIER = "kanban-delivery", "routine"
+
+# Tiers 0 and 1 get one combined card; tier 2, or no recorded tier, gets a
+# correctness (R15) and a security (R12) card (owner decision, 2026-10-04). Only
+# the recorded tier decides: code nothing calls yet gets its tier before delivery.
+_COMBINED = {"R15": "correctness and security"}
+_SPLIT = {"R15": "correctness", "R12": "security"}
+
+# Fixed kernel text with ids only, like the pull request's.
+_REVIEW_TITLE = "Review ({lens}) of {source} at {head}"
+_REVIEW_BODY = (
+    "Kernel review of a published delivery: review pull request {number} on the code host at the "
+    "head below, not a local worktree, and post the review on that commit.\nReview: {lens}\n"
+    "Source card: {source}\nHead: {head}\nBase commit: {base}\nRepository: {repository}\n"
+    "Pull request: {number}\nBranch: {branch}\nRisk tier: {tier}\nCI on {head}: passed ({checks})\n"
+)
+
+
+def review_key(source_task_id: str, head: str, responsibility: str) -> str:
+    return f"{REVIEW_KEY_PREFIX}{source_task_id}:{head}:{responsibility}"
+
+
+def _board_slug(db_path: Path) -> str:
+    """The board whose file is ``db_path``, whatever board the environment names."""
+    path = Path(db_path)
+    return path.parent.name if path.parent.parent.name == "boards" else kb.DEFAULT_BOARD
+
+
+def _review_route() -> tuple:
+    """``(reviewer, route)`` as the team policy resolves them now, or ``(None, None)``."""
+    reviewer = kb.policy_resolved_reviewer()
+    if reviewer is None:
+        return None, None
+    try:
+        policy = kb._model_policy()
+        chosen = policy.resolve_task_assignment(reviewer, policy.normalize_execution_tier(_REVIEW_TIER))
+    except Exception:
+        return None, None
+    return reviewer, {"provider_override": chosen.provider, "model_override": chosen.model,
+                      "reasoning_effort": chosen.reasoning_effort}
+
+
+def _page(github, path: str, key: str, **query) -> tuple:
+    """``(objects, total_count)`` of GitHub's one answer of up to 100 objects under ``key``; no other
+    page is read. An answer that is not a 200 listing objects of distinct ids is a refusal."""
+    answer = _answered(github.request("GET", path, query=dict(query, per_page=100)))
+    data = answer["data"] if answer["status"] == 200 and isinstance(answer["data"], dict) else {}
+    page, count = data.get(key), data.get("total_count")
+    if type(count) is not int or not isinstance(page, list) or not all(
+            isinstance(item, dict) and type(item.get("id")) is int for item in page) or (
+            len({item["id"] for item in page}) != len(page)):
+        raise PublishRefused("ci_unreadable", f"GitHub answered {answer['status']} for {path}")
+    return page, count
+
+
+def _open_at_head(github, repository: str, row: dict) -> bool:
+    """The pull request, read through the fenced pull endpoint, is open at the row's head."""
+    answer = _answered(github.request("GET", f"/repos/{repository}/pulls/{row['pull_request_number']}"))
+    pull = answer["data"] if answer["status"] == 200 and isinstance(answer["data"], dict) else {}
+    pulled = pull["head"].get("sha") if isinstance(pull.get("head"), dict) else None
+    return (pull.get("state"), pulled) == ("open", row["pull_request_head"])
+
+
+def _source_read(conn: sqlite3.Connection, source: str) -> tuple:
+    """The source card's event revision, status, head and risk tier. The owner workspace
+    writes a tier with no event, so the tier is read itself."""
+    revision = kb.task_event_revision(conn, source)
+    task = conn.execute("SELECT status, head_commit, risk_tier FROM tasks WHERE id = ?", (source,)).fetchone()
+    return (revision, *(task or (None, None, None)))
+
+
+def _unchanged(conn: sqlite3.Connection, row: dict, read: tuple) -> bool:
+    """The delivery row still names the pull request, head, state and lease this pass read,
+    and the source card is as ``read``, its :func:`_source_read` before the network calls."""
+    keys = ("pull_request_number", "pull_request_head", "pull_request_state", "publish_lease")
+    now = conn.execute(f"SELECT {', '.join(keys)} FROM kanban_deliveries WHERE id = ?", (row["id"],)).fetchall()
+    return [tuple(record) for record in now] == [tuple(row[key] for key in keys)] and (
+        _source_read(conn, row["source_task_id"]) == read)
+
+
+def _outcome(row: dict, **details) -> dict:
+    """An outcome's event payload: the delivery and the head it applied to."""
+    return {"delivery_id": row["id"], "head": row["pull_request_head"],
+            "pull_request_number": row["pull_request_number"], **details}
+
+
+def _waiting(conn: sqlite3.Connection, row: dict, code: str, **details) -> None:
+    """Why the open row still waits, recorded on the source card once for its head and
+    ``code``, inside the caller's write transaction."""
+    waited = {(json.loads(payload).get("head"), json.loads(payload).get("code")) for (payload,) in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'delivery_review_waiting'",
+        (row["source_task_id"],))}
+    if (row["pull_request_head"], code) not in waited:
+        kb._append_event(conn, row["source_task_id"], "delivery_review_waiting", _outcome(row, code=code, **details))
+
+
+def review_step(db_path: Path) -> None:
+    """Card 2 on the board whose file is ``db_path``: each published head whose CI is
+    green gets its review cards; one whose CI still runs or is red waits, and a later
+    pass reads CI again. With no reviewer from the team policy nothing is read or
+    created. Raises no error, so the tick goes on."""
+    try:
+        reviewer, route = _review_route() if delivery_settings() else (None, None)
+        if reviewer is None:
+            return
+        with kb.connect_closing(db_path=db_path) as conn:
+            rows = [dict(row) for row in conn.execute(
+                "SELECT * FROM kanban_deliveries WHERE pull_request_number IS NOT NULL "
+                "AND pull_request_state = 'open' ORDER BY id")]
+    except Exception:
+        logger.exception("kanban delivery: the review step failed")
+        return
+    for row in rows:
+        try:
+            _review_delivery(db_path, row, reviewer, route)
+        except PublishRefused as refusal:
+            logger.warning("kanban delivery: delivery %s not reviewed: %s (%s)",
+                           row["id"], refusal.code, refusal.detail)
+        except Exception:
+            logger.exception("kanban delivery: delivery %s not reviewed", row["id"])
+
+
+def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Optional[str]:
+    """Card 2 for one published row: GitHub is read outside every transaction, and an
+    outcome or a waiting reason is stored only while the row and its done source card
+    are as this pass read them before GitHub. The required check on H, in one request read
+    right before the pull request is read again, alone decides green, red or wait; a red
+    decision's waiting record holds the id and conclusion of each red required check run,
+    as that request answered them. Returns the state stored, if any."""
+    from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
+
+    source, head = row["source_task_id"], row["pull_request_head"]
+    with kb.connect_closing(db_path=db_path) as conn:
+        read = _source_read(conn, source)
+        task = conn.execute("SELECT * FROM tasks WHERE id = ?", (source,)).fetchone()
+        bound = [event[0] for event in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'delivery_bound' "
+            "ORDER BY id DESC", (source,))]
+    if (read[1], _sha(read[2])) != ("done", head):
+        return None  # the source card is not done at H: nothing to decide for it
+    repository = _origin_repository(_repository(task["workspace_path"])) if task is not None else None
+    try:
+        policy = load_policy(_POLICY_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise PublishRefused("policy_unreadable", "the delivery policy cannot be read") from None
+    if repository not in policy.required_checks or _sha(head) != head:
+        raise PublishRefused("repository_not_in_policy", f"{repository or 'no GitHub origin'} is not in the policy")
+    base = None
+    for event in bound:  # the base the publish bound H to
+        with contextlib.suppress(ValueError, TypeError, KeyError):
+            payload = json.loads(event)
+            if payload["head"] == head:
+                base = payload["base_commit"]
+                break
+    try:
+        github = GitHubTransport("read_checks", repository)
+        if not _open_at_head(github, repository, row):
+            return None  # the pull request moved off H or closed: no card for a stale head
+        required = policy.required_checks[repository]
+        runs, count = _page(github, f"/repos/{repository}/commits/{head}/check-runs", "check_runs", filter="latest")
+        if count > 100 or len(runs) != count:  # the one decision request, read last: whole on its one page
+            raise PublishRefused("ci_unreadable", f"{count} check runs on {head}, {len(runs)} in the answer")
+        named = {name: [run for run in runs if run.get("name") == name] for name in required}
+        if not named or any(len(found) != 1 for found in named.values()):
+            return None  # a required check that is not in the answer exactly once decides nothing
+        outcomes = {_required_check(name, head, {"check_runs": found, "statuses": []}) for name, found in named.items()}
+        if outcomes & {"pending", "stale"} or not _open_at_head(github, repository, row):
+            return None  # CI on H still runs, or the pull request left H while CI was read: a later step tries again
+        if outcomes == {"success"}:
+            return _create_review_cards(db_path, row, read, repository, base, required, reviewer, route)
+        failed = [{"id": run["id"], "conclusion": run.get("conclusion")} for (run,) in named.values()
+                  if run.get("conclusion") != "success"]  # the red required checks, as the decision request read them
+        with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):  # red: no rerun, no rework, no POST
+            if delivery_settings() and _unchanged(conn, row, read):
+                _waiting(conn, row, "red_check_waiting", check_runs=failed)
+        return None
+    except GitHubTransportError as error:
+        raise _transport_refusal(error) from None
+
+
+def _create_review_cards(db_path, row, read, repository, base, checks, reviewer, route) -> Optional[str]:
+    """H's review cards as the review command makes them, each past the kernel's route guard,
+    created with the row's outcome and its event in one transaction, with the tier and project
+    the source card has there. No card is adopted by its key: when a key of H already names a
+    card, none is created and the conflict is recorded once for H."""
+    source, head = row["source_task_id"], row["pull_request_head"]
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if not delivery_settings() or not _unchanged(conn, row, read):
+            return None
+        task = conn.execute("SELECT risk_tier, project_id FROM tasks WHERE id = ?", (source,)).fetchone()
+        try:
+            tier, recorded = effective_risk_tier(task["risk_tier"]), task["risk_tier"] is not None
+        except ValueError:  # not a tier: tier 2, never a lower one
+            tier, recorded = UNRECORDED_RISK_TIER, False
+        text = {"source": source, "head": head, "base": base, "repository": repository, "checks": ", ".join(checks),
+                "number": row["pull_request_number"], "branch": row["pull_request_branch"],
+                "tier": tier if recorded else f"{tier}. {RISK_NOT_RECORDED}"}
+        lenses = _COMBINED if tier < 2 else _SPLIT
+        taken = sorted(card for responsibility in lenses for (card,) in conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ?", (review_key(source, head, responsibility),)))
+        if taken:
+            _waiting(conn, row, "review_key_conflict", cards=taken)
+            return None
+        cards = []
+        for responsibility, lens in lenses.items():
+            title = _REVIEW_TITLE.format(lens=lens, **text)
+            lock = None
+            # Unadmitted routes still park through the existing readiness guard.
+            with contextlib.suppress(ValueError):
+                lock = kb.mint_policy_lock(
+                    reviewer, route["provider_override"], route["model_override"],
+                    route["reasoning_effort"], _REVIEW_TIER)
+            card = kb.create_task(
+                conn, title=title, body=_REVIEW_BODY.format(lens=lens, **text), assignee=reviewer,
+                responsibility=responsibility, created_by=_REVIEW_CREATOR, workspace_kind="worktree",
+                execution_tier=_REVIEW_TIER, board=_board_slug(db_path), project_id=task["project_id"],
+                project_source_task_id=source, owned_paths=[], parents=[source],
+                idempotency_key=review_key(source, head, responsibility),
+                risk_tier=tier, model_policy_lock=lock, **route)
+            kb.authorize_executable_transition(conn, card)  # its route lock, or the card parked with why
+            cards.append(card)
+        conn.execute("UPDATE kanban_deliveries SET pull_request_state = 'review_cards_created', "
+                     "publish_lease = NULL, publish_lease_until = NULL WHERE id = ?", (row["id"],))
+        kb._append_event(conn, source, "delivery_review_cards_created", _outcome(row, cards=cards))
+        return "review_cards_created"

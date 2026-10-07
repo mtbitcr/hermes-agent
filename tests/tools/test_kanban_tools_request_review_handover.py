@@ -6,14 +6,19 @@ committing it could not ask for review at all: the kernel refuses to park
 scoped work with nothing committed. The tool now asks the kernel which
 patches the run saved for review
 (``kanban_db.saved_patch_ids_for_review``, the one copy of the selection
-rules) and decides by the length of that list alone:
+rules, oldest receipt first) and decides by that list alone:
 
 * one saved patch: it is handed over through the kernel's existing handover
   (``complete_task`` with the patch: materialize it on the task branch, prove
   the declared scope, park the card in the review lane);
 * no saved patch: the tool does exactly what it did before; and
-* several saved patches: the build is told plainly which ones, and no review
-  is requested.
+* several saved patches: the newest by receipt order, the list's last entry,
+  is handed over the same way. If that one cannot be materialized the request
+  fails closed with the kernel's reason, and no older patch is taken instead.
+
+The kernel's quiet-exit and no-report budget handovers take the same newest
+patch, and a run that is no longer the card's current open run hands nothing
+over.
 
 The worker side of every scenario runs in the exact environment the
 dispatcher gives the worker it launches: it is taken from
@@ -154,6 +159,23 @@ def _become(env: dict, monkeypatch) -> None:
     for name, value in env.items():
         if os.environ.get(name) != value:
             monkeypatch.setenv(name, value)
+
+
+def _supersede(build: dict) -> int:
+    """Reclaim the build's run as an operator would and claim the card again.
+
+    Returns the card's new current open run. The work area, branch and base
+    stay on the card for the run that follows.
+    """
+    conn, task_id = build["conn"], build["task"]
+    assert kb.reclaim_task(
+        conn, task_id, reason="superseded", signal_fn=lambda *_: None,
+    )
+    claimed = kb.claim_task(conn, task_id)
+    assert claimed is not None, "the reclaimed card could not be claimed again"
+    assert claimed.current_run_id not in (None, build["run"])
+    assert kb.get_run(conn, build["run"]).ended_at is not None
+    return claimed.current_run_id
 
 
 @pytest.fixture
@@ -310,42 +332,36 @@ def test_without_a_saved_patch_the_review_request_is_unchanged(worker_build):
     assert kb.saved_patch_ids_for_review(conn, task_id, run_id) == []
 
 
-def test_several_saved_patches_are_reported_and_no_review_is_requested(worker_build):
-    """Two saved patches: the build is told which, and nothing moves."""
+def test_the_newest_of_several_saved_patches_is_handed_over_to_review(worker_build):
+    """Two saved patches: the newer by receipt order lands and the card parks."""
     from tools import kanban_tools as kt
 
     build = worker_build
     conn, task_id, run_id = build["conn"], build["task"], build["run"]
-    # What the tool answers in this same state when no patch was saved.
-    no_patch = json.loads(kt._handle_request_review({"summary": SUMMARY}))
     first = _upload(build, "first.patch", _patch("value = 2"))
-    second = _upload(build, "second.patch", _patch("value = 3"))
+    newest = _patch("value = 3")
+    second = _upload(build, "second.patch", newest)
+    assert kb.saved_patch_ids_for_review(conn, task_id, run_id) == [first, second]
 
     out = json.loads(kt._handle_request_review({"summary": SUMMARY}))
-    message = out.get("error") or ""
 
-    assert message.startswith(
-        f"could not request review for {task_id}: 2 saved patches were found"
-    ), out
-    assert f"attachment ids {first}, {second}" in message
-    assert "none was handed over" in message
-    assert "no review was requested" in message
-    assert out != no_patch
-    assert "ok" not in out and "status" not in out
-    assert "handed_over_patch_attachment_id" not in out
-    # Nothing changed: the same card is running on the same open run, it was
-    # never sent to review, and the branch and work area are untouched.
-    task = kb.get_task(conn, task_id)
-    assert (task.status, task.current_run_id) == ("running", run_id)
-    run = kb.get_run(conn, run_id)
-    assert (run.status, run.ended_at) == ("running", None)
-    assert [
-        event.id for event in kb.list_events(conn, task_id)
-        if event.kind == "review_requested"
-    ] == []
-    assert _branch_head(build) == build["base"]
-    assert _git(build["workspace"], "status", "--porcelain") == ""
-    assert kb.saved_patch_ids_for_review(conn, task_id, run_id) == [first, second]
+    assert out.get("ok") is True, out
+    assert out["status"] == "review"
+    assert out["handed_over_patch_attachment_id"] == second
+    assert kb.get_task(conn, task_id).status == "review"
+    # Read back with git, not from the kernel: the branch moved off its base,
+    # holds exactly what the newer patch says, and that is the one patch on it.
+    assert _branch_head(build) != build["base"]
+    changed = _git(build["repo"], "show", f"{build['branch']}:{MODULE}")
+    assert changed == _content_after(newest) == "value = 3\n"
+    log = _git(
+        build["repo"], "log", "--format=%B", f"{build['base']}..{build['branch']}",
+    )
+    trailers = [
+        line for line in log.splitlines()
+        if line.startswith("Hermes-Patch-Attachment:")
+    ]
+    assert trailers == [f"Hermes-Patch-Attachment: {second}"]
 
 
 def test_the_wrapper_and_the_quiet_exit_handover_agree_on_one_run(worker_build):
@@ -370,10 +386,160 @@ def test_the_wrapper_and_the_quiet_exit_handover_agree_on_one_run(worker_build):
         ids = kb.saved_patch_ids_for_review(conn, task_id, run_id)
         assert ids == qualifying
         handed = kb._saved_patch_for_review_handover(conn, task_id, run_id, quiet_exit)
-        assert handed == (ids[0] if len(ids) == 1 else None)
+        assert handed == (ids[-1] if ids else None)
         if len(ids) == 1:
             # The quiet-exit gate still belongs to the handover alone.
             assert kb._saved_patch_for_review_handover(
                 conn, task_id, run_id, {"evidence": "session_terminal_intent"},
             ) is None
     assert len(qualifying) == 2
+
+
+def test_older_run_owner_and_unbound_patches_never_win_even_when_newer(
+    worker_build, monkeypatch,
+):
+    """Only the current run's own agent patches compete, and the newest wins."""
+    from tools import kanban_tools as kt
+
+    build = worker_build
+    conn, task_id = build["conn"], build["task"]
+    older_run = _upload(build, "older-run.patch", _patch("value = 9"))
+    run_id = _supersede(build)
+    # Carry on as the worker of the card's new current run.
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    build = {**build, "run": run_id}
+    first = _upload(build, "first.patch", _patch("value = 2"))
+    newest = _patch("value = 3")
+    second = _upload(build, "second.patch", newest)
+    # Stored after the run's own patches, so newer, and still never eligible.
+    owner = _upload(build, "owner.patch", _patch("value = 7"), by="owner")
+    stray = _upload(build, "stray.patch", _patch("value = 8"), on_run=False)
+    assert older_run < first < second < owner < stray
+    assert kb.saved_patch_ids_for_review(conn, task_id, run_id) == [first, second]
+
+    out = json.loads(kt._handle_request_review({"summary": SUMMARY}))
+
+    assert out.get("ok") is True, out
+    assert out["status"] == "review"
+    assert out["handed_over_patch_attachment_id"] == second
+    assert kb.get_task(conn, task_id).status == "review"
+    changed = _git(build["repo"], "show", f"{build['branch']}:{MODULE}")
+    assert changed == _content_after(newest) == "value = 3\n"
+
+
+def test_a_run_that_is_no_longer_current_hands_nothing_over(worker_build):
+    """A superseded run's saved patches are refused; its successor is untouched."""
+    from tools import kanban_tools as kt
+
+    build = worker_build
+    conn, task_id, stale_run = build["conn"], build["task"], build["run"]
+    _upload(build, "first.patch", _patch("value = 2"))
+    _upload(build, "second.patch", _patch("value = 3"))
+    current_run = _supersede(build)
+    seen = max(event.id for event in kb.list_events(conn, task_id))
+
+    # The worker's environment still names the superseded run.
+    out = json.loads(kt._handle_request_review({"summary": SUMMARY}))
+
+    assert "run id is stale" in (out.get("error") or ""), out
+    assert "ok" not in out and "handed_over_patch_attachment_id" not in out
+    assert kb._complete_run_handover_before_timeout(
+        conn, task_id, handover_reason="budget_exhausted", run_id=stale_run,
+    ) is False
+    # Nothing was handed over, and nothing was written on the card the
+    # successor run now owns: no park, no handover receipt, no failure.
+    assert [
+        event.kind for event in kb.list_events(conn, task_id) if event.id > seen
+    ] == []
+    task = kb.get_task(conn, task_id)
+    assert (task.status, task.current_run_id) == ("running", current_run)
+    assert kb.get_run(conn, current_run).ended_at is None
+    assert _branch_head(build) == build["base"]
+    assert _git(build["workspace"], "status", "--porcelain") == ""
+    assert kb.saved_patch_ids_for_review(conn, task_id, current_run) == []
+
+
+def test_the_budget_handover_without_a_report_hands_over_the_newest_patch(
+    worker_build,
+):
+    """An expiring budget with no report hands the newest saved patch to review."""
+    build = worker_build
+    conn, task_id, run_id = build["conn"], build["task"], build["run"]
+    _upload(build, "first.patch", _patch("value = 2"))
+    newest = _patch("value = 3")
+    second = _upload(build, "second.patch", newest)
+
+    assert kb._complete_run_handover_before_timeout(
+        conn, task_id, handover_reason="budget_exhausted", run_id=run_id,
+    ) is True
+
+    assert kb.get_task(conn, task_id).status == "review"
+    handed = [
+        event.payload["patch_attachment_id"]
+        for event in kb.list_events(conn, task_id)
+        if event.kind == "run_handover_completed"
+    ]
+    assert handed == [second]
+    changed = _git(build["repo"], "show", f"{build['branch']}:{MODULE}")
+    assert changed == _content_after(newest) == "value = 3\n"
+
+
+_BROKEN_PATCH_REASONS = {
+    "malformed": "git evidence command failed (apply --check",
+    "deleted": "patch attachment file is unavailable",
+    "truncated": "patch attachment size does not match its receipt",
+}
+
+
+@pytest.mark.parametrize("damage", sorted(_BROKEN_PATCH_REASONS))
+def test_a_broken_newest_patch_fails_closed_and_no_older_patch_lands(
+    worker_build, damage,
+):
+    """The newest saved patch is unusable: refused with a reason, nothing moves."""
+    from tools import kanban_tools as kt
+
+    build = worker_build
+    conn, task_id, run_id = build["conn"], build["task"], build["run"]
+    older = _upload(build, "older.patch", _patch("value = 2"))
+    if damage == "malformed":
+        newest = _upload(build, "newest.patch", b"this is not a patch\n")
+    else:
+        valid = _patch("value = 3")
+        newest = _upload(build, "newest.patch", valid)
+        # Root ignores permission bits, so the stored file itself is damaged.
+        stored = Path(kb.get_attachment(conn, newest).stored_path)
+        if damage == "deleted":
+            stored.unlink()
+        else:
+            stored.write_bytes(valid[: len(valid) // 2])
+    assert kb.saved_patch_ids_for_review(conn, task_id, run_id) == [older, newest]
+    reason = _BROKEN_PATCH_REASONS[damage]
+
+    out = json.loads(kt._handle_request_review({"summary": SUMMARY}))
+    message = out.get("error") or ""
+
+    assert reason in message, out
+    assert f"(attachment id {newest}) was not handed over" in message
+    assert "ok" not in out and "handed_over_patch_attachment_id" not in out
+    # The budget handover refuses the same patch and records the same reason.
+    assert kb._complete_run_handover_before_timeout(
+        conn, task_id, handover_reason="budget_exhausted", run_id=run_id,
+    ) is False
+    failed = [
+        event.payload for event in kb.list_events(conn, task_id)
+        if event.kind == "run_handover_failed"
+    ]
+    assert [payload["patch_attachment_id"] for payload in failed] == [newest]
+    assert reason in failed[0]["reason"]
+    # Nothing was approved or parked, and the older valid patch never landed.
+    task = kb.get_task(conn, task_id)
+    assert (task.status, task.current_run_id) == ("running", run_id)
+    assert kb.get_run(conn, run_id).ended_at is None
+    assert [
+        event.kind for event in kb.list_events(conn, task_id)
+        if event.kind in ("review_requested", "completed")
+    ] == []
+    assert _branch_head(build) == build["base"]
+    changed = _git(build["repo"], "show", f"{build['branch']}:{MODULE}")
+    assert changed == f"{BASE_LINE}\n"
+    assert _git(build["workspace"], "status", "--porcelain") == ""

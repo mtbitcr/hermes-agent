@@ -97,10 +97,12 @@ from hermes_cli import kanban_provider_stops as _provider_stops
 from hermes_cli.kanban_risk_tier import (
     active_run_box_seconds,
     card_work_kind,
+    check_raise,
     effective_risk_tier,
     parse_risk_tier,
     pinned_reasoning_effort,
     pinned_time_box_seconds,
+    raised_reasoning_effort,
     requires_independent_review,
     review_run_box_seconds,
 )
@@ -28556,6 +28558,7 @@ def submit_review_findings(
     findings: Any,
     candidate_digest: str,
     expected_run_id: Optional[int] = None,
+    risk_tier: Any = None,
 ) -> dict:
     """Reviewer handback entry point — the ONLY way typed findings reach an
     implementer.
@@ -28591,6 +28594,14 @@ def submit_review_findings(
     Returns a dict with ``outcome`` in
     ``{"passed", "handed_back", "owner_decision_blocked", "error"}`` plus
     outcome-specific detail (``attachment_id``, ``fingerprints``, ...).
+
+    ``risk_tier`` is the reviewer's tier for the card. It may only raise the
+    tier (:func:`hermes_cli.kanban_risk_tier.check_raise`): a lowering is an
+    ``error`` before anything is written, with no verdict. A raise is written
+    with one ``risk_tier_raised`` event before the verdict, together with the
+    re-pin of the role holding a card pinned at creation
+    (:func:`hermes_cli.kanban_risk_tier.raised_reasoning_effort`), so every
+    later run, after any verdict, runs at the raised tier's effort.
     """
     document = build_review_findings_document(findings, candidate_digest=candidate_digest)
     candidate_digest = document["candidate_digest"]
@@ -28624,6 +28635,44 @@ def submit_review_findings(
                 "outcome": "error",
                 "reason": "active run was not claimed from review",
             }
+        try:
+            raised_to = None if risk_tier is None else check_raise(task.risk_tier, risk_tier)
+        except ValueError as exc:
+            return {"outcome": "error", "reason": str(exc)}
+        risk_tier_raised = None
+        if raised_to is not None:
+            risk_tier_raised = {
+                "from": task.risk_tier, "to": raised_to,
+                "reviewer": task.assignee, "run_id": current_run_id,
+            }
+            pinned = conn.execute(
+                "SELECT pinned_effort FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()["pinned_effort"]
+            effort = raised_reasoning_effort(pinned, raised_to, task.responsibility)
+            if effort is None:
+                conn.execute(
+                    "UPDATE tasks SET risk_tier = ? WHERE id = ?", (raised_to, task_id),
+                )
+            else:
+                # The role holding the card is re-pinned with the raise and
+                # sealed again on its own route, so no later run, whichever
+                # verdict follows, runs below the raised tier.
+                conn.execute(
+                    "UPDATE tasks SET risk_tier = ?, reasoning_effort = ?, "
+                    "model_policy_lock = ?, pinned_effort = ? WHERE id = ?",
+                    (
+                        raised_to, effort,
+                        mint_policy_lock(
+                            task.assignee, task.provider_override,
+                            task.model_override, effort, task.execution_tier,
+                        ),
+                        effort, task_id,
+                    ),
+                )
+            _append_event(
+                conn, task_id, "risk_tier_raised", risk_tier_raised,
+                run_id=current_run_id,
+            )
 
         # EVERY validated finding the current review reports is outstanding.
         # History is consulted only to note that a finding is being re-raised
@@ -28649,6 +28698,7 @@ def submit_review_findings(
             )
         history = _review_findings_history(conn, task_id)
     re_raised_fingerprints = [f["fingerprint"] for f in re_raised]
+    raised_detail = {"risk_tier_raised": risk_tier_raised} if risk_tier_raised else {}
 
     if not outstanding:
         ok = complete_task(
@@ -28660,6 +28710,7 @@ def submit_review_findings(
         return {
             "outcome": "passed" if ok else "error",
             "re_raised_fingerprints": re_raised_fingerprints,
+            **raised_detail,
         }
 
     outstanding_fingerprints = {f["fingerprint"] for f in outstanding}
@@ -28708,6 +28759,7 @@ def submit_review_findings(
                 "candidate_digest": candidate_digest,
                 "fingerprints": sorted(outstanding_fingerprints),
                 "re_raised_fingerprints": re_raised_fingerprints,
+                **raised_detail,
             }
 
     document_bytes = json.dumps(
@@ -28793,6 +28845,7 @@ def submit_review_findings(
         "implementer": implementer,
         "fingerprints": sorted(outstanding_fingerprints),
         "re_raised_fingerprints": re_raised_fingerprints,
+        **raised_detail,
     }
 
 
@@ -33988,8 +34041,8 @@ def _complete_run_handover_before_timeout(
     it out. Returns True only when the completion landed.
 
     A handover is the run's own patch and report. On a card that requires
-    review the run's one saved patch is enough (owner decision 4): it goes
-    over as the existing saved-result handover does, the one candidate of
+    review the run's newest saved patch is enough (owner decision 4): it goes
+    over as the existing saved-result handover does, the last candidate of
     :func:`_saved_patch_ids_for_review` passed to :func:`complete_task` as
     ``_saved_result_attachment_id``, whose review park records it.
 
@@ -34039,11 +34092,11 @@ def _complete_run_handover_before_timeout(
     if handover is not None:
         patch_id, report_attachment = handover[0].id, handover[1]
     else:
-        # Without a report, only the one patch a reviewed card's run saved.
+        # Without a report, the newest patch a reviewed card's run saved.
         patches = _saved_patch_ids_for_review(conn, task_id, int(run_id))
-        if len(patches) != 1:
+        if not patches:
             return False
-        patch_id, report_attachment = patches[0], None
+        patch_id, report_attachment = patches[-1], None
     if stop_worker is not None:
         stop_worker()
     summary: Optional[str] = _BUDGET_PATCH_HANDOVER_SUMMARY
@@ -34077,8 +34130,8 @@ def _complete_run_handover_before_timeout(
             metadata=metadata,
             patch_attachment_id=patch_id,
             expected_run_id=int(run_id),
-            # A lone saved patch is the saved-result handover: its review park
-            # records it, and a refusal carries the park's own reason.
+            # A saved patch with no report is the saved-result handover: its
+            # review park records it; a refusal carries the park's own reason.
             _saved_result_attachment_id=patch_id if report_id is None else None,
         )
         if not handover_ok:
@@ -34138,7 +34191,7 @@ def enforce_max_runtime(
     materialization/completion fails for any reason, this falls back to
     the ordinary timeout behavior below (never silently loses the task)
     and records why via a ``run_handover_failed`` event. On a card that
-    requires review the run's one saved patch is enough without a report:
+    requires review the run's newest saved patch is enough without a report:
     the same completion parks it in the review lane.
 
     Otherwise: sends SIGTERM, waits a short grace window, then SIGKILL.
@@ -34736,8 +34789,8 @@ def _saved_patch_ids_for_review(
     existing handover then parks the work in the review lane, so the kernel
     never finishes a card on a worker's behalf. A run claimed from review is
     the reviewer's own, and ``complete_task`` would read it as an approval.
-    Counted from the run's own agent ``attached`` receipts; with several
-    patches the kernel does not pick one.
+    Counted from the run's own agent ``attached`` receipts in receipt order;
+    with several patches the newest, the last id, is the one handed over.
 
     This is the one copy of these rules: every other caller, inside the
     kernel or out, takes its candidates from here.
@@ -34768,7 +34821,7 @@ def saved_patch_ids_for_review(
 
     This is their entry point: it returns
     :func:`_saved_patch_ids_for_review`'s list unchanged, oldest first. A
-    caller decides by the list's length alone and keeps no copy of the rules.
+    caller hands over the last, newest id and keeps no copy of the rules.
     """
     return _saved_patch_ids_for_review(conn, task_id, run_id)
 
@@ -34779,16 +34832,16 @@ def _saved_patch_for_review_handover(
     run_id: Optional[int],
     unreported: dict,
 ) -> Optional[int]:
-    """The one patch a quietly exited run saved for review, or ``None``.
+    """The newest patch a quietly exited run saved for review, or ``None``.
 
     Applies the quiet-exit gate, takes its candidates from
-    :func:`_saved_patch_ids_for_review`, and with several patches does not
-    pick one.
+    :func:`_saved_patch_ids_for_review`, and with several patches picks the
+    newest by receipt order, the last id.
     """
     if unreported.get("evidence") != "deliverable_present":
         return None
     patches = _saved_patch_ids_for_review(conn, task_id, run_id)
-    return patches[0] if len(patches) == 1 else None
+    return patches[-1] if patches else None
 
 
 def _saved_patch_handover_marker(
@@ -34834,7 +34887,7 @@ def _saved_patch_handover_pending(
     scan. It also recognizes the unmarked row the scan sets aside later on
     the same tick, in the scan's own terms: the reap registry saw its worker
     exit cleanly, its identity proves it gone, and
-    :func:`_saved_patch_for_review_handover` finds the one patch its run saved
+    :func:`_saved_patch_for_review_handover` finds a patch its run saved
     for review. Its claim or heartbeat can lapse before the first scan has
     marked it. The runtime cap runs after the scan, which has handed such a
     row over or marked it by then, and does not pass it.
@@ -35154,8 +35207,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     classifies it instead (:func:`_known_provider_stop`), and the run is
     booked as that stop.
 
-    A clean exit whose run saved exactly one patch of its own, on a card that
-    requires review, is handed to review through :func:`complete_task` -- the
+    A clean exit whose run saved patches of its own, on a card that requires
+    review, hands the newest to review through :func:`complete_task` -- the
     existing handover -- once the main transaction has committed, instead of
     being parked for a person to hand over by hand; a refused handover parks it
     exactly as before. Until then the task stays running with its run open,
@@ -36039,7 +36092,7 @@ def check_respawn_guard(
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -36159,6 +36212,10 @@ def check_respawn_guard(
     #    correspondence cannot be established for ANY comment on the task —
     #    every same-second tie then fails CLOSED (still counts as an active,
     #    unreviewed PR) rather than risk mis-ordering.
+    #    A read-only role cannot open a PR: a PR URL on its task is the
+    #    review input, never a duplicate (t_69eba6ff).
+    if row["assignee"] in _READ_ONLY_PROFILES:
+        return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     latest_handback = conn.execute(
         "SELECT created_at, id FROM task_events "

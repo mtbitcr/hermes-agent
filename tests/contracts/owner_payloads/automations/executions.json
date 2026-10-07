@@ -1,0 +1,111 @@
+{
+  "body": {
+    "executions": [
+      {
+        "claimed_at": "2026-09-21T14:13:20+00:00",
+        "delivery": {
+          "resend": {
+            "attempts": [],
+            "eligible": true,
+            "execution_id": "cc2dc8d8adb6439685fa188ed5f0d8a4",
+            "reason": null
+          },
+          "state": "failed",
+          "targets": [
+            {
+              "label": "Telegram (Ops room)",
+              "reason": null,
+              "state": "delivered"
+            },
+            {
+              "label": "Telegram",
+              "reason": "platform_refused",
+              "state": "failed"
+            },
+            {
+              "label": "Telegram 2",
+              "reason": "error_after_handover",
+              "state": "unknown"
+            }
+          ]
+        },
+        "delivery_outcome": "failed",
+        "finished_at": "2026-09-21T14:13:20+00:00",
+        "job_id": "08946cd494a2",
+        "started_at": "2026-09-21T14:13:20+00:00",
+        "status": "completed"
+      },
+      {
+        "claimed_at": "2026-09-21T14:13:20+00:00",
+        "delivery": {
+          "resend": {
+            "attempts": [],
+            "eligible": false,
+            "reason": "already_delivered"
+          },
+          "state": "delivered",
+          "targets": [
+            {
+              "label": "Telegram (Ops room)",
+              "reason": null,
+              "state": "delivered"
+            }
+          ]
+        },
+        "delivery_outcome": "delivered",
+        "finished_at": "2026-09-21T14:13:20+00:00",
+        "job_id": "08946cd494a2",
+        "started_at": "2026-09-21T14:13:20+00:00",
+        "status": "completed"
+      },
+      {
+        "claimed_at": "2026-09-21T14:13:20+00:00",
+        "delivery": {
+          "resend": {
+            "attempts": [],
+            "eligible": false,
+            "reason": "in_progress"
+          },
+          "state": "failed",
+          "targets": [
+            {
+              "label": "Telegram",
+              "reason": "platform_refused",
+              "state": "failed"
+            }
+          ]
+        },
+        "delivery_outcome": null,
+        "finished_at": null,
+        "job_id": "08946cd494a2",
+        "started_at": "2026-09-21T14:13:20+00:00",
+        "status": "running"
+      },
+      {
+        "claimed_at": "2026-09-21T14:13:20+00:00",
+        "delivery": {
+          "resend": {
+            "attempts": [],
+            "eligible": false,
+            "reason": "outcome_unknown"
+          },
+          "state": "unknown",
+          "targets": [
+            {
+              "label": "Telegram",
+              "reason": "error_after_handover",
+              "state": "unknown"
+            }
+          ]
+        },
+        "delivery_outcome": "failed",
+        "finished_at": "2026-09-21T14:13:20+00:00",
+        "job_id": "08946cd494a2",
+        "started_at": "2026-09-21T14:13:20+00:00",
+        "status": "completed"
+      }
+    ],
+    "limit": 100
+  },
+  "status": 200
+}
