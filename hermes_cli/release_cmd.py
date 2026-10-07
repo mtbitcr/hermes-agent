@@ -5,8 +5,8 @@
 nothing to the release state: config.yaml is read as it is on disk, the release record is opened
 read-only, and the guards only read. ``status`` prints the waiting batch and the last
 outcome. ``run`` releases the accepted batch after the same preflight, under the pause (S-A), in
-the calling process: SIGINT or SIGTERM refuses a release that has not cut over yet, and fails one
-that has, which stays paused for its recovery (card 7). The release unit (S-F) belongs to card 6.
+the calling process: SIGINT or SIGTERM refuses a release until its runner starts; after that, only
+a hard kill ends it, and its recovery belongs to card 7. The release unit (S-F) belongs to card 6.
 
 Design rule (K6), as in the runner: everything ``run`` needs is imported when this module loads,
 so nothing is imported once the units stop and the checkout moves under the running process.
@@ -189,8 +189,10 @@ def run() -> int:
     which asks every guard again before it stops anything. Then record the outcome and resume,
     except after a failed outcome: the platform stays paused for a person.
 
-    SIGINT and SIGTERM refuse the release until the runner stops its first unit. From then on, a
-    stop, or a runner result that never comes back, fails the release midway.
+    SIGINT and SIGTERM only set a stop flag, read after the pause's publication, at every drain
+    poll and just before the runner, where it refuses the release; from then on the runner's own
+    outcome stands. The runner's first unit stop reads the pause again and refuses the release
+    unless it is the release's own. A runner result that never comes back fails it midway.
 
     Returns 0 when the batch was released, 1 otherwise, and 1 when the release's own pause is
     still in place after its removal.
@@ -198,9 +200,25 @@ def run() -> int:
     inputs = _inputs()
     if isinstance(inputs, int):  # refused before anything was written
         return inputs
+    _batch, _merges, _pins, reader, actions, _settings = inputs
+    token = secrets.token_hex(16)  # the release token: only the release's own pause carries it
+    host = _Host(reader, actions, token)
+    # The handlers only set the host's stop flag. They are in place before the begin commit, and
+    # the caller's are back only once the outcome is recorded and the pause's removal read back.
+    previous = {
+        signum: signal.signal(signum, host.stop) for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        return _release(inputs, host, token)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler or signal.SIG_DFL)
+
+
+def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
+    """``run`` from the begin commit to the readback of the pause's removal, under its handlers."""
     batch, merges, pins, reader, actions, settings = inputs
     batch_id, reason = batch["batch_id"], f"release {batch['batch_id']}"
-    token = secrets.token_hex(16)  # the release token: only the release's own pause carries it
     try:
         conn = release_ledger.connect()
     except (OSError, sqlite3.Error) as error:
@@ -210,10 +228,7 @@ def run() -> int:
             release_ledger.begin_release(conn, batch_id, prev=pins.prev, new=pins.new)
         except (ValueError, sqlite3.Error) as error:
             return _refuse(f"batch {batch_id} could not begin its release ({error})")
-        refusals, result, host = [], None, _Host(reader, actions)
-        previous = {
-            signum: signal.signal(signum, host.stop) for signum in (signal.SIGINT, signal.SIGTERM)
-        }
+        refusals, result = [], None
         try:
             actions.fetch(pins.new)
             actions.save_config_snapshot(pins.new)
@@ -226,21 +241,22 @@ def run() -> int:
             if not refusals and not _pause(reason, token):
                 refusals.append("the platform is already paused")
             if not refusals:
-                _hold(token)
-                _drain(reader, pins, merges, settings["drain_poll_seconds"])
+                _hold(token, host.stopped)
+                _drain(reader, pins, merges, settings["drain_poll_seconds"], host)
                 tier = max(m["tier"] if m["tier_recorded"] else 2 for m in batch["members"])
-                _hold(token)
+                _hold(token, host.stopped)
                 result = run_release(host, pins, tier, merges)
+                if result.outcome != "refused" and not host.cut_over:
+                    # At its first unit stop the pause was not the release's own: nothing moved.
+                    result = None
+                    raise _Stopped("stopped before cutover")
         except _Stopped as stop:
             refusals.append(str(stop))
         except Exception as error:  # an action, or a read in the drain or the fresh guards (F5)
             refusals.append(f"a step before the cutover failed ({type(error).__name__}: {error})")
-        finally:
-            for signum, handler in previous.items():
-                signal.signal(signum, handler or signal.SIG_DFL)
-        if host.cut_over and (host.stopped or result is None):
-            # From the first unit stop on, a stop, or a runner result that never came back, is
-            # never a refusal: the release failed midway and stays paused for its recovery (card 7).
+        if host.cut_over and result is None:
+            # From the first unit stop on, a runner result that never came back is never a
+            # refusal: the release failed midway and stays paused for its recovery (card 7).
             outcome = "failed"
             print("The release failed after the cutover (stopped midway).")
         else:
@@ -280,12 +296,14 @@ def _guards_failed(guards: list[str]) -> str:
 
 
 def _drain(
-    reader: LiveHostReader, pins: Pins, merges: list[RecordedMerge], seconds: float
+    reader: LiveHostReader, pins: Pins, merges: list[RecordedMerge], seconds: float, host: _Host
 ) -> None:
     """Wait until the merged G10 holds, asking it every ``seconds``. The wait has no time limit
-    of its own (decision B): a stop signal ends it."""
+    of its own (decision B): the host's stop flag, read at every poll, ends it."""
     [check] = [check for guard, _rule, check in release_guards.GUARDS if guard == "G10"]
     while not check(reader, pins, merges):
+        if host.stopped:
+            raise _Stopped("stopped before cutover")
         time.sleep(seconds)
 
 
@@ -293,22 +311,25 @@ class _Host:
     """The live reader and actions as the one release host the runner asks. A name the actions
     have is theirs, so ``checkout`` is the move; every other name is the reader's.
 
-    The host is also the run's SIGINT and SIGTERM handler. It marks the cutover just before the
-    runner's first unit stop is handed over, so a stop in that very call comes after the cutover.
+    The host also holds the run's stop flag, which its SIGINT and SIGTERM handler only sets. Until
+    the cutover, it hands an action over only while the release's own pause is in place, read each
+    time: the runner's first unit stop, after the fresh guards, reads it and marks the cutover, and
+    a pause that is not the release's own leaves the runner no unit to stop and no move back.
     """
 
-    def __init__(self, reader: LiveHostReader, actions: ReleaseHostActions) -> None:
-        self._reader, self._actions = reader, actions
+    def __init__(self, reader: LiveHostReader, actions: ReleaseHostActions, token: str) -> None:
+        self._reader, self._actions, self._release_token = reader, actions, token
         self.cut_over = self.stopped = False
 
     def __getattr__(self, name: str) -> Any:
-        if name == "stop_units":
-            self.cut_over = True
-        return getattr(self._actions if hasattr(self._actions, name) else self._reader, name)
+        owner = self._actions if hasattr(self._actions, name) else self._reader
+        if owner is self._actions and not self.cut_over:
+            _hold(self._release_token)
+            self.cut_over = name == "stop_units"
+        return getattr(owner, name)
 
     def stop(self, signum: int, frame: Any) -> None:
         self.stopped = True
-        raise _Stopped("stopped midway" if self.cut_over else "stopped before cutover")
 
 
 class _Stopped(BaseException):
@@ -322,7 +343,7 @@ def _pause(reason: str, token: str) -> bool:
     pause is in place, so an owner's pause is never written over: False then. Any other failure
     to publish is left to the readback, which refuses. Once created, the temporary file is
     removed; an error of that removal other than a missing file is raised, so the run refuses
-    before the cutover."""
+    before the cutover, with its type and errno only: its file name and text carry the token."""
     path = estop.sentinel_path()
     temporary = path.with_name(f".{path.name}.{token}")
     payload = {"engaged_at": datetime.now(timezone.utc).isoformat(), "reason": reason}
@@ -339,8 +360,13 @@ def _pause(reason: str, token: str) -> bool:
         pass
     finally:
         if created:
-            with contextlib.suppress(FileNotFoundError):
+            try:
                 os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            except OSError as error:  # its name and text carry the token: type and errno only
+                step = "the temporary pause file could not be removed"
+                raise type(error)(error.errno, step) from None
     return True
 
 
@@ -351,9 +377,10 @@ def _token() -> str | None:
     return None
 
 
-def _hold(token: str) -> None:
-    """Stop the release before the cutover unless its own pause, with ``token``, is in place."""
-    if _token() != token:
+def _hold(token: str, stopped: bool = False) -> None:
+    """Stop the release before the cutover when ``stopped``, or unless its own pause, with
+    ``token``, is in place."""
+    if stopped or _token() != token:
         raise _Stopped("stopped before cutover")
 
 
