@@ -88,6 +88,9 @@ _WRITER = (
     "sys.stdin.read()\n"
     "conn.close()\n"
 )
+# The first bytes of a rollback journal once it is synced, as it is before a writer puts any change
+# into the database file. Until then they are zeros, and the journal is not hot.
+_JOURNAL_MAGIC = bytes.fromhex("d9d505f920a163d7")
 
 
 @dataclass
@@ -343,6 +346,31 @@ def _wal_writer(top: Path, home: Path):
     ) as writer:
         assert writer.stdout.readline() == "ready\n"
         yield writer
+
+
+class _RolledBack(Exception):
+    """Raised in place of a held COMMIT, so its transaction rolls back."""
+
+
+def _accept_held_at_commit(batch: dict, cache_pages: int, at_commit) -> None:
+    """Accept ``batch`` on a connection with ``cache_pages`` pages of cache, call ``at_commit``
+    when the decision's COMMIT is due, and roll the decision back instead of committing it. With
+    one or two pages the decision has spilled into the database file by then."""
+
+    class HeldAtCommit(sqlite3.Connection):
+        def execute(self, sql, parameters=(), /):
+            if sql == "COMMIT":
+                at_commit()
+                raise _RolledBack
+            return super().execute(sql, parameters)
+
+    with contextlib.closing(
+        sqlite3.connect(ledger.ledger_path(), isolation_level=None, factory=HeldAtCommit)
+    ) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA cache_size={cache_pages}")
+        with pytest.raises(_RolledBack):
+            _accept(conn, batch)
 
 
 def test_prepare_runs_every_guard_and_writes_nothing(root, tmp_path, monkeypatch, capsys):
@@ -702,7 +730,7 @@ def test_the_real_command_writes_nothing_to_the_release_state(root, tmp_path, ca
 
 @pytest.mark.parametrize("command", ["prepare", "status"])
 @pytest.mark.parametrize("writing", [False, True], ids=["closed-wal-ledger", "live-writer"])
-def test_the_release_record_is_read_from_a_private_copy(
+def test_the_committed_changes_of_a_record_in_wal_mode_are_read(
     root, tmp_path, monkeypatch, capsys, command, writing
 ):
     release_cmd = _command(monkeypatch, FakeHost())
@@ -717,7 +745,10 @@ def test_the_release_record_is_read_from_a_private_copy(
 
         assert getattr(release_cmd, command)() == 0
 
-        assert _live_files(path) == before
+        # The database file and the writer's -wal are as they were. SQLite may change the
+        # -shm, and make it and an empty -wal where there were none.
+        after = _live_files(path)
+        assert (after[""], after["-wal"] or None) == (before[""], before["-wal"])
     # Every committed change is read, those still only in the -wal too.
     out = capsys.readouterr().out
     if command == "prepare":
@@ -726,33 +757,78 @@ def test_the_release_record_is_read_from_a_private_copy(
         assert "waiting for the owner's decision: 1 change" in out
 
 
-@pytest.mark.parametrize("command", ["prepare", "status"])
-@pytest.mark.parametrize(
-    ("damage", "cause"),
-    [
-        pytest.param(
-            "empty", "OperationalError: no such table: release_batches", id="empty-main-file"
+@pytest.mark.parametrize("cache_pages", [1, 2, 5])
+def test_a_decision_that_was_never_committed_is_never_reported(root, tmp_path, cache_pages):
+    # S1 of the final security review: the owner's Accept is held at its COMMIT while both
+    # commands run, each in its own process, and is then rolled back. This process does not open
+    # the database file meanwhile: closing it would drop the writer's locks on it.
+    with contextlib.closing(ledger.connect()) as conn:
+        batch = _merge(conn, NEW)
+    path = ledger.ledger_path()
+    before = _live_files(path)
+    done = {}
+
+    def run_both():
+        if cache_pages < 5:  # the decision is in the database file already
+            assert Path(f"{path}-journal").read_bytes().startswith(_JOURNAL_MAGIC)
+        for command in ("prepare", "status"):
+            done[command] = _cli(tmp_path, root, "release", command)
+
+    _accept_held_at_commit(batch, cache_pages, run_both)
+
+    assert _live_files(path) == before  # the decision is gone, and the reads changed nothing
+    # Each command reads the committed record, in which the batch still waits, or refuses in plain
+    # words; neither reports the acceptance, which never was.
+    committed = {
+        "prepare": (
+            1,
+            ["Refused: no batch is accepted, so there is nothing to release.", WROTE_NOTHING],
         ),
-        pytest.param("header", "DatabaseError: file is not a database", id="damaged-header"),
-    ],
-)
-def test_a_record_copy_sqlite_cannot_read_fails_closed(
-    root, tmp_path, monkeypatch, capsys, command, damage, cause
-):
+        "status": (
+            0,
+            [
+                f"Waiting batch {batch['batch_id']}, waiting for the owner's decision: 1 change",
+                f"  - t_{NEW[:8]} (https://github.com/mtbitcr/hermes-agent/pull/1)",
+                "Last outcome: no release has finished yet.",
+            ],
+        ),
+    }
+    unreadable = f"Refused: the release record {path} could not be read ("
+    seen, expected = {}, {}
+    for command, result in done.items():
+        out = result.stdout.splitlines()
+        refusal = next((line for line in out if line.startswith(unreadable)), None)
+        code, lines = committed[command] if refusal is None else (1, [refusal, WROTE_NOTHING])
+        seen[command], expected[command] = (result.returncode, out[-len(lines):]), (code, lines)
+    assert seen == expected
+
+
+@pytest.mark.parametrize("command", ["prepare", "status"])
+def test_a_record_with_a_hot_journal_fails_closed(root, monkeypatch, capsys, command):
+    # A writer stopped at its COMMIT, after its Accept spilled into the database file, leaves a hot
+    # journal: only a rollback, which a read-only reader cannot make, brings back what was
+    # committed.
     host = FakeHost()
     release_cmd = _command(monkeypatch, host)
+    with contextlib.closing(ledger.connect()) as conn:
+        batch = _merge(conn, NEW)
     path = ledger.ledger_path()
-    with _wal_writer(tmp_path, root):
-        wal = Path(f"{path}-wal").read_bytes()  # a valid -wal of this record
-    main = path.read_bytes()
-    path.write_bytes(b"" if damage == "empty" else bytes(100) + main[100:])
-    Path(f"{path}-wal").write_bytes(wal)
+    left = {}
+
+    def stop():  # what the writer leaves when it stops there
+        left.update((side, Path(f"{path}{side}").read_bytes()) for side in ("", "-journal"))
+
+    _accept_held_at_commit(batch, 1, stop)
+    for side, data in left.items():
+        Path(f"{path}{side}").write_bytes(data)
+    assert left["-journal"].startswith(_JOURNAL_MAGIC)
     before = _live_files(path)
 
     assert getattr(release_cmd, command)() == 1
 
     assert capsys.readouterr().out.splitlines() == [
-        f"Refused: the release record {path} could not be read ({cause}).",
+        f"Refused: the release record {path} could not be read (OperationalError: attempt to"
+        " write a readonly database).",
         WROTE_NOTHING,
     ]
     assert (_live_files(path), host.built) == (before, [])
@@ -888,47 +964,6 @@ def test_a_record_in_a_folder_that_cannot_be_searched_fails_closed(monkeypatch, 
             WROTE_NOTHING,
         ]
         assert _live_files(path) == before
-
-
-@pytest.mark.parametrize("command", ["prepare", "status"])
-@pytest.mark.parametrize("wal", ["absent", "ordinary", "broken-link"])
-def test_a_wal_that_exists_but_cannot_be_copied_fails_closed(root, tmp_path, command, wal):
-    # Through the CLI in a child process. The record is in WAL mode: while its writer is open, the
-    # writer's changes are only in the -wal, and once it has closed there is no -wal.
-    path = ledger.ledger_path()
-    with _wal_writer(tmp_path, root) as writer:
-        if wal != "ordinary":
-            writer.stdin.close()
-            writer.wait(timeout=30)
-        if wal == "broken-link":
-            Path(f"{path}-wal").symlink_to(path.with_name("moved.db-wal"))  # nothing is there
-        before = _live_files(path)
-
-        done = _cli(tmp_path, root, "release", command)
-
-        assert _live_files(path) == before
-    tail = {
-        "prepare": [
-            f"Batch 1: PREV {PREV}, NEW {NEW}",
-            *(f"{guard} passed: {rule}" for guard, rule, _check in GUARDS),
-            f"All {len(GUARDS)} release guards passed. {WROTE_NOTHING}",
-        ],
-        "status": [
-            "Waiting batch 2, waiting for the owner's decision: 1 change",
-            f"  - t_{LATER[:8]} (https://github.com/mtbitcr/hermes-agent/pull/2)",
-            "Last outcome: no release has finished yet.",
-        ],
-    }[command]
-    if wal == "broken-link":
-        # A -wal that was seen may hold committed changes, so failing to copy it refuses.
-        tail = [
-            f"Refused: the release record {path} could not be read (FileNotFoundError: [Errno 2]"
-            f" No such file or directory: '{path}-wal').",
-            WROTE_NOTHING,
-        ]
-    assert done.returncode == (1 if wal == "broken-link" else 0), done.stderr
-    assert "Traceback" not in done.stderr
-    assert done.stdout.splitlines()[-len(tail):] == tail
 
 
 # Damage to a record that is otherwise well formed, and the plain reason each command that reads

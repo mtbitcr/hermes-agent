@@ -2,8 +2,8 @@
 
 ``prepare`` works out PREV and NEW (S-B), builds both live adapters from the ``release`` settings
 (S-E) and asks the host every merged guard, printing each result in plain words. It writes
-nothing to the release state: config.yaml is read as it is on disk, the release record is read
-from a private copy, and the guards only read. ``status`` prints the waiting batch and the last
+nothing to the release state: config.yaml is read as it is on disk, the release record is opened
+read-only, and the guards only read. ``status`` prints the waiting batch and the last
 outcome. The release itself, under the pause (S-A) and in its own unit (S-F), belongs to a later
 card.
 """
@@ -12,10 +12,8 @@ from __future__ import annotations
 
 import contextlib
 import os
-import shutil
 import sqlite3
 import stat
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -63,12 +61,8 @@ _ROLLED_BACK = (
 _LAST_FINISHED_SQL = (
     "SELECT batch_id FROM release_events WHERE kind = 'release_finished' ORDER BY id DESC LIMIT 1"
 )
-# release_ledger.last_released's query. The ledger's readers refuse a connection to anything but
-# the live store itself, so the copy is read with these queries and release_ledger._snapshot.
-_LAST_RELEASED_SQL = (
-    "SELECT new FROM release_batches JOIN release_events ON batch_id = release_batches.id "
-    "WHERE state = 'released' AND kind = 'release_finished' ORDER BY release_events.id DESC LIMIT 1"
-)
+# How long a read of the release record waits while a writer keeps it out, before it refuses.
+_BUSY_TIMEOUT_MS = 1000
 
 
 class _UnreadableRecord(Exception):
@@ -226,16 +220,16 @@ def _adapters(
 
 def _record() -> tuple[list[dict[str, Any]], str | None, int | None]:
     """Every batch, the NEW of the last released batch and the batch whose release finished last,
-    all from a private copy of the release record.
+    all from one read transaction on the release record.
 
     The record has two shapes. When none of its four names exists, the database file and its
     -wal, -shm and -journal files, it does not exist yet and reads as empty. When the database
-    file is a regular file, not a link, it and its -wal, when that name exists, are copied into a
-    private temporary directory; the copy is opened there read-only, read and removed. SQLite
-    never opens the live files, so it cannot create, change or delete their side files, and what
-    was committed to the -wal is still read. Any other state, an error while the names are looked
-    at, a -wal that exists but cannot be copied, a copy SQLite cannot read and a batch the
-    record's own snapshot cannot decode raise _UnreadableRecord.
+    file is a regular file, not a link, SQLite opens it read-only, with a short busy timeout, and
+    reads every row in one read transaction, so only what was committed is read, in the -wal too.
+    SQLite keeps the side files as it does for any read-only reader and never writes the database
+    file. Any other state, an error while the names are looked at, any SQLite error (a hot
+    journal, a lock held past the timeout, a file it cannot read) and a batch the record's own
+    snapshot cannot decode raise _UnreadableRecord.
     """
     path = release_ledger.ledger_path()
     try:
@@ -254,33 +248,32 @@ def _record() -> tuple[list[dict[str, Any]], str | None, int | None]:
         if not stat.S_ISREG(found[""]):
             link = "a symbolic link, " if stat.S_ISLNK(found[""]) else ""
             raise _unreadable(f"it is {link}not a regular file")
-        with tempfile.TemporaryDirectory(prefix="hermes-release-record-") as private:
-            copy = Path(private) / path.name
-            shutil.copyfile(path, copy)
-            # A -wal seen above may hold committed changes, so failing to copy it refuses, also
-            # when it has gone since or is a broken link. Only a -wal not seen is skipped.
-            if "-wal" in found:
-                shutil.copyfile(f"{path}-wal", f"{copy}-wal")
-            conn = sqlite3.connect(f"{copy.as_uri()}?mode=ro", uri=True, isolation_level=None)
-            conn.row_factory = sqlite3.Row
-            try:
+        conn = sqlite3.connect(
+            f"{path.absolute().as_uri()}?mode=ro",
+            uri=True,
+            isolation_level=None,
+            timeout=_BUSY_TIMEOUT_MS / 1000,
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            with release_ledger._read_txn(conn):
                 ids = conn.execute("SELECT id FROM release_batches ORDER BY id").fetchall()
-                live = conn.execute(_LAST_RELEASED_SQL).fetchone()
+                live = release_ledger.last_released(conn)
                 finished = conn.execute(_LAST_FINISHED_SQL).fetchone()
                 return (
                     [_batch(conn, row["id"]) for row in ids],
-                    None if live is None else live["new"],
+                    live,
                     None if finished is None else finished["batch_id"],
                 )
-            finally:
-                conn.close()
+        finally:
+            conn.close()
     except (OSError, sqlite3.Error) as error:
         raise _unreadable(f"{type(error).__name__}: {error}") from error
 
 
 def _batch(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
-    """A batch in the copy as the record's own snapshot reads it. One it cannot decode, a field
-    missing or a commit that is not ASCII, cannot be read."""
+    """A batch as the record's own snapshot reads it. One it cannot decode, a field missing or a
+    commit that is not ASCII, cannot be read."""
     try:
         return release_ledger._snapshot(conn, batch_id)
     except (LookupError, ValueError) as error:
