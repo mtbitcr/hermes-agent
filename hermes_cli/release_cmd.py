@@ -320,12 +320,16 @@ def _pause(reason: str, token: str) -> bool:
     """Publish the pause sentinel whole: estop's payload and the release token are written to a
     temporary file beside it, which is then linked to the sentinel's name. The link fails when a
     pause is in place, so an owner's pause is never written over: False then. Any other failure
-    is left to the readback, which refuses. The temporary file is removed in every case."""
+    to publish is left to the readback, which refuses. Once created, the temporary file is
+    removed; an error of that removal other than a missing file is raised, so the run refuses
+    before the cutover."""
     path = estop.sentinel_path()
     temporary = path.with_name(f".{path.name}.{token}")
     payload = {"engaged_at": datetime.now(timezone.utc).isoformat(), "reason": reason}
+    created = False
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        created = True
         with os.fdopen(fd, "w", encoding="utf-8") as sentinel:
             sentinel.write(json.dumps({**payload, "release_token": token}, indent=2) + "\n")
         os.link(temporary, path)
@@ -334,8 +338,9 @@ def _pause(reason: str, token: str) -> bool:
     except OSError:
         pass
     finally:
-        with contextlib.suppress(OSError):
-            os.unlink(temporary)
+        if created:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
     return True
 
 

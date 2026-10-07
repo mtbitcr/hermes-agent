@@ -296,18 +296,6 @@ def _stop_signal(signum: int = signal.SIGTERM):
     signal.raise_signal(signum)
 
 
-def _signal_after(monkeypatch, owner, name, signum):
-    """A stop signal just after each real call of ``owner.name`` returns; set before ``_run``."""
-    real = getattr(owner, name)
-
-    def call_then_signal(*args, **kwargs):
-        returned = real(*args, **kwargs)
-        _stop_signal(signum)
-        return returned
-
-    monkeypatch.setattr(owner, name, call_then_signal)
-
-
 def test_run_pauses_waits_for_the_drain_then_releases_and_resumes(root, monkeypatch, capsys):
     batch_id = _accepted(1)["batch_id"]
     host = FakeHost(open_reads=3, at={("runner", 1): _sentinel})  # one live run, for two polls
@@ -502,6 +490,72 @@ def test_the_pause_is_published_whole_or_not_at_all(root, monkeypatch, capsys, c
     assert set(os.listdir(root)) == (names | {"ESTOP"} if owner else names)
     refusal = "the platform is already paused" if owner else "stopped before cutover"
     assert f"Refused: {refusal}." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("case", "error"),
+    [
+        ("published", "EACCES"), ("published", "EIO"), ("owner pause", "EACCES"),
+        ("owner pause", "EIO"), ("read-only folder", "EACCES"), ("removed", None),
+        ("already gone", None),
+    ],
+)
+def test_a_failed_removal_of_the_pause_file_refuses_the_run(
+    root, monkeypatch, capsys, case, error
+):
+    """Owner rule 344, item 3 (the finding of the fourth review). A removal of the release's pause
+    file that fails for any reason but a missing file is reported and refuses the run before the
+    cutover: once the pause is published, once an owner's pause, written just after the run's
+    read, failed the publication, or as the root home is read-only for that removal. No unit
+    stops, and only the release's own pause is lifted. The controls: the file is removed, or
+    already gone."""
+    _accepted(1)
+    host, unlink, link, mode = FakeHost(), os.unlink, os.link, root.stat().st_mode
+    prefix = f".{estop.SENTINEL_NAME}."  # the start of the pause file's name
+    number = getattr(errno, error) if error else None
+
+    def remove(path, *args, **kwargs):  # every removal is real, but the pause file's may fail
+        if error is None or not Path(path).name.startswith(prefix):
+            return unlink(path, *args, **kwargs)
+        if case != "read-only folder":  # an OSError of EACCES is a PermissionError
+            raise OSError(number, os.strerror(number), os.fspath(path))
+        root.chmod(0o555)
+        try:
+            if os.access(root, os.W_OK):  # root removes from a read-only folder anyway
+                raise PermissionError(number, os.strerror(number), os.fspath(path))
+            return unlink(path, *args, **kwargs)
+        finally:
+            root.chmod(mode)
+
+    def link_then_remove(source, *args, **kwargs):  # the pause is published; its file is gone
+        link(source, *args, **kwargs)
+        unlink(source)
+
+    monkeypatch.setattr(os, "unlink", remove)
+    if case == "already gone":
+        monkeypatch.setattr(os, "link", link_then_remove)
+    elif case == "owner pause":  # written just after the run read that none was set
+        read = estop.is_engaged
+
+        def is_engaged():
+            engaged = read()
+            if not host.injected:
+                host.injected.append(estop.engage(OWNER).read_bytes())
+            return engaged
+
+        monkeypatch.setattr(estop, "is_engaged", is_engaged)
+
+    code = _run(monkeypatch, host)
+    out, outcomes = capsys.readouterr().out, [batch["outcome"] for batch in _batches()]
+    assert _sentinel() == (host.injected[0] if case == "owner pause" else None)
+    if error is None:
+        assert (code, outcomes) == (0, ["released"])
+        assert not [name for name in os.listdir(root) if name.startswith(prefix)]
+    else:
+        assert (code, host.stops, host.results, outcomes) == (1, 0, [], ["refused", None])
+        kind = "PermissionError" if error == "EACCES" else "OSError"
+        failure = f"({kind}: [Errno {number}] {os.strerror(number)}: "
+        assert f"Refused: a step before the cutover failed {failure}" in out
 
 
 @pytest.mark.parametrize("at", [("G10", 2), ("preflight", 2)], ids=["drain", "fresh guards"])
