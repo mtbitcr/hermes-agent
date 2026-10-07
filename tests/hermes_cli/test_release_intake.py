@@ -16,7 +16,7 @@ from tests.hermes_cli.test_kanban_delivery import (  # noqa: F401  (board is a f
     IMPLEMENTER, _become, _git, _spawned_worker_env, _write_config, board,
 )
 from tests.hermes_cli.test_kanban_delivery_auto_merge import (  # noqa: F401  (armed is a fixture)
-    _done, _lenses, _published_as, _reviews, armed,
+    _continues, _done, _lenses, _published_as, _reviews, armed,
 )
 from tests.hermes_cli.test_kanban_delivery_github import REPO
 from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _events, _tick
@@ -230,3 +230,127 @@ def test_intake_reaches_the_root_store_under_a_worker_env(merged, monkeypatch):
         (tid, "other", 1, gh["merges"][41]), (home, kb.DEFAULT_BOARD, 2, gh["merges"][44])])
     assert [path for path in root.rglob("*") if "release" in path.name] == [root / "kanban" / "release_ledger.db"]
     assert (_state(kb, head, other_db), _state(kb, home_head, root_db)) == ("merged", "merged")
+
+
+_READ = ("GET", f"/repos/{REPO}/pulls/41")  # one read of pull request 41
+
+
+def _replacing(merged, state, during):
+    """The reviewer's reproduction through the dispatcher: pull request 41 of H left ``state`` (armed or unknown)
+    and its linked continuation published as 42, so the next pass closes 41. GitHub merges H while that close is
+    outstanding and ``during(merge)`` returns the close's answer; None cuts the pass off inside the close."""
+    kb, root, repo, gh = merged
+    db = kb.kanban_db_path()
+    tid, head = _ready(merged)
+    base = _git(repo, "rev-parse", "main")
+    _tick(kb)
+    _done(db)
+    _reviews(gh, *_lenses(kb, head))
+    gh["arm"] = "timeout" if state == "auto_merge_unknown" else gh["arm"]
+    _tick(kb)
+    assert _state(kb, head) == state
+    rework, continued = _approved(kb, repo, "rework")
+    _continues(db, rework, head, tid)
+    _published_as(db, gh, rework, continued, 42)
+    merge = _merge(repo, head)
+
+    def outstanding():
+        gh["merges"][41] = merge
+        gh["close"] = during(merge)
+        if gh["close"] is None:
+            raise RuntimeError("the pass is cut off inside the close")
+
+    gh["hooks"]["PATCH"] = outstanding
+    return tid, head, base, merge
+
+
+def _held(kb):
+    """Pull request 41's row, read from its file: its state and whether an action claims it."""
+    return [(row["pull_request_state"], row["claimed"]) for row in _raw(
+        kb.kanban_db_path(), "SELECT pull_request_state, publish_lease IS NOT NULL AS claimed FROM kanban_deliveries "
+        "WHERE pull_request_number = 41")]
+
+
+@pytest.mark.parametrize("close, after", [((200, {"number": 41, "state": "closed"}), "replaced"),
+                                          ((403, None), "merged"), (None, None)],
+                         ids=["closed", "refused_403", "interrupted"])
+@pytest.mark.parametrize("state", ["auto_merge_armed", "auto_merge_unknown"])
+def test_a_merge_seen_while_the_close_is_in_flight_is_read_on_a_later_pass(merged, state, close, after):
+    """Owner rule 1: a pass run while the close of 41 is in flight neither reads 41 nor records its merge; a later
+    pass reads it once the close leaves it armed or unknown."""
+    kb, root, repo, gh = merged
+    seen = []
+
+    def during(merge):
+        calls = len(gh["calls"])
+        _tick(kb)
+        seen.append((_store(root), gh["calls"][calls:].count(_READ), _held(kb)))
+        return close
+
+    tid, head, base, merge = _replacing(merged, state, during)
+    _tick(kb)
+    calls = len(gh["calls"])
+    _tick(kb)
+
+    assert seen == [([], 0, [(state, 1)])]
+    assert (_held(kb), [m["merge_commit"] for m in _store(root)], gh["calls"][calls:].count(_READ)) == (
+        [(after or state, int(after is None))], [merge] * (after == "merged"), int(after == "merged"))
+
+
+@pytest.mark.parametrize("close, outcomes, after", [
+    ((200, {"number": 41, "state": "closed"}), ["close_pending", "replaced"], "replaced"),
+    ((403, None), ["close_pending", "close_refused", "merged"], "merged"),
+    (None, ["close_pending"], None),
+    ("not_sent", ["merged"], "merged")], ids=["closed", "refused_403", "interrupted", "merged_before_the_close"])
+@pytest.mark.parametrize("state", ["auto_merge_armed", "auto_merge_unknown"])
+def test_merged_is_final_never_overwritten_closed_or_read_again(merged, state, close, outcomes, after):
+    """Owner rule 2: merged is final. No close answer overwrites it; a merged row holds no claim, is never closed
+    as replaced and is not read again."""
+    kb, root, repo, gh = merged
+
+    def during(merge):
+        _tick(kb)
+        return close
+
+    tid, head, base, merge = _replacing(merged, state, during)
+    if close == "not_sent":
+        gh["merges"][41] = merge  # merged before the pass that owes its close
+    _tick(kb)
+    _tick(kb)
+    calls = len(gh["calls"])
+    _tick(kb)
+
+    assert [call for call in gh["calls"][calls:] if call[1].startswith(f"/repos/{REPO}/pulls/41")] == []
+    assert [kind[9:] for kind, _ in _events(kb, tid) if kind[9:] in (
+        "close_pending", "replaced", "close_refused", "merged")] == outcomes
+    assert (_held(kb), [m["merge_commit"] for m in _store(root)]) == (
+        [(after or state, int(after is None))], [merge] * (after == "merged"))
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["recorded", "intake_fails_once"])
+@pytest.mark.parametrize("state", ["auto_merge_armed", "auto_merge_unknown"])
+def test_a_close_answered_with_the_merge_records_it_and_ends_merged(merged, state, fails):
+    """Owner rule 3: a close answered with 41 merged into main records the merge with the merge pass's values and
+    ends merged, not replaced; an intake failure leaves 41 to the next merge pass, which records it once."""
+    kb, root, repo, gh = merged
+    store = root / "kanban" / "release_ledger.db"
+    tid, head, base, merge = _replacing(merged, state, lambda merge: (200, {
+        "number": 41, "state": "closed", "merged": True, "base": {"ref": "main"}, "merge_commit_sha": merge}))
+    if fails:
+        store.mkdir(parents=True)
+    _tick(kb)
+
+    assert (_held(kb), len(_store(root))) == (([(state, 0)], 0) if fails else ([("merged", 0)], 1))
+    if fails:
+        store.rmdir()
+        _tick(kb)
+    calls = len(gh["calls"])
+    _tick(kb)
+
+    tree = _git(repo, "rev-parse", f"{head}^{{tree}}")
+    assert [(m["merge_commit"], m["pr_url"], m["reviewed_base"], m["reviewed_head"], m["reviewed_tree"], m["tier"],
+             m["card_id"], m["title"], m["board"]) for m in _store(root)] == [
+        (merge, f"https://github.com/{REPO}/pull/41", base, head, tree, 2, tid, "build feature", "default")]
+    assert [kind for kind, _ in _events(kb, tid) if kind in ("delivery_replaced", "delivery_merged")] == [
+        "delivery_merged"]
+    assert (_held(kb), gh["calls"][calls:].count(_READ)) == ([("merged", 0)], 0)
