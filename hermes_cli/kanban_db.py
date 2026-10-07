@@ -36092,7 +36092,7 @@ def check_respawn_guard(
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -36212,6 +36212,10 @@ def check_respawn_guard(
     #    correspondence cannot be established for ANY comment on the task —
     #    every same-second tie then fails CLOSED (still counts as an active,
     #    unreviewed PR) rather than risk mis-ordering.
+    #    A read-only role cannot open a PR: a PR URL on its task is the
+    #    review input, never a duplicate (t_69eba6ff).
+    if row["assignee"] in _READ_ONLY_PROFILES:
+        return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     latest_handback = conn.execute(
         "SELECT created_at, id FROM task_events "
