@@ -20,7 +20,9 @@ whether the approved head becomes the delivery's one pull request.
 
 :func:`review_step`, run by the same step, waits for CI on each published head:
 on green it creates that head's review cards; while a required check is red it
-waits, and a later pass reads CI again.
+waits, and a later pass reads CI again. :func:`arm_step` then arms GitHub
+auto-merge once on each head whose required review cards are done and approve it,
+and closes once each pull request a rework card replaced; GitHub does the merge.
 """
 
 from __future__ import annotations
@@ -270,12 +272,13 @@ def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional
             (task_id, head, approval["run_id"], int(time.time())),
         )
         # A new approval of a head with no pull request recorded re-arms its row
-        # and ends any lease on it, so a pass still holding one stores nothing.
+        # and ends any lease on it, so a pass still holding one stores nothing. A head
+        # parked behind an armed pull request stays parked: a later card owns its release.
         conn.execute(
             "UPDATE kanban_deliveries SET approval_run_id = ?, pull_request_state = NULL, "
             "publish_refusal = NULL, publish_lease = NULL, publish_lease_until = NULL "
             "WHERE source_task_id = ? AND source_head = ? AND pull_request_number IS NULL "
-            "AND approval_run_id IS NOT ?",
+            "AND approval_run_id IS NOT ? AND IFNULL(publish_refusal, '') != 'auto_merge_armed'",
             (approval["run_id"], task_id, head, approval["run_id"]),
         )
         record = conn.execute(
@@ -284,11 +287,11 @@ def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional
             (task_id, head),
         ).fetchone()
         # The approval is the source card's latest, so every other head of it,
-        # older or newer, is returned for changes.
+        # older or newer, is returned for changes; a head GitHub may hold armed stays as it is.
         conn.execute(
             "UPDATE kanban_deliveries SET pull_request_state = 'returned_for_changes' "
-            "WHERE source_task_id = ? AND source_head != ?",
-            (task_id, head),
+            "WHERE source_task_id = ? AND source_head != ? AND IFNULL(pull_request_state, '') NOT IN (?, ?, ?)",
+            (task_id, head, *_ARM_HELD),
         )
         return record["id"]
 
@@ -307,6 +310,8 @@ _PULL_REQUEST_BASE = "main"
 # The reviewed per-repository policy (C1): a repository it does not list is
 # never published.
 _POLICY_FILE = Path(__file__).with_name("kanban_delivery_policy.json")
+# The one account whose GitHub review confirms a done review card before auto-merge is armed.
+_REVIEWER_BOT = "raphael-reviewer-mtbitcr[bot]"
 
 # The GitHub repository the card's own repository names as its origin.
 _ORIGIN = re.compile(
@@ -522,6 +527,7 @@ def publish_step(db_path: Optional[Path]) -> Optional[dict]:
     if db_path is None or not delivery_settings():
         return None
     review_step(db_path)
+    arm_step(db_path)
     try:
         leased = _take_lease(db_path)
         if leased is None:
@@ -591,6 +597,8 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
         ledger = dict(_NO_LEDGER)
         if recorded:
             recorded_number, old, recorded_state = recorded[0]
+            if recorded_state in _ARM_HELD:  # no new head on it: a later card owns its release
+                raise PublishRefused("auto_merge_armed", f"pull request {recorded_number} may have auto-merge armed")
             ledger = {
                 "pull_request": recorded_number, "head": old, "state": recorded_state,
                 "head_is_ancestor": _git_proof(workdir, head, _sha(old))[1],
@@ -745,14 +753,16 @@ _REVIEW_CREATOR, _REVIEW_TIER = "kanban-delivery", "routine"
 _COMBINED = {"R15": "correctness and security"}
 _SPLIT = {"R15": "correctness", "R12": "security"}
 
-# Fixed kernel text with ids only, like the pull request's.
-_REVIEW_TITLE = "Review ({lens}) of {source} at {head}"
+# Fixed kernel text: the title names the source card by its own title, and the body carries the ids.
+_REVIEW_TITLE = "Review ({lens}) of {title}"
 _REVIEW_BODY = (
     "Kernel review of a published delivery: review pull request {number} on the code host at the "
     "head below, not a local worktree, and post the review on that commit.\nReview: {lens}\n"
     "Source card: {source}\nHead: {head}\nBase commit: {base}\nRepository: {repository}\n"
     "Pull request: {number}\nBranch: {branch}\nRisk tier: {tier}\nCI on {head}: passed ({checks})\n"
 )
+# Added once the card has its id: the line that ties the reviewer's GitHub review to this one card.
+_REVIEW_LINE = "Start your GitHub review body with this exact line:\nReview card {card}\n"
 
 
 def review_key(source_task_id: str, head: str, responsibility: str) -> str:
@@ -926,13 +936,13 @@ def _create_review_cards(db_path, row, read, repository, base, checks, reviewer,
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or not _unchanged(conn, row, read):
             return None
-        task = conn.execute("SELECT risk_tier, project_id FROM tasks WHERE id = ?", (source,)).fetchone()
+        task = conn.execute("SELECT risk_tier, project_id, title FROM tasks WHERE id = ?", (source,)).fetchone()
         try:
             tier, recorded = effective_risk_tier(task["risk_tier"]), task["risk_tier"] is not None
         except ValueError:  # not a tier: tier 2, never a lower one
             tier, recorded = UNRECORDED_RISK_TIER, False
         text = {"source": source, "head": head, "base": base, "repository": repository, "checks": ", ".join(checks),
-                "number": row["pull_request_number"], "branch": row["pull_request_branch"],
+                "number": row["pull_request_number"], "branch": row["pull_request_branch"], "title": task["title"],
                 "tier": tier if recorded else f"{tier}. {RISK_NOT_RECORDED}"}
         lenses = _COMBINED if tier < 2 else _SPLIT
         taken = sorted(card for responsibility in lenses for (card,) in conn.execute(
@@ -956,9 +966,256 @@ def _create_review_cards(db_path, row, read, repository, base, checks, reviewer,
                 project_source_task_id=source, owned_paths=[], parents=[source],
                 idempotency_key=review_key(source, head, responsibility),
                 risk_tier=tier, model_policy_lock=lock, **route)
+            conn.execute("UPDATE tasks SET body = body || ? WHERE id = ?", (_REVIEW_LINE.format(card=card), card))
             kb.authorize_executable_transition(conn, card)  # its route lock, or the card parked with why
             cards.append(card)
         conn.execute("UPDATE kanban_deliveries SET pull_request_state = 'review_cards_created', "
                      "publish_lease = NULL, publish_lease_until = NULL WHERE id = ?", (row["id"],))
         kb._append_event(conn, source, "delivery_review_cards_created", _outcome(row, cards=cards))
         return "review_cards_created"
+
+
+# ---------------------------------------------------------------------------
+# Card 5: auto-merge armed on a fully approved head; a replaced pull request closed
+# ---------------------------------------------------------------------------
+
+# Each mutation is first recorded as pending, in the write transaction that reads its
+# evidence a last time, and only the pass that wrote that sends it; its answer is then
+# recorded once. A head's arm ends armed, refused (with GitHub's status) or unknown (no
+# answer), and is never sent again: a new head is a new row. GitHub may hold a pending,
+# armed or unknown arm, so no new head is pushed to that pull request. A close ends
+# replaced or close_refused (with GitHub's status), its delivery_close_pending event
+# the record that it was sent.
+_PENDING, _ARMED, _ARM_REFUSED, _ARM_UNKNOWN = (
+    "auto_merge_pending", "auto_merge_armed", "auto_merge_refused", "auto_merge_unknown")
+_ARM_HELD = (_PENDING, _ARMED, _ARM_UNKNOWN)
+_REPLACED, _CLOSE_REFUSED = "replaced", "close_refused"
+_REVIEW_PAGES = 10  # owner rule 2 of round 3: a pull request's reviews are read up to 10 pages of 100
+# A row's repository: the publish step's own record of the pull request it published,
+# never the current git origin. No record, no repository, and nothing is sent.
+_RECEIPT = ("(SELECT json_extract(payload, '$.repository') FROM task_events WHERE task_id = {0}.source_task_id "
+            "AND kind = 'delivery_published' AND json_extract(payload, '$.head') = {0}.pull_request_head "
+            "AND json_extract(payload, '$.pull_request_number') = {0}.pull_request_number ORDER BY id DESC LIMIT 1)")
+
+
+def arm_step(db_path: Path) -> None:
+    """Card 5 on the board whose file is ``db_path``: arm GitHub auto-merge once on each
+    head whose required review cards are done and approve it, and close once the pull
+    request of each head a rework card continues. GitHub does the merge. Raises no error,
+    so the tick goes on."""
+    try:
+        with kb.connect_closing(db_path=db_path) as conn:
+            rows = [dict(row) for row in conn.execute(
+                f"SELECT d.*, {_RECEIPT.format('d')} AS repository FROM kanban_deliveries AS d "
+                "WHERE d.pull_request_number IS NOT NULL AND d.pull_request_state = 'review_cards_created' "
+                "ORDER BY d.id")]
+            replaced = _replaced(conn)
+    except Exception:
+        logger.exception("kanban delivery: the auto-merge step failed")
+        return
+    for act, items in ((_arm_delivery, rows), (_close_replaced, replaced)):
+        for row in items:
+            try:
+                act(db_path, row)
+            except PublishRefused as refusal:
+                logger.warning("kanban delivery: delivery %s: %s (%s)", row["id"], refusal.code, refusal.detail)
+            except Exception:
+                logger.exception("kanban delivery: delivery %s not armed or closed", row["id"])
+
+
+def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
+    """Each published row (or row ``old_id``) whose pull request, its repository and number,
+    another card's work continues: that card is a task_links child of the row's source card,
+    its recorded base is the row's head and its own published pull request is another one of
+    the same repository. The row is still the latest on its pull request, and no close of it
+    was sent."""
+    old, new, later = (_RECEIPT.format(name) for name in ("old", "new", "later"))
+    return [dict(row) for row in conn.execute(
+        f"SELECT old.*, {old} AS repository, MIN(rework.id) AS replaced_by FROM kanban_deliveries AS old "
+        "JOIN tasks AS rework ON rework.base_commit = old.pull_request_head AND rework.id != old.source_task_id "
+        "JOIN task_links AS link ON link.parent_id = old.source_task_id AND link.child_id = rework.id "
+        "JOIN kanban_deliveries AS new ON new.source_task_id = rework.id AND new.pull_request_number IS NOT NULL "
+        f"AND new.pull_request_number != old.pull_request_number AND {new} = {old} "
+        "WHERE old.pull_request_number IS NOT NULL AND (? IS NULL OR old.id = ?) "
+        "AND NOT EXISTS (SELECT 1 FROM kanban_deliveries AS later WHERE later.id > old.id "
+        f"AND later.pull_request_number = old.pull_request_number AND {later} = {old}) "
+        "AND NOT EXISTS (SELECT 1 FROM task_events WHERE task_id = old.source_task_id "
+        "AND kind = 'delivery_close_pending' AND json_extract(payload, '$.delivery_id') = old.id) "
+        "GROUP BY old.id ORDER BY old.id", (old_id, old_id))]
+
+
+def _approving_cards(conn: sqlite3.Connection, row: dict, read: tuple) -> list:
+    """The review cards the source card's tier requires for the row's head, when the source
+    is done at that head and each of them exists, is done and returned no changes; else [].
+    Each is its id, key, creator, status, own head and base, and event revision."""
+    source, head = row["source_task_id"], row["pull_request_head"]
+    if (read[1], _sha(read[2])) != ("done", head):
+        return []
+    try:
+        tier = effective_risk_tier(read[3])
+    except ValueError:  # not a tier: tier 2, never a lower one
+        tier = UNRECORDED_RISK_TIER
+    cards = [conn.execute("SELECT id, idempotency_key, created_by, status, head_commit, base_commit FROM tasks "
+                          "WHERE idempotency_key = ? AND created_by = ?",
+                          (review_key(source, head, responsibility), _REVIEW_CREATOR)).fetchone()
+             for responsibility in (_COMBINED if tier < 2 else _SPLIT)]
+    if any(card is None or card["status"] != "done" or conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (card["id"],)).fetchone()
+           for card in cards):
+        return []
+    return [(*card, kb.task_event_revision(conn, card["id"])) for card in cards]
+
+
+def _lenses_approve(reviews: list, head: str, cards: list) -> bool:
+    """Owner rule 1 of round 2. Of the reviews, oldest first as GitHub lists them, only the
+    reviewer bot's count: its latest approves H, and for each card so does its latest review
+    whose first line is exactly that card's line. No lens stands in for another."""
+    own = [review for review in reviews if isinstance(review, dict) and isinstance(review.get("user"), dict)
+           and review["user"].get("login") == _REVIEWER_BOT]
+    return all(found and (found[-1].get("state"), found[-1].get("commit_id")) == ("APPROVED", head) for found in (
+        own, *([review for review in own if review.get("body") == f"Review card {card[0]}"] for card in cards)))
+
+
+def _sent(github, call, *args, **kwargs) -> dict:
+    """A mutation's answer, or no status when none came: it is never sent again either way."""
+    from hermes_cli.kanban_delivery_github import GitHubTransportError
+
+    try:
+        return getattr(github, call)(*args, **kwargs)
+    except GitHubTransportError as error:
+        return {"status": None, "data": None, "reason": error.reason}
+
+
+def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
+    """Arm auto-merge on the row's head H, once (owner rules 1 to 3 of round 2). Every GitHub
+    read comes first: the pull request, open at H, then its reviews, which approve H lens by
+    lens. One write transaction then reads the complete evidence again, finds the pull request
+    unclaimed and reserves the arm under this attempt. The arm is the one call after it, and
+    its answer is written to this attempt only. A full tenth page of reviews that GitHub does not
+    show to be the last refuses H once instead."""
+    from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
+
+    source, head, number, repository = (row[key] for key in (
+        "source_task_id", "pull_request_head", "pull_request_number", "repository"))
+    with kb.connect_closing(db_path=db_path) as conn:
+        evidence = _arm_evidence(conn, row)
+        claimed = _claimed(conn, repository, number)
+    if claimed or not evidence[2] or repository not in _policy_repositories() or not delivery_settings():
+        return None  # claimed, a required card is missing, open or returned changes, or no repository recorded
+    reviews, whole = [], False
+    try:
+        github = GitHubTransport("publish", repository)
+        if not _open_at_head(github, repository, row):
+            return None  # the pull request left H or is closed: nothing to arm
+        for page in range(1, _REVIEW_PAGES + 1):  # oldest first; the last is not full or names no next page
+            listed = _answered(github.request("GET", f"/repos/{repository}/pulls/{number}/reviews",
+                                              query={"per_page": 100, "page": page}))
+            if listed["status"] != 200 or not isinstance(listed["data"], list):
+                return None  # a page GitHub does not list: nothing is armed or recorded on this pass
+            reviews, whole = reviews + listed["data"], len(listed["data"]) < 100 or listed.get("next_page") is False
+            if whole:
+                break
+    except GitHubTransportError as error:
+        raise _transport_refusal(error) from None
+    if whole and not _lenses_approve(reviews, head, evidence[2]):
+        return None  # a lens or the bot's latest review does not approve H
+    attempt = secrets.token_hex(8)
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if not delivery_settings() or _arm_evidence(conn, row) != evidence or _claimed(conn, repository, number):
+            return None  # the evidence changed while GitHub was read: nothing is sent
+        if not whole:  # a full tenth page, a next page named or unknown: H is refused once and never sent
+            conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (_ARM_REFUSED, row["id"]))
+            kb._append_event(conn, source, f"delivery_{_ARM_REFUSED}", _outcome(
+                row, repository=repository, status=None, reason="review_history_over_10_pages",
+                cards=[card[0] for card in evidence[2]]))
+            return _ARM_REFUSED
+        conn.execute("UPDATE kanban_deliveries SET pull_request_state = ?, publish_lease = ? WHERE id = ?",
+                     (_PENDING, attempt, row["id"]))
+    answer = _sent(github, "arm_auto_merge", number, head)
+    data = answer["data"] if isinstance(answer["data"], dict) else {}
+    result = data.get("data") if isinstance(data.get("data"), dict) else {}
+    state = _ARM_UNKNOWN if answer["status"] is None else _ARMED if answer["status"] == 200 and (
+        "errors" not in data and isinstance(result.get("enablePullRequestAutoMerge"), dict)) else _ARM_REFUSED
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if conn.execute("UPDATE kanban_deliveries SET pull_request_state = ?, publish_lease = NULL "
+                        "WHERE id = ? AND publish_lease = ?", (state, row["id"], attempt)).rowcount:
+            kb._append_event(conn, source, f"delivery_{state}", _outcome(
+                row, repository=repository, status=answer["status"], reason=answer.get("reason"),
+                cards=[card[0] for card in evidence[2]], attempt=attempt))
+    return state
+
+
+def _arm_evidence(conn: sqlite3.Connection, row: dict) -> tuple:
+    """All the arm stands on, read at once: the delivery row (its repository receipt, number,
+    head, state and claim), the source card's read and its approving review cards."""
+    now = conn.execute(f"SELECT d.*, {_RECEIPT.format('d')} AS repository FROM kanban_deliveries AS d "
+                       "WHERE d.id = ?", (row["id"],)).fetchone()
+    if now is None or any(now[key] != row[key] for key in (
+            "source_task_id", "pull_request_number", "pull_request_head", "pull_request_state", "repository")):
+        return (None, None, [])
+    read = _source_read(conn, row["source_task_id"])
+    return tuple(now), read, _approving_cards(conn, row, read)
+
+
+def _claimed(conn: sqlite3.Connection, repository: str, number: int) -> bool:
+    """Owner rule 3 of round 2: an arm or a close of this pull request holds its one action
+    claim, the attempt in publish_lease, which a published row holds for nothing else."""
+    return conn.execute(f"SELECT 1 FROM kanban_deliveries AS d WHERE d.publish_lease IS NOT NULL "
+                        f"AND d.pull_request_number = ? AND {_RECEIPT.format('d')} = ?",
+                        (number, repository)).fetchone() is not None
+
+
+def _close_replaced(db_path: Path, row: dict) -> None:
+    """Close, once, the pull request of a head a rework card continues (owner rules 2 and 3 of
+    round 2). GitHub must show it open at that head; one write transaction then reads the
+    replacement proof again, finds the pull request unclaimed and reserves the close
+    under this attempt, and the one call setting its state to closed follows. Done only when
+    the answer shows that pull request closed; else a close refusal, which keeps an armed hold."""
+    from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
+
+    repository, number = row["repository"], row["pull_request_number"]
+    with kb.connect_closing(db_path=db_path) as conn:
+        proof = _close_proof(conn, row)
+        claimed = _claimed(conn, repository, number)
+    if claimed or not proof or repository not in _policy_repositories() or not delivery_settings():
+        return
+    try:
+        github = GitHubTransport("publish", repository)
+        if not _open_at_head(github, repository, row):
+            return  # the pull request left the replaced head or is closed: nothing to close
+    except GitHubTransportError as error:
+        raise _transport_refusal(error) from None
+    attempt = secrets.token_hex(8)
+    held = row["pull_request_state"] if row["pull_request_state"] in _ARM_HELD else None
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if not delivery_settings() or _close_proof(conn, row) != proof or _claimed(conn, repository, number):
+            return
+        conn.execute("UPDATE kanban_deliveries SET pull_request_state = ?, publish_lease = ? WHERE id = ?",
+                     (held or "close_pending", attempt, row["id"]))
+        kb._append_event(conn, row["source_task_id"], "delivery_close_pending", _outcome(
+            row, repository=repository, replaced_by=row["replaced_by"], attempt=attempt))
+    answer = _sent(github, "request", "PATCH", f"/repos/{repository}/pulls/{number}", body={"state": "closed"})
+    data = answer["data"] if isinstance(answer["data"], dict) else {}
+    closed = (answer["status"], data.get("number"), data.get("state")) == (200, number, "closed")
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if conn.execute("UPDATE kanban_deliveries SET pull_request_state = ?, publish_lease = NULL "
+                        "WHERE id = ? AND publish_lease = ?",
+                        (_REPLACED if closed else held or _CLOSE_REFUSED, row["id"], attempt)).rowcount:
+            kb._append_event(conn, row["source_task_id"], f"delivery_{_REPLACED if closed else _CLOSE_REFUSED}",
+                             _outcome(row, repository=repository, replaced_by=row["replaced_by"],
+                                      status=answer["status"], closed=closed, attempt=attempt))
+
+
+def _close_proof(conn: sqlite3.Connection, row: dict) -> tuple:
+    """The replacement proof, read at once, by design not covering every change of the source or
+    continuation evidence (owner rule 1 of round 3): the row still replaced as ``row`` holds it
+    (its repository, number, head and state), its source card's status, head and tier, and the
+    continuing card's status and head and its deliveries' heads, repositories and numbers."""
+    if _replaced(conn, row["id"]) != [row]:
+        return ()
+    source, rework = (conn.execute("SELECT status, head_commit, risk_tier FROM tasks WHERE id = ?", (task,)).fetchone()
+                      for task in (row["source_task_id"], row["replaced_by"]))
+    deliveries = conn.execute(f"SELECT d.source_head, {_RECEIPT.format('d')}, d.pull_request_number, "
+                              "d.pull_request_head FROM kanban_deliveries AS d WHERE d.source_task_id = ? "
+                              "ORDER BY d.id", (row["replaced_by"],)).fetchall()
+    return tuple(source or ()), tuple(rework or ())[:2], [tuple(delivery) for delivery in deliveries]
