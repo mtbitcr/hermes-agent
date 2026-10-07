@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -92,8 +93,9 @@ class FakeHost:
 
     def note(self, entry):
         pause = _sentinel()
-        if pause is not None and pause != self.pause:
-            self.journal.append(f"pause {json.loads(pause)['reason']!r} at {estop.sentinel_path()}")
+        if pause is not None and pause != self.pause:  # an empty pause has no reason
+            reason = json.loads(pause or "{}").get("reason")
+            self.journal.append(f"pause {reason!r} at {estop.sentinel_path()}")
         self.pause = pause
         self.journal.append(entry)
         hook = self.at.pop((entry, self.journal.count(entry)), None)
@@ -267,7 +269,10 @@ def _run(monkeypatch: pytest.MonkeyPatch, host: FakeHost) -> int:
     _spy(monkeypatch, estop, "disengage", lambda: host.note("resume"))
     host.results = _spy(monkeypatch, release_cmd, "run_release", lambda *args: host.note("runner"))
     host.pause = _sentinel()
-    code = args.func(args)
+    try:
+        code = args.func(args)
+    except KeyboardInterrupt:  # an interrupt the run lets through would end the whole session
+        pytest.fail("an interrupt escaped the run")
     assert not host.at, "a hook was never reached"
     return code
 
@@ -285,10 +290,10 @@ def _spy(monkeypatch, owner, name, note):
     return results
 
 
-def _stop_signal():
+def _stop_signal(signum: int = signal.SIGTERM):
     """A stop signal to the run; the default handler would end the test process instead."""
-    assert callable(signal.getsignal(signal.SIGTERM)), "the run set no handler for its stop"
-    signal.raise_signal(signal.SIGTERM)
+    assert callable(signal.getsignal(signum)), "the run set no handler for its stop"
+    signal.raise_signal(signum)
 
 
 def test_run_pauses_waits_for_the_drain_then_releases_and_resumes(root, monkeypatch, capsys):
@@ -451,6 +456,131 @@ def test_stop_signal_during_the_drain_resumes(root, monkeypatch, capsys):
     ]
     assert "Refused: stopped before cutover." in capsys.readouterr().out
     assert (_sentinel(), signal.getsignal(signal.SIGTERM)) == (None, handler)  # its handler is gone
+
+
+@pytest.mark.parametrize("case", ["owner pause", "write fails", "stop signal"])
+def test_the_pause_is_published_whole_or_not_at_all(root, monkeypatch, capsys, case):
+    """Owner rule 326, item 1 (finding 1 of the second review). An owner's pause written once the
+    release has created its pause file, before the pause is published, refuses the run and stays
+    as the owner wrote it. A payload write that fails there, or a stop signal, refuses the run and
+    leaves no pause. No sentinel shows before the payload is whole, and no file of the release is
+    left beside it."""
+    _accepted(1)
+    host, names, fdopen = FakeHost(), set(os.listdir(root)), os.fdopen
+
+    def created(fd, *args, **kwargs):  # the release's pause file exists; its payload is not written
+        monkeypatch.setattr(os, "fdopen", fdopen)
+        host.injected.append(_sentinel())
+        if case == "owner pause":
+            host.injected.append(estop.engage(OWNER).read_bytes())
+        elif case == "write fails":
+            os.close(fd)
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        else:
+            _stop_signal()
+        return fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", created)
+
+    assert _run(monkeypatch, host) == 1
+    assert (host.stops, host.results, host.injected[0]) == (0, [], None)
+    assert [batch["outcome"] for batch in _batches()] == ["refused", None]
+    owner = case == "owner pause"
+    assert _sentinel() == (host.injected[1] if owner else None)
+    assert set(os.listdir(root)) == (names | {"ESTOP"} if owner else names)
+    refusal = "the platform is already paused" if owner else "stopped before cutover"
+    assert f"Refused: {refusal}." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("at", [("G10", 2), ("preflight", 2)], ids=["drain", "fresh guards"])
+def test_interrupt_before_the_cutover_refuses_and_resumes(root, monkeypatch, capsys, at):
+    """Owner rule 326, item 2 (finding 2). SIGINT while the run waits for the drain, or while the
+    runner asks every guard again, refuses the release as SIGTERM does: no unit stops, the changes
+    go back to the waiting decision, the release's own pause is lifted, and the caller's handlers
+    of both signals are back in place."""
+    _accepted(1)
+    handlers = [signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)]
+    host = FakeHost(open_reads=3, at={at: lambda: _stop_signal(signal.SIGINT)})
+
+    assert _run(monkeypatch, host) == 1
+    assert (host.stops, host.results, host.journal[-2:]) == (0, [], ["outcome refused", "resume"])
+    assert ([batch["outcome"] for batch in _batches()], _sentinel()) == (["refused", None], None)
+    assert "Refused: stopped before cutover." in capsys.readouterr().out
+    assert [signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)] == handlers
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["SIGINT", "SIGTERM"])
+@pytest.mark.parametrize("moment", ["after a unit stopped", "as the runner returns"])
+def test_stop_after_the_first_unit_stop_fails_midway_and_stays_paused(
+    root, monkeypatch, capsys, moment, signum
+):
+    """Owner rule 326, item 2 (finding 2). From the first unit stop on, a stop signal is never a
+    refusal: once the runner has stopped a unit, or as the unchanged runner hands back its result,
+    the release failed midway. Its changes stay in the batch, kept for recovery (card 7), and the
+    platform stays paused."""
+    from hermes_cli import release_cmd
+
+    batch_id = _accepted(1)["batch_id"]
+    host = FakeHost()
+    if moment == "after a unit stopped":
+        stop_units = host.stop_units
+
+        def stop_units_then_signal(units):
+            stop_units(units)
+            if host.stops == 1:
+                _stop_signal(signum)
+
+        host.stop_units = stop_units_then_signal
+    else:
+        runner = release_cmd.run_release
+
+        def return_then_signal(*args):
+            host.injected.append(runner(*args))  # the unchanged runner's result: released
+            _stop_signal(signum)
+            return host.injected[-1]
+
+        monkeypatch.setattr(release_cmd, "run_release", return_then_signal)
+
+    assert _run(monkeypatch, host) == 1
+    assert host.stops and host.journal[-1] == "outcome failed"
+    assert [(batch["state"], batch["outcome"]) for batch in _batches()] == [("failed", "failed")]
+    assert (estop.get_state() or {}).get("reason") == f"release {batch_id}"
+    out = capsys.readouterr().out
+    assert "stopped midway" in out and "Refused" not in out
+
+
+@pytest.mark.parametrize("removal", ["fails", "succeeds"])
+def test_resume_is_read_back(root, monkeypatch, capsys, removal):
+    """Owner rule 326, item 3 (finding 3). When the release's own pause cannot be removed, as its
+    folder turned read-only once the outcome was recorded, the run says the platform is still
+    paused and exits 1, and the batch stays released. The control: a removal that succeeds."""
+    batch_id = _accepted(1)["batch_id"]
+    host, mode, unlink = FakeHost(), root.stat().st_mode, os.unlink
+
+    def denied(path, *args, **kwargs):  # the removal, failed as a read-only folder fails it
+        if Path(path).name == estop.SENTINEL_NAME:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(path))
+        return unlink(path, *args, **kwargs)
+
+    def read_only():
+        root.chmod(0o555)
+        if os.access(root, os.W_OK):  # root writes in a read-only folder anyway
+            monkeypatch.setattr(os, "unlink", denied)
+
+    if removal == "fails":  # the outcome is recorded; the removal comes next
+        host.at[("resume", 1)] = read_only
+    try:
+        code = _run(monkeypatch, host)
+    finally:
+        root.chmod(mode)
+
+    paused = removal == "fails"
+    assert (code, host.journal[-2:]) == (1 if paused else 0, ["outcome released", "resume"])
+    assert [batch["outcome"] for batch in _batches()] == ["released"]
+    assert (estop.get_state() or {}).get("reason") == (f"release {batch_id}" if paused else None)
+    out = capsys.readouterr().out
+    assert f"Batch {batch_id} was released." in out
+    assert ("The platform is still paused" in out) is paused
 
 
 def test_nothing_is_imported_after_the_units_stop(root, monkeypatch):
