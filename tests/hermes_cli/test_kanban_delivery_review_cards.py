@@ -153,7 +153,7 @@ def test_the_recorded_tier_alone_decides_the_cards_of_the_exact_head(world, tier
 
     cards = _cards(kb)
     assert [(c["idempotency_key"], c["responsibility"], c["title"]) for c in cards] == [
-        (f"review:{tid}:{head}:{r}", r, f"Review ({lens}) of {tid} at {head}") for r, lens in lenses.items()]
+        (f"review:{tid}:{head}:{r}", r, f"Review ({lens}) of build feature") for r, lens in lenses.items()]
     assert {("Risk not recorded" in c["body"], f"Head: {head}" in c["body"]) for c in cards} == {(tier is None, True)}
     kind, payload = _events(kb, tid)[-1]
     assert (kind, payload["head"], sorted(payload["cards"])) == (

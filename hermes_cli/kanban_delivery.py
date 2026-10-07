@@ -20,7 +20,9 @@ whether the approved head becomes the delivery's one pull request.
 
 :func:`review_step`, run by the same step, waits for CI on each published head:
 on green it creates that head's review cards; while a required check is red it
-waits, and a later pass reads CI again.
+waits, and a later pass reads CI again. :func:`arm_step` then arms GitHub
+auto-merge once on each head whose required review cards are done and approve it,
+and closes once each pull request a rework card replaced; GitHub does the merge.
 """
 
 from __future__ import annotations
@@ -40,7 +42,9 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_risk_tier import RISK_NOT_RECORDED, UNRECORDED_RISK_TIER, effective_risk_tier
-from hermes_cli.kanban_delivery_fences import Decision, _required_check, decide_publish, load_policy
+from hermes_cli.kanban_delivery_fences import (
+    _DECISIVE_REVIEWS, Decision, _required_check, decide_publish, load_policy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -522,6 +526,7 @@ def publish_step(db_path: Optional[Path]) -> Optional[dict]:
     if db_path is None or not delivery_settings():
         return None
     review_step(db_path)
+    arm_step(db_path)
     try:
         leased = _take_lease(db_path)
         if leased is None:
@@ -745,8 +750,8 @@ _REVIEW_CREATOR, _REVIEW_TIER = "kanban-delivery", "routine"
 _COMBINED = {"R15": "correctness and security"}
 _SPLIT = {"R15": "correctness", "R12": "security"}
 
-# Fixed kernel text with ids only, like the pull request's.
-_REVIEW_TITLE = "Review ({lens}) of {source} at {head}"
+# Fixed kernel text: the title names the source card by its own title, and the body carries the ids.
+_REVIEW_TITLE = "Review ({lens}) of {title}"
 _REVIEW_BODY = (
     "Kernel review of a published delivery: review pull request {number} on the code host at the "
     "head below, not a local worktree, and post the review on that commit.\nReview: {lens}\n"
@@ -926,13 +931,13 @@ def _create_review_cards(db_path, row, read, repository, base, checks, reviewer,
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or not _unchanged(conn, row, read):
             return None
-        task = conn.execute("SELECT risk_tier, project_id FROM tasks WHERE id = ?", (source,)).fetchone()
+        task = conn.execute("SELECT risk_tier, project_id, title FROM tasks WHERE id = ?", (source,)).fetchone()
         try:
             tier, recorded = effective_risk_tier(task["risk_tier"]), task["risk_tier"] is not None
         except ValueError:  # not a tier: tier 2, never a lower one
             tier, recorded = UNRECORDED_RISK_TIER, False
         text = {"source": source, "head": head, "base": base, "repository": repository, "checks": ", ".join(checks),
-                "number": row["pull_request_number"], "branch": row["pull_request_branch"],
+                "number": row["pull_request_number"], "branch": row["pull_request_branch"], "title": task["title"],
                 "tier": tier if recorded else f"{tier}. {RISK_NOT_RECORDED}"}
         lenses = _COMBINED if tier < 2 else _SPLIT
         taken = sorted(card for responsibility in lenses for (card,) in conn.execute(
@@ -962,3 +967,149 @@ def _create_review_cards(db_path, row, read, repository, base, checks, reviewer,
                      "publish_lease = NULL, publish_lease_until = NULL WHERE id = ?", (row["id"],))
         kb._append_event(conn, source, "delivery_review_cards_created", _outcome(row, cards=cards))
         return "review_cards_created"
+
+
+# ---------------------------------------------------------------------------
+# Card 5: auto-merge armed on a fully approved head; a replaced pull request closed
+# ---------------------------------------------------------------------------
+
+# A row whose head is armed, or whose arm GitHub refused, is done with: neither is
+# tried again, and a new head is a new row. A replaced row's pull request is closed.
+_ARMED, _ARM_REFUSED, _REPLACED = "auto_merge_armed", "auto_merge_refused", "replaced"
+
+
+def arm_step(db_path: Path) -> None:
+    """Card 5 on the board whose file is ``db_path``: arm GitHub auto-merge once on each
+    head whose required review cards are done and approve it, and close once the pull
+    request of each head a rework card continues. GitHub does the merge. Raises no error,
+    so the tick goes on."""
+    try:
+        with kb.connect_closing(db_path=db_path) as conn:
+            rows = [dict(row) for row in conn.execute(
+                "SELECT * FROM kanban_deliveries WHERE pull_request_number IS NOT NULL "
+                "AND pull_request_state = 'review_cards_created' ORDER BY id")]
+            # A published row of another card whose recorded base is the head of a row
+            # still last on its own pull request: that card's work continues the head.
+            replaced = [dict(row) for row in conn.execute(
+                "SELECT old.*, MIN(rework.id) AS replaced_by FROM kanban_deliveries AS old "
+                "JOIN tasks AS rework ON rework.base_commit = old.pull_request_head "
+                "AND rework.id != old.source_task_id "
+                "JOIN kanban_deliveries AS new ON new.source_task_id = rework.id "
+                "AND new.pull_request_number IS NOT NULL AND new.pull_request_number != old.pull_request_number "
+                "WHERE old.pull_request_number IS NOT NULL AND old.pull_request_state != ? "
+                "AND NOT EXISTS (SELECT 1 FROM kanban_deliveries AS later WHERE later.id > old.id "
+                "AND later.pull_request_number = old.pull_request_number) "
+                "AND NOT EXISTS (SELECT 1 FROM task_events WHERE task_id = old.source_task_id "
+                "AND kind = 'delivery_replaced' AND json_extract(payload, '$.delivery_id') = old.id) "
+                "GROUP BY old.id ORDER BY old.id", (_REPLACED,))]
+    except Exception:
+        logger.exception("kanban delivery: the auto-merge step failed")
+        return
+    for act, items in ((_arm_delivery, rows), (_close_replaced, replaced)):
+        for row in items:
+            try:
+                act(db_path, row)
+            except PublishRefused as refusal:
+                logger.warning("kanban delivery: delivery %s: %s (%s)", row["id"], refusal.code, refusal.detail)
+            except Exception:
+                logger.exception("kanban delivery: delivery %s not armed or closed", row["id"])
+
+
+def _github_repository(conn: sqlite3.Connection, source: str) -> str:
+    """The policy's GitHub repository of the source card's own repository, or a refusal."""
+    task = conn.execute("SELECT workspace_path FROM tasks WHERE id = ?", (source,)).fetchone()
+    repository = _origin_repository(_repository(task["workspace_path"])) if task is not None else None
+    if repository not in _policy_repositories():
+        raise PublishRefused("repository_not_in_policy", f"{repository or 'no GitHub origin'} is not in the policy")
+    return repository
+
+
+def _approving_cards(conn: sqlite3.Connection, row: dict, read: tuple) -> list:
+    """The review cards the source card's tier requires for the row's head, when the source
+    is done at that head and each of them exists, is done and returned no changes; else []."""
+    source, head = row["source_task_id"], row["pull_request_head"]
+    if (read[1], _sha(read[2])) != ("done", head):
+        return []
+    try:
+        tier = effective_risk_tier(read[3])
+    except ValueError:  # not a tier: tier 2, never a lower one
+        tier = UNRECORDED_RISK_TIER
+    cards = [conn.execute("SELECT id, status FROM tasks WHERE idempotency_key = ? AND created_by = ?",
+                          (review_key(source, head, responsibility), _REVIEW_CREATOR)).fetchone()
+             for responsibility in (_COMBINED if tier < 2 else _SPLIT)]
+    if any(card is None or card["status"] != "done" or conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (card["id"],)).fetchone()
+           for card in cards):
+        return []
+    return [card["id"] for card in cards]
+
+
+def _each_approves(reviews: list, head: str, cards: list) -> bool:
+    """Both lenses post from one reviewer account and GitHub passes no user here, so each
+    required card needs its own review: the latest decisive reviews, one per card, all
+    approve ``head``. One lens's approval never stands in for another's."""
+    decisive = sorted((review for review in reviews if isinstance(review, dict) and type(review.get("id")) is int
+                       and review.get("state") in _DECISIVE_REVIEWS), key=lambda review: review["id"])
+    latest = decisive[-len(cards):]
+    return len(latest) == len(cards) == len({review["id"] for review in latest}) and all(
+        (review["state"], review.get("commit_id")) == ("APPROVED", head) for review in latest)
+
+
+def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
+    """Arm auto-merge on the row's head H, once: only after the required cards are done,
+    read here, does GitHub get read, and only when the pull request is open at H and each
+    card's review approves H is the one mutation sent, naming H as the expected head. Its
+    answer, armed or refused, is recorded once on the row; a transport failure is not."""
+    from hermes_cli.kanban_delivery_github import AUTO_MERGE_MUTATION, GitHubTransport, GitHubTransportError
+
+    source, head, number = row["source_task_id"], row["pull_request_head"], row["pull_request_number"]
+    with kb.connect_closing(db_path=db_path) as conn:
+        cards = _approving_cards(conn, row, _source_read(conn, source))
+        if not cards:
+            return None  # a required card is missing, open or returned changes: GitHub is not read
+        repository = _github_repository(conn, source)
+    try:
+        github = GitHubTransport("publish", repository)
+        answer = _answered(github.request("GET", f"/repos/{repository}/pulls/{number}"))
+        pull = answer["data"] if answer["status"] == 200 and isinstance(answer["data"], dict) else {}
+        node, pulled = pull.get("node_id"), pull["head"].get("sha") if isinstance(pull.get("head"), dict) else None
+        if (pull.get("state"), pulled) != ("open", head) or not isinstance(node, str):
+            return None  # the pull request left H or closed: nothing to arm
+        listed = _answered(github.request("GET", f"/repos/{repository}/pulls/{number}/reviews",
+                                          query={"per_page": 100}))
+        reviews = listed["data"] if listed["status"] == 200 and isinstance(listed["data"], list) else []
+        if len(reviews) >= 100 or not _each_approves(reviews, head, cards) or not delivery_settings():
+            return None  # not every required lens approves H yet, not all reviews are read, or delivery is off
+        answer = _answered(github.request("POST", "/graphql", body={
+            "query": AUTO_MERGE_MUTATION, "variables": {"pullRequestId": node, "expectedHeadOid": head}}))
+    except GitHubTransportError as error:
+        raise _transport_refusal(error) from None
+    data = answer["data"] if isinstance(answer["data"], dict) else {}
+    result = data.get("data") if isinstance(data.get("data"), dict) else {}
+    state = _ARMED if answer["status"] == 200 and "errors" not in data and isinstance(
+        result.get("enablePullRequestAutoMerge"), dict) else _ARM_REFUSED
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ? AND pull_request_head = ? "
+                        "AND pull_request_state = 'review_cards_created'", (state, row["id"], head)).rowcount:
+            kb._append_event(conn, source, f"delivery_{state}", _outcome(row, status=answer["status"], cards=cards))
+    return state
+
+
+def _close_replaced(db_path: Path, row: dict) -> None:
+    """Close, once, the pull request of a head a rework card continues: one call that sets
+    its state to closed, recorded on the row with GitHub's status whatever it answers."""
+    from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
+
+    with kb.connect_closing(db_path=db_path) as conn:
+        repository = _github_repository(conn, row["source_task_id"])
+    if not delivery_settings():
+        return
+    try:
+        answer = _answered(GitHubTransport("publish", repository).request(
+            "PATCH", f"/repos/{repository}/pulls/{row['pull_request_number']}", body={"state": "closed"}))
+    except GitHubTransportError as error:
+        raise _transport_refusal(error) from None
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):  # the call was made: always recorded
+        conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (_REPLACED, row["id"]))
+        kb._append_event(conn, row["source_task_id"], "delivery_replaced", _outcome(
+            row, replaced_by=row["replaced_by"], status=answer["status"], closed=answer["status"] == 200))

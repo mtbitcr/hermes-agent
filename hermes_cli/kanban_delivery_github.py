@@ -75,12 +75,35 @@ class Endpoint(NamedTuple):
     permission: tuple[str, str] | None  # what the step must hold; None for the App's own token call
     query: MappingProxyType = MappingProxyType({})  # allowed parameters, each with its value pattern
     required_query: tuple[str, ...] = ()
+    body: object = None  # when set, the one test a body must pass: the call sends nothing else
 
 
 _TOKEN_ENDPOINT = Endpoint("POST", "/app/installations/{installation}/access_tokens", None)
 
+# GitHub's REST interface has no call that arms auto-merge, so this fixed mutation is the one GraphQL
+# document there is: a merge commit, only while the pull request still holds the head the caller names.
+AUTO_MERGE_MUTATION = (
+    "mutation($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) { enablePullRequestAutoMerge(input: "
+    "{pullRequestId: $pullRequestId, expectedHeadOid: $expectedHeadOid, mergeMethod: MERGE}) { clientMutationId } }")
+_NODE_ID = re.compile(r"[A-Za-z0-9_=-]{1,100}")
+
+
+def _arm_body(body) -> bool:
+    variables = body.get("variables") if isinstance(body, dict) else None
+    return (isinstance(body, dict) and body.keys() == {"query", "variables"} and body["query"] == AUTO_MERGE_MUTATION
+            and isinstance(variables, dict) and variables.keys() == {"pullRequestId", "expectedHeadOid"}
+            and isinstance(variables["pullRequestId"], str) and bool(_NODE_ID.fullmatch(variables["pullRequestId"]))
+            and _is_sha(variables["expectedHeadOid"]))
+
+
+def _close_body(body) -> bool:
+    return isinstance(body, dict) and body == {"state": "closed"}
+
+
+GRAPHQL_ALLOWLIST = (Endpoint("POST", "/graphql", ("pull_requests", "write"), body=_arm_body),)
+
 # The plan's endpoint list and nothing else: no protection, rules, settings, hooks, collaborators,
-# keys or installation management, and no GraphQL. Commit statuses are left out by the owner's call:
+# keys or installation management, and no other GraphQL. Commit statuses are left out by the owner's call:
 # the required checks of both repositories are check runs and the App holds no commit-statuses
 # permission, so the transport offers no statuses read and a later merge fence takes an empty
 # statuses list.
@@ -89,6 +112,10 @@ REST_ALLOWLIST = (
         {"state": "open|closed|all", "head": rf"[A-Za-z0-9-]+:{_BRANCH.pattern}", "base": _BRANCH.pattern, **_PAGE})),
     Endpoint("POST", "/repos/{repo}/pulls", ("pull_requests", "write")),
     Endpoint("GET", "/repos/{repo}/pulls/{number}", ("pull_requests", "read")),
+    # The close of a pull request a rework card replaced: its state, and no other field.
+    Endpoint("PATCH", "/repos/{repo}/pulls/{number}", ("pull_requests", "write"), body=_close_body),
+    # The reviews auto-merge is armed on, read through this same fence.
+    Endpoint("GET", "/repos/{repo}/pulls/{number}/reviews", ("pull_requests", "read"), MappingProxyType(_PAGE)),
     Endpoint("PUT", "/repos/{repo}/pulls/{number}/merge", ("contents", "write")),
     Endpoint("POST", "/repos/{repo}/pulls/{number}/reviews", ("pull_requests", "write")),
     # T1's one branch read: the commit a head branch holds, and 404 when the branch does not exist.
@@ -111,6 +138,7 @@ _FIELDS = frozenset({
     "id", "number", "name", "state", "status", "conclusion", "merged", "mergeable", "mergeable_state",
     "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app", "object",
     "total_count", "check_runs", "workflow_runs", "jobs", "steps", "run_id", "run_attempt",
+    "node_id", "data", "errors", "enablePullRequestAutoMerge", "clientMutationId",
 })
 _MAX_TEXT = 256
 
@@ -268,7 +296,8 @@ class GitHubTransport:
         # profile HERMES_HOME a worker runs with.
         self._key_path = Path(key_path) if key_path is not None else (
             get_default_hermes_root() / "secrets" / "github-app" / "raphael-agent-factory.pem")
-        self._routes = [(e, _path_pattern(e.template, repository)) for e in REST_ALLOWLIST if e.permission]
+        self._routes = [(e, _path_pattern(e.template, repository))
+                        for e in REST_ALLOWLIST + GRAPHQL_ALLOWLIST if e.permission]
         self._token: str | None = None
 
     def request(self, method: str, path: str, *, query=None, body=None) -> dict:
@@ -284,6 +313,8 @@ class GitHubTransport:
             raise GitHubTransportError("query_not_allowed")
         if not _holds(self._permissions, endpoint.permission):
             raise GitHubTransportError("step_not_permitted")
+        if endpoint.body is not None and not endpoint.body(body):
+            raise GitHubTransportError("body_not_allowed")
         target = f"{path}?{urlencode(values)}" if values else path
         status, value = _exchange(method, target, f"Bearer {self._installation_token()}", body)
         return {"status": status, "data": None if value is None else self._project(value)}

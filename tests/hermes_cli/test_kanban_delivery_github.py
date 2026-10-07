@@ -360,7 +360,7 @@ def test_no_administration_call_is_possible(github, monkeypatch):
     forbidden = ("protection", "rules", "settings", "hooks", "collaborators", "keys", "admin",
                  "permissions", "branches", "installation")
     for entry in mod.REST_ALLOWLIST:
-        assert entry.method in {"GET", "POST", "PUT"}
+        assert entry.method in {"GET", "POST", "PUT", "PATCH"}
         if (entry.method, entry.template) == ("POST", "/app/installations/{installation}/access_tokens"):
             continue  # the App's own call that mints a narrowed token
         segments = entry.template.strip("/").split("/")
@@ -381,7 +381,7 @@ def test_no_administration_call_is_possible(github, monkeypatch):
                 transport.request(entry.method, entry.template.format(**SAMPLE),
                                   query={k: SAMPLE[k] for k in entry.required_query})
             except mod.GitHubTransportError as exc:
-                assert exc.reason in {"step_not_permitted", "endpoint_not_allowed"}
+                assert exc.reason in {"step_not_permitted", "endpoint_not_allowed", "body_not_allowed"}
     allowed = [(e.method, _template_regex(e.template)) for e in mod.REST_ALLOWLIST]
     assert github["calls"]
     for method, path in github["calls"]:  # everything that reached the network was allowlisted
@@ -520,7 +520,10 @@ def test_path_outside_the_allowlist_is_refused_before_any_socket(monkeypatch, tm
         for method, path in outside:
             with pytest.raises(mod.GitHubTransportError) as refused:
                 transport.request(method, path)
-            assert refused.value.reason in {"endpoint_not_allowed", "query_not_allowed"}, (step, method, path)
+            # /graphql is listed for its one fixed document only, so a bare call fails a later check.
+            assert refused.value.reason in {"endpoint_not_allowed", "query_not_allowed"} or (
+                path == "/graphql" and refused.value.reason in {"step_not_permitted", "body_not_allowed"}), (
+                step, method, path)
         with pytest.raises(mod.GitHubTransportError) as refused:
             transport.request("GET", f"/repos/{REPO}/pulls", query={"per_page": "100", "q": "is:open"})
         assert refused.value.reason == "query_not_allowed"
@@ -547,7 +550,7 @@ def test_no_token_request_names_administration(github, monkeypatch):
                     transport.request(entry.method, entry.template.format(**{**SAMPLE, "repo": repository}),
                                       query={k: SAMPLE[k] for k in entry.required_query})
                 except mod.GitHubTransportError as exc:
-                    assert exc.reason in {"step_not_permitted", "endpoint_not_allowed"}
+                    assert exc.reason in {"step_not_permitted", "endpoint_not_allowed", "body_not_allowed"}
 
     requests = github["token_requests"]
     assert len(requests) == transports  # the stand-in's own count: one per step and repository
