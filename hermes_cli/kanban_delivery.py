@@ -943,12 +943,19 @@ def _create_review_cards(db_path, row, read, repository, base, checks, reviewer,
         cards = []
         for responsibility, lens in lenses.items():
             title = _REVIEW_TITLE.format(lens=lens, **text)
+            lock = None
+            # Unadmitted routes still park through the existing readiness guard.
+            with contextlib.suppress(ValueError):
+                lock = kb.mint_policy_lock(
+                    reviewer, route["provider_override"], route["model_override"],
+                    route["reasoning_effort"], _REVIEW_TIER)
             card = kb.create_task(
                 conn, title=title, body=_REVIEW_BODY.format(lens=lens, **text), assignee=reviewer,
                 responsibility=responsibility, created_by=_REVIEW_CREATOR, workspace_kind="worktree",
                 execution_tier=_REVIEW_TIER, board=_board_slug(db_path), project_id=task["project_id"],
                 project_source_task_id=source, owned_paths=[], parents=[source],
-                idempotency_key=review_key(source, head, responsibility), **route)
+                idempotency_key=review_key(source, head, responsibility),
+                risk_tier=tier, model_policy_lock=lock, **route)
             kb.authorize_executable_transition(conn, card)  # its route lock, or the card parked with why
             cards.append(card)
         conn.execute("UPDATE kanban_deliveries SET pull_request_state = 'review_cards_created', "

@@ -159,6 +159,25 @@ def test_the_recorded_tier_alone_decides_the_cards_of_the_exact_head(world, tier
     assert (kind, payload["head"], sorted(payload["cards"])) == (
         "delivery_review_cards_created", head, sorted(c["id"] for c in cards))
     assert _state(kb, head) == "review_cards_created"
+    from hermes_cli.kanban_risk_tier import pinned_reasoning_effort, pinned_time_box_seconds
+    for card in cards:
+        effort = pinned_reasoning_effort(tier, card["responsibility"])
+        assert card["risk_tier"] == (2 if tier is None else tier)
+        assert card["max_runtime_seconds"] == pinned_time_box_seconds("review")
+        assert card["pinned_effort"] == card["reasoning_effort"] == effort
+        assert not card["requires_review"] and card["owned_paths"] == "[]"
+
+
+def test_security_review_pins_max_on_an_admitted_high_route(world, monkeypatch):
+    kb, root, repo, gh = world
+    _policy_route(monkeypatch, dict(ROUTE, reasoning_effort="high"))
+    _ready(world, tier=2)
+    _tick(kb)
+
+    security = next(card for card in _cards(kb) if card["responsibility"] == "R12")
+    assert security["status"] == "ready"
+    assert security["reasoning_effort"] == security["pinned_effort"] == "max"
+    assert security["risk_tier"] == 2 and security["model_policy_lock"]
 
 
 def test_cards_carry_the_command_fields_after_the_same_route_guard(world):
@@ -173,6 +192,8 @@ def test_cards_carry_the_command_fields_after_the_same_route_guard(world):
         command = kb.create_task(
             conn, title="command", body="command", assignee=REVIEWER, responsibility="R15", created_by="operator",
             workspace_kind="worktree", execution_tier="routine", board="default", project_id=project, owned_paths=[],
+            risk_tier=2, model_policy_lock=kb.mint_policy_lock(
+                REVIEWER, ROUTE["provider_override"], ROUTE["model_override"], ROUTE["reasoning_effort"], "routine"),
             **ROUTE)
         with kb.write_txn(conn):
             assert kb.authorize_executable_transition(conn, command)
@@ -182,7 +203,8 @@ def test_cards_carry_the_command_fields_after_the_same_route_guard(world):
     finally:
         conn.close()
     fields = ("assignee", "workspace_kind", "workspace_path", "execution_tier", "model_override",
-              "provider_override", "reasoning_effort", "owned_paths", "project_id", "tenant", "model_policy_lock")
+              "provider_override", "reasoning_effort", "owned_paths", "project_id", "tenant", "model_policy_lock",
+              "max_runtime_seconds", "risk_tier", "pinned_effort")
     expected = _raw(kb.kanban_db_path(), "SELECT * FROM tasks WHERE id = ?", command)[0]
     assert expected["model_policy_lock"]
     for card in _cards(kb):
