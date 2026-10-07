@@ -5,7 +5,8 @@
 nothing to the release state: config.yaml is read as it is on disk, the release record is opened
 read-only, and the guards only read. ``status`` prints the waiting batch and the last
 outcome. ``run`` releases the accepted batch after the same preflight, under the pause (S-A), in
-its own unit (S-F), whose stop ends a release that has not cut over yet.
+the calling process: a stop signal ends a release that has not cut over yet. The release unit
+(S-F) belongs to card 6.
 
 Design rule (K6), as in the runner: everything ``run`` needs is imported when this module loads,
 so nothing is imported once the units stop and the checkout moves under the running process.
@@ -14,11 +15,14 @@ so nothing is imported once the units stop and the checkout moves under the runn
 from __future__ import annotations
 
 import contextlib
+import json
 import os
+import secrets
 import signal
 import sqlite3
 import stat
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -178,11 +182,12 @@ def run() -> int:
 
     Mark the batch releasing with both versions, fetch NEW and save the named configuration
     snapshot, and run prepare's preflight. A pause already in place, or a failed guard other than
-    G10, refuses the release and pauses nothing. Otherwise pause with the release reason (S-A),
-    wait until the merged G10 holds, and run the merged runner for the batch's tier: tier 2 when
-    a change has tier 2 or no recorded tier, forward only otherwise. The runner asks every guard
-    again before it stops anything. Then record the outcome and resume, except after a failed
-    outcome: the platform stays paused for a person.
+    G10, refuses the release and pauses nothing. Otherwise create the pause (S-A) with the release
+    reason and a release token, wait until the merged G10 holds, and run the merged runner for
+    the batch's tier: tier 2 when a change has tier 2 or no recorded tier, forward only otherwise.
+    The pause is read back after the create and again just before the runner, which asks every
+    guard again before it stops anything. Then record the outcome and resume, except after a
+    failed outcome: the platform stays paused for a person.
 
     Returns 0 when the batch was released, 1 otherwise.
     """
@@ -191,6 +196,7 @@ def run() -> int:
         return inputs
     batch, merges, pins, reader, actions, settings = inputs
     batch_id, reason = batch["batch_id"], f"release {batch['batch_id']}"
+    token = secrets.token_hex(16)  # the release token: only the release's own pause carries it
     try:
         conn = release_ledger.connect()
     except (OSError, sqlite3.Error) as error:
@@ -210,10 +216,14 @@ def run() -> int:
                 refusals.append("the platform is already paused")
             if failed:
                 refusals.append(_guards_failed(failed))
+            # The exclusive create refuses an owner's pause written since that read, too.
+            if not refusals and not _pause(reason, token):
+                refusals.append("the platform is already paused")
             if not refusals:
-                estop.engage(reason)
+                _hold(token)
                 _drain(reader, pins, merges, settings["drain_poll_seconds"])
                 tier = max(m["tier"] if m["tier_recorded"] else 2 for m in batch["members"])
+                _hold(token)
                 result = run_release(_Host(reader, actions), pins, tier, merges)
         except _Stopped as stop:
             refusals.append(str(stop))
@@ -232,10 +242,11 @@ def run() -> int:
             for error in result.restore_errors:
                 print(f"    Going back, a step failed too: {error}")
         release_ledger.finish_release(conn, batch_id, outcome=outcome)
-    # S-A: lift only the release's own pause; an owner's pause, set before or during the release,
-    # stays. After a failed outcome the release's own pause stays too.
+    # S-A: lift only the release's own pause, the one with its token, unless the outcome failed;
+    # an owner's pause stays. One written between the token's read and the removal goes with it,
+    # by design: the owner page then shows the platform running, and the owner can pause again.
     state = estop.get_state()
-    lift = outcome != "failed" and state is not None and state["reason"] == reason
+    lift = outcome != "failed" and _token() == token
     if lift:
         estop.disengage()
     print(f"Batch {batch_id} {_OUTCOMES[outcome]}.")
@@ -252,7 +263,7 @@ def _drain(
     reader: LiveHostReader, pins: Pins, merges: list[RecordedMerge], seconds: float
 ) -> None:
     """Wait until the merged G10 holds, asking it every ``seconds``. The wait has no time limit
-    of its own (decision B): stopping the release unit ends it."""
+    of its own (decision B): a stop signal ends it."""
     [check] = [check for guard, _rule, check in release_guards.GUARDS if guard == "G10"]
     while not check(reader, pins, merges):
         time.sleep(seconds)
@@ -270,11 +281,39 @@ class _Host:
 
 
 class _Stopped(BaseException):
-    """The release unit was stopped (S-F). Like an interrupt, no ``except Exception`` takes it."""
+    """The run stopped before the cutover. Like an interrupt, no ``except Exception`` takes it."""
 
 
 def _stop(signum: int, frame: Any) -> None:
     raise _Stopped("stopped before cutover")
+
+
+def _pause(reason: str, token: str) -> bool:
+    """Create the pause sentinel, exclusively, with estop's payload and the release token. False
+    when a pause is in place; any other failure is left to the readback, which refuses."""
+    payload = {"engaged_at": datetime.now(timezone.utc).isoformat(), "reason": reason}
+    try:
+        fd = os.open(estop.sentinel_path(), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        with os.fdopen(fd, "w", encoding="utf-8") as sentinel:
+            sentinel.write(json.dumps({**payload, "release_token": token}, indent=2) + "\n")
+    except FileExistsError:
+        return False
+    except OSError:
+        pass
+    return True
+
+
+def _token() -> str | None:
+    """The release token in the pause sentinel, or None when there is none."""
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        return json.loads(estop.sentinel_path().read_text(encoding="utf-8")).get("release_token")
+    return None
+
+
+def _hold(token: str) -> None:
+    """Stop the release before the cutover unless its own pause, with ``token``, is in place."""
+    if _token() != token:
+        raise _Stopped("stopped before cutover")
 
 
 def status() -> int:
