@@ -1084,3 +1084,35 @@ def test_branch_head_is_none_when_github_answers_404(github, monkeypatch):
 
     assert head is None
     assert github["calls"] == [("GET", f"/repos/{REPO}/git/ref/heads/delivery/card-2")]
+
+
+@pytest.mark.parametrize("read, sends", [({"state": "open", "head": {"sha": HEAD}}, True), (None, False),
+                                         ({"state": "closed", "head": {"sha": HEAD}}, False),
+                                         ({"state": "open", "head": {"sha": "f" * 40}}, False)])
+def test_the_arm_reads_nothing_and_sends_only_on_the_transports_own_read_of_the_open_head(monkeypatch, read, sends):
+    """Owner rule 2 of round 2: the arm makes no read and mints no token. It sends the one mutation, with the
+    token the transport's earlier reads minted, only when its own read of the pull request showed it open at
+    the head. A reviews read keeps each review's author login, state, commit and body's first line only."""
+    mod = _module()
+    sent, mints = [], []
+    answers = {f"/repos/{REPO}/pulls/41": dict(read or {}, number=41, node_id="PR_kw"),
+               f"/repos/{REPO}/pulls/41/reviews": [{"id": 3, "state": "APPROVED", "commit_id": HEAD, "html_url": STRAY,
+                                                    "body": "Review card t_1 \r\nfine", "user": {"login": "b", "id": 9}}]}
+    monkeypatch.setattr(mod, "_exchange", lambda method, target, authorization, payload=None: (
+        sent.append((method, target.split("?")[0], authorization)) or (200, answers.get(target.split("?")[0], {}))))
+    monkeypatch.setattr(mod.GitHubTransport, "_installation_token", lambda self: (
+        mints.append(self) or setattr(self, "_token", DUMMY) or DUMMY))
+    github = mod.GitHubTransport("publish", REPO)
+    assert github.request("GET", f"/repos/{REPO}/pulls/41/reviews", query={"per_page": 100})["data"] == [
+        {"user": {"login": "b"}, "state": "APPROVED", "commit_id": HEAD, "body": "Review card t_1"}]
+    if read is not None:
+        github.request("GET", f"/repos/{REPO}/pulls/41")
+    reads = len(sent)
+
+    if sends:
+        github.arm_auto_merge(41, HEAD)
+    for number, head in ((41, BASE), (42, HEAD)) + (() if sends else ((41, HEAD),)):
+        with pytest.raises(mod.GitHubTransportError):
+            github.arm_auto_merge(number, head)
+
+    assert sent[reads:] == ([("POST", "/graphql", f"Bearer {DUMMY}")] if sends else []) and len(mints) == reads

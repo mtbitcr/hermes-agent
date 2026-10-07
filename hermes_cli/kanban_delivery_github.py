@@ -134,7 +134,7 @@ REST_ALLOWLIST = (
 )
 
 # Fixed fields only: ids, SHAs, refs, states and counts, and of a user only its login (a review's
-# author). Titles, bodies, messages and URLs never pass, and neither do response headers.
+# author). Titles, bodies (but a listed review's first line), messages and URLs never pass, nor headers.
 _FIELDS = frozenset({
     "id", "number", "name", "state", "status", "conclusion", "merged", "mergeable", "mergeable_state",
     "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app", "object",
@@ -299,6 +299,7 @@ class GitHubTransport:
             get_default_hermes_root() / "secrets" / "github-app" / "raphael-agent-factory.pem")
         self._routes = [(e, _path_pattern(e.template, repository)) for e in REST_ALLOWLIST if e.permission]
         self._token: str | None = None
+        self._pull: tuple | None = None  # number, state, head and node id, as this transport last read them
 
     def request(self, method: str, path: str, *, query=None, body=None) -> dict:
         """Call one allowlisted endpoint. Returns {"status", "data"}, where data holds the fixed
@@ -316,26 +317,32 @@ class GitHubTransport:
         if endpoint.body is not None and not endpoint.body(body):
             raise GitHubTransportError("body_not_allowed")
         target = f"{path}?{urlencode(values)}" if values else path
+        pull = (method, endpoint.template) == ("GET", "/repos/{repo}/pulls/{number}")
+        self._pull = None if pull else self._pull
         status, value = _exchange(method, target, f"Bearer {self._installation_token()}", body)
-        return {"status": status, "data": None if value is None else self._project(value)}
+        if endpoint.template.endswith("/reviews") and method == "GET" and isinstance(value, list):
+            return {"status": status, "data": [self._review(review) for review in value]}
+        data = None if value is None else self._project(value)
+        if pull and status == 200 and isinstance(data, dict) and isinstance(data.get("head"), dict):
+            self._pull = (data.get("number"), data.get("state"), data["head"].get("sha"), data.get("node_id"))
+        return {"status": status, "data": data}
 
     def arm_auto_merge(self, number: int, head: str) -> dict:
         """The one GraphQL call: arm auto-merge, a merge commit, on pull request ``number`` of this
         repository at ``head``, both from its delivery record. The document and its variables are
-        built here, never passed in; the pull request is read first and must be open at ``head``,
-        else no mutation is sent. Returns {"status", "data"} as :meth:`request` does."""
+        built here, never passed in. Nothing is read or minted here: the mutation goes, with the
+        token this transport's earlier reads minted, only when its latest read of that pull request
+        found it open at ``head``. Returns {"status", "data"} as :meth:`request` does."""
         endpoint = GRAPHQL_ALLOWLIST[0]
         if type(number) is not int or number < 1 or not _is_sha(head):
             raise GitHubTransportError("bad_arm_target")
         if not _holds(self._permissions, endpoint.permission):
             raise GitHubTransportError("step_not_permitted")
-        pull = self.request("GET", f"/repos/{self.repository}/pulls/{number}")
-        data = pull["data"] if pull["status"] == 200 and isinstance(pull["data"], dict) else {}
-        held = data["head"].get("sha") if isinstance(data.get("head"), dict) else None
-        body = {"query": AUTO_MERGE_MUTATION, "variables": {"pullRequestId": data.get("node_id"), "expectedHeadOid": head}}
-        if (data.get("number"), data.get("state"), held) != (number, "open", head) or not endpoint.body(body):
+        held, state, pulled, node = self._pull or (None, None, None, None)
+        body = {"query": AUTO_MERGE_MUTATION, "variables": {"pullRequestId": node, "expectedHeadOid": head}}
+        if (held, state, pulled) != (number, "open", head) or not endpoint.body(body) or self._token is None:
             raise GitHubTransportError("pull_request_not_at_head")
-        status, value = _exchange(endpoint.method, endpoint.template, f"Bearer {self._installation_token()}", body)
+        status, value = _exchange(endpoint.method, endpoint.template, f"Bearer {self._token}", body)
         return {"status": status, "data": None if value is None else self._project(value)}
 
     def branch_head(self, branch: str) -> str | None:
@@ -428,6 +435,15 @@ class GitHubTransport:
             env[f"GIT_CONFIG_VALUE_{index}"] = value
         env["GIT_CONFIG_COUNT"] = str(len(config))
         return env
+
+    def _review(self, review) -> dict:
+        """A listed review: its author's login, state, commit and its body's first line only."""
+        review = review if isinstance(review, dict) else {}
+        user, body = review.get("user"), review.get("body")
+        line = body.split("\n", 1)[0].rstrip() if isinstance(body, str) else ""
+        return {"user": {"login": self._project((user if isinstance(user, dict) else {}).get("login"))},
+                "state": self._project(review.get("state")), "commit_id": self._project(review.get("commit_id")),
+                "body": self._project(line)}
 
     def _project(self, value):
         if isinstance(value, dict):

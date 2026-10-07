@@ -221,6 +221,19 @@ def test_cards_carry_the_command_fields_after_the_same_route_guard(world):
     assert parents == [tid, tid]
 
 
+def test_each_card_tells_the_reviewer_to_start_its_github_review_with_the_cards_own_line(world):
+    """Owner rule 1 of round 2: the reviewer bot's GitHub review names the one card it decides, by the
+    first line of its body; the id stays out of the title."""
+    kb, root, repo, gh = world
+    _ready(world)
+
+    _tick(kb)
+
+    cards = _cards(kb)
+    assert len(cards) == 2 and all(f"exact line:\nReview card {card['id']}\n" in card["body"]
+                                   and card["id"] not in card["title"] for card in cards)
+
+
 @pytest.mark.parametrize("model, created, after", [
     (ROUTE["model_override"], ("ready", None, True, []), "running"),
     ("unadmitted", ("blocked", "needs_input", False, [{"kind": "blocked"}]), "blocked")])
