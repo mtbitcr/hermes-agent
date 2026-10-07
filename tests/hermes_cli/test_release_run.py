@@ -296,6 +296,18 @@ def _stop_signal(signum: int = signal.SIGTERM):
     signal.raise_signal(signum)
 
 
+def _signal_after(monkeypatch, owner, name, signum):
+    """A stop signal just after each real call of ``owner.name`` returns; set before ``_run``."""
+    real = getattr(owner, name)
+
+    def call_then_signal(*args, **kwargs):
+        returned = real(*args, **kwargs)
+        _stop_signal(signum)
+        return returned
+
+    monkeypatch.setattr(owner, name, call_then_signal)
+
+
 def test_run_pauses_waits_for_the_drain_then_releases_and_resumes(root, monkeypatch, capsys):
     batch_id = _accepted(1)["batch_id"]
     host = FakeHost(open_reads=3, at={("runner", 1): _sentinel})  # one live run, for two polls
