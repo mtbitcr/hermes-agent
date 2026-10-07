@@ -23,6 +23,9 @@ on green it creates that head's review cards; while a required check is red it
 waits, and a later pass reads CI again. :func:`arm_step` then arms GitHub
 auto-merge once on each head whose required review cards are done and approve it,
 and closes once each pull request a rework card replaced; GitHub does the merge.
+:func:`merge_step` reads each armed pull request, and once GitHub shows it merged
+into main adds the merge to the release decision through
+:mod:`hermes_cli.release_intake` and marks the row merged, its final state.
 """
 
 from __future__ import annotations
@@ -287,11 +290,11 @@ def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional
             (task_id, head),
         ).fetchone()
         # The approval is the source card's latest, so every other head of it,
-        # older or newer, is returned for changes; a head GitHub may hold armed stays as it is.
+        # older or newer, is returned for changes; a head GitHub may hold armed, or merged, stays as it is.
         conn.execute(
             "UPDATE kanban_deliveries SET pull_request_state = 'returned_for_changes' "
-            "WHERE source_task_id = ? AND source_head != ? AND IFNULL(pull_request_state, '') NOT IN (?, ?, ?)",
-            (task_id, head, *_ARM_HELD),
+            "WHERE source_task_id = ? AND source_head != ? AND IFNULL(pull_request_state, '') NOT IN (?, ?, ?, ?)",
+            (task_id, head, *_ARM_HELD, _MERGED),
         )
         return record["id"]
 
@@ -527,6 +530,7 @@ def publish_step(db_path: Optional[Path]) -> Optional[dict]:
     if db_path is None or not delivery_settings():
         return None
     review_step(db_path)
+    merge_step(db_path)
     arm_step(db_path)
     try:
         leased = _take_lease(db_path)
@@ -1219,3 +1223,82 @@ def _close_proof(conn: sqlite3.Connection, row: dict) -> tuple:
                               "d.pull_request_head FROM kanban_deliveries AS d WHERE d.source_task_id = ? "
                               "ORDER BY d.id", (row["replaced_by"],)).fetchall()
     return tuple(source or ()), tuple(rework or ())[:2], [tuple(delivery) for delivery in deliveries]
+
+
+# ---------------------------------------------------------------------------
+# Card 10: each merged change added to the release decision
+# ---------------------------------------------------------------------------
+
+# GitHub merged the armed pull request into main and the release record holds the merge: final.
+_MERGED = "merged"
+
+
+def merge_step(db_path: Path) -> None:
+    """Card 10 on the board whose file is ``db_path``: read the pull request of each armed or
+    unknown arm and, once GitHub shows it merged into main, add the merge to the waiting
+    release decision and mark the row merged. A failure leaves the row as it was, so the next
+    pass reads it again. Raises no error, so the tick goes on."""
+    try:
+        with kb.connect_closing(db_path=db_path) as conn:
+            rows = [dict(row) for row in conn.execute(
+                f"SELECT d.*, {_RECEIPT.format('d')} AS repository FROM kanban_deliveries AS d "
+                "WHERE d.pull_request_number IS NOT NULL AND d.pull_request_state IN (?, ?) ORDER BY d.id",
+                (_ARMED, _ARM_UNKNOWN))]
+    except Exception:
+        logger.exception("kanban delivery: the merge step failed")
+        return
+    for row in rows:
+        try:
+            _record_merge(db_path, row)
+        except PublishRefused as refusal:
+            logger.warning("kanban delivery: delivery %s: %s (%s)", row["id"], refusal.code, refusal.detail)
+        except Exception:
+            logger.exception("kanban delivery: the merge of delivery %s is not recorded", row["id"])
+
+
+def _record_merge(db_path: Path, row: dict) -> Optional[str]:
+    """One armed row: its pull request, read through the fenced pull endpoint, merged into main
+    gives the merge commit and the confirmation that it is on main. The rest is what review
+    approved, never recomputed from the merge: H, the base the publish bound H to, and H's tree
+    read from the card's own repository. The release record ignores a repeat, so a merge whose
+    row could not be marked is still recorded once, however often it is seen."""
+    from hermes_cli import release_intake
+    from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
+
+    source, head, number, repository = (row[key] for key in (
+        "source_task_id", "pull_request_head", "pull_request_number", "repository"))
+    if repository not in _policy_repositories() or _sha(head) != head:
+        return None  # no receipt of a repository in the policy: nothing is read
+    try:
+        answer = _answered(GitHubTransport("read_checks", repository).request(
+            "GET", f"/repos/{repository}/pulls/{number}"))
+    except GitHubTransportError as error:
+        raise _transport_refusal(error) from None
+    pull = answer["data"] if answer["status"] == 200 and isinstance(answer["data"], dict) else {}
+    base = pull["base"].get("ref") if isinstance(pull.get("base"), dict) else None
+    merge = _sha(pull.get("merge_commit_sha"))
+    if (pull.get("number"), pull.get("merged"), base) != (number, True, _PULL_REQUEST_BASE) or merge is None:
+        return None  # not merged into main: a later pass reads it again
+    with kb.connect_closing(db_path=db_path) as conn:
+        task = conn.execute("SELECT title, risk_tier, workspace_path FROM tasks WHERE id = ?", (source,)).fetchone()
+        bound = conn.execute(
+            "SELECT json_extract(payload, '$.base_commit') FROM task_events WHERE task_id = ? "
+            "AND kind = 'delivery_bound' AND json_extract(payload, '$.head') = ? ORDER BY id DESC LIMIT 1",
+            (source, head)).fetchone()
+    workdir = _repository(task["workspace_path"]) if task is not None else None
+    tree = _run_git(workdir, "rev-parse", "--verify", "--quiet", f"{head}^{{tree}}") if workdir else None
+    reviewed_tree = _sha(tree.stdout.decode()) if tree is not None and tree.returncode == 0 else None
+    reviewed_base = _sha(bound[0]) if bound is not None else None
+    if reviewed_base is None or reviewed_tree is None:
+        logger.warning("kanban delivery: delivery %s: the reviewed base or tree of %s is unreadable", row["id"], head)
+        return None
+    recorded = release_intake.record_merged_change(
+        repository=repository, number=number, merge_commit=merge, reviewed_base=reviewed_base,
+        reviewed_head=head, reviewed_tree=reviewed_tree, tier=task["risk_tier"], card_id=source,
+        title=task["title"], board=_board_slug(db_path))["recorded"]
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ? AND pull_request_state = ?",
+                        (_MERGED, row["id"], row["pull_request_state"])).rowcount:
+            kb._append_event(conn, source, f"delivery_{_MERGED}", _outcome(
+                row, repository=repository, merge_commit=merge, recorded=recorded))
+    return _MERGED
