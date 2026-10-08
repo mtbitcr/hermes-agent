@@ -19,7 +19,7 @@ import yaml
 
 from agent import estop
 from hermes_cli import release_ledger as ledger
-from hermes_cli import release_runner
+from hermes_cli import release_runner, release_unit
 from hermes_cli.release_guards import Pins
 from hermes_cli.release_runner import PLATFORM_UNITS, SANDBOX_TUNNEL_UNIT
 from hermes_cli.subcommands.release import build_release_parser
@@ -130,6 +130,31 @@ def _midway(*unhealthy: str) -> FakeHost:
     return FakeHost(running=None, active={SANDBOX_TUNNEL_UNIT}, unhealthy=set(unhealthy))
 
 
+# What a release run asks of its host beyond FakeHost's reads, answered as the merged run's host
+# answers it: every guard passes for NEW on PREV.
+ANSWERS = {
+    "origin_main": NEW, "first_parent_chain": [NEW], "commit_parents": (PREV, FEATURE),
+    "commit_tree": TREE, "changed_paths": {"hermes_cli/main.py"}, "free_disk_bytes": 5 * 1024**3,
+    "snapshots": [], "open_native_runs": [],
+}
+
+
+@dataclass
+class RunHost(FakeHost):
+    """FakeHost as a release run finds it: its checkout at PREV and its units running PREV. The
+    reads of the run's guards that FakeHost lacks get ANSWERS, as in the merged run's host, and
+    any other read or action succeeds."""
+
+    head: str = PREV
+    running: str | None = PREV
+
+    def __getattr__(self, name):
+        return lambda *args: ANSWERS.get(name, True)
+
+    def unit_property(self, unit, name):
+        return {"KillSignal": "SIGINT", "KillMode": "mixed"}[name]
+
+
 @pytest.fixture
 def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """The root Hermes home at ``<tmp>/.hermes``, with the release settings this host needs."""
@@ -139,6 +164,20 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HERMES_HOME", str(home))
     (home / "config.yaml").write_text(yaml.safe_dump({"release": SETTINGS}))
     return home
+
+
+def _accepted() -> int:
+    """The record a release begins from: one change, NEW, and its batch accepted."""
+    with contextlib.closing(ledger.connect()) as conn:
+        batch = ledger.record_merge(
+            conn, merge_commit=NEW, pr_url="https://github.com/mtbitcr/hermes-agent/pull/1",
+            reviewed_base=PREV, reviewed_head=FEATURE, reviewed_tree=TREE, tier=1,
+            card_id=f"t_{NEW[:8]}", on_main=True,
+        )["batch"]
+        return ledger.decide_release(
+            conn, batch["batch_id"], decision="accepted", shown_digest=batch["digest"],
+            expected_version=batch["version"], decision_ref="decisions-page:release",
+        )["batch_id"]
 
 
 def _stopped_midway(pause: str = "own") -> int:
@@ -380,3 +419,52 @@ def test_a_second_recovery_refuses_at_once_and_writes_nothing(root):
         "Nothing in the release state was written.",
     ]
     assert (first_code, first_calls, _batch(batch_id)["recovery_attempts"]) == (1, RESTORE, 1)
+
+
+def test_a_release_that_fails_on_the_first_start_gets_two_recoveries(root, monkeypatch):
+    """Owner rule 456, test 1 (the finding of attachment 455, accepted by design). The release
+    unit's first start runs the release of an accepted batch on a host where neither NEW nor PREV
+    reads back, and the release ends failed under its own pause. As the merged unit does, a start
+    follows only a non-zero exit, START_LIMIT_BURST starts in all: the second and third starts
+    each make one recovery attempt, and after the third the batch stays failed with its pause,
+    and the unit has no start left."""
+    batch_id, host = _accepted(), RunHost(unhealthy={NEW, PREV})
+    codes, records, calls, pauses = [], [], [], []
+    while len(codes) < release_unit.START_LIMIT_BURST and (not codes or codes[-1] != 0):
+        done = len(host.calls)
+        codes.append(_command(monkeypatch, host, "run", str(batch_id)))
+        batch = _batch(batch_id)
+        records.append((batch["state"], batch["outcome"], batch["recovery_attempts"]))
+        calls.append(host.calls[done:])
+        pauses.append(_sentinel())
+
+    # Every start failed, so the unit would start again, but these were all its starts: it stops.
+    assert release_unit.START_LIMIT_BURST == 3 and codes == [1, 1, 1]
+    assert records == [("failed", "failed", attempts) for attempts in (0, 1, 2)]
+    # The release: its first unit stop, the move to NEW and the restore; then one restore a start.
+    assert calls == [["stop", "stop", f"checkout {NEW}", "start", *RESTORE], RESTORE, RESTORE]
+    pause = json.loads(pauses[0])  # the release's own: its reason and its token
+    assert pause["reason"] == f"release {batch_id}" and pause["release_token"]
+    assert pauses == [pauses[0]] * 3  # kept byte for byte
+
+
+def test_a_start_after_the_cap_makes_no_host_step_and_exits_cleanly(root, monkeypatch, capsys):
+    """Owner rule 456, test 2. A start on a batch failed after three recovery attempts, under the
+    release's own pause, as a new unit finds it: ``release run BATCH`` asks the host nothing and
+    exits 0, and the count of three, the failed batch and the pause stay as they were."""
+    batch_id = _stopped_midway()
+    with contextlib.closing(ledger.connect()) as conn:
+        for _attempt in range(3):
+            ledger.begin_recovery(conn, batch_id)
+            ledger.finish_release(conn, batch_id, outcome="failed")
+    host, before = _midway(NEW, PREV), _sentinel()
+
+    assert _command(monkeypatch, host, "run", str(batch_id)) == 0
+
+    batch = _batch(batch_id)
+    assert (batch["state"], batch["outcome"], batch["recovery_attempts"]) == ("failed", "failed", 3)
+    assert host.calls == [] and _sentinel() == before
+    assert capsys.readouterr().out == (
+        f"Batch {batch_id} stays failed after 3 recovery attempts: a person must bring the"
+        " platform back.\n"
+    )
