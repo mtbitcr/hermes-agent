@@ -153,13 +153,15 @@ class FakeHost:
 @dataclass
 class Boundary:
     """The live host's processes, faked: git in the checkout, the user manager and the board
-    reader's child. The checkout and the units move as the live adapters ask, a starting gateway
-    stamps its record with the checkout's head, and the modules at the first stop are kept."""
+    reader's child. The checkout and the units move as the live adapters ask, each move noted, a
+    starting gateway stamps its record with the checkout's head, and the modules at the first stop
+    are kept."""
 
     root: Path
     head: str = PREV
     active: set[str] = field(default_factory=lambda: set(UNITS))
     modules_at_stop: set[str] | None = None
+    moves: list[str] = field(default_factory=list)
 
     def run(self, argv, **options):
         if argv[0] == sys.executable:  # the board reader's child: no board has an open run
@@ -172,6 +174,7 @@ class Boundary:
             return self._done("", 0 if args[2] == args[3] or args[2:] == (PREV, NEW) else 1)
         if args[0] == "checkout":
             self.head = args[-1]
+            self.moves.append(f"checkout {self.head}")
         return self._done({
             ("rev-parse", "--verify", "HEAD"): self.head,
             ("status", "--porcelain", "--untracked-files=normal"): "",
@@ -192,6 +195,7 @@ class Boundary:
             return self._done(f"{name}={value}\n")
         if verb == "is-active":
             return self._done("active\n") if rest[0] in self.active else self._done("inactive\n", 3)
+        self.moves.append(f"{verb} {rest[0]}")
         if verb == "stop":
             if self.modules_at_stop is None:
                 self.modules_at_stop = set(sys.modules)
@@ -768,6 +772,54 @@ def test_the_first_unit_stop_reads_the_pause_again(root, monkeypatch, capsys, ca
     assert (host.journal[-1], _sentinel()) == ("outcome refused", host.injected[0])
     assert "Refused: stopped before cutover." in out and "after the cutover" not in out
     assert TOKEN not in out + err
+
+
+@pytest.mark.parametrize("last", [3, 4, 5, 6], ids=lambda last: f"denied through read {last}")
+def test_a_refusal_at_the_first_unit_stop_is_final(root, monkeypatch, capsys, last):
+    """Owner rule 357, item 4 (S3), as its review reproduced it on the live adapters, with only
+    their processes faked. The run's third read of the pause, at the runner's first unit stop, is
+    denied, and so is every read after it up to the ``last``; the first two are the reads once the
+    pause is published and just before the runner. The refusal at the first unit stop is final:
+    whatever a later read finds, no unit stop, checkout, configuration restore or unit start
+    reaches the host, and the run records refused. A denial that reaches the run's reads after
+    the outcome may leave the release's own pause in place, a safe end."""
+    from hermes_cli import release_cmd
+
+    _accepted(1)
+    args = _parsed_run()
+    boundary, sentinel, reads = Boundary(root), estop.sentinel_path(), []
+    boundary.stamp()  # the live gateway runs PREV
+    answer = SimpleNamespace(status=200)  # each readback address answers
+    direct = SimpleNamespace(open=lambda url, timeout: contextlib.nullcontext(answer))
+    read_text, restore = Path.read_text, release_host_actions.ReleaseHostActions.restore_config
+
+    def read_or_deny(path, *rest, **options):  # root reads any file: the denial is injected here
+        if path == sentinel:
+            reads.append(path)
+            if 3 <= len(reads) <= last:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(path))
+        return read_text(path, *rest, **options)
+
+    def restore_config(actions):  # the configuration restore starts no process: noted here
+        boundary.moves.append("restore configuration")
+        return restore(actions)
+
+    monkeypatch.setattr(Path, "read_text", read_or_deny)
+    monkeypatch.setattr(release_host_actions.ReleaseHostActions, "restore_config", restore_config)
+    monkeypatch.setattr(subprocess, "run", boundary.run)
+    monkeypatch.setattr(build_info, "get_code_identity", lambda **_: {"sha": boundary.head})
+    monkeypatch.setattr(release_host_actions, "_DIRECT", direct)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=8 * 1024**3))
+    monkeypatch.setattr(release_cmd, "secrets", SimpleNamespace(token_hex=lambda nbytes: TOKEN))
+    results = _spy(monkeypatch, release_cmd, "run_release", lambda *_: None)
+    Clock().install(monkeypatch)
+
+    code = args.func(args)
+    (out, err), outcomes = capsys.readouterr(), [batch["outcome"] for batch in _batches()]
+    assert TOKEN not in out + err
+    assert [result.steps[:2] for result in results] == [("guards", "stop")]  # the first unit stop
+    assert (code, boundary.moves, outcomes) == (1, [], ["refused", None])
+    assert "Refused: stopped before cutover." in out and "after the cutover" not in out
 
 
 def test_a_failed_cleanup_shows_its_step_type_and_errno_only(root, monkeypatch, capsys):

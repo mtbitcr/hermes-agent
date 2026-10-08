@@ -192,7 +192,7 @@ def run() -> int:
     SIGINT and SIGTERM only set a stop flag, read after the pause's publication, at every drain
     poll and just before the runner, where it refuses the release; from then on the runner's own
     outcome stands. The runner's first unit stop reads the pause again and refuses the release
-    unless it is the release's own. A runner result that never comes back fails it midway.
+    for good unless it is the release's own. A runner result that never comes back fails it midway.
 
     Returns 0 when the batch was released, 1 otherwise, and 1 when the release's own pause is
     still in place after its removal.
@@ -313,18 +313,22 @@ class _Host:
 
     The host also holds the run's stop flag, which its SIGINT and SIGTERM handler only sets. Until
     the cutover, it hands an action over only while the release's own pause is in place, read each
-    time: the runner's first unit stop, after the fresh guards, reads it and marks the cutover, and
-    a pause that is not the release's own leaves the runner no unit to stop and no move back.
+    time: the runner's first unit stop, after the fresh guards, reads it and marks the cutover. A
+    pause that is not the release's own refuses that action, and the refusal is final: every later
+    action is refused too, without reading the pause again, so the runner has no unit to stop and
+    no move back.
     """
 
     def __init__(self, reader: LiveHostReader, actions: ReleaseHostActions, token: str) -> None:
         self._reader, self._actions, self._release_token = reader, actions, token
-        self.cut_over = self.stopped = False
+        self.cut_over = self.stopped = self.refused = False
 
     def __getattr__(self, name: str) -> Any:
         owner = self._actions if hasattr(self._actions, name) else self._reader
         if owner is self._actions and not self.cut_over:
-            _hold(self._release_token)
+            if self.refused or _token() != self._release_token:
+                self.refused = True  # for the rest of the run: the pause is not read again
+                raise _Stopped("stopped before cutover")
             self.cut_over = name == "stop_units"
         return getattr(owner, name)
 
