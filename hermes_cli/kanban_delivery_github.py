@@ -136,9 +136,10 @@ _MAX_TEXT = 256
 class GitHubTransportError(Exception):
     """A refusal or failure named by a fixed reason code, never by a request, response or token."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, status: int | None = None):
         super().__init__(reason)
         self.reason = reason
+        self.status = status  # the HTTP status of an answer that came but could not be read
 
 
 def _connect() -> http.client.HTTPConnection:
@@ -195,7 +196,7 @@ def _exchange(method: str, target: str, authorization: str, payload=None) -> tup
     if not 200 <= status < 300:  # an error's JSON object; no redirect target, as no Location header is read
         return status, value if isinstance(value, dict) else None, more
     if not isinstance(value, (dict, list)):
-        raise GitHubTransportError("bad_response")
+        raise GitHubTransportError("bad_response", status)
     return status, value, more
 
 
@@ -321,7 +322,13 @@ class GitHubTransport:
         if endpoint.body is not None and not endpoint.body(body):
             raise GitHubTransportError("body_not_allowed")
         target = f"{path}?{urlencode(values)}" if values else path
-        status, value, *paging = _exchange(method, target, f"Bearer {self._installation_token()}", body)
+        authorization = f"Bearer {self._installation_token()}"  # minted first: its failure is no merge's answer
+        try:
+            status, value, *paging = _exchange(method, target, authorization, body)
+        except GitHubTransportError as error:  # a merge GitHub answered unreadably keeps its status, with the reason
+            if error.status is None or not endpoint.template.endswith("/merge"):
+                raise
+            return {"status": error.status, "data": self._merge(None), "reason": error.reason}
         if endpoint.template.endswith("/merge"):
             return {"status": status, "data": self._merge(value)}
         value = value if 200 <= status < 300 else None  # no other error's body is passed on

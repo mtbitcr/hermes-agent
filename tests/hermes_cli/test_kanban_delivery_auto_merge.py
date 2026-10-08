@@ -5,7 +5,10 @@ real transport with only its exchange and App token replaced by a table, so ever
 
 from __future__ import annotations
 
+import http.client
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -351,6 +354,44 @@ def test_a_refused_arm_is_recorded_once_for_its_head(armed, answer, state):
     assert [(kind, p["head"], p.get("status")) for kind, p in refused] == [
         (f"delivery_auto_merge_{state}", head, None if answer == "timeout" else answer[0])]
     assert [p["message"] for kind, p in refused] == [answer[1]["message"] if answer != "timeout" and answer[1] else None]
+
+
+@pytest.mark.parametrize("status, raw", [(200, b"null"), (200, b"false"), (200, b'"merged"'), (200, b'{"merged": true'),
+                                         (202, b"null")], ids=["null", "false", "string", "malformed", "202_null"])
+def test_a_merge_answered_with_an_unreadable_body_is_refused_once_with_githubs_status(request, monkeypatch, status, raw):
+    """A received answer is never unknown: GitHub's status stands, whatever the body. Other endpoints still raise."""
+    from hermes_cli import kanban_delivery_github as transport
+
+    exchange = transport._exchange  # the real one, taken before the armed world replaces it with a table
+    kb, root, repo, gh = armed = request.getfixturevalue("armed")
+    tid, head = _ready(armed)
+    _tick(kb)
+    _done(kb.kanban_db_path())
+    _reviews(gh, *_lenses(kb, head))
+    calls, table = [], transport._exchange
+
+    class Handler(BaseHTTPRequestHandler):  # GitHub's whole answer, on the wire, to each request
+        def do_PUT(self):
+            calls.append((self.command, self.path, self.rfile.read(int(self.headers.get("Content-Length", 0)))))
+            self.wfile.write(b"HTTP/1.0 %d Answer\r\nContent-Length: %d\r\n\r\n%s" % (status, len(raw), raw))
+        do_GET = do_PUT
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    request.addfinalizer(lambda: server.shutdown() or server.server_close())
+    monkeypatch.setattr(transport, "_connect", lambda: http.client.HTTPConnection(*server.server_address, timeout=10))
+    monkeypatch.setattr(transport, "_exchange", lambda *call: (exchange if call[0] == "PUT" else table)(*call))
+
+    _tick(kb)
+    _tick(kb)
+    monkeypatch.setattr(transport, "_exchange", exchange)
+    with pytest.raises(transport.GitHubTransportError, match="^bad_response$"):  # any other endpoint still raises
+        transport.GitHubTransport("publish", REPO).request("GET", f"/repos/{REPO}/pulls/41")
+
+    assert [c[:2] for c in calls] == [("PUT", f"/repos/{REPO}/pulls/41/merge"), ("GET", f"/repos/{REPO}/pulls/41")]
+    assert _state(kb, head) == "auto_merge_refused"
+    assert [(kind, p["head"], p["status"], p["reason"]) for kind, p in _events(kb, tid) if "auto_merge" in kind] == [
+        ("delivery_auto_merge_refused", head, status, "bad_response")]
 
 
 def test_a_new_head_starts_fresh_after_a_refused_arm(armed):
