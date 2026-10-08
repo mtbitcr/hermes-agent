@@ -6903,6 +6903,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 "/v1/owner-workspace/decisions/{decision_ref}/defer",
                 self._handle_owner_workspace_suggestion_decision,
             ),
+            (
+                "GET",
+                "/v1/owner-workspace/release",
+                __import__("gateway.platforms.api_server_release", fromlist=["route"]).route(self, "view"),
+            ),
+            (
+                "POST",
+                "/v1/owner-workspace/release/{batch_id}/accept",
+                __import__("gateway.platforms.api_server_release", fromlist=["route"]).route(self, "accept"),
+            ),
+            (
+                "POST",
+                "/v1/owner-workspace/release/{batch_id}/defer",
+                __import__("gateway.platforms.api_server_release", fromlist=["route"]).route(self, "defer"),
+            ),
+            (
+                "POST",
+                "/v1/owner-workspace/release/{batch_id}/start",
+                __import__("gateway.platforms.api_server_release", fromlist=["route"]).route(self, "start"),
+            ),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
