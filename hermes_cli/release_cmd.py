@@ -1,23 +1,33 @@
-"""``hermes release``: check a release before it runs (release card 4).
+"""``hermes release``: check a release before it runs (release card 4), and run it (card 5).
 
 ``prepare`` works out PREV and NEW (S-B), builds both live adapters from the ``release`` settings
 (S-E) and asks the host every merged guard, printing each result in plain words. It writes
 nothing to the release state: config.yaml is read as it is on disk, the release record is opened
 read-only, and the guards only read. ``status`` prints the waiting batch and the last
-outcome. The release itself, under the pause (S-A) and in its own unit (S-F), belongs to a later
-card.
+outcome. ``run`` releases the accepted batch after the same preflight, under the pause (S-A), in
+the calling process: SIGINT or SIGTERM refuses a release until its runner starts; after that, only
+a hard kill ends it, and its recovery belongs to card 7. The release unit (S-F) belongs to card 6.
+
+Design rule (K6), as in the runner: everything ``run`` needs is imported when this module loads,
+so nothing is imported once the units stop and the checkout moves under the running process.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import os
+import secrets
+import signal
 import sqlite3
 import stat
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from hermes_cli import release_ledger
+from agent import estop
+from hermes_cli import release_guards, release_ledger
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     _ENV_REF_RE,
@@ -30,7 +40,7 @@ from hermes_cli.config import (
 from hermes_cli.release_guards import GATEWAY_UNIT, GUARDS, SERVE_UNIT, Pins, RecordedMerge
 from hermes_cli.release_host import LiveHostReader
 from hermes_cli.release_host_actions import ReleaseHostActions
-from hermes_cli.release_runner import SANDBOX_TUNNEL_UNIT
+from hermes_cli.release_runner import SANDBOX_TUNNEL_UNIT, run_release
 from hermes_constants import get_default_hermes_root, get_hermes_home
 
 # The host's unit names and readback addresses are not in the repository, so an empty one refuses
@@ -70,7 +80,9 @@ class _UnreadableRecord(Exception):
 
 
 def cmd_release(args) -> int:
-    """``hermes release prepare`` or ``hermes release status``."""
+    """``hermes release prepare``, ``hermes release status`` or ``hermes release run``."""
+    if args.release_command == "run":
+        return run()
     return prepare() if args.release_command == "prepare" else status()
 
 
@@ -79,6 +91,22 @@ def prepare() -> int:
 
     Returns 0 when every guard passed, 1 when one failed or the release was refused before them.
     """
+    inputs = _inputs()
+    if isinstance(inputs, int):  # refused before the guards
+        return inputs
+    batch, merges, pins, reader, _actions, _settings = inputs
+    failed = _preflight(batch, merges, pins, reader)
+    if failed:
+        return _refuse(f"{len(failed)} of {len(GUARDS)} release guards failed")
+    print(f"All {len(GUARDS)} release guards passed. Nothing in the release state was written.")
+    return 0
+
+
+def _inputs() -> int | tuple[
+    dict[str, Any], list[RecordedMerge], Pins, LiveHostReader, ReleaseHostActions, dict[str, Any]
+]:
+    """What prepare and run work on: the accepted batch, its changes, both versions, the live
+    reader and actions, and the release settings; or, once a refusal is printed, its exit code."""
     root, home = get_default_hermes_root(), get_hermes_home()
     if home.resolve() != root.resolve():  # S-A
         return _refuse(f"a release runs only from the root Hermes home {root}, not from {home}")
@@ -115,7 +143,7 @@ def prepare() -> int:
         return _refuse(str(error))
     new = merges[-1].commit
     # The guards only read; the actions are built from the same settings, as the release will.
-    reader, _actions = _adapters(root, settings, new)
+    reader, actions = _adapters(root, settings, new)
     try:
         prev = live or reader.checkout_head()
     except Exception as error:
@@ -124,9 +152,16 @@ def prepare() -> int:
             f" ({type(error).__name__}: {error})"
         )
     pins = Pins(new=new, prev=prev)
+    return batch, merges, pins, reader, actions, settings
 
-    print(f"Batch {batch['batch_id']}: PREV {prev}, NEW {new}")
-    failed = 0
+
+def _preflight(
+    batch: dict[str, Any], merges: list[RecordedMerge], pins: Pins, reader: LiveHostReader
+) -> list[str]:
+    """Card 4's preflight: print both versions, then ask the host every guard and print each
+    result in plain words. Returns the guards that failed."""
+    print(f"Batch {batch['batch_id']}: PREV {pins.prev}, NEW {pins.new}")
+    failed = []
     for guard, rule, check in GUARDS:
         # Every guard is asked, as in release_guards.prepare. A read that raises fails its guard
         # and keeps its cause, as a readback does in the runner.
@@ -137,11 +172,244 @@ def prepare() -> int:
         print(f"{guard} {'passed' if ok else 'failed'}: {rule}{cause}")
         if guard == "G9" and not ok and not cause:
             print(f"    {_ROLLED_BACK}")
-        failed += not ok
-    if failed:
-        return _refuse(f"{failed} of {len(GUARDS)} release guards failed")
-    print(f"All {len(GUARDS)} release guards passed. Nothing in the release state was written.")
-    return 0
+        if not ok:
+            failed.append(guard)
+    return failed
+
+
+def run() -> int:
+    """Release the accepted batch between a pause and a resume, in card 5's order.
+
+    Mark the batch releasing with both versions, fetch NEW and save the named configuration
+    snapshot, and run prepare's preflight. A pause already in place, or a failed guard other than
+    G10, refuses the release and pauses nothing. Otherwise publish the pause (S-A), whole, with the
+    release reason and a release token, wait until the merged G10 holds, and run the merged runner
+    for the batch's tier: tier 2 when a change has tier 2 or no recorded tier, forward only
+    otherwise. The pause is read back after its publication and again just before the runner,
+    which asks every guard again before it stops anything. Then record the outcome and resume,
+    except after a failed outcome: the platform stays paused for a person.
+
+    SIGINT and SIGTERM only set a stop flag, read after the pause's publication, at every drain
+    poll and just before the runner, where it refuses the release; from then on the runner's own
+    outcome stands. The runner's first unit stop reads the pause again and refuses the release
+    for good unless it is the release's own. A runner result that never comes back fails it midway.
+
+    Returns 0 when the batch was released, 1 otherwise, and 1 when the release's own pause is
+    still in place after its removal.
+    """
+    inputs = _inputs()
+    if isinstance(inputs, int):  # refused before anything was written
+        return inputs
+    _batch, _merges, _pins, reader, actions, _settings = inputs
+    token = secrets.token_hex(16)  # the release token: only the release's own pause carries it
+    host = _Host(reader, actions, token)
+    # The handlers only set the host's stop flag. They are in place before the begin commit, and
+    # the caller's are back only once the outcome is recorded and the pause's removal read back.
+    previous = {
+        signum: signal.signal(signum, host.stop) for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        return _release(inputs, host, token)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler or signal.SIG_DFL)
+
+
+def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
+    """``run`` from the begin commit to the readback of the pause's removal, under its handlers."""
+    batch, merges, pins, reader, actions, settings = inputs
+    batch_id, reason = batch["batch_id"], f"release {batch['batch_id']}"
+    try:
+        conn = release_ledger.connect()
+    except (OSError, sqlite3.Error) as error:
+        return _refuse(f"the release record could not be opened ({type(error).__name__}: {error})")
+    with contextlib.closing(conn):
+        try:
+            release_ledger.begin_release(conn, batch_id, prev=pins.prev, new=pins.new)
+        except (ValueError, sqlite3.Error) as error:
+            return _refuse(f"batch {batch_id} could not begin its release ({error})")
+        refusals, result = [], None
+        try:
+            actions.fetch(pins.new)
+            actions.save_config_snapshot(pins.new)
+            failed = [guard for guard in _preflight(batch, merges, pins, reader) if guard != "G10"]
+            if estop.is_engaged():
+                refusals.append("the platform is already paused")
+            if failed:
+                refusals.append(_guards_failed(failed))
+            # The publication refuses an owner's pause written since that read, too.
+            if not refusals and not _pause(reason, token):
+                refusals.append("the platform is already paused")
+            if not refusals:
+                _hold(token, host.stopped)
+                _drain(reader, pins, merges, settings["drain_poll_seconds"], host)
+                tier = max(m["tier"] if m["tier_recorded"] else 2 for m in batch["members"])
+                _hold(token, host.stopped)
+                result = run_release(host, pins, tier, merges)
+                if result.outcome != "refused" and not host.cut_over:
+                    # At its first unit stop the pause was not the release's own: nothing moved.
+                    result = None
+                    raise _Stopped("stopped before cutover")
+        except _Stopped as stop:
+            refusals.append(str(stop))
+        except Exception as error:  # an action, or a read in the drain or the fresh guards (F5)
+            refusals.append(f"a step before the cutover failed ({type(error).__name__}: {error})")
+        if host.cut_over and result is None:
+            # From the first unit stop on, a runner result that never came back is never a
+            # refusal: the release failed midway and stays paused for its recovery (card 7).
+            outcome = "failed"
+            print("The release failed after the cutover (stopped midway).")
+        else:
+            if result is not None and result.outcome == "refused":
+                fresh = [check.guard for check in result.guards if not check.ok]
+                refusals.append(f"{_guards_failed(fresh)} when asked again before the stop")
+            outcome = "refused" if result is None else result.outcome
+            for refusal in refusals:
+                print(f"Refused: {refusal}.")
+            if result is not None and result.error:
+                print(f"The release failed after the cutover ({result.error}).")
+                for error in result.restore_errors:
+                    print(f"    Going back, a step failed too: {error}")
+        release_ledger.finish_release(conn, batch_id, outcome=outcome)
+    # S-A: lift only the release's own pause, the one with its token, unless the outcome failed;
+    # an owner's pause stays. One written between the token's read and the removal goes with it,
+    # by design: the owner page then shows the platform running, and the owner can pause again.
+    # The removal is read back, and never tried again.
+    state = estop.get_state()
+    own = _final_token()
+    lift = outcome != "failed" and own == token
+    if lift:
+        estop.disengage()
+    print(f"Batch {batch_id} {_OUTCOMES[outcome]}.")
+    after = _final_token() if lift else own
+    if after is _UNREADABLE:  # the release cannot know whether its own pause is still in place
+        print("The pause could not be read: the platform may still be paused by this release.")
+        return 1
+    if state is not None and not lift:
+        print(f"The platform stays paused ({state['reason'] or 'no reason given'}).")
+    elif lift and after == token:  # the removal failed: the release's own pause is in place
+        print(
+            f"The platform is still paused ({reason}): the release could not remove its pause"
+            f" at {estop.sentinel_path()}."
+        )
+        return 1
+    return 0 if outcome == "released" else 1
+
+
+def _guards_failed(guards: list[str]) -> str:
+    return f"release guard{'s' * (len(guards) > 1)} {', '.join(guards)} failed"
+
+
+def _drain(
+    reader: LiveHostReader, pins: Pins, merges: list[RecordedMerge], seconds: float, host: _Host
+) -> None:
+    """Wait until the merged G10 holds, asking it every ``seconds``. The wait has no time limit
+    of its own (decision B): the host's stop flag, read at every poll, ends it."""
+    [check] = [check for guard, _rule, check in release_guards.GUARDS if guard == "G10"]
+    while not check(reader, pins, merges):
+        if host.stopped:
+            raise _Stopped("stopped before cutover")
+        time.sleep(seconds)
+
+
+class _Host:
+    """The live reader and actions as the one release host the runner asks. A name the actions
+    have is theirs, so ``checkout`` is the move; every other name is the reader's.
+
+    The host also holds the run's stop flag, which its SIGINT and SIGTERM handler only sets. Until
+    the cutover, it hands an action over only while the release's own pause is in place, read each
+    time: the runner's first unit stop, after the fresh guards, reads it and marks the cutover. A
+    pause that is not the release's own refuses that action, and the refusal is final: every later
+    action is refused too, without reading the pause again, so the runner has no unit to stop and
+    no move back.
+    """
+
+    def __init__(self, reader: LiveHostReader, actions: ReleaseHostActions, token: str) -> None:
+        self._reader, self._actions, self._release_token = reader, actions, token
+        self.cut_over = self.stopped = self.refused = False
+
+    def __getattr__(self, name: str) -> Any:
+        owner = self._actions if hasattr(self._actions, name) else self._reader
+        if owner is self._actions and not self.cut_over:
+            if self.refused or _token() != self._release_token:
+                self.refused = True  # for the rest of the run: the pause is not read again
+                raise _Stopped("stopped before cutover")
+            self.cut_over = name == "stop_units"
+        return getattr(owner, name)
+
+    def stop(self, signum: int, frame: Any) -> None:
+        self.stopped = True
+
+
+class _Stopped(BaseException):
+    """A stop signal, or the release's pause gone before the cutover, ended the run. Like an
+    interrupt, no ``except Exception`` takes it."""
+
+
+def _pause(reason: str, token: str) -> bool:
+    """Publish the pause sentinel whole: estop's payload and the release token are written to a
+    temporary file beside it, which is then linked to the sentinel's name. The link fails when a
+    pause is in place, so an owner's pause is never written over: False then. Any other failure
+    to publish is left to the readback, which refuses. Once created, the temporary file is
+    removed; an error of that removal other than a missing file is raised, so the run refuses
+    before the cutover, with its type and errno only: its file name and text carry the token."""
+    path = estop.sentinel_path()
+    temporary = path.with_name(f".{path.name}.{token}")
+    payload = {"engaged_at": datetime.now(timezone.utc).isoformat(), "reason": reason}
+    created = False
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        created = True
+        with os.fdopen(fd, "w", encoding="utf-8") as sentinel:
+            sentinel.write(json.dumps({**payload, "release_token": token}, indent=2) + "\n")
+        os.link(temporary, path)
+    except FileExistsError:
+        return False
+    except OSError:
+        pass
+    finally:
+        if created:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            except OSError as error:  # its name and text carry the token: type and errno only
+                step = "the temporary pause file could not be removed"
+                raise type(error)(error.errno, step) from None
+    return True
+
+
+def _token() -> str | None:
+    """The release token in the pause sentinel, or None when there is none."""
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        return json.loads(estop.sentinel_path().read_text(encoding="utf-8")).get("release_token")
+    return None
+
+
+_UNREADABLE = object()  # the pause sentinel may exist but cannot be read
+
+
+def _final_token() -> object:
+    """The release token for the final removal, which must tell an unreadable sentinel from an
+    absent one: None when there is no sentinel or it carries no token (an owner's pause),
+    _UNREADABLE when it cannot be read, otherwise the token."""
+    try:
+        text = estop.sentinel_path().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _UNREADABLE
+    with contextlib.suppress(ValueError):
+        data = json.loads(text)
+        return data.get("release_token") if isinstance(data, dict) else None
+    return None  # not the release's own sentinel, which is always written whole
+
+
+def _hold(token: str, stopped: bool = False) -> None:
+    """Stop the release before the cutover when ``stopped``, or unless its own pause, with
+    ``token``, is in place."""
+    if stopped or _token() != token:
+        raise _Stopped("stopped before cutover")
 
 
 def status() -> int:
