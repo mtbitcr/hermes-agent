@@ -9,6 +9,18 @@
       {
         "test": "tests/tui_gateway/test_compute_host_turn_protocol.py::test_turn_start_streams_deltas_then_turn_end_with_history_identity",
         "finding": 100
+      },
+      {
+        "test": "tests/tui_gateway/test_hosted_room_driver_runtime.py::test_waiting_room_does_not_block_an_independent_local_room",
+        "finding": 139
+      },
+      {
+        "test": "tests/tui_gateway/test_hosted_room_driver_runtime.py::test_deadline_releases_worker_capacity_for_later_room",
+        "finding": 139
+      },
+      {
+        "test": "tests/tui_gateway/test_hosted_room_driver_runtime.py::test_rotated_bounded_scheduler_eventually_runs_later_room",
+        "finding": 139
       }
     ]
   },
