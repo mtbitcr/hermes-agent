@@ -29,6 +29,15 @@ CONTINUED = ("SELECT * FROM tasks WHERE id IN (SELECT child_id FROM task_links W
              "AND idempotency_key IS NULL")
 KEPT = ("owned_paths", "risk_tier", "execution_tier", "requires_review")
 BUILDER = "raphael-claude-worker"
+# Owner rule 3 of round 3: a source card _governed sealed, then left so that no lock binds its route for its builder,
+# beside the start of the reason its continuation parks with: governed by its lock alone, with no tier; or owner
+# receipt-bound on a model not admitted, or on a provider with no model. ROUTE: the fields the continuation copies.
+UNLOCKABLE = {"lock_only": ("execution_tier = NULL", "names no admitted"),
+              "unadmitted": ("owner_receipt_bound = 1, model_policy_lock = NULL, model_override = 'claude-unadmitted'",
+                             "'claude-unadmitted'"),
+              "provider_only": ("owner_receipt_bound = 1, model_policy_lock = NULL, model_override = NULL",
+                                "is incomplete")}
+ROUTE = ("owner_receipt_bound", "execution_tier", "provider_override", "model_override", "reasoning_effort")
 
 
 def _branch(tid, head):
@@ -77,6 +86,33 @@ def _governed(kb, tid, tier):
     _raw(db, "UPDATE task_events SET payload = json_set(payload, '$.implementer', ?) "
          "WHERE task_id = ? AND kind = 'review_requested'", BUILDER, tid)
     return route.model, effort
+
+
+def _held(kb, tid, card, returned, why):
+    """Owner rule 3 of round 3: the continuation ``card`` of the governed source card ``tid`` is created parked with
+    the reason, starting ``why``, that the return event ``returned`` names. It keeps the source's ROUTE as it is, a
+    provider with no model included, and, of a source governed by its lock alone, that lock, which binds no route
+    with no tier. So the kernel's own predicate holds it governed: its route authority fails for that reason, and
+    an unapproved route edit and an unblock without route approval are refused, so it stays parked."""
+    db = kb.kanban_db_path()
+    (source,) = _raw(db, "SELECT * FROM tasks WHERE id = ?", tid)
+    parked = [json.loads(event["payload"])["detail"] for event in _raw(
+        db, "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'model_route_unapproved'", card["id"])]
+    assert (card["status"], card["block_kind"], returned["rework"]) == ("blocked", "needs_input", card["id"])
+    assert parked == [returned["parked"]] and returned["parked"].startswith(f"policy-locked route {why}")
+    alone = not (source["execution_tier"] or source["owner_receipt_bound"])
+    assert [card[key] for key in ROUTE] == [source[key] for key in ROUTE]
+    assert card["model_policy_lock"] == (source["model_policy_lock"] if alone else None)
+    conn = kb.connect()
+    try:
+        assert kb.task_is_policy_governed(card) and kb.route_authority_error(conn, card["id"]) == returned["parked"]
+        with pytest.raises(RuntimeError, match="owner-governed"):
+            kb.set_model_override(conn, card["id"], "claude-unapproved", "anthropic")
+        assert kb.unblock_task(conn, card["id"]) is False
+    finally:
+        conn.close()
+    assert _raw(db, "SELECT status, model_override FROM tasks WHERE id = ?", card["id"]) == [
+        {"status": "blocked", "model_override": card["model_override"]}]
 
 
 def _run(db, card, started, *findings):
@@ -360,19 +396,19 @@ def test_a_governed_sources_continuation_is_claimable_on_its_builders_route(arme
     assert (claimed["branch_name"], _git(Path(claimed["workspace_path"]), "rev-parse", "HEAD")) == (_branch(tid, head), head)
 
 
-@pytest.mark.parametrize("route", ["admitted", "incomplete", "unadmitted", "lock_only"])
+@pytest.mark.parametrize("route", ["admitted", "incomplete", "unadmitted", "lock_only", "provider_only"])
 def test_a_governed_sources_continuation_keeps_its_receipt_binding_and_parks_with_why_when_unlockable(armed, route):
     """Owner rule 3 of round 3: the source card is owner receipt-bound, on its builder's admitted route, on no
-    route at all or on a model not admitted; or it is governed by its lock alone, with no tier. The continuation
-    copies the source's owner_receipt_bound. Locked for its builder, it is ready; when its route cannot be locked,
-    it is created parked with the reason, and the return event names it. A governed source gives no manual card."""
+    route at all, on a model not admitted or on a provider with no model; or it is governed by its lock alone, with
+    no tier. The continuation copies the source's owner_receipt_bound. Locked for its builder, it is ready; when its
+    route cannot be locked, it is created parked with the reason, the return event names it, and it stays governed
+    (_held). A governed source gives no manual card."""
     kb, root, repo, gh = armed
     db = kb.kanban_db_path()
     tid, head, cards = _changes_requested(armed)
     if route != "incomplete":
         _governed(kb, tid, "routine")
-    change = {"lock_only": "execution_tier = NULL", "unadmitted": "owner_receipt_bound = 1, model_policy_lock = NULL, "
-              "model_override = 'claude-unadmitted'"}.get(route, "owner_receipt_bound = 1")
+    change, why = UNLOCKABLE.get(route, ("owner_receipt_bound = 1", "is incomplete"))
     _raw(db, f"UPDATE tasks SET {change} WHERE id = ?", tid)
 
     _tick(kb)
@@ -387,9 +423,7 @@ def test_a_governed_sources_continuation_keeps_its_receipt_binding_and_parks_wit
         assert kb.policy_lock_error(card["model_policy_lock"], BUILDER, "anthropic", card["model_override"],
                                     card["reasoning_effort"], "routine") is None
         return
-    why = {"incomplete": "is incomplete", "unadmitted": "'claude-unadmitted'", "lock_only": "names no admitted"}[route]
-    assert (card["status"], card["block_kind"], card["model_policy_lock"]) == ("blocked", "needs_input", None)
-    assert parked == [returned["parked"]] and returned["parked"].startswith(f"policy-locked route {why}")
+    _held(kb, tid, card, returned, why)
 
 
 @pytest.mark.parametrize("layout", ["external", "advanced", "dot_worktrees", "removed", "other_clone", "separate_git_dir"])

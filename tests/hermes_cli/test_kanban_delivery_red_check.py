@@ -23,8 +23,8 @@ from tests.hermes_cli.test_kanban_delivery_review_cards import (  # noqa: F401  
     CHECK, _cards, _published, _raw, _state, world,
 )
 from tests.hermes_cli.test_kanban_delivery_review_return import (
-    BUILDER, CONTINUED, KEPT, _branch, _branches, _branching, _changes_requested, _checkout_elsewhere,
-    _claimed_apart, _clone, _governed, _ready, _registered, _run,
+    BUILDER, CONTINUED, KEPT, UNLOCKABLE, _branch, _branches, _branching, _changes_requested, _checkout_elsewhere,
+    _claimed_apart, _clone, _governed, _held, _ready, _registered, _run,
 )
 
 FLAKY = ("tests/tools/test_zombie_process_cleanup.py::TestDelegationCleanup::"
@@ -397,6 +397,29 @@ def test_a_governed_sources_red_check_continuation_is_claimable_on_its_builders_
     (claimed,) = _raw(db, CONTINUED, tid)
     assert (claimed["id"], claimed["status"], claimed["base_commit"]) == (item["id"], "running", head)
     assert (claimed["branch_name"], _git(Path(claimed["workspace_path"]), "rev-parse", "HEAD")) == (_branch(tid, head), head)
+
+
+@pytest.mark.parametrize("route", ["lock_only", "provider_only"])
+@pytest.mark.parametrize("tests, answer", [([UNLISTED], 201), ([FLAKY], 403), ([FLAKY], None)],
+                         ids=["returned", "refused", "unanswered"])
+def test_a_governed_sources_red_check_continuation_parks_governed_when_unlockable(red, tests, answer, route):
+    """Owner rule 3 of round 3: the red check returns the work of a governed source card, for a failed test no
+    policy lists or after a refused (403) or unanswered rerun, and its route cannot be locked for its builder: it
+    is governed by its lock alone, with no tier, or owner receipt-bound on a provider with no model. The continuation
+    is created parked with the reason red_check_returned names, and it stays governed (_held): never a manual card."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    _governed(kb, tid, "routine")
+    change, why = UNLOCKABLE[route]
+    _raw(kb.kanban_db_path(), f"UPDATE tasks SET {change} WHERE id = ?", tid)
+    gh.update(tests=tests, rerun=answer)
+
+    for _ in range(3):
+        _tick(kb)
+
+    (item,) = _raw(kb.kanban_db_path(), CONTINUED, tid)
+    (returned,) = _waited(kb, tid, "red_check_returned")
+    _held(kb, tid, item, returned, why)
 
 
 @pytest.mark.parametrize("layout", ["external", "advanced", "dot_worktrees", "other_clone", "separate_git_dir"])
