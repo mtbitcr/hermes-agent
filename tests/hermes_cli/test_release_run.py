@@ -660,6 +660,41 @@ def test_resume_is_read_back(root, monkeypatch, capsys, removal):
     assert ("The platform is still paused" in out) is paused
 
 
+@pytest.mark.parametrize("moment", ["before the removal", "after a failed removal"])
+def test_an_unreadable_pause_at_the_end_is_never_a_success(root, monkeypatch, capsys, moment):
+    """S5 of the second security review. When the pause sentinel cannot be read at the end, the
+    run cannot know that its own pause is gone: it keeps the recorded outcome, says that the pause
+    could not be read, and exits 1. Before the removal, nothing is removed; after a failed
+    removal, the readback is what cannot be read."""
+    batch_id = _accepted(1)["batch_id"]
+    host, read_text, unlink = FakeHost(), Path.read_text, os.unlink
+
+    def unreadable(path, *args, **kwargs):  # the sentinel's folder turned unreadable
+        if path.name == estop.SENTINEL_NAME:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(path))
+        return read_text(path, *args, **kwargs)
+
+    def denied(path, *args, **kwargs):  # and its removal fails, as in an unwritable folder
+        if Path(path).name == estop.SENTINEL_NAME:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(path))
+        return unlink(path, *args, **kwargs)
+
+    def turn_unreadable():
+        monkeypatch.setattr(Path, "read_text", unreadable)
+        monkeypatch.setattr(os, "unlink", denied)
+
+    host.at[("outcome released", 1) if moment == "before the removal" else ("resume", 1)] = turn_unreadable
+    code = _run(monkeypatch, host)
+
+    assert code == 1
+    assert [batch["outcome"] for batch in _batches()] == ["released"]
+    assert json.loads(_sentinel())["release_token"] == TOKEN  # the release's own pause is in place
+    assert ("resume" in host.journal) is (moment == "after a failed removal")
+    out = capsys.readouterr().out
+    assert f"Batch {batch_id} was released." in out
+    assert "The pause could not be read" in out and TOKEN not in out
+
+
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["SIGINT", "SIGTERM"])
 @pytest.mark.parametrize("moment", ["after the begin commit", "before finish_release"])
 def test_a_stop_at_either_end_of_the_record_settles_the_batch(
