@@ -667,6 +667,72 @@ def test_a_failed_config_save_keeps_the_earlier_save(tmp_path, monkeypatch):
     assert (root / "config.yaml").read_bytes() == b"model: saved\n"
 
 
+# The configuration set (S-D) of a root home with one profile home.
+CONFIG_SET = ("config.yaml", ".env", "profiles/coder/config.yaml", "profiles/coder/.env")
+
+
+def saved_then_changed(tmp_path: Path) -> tuple[ReleaseHostActions, Path, dict[str, bytes]]:
+    """Save the configuration set, then change each of its files live, so that a restore shows in
+    every one. Returns the actions, the save, and the live files with their changed bytes."""
+    root = tmp_path / "root"
+    for rel in CONFIG_SET:
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(f"saved {rel}\n".encode())
+    actions = make_actions(tmp_path)
+    actions.save_config_snapshot("release")
+    changed = {rel: f"changed {rel}\n".encode() for rel in CONFIG_SET}
+    for rel, data in changed.items():
+        (root / rel).write_bytes(data)
+    return actions, tmp_path / "snapshots" / "config" / "release", changed
+
+
+# A save that does not hold the whole configuration set would remove the live files it lacks, so
+# the restore refuses it before any live file changes: each one keeps its exact bytes.
+def test_config_restore_refuses_an_empty_save_and_keeps_every_live_file(tmp_path):
+    actions, saved, changed = saved_then_changed(tmp_path)
+    shutil.rmtree(saved)
+    saved.mkdir()
+    with pytest.raises(FileNotFoundError, match="config.yaml"):
+        actions.restore_config()
+    assert published(tmp_path / "root") == changed
+
+
+def test_config_restore_refuses_a_save_of_unrelated_files_and_keeps_every_live_file(tmp_path):
+    actions, saved, changed = saved_then_changed(tmp_path)
+    shutil.rmtree(saved)
+    for rel in ("notes.txt", "state.db", "profiles/coder/memories/MEMORY.md"):
+        (saved / rel).parent.mkdir(parents=True, exist_ok=True)
+        (saved / rel).write_bytes(b"not configuration\n")
+    with pytest.raises(ValueError, match="no configuration file"):
+        actions.restore_config()
+    assert published(tmp_path / "root") == changed
+
+
+def test_config_restore_refuses_a_save_with_an_unreadable_file_and_keeps_every_live_file(
+    tmp_path, monkeypatch
+):
+    actions, saved, changed = saved_then_changed(tmp_path)
+    unreadable, read_bytes = saved / "profiles" / "coder" / "config.yaml", Path.read_bytes
+    unreadable.chmod(0)  # sorted last: a restore that read as it went would change the rest first
+
+    def read_or_deny(path):  # root reads any file: the denial is injected here
+        if path == unreadable:
+            raise PermissionError(13, "Permission denied", str(path))
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_or_deny)
+    with pytest.raises(PermissionError):
+        actions.restore_config()
+    assert published(tmp_path / "root") == changed
+
+
+def test_config_restore_of_a_complete_save_puts_back_every_saved_file(tmp_path):
+    actions, saved, changed = saved_then_changed(tmp_path)
+    assert sorted(published(saved)) == sorted(changed)
+    actions.restore_config()
+    assert published(tmp_path / "root") == {rel: f"saved {rel}\n".encode() for rel in CONFIG_SET}
+
+
 SLOW_SECONDS = 2.5
 
 
