@@ -102,6 +102,10 @@ READBACKS: tuple[tuple[str, Callable[[ReleaseHost, str], bool]], ...] = (
     # with: releases are code-only, and the restore puts that snapshot back.
     ("configuration", lambda host, expected: host.live_config() == host.named_config_snapshot()),
 )
+# Recovery compares the configuration only when NEW's configuration snapshot exists (see
+# recover). Without it, the check is left out, or counts as not held.
+_NO_CONFIGURATION = tuple(read for read in READBACKS if read[0] != "configuration")
+_CONFIGURATION_NOT_HELD = (*_NO_CONFIGURATION, ("configuration", lambda host, expected: False))
 
 
 @dataclass(frozen=True)
@@ -174,18 +178,26 @@ def recover(host: ReleaseHost, pins: Pins) -> ReleaseResult:
     NEW ends released, PREV restored. Otherwise the merged restore steps run and PREV is read
     back, and the outcome is failed when that fails too. Recovery never checks NEW out, and asks
     no guard: the release asked them all before its cutover.
+
+    The live configuration is compared with NEW's configuration snapshot only when that exists.
+    The release publishes it before its cutover, so without it PREV is read back without the
+    configuration and, when that holds, kept with no host step. Any other readback then counts the
+    configuration as not held.
     """
     steps: list[str] = []
     readbacks: list[Readback] = []
+    saved = _config_saved(host)
+    reads = READBACKS if saved else _CONFIGURATION_NOT_HELD
     try:
         head = host.checkout_head()
         if head not in (pins.new, pins.prev):
             raise ReadbackFailed(f"the checkout is at {head}, neither PREV nor NEW")
-        _require(_read_back(host, head, steps, readbacks))
+        first = _NO_CONFIGURATION if head == pins.prev and not saved else reads
+        _require(_read_back(host, head, steps, readbacks, first))
     except BaseException as failure:
         steps.append("restore")
         restore_errors = _restore(host, pins)
-        restored = _read_back(host, pins.prev, steps, readbacks).ok
+        restored = _read_back(host, pins.prev, steps, readbacks, reads).ok
         return ReleaseResult(
             "restored" if restored else "failed",
             tuple(steps),
@@ -196,6 +208,16 @@ def recover(host: ReleaseHost, pins: Pins) -> ReleaseResult:
         )
     outcome = "released" if head == pins.new else "restored"
     return ReleaseResult(outcome, tuple(steps), (), tuple(readbacks))
+
+
+def _config_saved(host: ReleaseHost) -> bool:
+    """Whether NEW's configuration snapshot exists: the reader reads one that does not as empty,
+    and a saved one holds at least the root home's config.yaml. A read that raises counts as one
+    that exists, so the configuration is compared as before."""
+    try:
+        return bool(host.named_config_snapshot())
+    except BaseException:
+        return True
 
 
 def _snapshot(host: ReleaseHost, pins: Pins) -> None:
@@ -246,11 +268,15 @@ MOVES: dict[str, Callable[[ReleaseHost, Pins], str]] = {"forward": _forward, "ba
 
 
 def _read_back(
-    host: ReleaseHost, expected: str, steps: list[str], readbacks: list[Readback]
+    host: ReleaseHost,
+    expected: str,
+    steps: list[str],
+    readbacks: list[Readback],
+    reads: Sequence[tuple[str, Callable[[ReleaseHost, str], bool]]] = READBACKS,
 ) -> Readback:
     steps.append("readback")
     errors: dict[str, str] = {}
-    checks = {name: _holds(name, check, host, expected, errors) for name, check in READBACKS}
+    checks = {name: _holds(name, check, host, expected, errors) for name, check in reads}
     readback = Readback(expected, checks, errors)
     readbacks.append(readback)
     return readback

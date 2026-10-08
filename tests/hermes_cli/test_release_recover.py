@@ -78,6 +78,8 @@ class FakeHost:
     calls: list[str] = field(default_factory=list)
     modules_at_stop: set[str] | None = None
     config_snapshot: str = ""  # as in the live actions: the snapshot the restore puts back
+    # NEW's configuration snapshot as the live reader reads it: empty when none was published.
+    saved: dict[str, str] = field(default_factory=lambda: dict(CONFIG))
 
     def checkout_head(self):
         return self.head
@@ -102,7 +104,8 @@ class FakeHost:
     def live_config(self):
         return dict(CONFIG)
 
-    named_config_snapshot = live_config
+    def named_config_snapshot(self):
+        return dict(self.saved)
 
     def stop_units(self, units):
         self.calls.append("stop")
@@ -264,6 +267,33 @@ def _files(root: Path) -> dict[str, bytes]:
     """Every file under the root home with its bytes, the release record's and the pause's
     among them."""
     return {str(path): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+# Where a release stopped before its cutover, as the snapshot root shows it (S-C): the
+# configuration snapshot the release of PREV published, and of NEW's either nothing (before the
+# fetch of NEW), its staging, or its staging with an earlier one set aside, not yet replaced.
+_BEFORE_CUTOVER = {
+    "before-fetch": [f"config/{PREV}"],
+    "staged": [f"config/{PREV}", f".config-{NEW}.partial"],
+    "set-aside": [f"config/{PREV}", f".config-{NEW}.partial", f".config-{NEW}.previous"],
+}
+
+
+def _snapshots(root: Path, *names: str) -> dict[str, str]:
+    """These entries of the snapshot root, release-snapshots under the root home (S-C), each
+    holding a saved configuration file; and NEW's configuration snapshot as the live reader then
+    reads it, empty when there is none."""
+    from hermes_cli.release_host import LiveHostReader
+
+    for name in names:
+        saved = root / "release-snapshots" / name
+        saved.mkdir(parents=True)
+        (saved / "config.yaml").write_text(yaml.safe_dump({"release": SETTINGS}))
+    reader = LiveHostReader(
+        checkout=Path(CHECKOUT), root_home=root, units={},
+        snapshot_root=root / "release-snapshots", snapshot_name=NEW,
+    )
+    return dict(reader.named_config_snapshot())
 
 
 def test_recover_keeps_new_when_it_reads_back():
@@ -468,3 +498,54 @@ def test_a_start_after_the_cap_makes_no_host_step_and_exits_cleanly(root, monkey
         f"Batch {batch_id} stays failed after 3 recovery attempts: a person must bring the"
         " platform back.\n"
     )
+
+
+@pytest.mark.parametrize("pause", ["own", "owner"])
+@pytest.mark.parametrize("stop", list(_BEFORE_CUTOVER))
+def test_a_release_stopped_before_its_cutover_is_kept_as_it_is(root, monkeypatch, stop, pause):
+    """Finding of the security review. A release that stopped after its releasing record and
+    before it published NEW's configuration snapshot left PREV checked out, its units up and
+    healthy. Recovery reads the host back as it is and records restored with no host step: no
+    stop, checkout, restore or start. It lifts only the release's own pause; an owner's stays."""
+    batch_id = _stopped_midway(pause)
+    saved = _snapshots(root, *_BEFORE_CUTOVER[stop])
+    host, before = FakeHost(head=PREV, running=PREV, saved=saved), _sentinel()
+
+    assert _command(monkeypatch, host, "recover", str(batch_id)) == 1
+
+    batch = _batch(batch_id)
+    assert (batch["outcome"], batch["recovery_attempts"]) == ("restored", 1)
+    assert host.calls == []
+    assert _sentinel() == (None if pause == "own" else before)
+
+
+def test_a_published_snapshot_of_new_is_still_compared(root, monkeypatch, capsys):
+    """Once the release published NEW's configuration snapshot, recovery compares the live
+    configuration with it: PREV up and healthy, its live configuration other than the snapshot's,
+    is not kept as it is. The restore runs, and as this host's configuration still differs after
+    it, the outcome is failed and the pause stays."""
+    batch_id = _stopped_midway()
+    saved = _snapshots(root, f"config/{PREV}", f"config/{NEW}")
+    host, before = FakeHost(head=PREV, running=PREV, saved=saved), _sentinel()
+
+    assert _command(monkeypatch, host, "recover", str(batch_id)) == 1
+
+    batch = _batch(batch_id)
+    assert (batch["outcome"], batch["recovery_attempts"]) == ("failed", 1)
+    assert host.calls == RESTORE and _sentinel() == before
+    assert f"(ReadbackFailed: configuration did not hold on {PREV})" in capsys.readouterr().out
+
+
+def test_new_is_never_kept_without_its_configuration_snapshot(root, monkeypatch):
+    """A release checks NEW out only after it published NEW's configuration snapshot, so NEW
+    checked out without one is not kept: nothing shows its configuration held. The restore runs,
+    nothing shows PREV's held either, and the outcome is failed with the pause in place."""
+    batch_id = _stopped_midway()
+    saved = _snapshots(root, f"config/{PREV}")
+    host, before = FakeHost(saved=saved), _sentinel()
+
+    assert _command(monkeypatch, host, "recover", str(batch_id)) == 1
+
+    batch = _batch(batch_id)
+    assert (batch["outcome"], batch["recovery_attempts"]) == ("failed", 1)
+    assert host.calls == RESTORE and _sentinel() == before
