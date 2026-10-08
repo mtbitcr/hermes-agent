@@ -14,12 +14,15 @@ import pytest
 from tests.hermes_cli.test_kanban_delivery import (  # noqa: F401  (board is a fixture)
     IMPLEMENTER, REVIEWER, _become, _git, _park, _rework, _spawned_worker_env, _write_config, board,
 )
+from tests.hermes_cli.test_kanban_delivery_auto_merge import (  # noqa: F401  (armed is a fixture)
+    OTHER, _done, _reviews, armed,
+)
 from tests.hermes_cli.test_kanban_delivery_github import REPO
 from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _events, _tick
 from tests.hermes_cli.test_kanban_delivery_review_cards import (  # noqa: F401  (world is a fixture)
     CHECK, _cards, _project, _published, _raw, _ready, _state, world,
 )
-from tests.hermes_cli.test_kanban_delivery_review_return import CONTINUED, KEPT
+from tests.hermes_cli.test_kanban_delivery_review_return import BUILDER, CONTINUED, KEPT, _branch, _governed, _run
 
 FLAKY = ("tests/tools/test_zombie_process_cleanup.py::TestDelegationCleanup::"
          "test_timed_out_child_keeps_relay_session_until_its_turn_exits")
@@ -205,7 +208,7 @@ def test_a_red_check_return_creates_the_continuation_in_place_of_the_triage_item
     assert [item[key] for key in KEPT] == [source[key] for key in KEPT] and item["risk_tier"] == 1
     assert f"head {head} of pull request 41" in item["body"] and item["body"].endswith(
         f"CI named these failed tests: {UNLISTED}. The job's CI log has the complete list.")
-    assert _git(repo, "rev-parse", f"refs/heads/wt/{item['id']}") == head
+    assert item["branch_name"] == _branch(tid, head) and _git(repo, "rev-parse", f"refs/heads/{_branch(tid, head)}") == head
     assert _raw(db, IDENTITY, tid, item["id"]) == _red_identity(kb, tid, head)
     (root / "profiles" / IMPLEMENTER).mkdir(parents=True)
     _tick(kb)
@@ -259,6 +262,105 @@ def test_a_refused_or_unanswered_rerun_call_returns_the_work_once(red, answer, r
         dict(outcome, code="red_check_returned", reason=reason, tests=[FLAKY], rework=item["id"])]
     assert gh["reruns"] == [RERUN] and item["assignee"] == IMPLEMENTER
     assert f"CI named these failed tests: {FLAKY}." in item["body"]
+
+
+@pytest.mark.parametrize("after", ["failed", "moved", "closed"])
+@pytest.mark.parametrize("answer, reason", [(403, "rerun_refused"), (None, "rerun_unknown")])
+def test_a_refused_or_unanswered_rerun_returns_the_work_on_a_later_pass(red, monkeypatch, answer, reason, after):
+    """Owner rule 4: the rerun call is refused (403) or unanswered, and the pull request read after it then
+    fails, shows another head or shows it closed: that pass records the rerun's outcome and ends. A later pass
+    reads the pull request again and, open at H, records red_check_returned once for H with the continuation,
+    with that reason and the failed test. One rerun call is sent in all."""
+    from hermes_cli import kanban_delivery_github as transport
+
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    gh["rerun"] = answer
+    table, read = transport._exchange, []
+
+    def exchange(method, target, authorization, payload=None):
+        if gh["reruns"] and not read and urlsplit(target).path == f"/repos/{REPO}/pulls/41":
+            read.append(after)  # the one read after the rerun call
+            if after == "failed":
+                raise transport.GitHubTransportError("network_error")
+            return 200, {"number": 41, "state": "closed" if after == "closed" else "open",
+                         "head": {"sha": head if after == "closed" else OTHER}}
+        return table(method, target, authorization, payload)
+
+    monkeypatch.setattr(transport, "_exchange", exchange)
+
+    _tick(kb)
+
+    assert (read, gh["reruns"], _raw(kb.kanban_db_path(), CONTINUED, tid)) == ([after], [RERUN], [])
+    assert [p["statuses"] for p in _waited(kb, tid, "red_check_rerun_outcome")] == [[answer]]
+    assert _waited(kb, tid, "red_check_returned") == []
+    for _ in range(3):
+        _tick(kb)
+    (item,) = _raw(kb.kanban_db_path(), CONTINUED, tid)
+    assert [(p["reason"], p["tests"], p["rework"]) for p in _waited(kb, tid, "red_check_returned")] == [
+        (reason, [FLAKY], item["id"])]
+    assert gh["reruns"] == [RERUN] and f"CI named these failed tests: {FLAKY}." in item["body"]
+    assert (item["status"], item["branch_name"]) == ("ready", _branch(tid, head))
+
+
+@pytest.mark.parametrize("tier", ["routine", "deep"])
+def test_a_governed_sources_red_check_continuation_is_claimable_on_its_builders_route(red, tier):
+    """Owner rule 1: the red check returns the work of a governed source card, of execution tier ``tier`` and
+    its builder raphael-claude-worker: the continuation has the source's route and tier and the builder's lock,
+    so it is ready, and the kernel claims it with H as its recorded base."""
+    kb, root, repo, gh = red
+    db = kb.kanban_db_path()
+    tid, head = _ready(red)
+    model, effort = _governed(kb, tid, tier)
+    gh["tests"] = [UNLISTED]
+
+    _tick(kb)
+
+    (item,) = _raw(db, CONTINUED, tid)
+    assert [p["rework"] for p in _waited(kb, tid, "red_check_returned")] == [item["id"]]
+    assert (item["assignee"], item["status"], item["execution_tier"], item["model_override"],
+            item["reasoning_effort"]) == (BUILDER, "ready", tier, model, effort)
+    assert kb.policy_lock_error(item["model_policy_lock"], BUILDER, "anthropic", model, effort, tier) is None
+    (root / "profiles" / BUILDER).mkdir(parents=True)
+    _tick(kb)
+    (claimed,) = _raw(db, CONTINUED, tid)
+    assert (claimed["id"], claimed["status"], claimed["base_commit"]) == (item["id"], "running", head)
+    assert (claimed["branch_name"], _git(Path(claimed["workspace_path"]), "rev-parse", "HEAD")) == (_branch(tid, head), head)
+
+
+@pytest.mark.parametrize("left", ["ready", "archived", "done"])
+def test_a_review_return_on_the_red_returned_head_reuses_its_one_continuation(red, armed, left):
+    """Owner rule 3: the red check returned H's work through its continuation, which is then left ``left``.
+    CI on H turns green and the review of H requests changes: no second card or branch is made for H. A
+    continuation still open gets the review's findings as one comment, a done or archived one stays as it
+    is, and the review_returned event names that one card."""
+    kb, root, repo, gh = red
+    db = kb.kanban_db_path()
+    tid, head = _ready(red)
+    gh["tests"] = [UNLISTED]
+    _tick(kb)
+    (item,) = _raw(db, CONTINUED, tid)
+    _raw(db, "UPDATE tasks SET status = ? WHERE id = ?", left, item["id"])
+    gh["check"] = ("completed", "success")
+    _tick(kb)
+    cards = {card["responsibility"]: card["id"] for card in _cards(kb)}
+    _run(db, cards["R12"], 100, "VALIDATE_QUERY_FROM_LATEST_REVIEW")
+    _done(db)
+    _reviews(gh, ("APPROVED", head, cards["R15"]), ("CHANGES_REQUESTED", head, cards["R12"]))
+
+    _tick(kb)
+    _tick(kb)
+
+    assert [card["id"] for card in _raw(db, CONTINUED, tid)] == [item["id"]]
+    assert [p["rework"] for p in _waited(kb, tid, "review_returned")] == [item["id"]]
+    assert _raw(db, "SELECT status, body FROM tasks WHERE id = ?", item["id"]) == [
+        {"status": left, "body": item["body"]}]
+    assert _git(repo, "branch", "--list", "wt/*", "delivery-return/*") == _branch(tid, head)
+    comments = _raw(db, "SELECT author, body FROM task_comments WHERE task_id = ?", item["id"])
+    assert len(comments) == (left == "ready")
+    for comment in comments:
+        assert f"head {head} of pull request 41" in comment["body"]
+        assert f"Review card {cards['R12']}:\nVALIDATE_QUERY_FROM_LATEST_REVIEW" in comment["body"]
 
 
 def test_a_red_check_makes_its_own_continuation_beside_a_done_review_follow_up(red):
@@ -356,7 +458,8 @@ def test_the_work_returns_on_the_ticked_board_under_the_worker_environment(red, 
     boards = (other_db, own_db, root / "kanban.db")
     assert [(_raw(db, returned)[0]["n"], _raw(db, rework)[0]["n"]) for db in boards] == [(1, 1), (0, 0), (0, 0)]
     (item,) = _raw(other_db, CONTINUED, tid)
-    assert (item["assignee"], item["project_id"]) == (IMPLEMENTER, "delivery-project")
+    assert (item["assignee"], item["project_id"], item["branch_name"]) == (IMPLEMENTER, "delivery-project", _branch(tid, head))
+    assert _git(repo, "rev-parse", f"refs/heads/{_branch(tid, head)}") == head
     assert f"CI named these failed tests: {UNLISTED}." in item["body"]
     assert _raw(other_db, IDENTITY, tid, item["id"]) == _red_identity(kb, tid, head)
     assert gh["reruns"] == [] and not (profile_home / "kanban.db").exists()

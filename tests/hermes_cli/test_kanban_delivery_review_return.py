@@ -27,6 +27,29 @@ from tests.hermes_cli.test_kanban_delivery_review_cards import (  # noqa: F401  
 CONTINUED = ("SELECT * FROM tasks WHERE id IN (SELECT child_id FROM task_links WHERE parent_id = ?) "
              "AND idempotency_key IS NULL")
 KEPT = ("owned_paths", "risk_tier", "execution_tier", "requires_review")
+BUILDER = "raphael-claude-worker"
+
+
+def _branch(tid, head):
+    """Owner rule 2: the continuation's branch, named from the source card id and H only."""
+    return f"delivery-return/{tid}-{head[:12]}"
+
+
+def _governed(kb, tid, tier):
+    """The source card sealed on its builder's admitted route for execution tier ``tier`` at its risk tier's
+    effort, its accepted handover naming raphael-claude-worker as its builder. Returns the model and effort."""
+    from hermes_cli.kanban_risk_tier import pinned_reasoning_effort
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    db = kb.kanban_db_path()
+    route = model_policy.task_assignment_for(BUILDER, "anthropic", tier)
+    effort = pinned_reasoning_effort(_raw(db, "SELECT risk_tier FROM tasks WHERE id = ?", tid)[0]["risk_tier"], None)
+    _raw(db, "UPDATE tasks SET assignee = ?, execution_tier = ?, provider_override = ?, model_override = ?, "
+         "reasoning_effort = ?, model_policy_lock = ? WHERE id = ?", BUILDER, tier, route.provider, route.model,
+         effort, kb.mint_policy_lock(BUILDER, route.provider, route.model, effort, tier), tid)
+    _raw(db, "UPDATE task_events SET payload = json_set(payload, '$.implementer', ?) "
+         "WHERE task_id = ? AND kind = 'review_requested'", BUILDER, tid)
+    return route.model, effort
 
 
 def _run(db, card, started, *findings):
@@ -42,7 +65,7 @@ def _returned(kb, tid):
 
 
 def _branches(repo):
-    return _git(repo, "branch", "--list", "wt/*")
+    return _git(repo, "branch", "--list", "wt/*", "delivery-return/*")
 
 
 def _changes_requested(armed):
@@ -87,7 +110,7 @@ def test_a_returned_review_creates_one_claimable_continuation_with_its_findings_
     assert f"Review card {cards['R12']}:\nsrc/impl/feature.py: validate the input\n" in card["body"]
     assert '"problem": "no check"' in card["body"] and "an older finding" not in card["body"]
     assert f"Review card {cards['R15']}:" not in card["body"] and "a correctness note" not in card["body"]
-    assert _git(repo, "rev-parse", f"refs/heads/wt/{card['id']}") == head
+    assert card["branch_name"] == _branch(tid, head) and _git(repo, "rev-parse", f"refs/heads/{_branch(tid, head)}") == head
     assert gh["writes"] == [] and {method for method, _ in gh["calls"]} == {"GET"}
     assert _state(kb, head) == "review_cards_created"
     events = _events(kb, tid)
@@ -170,8 +193,10 @@ def test_nothing_returns_while_a_card_is_open_or_after_the_pull_request_leaves_h
 
 @pytest.mark.parametrize("fails", ["branch", "record"])
 def test_no_partial_state_survives_a_failure_between_the_reservation_and_the_action(armed, monkeypatch, fails):
-    """Safety rule 3: git refuses the card's branch, or the return's record fails after the card and its branch
-    were made: the pass leaves no record, no card and no branch. The next pass returns the work once."""
+    """Safety rule 3 under owner rule 2: git refuses the card's branch, so nothing is recorded or made; or the
+    return's record fails after the branch was made at H before the write transaction and the card in it: the
+    pass leaves no record and no card, only that branch at H, which no pass deletes. The next pass reuses it
+    and returns the work once."""
     from hermes_cli import kanban_delivery
 
     kb, root, repo, gh = armed
@@ -192,14 +217,65 @@ def test_no_partial_state_survives_a_failure_between_the_reservation_and_the_act
 
     _tick(kb)
 
-    assert (_raw(db, CONTINUED, tid), _returned(kb, tid), _branches(repo)) == ([], [], "")
+    left = "" if fails == "branch" else _branch(tid, head)
+    assert (_raw(db, CONTINUED, tid), _returned(kb, tid), _branches(repo)) == ([], [], left)
     assert len(seen) == (fails == "record") and all(seen)  # the branch existed when the record failed
+    assert not left or _git(repo, "rev-parse", f"refs/heads/{left}") == head
     monkeypatch.setattr(kanban_delivery, "_run_git", run_git)
     monkeypatch.setattr(kanban_delivery, "_waiting", waiting)
     _tick(kb)
     _tick(kb)
     (card,) = _raw(db, CONTINUED, tid)
-    assert len(_returned(kb, tid)) == 1 and _git(repo, "rev-parse", f"refs/heads/wt/{card['id']}") == head
+    assert (len(_returned(kb, tid)), card["branch_name"], _branches(repo)) == (1, _branch(tid, head), _branch(tid, head))
+    assert _git(repo, "rev-parse", f"refs/heads/{_branch(tid, head)}") == head
+
+
+@pytest.mark.parametrize("tier", ["routine", "deep"])
+def test_a_governed_sources_continuation_is_claimable_on_its_builders_route(armed, tier):
+    """Owner rule 1: the source card is governed, of execution tier ``tier``, its builder raphael-claude-worker.
+    The review return's continuation has the source's route and tier and the lock minted for the builder, so it
+    is ready and not parked, and the kernel claims it with H as its recorded base, on its branch at H."""
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head, cards = _changes_requested(armed)
+    model, effort = _governed(kb, tid, tier)
+
+    _tick(kb)
+
+    (card,) = _raw(db, CONTINUED, tid)
+    assert [payload["rework"] for payload in _returned(kb, tid)] == [card["id"]]
+    assert (card["assignee"], card["status"], card["execution_tier"]) == (BUILDER, "ready", tier)
+    assert (card["provider_override"], card["model_override"], card["reasoning_effort"]) == ("anthropic", model, effort)
+    assert card["model_policy_lock"] and kb.policy_lock_error(
+        card["model_policy_lock"], BUILDER, "anthropic", model, effort, tier) is None
+    (root / "profiles" / BUILDER).mkdir(parents=True)
+    _tick(kb)
+    (claimed,) = _raw(db, CONTINUED, tid)
+    assert (claimed["id"], claimed["status"], claimed["base_commit"]) == (card["id"], "running", head)
+    assert (claimed["branch_name"], _git(Path(claimed["workspace_path"]), "rev-parse", "HEAD")) == (_branch(tid, head), head)
+
+
+@pytest.mark.parametrize("found", ["at_h", "elsewhere"])
+def test_the_branch_named_from_the_source_and_h_is_reused_at_h_and_refuses_elsewhere(armed, found):
+    """Owner rule 2: the continuation's branch is named from the source card id and H only. A branch of that
+    name already at H is reused as the card's branch; one at another commit refuses the return, so nothing is
+    recorded or made on any pass, and that ref stays as it was. No pass deletes a branch."""
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head, cards = _changes_requested(armed)
+    main = _git(repo, "rev-parse", "main")
+    _git(repo, "branch", _branch(tid, head), head if found == "at_h" else main)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert _git(repo, "rev-parse", f"refs/heads/{_branch(tid, head)}") == (head if found == "at_h" else main)
+    assert (_branches(repo), gh["writes"]) == (_branch(tid, head), [])
+    if found == "elsewhere":
+        assert (_raw(db, CONTINUED, tid), _returned(kb, tid)) == ([], [])
+        return
+    (card,) = _raw(db, CONTINUED, tid)
+    assert card["branch_name"] == _branch(tid, head) and [p["rework"] for p in _returned(kb, tid)] == [card["id"]]
 
 
 def test_the_continuations_own_delivery_closes_the_earlier_pull_request(armed):

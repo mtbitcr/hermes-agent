@@ -999,20 +999,26 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
     work: red_check_returned and one continuation card for the builder, once for H, also when a rerun call was
     refused (rerun_refused) or got no answer (rerun_unknown). Nothing is recorded or sent unless the pull
     request, read after H's run, jobs and annotations, is still open at H. Until GitHub shows a newer
-    attempt than the accepted rerun, the pass waits. Returns the outcome recorded, if any."""
-    from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
+    attempt than the rerun whose recorded outcome shows every call accepted, the pass waits; after a
+    refused or unanswered one, the pass reads the pull request again (owner rule 4). Returns the outcome
+    recorded, if any."""
+    from hermes_cli.kanban_delivery_github import GitHubTransport
 
     source, head = row["source_task_id"], row["pull_request_head"]
     with kb.connect_closing(db_path=db_path) as conn:
         reruns, returned = _recorded(conn, source, "red_check_rerun"), _recorded(conn, source, "red_check_returned")
+        answered = [record for record in _recorded(conn, source, "red_check_rerun_outcome") if record["head"] == head]
     if any(record["head"] == head for record in returned):
         return None  # H's work went back to its builder already
+    if answered and _rerun_reason(answered[0]["statuses"]):
+        tests = next(record["tests"] for record in reruns if record["head"] == head)
+        return _rerun_refused(db_path, row, read, github, repository, answered[0], tests)
     jobs = _failed_jobs(github, repository, head, red)
     if jobs is None:
         return None
     attempt = max((job["run_attempt"] for job in jobs if type(job.get("run_attempt")) is int), default=0)
-    if any(record["head"] == head and attempt <= record["attempt"] for record in reruns):
-        return None  # H's rerun was sent and GitHub has not started it yet
+    if answered and any(record["head"] == head and attempt <= record["attempt"] for record in reruns):
+        return None  # H's rerun was accepted and GitHub has not started it yet
     decision = decide_rerun(policy, repository, head, jobs, {"reruns": [record["head"] for record in reruns]})
     if decision.allowed and decision.code != "rerun":
         return None
@@ -1021,7 +1027,8 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
     code = "red_check_rerun" if decision.allowed else "red_check_returned"
     tests = [test for job in jobs for test in job.get("failed_tests") or () if isinstance(test, str)]
     ids = sorted({match["job_id"] for match in decision.matches})
-    with _branches_undone() as made, kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+    branch = None if decision.allowed else _return_branch(db_path, row)  # owner rule 2: the branch comes first
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or not _unchanged(conn, row, read) or any(
                 record["head"] == head for record in _recorded(conn, source, code)):
             return None
@@ -1029,24 +1036,43 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
             _waiting(conn, row, code, jobs=ids, tests=tests, attempt=attempt)
         else:
             _waiting(conn, row, code, reason=decision.code, tests=tests,
-                     rework=_continuation(conn, db_path, row, _red_body(row, decision, tests), made))
+                     rework=_continuation(conn, db_path, row, _red_body(row, decision, tests), branch))
     if not decision.allowed:
         return code
     rerun = GitHubTransport("rerun_flaky", repository)  # sent once: only by the pass that recorded the rerun
     statuses = [_sent(rerun, "request", "POST", f"/repos/{repository}/actions/jobs/{job}/rerun")["status"]
                 for job in ids]
-    reason = "rerun_refused" if set(statuses) - {201, None} else "rerun_unknown" if None in statuses else None
-    returns = False
-    with contextlib.suppress(GitHubTransportError, PublishRefused):  # safety rule 1: H read again before the card
-        returns = bool(reason) and _open_at_head(github, repository, row)
-    # owner rule 2: once for H, in this pass
-    with _branches_undone() as made, kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         _waiting(conn, row, "red_check_rerun_outcome", jobs=ids, statuses=statuses)
-        if returns:
-            refusal = Decision(False, reason, f"the rerun calls of jobs {ids} were answered {statuses} (None: no answer)")
-            _waiting(conn, row, "red_check_returned", reason=reason, tests=tests,
-                     rework=_continuation(conn, db_path, row, _red_body(row, refusal, tests), made))
-    return "red_check_returned" if returns else code
+        read = _source_read(conn, source)  # the record just written moved the source card's revision
+    if not _rerun_reason(statuses):
+        return code
+    return _rerun_refused(db_path, row, read, github, repository, {"jobs": ids, "statuses": statuses}, tests) or code
+
+
+def _rerun_reason(statuses: list) -> Optional[str]:
+    """Why a rerun's calls did not all start a newer attempt: a call refused, or one with no answer."""
+    return "rerun_refused" if set(statuses) - {201, None} else "rerun_unknown" if None in statuses else None
+
+
+def _rerun_refused(db_path: Path, row: dict, read: tuple, github, repository: str, sent: dict, tests: list):
+    """Owner rule 4: H's rerun outcome ``sent`` shows a refused or unanswered call, so the pull request is read
+    again and, open at H, red_check_returned is recorded once for H with H's continuation. A failed read
+    raises and only ends the pass; a later pass reads it again. Returns the outcome recorded, if any."""
+    source, head = row["source_task_id"], row["pull_request_head"]
+    if not _open_at_head(github, repository, row):
+        return None  # safety rule 1: the pull request left H or closed
+    branch = _return_branch(db_path, row)
+    reason = _rerun_reason(sent["statuses"])
+    refusal = Decision(False, reason, f"the rerun calls of jobs {sent['jobs']} were answered {sent['statuses']} "
+                                      "(None: no answer)")
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if not delivery_settings() or not _unchanged(conn, row, read) or any(
+                record["head"] == head for record in _recorded(conn, source, "red_check_returned")):
+            return None
+        _waiting(conn, row, "red_check_returned", reason=reason, tests=tests,
+                 rework=_continuation(conn, db_path, row, _red_body(row, refusal, tests), branch))
+    return "red_check_returned"
 
 
 def _red_body(row: dict, decision, tests: list) -> str:
@@ -1057,48 +1083,72 @@ def _red_body(row: dict, decision, tests: list) -> str:
                                    detail=decision.detail, tests=named)
 
 
-@contextlib.contextmanager
-def _branches_undone():
-    """The branches a pass makes in its write transaction, deleted again when the pass fails before that
-    transaction commits (safety rule 3: no partial state survives a failure between reservation and action)."""
-    made = []
-    try:
-        yield made
-    except BaseException:
-        for root, branch in made:
-            _run_git(root, "branch", "-D", branch)
-        raise
-
-
-def _continuation(conn: sqlite3.Connection, db_path: Path, row: dict, body: str, made: list) -> str:
-    """H's one continuation card, for a review or a red check return: a task_links child of the source for
-    its builder, with its owned paths, tiers and review requirement, titled through owner_title and recorded
-    under the identity of the source, H and "continuation", so it is reused. Its branch is made at H in the
-    source card's repository before the card commits, so H is its recorded base; ``made`` keeps it for undoing."""
-    from hermes_cli.owner_workspace import owner_title
-
-    source, head = row["source_task_id"], row["pull_request_head"]
+def _continued(conn: sqlite3.Connection, source: str, head: str) -> tuple:
+    """Owner rule 3: the identity of the source, H and "continuation", and the card the source card's own
+    review_followup_recorded events name for it with that card's status, done or archived included; the
+    card and status are None while none is recorded."""
     identity = kb._review_followup_identity_key(reviewed_task_id=source, candidate=f"{head} continuation")
-    item = kb._recorded_review_followup(conn, source, identity)
-    if item is not None:
-        return item
-    task = kb.get_task(conn, source)
-    implementer = kb._latest_review_provenance(conn, source)[0]
-    workdir = _repository(task.workspace_path)
+    for (payload,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? "
+                                   "AND kind = 'review_followup_recorded' ORDER BY id DESC", (source,)):
+        recorded = json.loads(payload)
+        if recorded.get("identity") == identity and recorded.get("followup_task_id"):
+            item = recorded["followup_task_id"]
+            status = conn.execute("SELECT status FROM tasks WHERE id = ?", (item,)).fetchone()
+            return identity, item, status[0] if status else None
+    return identity, None, None
+
+
+def _return_branch(db_path: Path, row: dict) -> Optional[tuple]:
+    """Owner rule 2: the source card's repository and H's continuation branch, named from the source card
+    and H only, made at H before the write transaction or reused when it points at H already. When the name
+    points at another commit, the pass is refused and records nothing. No branch is ever deleted: a pass
+    stopped before its commit leaves only this branch at H, which the next pass reuses. None when H's
+    continuation is recorded already, as that card has its branch."""
+    source, head = row["source_task_id"], row["pull_request_head"]
+    branch = f"delivery-return/{source}-{head[:12]}"
+    with kb.connect_closing(db_path=db_path) as conn:
+        if _continued(conn, source, head)[1] is not None:
+            return None
+        workdir = _repository(kb.get_task(conn, source).workspace_path)
     root = workdir.parent.parent if workdir is not None and workdir.parent.name == ".worktrees" else workdir
     if root is None:
         raise PublishRefused("no_repository", f"no repository holds the source card {source}")
+    _run_git(root, "branch", branch, head)  # git refuses a name that exists; the read below decides
+    found = _run_git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    if found is None or found.returncode != 0 or _sha(found.stdout.decode()) != head:
+        raise PublishRefused("branch_not_at_head", f"{branch} is not at {head}")
+    return root, branch
+
+
+def _continuation(conn: sqlite3.Connection, db_path: Path, row: dict, body: str, branch: Optional[tuple]) -> str:
+    """H's one continuation card, for a review or a red check return: a task_links child of the source for
+    its builder, with its owned paths, tiers, route and review requirement, titled through owner_title and
+    recorded under the identity of the source, H and "continuation". Owner rule 3: a recorded one is used for
+    its lifetime, and one not done or archived gets ``body`` as one comment. A new card is made in ``branch``,
+    the repository and branch :func:`_return_branch` made at H, so H is its recorded base."""
+    from hermes_cli.owner_workspace import owner_title
+
+    source = row["source_task_id"]
+    identity, item, status = _continued(conn, source, row["pull_request_head"])
+    if item is not None:
+        if status not in ("done", "archived", None):
+            kb.add_comment(conn, item, _REVIEW_CREATOR, body)
+        return item
+    task = kb.get_task(conn, source)
+    implementer = kb._latest_review_provenance(conn, source)[0]
+    root, name = branch
+    lock = None
+    # Owner rule 1: the source card's own route and tier, locked for the builder; unadmitted, the card parks.
+    with contextlib.suppress(ValueError):
+        lock = kb.mint_policy_lock(implementer, task.provider_override, task.model_override,
+                                   task.reasoning_effort, task.execution_tier)
     item = kb.create_task(
         conn, title=owner_title(task.title), body=body, assignee=implementer, parents=[source], tenant=task.tenant,
-        workspace_kind="worktree", workspace_path=str(root), owned_paths=task.owned_paths,
+        workspace_kind="worktree", workspace_path=str(root), branch_name=name, owned_paths=task.owned_paths,
         risk_tier=task.risk_tier, execution_tier=task.execution_tier, requires_review=task.requires_review,
-        board=_board_slug(db_path))
+        provider_override=task.provider_override, model_override=task.model_override,
+        reasoning_effort=task.reasoning_effort, model_policy_lock=lock, board=_board_slug(db_path))
     conn.execute("UPDATE tasks SET project_id = ? WHERE id = ?", (task.project_id, item))
-    branch = kb.get_task(conn, item).branch_name or f"wt/{item}"
-    made.append((root, branch))
-    created = _run_git(root, "branch", branch, head)
-    if created is None or created.returncode != 0:
-        raise PublishRefused("branch_not_made", f"git did not make {branch} at {head}")
     kb.authorize_executable_transition(conn, item)  # its route, or the card parked with why
     kb._append_event(conn, source, "review_followup_recorded",
                      {"followup_task_id": item, "implementer": implementer, "identity": identity})
@@ -1292,13 +1342,14 @@ def _return_review(db_path: Path, row: dict, evidence: tuple, github, returned: 
             return None  # safety rule 1: the pull request left H or closed while its reviews were read
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None
-    with _branches_undone() as made, kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+    branch = _return_branch(db_path, row)  # owner rule 2: the branch comes first
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or _arm_evidence(conn, row) != evidence or any(
                 record["head"] == head for record in _recorded(conn, source, "review_returned")):
             return None  # the evidence changed while GitHub was read, or H returned already: nothing is made
         body = _REVIEW_RETURN_BODY.format(source=source, head=head, number=row["pull_request_number"],
                                           cards=", ".join(returned), findings=_findings(conn, returned))
-        _waiting(conn, row, "review_returned", cards=returned, rework=_continuation(conn, db_path, row, body, made))
+        _waiting(conn, row, "review_returned", cards=returned, rework=_continuation(conn, db_path, row, body, branch))
     return "review_returned"
 
 
