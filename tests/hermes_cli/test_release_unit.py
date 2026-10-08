@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -204,6 +205,17 @@ def _began() -> list[int]:
         return [row[0] for row in conn.execute(
             "SELECT batch_id FROM release_events WHERE kind = 'release_began' ORDER BY id"
         )]
+
+
+def _read_record(path: Path) -> tuple[list[tuple[int, str]], list[int]]:
+    """Each batch with its state, and the batches whose release began, from the release record
+    file ``path``: read by sqlite3 itself, read-only, never through the code under test."""
+    with contextlib.closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as conn:
+        batches = conn.execute("SELECT id, state FROM release_batches ORDER BY id").fetchall()
+        began = conn.execute(
+            "SELECT batch_id FROM release_events WHERE kind = 'release_began' ORDER BY id"
+        ).fetchall()
+    return batches, [row[0] for row in began]
 
 
 def _unit_environment(root: Path, **board: str) -> dict[str, str]:
@@ -462,3 +474,60 @@ def test_no_board_variable_reaches_the_release_run(root, manager, tmp_path, monk
         "--no-optional-locks rev-parse --verify HEAD", f"fetch --no-tags origin {NEW}",
     ]
     assert [names for _call, names in git] == [[], []]
+
+
+@pytest.mark.parametrize(
+    ("root_state", "named_state", "states", "worker"),
+    [
+        ("accepted", "open", ["active"], False),
+        ("open", "accepted", ["active"], False),
+        ("accepted", "accepted", ["failed"], False),
+        ("accepted", "accepted", ["failed"], True),
+    ],
+    ids=["root-accepted", "root-open", "read-back-failed", "read-back-failed-from-a-worker"],
+)
+def test_start_judges_and_reports_the_root_batch(
+    root, manager, tmp_path, monkeypatch, capsys, root_state, named_state, states, worker
+):
+    """Owner rule 5: HERMES_KANBAN_HOME names another kanban root, with its own release record, in
+    the caller and in the user manager. The start judges and reports the batch of the root's
+    record, which the run in the unit releases, never the batch of the record the variable names."""
+    named = tmp_path / "kanban-home"
+    batch_id = _batch_in(root_state)  # batch 1 in the root's record, then in the named one
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(named))
+    assert _batch_in(named_state) == batch_id
+    if worker:  # as the dispatcher starts a kanban worker: pinned to its board, at a profile home
+        profile = root / "profiles" / "coder"
+        profile.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        for name, value in WORKER.items():
+            monkeypatch.setenv(name, value)
+    manager.answer(
+        states=states, environment=_unit_environment(root, HERMES_KANBAN_HOME=str(named))
+    )
+    record = root / "kanban" / ledger.STORE_NAME
+    assert _read_record(record) == ([(batch_id, root_state)], [])
+    before, named_before = _files(root.parent), _files(named)
+
+    code, _clock = _start(monkeypatch, batch_id)
+
+    out = capsys.readouterr().out
+    if root_state == "open":  # the root batch cannot start: refused, nothing written, no launch
+        assert out.startswith(f"Refused: batch {batch_id} is open, not accepted, releasing or")
+        assert (code, manager.launches()) == (1, [])
+        assert _files(root.parent) == before
+        assert _read_record(record) == ([(batch_id, "open")], [])
+    else:  # the unit's run began the root batch and was refused: folded, its change in batch 2
+        assert "Refused" not in out
+        assert "left as it was" not in out
+        assert len(manager.launches()) == 1
+        assert _read_record(record) == ([(batch_id, "folded"), (batch_id + 1, "open")], [batch_id])
+        if states == ["active"]:
+            assert code == 0 and f"Started the release of batch {batch_id}" in out
+        else:
+            assert code == 1 and (
+                f"Batch {batch_id} was accepted before the start; the release record now shows it"
+                " folded." in out
+            )
+    assert _files(named) == named_before  # the named record: not a byte changed
+    assert [name for name in os.environ if name.startswith("HERMES_KANBAN")] == []

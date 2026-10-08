@@ -437,6 +437,11 @@ def start(batch_id: int) -> int:
     S-F (card 6). The start writes nothing to the release state: the run in the unit begins the
     release.
 
+    First, before any other step, remove every HERMES_KANBAN variable from the start's
+    environment, as the run does, so its reads of the release record, before the launch and after
+    a failed launch or readback, read the record of the root home the launch runs the unit from:
+    the record the run in the unit reads.
+
     Every read comes first: systemd-run, the batches in the release record, and the release units
     the user manager has loaded. A missing systemd-run, a batch that is not accepted, releasing or
     failed, an accepted batch behind an older accepted one, which a release run releases first,
@@ -449,6 +454,8 @@ def start(batch_id: int) -> int:
 
     Returns 0 once the unit answers active, 1 otherwise.
     """
+    for name in [name for name in os.environ if name.startswith("HERMES_KANBAN")]:
+        del os.environ[name]
     systemd_run = release_unit.find_systemd_run()
     if systemd_run is None:  # fails closed, as update_abort_recovery does
         return _refuse("systemd-run is missing, so the release cannot run as its own user service")
