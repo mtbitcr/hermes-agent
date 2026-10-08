@@ -204,12 +204,13 @@ def test_the_allowlist_holds_exactly_the_three_new_entries_and_refuses_every_oth
     assert "mergeMethod: MERGE" in document and "expectedHeadOid: $expectedHeadOid" in document
     assert {(e.method, e.template) for e in transport.REST_ALLOWLIST + transport.GRAPHQL_ALLOWLIST} == {
         ("GET", "/repos/{repo}/pulls"), ("POST", "/repos/{repo}/pulls"), ("GET", "/repos/{repo}/pulls/{number}"),
-        ("PUT", "/repos/{repo}/pulls/{number}/merge"), ("POST", "/repos/{repo}/pulls/{number}/reviews"),
         ("GET", "/repos/{repo}/git/ref/heads/{branch}"), ("GET", "/repos/{repo}/commits/{sha}/check-runs"),
         ("GET", "/repos/{repo}/actions/runs"), ("GET", "/repos/{repo}/actions/runs/{id}/jobs"),
         ("GET", "/repos/{repo}/actions/jobs/{id}/logs"), ("POST", "/repos/{repo}/actions/jobs/{id}/rerun"),
-        ("POST", "/app/installations/{installation}/access_tokens"),  # the twelve before this card, and its three:
-        ("GET", "/repos/{repo}/pulls/{number}/reviews"), ("PATCH", "/repos/{repo}/pulls/{number}"), ("POST", "/graphql")}
+        ("POST", "/app/installations/{installation}/access_tokens"),  # the twelve before card 5 less the two
+        # unused ones the owner removed on 2026-10-04, card 5's three, and the red check's annotations read:
+        ("GET", "/repos/{repo}/pulls/{number}/reviews"), ("PATCH", "/repos/{repo}/pulls/{number}"), ("POST", "/graphql"),
+        ("GET", "/repos/{repo}/check-runs/{id}/annotations")}
     refused = [
         ("PATCH", f"/repos/{REPO}/pulls/41", {"state": "closed", "title": "replaced"}),
         ("PATCH", f"/repos/{REPO}/pulls/41", {"state": "open"}),
@@ -234,6 +235,8 @@ def test_the_allowlist_holds_exactly_the_three_new_entries_and_refuses_every_oth
         ("POST", "/graphql", {"query": "mutation { mergePullRequest(input: {pullRequestId: \"PR_kwDOAbc\"}) { clientMutationId } }"}),
         ("POST", f"/repos/{REPO}/graphql", arm),
         ("PUT", f"/repos/{REPO}/branches/main/protection", {}),
+        ("PUT", f"/repos/{REPO}/pulls/41/merge", {"sha": HEAD}),  # removed: nothing merges through REST
+        ("POST", f"/repos/{REPO}/pulls/41/reviews", {"event": "APPROVE"}),  # removed: nothing posts a review
     ]
     for method, path, body in refused:
         with pytest.raises(transport.GitHubTransportError):

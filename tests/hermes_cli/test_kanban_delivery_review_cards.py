@@ -361,7 +361,8 @@ def test_the_required_check_must_appear_exactly_once_in_the_decision_answer(worl
 def test_one_pass_decides_then_reads_the_pull_request_then_writes(world, conclusion):
     """The order of one pass, after its first pull request read: the one decision request (H's check runs,
     latest, 100 per page), then the final pull request read, then the write transaction: the cards or the
-    waiting record are stored after every read, and nothing else is read from GitHub."""
+    waiting record are stored after every read. After a red waiting record the pass reads H's workflow runs
+    once; this table answers 404, so it stops there. Nothing else is read from GitHub."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
     gh["check"] = ("completed", conclusion)
@@ -371,17 +372,19 @@ def test_one_pass_decides_then_reads_the_pull_request_then_writes(world, conclus
     _tick(kb)
 
     pull = f"/repos/{REPO}/pulls/41"
+    red = [] if conclusion == "success" else [(f"/repos/{REPO}/actions/runs", {"head_sha": [head], "per_page": ["100"]})]
     assert gh["queries"] == [
         (pull, {}), (f"/repos/{REPO}/commits/{head}/check-runs", {"filter": ["latest"], "per_page": ["100"]}),
-        (pull, {})]
-    assert (seen, _raw(kb.kanban_db_path(), stored)[0]["n"]) == ([0] * 3, 1)
+        (pull, {})] + red
+    assert (seen, _raw(kb.kanban_db_path(), stored)[0]["n"]) == ([0] * 3 + [1] * len(red), 1)
 
 
 @pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out"])
 def test_a_red_check_waits_once_per_head_until_a_green_rerun(world, conclusion):
     """A required check completed on H with any conclusion other than success leaves the delivery waiting:
     red_check_waiting with that check run's id and conclusion from the decision request, once for H, with no
-    POST, no jobs request and the source card unchanged. Later passes read CI again, so a green rerun on the
+    POST, no jobs request and the source card unchanged. Each pass reads H's workflow runs once; this table
+    answers 404, so no rerun and no return is decided. Later passes read CI again, so a green rerun on the
     code host gets H its review cards."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
@@ -396,7 +399,7 @@ def test_a_red_check_waits_once_per_head_until_a_green_rerun(world, conclusion):
         "check_runs": [{"id": 900, "conclusion": conclusion}]})]
     assert (_cards(kb), _state(kb, head), _source(kb, tid)) == ([], "open", source)
     assert [call for call in gh["calls"] if call[0] != "GET"] == [] and set(gh["steps"]) == {"read_checks"}
-    assert [path for _, path in gh["calls"] if "/actions/" in path] == []  # no workflow-runs or jobs request
+    assert [path for _, path in gh["calls"] if "/actions/" in path] == [f"/repos/{REPO}/actions/runs"] * 3  # no jobs
     gh["check"] = ("completed", "success")
     _tick(kb)
     assert len(_cards(kb)) == 2 and _state(kb, head) == "review_cards_created"
