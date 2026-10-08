@@ -626,7 +626,14 @@ async def test_a_put_off_while_another_accept_lands_first_answers_from_the_final
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "state", ["side-files", "folder", "pipe", "broken-link", "link-to-a-valid-record"]
+    "state",
+    [
+        "side-files",
+        "folder",
+        pytest.param("pipe", marks=pytest.mark.linux_only),
+        "broken-link",
+        "link-to-a-valid-record",
+    ],
 )
 async def test_a_record_that_is_not_a_regular_database_file_refuses_in_plain_words(
     root, units, state
@@ -643,6 +650,7 @@ async def test_a_record_that_is_not_a_regular_database_file_refuses_in_plain_wor
     elif state == "folder":
         path.mkdir()
     elif state == "pipe":
+        assert sys.platform.startswith("linux")  # linux_only gates this; a type checker reads no marker
         os.mkfifo(path)
     elif state == "broken-link":
         path.symlink_to(path.with_name("moved.db"))
@@ -665,17 +673,17 @@ async def test_a_record_that_is_not_a_regular_database_file_refuses_in_plain_wor
 async def test_a_read_leaves_the_database_file_itself_byte_for_byte_unchanged(root):
     _merge("a", "Show the release decision")
     path = root / "kanban" / "release_ledger.db"
-    # The record in WAL mode, as a writer that stopped left it: the last change sits in the -wal alone.
+    # The record in WAL mode while a writer stays open: the last change sits in the -wal alone.
     with contextlib.closing(sqlite3.connect(path)) as writer:
-        writer.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
         writer.execute("PRAGMA journal_mode=WAL")
         writer.execute("SELECT COUNT(*) FROM release_batches").fetchall()  # it now holds the -wal open
         _merge("b", "Keep the owner page fast")
-    assert Path(f"{path}-wal").stat().st_size > 0
-    before = path.read_bytes()
-    async with _client() as client:
-        waiting = (await (await client.get(VIEW)).json())["waiting"]
+        assert Path(f"{path}-wal").stat().st_size > 0
+        before = path.read_bytes()
+        async with _client() as client:
+            waiting = (await (await client.get(VIEW)).json())["waiting"]
+        # The -wal and -shm files may change on a read; the database file itself never does.
+        # Compared while the writer is open: closing the last connection checkpoints the -wal.
+        assert path.read_bytes() == before
 
     assert waiting["count"] == 2  # the read saw the change in the -wal
-    # The -wal and -shm files may change on a read; the database file itself never does.
-    assert path.read_bytes() == before
