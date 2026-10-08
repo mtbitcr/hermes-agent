@@ -658,7 +658,7 @@ def test_release_is_registered_with_its_subcommands(monkeypatch):
 
     release = subparsers.choices["release"]
     [nested] = [a for a in release._actions if isinstance(a, argparse._SubParsersAction)]
-    assert set(nested.choices) == {"prepare", "status", "run", "start"}
+    assert set(nested.choices) == {"prepare", "status", "run", "start", "recover"}
     # A built-in name, so `hermes release` skips plugin discovery and `hermes --help` lists it.
     assert "release" in main._BUILTIN_SUBCOMMANDS
     assert "Check a release before it runs" in parser.format_help()

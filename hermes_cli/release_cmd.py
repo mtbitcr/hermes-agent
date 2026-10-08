@@ -9,7 +9,9 @@ outcome. ``run`` releases the accepted batch after the same preflight, under the
 the calling process: SIGINT or SIGTERM refuses a release until its runner starts; after that, only
 a hard kill ends it, and its recovery belongs to card 7. ``start BATCH`` runs ``release run BATCH``
 as the release unit (S-F), the transient user service of release_unit, so the release keeps
-running when the gateway stops; the start writes nothing to the release state either.
+running when the gateway stops; the start writes nothing to the release state either. ``recover
+BATCH`` brings the platform back from a release that stopped midway, as ``run BATCH`` does for a
+batch the record shows releasing or failed.
 
 Design rule (K6), as in the runner: everything ``run`` needs is imported when this module loads,
 so nothing is imported once the units stop and the checkout moves under the running process.
@@ -30,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from agent import estop
-from hermes_cli import release_guards, release_ledger, release_unit
+from hermes_cli import release_guards, release_ledger, release_runner, release_unit
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     _ENV_REF_RE,
@@ -61,6 +63,10 @@ _RESOLVED = {**_REQUIRED, "snapshot_dir": "the snapshot directory"}
 _WAITING = {"open": "waiting for the owner's decision", "deferred": "put off by the owner"}
 # The batches start runs: an accepted one, or one whose release began and has not ended (card 7).
 _STARTABLE = ("accepted", "releasing", "failed")
+# The batches whose release stopped midway, which recovery takes, at most this many times.
+_UNFINISHED = ("releasing", "failed")
+_RECOVERY_ATTEMPTS = 3
+_CAPPED = "Batch {} stays failed after {} recovery attempts: a person must bring the platform back."
 _OUTCOMES = {
     "released": "was released",
     "restored": "was rolled back; its changes went back to the waiting decision",
@@ -85,9 +91,12 @@ class _UnreadableRecord(Exception):
 
 
 def cmd_release(args) -> int:
-    """``hermes release prepare``, ``status``, ``run [BATCH]`` or ``start BATCH``."""
+    """``hermes release prepare``, ``status``, ``run [BATCH]``, ``start BATCH`` or
+    ``recover BATCH``."""
     if args.release_command == "start":
         return start(args.batch)
+    if args.release_command == "recover":
+        return recover(args.batch)
     if args.release_command == "run":
         return run() if args.batch is None else run(args.batch)
     return prepare() if args.release_command == "prepare" else status()
@@ -109,12 +118,9 @@ def prepare() -> int:
     return 0
 
 
-def _inputs(batch_id: int | None = None) -> int | tuple[
-    dict[str, Any], list[RecordedMerge], Pins, LiveHostReader, ReleaseHostActions, dict[str, Any]
-]:
-    """What prepare and run work on: the accepted batch, its changes, both versions, the live
-    reader and actions, and the release settings; or, once a refusal is printed, its exit code.
-    Given ``batch_id``, a batch that is not the accepted batch taken first refuses."""
+def _root_settings() -> int | tuple[Path, dict[str, Any]]:
+    """The root home and its release settings, each required one set and resolved; or, once a
+    refusal is printed, its exit code."""
     root, home = get_default_hermes_root(), get_hermes_home()
     if home.resolve() != root.resolve():  # S-A
         return _refuse(f"a release runs only from the root Hermes home {root}, not from {home}")
@@ -131,6 +137,19 @@ def _inputs(batch_id: int | None = None) -> int | tuple[
             )
     if reasons:
         return _refuse(*reasons)
+    return root, settings
+
+
+def _inputs(batch_id: int | None = None) -> int | tuple[
+    dict[str, Any], list[RecordedMerge], Pins, LiveHostReader, ReleaseHostActions, dict[str, Any]
+]:
+    """What prepare and run work on: the accepted batch, its changes, both versions, the live
+    reader and actions, and the release settings; or, once a refusal is printed, its exit code.
+    Given ``batch_id``, a batch that is not the accepted batch taken first refuses."""
+    found = _root_settings()
+    if isinstance(found, int):
+        return found
+    root, settings = found
 
     try:
         batches, live, _finished = _record()
@@ -197,6 +216,8 @@ def run(batch_id: int | None = None) -> int:
     so no board context reaches the release or a process it starts. Given ``batch_id``, as the
     release unit gives it, the run releases only that batch, and refuses and writes nothing unless
     it is the accepted batch a run takes first: a restart of the unit never takes another batch.
+    A batch the record shows releasing or failed, whose release stopped midway, goes straight to
+    ``recover`` instead (card 7).
 
     Mark the batch releasing with both versions, fetch NEW and save the named configuration
     snapshot, and run prepare's preflight. A pause already in place, or a failed guard other than
@@ -217,6 +238,8 @@ def run(batch_id: int | None = None) -> int:
     """
     for name in [name for name in os.environ if name.startswith("HERMES_KANBAN")]:
         del os.environ[name]
+    if batch_id is not None and _unfinished(batch_id):
+        return recover(batch_id)
     inputs = _inputs(batch_id)
     if isinstance(inputs, int):  # refused before anything was written
         return inputs
@@ -430,6 +453,104 @@ def _hold(token: str, stopped: bool = False) -> None:
     ``token``, is in place."""
     if stopped or _token() != token:
         raise _Stopped("stopped before cutover")
+
+
+def _unfinished(batch_id: int) -> bool:
+    """Whether the record shows ``batch_id`` releasing or failed: its release stopped midway. A
+    record that cannot be read is the run's to refuse."""
+    with contextlib.suppress(_UnreadableRecord):
+        batches, _live, _finished = _record()
+        state = next((batch["state"] for batch in batches if batch["batch_id"] == batch_id), None)
+        return state in _UNFINISHED
+    return False
+
+
+def recover(batch_id: int) -> int:
+    """Bring the platform back from a release of ``batch_id`` that stopped midway (card 7), to
+    exactly PREV or exactly NEW with a passing readback, and never forward.
+
+    As the run does, first remove every HERMES_KANBAN variable. A batch that is not releasing or
+    failed refuses. Past three attempts the host is not asked: the outcome stays failed and
+    recovery exits cleanly, so the release unit is not started again. Otherwise count the attempt,
+    run the runner's recover with the stored versions (S-B) and the saved configuration snapshot
+    (S-C), and record the outcome. After a passing readback, lift only the release's own pause,
+    the one with its reason and a token. An owner's pause stays; a failed recovery keeps any pause.
+
+    Returns 0 when the batch was released, and once its third attempt failed; 1 otherwise, and 1
+    when the pause cannot be read or the release's own pause is still in place after its removal.
+    """
+    for name in [name for name in os.environ if name.startswith("HERMES_KANBAN")]:
+        del os.environ[name]
+    found = _root_settings()
+    if isinstance(found, int):
+        return found
+    root, settings = found
+    try:
+        batches, _live, _finished = _record()
+        batch = next((batch for batch in batches if batch["batch_id"] == batch_id), None)
+        if batch is None:
+            return _refuse(f"there is no batch {batch_id} in the release record")
+        if batch["state"] not in _UNFINISHED:
+            return _refuse(f"batch {batch_id} is {batch['state']}, not releasing or failed")
+        pins = Pins(
+            new=_text(batch.get("new"), f"batch {batch_id} has no stored NEW"),
+            prev=_text(batch.get("prev"), f"batch {batch_id} has no stored PREV"),
+        )
+    except _UnreadableRecord as error:
+        return _refuse(str(error))
+    try:
+        conn = release_ledger.connect()
+    except (OSError, sqlite3.Error) as error:
+        return _refuse(f"the release record could not be opened ({type(error).__name__}: {error})")
+    with contextlib.closing(conn):
+        if batch["recovery_attempts"] >= _RECOVERY_ATTEMPTS:  # the host is not asked again
+            if batch["state"] == "releasing":  # the last attempt ended before its outcome
+                release_ledger.finish_release(conn, batch_id, outcome="failed")
+            print(_CAPPED.format(batch_id, _RECOVERY_ATTEMPTS))
+            return 0
+        try:
+            attempt = release_ledger.begin_recovery(conn, batch_id)["recovery_attempts"]
+        except (ValueError, sqlite3.Error) as error:
+            return _refuse(f"batch {batch_id} could not begin its recovery ({error})")
+        print(
+            f"Batch {batch_id} stopped midway: recovery attempt {attempt} of"
+            f" {_RECOVERY_ATTEMPTS}, PREV {pins.prev}, NEW {pins.new}"
+        )
+        reader, actions = _adapters(root, settings, pins.new)
+        actions.config_snapshot = pins.new  # the configuration snapshot the release saved (S-C)
+        host = _Host(reader, actions, "")
+        host.cut_over = True  # the release cut over before it stopped: every action goes through
+        result = release_runner.recover(host, pins)
+        if result.error:
+            print(f"The checked-out version did not read back ({result.error}).")
+            for error in result.restore_errors:
+                print(f"    Going back, a step failed too: {error}")
+        outcome = result.outcome
+        release_ledger.finish_release(conn, batch_id, outcome=outcome)
+    # S-A, as in the run: lift only the release's own pause unless the outcome failed. The removal
+    # is read back, and never tried again.
+    reason = f"release {batch_id}"
+    state, own = estop.get_state(), _final_token()
+    lift = outcome != "failed" and isinstance(own, str) and (state or {}).get("reason") == reason
+    if lift:
+        estop.disengage()
+    print(f"Batch {batch_id} {_OUTCOMES[outcome]}.")
+    after = _final_token() if lift else own
+    if after is _UNREADABLE:  # recovery cannot know whether the release's own pause is in place
+        print("The pause could not be read: the platform may still be paused by this release.")
+        return 1
+    if state is not None and not lift:
+        print(f"The platform stays paused ({state['reason'] or 'no reason given'}).")
+    elif lift and after == own:  # the removal failed: the release's own pause is in place
+        print(
+            f"The platform is still paused ({reason}): the recovery could not remove its pause"
+            f" at {estop.sentinel_path()}."
+        )
+        return 1
+    if outcome == "failed" and attempt >= _RECOVERY_ATTEMPTS:  # the unit is not started again
+        print(_CAPPED.format(batch_id, _RECOVERY_ATTEMPTS))
+        return 0
+    return 0 if outcome == "released" else 1
 
 
 def start(batch_id: int) -> int:

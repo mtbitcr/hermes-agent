@@ -1,4 +1,5 @@
-"""The release runner: guards, cutover, the tier's moves, and a readback after every move.
+"""The release runner: guards, cutover, the tier's moves, and a readback after every move; and the
+recovery of a release that stopped midway.
 
 Like the guards, these steps come from the per-release wrapper script on the release server and
 now run against a host adapter, `ReleaseHost`. Pins, the tier and the batch's recorded merges
@@ -164,6 +165,37 @@ def run_release(
             restore_errors,
         )
     return ReleaseResult("released", tuple(steps), guards, tuple(readbacks))
+
+
+def recover(host: ReleaseHost, pins: Pins) -> ReleaseResult:
+    """Bring the host back after a release stopped midway, to exactly PREV or exactly NEW.
+
+    The checked-out version is read back when it is PREV or NEW, and kept when the readback holds:
+    NEW ends released, PREV restored. Otherwise the merged restore steps run and PREV is read
+    back, and the outcome is failed when that fails too. Recovery never checks NEW out, and asks
+    no guard: the release asked them all before its cutover.
+    """
+    steps: list[str] = []
+    readbacks: list[Readback] = []
+    try:
+        head = host.checkout_head()
+        if head not in (pins.new, pins.prev):
+            raise ReadbackFailed(f"the checkout is at {head}, neither PREV nor NEW")
+        _require(_read_back(host, head, steps, readbacks))
+    except BaseException as failure:
+        steps.append("restore")
+        restore_errors = _restore(host, pins)
+        restored = _read_back(host, pins.prev, steps, readbacks).ok
+        return ReleaseResult(
+            "restored" if restored else "failed",
+            tuple(steps),
+            (),
+            tuple(readbacks),
+            f"{type(failure).__name__}: {failure}",
+            restore_errors,
+        )
+    outcome = "released" if head == pins.new else "restored"
+    return ReleaseResult(outcome, tuple(steps), (), tuple(readbacks))
 
 
 def _snapshot(host: ReleaseHost, pins: Pins) -> None:
