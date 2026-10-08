@@ -20,7 +20,7 @@ from tests.hermes_cli.test_kanban_delivery_auto_merge import (  # noqa: F401  (a
 from tests.hermes_cli.test_kanban_delivery_github import REPO
 from tests.hermes_cli.test_kanban_delivery_publish_step import _events, _tick
 from tests.hermes_cli.test_kanban_delivery_review_cards import (  # noqa: F401  (world is a fixture)
-    _cards, _raw, _ready, _state, world,
+    _cards, _raw, _ready, _source, _state, world,
 )
 
 # The source card's continuation: its task_links child that is none of its review cards.
@@ -85,6 +85,43 @@ def _changes_requested(armed):
     _reviews(gh, ("CHANGES_REQUESTED", head, cards["R15"]), ("APPROVED", head, cards["R15"]),
              ("CHANGES_REQUESTED", head, cards["R12"]))
     return tid, head, cards
+
+
+def _branching(monkeypatch, change):
+    """The _run_git seam runs ``change`` once, as it makes the continuation's branch."""
+    from hermes_cli import kanban_delivery
+
+    run_git, changes = kanban_delivery._run_git, [change]
+
+    def branching(workdir, *args):
+        if args[:1] == ("branch",) and changes:
+            changes.pop()()
+        return run_git(workdir, *args)
+
+    monkeypatch.setattr(kanban_delivery, "_run_git", branching)
+
+
+def _checkout_elsewhere(kb, repo, tid, layout):
+    """The source card's workspace: its branch checked out by git outside its repository, at an external path,
+    there advanced one commit past H, or in an external folder named .worktrees. Returns it."""
+    checkout = repo.parent / "elsewhere" / (".worktrees" if layout == "dot_worktrees" else "") / tid
+    _git(repo, "worktree", "add", str(checkout), _source(kb, tid)["branch_name"])
+    _raw(kb.kanban_db_path(), "UPDATE tasks SET workspace_path = ? WHERE id = ?", str(checkout), tid)
+    if layout == "advanced":
+        _git(checkout, "commit", "--allow-empty", "-qm", "past H")
+    return checkout
+
+
+def _claimed_apart(kb, root, repo, tid, head, source):
+    """The kernel claims the continuation in a worktree of its own, not ``source``, on its branch at H in the
+    repository, H its recorded base."""
+    (root / "profiles" / IMPLEMENTER).mkdir(parents=True)
+    _tick(kb)
+    (claimed,) = _raw(kb.kanban_db_path(), CONTINUED, tid)
+    workspace = Path(claimed["workspace_path"])
+    assert (claimed["status"], claimed["branch_name"], claimed["base_commit"]) == ("running", _branch(tid, head), head)
+    assert workspace.resolve() != source.resolve() and _git(workspace, "rev-parse", "HEAD") == head
+    assert _git(repo, "rev-parse", f"refs/heads/{_branch(tid, head)}") == head
 
 
 def test_a_returned_review_creates_one_claimable_continuation_with_its_findings_and_branch_at_h(armed):
@@ -181,7 +218,8 @@ def test_nothing_returns_while_a_card_is_open_or_after_the_pull_request_leaves_h
 
     _tick(kb)
 
-    assert (_raw(db, CONTINUED, tid), _returned(kb, tid), _branches(repo), gh["writes"]) == ([], [], "", [])
+    left = "" if case == "card_open" else _branch(tid, head)
+    assert (_raw(db, CONTINUED, tid), _returned(kb, tid), _branches(repo), gh["writes"]) == ([], [], left, [])
     if case != "card_open":
         assert gh["calls"][-2:] == [("GET", f"/repos/{REPO}/pulls/41/reviews"), ("GET", f"/repos/{REPO}/pulls/41")]
     _done(db)
@@ -189,6 +227,31 @@ def test_nothing_returns_while_a_card_is_open_or_after_the_pull_request_leaves_h
     _tick(kb)
     _tick(kb)
     assert len(_raw(db, CONTINUED, tid)) == len(_returned(kb, tid)) == 1
+
+
+@pytest.mark.parametrize("after", ["moved", "closed", "failed"])
+def test_nothing_returns_when_the_pull_request_leaves_h_while_the_branch_is_made(armed, monkeypatch, after):
+    """Safety rule 1 under owner rule 2: the pull request moves off H, closes or cannot be read while the
+    continuation's branch is made. The read after the branch stops the pass: no continuation and no review_returned,
+    only the branch at H; a later pass, the pull request open at H again, reuses it and returns the work once."""
+    from hermes_cli.kanban_delivery_github import GitHubTransportError
+
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head, cards = _changes_requested(armed)
+
+    def failed():
+        raise GitHubTransportError("network_error")
+
+    _branching(monkeypatch, {"moved": lambda: gh.update(pull_head=OTHER), "closed": lambda: gh["ended"].update(
+        {41: False}), "failed": lambda: gh["hooks"].update(PULL=failed)}[after])
+
+    _tick(kb)
+
+    assert (_raw(db, CONTINUED, tid), _returned(kb, tid), _branches(repo), gh["writes"]) == ([], [], _branch(tid, head), [])
+    gh.update(pull_head=None, ended={})
+    _tick(kb)
+    assert (len(_raw(db, CONTINUED, tid)), len(_returned(kb, tid)), gh["writes"]) == (1, 1, [])
 
 
 @pytest.mark.parametrize("fails", ["branch", "record"])
@@ -253,6 +316,20 @@ def test_a_governed_sources_continuation_is_claimable_on_its_builders_route(arme
     (claimed,) = _raw(db, CONTINUED, tid)
     assert (claimed["id"], claimed["status"], claimed["base_commit"]) == (card["id"], "running", head)
     assert (claimed["branch_name"], _git(Path(claimed["workspace_path"]), "rev-parse", "HEAD")) == (_branch(tid, head), head)
+
+
+@pytest.mark.parametrize("layout", ["external", "advanced", "dot_worktrees"])
+def test_a_source_checked_out_outside_its_repository_continues_in_a_worktree_of_its_own(armed, layout):
+    """The source card's checkout is linked from outside its repository, there advanced past H, or in an external
+    folder named .worktrees. The review return finds the repository through git's common directory and makes the
+    branch at H there; the kernel claims the continuation in a worktree of its own on that branch, H its base."""
+    kb, root, repo, gh = armed
+    tid, head, cards = _changes_requested(armed)
+    source = _checkout_elsewhere(kb, repo, tid, layout)
+
+    _tick(kb)
+
+    _claimed_apart(kb, root, repo, tid, head, source)
 
 
 @pytest.mark.parametrize("found", ["at_h", "elsewhere"])

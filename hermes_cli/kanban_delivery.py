@@ -1022,12 +1022,12 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
     decision = decide_rerun(policy, repository, head, jobs, {"reruns": [record["head"] for record in reruns]})
     if decision.allowed and decision.code != "rerun":
         return None
+    branch = None if decision.allowed else _return_branch(db_path, row)  # owner rule 2: the branch comes first
     if not _open_at_head(github, repository, row):
         return None  # owner rule 1: the pull request left H or closed while H's run was read
     code = "red_check_rerun" if decision.allowed else "red_check_returned"
     tests = [test for job in jobs for test in job.get("failed_tests") or () if isinstance(test, str)]
     ids = sorted({match["job_id"] for match in decision.matches})
-    branch = None if decision.allowed else _return_branch(db_path, row)  # owner rule 2: the branch comes first
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or not _unchanged(conn, row, read) or any(
                 record["head"] == head for record in _recorded(conn, source, code)):
@@ -1060,9 +1060,9 @@ def _rerun_refused(db_path: Path, row: dict, read: tuple, github, repository: st
     again and, open at H, red_check_returned is recorded once for H with H's continuation. A failed read
     raises and only ends the pass; a later pass reads it again. Returns the outcome recorded, if any."""
     source, head = row["source_task_id"], row["pull_request_head"]
+    branch = _return_branch(db_path, row)
     if not _open_at_head(github, repository, row):
         return None  # safety rule 1: the pull request left H or closed
-    branch = _return_branch(db_path, row)
     reason = _rerun_reason(sent["statuses"])
     refusal = Decision(False, reason, f"the rerun calls of jobs {sent['jobs']} were answered {sent['statuses']} "
                                       "(None: no answer)")
@@ -1099,8 +1099,9 @@ def _continued(conn: sqlite3.Connection, source: str, head: str) -> tuple:
 
 
 def _return_branch(db_path: Path, row: dict) -> Optional[tuple]:
-    """Owner rule 2: the source card's repository and H's continuation branch, named from the source card
-    and H only, made at H before the write transaction or reused when it points at H already. When the name
+    """Owner rule 2: the repository Git's common directory names for the source card's workspace and H's
+    continuation branch, named from the source card and H only, made there at H before the write transaction
+    or reused when it points at H already; with no such repository nothing is recorded. When the name
     points at another commit, the pass is refused and records nothing. No branch is ever deleted: a pass
     stopped before its commit leaves only this branch at H, which the next pass reuses. None when H's
     continuation is recorded already, as that card has its branch."""
@@ -1110,7 +1111,9 @@ def _return_branch(db_path: Path, row: dict) -> Optional[tuple]:
         if _continued(conn, source, head)[1] is not None:
             return None
         workdir = _repository(kb.get_task(conn, source).workspace_path)
-    root = workdir.parent.parent if workdir is not None and workdir.parent.name == ".worktrees" else workdir
+    found = _run_git(workdir, "rev-parse", "--path-format=absolute", "--git-common-dir") if workdir else None
+    common = Path(found.stdout.decode().strip()) if found is not None and found.returncode == 0 else None
+    root = common.parent if common is not None and common.name == ".git" else None
     if root is None:
         raise PublishRefused("no_repository", f"no repository holds the source card {source}")
     _run_git(root, "branch", branch, head)  # git refuses a name that exists; the read below decides
@@ -1337,12 +1340,12 @@ def _return_review(db_path: Path, row: dict, evidence: tuple, github, returned: 
     with kb.connect_closing(db_path=db_path) as conn:
         if any(record["head"] == head for record in _recorded(conn, source, "review_returned")):
             return None  # H's work went back to its builder already
+    branch = _return_branch(db_path, row)  # owner rule 2: the branch comes first
     try:
         if not _open_at_head(github, row["repository"], row):
             return None  # safety rule 1: the pull request left H or closed while its reviews were read
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None
-    branch = _return_branch(db_path, row)  # owner rule 2: the branch comes first
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or _arm_evidence(conn, row) != evidence or any(
                 record["head"] == head for record in _recorded(conn, source, "review_returned")):

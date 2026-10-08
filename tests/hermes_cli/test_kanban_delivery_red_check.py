@@ -22,7 +22,9 @@ from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _event
 from tests.hermes_cli.test_kanban_delivery_review_cards import (  # noqa: F401  (world is a fixture)
     CHECK, _cards, _project, _published, _raw, _ready, _state, world,
 )
-from tests.hermes_cli.test_kanban_delivery_review_return import BUILDER, CONTINUED, KEPT, _branch, _governed, _run
+from tests.hermes_cli.test_kanban_delivery_review_return import (
+    BUILDER, CONTINUED, KEPT, _branch, _branching, _checkout_elsewhere, _claimed_apart, _governed, _run,
+)
 
 FLAKY = ("tests/tools/test_zombie_process_cleanup.py::TestDelegationCleanup::"
          "test_timed_out_child_keeps_relay_session_until_its_turn_exits")
@@ -303,6 +305,38 @@ def test_a_refused_or_unanswered_rerun_returns_the_work_on_a_later_pass(red, mon
     assert (item["status"], item["branch_name"]) == ("ready", _branch(tid, head))
 
 
+@pytest.mark.parametrize("after", ["moved", "closed", "failed"])
+@pytest.mark.parametrize("tests, answer", [([UNLISTED], 201), ([FLAKY], 403), ([FLAKY], None)],
+                         ids=["returned", "refused", "unanswered"])
+def test_nothing_returns_when_the_pull_request_leaves_h_while_the_branch_is_made(red, monkeypatch, tests, answer, after):
+    """Safety rule 1 under owner rule 2: on the red check's return, also after a refused (403) or unanswered rerun,
+    the pull request moves off H, closes or cannot be read while the continuation's branch is made. The read after
+    the branch stops the pass: no continuation and no red_check_returned, and the rerun is not sent again; a later
+    pass, the pull request open at H again, returns the work once."""
+    from hermes_cli import kanban_delivery_github as transport
+
+    kb, root, repo, gh = red
+    db = kb.kanban_db_path()
+    tid, head = _ready(red)
+    gh.update(tests=tests, rerun=answer)
+    sent = [RERUN] if tests == [FLAKY] else []
+
+    def failed():
+        gh["each"] = None
+        raise transport.GitHubTransportError("network_error")
+
+    _branching(monkeypatch, {"moved": lambda: gh.update(pull_head=OTHER), "failed": lambda: gh.update(each=failed),
+                             "closed": lambda: gh.update(closed=True, pull_head=head)}[after])
+
+    _tick(kb)
+
+    assert (_raw(db, CONTINUED, tid), _waited(kb, tid, "red_check_returned"), gh["reruns"]) == ([], [], sent)
+    gh.update(pull_head=None, closed=False)
+    _tick(kb)
+    (item,) = _raw(db, CONTINUED, tid)
+    assert ([p["rework"] for p in _waited(kb, tid, "red_check_returned")], gh["reruns"]) == ([item["id"]], sent)
+
+
 @pytest.mark.parametrize("tier", ["routine", "deep"])
 def test_a_governed_sources_red_check_continuation_is_claimable_on_its_builders_route(red, tier):
     """Owner rule 1: the red check returns the work of a governed source card, of execution tier ``tier`` and
@@ -326,6 +360,21 @@ def test_a_governed_sources_red_check_continuation_is_claimable_on_its_builders_
     (claimed,) = _raw(db, CONTINUED, tid)
     assert (claimed["id"], claimed["status"], claimed["base_commit"]) == (item["id"], "running", head)
     assert (claimed["branch_name"], _git(Path(claimed["workspace_path"]), "rev-parse", "HEAD")) == (_branch(tid, head), head)
+
+
+@pytest.mark.parametrize("layout", ["external", "advanced", "dot_worktrees"])
+def test_a_red_check_of_a_source_checked_out_outside_its_repository_continues_in_a_worktree_of_its_own(red, layout):
+    """The red check returns the work of a source whose checkout is linked from outside its repository, there
+    advanced past H, or in an external folder named .worktrees: the kernel claims the continuation in a worktree
+    of its own on its branch at H in the repository, H its recorded base."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    gh["tests"] = [UNLISTED]
+    source = _checkout_elsewhere(kb, repo, tid, layout)
+
+    _tick(kb)
+
+    _claimed_apart(kb, root, repo, tid, head, source)
 
 
 @pytest.mark.parametrize("left", ["ready", "archived", "done"])
