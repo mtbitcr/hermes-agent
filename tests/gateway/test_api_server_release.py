@@ -157,6 +157,24 @@ def _start_argv(batch_id: int) -> tuple:
     return (sys.executable, "-m", "hermes_cli.main", "release", "start", str(batch_id))
 
 
+def _ready(action: str) -> dict:
+    """A batch the route takes: waiting for the owner's accept, or accepted for a start again."""
+    batch = _merge("a", "Show the release decision")
+    return batch if action == "accept" else _accepted(batch)
+
+
+async def _post(client: TestClient, action: str, batch: dict):
+    """The owner's accept of the batch as it was shown, or the start again of the accepted batch."""
+    path = f"{VIEW}/{batch['batch_id']}/{action}"
+    return await client.post(path, json=_shown(batch) if action == "accept" else None)
+
+
+def _begin(batch: dict) -> None:
+    """The run in the release unit begins the release of ``batch``."""
+    new = batch["members"][-1]["merge_commit"]
+    _ledger(ledger.begin_release, batch["batch_id"], prev=_commit("live"), new=new)
+
+
 @pytest.mark.asyncio
 async def test_release_decision_lists_the_waiting_batch_in_plain_words(root):
     async with _client() as client:
@@ -215,7 +233,7 @@ async def test_accept_with_the_shown_version_and_digest_starts_the_release(root,
         repeated = await client.post(accept, json=_shown(shown))
 
     assert response.status == 200
-    assert (body["answer"], body["message"]) == ("releasing", "Accepted. The release is running.")
+    assert (body["answer"], body["message"]) == ("releasing", "The release is running.")
     assert _answers(root) == 1
     assert _store(root, "SELECT state FROM release_batches") == [("accepted",)]
     # One unit start: the release start command, run as a child process.
@@ -428,10 +446,7 @@ async def test_accept_while_an_older_unit_is_busy_starts_once_and_answers_its_re
     assert states == [(older["batch_id"], "releasing"), (shown["batch_id"], "accepted")]
     # The start ran once, as a child, and its own check refused: another release is at work.
     assert units.started == [_start_argv(shown["batch_id"])]
-    assert (body["answer"], body["message"]) == (
-        "accepted",
-        "Accepted. Another release is at work; start this one once it ends.",
-    )
+    assert (body["answer"], body["message"]) == ("another_release", "Another release is at work.")
     # The decision returned with the answer shows that release at work.
     release = body["decision"]["release"]
     assert (release["batch_id"], release["unit_running"]) == (older["batch_id"], True)
@@ -462,7 +477,109 @@ async def test_accept_as_the_older_release_finishes_starts_once_and_answers_star
     assert response.status == 200
     # No release was at work once the accept was recorded: the start ran once, and started.
     assert units.started == [_start_argv(shown["batch_id"])]
-    assert (body["answer"], body["message"]) == ("releasing", "Accepted. The release is running.")
+    assert (body["answer"], body["message"]) == ("releasing", "The release is running.")
     release = body["decision"]["release"]
     assert (release["batch_id"], release["state"]) == (shown["batch_id"], "accepted")
     assert (release["unit_running"], release["actions"]) == (True, [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["accept", "start"])
+@pytest.mark.parametrize(
+    ("outcome", "sentence"),
+    [
+        ("released", "It was released."),
+        ("failed", "It failed midway and is kept for recovery."),
+        ("restored", "It was rolled back. Its changes went back to the waiting batch."),
+    ],
+    ids=["released", "failed", "restored"],
+)
+async def test_a_release_that_ends_before_the_final_read_answers_its_outcome(
+    root, units, monkeypatch, action, outcome, sentence
+):
+    batch = _ready(action)
+    child = asyncio.create_subprocess_exec
+
+    async def start_and_end(*argv, **options):
+        started = await child(*argv, **options)  # the unit started: the user manager answered active
+        # The run in the unit ends the release, and the unit is collected, before the final read.
+        _begin(batch)
+        _ledger(ledger.finish_release, batch["batch_id"], outcome=outcome)
+        units.busy = []
+        return started
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start_and_end)
+    async with _client() as client:
+        response = await _post(client, action, batch)
+        body = await response.json()
+
+    assert response.status == 200
+    assert units.started == [_start_argv(batch["batch_id"])]
+    # The final read alone gives the answer: the outcome sentence, and no running release.
+    assert (body["answer"], body["message"]) == (outcome, sentence)
+    assert "running" not in body["message"]
+    release = body["decision"]["release"]
+    assert (release["batch_id"], release["outcome"]) == (batch["batch_id"], outcome)
+    assert (release["outcome_text"], release["unit_running"]) == (sentence, False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["accept", "start"])
+@pytest.mark.parametrize("state", ["accepted", "releasing"])
+async def test_its_own_unit_still_activating_answers_running_never_another_release(
+    root, units, monkeypatch, action, state
+):
+    batch = _ready(action)
+    child = asyncio.create_subprocess_exec
+
+    async def still_activating(*argv, **options):
+        units.exits = [1]  # the user manager did not answer active in time, so the child exits 1
+        exited = await child(*argv, **options)
+        units.busy = [(release_unit.unit_name(batch["batch_id"]), "activating")]
+        if state == "releasing":  # the run in the unit already began the release
+            _begin(batch)
+        return exited
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", still_activating)
+    async with _client() as client:
+        response = await _post(client, action, batch)
+        body = await response.json()
+
+    assert response.status == 200
+    assert units.started == [_start_argv(batch["batch_id"])]
+    # The busy unit's name is this batch's own: its release is running, never another one.
+    assert (body["answer"], body["message"]) == ("releasing", "The release is running.")
+    release = body["decision"]["release"]
+    assert (release["batch_id"], release["state"]) == (batch["batch_id"], state)
+    # No start again is offered while its unit is at work.
+    assert (release["unit_running"], release["actions"]) == (True, [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["accept", "start"])
+async def test_a_unit_of_another_batch_at_work_answers_another_release_without_start_again(
+    root, units, monkeypatch, action
+):
+    other = _accepted(_merge("other", "Keep the owner page fast"))
+    _begin(other)
+    _ledger(ledger.finish_release, other["batch_id"], outcome="released")
+    batch = _ready(action)
+    child = asyncio.create_subprocess_exec
+
+    async def another_at_work(*argv, **options):
+        # The other batch's unit is at work by the time the start runs, so the start's check refuses.
+        units.busy = [(release_unit.unit_name(other["batch_id"]), "active")]
+        return await child(*argv, **options)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", another_at_work)
+    async with _client() as client:
+        response = await _post(client, action, batch)
+        body = await response.json()
+
+    assert response.status == 200
+    assert units.started == [_start_argv(batch["batch_id"])]
+    assert (body["answer"], body["message"]) == ("another_release", "Another release is at work.")
+    release = body["decision"]["release"]
+    assert (release["batch_id"], release["state"]) == (batch["batch_id"], "accepted")
+    # No start again is offered while another release is at work.
+    assert (release["unit_running"], release["actions"]) == (False, [])

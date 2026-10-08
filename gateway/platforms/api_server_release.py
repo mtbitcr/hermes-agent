@@ -11,9 +11,11 @@ and a repeated one records no second answer. A recorded accept, and start
 again, run ``hermes release start BATCH`` once as a child process of the
 gateway, never the start function inside this process, because the start
 removes variables from its own environment; the start's own checks refuse
-while a release unit is at work. Each title is shown as ``owner_title`` shows
-it, the one title boundary of every owner surface; the version and digest keep
-their own fields.
+while a release unit is at work. Once the child returns, one more read of the
+release record and the release units is the only source of the answer and of
+the decision returned with it; the child's exit code and every earlier read
+decide nothing. Each title is shown as ``owner_title`` shows it, the one title
+boundary of every owner surface; the version and digest keep their own fields.
 """
 
 from __future__ import annotations
@@ -67,13 +69,13 @@ _OUTCOMES = {
     "restored": "It was rolled back. Its changes went back to the waiting batch.",
     "refused": "It was refused before anything changed. Its changes went back to the waiting batch.",
 }
+# What an answer says. After the start child the final read alone picks it, alike on the accept and
+# the start route; a release that ended answers with its outcome sentence instead.
 _ANSWERS = {
-    ("defer", "put_off"): "Put off. The batch keeps waiting, and new changes join it.",
-    ("accept", "accepted"): "Accepted. Another release is at work; start this one once it ends.",
-    ("accept", "releasing"): "Accepted. The release is running.",
-    ("accept", "could_not_start"): "Accepted, but the release could not start. You can start it again.",
-    ("start", "releasing"): "Started again. The release is running.",
-    ("start", "could_not_start"): "The release could not start. You can start it again.",
+    "put_off": "Put off. The batch keeps waiting, and new changes join it.",
+    "releasing": "The release is running.",
+    "could_not_start": "The release could not start.",
+    "another_release": "Another release is at work.",
 }
 _CHANGED = "The waiting batch changed after it was shown. Nothing was recorded; here is the new list."
 # The batches an answer is under way for in this gateway: the one reservation before its action.
@@ -128,7 +130,8 @@ async def _answer(request: web.Request, action: str, body: dict[str, Any]) -> we
         if action != "start":
             await asyncio.to_thread(_decide, batch_id, _DECISIONS[action], version, digest)
         # Accept and start again run the start once; its own checks refuse while a release unit is at work.
-        started = action != "defer" and await _run_start(batch_id)
+        if action != "defer":
+            await _run_start(batch_id)
     except PermissionError:  # the decide step refuses a kanban worker
         return _refusal(403, "Only the owner decides a release. Nothing was recorded.", "release_decision_refused")
     except ValueError:  # the batch changed between the reads and the decide step
@@ -138,17 +141,39 @@ async def _answer(request: web.Request, action: str, body: dict[str, Any]) -> we
     # One readback, for the answer and the decision it returns, so the two cannot disagree.
     batches, busy = await asyncio.to_thread(_read)
     if action == "defer":
-        answer = "put_off"
-    elif started:
-        answer = "releasing"
-    else:  # the start refused while another release is at work, or it could not start
-        answer = "accepted" if action == "accept" and busy else "could_not_start"
+        answer, message = "put_off", _ANSWERS["put_off"]
+    else:  # accept and start again alike, whatever the start child exited with
+        answer, message = _after_start(batch_id, batches, busy)
     return web.json_response({
         "object": "hermes.owner_workspace.release_answer",
         "answer": answer,
-        "message": _ANSWERS[action, answer],
+        "message": message,
         "decision": _view(batches, busy),
     })
+
+
+def _after_start(
+    batch_id: int, batches: list[dict[str, Any]], busy: Optional[list[tuple[str, str]]]
+) -> tuple[str, str]:
+    """The answer after the start child, as (answer, message), from the final read alone.
+
+    The child's exit code and every earlier read decide nothing. The words agree with the decision
+    returned with them: ``_release`` reads this batch from the same snapshot, and tells which batch
+    a busy unit belongs to by the unit's name.
+    """
+    release = _release(next(batch for batch in batches if batch["batch_id"] == batch_id), busy)
+    if release["outcome"]:  # released, restored, refused or failed: never announced as running
+        return release["outcome"], release["outcome_text"]
+    if release["unit_running"]:  # its own unit is starting or at work, accepted or already releasing
+        return "releasing", _ANSWERS["releasing"]
+    if busy:  # only units of other batches are at work, and the decision offers no start again
+        return "another_release", _ANSWERS["another_release"]
+    if busy == [] and release["state"] == "accepted":  # no unit of it is loaded; start again is offered
+        return "could_not_start", _ANSWERS["could_not_start"]
+    # Any other snapshot, as a release that stopped midway (releasing, and no unit runs) or units that
+    # could not be read: the words the decision gives it.
+    words = f"{release['status']} {release['unit']} {release['outcome_text']}"
+    return ("stopped" if busy == [] else "unreadable"), words
 
 
 def _refused(action, batch_id, version, digest, batches, busy) -> Optional[tuple[int, str, str]]:
@@ -202,10 +227,10 @@ def _decide(batch_id: int, decision: str, version: int, digest: str) -> None:
         conn.close()
 
 
-async def _run_start(batch_id: int) -> bool:
-    """``hermes release start BATCH`` as a child process; True once it started the release unit.
+async def _run_start(batch_id: int) -> None:
+    """``hermes release start BATCH`` as a child process.
 
-    Its output goes to the gateway log, never to the owner.
+    Its exit code and its output go to the gateway log, never into the answer.
     """
     try:
         child = await asyncio.create_subprocess_exec(
@@ -215,12 +240,11 @@ async def _run_start(batch_id: int) -> bool:
         output, _ = await child.communicate()
     except OSError:
         logger.exception("[api_server] the release start of batch %s could not run", batch_id)
-        return False
+        return
     logger.info(
         "[api_server] the release start of batch %s exited %s: %s",
         batch_id, child.returncode, output.decode(errors="replace").strip(),
     )
-    return child.returncode == 0
 
 
 def _view(batches: list[dict[str, Any]], busy: Optional[list[tuple[str, str]]]) -> dict[str, Any]:
