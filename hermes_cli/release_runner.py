@@ -1,4 +1,5 @@
-"""The release runner: guards, cutover, the tier's moves, and a readback after every move.
+"""The release runner: guards, cutover, the tier's moves, and a readback after every move; and the
+recovery of a release that stopped midway.
 
 Like the guards, these steps come from the per-release wrapper script on the release server and
 now run against a host adapter, `ReleaseHost`. Pins, the tier and the batch's recorded merges
@@ -101,6 +102,10 @@ READBACKS: tuple[tuple[str, Callable[[ReleaseHost, str], bool]], ...] = (
     # with: releases are code-only, and the restore puts that snapshot back.
     ("configuration", lambda host, expected: host.live_config() == host.named_config_snapshot()),
 )
+# Recovery compares the configuration only when NEW's configuration snapshot may exist (see
+# recover). Without it, the check is left out, or counts as not held.
+_NO_CONFIGURATION = tuple(read for read in READBACKS if read[0] != "configuration")
+_CONFIGURATION_NOT_HELD = (*_NO_CONFIGURATION, ("configuration", lambda host, expected: False))
 
 
 @dataclass(frozen=True)
@@ -166,6 +171,45 @@ def run_release(
     return ReleaseResult("released", tuple(steps), guards, tuple(readbacks))
 
 
+def recover(host: ReleaseHost, pins: Pins, *, saved: bool = True) -> ReleaseResult:
+    """Bring the host back after a release stopped midway, to exactly PREV or exactly NEW.
+
+    The checked-out version is read back when it is PREV or NEW, and kept when the readback holds:
+    NEW ends released, PREV restored. Otherwise the merged restore steps run and PREV is read
+    back, and the outcome is failed when that fails too. Recovery never checks NEW out, and asks
+    no guard: the release asked them all before its cutover.
+
+    The live configuration is compared with NEW's configuration snapshot unless ``saved`` is False:
+    the caller's readback of its path found no such name, which alone proves it was not published.
+    The release publishes it before its cutover, so without it PREV is read back without the
+    configuration and, when that holds, kept with no host step. Any other readback then counts the
+    configuration as not held.
+    """
+    steps: list[str] = []
+    readbacks: list[Readback] = []
+    reads = READBACKS if saved else _CONFIGURATION_NOT_HELD
+    try:
+        head = host.checkout_head()
+        if head not in (pins.new, pins.prev):
+            raise ReadbackFailed(f"the checkout is at {head}, neither PREV nor NEW")
+        first = _NO_CONFIGURATION if head == pins.prev and not saved else reads
+        _require(_read_back(host, head, steps, readbacks, first))
+    except BaseException as failure:
+        steps.append("restore")
+        restore_errors = _restore(host, pins)
+        restored = _read_back(host, pins.prev, steps, readbacks, reads).ok
+        return ReleaseResult(
+            "restored" if restored else "failed",
+            tuple(steps),
+            (),
+            tuple(readbacks),
+            f"{type(failure).__name__}: {failure}",
+            restore_errors,
+        )
+    outcome = "released" if head == pins.new else "restored"
+    return ReleaseResult(outcome, tuple(steps), (), tuple(readbacks))
+
+
 def _snapshot(host: ReleaseHost, pins: Pins) -> None:
     host.take_snapshot(pins.snapshot)
     for name in host.snapshots()[:-KEEP_SNAPSHOTS]:
@@ -214,11 +258,15 @@ MOVES: dict[str, Callable[[ReleaseHost, Pins], str]] = {"forward": _forward, "ba
 
 
 def _read_back(
-    host: ReleaseHost, expected: str, steps: list[str], readbacks: list[Readback]
+    host: ReleaseHost,
+    expected: str,
+    steps: list[str],
+    readbacks: list[Readback],
+    reads: Sequence[tuple[str, Callable[[ReleaseHost, str], bool]]] = READBACKS,
 ) -> Readback:
     steps.append("readback")
     errors: dict[str, str] = {}
-    checks = {name: _holds(name, check, host, expected, errors) for name, check in READBACKS}
+    checks = {name: _holds(name, check, host, expected, errors) for name, check in reads}
     readback = Readback(expected, checks, errors)
     readbacks.append(readback)
     return readback
