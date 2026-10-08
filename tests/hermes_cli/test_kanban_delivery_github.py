@@ -277,8 +277,8 @@ def github(tmp_path):
         def do_POST(self):
             self._route("POST")
 
-        def do_PUT(self):
-            self._route("PUT")
+        def do_PATCH(self):
+            self._route("PATCH")
 
         def _reply(self, status, value=None, extra=(), raw=None, cut=0):
             data = raw if raw is not None else b"" if value is None else json.dumps(value).encode()
@@ -328,9 +328,15 @@ def github(tmp_path):
                     "base": {"sha": BASE, "ref": STRAY}, "mergeable_state": "clean", "merge_commit_sha": BASIC})
             if method == "GET" and path.endswith("/pulls/8"):
                 return self._reply(200, raw=f"<html>Bad gateway {TOKEN}</html>".encode())
-            if method == "PUT" and path.endswith("/pulls/7/merge"):
+            if method == "PATCH" and path.endswith("/pulls/7"):
                 return self._reply(405, {"message": f"Pull Request is not mergeable {TOKEN}",
                                          "documentation_url": f"https://docs.example/{TOKEN}"})
+            if method == "GET" and path.endswith("/annotations"):
+                return self._reply(200, [
+                    {"path": ".github", "annotation_level": "failure", "title": "Failed test",
+                     "message": "tests/a.py::test_one", "raw_details": TOKEN, "blob_href": f"https://x.example/{TOKEN}"},
+                    {"path": ".github", "annotation_level": "notice", "title": f"Failed test {STRAY}",
+                     "message": f"count 1 {TOKEN}", "start_line": 1}])
             if path.endswith("/logs"):
                 return self._reply(302, None, [("Location", f"https://storage.example/log?sig={TOKEN}")])
             if method == "GET" and path.endswith("/reviews"):  # Link: a next page (7), the last (8), none (9), cut (10)
@@ -412,7 +418,7 @@ def test_token_never_reaches_model_visible_output(github, monkeypatch, caplog, c
     merge = mod.GitHubTransport("merge", REPO, key_path=github["key_file"])
     pull = merge.request("GET", f"/repos/{REPO}/pulls/7")
     assert pull["status"] == 200 and pull["data"]["number"] == 7 and pull["data"]["head"]["sha"] == HEAD
-    refused = merge.request("PUT", f"/repos/{REPO}/pulls/7/merge", body={"sha": HEAD})
+    refused = merge.request("PATCH", f"/repos/{REPO}/pulls/7", body={"state": "closed"})
     assert refused["status"] == 405
     logs = mod.GitHubTransport("read_checks", REPO, key_path=github["key_file"]).request(
         "GET", f"/repos/{REPO}/actions/jobs/9/logs")
@@ -1025,6 +1031,46 @@ def test_commit_statuses_are_refused_before_any_socket_or_token(monkeypatch, tmp
                     transport.request("GET", path, query=query)
                 assert refused.value.reason == "endpoint_not_allowed", (step, path, query)
     assert opened == []
+
+
+def test_the_annotations_read_is_the_one_new_call_and_the_unused_merge_and_review_posts_are_gone(github, monkeypatch):
+    """The red check card adds one read: the annotations of one check run in the bound repository, with
+    checks read, each annotation's title and message only. The owner decisions of 2026-10-04 removed the
+    unused REST merge and review post, so no step reaches them, and every other path and method near the
+    new read stays refused before any token or socket."""
+    mod = _transport_module(monkeypatch, github)
+    entries = {(e.method, e.template) for e in mod.REST_ALLOWLIST}
+    assert ("GET", "/repos/{repo}/check-runs/{id}/annotations") in entries
+    assert not entries & {("PUT", "/repos/{repo}/pulls/{number}/merge"), ("POST", "/repos/{repo}/pulls/{number}/reviews")}
+    path = f"/repos/{REPO}/check-runs/9/annotations"
+    outside = [("PUT", f"/repos/{REPO}/pulls/7/merge"), ("POST", f"/repos/{REPO}/pulls/7/reviews"),
+               ("GET", f"/repos/{SIBLING}/check-runs/9/annotations"), ("GET", f"/repos/{REPO}/check-runs/09/annotations"),
+               ("GET", f"/repos/{REPO}/check-runs/x/annotations"), ("GET", f"{path}/1"), ("GET", f"{path}/"),
+               ("GET", f"/repos/{REPO}/check-runs/9"), ("GET", f"/repos/{REPO}/check-suites/9/annotations"),
+               *((method, path) for method in ("POST", "PUT", "PATCH", "DELETE", "get"))]
+    for step, permissions in mod.STEP_PERMISSIONS.items():
+        transport = mod.GitHubTransport(step, REPO, key_path=github["key_file"])
+        for method, target in outside:
+            with pytest.raises(mod.GitHubTransportError) as refused:
+                transport.request(method, target, body={})
+            assert refused.value.reason == "endpoint_not_allowed", (step, method, target)
+        for query in ({"per_page": "101"}, {"filter": "latest"}, {"page": "0"}):
+            with pytest.raises(mod.GitHubTransportError) as refused:
+                transport.request("GET", path, query=query)
+            assert refused.value.reason == "query_not_allowed", (step, query)
+        if "checks" not in permissions:
+            with pytest.raises(mod.GitHubTransportError) as refused:
+                transport.request("GET", path)
+            assert refused.value.reason == "step_not_permitted", step
+    assert github["calls"] == [] and github["token_requests"] == []
+
+    read = mod.GitHubTransport("read_checks", REPO, key_path=github["key_file"]).request(
+        "GET", path, query={"per_page": 100, "page": 1})
+
+    assert read["status"] == 200 and read["data"][0] == {"title": "Failed test", "message": "tests/a.py::test_one"}
+    assert [sorted(note) for note in read["data"]] == [["message", "title"]] * 2
+    assert TOKEN not in repr(read) and STRAY not in repr(read)
+    assert github["calls"] == [("GET", f"{path}?per_page=100&page=1")]
 
 
 def test_push_starts_no_git_from_the_working_directory(github, monkeypatch, tmp_path):
