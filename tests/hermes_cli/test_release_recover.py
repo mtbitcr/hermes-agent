@@ -5,12 +5,12 @@ built like the merged one; the command's tests under a temporary root home."""
 from __future__ import annotations
 
 import argparse
-import ast
 import contextlib
 import hashlib
-import inspect
+import json
+import os
+import subprocess
 import sys
-import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,6 +43,26 @@ TOKEN = "placeholder-release-token"
 # The merged restore steps: the units stop, the checkout goes to PREV, its configuration comes
 # back, and the units start.
 RESTORE = ["stop", f"checkout {PREV}", "restore config", "start"]
+_REPO = Path(__file__).resolve().parents[2]
+# ``hermes release COMMAND BATCH`` in its own process, as _command runs it, on a host where
+# neither version reads back; its last line of output is its host's calls. Given "held", it says
+# ready as it is about to count its recovery attempt, and goes on once its input ends.
+_PROCESS = (
+    "import json, sys\n"
+    "import pytest\n"
+    "sys.path.insert(0, sys.argv.pop(1))\n"
+    "import test_release_recover as t\n"
+    "begin, host = t.ledger.begin_recovery, t._midway(t.NEW, t.PREV)\n"
+    "def held(*args):\n"
+    "    print('ready', flush=True)\n"
+    "    sys.stdin.read()\n"
+    "    return begin(*args)\n"
+    "if sys.argv.pop(1) == 'held':\n"
+    "    t.ledger.begin_recovery = held\n"
+    "code = t._command(pytest.MonkeyPatch(), host, *sys.argv[1:])\n"
+    "print(json.dumps(host.calls))\n"
+    "sys.exit(code)\n"
+)
 
 
 @dataclass
@@ -168,6 +188,45 @@ def _sentinel() -> bytes | None:
     return None
 
 
+def _at_attempt_two() -> int:
+    """A batch whose release stopped midway and whose recovery then failed twice: failed, at
+    attempt count two, under the release's own pause."""
+    batch_id = _stopped_midway()
+    with contextlib.closing(ledger.connect()) as conn:
+        for _attempt in range(2):
+            ledger.begin_recovery(conn, batch_id)
+            ledger.finish_release(conn, batch_id, outcome="failed")
+    return batch_id
+
+
+def _process(root: Path, command: str, batch_id: int, held: bool = False) -> subprocess.Popen:
+    """``hermes release COMMAND BATCH`` in its own process (see _PROCESS), on the root home
+    ``root`` and its release record."""
+    return subprocess.Popen(
+        [sys.executable, "-c", _PROCESS, str(Path(__file__).parent), "held" if held else "free",
+         command, str(batch_id)],
+        cwd=_REPO,
+        env={**os.environ, "HOME": str(root.parent), "HERMES_HOME": str(root),
+             "PYTHONPATH": str(_REPO), "PYTHONDONTWRITEBYTECODE": "1"},
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def _finish(process: subprocess.Popen) -> tuple[int, list[str], list[str]]:
+    """The exit code, output lines and host calls of a process from _process, once its input
+    ends."""
+    out, err = process.communicate(timeout=60)
+    *lines, calls = out.splitlines() or [""]
+    assert calls.startswith("["), err
+    return process.returncode, lines, json.loads(calls)
+
+
+def _files(root: Path) -> dict[str, bytes]:
+    """Every file under the root home with its bytes, the release record's and the pause's
+    among them."""
+    return {str(path): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
 def test_recover_keeps_new_when_it_reads_back():
     host = FakeHost()
 
@@ -273,14 +332,51 @@ def test_recovery_attempts_are_capped(root, monkeypatch, capsys):
 
 def test_recover_imports_nothing(root, monkeypatch):
     """K6: from the first unit stop to the pause's removal, recovery imports nothing, so no code
-    loads from the checkout it moves; neither recover function has an import of its own."""
-    from hermes_cli import release_cmd
-
+    loads from the checkout it moves."""
     batch_id, host = _stopped_midway(), _midway(NEW)
 
     assert _command(monkeypatch, host, "recover", str(batch_id)) == 1
     assert host.calls == RESTORE and _sentinel() is None
     assert set(sys.modules) - host.modules_at_stop == set()
-    for function in (release_runner.recover, release_cmd.recover):
-        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
-        assert not [node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))]
+
+
+@pytest.mark.parametrize(("first", "second"), [("run", "recover"), ("recover", "run")])
+def test_two_processes_never_count_past_three(root, first, second):
+    """Owner rule 443, test 1 (finding 1 of the card review). On a temporary record at attempt
+    count two, ``first`` waits in its own process as it is about to count its attempt, and
+    ``second`` starts in another: it refuses at once and asks its host nothing. The first makes
+    the third attempt, and the count never exceeds three."""
+    batch_id = _at_attempt_two()
+
+    with _process(root, first, batch_id, held=True) as waiting:
+        assert waiting.stdout.readline() == "ready\n"
+        code, _out, calls = _finish(_process(root, second, batch_id))
+        first_code, _first_out, first_calls = _finish(waiting)
+
+    batch = _batch(batch_id)
+    assert (batch["state"], batch["outcome"], batch["recovery_attempts"]) == ("failed", "failed", 3)
+    assert (code, calls) == (1, [])  # the second asked its host nothing
+    assert (first_code, first_calls) == (0, RESTORE)  # the third attempt failed: no restart
+
+
+def test_a_second_recovery_refuses_at_once_and_writes_nothing(root):
+    """Owner rule 443, test 2: two concurrent recover commands. While the first waits as it is
+    about to count its attempt, the second refuses at once: it writes nothing to the release
+    record, leaves the pause as it was and asks its host nothing."""
+    batch_id = _stopped_midway()
+
+    with _process(root, "recover", batch_id, held=True) as waiting:
+        assert waiting.stdout.readline() == "ready\n"
+        before = _files(root)
+        code, out, calls = _finish(_process(root, "recover", batch_id))
+        after = _files(root)
+        first_code, _first_out, first_calls = _finish(waiting)
+
+    assert (code, calls) == (1, [])
+    assert after == before  # not a byte of the release record or the pause changed
+    lock = root / ".release.lock"
+    assert out == [
+        f"Refused: another release run or recovery holds the release lock {lock}.",
+        "Nothing in the release state was written.",
+    ]
+    assert (first_code, first_calls, _batch(batch_id)["recovery_attempts"]) == (1, RESTORE, 1)

@@ -11,15 +11,18 @@ a hard kill ends it, and its recovery belongs to card 7. ``start BATCH`` runs ``
 as the release unit (S-F), the transient user service of release_unit, so the release keeps
 running when the gateway stops; the start writes nothing to the release state either. ``recover
 BATCH`` brings the platform back from a release that stopped midway, as ``run BATCH`` does for a
-batch the record shows releasing or failed.
+batch the record shows releasing or failed. ``run`` and ``recover`` share one host lock: while one
+of them is at work, another refuses at once and writes nothing.
 
-Design rule (K6), as in the runner: everything ``run`` needs is imported when this module loads,
-so nothing is imported once the units stop and the checkout moves under the running process.
+Design rule (K6), as in the runner: everything ``run`` and ``recover`` need, the host lock
+included, is imported when this module loads, so nothing is imported once the units stop and the
+checkout moves under the running process.
 """
 
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import secrets
@@ -27,6 +30,7 @@ import signal
 import sqlite3
 import stat
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -84,6 +88,8 @@ _LAST_FINISHED_SQL = (
 )
 # How long a read of the release record waits while a writer keeps it out, before it refuses.
 _BUSY_TIMEOUT_MS = 1000
+# The host lock that run and recover share, a file in the root home (see _locked).
+_LOCK = ".release.lock"
 
 
 class _UnreadableRecord(Exception):
@@ -217,7 +223,9 @@ def run(batch_id: int | None = None) -> int:
     release unit gives it, the run releases only that batch, and refuses and writes nothing unless
     it is the accepted batch a run takes first: a restart of the unit never takes another batch.
     A batch the record shows releasing or failed, whose release stopped midway, goes straight to
-    ``recover`` instead (card 7).
+    ``recover`` instead (card 7). The run holds the host lock from before its first read of the
+    record until it ends (see _locked): while another run or recovery holds it, the run refuses
+    at once and writes nothing.
 
     Mark the batch releasing with both versions, fetch NEW and save the named configuration
     snapshot, and run prepare's preflight. A pause already in place, or a failed guard other than
@@ -238,8 +246,13 @@ def run(batch_id: int | None = None) -> int:
     """
     for name in [name for name in os.environ if name.startswith("HERMES_KANBAN")]:
         del os.environ[name]
+    return _locked(_run, batch_id)
+
+
+def _run(batch_id: int | None) -> int:
+    """``run`` under the host lock."""
     if batch_id is not None and _unfinished(batch_id):
-        return recover(batch_id)
+        return _recover(batch_id)
     inputs = _inputs(batch_id)
     if isinstance(inputs, int):  # refused before anything was written
         return inputs
@@ -469,18 +482,25 @@ def recover(batch_id: int) -> int:
     """Bring the platform back from a release of ``batch_id`` that stopped midway (card 7), to
     exactly PREV or exactly NEW with a passing readback, and never forward.
 
-    As the run does, first remove every HERMES_KANBAN variable. A batch that is not releasing or
-    failed refuses. Past three attempts the host is not asked: the outcome stays failed and
-    recovery exits cleanly, so the release unit is not started again. Otherwise count the attempt,
-    run the runner's recover with the stored versions (S-B) and the saved configuration snapshot
-    (S-C), and record the outcome. After a passing readback, lift only the release's own pause,
-    the one with its reason and a token. An owner's pause stays; a failed recovery keeps any pause.
+    As the run does, first remove every HERMES_KANBAN variable, then take the host lock: while
+    another run or recovery holds it, recovery refuses at once and writes nothing. A batch that is
+    not releasing or failed refuses. Past three attempts the host is not asked, nor when the count
+    begin_recovery returns is past three: the outcome stays failed and recovery exits cleanly, so
+    the release unit is not started again. Otherwise count the attempt, run the runner's recover
+    with the stored versions (S-B) and the saved configuration snapshot (S-C), and record the
+    outcome. After a passing readback, lift only the release's own pause, the one with its reason
+    and a token. An owner's pause stays; a failed recovery keeps any pause.
 
     Returns 0 when the batch was released, and once its third attempt failed; 1 otherwise, and 1
     when the pause cannot be read or the release's own pause is still in place after its removal.
     """
     for name in [name for name in os.environ if name.startswith("HERMES_KANBAN")]:
         del os.environ[name]
+    return _locked(_recover, batch_id)
+
+
+def _recover(batch_id: int) -> int:
+    """``recover`` under the host lock, which ``run`` holds too when it recovers a batch."""
     found = _root_settings()
     if isinstance(found, int):
         return found
@@ -512,6 +532,10 @@ def recover(batch_id: int) -> int:
             attempt = release_ledger.begin_recovery(conn, batch_id)["recovery_attempts"]
         except (ValueError, sqlite3.Error) as error:
             return _refuse(f"batch {batch_id} could not begin its recovery ({error})")
+        if attempt > _RECOVERY_ATTEMPTS:  # the count its own write returned: the host is not asked
+            release_ledger.finish_release(conn, batch_id, outcome="failed")
+            print(_CAPPED.format(batch_id, _RECOVERY_ATTEMPTS))
+            return 0
         print(
             f"Batch {batch_id} stopped midway: recovery attempt {attempt} of"
             f" {_RECOVERY_ATTEMPTS}, PREV {pins.prev}, NEW {pins.new}"
@@ -551,6 +575,36 @@ def recover(batch_id: int) -> int:
         print(_CAPPED.format(batch_id, _RECOVERY_ATTEMPTS))
         return 0
     return 0 if outcome == "released" else 1
+
+
+def _locked(command: Callable[[Any], int], batch_id: int | None) -> int:
+    """``command(batch_id)`` under the host lock that ``run`` and ``recover`` share: an exclusive
+    flock on _LOCK in the root home, taken before the command reads or writes the release record
+    and held until it returns; the process's exit lets go of it too. While another run or recovery
+    holds it, the command refuses at once and writes nothing. The lock file is removed before the
+    lock is let go, so the root home keeps no file of it; a command that locked a file removed in
+    the meantime refuses too."""
+    path = get_default_hermes_root() / _LOCK
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as error:
+        return _refuse(
+            f"the release lock {path} could not be opened ({type(error).__name__}: {error})"
+        )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        held = os.path.samestat(os.fstat(fd), os.stat(path))
+    except (BlockingIOError, FileNotFoundError):
+        held = False
+    if not held:
+        os.close(fd)
+        return _refuse(f"another release run or recovery holds the release lock {path}")
+    try:
+        return command(batch_id)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        os.close(fd)
 
 
 def start(batch_id: int) -> int:
