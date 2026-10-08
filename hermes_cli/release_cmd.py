@@ -276,13 +276,18 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
     # by design: the owner page then shows the platform running, and the owner can pause again.
     # The removal is read back, and never tried again.
     state = estop.get_state()
-    lift = outcome != "failed" and _token() == token
+    own = _final_token()
+    lift = outcome != "failed" and own == token
     if lift:
         estop.disengage()
     print(f"Batch {batch_id} {_OUTCOMES[outcome]}.")
+    after = _final_token() if lift else own
+    if after is _UNREADABLE:  # the release cannot know whether its own pause is still in place
+        print("The pause could not be read: the platform may still be paused by this release.")
+        return 1
     if state is not None and not lift:
         print(f"The platform stays paused ({state['reason'] or 'no reason given'}).")
-    elif lift and _token() == token:  # the removal failed: the release's own pause is in place
+    elif lift and after == token:  # the removal failed: the release's own pause is in place
         print(
             f"The platform is still paused ({reason}): the release could not remove its pause"
             f" at {estop.sentinel_path()}."
@@ -379,6 +384,25 @@ def _token() -> str | None:
     with contextlib.suppress(OSError, ValueError, AttributeError):
         return json.loads(estop.sentinel_path().read_text(encoding="utf-8")).get("release_token")
     return None
+
+
+_UNREADABLE = object()  # the pause sentinel may exist but cannot be read
+
+
+def _final_token() -> object:
+    """The release token for the final removal, which must tell an unreadable sentinel from an
+    absent one: None when there is no sentinel or it carries no token (an owner's pause),
+    _UNREADABLE when it cannot be read, otherwise the token."""
+    try:
+        text = estop.sentinel_path().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _UNREADABLE
+    with contextlib.suppress(ValueError):
+        data = json.loads(text)
+        return data.get("release_token") if isinstance(data, dict) else None
+    return None  # not the release's own sentinel, which is always written whole
 
 
 def _hold(token: str, stopped: bool = False) -> None:
