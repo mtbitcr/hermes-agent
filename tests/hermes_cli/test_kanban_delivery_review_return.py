@@ -1,0 +1,235 @@
+"""The review return: a published head H whose required review cards are all done, and on which the reviewer
+bot's latest review of one of them requests changes, returns its work to the source card's builder through one
+continuation card, its branch at H. Real boards and git; GitHub is the real transport with only its exchange and
+App token replaced by a table (the world of test_kanban_delivery_auto_merge.py), so every call passes the allowlist."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from tests.hermes_cli.test_kanban_delivery import (  # noqa: F401  (board is a fixture)
+    IMPLEMENTER, _approve, _git, board,
+)
+from tests.hermes_cli.test_kanban_delivery_auto_merge import (  # noqa: F401  (armed is a fixture)
+    OTHER, _arms, _done, _lenses, _published_as, _reviews, armed,
+)
+from tests.hermes_cli.test_kanban_delivery_github import REPO
+from tests.hermes_cli.test_kanban_delivery_publish_step import _events, _tick
+from tests.hermes_cli.test_kanban_delivery_review_cards import (  # noqa: F401  (world is a fixture)
+    _cards, _raw, _ready, _state, world,
+)
+
+# The source card's continuation: its task_links child that is none of its review cards.
+CONTINUED = ("SELECT * FROM tasks WHERE id IN (SELECT child_id FROM task_links WHERE parent_id = ?) "
+             "AND idempotency_key IS NULL")
+KEPT = ("owned_paths", "risk_tier", "execution_tier", "requires_review")
+
+
+def _run(db, card, started, *findings):
+    """A finished run of ``card`` that recorded ``findings``, as kanban_complete's metadata records them."""
+    _raw(db, "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at, metadata) "
+         "VALUES (?, 'raphael-verifier', 'done', 'completed', ?, ?, ?)",
+         card, started, started + 1, json.dumps({"findings": list(findings)}))
+
+
+def _returned(kb, tid):
+    return [payload for kind, payload in _events(kb, tid)
+            if kind == "delivery_review_waiting" and payload["code"] == "review_returned"]
+
+
+def _branches(repo):
+    return _git(repo, "branch", "--list", "wt/*")
+
+
+def _changes_requested(armed):
+    """H's cards done after their recorded runs; the bot's latest review on H of R12 requests changes, as R12's
+    own handback recorded, and that of R15 approves H after an earlier request. The title has an internal prefix."""
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head = _ready(armed)
+    _raw(db, "UPDATE tasks SET title = 'B03 — build feature' WHERE id = ?", tid)
+    _tick(kb)
+    cards = {card["responsibility"]: card["id"] for card in _cards(kb)}
+    _run(db, cards["R12"], 100, "an older finding")
+    _run(db, cards["R12"], 200, "src/impl/feature.py: validate the input", {"severity": "high", "problem": "no check"})
+    _run(db, cards["R15"], 300, "a correctness note")
+    _done(db)
+    _raw(db, "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'changes_requested', 0)", cards["R12"])
+    _reviews(gh, ("CHANGES_REQUESTED", head, cards["R15"]), ("APPROVED", head, cards["R15"]),
+             ("CHANGES_REQUESTED", head, cards["R12"]))
+    return tid, head, cards
+
+
+def test_a_returned_review_creates_one_claimable_continuation_with_its_findings_and_branch_at_h(armed):
+    """Required behaviors 1 and 3 to 5: review_returned once for H and one ready continuation for the builder,
+    with the source's paths, tiers and review requirement and the returned card's latest findings, its branch
+    at H; nothing is sent to GitHub, a second pass makes nothing, and the claim's recorded base is H."""
+    from hermes_cli.owner_workspace import owner_title
+
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head, cards = _changes_requested(armed)
+
+    _tick(kb)
+
+    (card,) = _raw(db, CONTINUED, tid)
+    (source,) = _raw(db, "SELECT * FROM tasks WHERE id = ?", tid)
+    assert _returned(kb, tid) == [{"delivery_id": 1, "head": head, "pull_request_number": 41,
+                                   "code": "review_returned", "cards": [cards["R12"]], "rework": card["id"]}]
+    assert (card["assignee"], card["status"], card["title"]) == (IMPLEMENTER, "ready", owner_title(source["title"]))
+    assert (source["title"], card["title"]) == ("B03 — build feature", "build feature")
+    assert [card[key] for key in KEPT] == [source[key] for key in KEPT] == ['["src/impl"]', 2, None, 1]
+    assert f"head {head} of pull request 41" in card["body"]
+    assert f"Review card {cards['R12']}:\nsrc/impl/feature.py: validate the input\n" in card["body"]
+    assert '"problem": "no check"' in card["body"] and "an older finding" not in card["body"]
+    assert f"Review card {cards['R15']}:" not in card["body"] and "a correctness note" not in card["body"]
+    assert _git(repo, "rev-parse", f"refs/heads/wt/{card['id']}") == head
+    assert gh["writes"] == [] and {method for method, _ in gh["calls"]} == {"GET"}
+    assert _state(kb, head) == "review_cards_created"
+    events = _events(kb, tid)
+
+    _tick(kb)
+
+    assert (len(_raw(db, CONTINUED, tid)), _events(kb, tid), gh["writes"]) == (1, events, [])
+    (root / "profiles" / IMPLEMENTER).mkdir(parents=True)
+    _tick(kb)
+    (claimed,) = _raw(db, CONTINUED, tid)
+    assert (claimed["id"], claimed["status"], claimed["base_commit"]) == (card["id"], "running", head)
+    assert _git(Path(claimed["workspace_path"]), "rev-parse", "HEAD") == head
+    assert (_events(kb, tid), gh["writes"]) == (events, [])
+
+
+def test_the_findings_are_bounded_to_8000_characters_in_all(armed):
+    """Required behavior 3: two returned cards' 6,000 characters each are cut to 8,000 in all, the first whole."""
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head = _ready(armed)
+    _tick(kb)
+    cards = {card["responsibility"]: card["id"] for card in _cards(kb)}
+    _run(db, cards["R15"], 100, "¶" * 6000)
+    _run(db, cards["R12"], 100, "§" * 6000)
+    _done(db)
+    _reviews(gh, *[("CHANGES_REQUESTED", head, card) for card in cards.values()])
+
+    _tick(kb)
+
+    (card,) = _raw(db, CONTINUED, tid)
+    assert [payload["cards"] for payload in _returned(kb, tid)] == [[cards["R15"], cards["R12"]]]
+    findings = card["body"][card["body"].index(f"Review card {cards['R15']}:"):]
+    assert len(findings) == 8000 and findings.count("¶") == 6000 and 0 < findings.count("§") < 2000
+
+
+@pytest.mark.parametrize("case", ["approved", "approved_after_changes", "changes_by_another_account"])
+def test_an_approving_review_creates_no_continuation(armed, case):
+    """Safety rule 4: the bot's latest review of each card approves H, also after its earlier request for
+    changes, and another account's request counts for nothing: H arms once, and nothing returns."""
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head = _ready(armed)
+    _tick(kb)
+    _done(db)
+    security = {card["responsibility"]: card["id"] for card in _cards(kb)}["R12"]
+    earlier = [("CHANGES_REQUESTED", head, security)] if case == "approved_after_changes" else []
+    later = [("CHANGES_REQUESTED", head, security, "someone")] if case == "changes_by_another_account" else []
+    _reviews(gh, *earlier, *_lenses(kb, head), *later)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_raw(db, CONTINUED, tid), _returned(kb, tid), _branches(repo)) == ([], [], "")
+    assert [body["variables"]["expectedHeadOid"] for body in _arms(gh)] == [head]
+
+
+@pytest.mark.parametrize("case", ["card_open", "moved", "closed"])
+def test_nothing_returns_while_a_card_is_open_or_after_the_pull_request_leaves_h(armed, case):
+    """Required behavior 1 and safety rule 1: a card still open, or the pull request read again off H or
+    closed, returns nothing; a later pass with every card done and H open returns the work once."""
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head, cards = _changes_requested(armed)
+    if case == "card_open":
+        _raw(db, "UPDATE tasks SET status = 'ready' WHERE id = ?", cards["R15"])
+    else:
+        gh["hooks"]["GET"] = lambda: gh["ended"].update({41: False}) if case == "closed" else gh.update(pull_head=OTHER)
+
+    _tick(kb)
+
+    assert (_raw(db, CONTINUED, tid), _returned(kb, tid), _branches(repo), gh["writes"]) == ([], [], "", [])
+    if case != "card_open":
+        assert gh["calls"][-2:] == [("GET", f"/repos/{REPO}/pulls/41/reviews"), ("GET", f"/repos/{REPO}/pulls/41")]
+    _done(db)
+    gh.update(pull_head=None, ended={})
+    _tick(kb)
+    _tick(kb)
+    assert len(_raw(db, CONTINUED, tid)) == len(_returned(kb, tid)) == 1
+
+
+@pytest.mark.parametrize("fails", ["branch", "record"])
+def test_no_partial_state_survives_a_failure_between_the_reservation_and_the_action(armed, monkeypatch, fails):
+    """Safety rule 3: git refuses the card's branch, or the return's record fails after the card and its branch
+    were made: the pass leaves no record, no card and no branch. The next pass returns the work once."""
+    from hermes_cli import kanban_delivery
+
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head, cards = _changes_requested(armed)
+    run_git, waiting, seen = kanban_delivery._run_git, kanban_delivery._waiting, []
+
+    def refused(workdir, *args):
+        return subprocess.CompletedProcess(args, 128) if args[:1] == ("branch",) else run_git(workdir, *args)
+
+    def failing(conn, row, code, **details):
+        if code != "review_returned":
+            return waiting(conn, row, code, **details)
+        seen.append(_branches(repo))
+        raise RuntimeError("the record failed")
+
+    monkeypatch.setattr(kanban_delivery, *(("_run_git", refused) if fails == "branch" else ("_waiting", failing)))
+
+    _tick(kb)
+
+    assert (_raw(db, CONTINUED, tid), _returned(kb, tid), _branches(repo)) == ([], [], "")
+    assert len(seen) == (fails == "record") and all(seen)  # the branch existed when the record failed
+    monkeypatch.setattr(kanban_delivery, "_run_git", run_git)
+    monkeypatch.setattr(kanban_delivery, "_waiting", waiting)
+    _tick(kb)
+    _tick(kb)
+    (card,) = _raw(db, CONTINUED, tid)
+    assert len(_returned(kb, tid)) == 1 and _git(repo, "rev-parse", f"refs/heads/wt/{card['id']}") == head
+
+
+def test_the_continuations_own_delivery_closes_the_earlier_pull_request(armed):
+    """The continuation, claimed at H, built on and published as pull request 42, closes pull request 41 of H
+    once through the merged replacement step, and nothing is armed."""
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head, cards = _changes_requested(armed)
+    _tick(kb)
+    (root / "profiles" / IMPLEMENTER).mkdir(parents=True)
+    _tick(kb)
+    (card,) = _raw(db, CONTINUED, tid)
+    workspace = Path(card["workspace_path"])
+    (workspace / "src" / "impl" / "feature.py").write_text("ok = 3\n", encoding="utf-8")
+    _git(workspace, "commit", "-qam", "fix: validate the input")
+    continued = _git(workspace, "rev-parse", "HEAD")
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, card["id"], summary="validated the input",
+                         expected_run_id=kb.get_task(conn, card["id"]).current_run_id)
+        assert _approve(kb, conn, card["id"]) is True
+    finally:
+        conn.close()
+    _published_as(db, gh, card["id"], continued, 42)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert [write for write in gh["writes"] if write[0] == "PATCH"] == [
+        ("PATCH", f"/repos/{REPO}/pulls/41", {"state": "closed"})]
+    assert [(p["pull_request_number"], p["replaced_by"]) for kind, p in _events(kb, tid)
+            if kind == "delivery_replaced"] == [(41, card["id"])]
+    assert (_state(kb, head), _arms(gh), len(_returned(kb, tid))) == ("replaced", [], 1)

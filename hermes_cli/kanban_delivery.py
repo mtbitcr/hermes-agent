@@ -21,9 +21,10 @@ whether the approved head becomes the delivery's one pull request.
 :func:`review_step`, run by the same step, waits for CI on each published head:
 on green it creates that head's review cards; when a required check is red it
 names the failed tests and reruns the failed jobs once if ``decide_rerun``
-allows it, or else returns the work once to its builder with one rework item,
-and a later pass reads CI again. :func:`arm_step` then arms GitHub
+allows it, or else returns the work once to its builder through one continuation
+card, and a later pass reads CI again. :func:`arm_step` then arms GitHub
 auto-merge once on each head whose required review cards are done and approve it,
+returns the work of each head whose review requests changes through that same card,
 and closes once each pull request a rework card replaced; GitHub does the merge.
 :func:`merge_step` reads each armed pull request, and once GitHub shows it merged
 into main adds the merge to the release decision through
@@ -947,6 +948,12 @@ _RED_REWORK_BODY = (
     "and the delivery returned the work to its builder ({reason}: {detail}). {tests} "
     "The job's CI log has the complete list."
 )
+_FINDINGS_MAX = 8000  # required behaviour 3: a review return's findings, 8,000 characters in all
+_REVIEW_RETURN_BODY = (
+    "Rework of {source}: the review of head {head} of pull request {number} on the code host requested changes "
+    "on review cards {cards}, and the delivery returned the work to its builder. Continue from head {head}. "
+    "The findings each returned review card's latest run recorded:\n{findings}"
+)
 
 
 def _recorded(conn: sqlite3.Connection, source: str, code: str) -> list:
@@ -989,11 +996,11 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
     """A red required check on H: ``decide_rerun``, given the latest jobs of H's run and the failed tests
     each failed slice names, either reruns the failed jobs once, recorded as red_check_rerun before the
     rerun calls are sent and as red_check_rerun_outcome with their answers after them, or returns the
-    work: red_check_returned and one rework item for the builder, once for H, also when a rerun call was
+    work: red_check_returned and one continuation card for the builder, once for H, also when a rerun call was
     refused (rerun_refused) or got no answer (rerun_unknown). Nothing is recorded or sent unless the pull
     request, read after H's run, jobs and annotations, is still open at H. Until GitHub shows a newer
     attempt than the accepted rerun, the pass waits. Returns the outcome recorded, if any."""
-    from hermes_cli.kanban_delivery_github import GitHubTransport
+    from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head = row["source_task_id"], row["pull_request_head"]
     with kb.connect_closing(db_path=db_path) as conn:
@@ -1014,7 +1021,7 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
     code = "red_check_rerun" if decision.allowed else "red_check_returned"
     tests = [test for job in jobs for test in job.get("failed_tests") or () if isinstance(test, str)]
     ids = sorted({match["job_id"] for match in decision.matches})
-    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+    with _branches_undone() as made, kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or not _unchanged(conn, row, read) or any(
                 record["head"] == head for record in _recorded(conn, source, code)):
             return None
@@ -1022,41 +1029,77 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
             _waiting(conn, row, code, jobs=ids, tests=tests, attempt=attempt)
         else:
             _waiting(conn, row, code, reason=decision.code, tests=tests,
-                     rework=_rework_item(conn, db_path, row, decision, tests))
+                     rework=_continuation(conn, db_path, row, _red_body(row, decision, tests), made))
     if not decision.allowed:
         return code
     rerun = GitHubTransport("rerun_flaky", repository)  # sent once: only by the pass that recorded the rerun
     statuses = [_sent(rerun, "request", "POST", f"/repos/{repository}/actions/jobs/{job}/rerun")["status"]
                 for job in ids]
     reason = "rerun_refused" if set(statuses) - {201, None} else "rerun_unknown" if None in statuses else None
-    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):  # owner rule 2: once for H, in this pass
+    returns = False
+    with contextlib.suppress(GitHubTransportError, PublishRefused):  # safety rule 1: H read again before the card
+        returns = bool(reason) and _open_at_head(github, repository, row)
+    # owner rule 2: once for H, in this pass
+    with _branches_undone() as made, kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         _waiting(conn, row, "red_check_rerun_outcome", jobs=ids, statuses=statuses)
-        if reason:
+        if returns:
             refusal = Decision(False, reason, f"the rerun calls of jobs {ids} were answered {statuses} (None: no answer)")
             _waiting(conn, row, "red_check_returned", reason=reason, tests=tests,
-                     rework=_rework_item(conn, db_path, row, refusal, tests))
-    return "red_check_returned" if reason else code
+                     rework=_continuation(conn, db_path, row, _red_body(row, refusal, tests), made))
+    return "red_check_returned" if returns else code
 
 
-def _rework_item(conn: sqlite3.Connection, db_path: Path, row: dict, decision, tests: list) -> str:
-    """H's one rework item for the source card's builder, made the way the review handback makes its
-    follow-up: a triage child of the source in its project, recorded on the source under the red check's
-    own identity of the source, H and "red check" (owner rule 3), so only an item of that identity is
-    reused and a review follow-up of the source and H stays as it is."""
+def _red_body(row: dict, decision, tests: list) -> str:
+    """A red check continuation's body: H, the pull request, the reason and the failed tests as CI named them."""
+    named = f"CI named these failed tests: {', '.join(tests)}." if tests else "No failed test was named."
+    return _RED_REWORK_BODY.format(source=row["source_task_id"], head=row["pull_request_head"],
+                                   number=row["pull_request_number"], reason=decision.code,
+                                   detail=decision.detail, tests=named)
+
+
+@contextlib.contextmanager
+def _branches_undone():
+    """The branches a pass makes in its write transaction, deleted again when the pass fails before that
+    transaction commits (safety rule 3: no partial state survives a failure between reservation and action)."""
+    made = []
+    try:
+        yield made
+    except BaseException:
+        for root, branch in made:
+            _run_git(root, "branch", "-D", branch)
+        raise
+
+
+def _continuation(conn: sqlite3.Connection, db_path: Path, row: dict, body: str, made: list) -> str:
+    """H's one continuation card, for a review or a red check return: a task_links child of the source for
+    its builder, with its owned paths, tiers and review requirement, titled through owner_title and recorded
+    under the identity of the source, H and "continuation", so it is reused. Its branch is made at H in the
+    source card's repository before the card commits, so H is its recorded base; ``made`` keeps it for undoing."""
+    from hermes_cli.owner_workspace import owner_title
+
     source, head = row["source_task_id"], row["pull_request_head"]
-    identity = kb._review_followup_identity_key(reviewed_task_id=source, candidate=f"{head} red check")
+    identity = kb._review_followup_identity_key(reviewed_task_id=source, candidate=f"{head} continuation")
     item = kb._recorded_review_followup(conn, source, identity)
     if item is not None:
         return item
-    task = conn.execute("SELECT title, tenant, project_id FROM tasks WHERE id = ?", (source,)).fetchone()
+    task = kb.get_task(conn, source)
     implementer = kb._latest_review_provenance(conn, source)[0]
-    named = f"CI named these failed tests: {', '.join(tests)}." if tests else "No failed test was named."
+    workdir = _repository(task.workspace_path)
+    root = workdir.parent.parent if workdir is not None and workdir.parent.name == ".worktrees" else workdir
+    if root is None:
+        raise PublishRefused("no_repository", f"no repository holds the source card {source}")
     item = kb.create_task(
-        conn, triage=True, tenant=task["tenant"], title=f"Rework: {task['title']}"[:kb._REVIEW_FOLLOWUP_TITLE_MAX_CHARS],
-        body=_RED_REWORK_BODY.format(source=source, head=head, number=row["pull_request_number"],
-                                     reason=decision.code, detail=decision.detail, tests=named),
-        assignee=implementer, parents=[source], board=_board_slug(db_path))
-    conn.execute("UPDATE tasks SET project_id = ? WHERE id = ?", (task["project_id"], item))
+        conn, title=owner_title(task.title), body=body, assignee=implementer, parents=[source], tenant=task.tenant,
+        workspace_kind="worktree", workspace_path=str(root), owned_paths=task.owned_paths,
+        risk_tier=task.risk_tier, execution_tier=task.execution_tier, requires_review=task.requires_review,
+        board=_board_slug(db_path))
+    conn.execute("UPDATE tasks SET project_id = ? WHERE id = ?", (task.project_id, item))
+    branch = kb.get_task(conn, item).branch_name or f"wt/{item}"
+    made.append((root, branch))
+    created = _run_git(root, "branch", branch, head)
+    if created is None or created.returncode != 0:
+        raise PublishRefused("branch_not_made", f"git did not make {branch} at {head}")
+    kb.authorize_executable_transition(conn, item)  # its route, or the card parked with why
     kb._append_event(conn, source, "review_followup_recorded",
                      {"followup_task_id": item, "implementer": implementer, "identity": identity})
     return item
@@ -1137,7 +1180,7 @@ def arm_step(db_path: Path) -> None:
     """Card 5 on the board whose file is ``db_path``: arm GitHub auto-merge once on each
     head whose required review cards are done and approve it, and close once the pull
     request of each head a rework card continues. GitHub does the merge. Raises no error,
-    so the tick goes on."""
+    so the tick goes on. A head whose review requests changes returns to its builder instead."""
     try:
         with kb.connect_closing(db_path=db_path) as conn:
             rows = [dict(row) for row in conn.execute(
@@ -1179,10 +1222,11 @@ def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
         "GROUP BY old.id ORDER BY old.id", (old_id, old_id, _MERGED))]
 
 
-def _approving_cards(conn: sqlite3.Connection, row: dict, read: tuple) -> list:
+def _approving_cards(conn: sqlite3.Connection, row: dict, read: tuple, returned: bool = False) -> list:
     """The review cards the source card's tier requires for the row's head, when the source
     is done at that head and each of them exists, is done and returned no changes; else [].
-    Each is its id, key, creator, status, own head and base, and event revision."""
+    Each is its id, key, creator, status, own head and base, and event revision. With
+    ``returned``, a card that returned changes counts too."""
     source, head = row["source_task_id"], row["pull_request_head"]
     if (read[1], _sha(read[2])) != ("done", head):
         return []
@@ -1194,7 +1238,7 @@ def _approving_cards(conn: sqlite3.Connection, row: dict, read: tuple) -> list:
                           "WHERE idempotency_key = ? AND created_by = ?",
                           (review_key(source, head, responsibility), _REVIEW_CREATOR)).fetchone()
              for responsibility in (_COMBINED if tier < 2 else _SPLIT)]
-    if any(card is None or card["status"] != "done" or conn.execute(
+    if any(card is None or card["status"] != "done" or not returned and conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (card["id"],)).fetchone()
            for card in cards):
         return []
@@ -1209,6 +1253,53 @@ def _lenses_approve(reviews: list, head: str, cards: list) -> bool:
            and review["user"].get("login") == _REVIEWER_BOT]
     return all(found and (found[-1].get("state"), found[-1].get("commit_id")) == ("APPROVED", head) for found in (
         own, *([review for review in own if review.get("body") == f"Review card {card[0]}"] for card in cards)))
+
+
+def _requests_changes(reviews: list, head: str, card: str) -> bool:
+    """Required behaviour 1: the reviewer bot's latest review on H of ``card`` (its first line) requests
+    changes. No other account's review counts, and the bot's later approval stands (safety rule 4)."""
+    own = [review for review in reviews if isinstance(review, dict) and isinstance(review.get("user"), dict)
+           and review["user"].get("login") == _REVIEWER_BOT and review.get("body") == f"Review card {card}"
+           and review.get("commit_id") == head]
+    return bool(own) and own[-1].get("state") == "CHANGES_REQUESTED"
+
+
+def _findings(conn: sqlite3.Connection, cards: list) -> str:
+    """Each returned card's findings, as its latest run recorded them (``findings`` in the run's
+    metadata, as kanban_complete records it), bounded to 8,000 characters in all."""
+    parts = []
+    for card in cards:
+        run = kb.latest_run(conn, card)
+        found = run.metadata.get("findings") if run is not None and isinstance(run.metadata, dict) else None
+        items = found if isinstance(found, list) else [] if found is None else [found]
+        lines = [item if isinstance(item, str) else json.dumps(item, sort_keys=True) for item in items]
+        parts.append("\n".join([f"Review card {card}:", *(lines or ["No findings were recorded."])]))
+    return "\n".join(parts)[:_FINDINGS_MAX]
+
+
+def _return_review(db_path: Path, row: dict, evidence: tuple, github, returned: list) -> Optional[str]:
+    """Required behaviour 1: after every GitHub read the pull request is read again; open at H, one write
+    transaction reads the evidence again, records review_returned once for H and makes H's one continuation
+    card. Nothing is sent to GitHub; the row keeps its state, so a later approval of H by every lens arms it."""
+    from hermes_cli.kanban_delivery_github import GitHubTransportError
+
+    source, head = row["source_task_id"], row["pull_request_head"]
+    with kb.connect_closing(db_path=db_path) as conn:
+        if any(record["head"] == head for record in _recorded(conn, source, "review_returned")):
+            return None  # H's work went back to its builder already
+    try:
+        if not _open_at_head(github, row["repository"], row):
+            return None  # safety rule 1: the pull request left H or closed while its reviews were read
+    except GitHubTransportError as error:
+        raise _transport_refusal(error) from None
+    with _branches_undone() as made, kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if not delivery_settings() or _arm_evidence(conn, row) != evidence or any(
+                record["head"] == head for record in _recorded(conn, source, "review_returned")):
+            return None  # the evidence changed while GitHub was read, or H returned already: nothing is made
+        body = _REVIEW_RETURN_BODY.format(source=source, head=head, number=row["pull_request_number"],
+                                          cards=", ".join(returned), findings=_findings(conn, returned))
+        _waiting(conn, row, "review_returned", cards=returned, rework=_continuation(conn, db_path, row, body, made))
+    return "review_returned"
 
 
 def _sent(github, call, *args, **kwargs) -> dict:
@@ -1227,7 +1318,7 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
     lens. One write transaction then reads the complete evidence again, finds the pull request
     unclaimed and reserves the arm under this attempt. The arm is the one call after it, and
     its answer is written to this attempt only. A full tenth page of reviews that GitHub does not
-    show to be the last refuses H once instead."""
+    show to be the last refuses H once instead, and a review requesting changes returns H (:func:`_return_review`)."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head, number, repository = (row[key] for key in (
@@ -1235,8 +1326,8 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
     with kb.connect_closing(db_path=db_path) as conn:
         evidence = _arm_evidence(conn, row)
         claimed = _claimed(conn, repository, number)
-    if claimed or not evidence[2] or repository not in _policy_repositories() or not delivery_settings():
-        return None  # claimed, a required card is missing, open or returned changes, or no repository recorded
+    if claimed or not evidence[3] or repository not in _policy_repositories() or not delivery_settings():
+        return None  # claimed, a required card is missing or open, or no repository recorded
     reviews, whole = [], False
     try:
         github = GitHubTransport("publish", repository)
@@ -1252,8 +1343,11 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
                 break
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None
-    if whole and not _lenses_approve(reviews, head, evidence[2]):
-        return None  # a lens or the bot's latest review does not approve H
+    returned = [card[0] for card in evidence[3] if whole and _requests_changes(reviews, head, card[0])]
+    if returned:
+        return _return_review(db_path, row, evidence, github, returned)
+    if not evidence[2] or whole and not _lenses_approve(reviews, head, evidence[2]):
+        return None  # a card returned changes, or a lens or the bot's latest review does not approve H
     attempt = secrets.token_hex(8)
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or _arm_evidence(conn, row) != evidence or _claimed(conn, repository, number):
@@ -1282,14 +1376,14 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
 
 def _arm_evidence(conn: sqlite3.Connection, row: dict) -> tuple:
     """All the arm stands on, read at once: the delivery row (its repository receipt, number,
-    head, state and claim), the source card's read and its approving review cards."""
+    head, state and claim), the source card's read, its approving and its done review cards."""
     now = conn.execute(f"SELECT d.*, {_RECEIPT.format('d')} AS repository FROM kanban_deliveries AS d "
                        "WHERE d.id = ?", (row["id"],)).fetchone()
     if now is None or any(now[key] != row[key] for key in (
             "source_task_id", "pull_request_number", "pull_request_head", "pull_request_state", "repository")):
-        return (None, None, [])
+        return (None, None, [], [])
     read = _source_read(conn, row["source_task_id"])
-    return tuple(now), read, _approving_cards(conn, row, read)
+    return tuple(now), read, _approving_cards(conn, row, read), _approving_cards(conn, row, read, returned=True)
 
 
 def _claimed(conn: sqlite3.Connection, repository: str, number: int) -> bool:
