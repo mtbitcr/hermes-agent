@@ -44,9 +44,15 @@ DECISION_ROUTES = tuple(
     f"POST /v1/owner-workspace/decisions/{{decision_ref}}/{action}"
     for action in ("accept", "reject", "defer")
 )
+RELEASE_ROUTES = tuple(
+    f"POST /v1/owner-workspace/release/{{batch_id}}/{action}" for action in ("accept", "defer", "start")
+)
 # The default profile's other probed routes, and the Decisions feed the owner app reads.
-OTHER_ROUTES = ("GET /v1/owner-workspace/decisions", "POST /v1/runs", "POST /v1/runs/{run_id}/approval")
+OTHER_ROUTES = (
+    "GET /v1/owner-workspace/decisions", "POST /v1/runs", "POST /v1/runs/{run_id}/approval",
+) + RELEASE_ROUTES
 [DECISIONS] = [probe for probe in watch.PROBES["default"] if probe.name == "decisions"]
+RELEASE = [probe for probe in watch.PROBES["default"] if "/owner-workspace/release/" in probe.path]
 # The plan's stores, as paths in the home; each board is every kanban.db found there.
 STORES = ("projects.db", "response_store.db", "cron/jobs.json", "cron/executions.db",
           "cron/delivery_records.db")
@@ -316,6 +322,33 @@ async def test_11_control_a_permitted_route_reaches_the_lookup(home, monkeypatch
 
     assert (healthy.status, healthy.code, healthy.outcome) == (404, "decision_not_found", watch.PASS)
     assert entered == [watch._DECISION]
+
+
+@pytest.mark.asyncio
+async def test_release_probes_pass_against_the_real_release_routes(home):
+    """Each release probe gets 400 invalid_argument from the real release route, which refuses the
+    batch id 0 before any read, reservation or action."""
+    assert len(RELEASE) == 3
+    async with listening(home):
+        _settings(home.root, home.port, OTHER_ROUTES + DECISION_ROUTES)
+        sent = [await asyncio.to_thread(_send, probe, DEFAULT_KEY) for probe in RELEASE]
+
+    assert [(r.status, r.code, r.outcome) for r in sent] == [(400, "invalid_argument", watch.PASS)] * 3
+
+
+@pytest.mark.asyncio
+async def test_a_release_route_missing_from_the_allowlist_fails_its_probe(home):
+    """With one release route left out of the permitted list, that route's probe gets 403
+    route_not_allowed and fails, and the other two release probes still pass."""
+    assert len(RELEASE) == 3
+    async with listening(home):
+        for left_out, probe in zip(RELEASE_ROUTES, RELEASE):
+            permitted = tuple(route for route in OTHER_ROUTES if route != left_out)
+            _settings(home.root, home.port, permitted + DECISION_ROUTES)
+            sent = {p.name: await asyncio.to_thread(_send, p, DEFAULT_KEY) for p in RELEASE}
+            assert (sent[probe.name].status, sent[probe.name].code, sent[probe.name].outcome) == (
+                403, "route_not_allowed", watch.FAIL)
+            assert [r.outcome for name, r in sent.items() if name != probe.name] == [watch.PASS] * 2
 
 
 async def _replay(home, *, keep_state=True) -> list:

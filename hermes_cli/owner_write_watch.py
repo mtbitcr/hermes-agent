@@ -124,6 +124,12 @@ PROBES: Dict[str, tuple] = {
               400, message="Invalid owner-workspace authority"),
         Probe("run_approval", "Run approvals (routes 5 to 8)", "POST",
               "/p/default/v1/runs/run_hourlycheck0000/approval", {}, 404, "run_not_found"),
+        Probe("release_accept", "Accepting a release", "POST",
+              "/p/default/v1/owner-workspace/release/0/accept", {}, 400, "invalid_argument"),
+        Probe("release_defer", "Putting off a release", "POST",
+              "/p/default/v1/owner-workspace/release/0/defer", {}, 400, "invalid_argument"),
+        Probe("release_start", "Starting a release", "POST",
+              "/p/default/v1/owner-workspace/release/0/start", {}, 400, "invalid_argument"),
     ),
     "raphael-planner": (
         Probe("planner_turn", "Conversation and automation planning (routes 2, 3)", "POST",
