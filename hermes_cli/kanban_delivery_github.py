@@ -117,12 +117,12 @@ REST_ALLOWLIST = (
     Endpoint("PATCH", "/repos/{repo}/pulls/{number}", ("pull_requests", "write"), body=_close_body),
     # The reviews auto-merge is armed on, read through this same fence.
     Endpoint("GET", "/repos/{repo}/pulls/{number}/reviews", ("pull_requests", "read"), MappingProxyType(_PAGE)),
-    Endpoint("PUT", "/repos/{repo}/pulls/{number}/merge", ("contents", "write")),
-    Endpoint("POST", "/repos/{repo}/pulls/{number}/reviews", ("pull_requests", "write")),
     # T1's one branch read: the commit a head branch holds, and 404 when the branch does not exist.
     Endpoint("GET", "/repos/{repo}/git/ref/heads/{branch}", ("contents", "read")),
     Endpoint("GET", "/repos/{repo}/commits/{sha}/check-runs", ("checks", "read"),
              MappingProxyType({"filter": "latest|all", **_PAGE})),
+    # The failed tests a red slice job names on its own check run (an Actions job's id is its check run's).
+    Endpoint("GET", "/repos/{repo}/check-runs/{id}/annotations", ("checks", "read"), MappingProxyType(_PAGE)),
     Endpoint("GET", "/repos/{repo}/actions/runs", ("actions", "read"),
              MappingProxyType({"head_sha": _SHA.pattern, **_PAGE}), ("head_sha",)),
     Endpoint("GET", "/repos/{repo}/actions/runs/{id}/jobs", ("actions", "read"),
@@ -134,7 +134,8 @@ REST_ALLOWLIST = (
 )
 
 # Fixed fields only: ids, SHAs, refs, states and counts, and of a user only its login (a review's
-# author). Titles, bodies (but a listed review's first line), messages and URLs never pass, nor headers.
+# author). Titles, bodies (but a listed review's first line), messages (but a check run annotation's
+# title and message) and URLs never pass, nor headers.
 _FIELDS = frozenset({
     "id", "number", "name", "state", "status", "conclusion", "merged", "mergeable", "mergeable_state",
     "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app", "object",
@@ -336,6 +337,8 @@ class GitHubTransport:
         if endpoint.template.endswith("/reviews") and method == "GET" and isinstance(value, list):
             return {"status": status, "data": [self._review(review) for review in value],
                     "next_page": paging[0] if paging and isinstance(paging[0], bool) else None}
+        if endpoint.template.endswith("/annotations") and isinstance(value, list):
+            return {"status": status, "data": [self._annotation(annotation) for annotation in value]}
         data = None if value is None else self._project(value)
         if pull and status == 200 and isinstance(data, dict) and isinstance(data.get("head"), dict):
             self._pull = (data.get("number"), data.get("state"), data["head"].get("sha"), data.get("node_id"))
@@ -458,6 +461,11 @@ class GitHubTransport:
         return {"user": {"login": self._project((user if isinstance(user, dict) else {}).get("login"))},
                 "state": self._project(review.get("state")), "commit_id": self._project(review.get("commit_id")),
                 "body": self._project(line)}
+
+    def _annotation(self, annotation) -> dict:
+        """A check run's annotation: its title and message only."""
+        annotation = annotation if isinstance(annotation, dict) else {}
+        return {"title": self._project(annotation.get("title")), "message": self._project(annotation.get("message"))}
 
     def _project(self, value):
         if isinstance(value, dict):

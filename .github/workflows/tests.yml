@@ -127,9 +127,28 @@ jobs:
         # which runs LPT distribution once and passes the file list to each
         # matrix job via --files. Previously each job re-discovered files and
         # re-ran LPT independently — redundant N times.
+        #
+        # A failed slice names its failed tests on this job's own check run,
+        # every annotation under the one fixed title "Failed test" that the
+        # delivery step reads: first the count from the run's summary, then
+        # one annotation per failed test id. GitHub keeps only the first
+        # annotations of each level per step, so the count (a notice) stays
+        # when the list of ids (errors) is cut, and the delivery step then
+        # refuses the rerun because the two disagree.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh --files '${{ matrix.slice.files }}'
+          set +e
+          scripts/run_tests.sh --files '${{ matrix.slice.files }}' 2>&1 | tee "$RUNNER_TEMP/slice.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            count=$(sed -nE 's/^=== Summary: [0-9]+ files, [0-9]+ tests passed, ([0-9]+) failed.*/\1/p' "$RUNNER_TEMP/slice.log" | tail -n 1)
+            echo "::notice title=Failed test::count ${count:-0}"
+            grep -oE '║ FAILED [^ ]+' "$RUNNER_TEMP/slice.log" | cut -d' ' -f3 | sort -u | sed 's/%/%25/g; s/\r/%0D/g' | while read -r test; do
+              echo "::error title=Failed test::$test"
+            done
+          fi
+          exit "$status"
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
