@@ -4,15 +4,18 @@
 service ``hermes-release-BATCH``. A service, not a scope: the user manager forks it in a control
 group of its own, outside the gateway's and the caller's, so the release keeps running while the
 units it restarts stop and start. It is given the user manager's own environment and HERMES_HOME
-at the root home, nothing of the caller's, so no HERMES_KANBAN variable reaches it. It runs
-``release run`` from the root home under the default profile, whatever profile is sticky there,
-and it is collected once it exits, failed or not.
+at the root home, nothing of the caller's; the run removes every HERMES_KANBAN variable from it
+before any other step, so no board context reaches the release. It runs ``release run BATCH``
+from the root home under the default profile, whatever profile is sticky there, and it is
+collected once it exits, failed or not.
 
 A run that exits non-zero, or that a hard kill ends, is started again (Restart=on-failure), at
 most START_LIMIT_BURST starts in all: StartLimitIntervalSec=infinity never lets the count of
 starts reset, so the user manager refuses the next one, and the unit fails and is collected.
-Until card 7 recovers a hard-killed batch, a restarted run of a batch that is still releasing
-refuses through the release record's own rules, and this limit ends the loop.
+Every start runs the same batch, which the run refuses unless it is the accepted batch a run
+takes first, so a restart never reaches another batch. Until card 7 recovers a hard-killed
+batch, a restarted run of a batch that is still releasing refuses, as it is no longer accepted,
+and this limit ends the loop.
 
 Without systemd-run nothing starts, by the rule of update_abort_recovery.
 """
@@ -69,7 +72,7 @@ def busy_units() -> list[tuple[str, str]]:
 
 
 def launch(systemd_run: str, batch_id: int, root: Path) -> None:
-    """Start ``release run`` as the release unit of ``batch_id``, from the root home ``root``.
+    """Start ``release run BATCH`` as the release unit of ``batch_id``, from the root home ``root``.
 
     The user manager makes the unit and starts it in one call, which a unit of that name that is
     still loaded refuses. Raises UnitError when the unit did not start.
@@ -80,6 +83,7 @@ def launch(systemd_run: str, batch_id: int, root: Path) -> None:
         f"--property=StartLimitBurst={START_LIMIT_BURST}",
         f"--working-directory={root}", f"--setenv=HERMES_HOME={root}",
         "--", sys.executable, "-m", "hermes_cli.main", "--profile", "default", "release", "run",
+        str(batch_id),
     )
 
 

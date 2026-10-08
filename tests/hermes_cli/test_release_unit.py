@@ -2,8 +2,10 @@
 own transient user service, hermes-release-BATCH (S-F).
 
 Each test parses the command before anything is patched, then starts a batch under a temporary
-root home. Stand-ins for systemd-run and systemctl, alone on PATH, record every call and give the
-user manager's answers that the test sets; the start's waits run on a fake clock."""
+root home. Stand-ins for systemd-run, systemctl and git, alone on PATH, record every call and give
+the user manager's answers that the test sets; the start's waits run on a fake clock. Given the
+user manager's own environment, the systemd-run stand-in also runs the unit's command, the real
+``release run``, as the user manager would (the owner's rules of round 1)."""
 
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,18 +40,57 @@ WORKER = {
     "HERMES_KANBAN_DB": "/srv/boards/proj-a/kanban.db", "HERMES_KANBAN_BOARD": "proj-a",
     "HERMES_KANBAN_TASK": "t_0badc0de", "HERMES_KANBAN_WORKSPACES_ROOT": "/srv/workspaces",
 }
-# The stand-in behind both names: it logs its name and arguments, then answers from answers.json.
+# The release settings of the host's config.yaml that have no default.
+SETTINGS = {
+    "units": {"sandbox-tunnel": "hermes-sandbox-tunnel"},
+    "health_url": "http://127.0.0.1:8642/health",
+    "workspace_check_url": "http://127.0.0.1:8650/api/projects",
+}
+# The stand-in behind every name: it logs its name and arguments, then answers from answers.json.
+# git logs to git.jsonl with the HERMES_KANBAN variables it was given, answers the checkout's head
+# and fails anything else, so a run that begins fails its fetch and is refused. Given the user
+# manager's environment, systemd-run runs the unit's command in it, with the unit's HERMES_HOME
+# and directory, and starts it again while it fails, up to its start limit, as the user manager
+# does under Restart=on-failure and StartLimitIntervalSec=infinity; each run goes to runs.jsonl.
 STAND_IN = r'''
-import json, sys
+import json, os, subprocess, sys
 from pathlib import Path
 
 top = Path(__file__).parent
 call = [Path(sys.argv[1]).name, *sys.argv[2:]]
+answers = json.loads((top / "answers.json").read_text(encoding="utf-8"))
+if call[0] == "git":
+    board = sorted(name for name in os.environ if name.startswith("HERMES_KANBAN"))
+    with open(top / "git.jsonl", "a", encoding="utf-8") as log:
+        log.write(json.dumps([call, board]) + "\n")
+    if "rev-parse" not in call:
+        sys.exit("fatal: the stand-in git answers rev-parse only")
+    print(answers["head"])
+    sys.exit(0)
 with open(top / "calls.jsonl", "a", encoding="utf-8") as log:
     log.write(json.dumps(call) + "\n")
-answers = json.loads((top / "answers.json").read_text(encoding="utf-8"))
 if call[0] == "systemd-run":
     code, error = answers["launch"]
+    if not code and answers["environment"] is not None:
+        options, command = call[1 : call.index("--")], call[call.index("--") + 1 :]
+        env, cwd, starts = dict(answers["environment"]), None, 1
+        for option in options:
+            name, _, value = option.partition("=")
+            if name == "--setenv":
+                env.update([value.split("=", 1)])
+            elif name == "--working-directory":
+                cwd = value
+            elif value.startswith("StartLimitBurst="):
+                starts = int(value.split("=", 1)[1])
+        for _ in range(starts if "--property=Restart=on-failure" in options else 1):
+            run = subprocess.run(
+                command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                encoding="utf-8", errors="replace", timeout=120,
+            )
+            with open(top / "runs.jsonl", "a", encoding="utf-8") as log:
+                log.write(json.dumps([run.returncode, run.stdout, run.stderr]) + "\n")
+            if run.returncode == 0:
+                break
     sys.stderr.write(error)
     sys.exit(code)
 if "list-units" in call:
@@ -69,14 +111,20 @@ class UserManager:
     def __init__(self, top: Path) -> None:
         self.top = top
 
-    def answer(self, *, launch=(0, ""), units=(), states=("active",)) -> None:
+    def answer(self, *, launch=(0, ""), units=(), states=("active",), environment=None) -> None:
         """systemd-run's exit code and error, the listed release units, and the read-back's
-        answers in turn (the last one stays)."""
-        answers = {"launch": list(launch), "units": list(units), "states": list(states)}
+        answers in turn (the last one stays). Given the user manager's ``environment``, a launch
+        also runs the unit's command in it; git answers the checkout's head with PREV."""
+        answers = {
+            "launch": list(launch), "units": list(units), "states": list(states),
+            "environment": environment, "head": PREV,
+        }
         (self.top / "answers.json").write_text(json.dumps(answers), encoding="utf-8")
 
-    def calls(self) -> list[list[str]]:
-        log = self.top / "calls.jsonl"
+    def calls(self, name: str = "calls.jsonl") -> list[list]:
+        """A stand-in's log in order: the calls to systemd-run and systemctl, or runs.jsonl or
+        git.jsonl."""
+        log = self.top / name
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
     def launches(self) -> list[list[str]]:
@@ -108,12 +156,12 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture
 def manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> UserManager:
-    """systemd-run and systemctl as stand-ins, the only programs on PATH; by default the launch
-    succeeds, no release unit is listed and the unit reads back active."""
+    """systemd-run, systemctl and git as stand-ins, the only programs on PATH; by default the
+    launch succeeds and runs nothing, no release unit is listed and the unit reads back active."""
     script, bin_dir = tmp_path / "stand_in.py", tmp_path / "bin"
     script.write_text(STAND_IN, encoding="utf-8")
     bin_dir.mkdir()
-    for name in ("systemd-run", "systemctl"):
+    for name in ("systemd-run", "systemctl", "git"):
         wrapper = bin_dir / name
         wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I -S "{script}" "$0" "$@"\n')
         wrapper.chmod(0o755)
@@ -148,6 +196,26 @@ def _batch_in(state: str, commit: str = NEW) -> int:
 def _states() -> list[str]:
     with contextlib.closing(ledger.connect()) as conn:
         return [batch["state"] for batch in ledger.list_batches(conn)]
+
+
+def _began() -> list[int]:
+    """The batches whose release began, in order, by the record's own events."""
+    with contextlib.closing(ledger.connect()) as conn:
+        return [row[0] for row in conn.execute(
+            "SELECT batch_id FROM release_events WHERE kind = 'release_began' ORDER BY id"
+        )]
+
+
+def _unit_environment(root: Path, **board: str) -> dict[str, str]:
+    """The user manager's own environment, in which the systemd-run stand-in runs the unit's
+    command: the temporary home, the stand-ins alone on PATH, this tree on PYTHONPATH (the
+    interpreter need not have it installed), and ``board``. The root home gets the release
+    settings a run reads."""
+    (root / "config.yaml").write_text(json.dumps({"release": SETTINGS}), encoding="utf-8")
+    return {
+        "HOME": str(root.parent), "PATH": os.environ["PATH"],
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]), **board,
+    }
 
 
 def _files(top: Path) -> dict[str, tuple[bytes, int]]:
@@ -203,6 +271,7 @@ def test_start_launches_a_transient_user_service(root, manager, monkeypatch, cap
     ])
     assert command == [
         sys.executable, "-m", "hermes_cli.main", "--profile", "default", "release", "run",
+        str(batch_id),
     ]
     assert [arg for arg in launch if "HERMES_KANBAN" in arg] == []
     out = capsys.readouterr().out
@@ -215,7 +284,7 @@ def test_start_refuses_without_systemd_run_and_writes_nothing(
     root, manager, tmp_path, monkeypatch, capsys
 ):
     batch_id = _batch_in("accepted")
-    (tmp_path / "bin" / "systemd-run").unlink()  # PATH holds the stand-in systemctl alone
+    (tmp_path / "bin" / "systemd-run").unlink()  # PATH holds no systemd-run
     before = _files(root.parent)
 
     code, _clock = _start(monkeypatch, batch_id)
@@ -321,3 +390,75 @@ def test_start_reads_back_the_unit_as_active(
     # The batch stays as it was: the start wrote nothing.
     assert _files(root.parent) == before
     assert _states() == ["accepted"]
+
+
+def test_a_release_unit_releases_its_own_batch_and_no_other(root, manager, monkeypatch):
+    """Owner rule 1: the unit runs ``release run BATCH``, so neither its run nor a restart ever
+    takes another accepted batch."""
+    first, second = _batch_in("accepted", _commit("first")), _batch_in("accepted")
+    manager.answer(states=["failed"], environment=_unit_environment(root))
+    from hermes_cli import release_unit
+
+    # The unit of the second batch, launched as the start launches it (the start itself refuses
+    # the second batch at its reads): each of its three starts refuses, writing nothing.
+    release_unit.launch(release_unit.find_systemd_run(), second, root)
+
+    runs = manager.calls("runs.jsonl")
+    assert _began() == [] and _states() == ["accepted", "accepted"]
+    assert [run[0] for run in runs] == [1, 1, 1]
+    assert all(out.startswith(f"Refused: batch {second} is not") for _code, out, _err in runs)
+
+    # The unit of the first batch: its first run begins it and is refused, since the stand-in git
+    # cannot fetch, which folds it; its restarts refuse too, and the second batch stays accepted.
+    code, _clock = _start(monkeypatch, first)
+
+    runs = manager.calls("runs.jsonl")[3:]
+    assert code == 1 and _began() == [first]
+    assert _states() == ["folded", "accepted", "open"]
+    assert [run[0] for run in runs] == [1, 1, 1]
+    assert f"Batch {first} was refused before anything changed" in runs[0][1]
+    assert all(out.startswith(f"Refused: batch {first} is not") for _code, out, _err in runs[1:])
+
+
+def test_start_reports_the_state_the_record_shows_after_a_failed_read_back(
+    root, manager, monkeypatch, capsys
+):
+    """Owner rule 2: the unit's run changed the record before the read-back failed, so the start
+    reports the state the record now shows, and not that the batch was left as it was."""
+    batch_id = _batch_in("accepted")
+    manager.answer(states=["failed"], environment=_unit_environment(root))
+
+    code, clock = _start(monkeypatch, batch_id)
+
+    out = capsys.readouterr().out
+    # The run began the batch and was refused: it is folded, and its change waits in a new batch.
+    assert _began() == [batch_id] and _states() == ["folded", "open"]
+    assert code == 1 and clock.now == pytest.approx(10.0)
+    assert f"batch {batch_id} could not start" in out and "(its last answer: failed)" in out
+    assert "left as it was" not in out
+    assert (
+        f"Batch {batch_id} was accepted before the start; the release record now shows it folded."
+        in out
+    )
+
+
+def test_no_board_variable_reaches_the_release_run(root, manager, tmp_path, monkeypatch):
+    """Owner rule 3: the run removes every HERMES_KANBAN variable of the user manager's
+    environment before any other step, so none reaches it or a process it starts."""
+    batch_id = _batch_in("accepted")
+    board = tmp_path / "board"  # a run that kept HERMES_KANBAN_HOME would read the record there
+    manager.answer(states=["failed"], environment=_unit_environment(
+        root, HERMES_KANBAN_HOME=str(board), HERMES_KANBAN_DB=str(board / "kanban.db"),
+        HERMES_KANBAN_TASK="t_0badc0de", HERMES_KANBAN_FUTURE_FLAG="1",
+    ))
+
+    _start(monkeypatch, batch_id)
+
+    # The run read the root's record and began the batch there; then it read the checkout's
+    # head and fetched NEW, and neither git call was given a HERMES_KANBAN variable.
+    assert _began() == [batch_id]
+    git = manager.calls("git.jsonl")
+    assert [" ".join(call[3:]) for call, _names in git] == [
+        "--no-optional-locks rev-parse --verify HEAD", f"fetch --no-tags origin {NEW}",
+    ]
+    assert [names for _call, names in git] == [[], []]

@@ -18,8 +18,11 @@ def build_release_parser(subparsers) -> None:
     release_subparsers.add_parser(
         "prepare", help="Run every release guard for the accepted batch; writes nothing")
     release_subparsers.add_parser("status", help="Show the waiting batch and the last outcome")
-    release_subparsers.add_parser(
+    run_parser = release_subparsers.add_parser(
         "run", help="Release the accepted batch between a pause and a resume")
+    run_parser.add_argument(
+        "batch", nargs="?", type=int,
+        help="Release only this batch; refused unless it is the accepted batch a run takes first")
     start_parser = release_subparsers.add_parser(
         "start", help="Run the release of one batch as its own user service")
     start_parser.add_argument("batch", type=int, help="The number of the batch to release")
