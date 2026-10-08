@@ -1099,23 +1099,30 @@ def _continued(conn: sqlite3.Connection, source: str, head: str) -> tuple:
 
 
 def _return_branch(db_path: Path, row: dict) -> Optional[tuple]:
-    """Owner rule 2: the repository Git's common directory names for the source card's workspace and H's
-    continuation branch, named from the source card and H only, made there at H before the write transaction
-    or reused when it points at H already; with no such repository nothing is recorded. When the name
-    points at another commit, the pass is refused and records nothing. No branch is ever deleted: a pass
-    stopped before its commit leaves only this branch at H, which the next pass reuses. None when H's
-    continuation is recorded already, as that card has its branch."""
+    """Owner rule 2: H's continuation branch, named from the source card and H only, made at H before the write
+    transaction or reused when it points at H already, in the continuation's repository. By the owner's rule of
+    round 2 that is the primary folder the project registry records for the source card's project, whose origin
+    names the repository the delivery recorded and which holds H. When the folder cannot be read, either fact
+    is false or the name points at another commit, the pass is refused and records nothing. No branch is ever
+    deleted: a pass stopped before its commit leaves only this branch at H, which the next pass reuses. None
+    when H's continuation is recorded already, as that card has its branch."""
+    from hermes_cli import projects_db
+
     source, head = row["source_task_id"], row["pull_request_head"]
-    branch = f"delivery-return/{source}-{head[:12]}"
+    branch, folder = f"delivery-return/{source}-{head[:12]}", None
     with kb.connect_closing(db_path=db_path) as conn:
         if _continued(conn, source, head)[1] is not None:
             return None
-        workdir = _repository(kb.get_task(conn, source).workspace_path)
-    found = _run_git(workdir, "rev-parse", "--path-format=absolute", "--git-common-dir") if workdir else None
-    common = Path(found.stdout.decode().strip()) if found is not None and found.returncode == 0 else None
-    root = common.parent if common is not None and common.name == ".git" else None
-    if root is None:
-        raise PublishRefused("no_repository", f"no repository holds the source card {source}")
+        project = kb.get_task(conn, source).project_id
+        (repository,) = conn.execute(f"SELECT {_RECEIPT.format('d')} FROM kanban_deliveries AS d WHERE d.id = ?",
+                                     (row["id"],)).fetchone()
+    if project:
+        with contextlib.suppress(Exception), projects_db.connect_closing() as registry:  # kb.create_task's registry
+            found = projects_db.get_project(registry, project)
+            folder = found.primary_path if found is not None else None
+    root = Path(folder) if folder and os.path.isabs(folder) else None
+    if root is None or not repository or _origin_repository(root) != repository or not _git_proof(root, head, None)[0]:
+        raise PublishRefused("no_repository", f"the project folder of {source} does not hold {head} of {repository}")
     _run_git(root, "branch", branch, head)  # git refuses a name that exists; the read below decides
     found = _run_git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
     if found is None or found.returncode != 0 or _sha(found.stdout.decode()) != head:
@@ -1127,8 +1134,9 @@ def _continuation(conn: sqlite3.Connection, db_path: Path, row: dict, body: str,
     """H's one continuation card, for a review or a red check return: a task_links child of the source for
     its builder, with its owned paths, tiers, route and review requirement, titled through owner_title and
     recorded under the identity of the source, H and "continuation". Owner rule 3: a recorded one is used for
-    its lifetime, and one not done or archived gets ``body`` as one comment. A new card is made in ``branch``,
-    the repository and branch :func:`_return_branch` made at H, so H is its recorded base."""
+    its lifetime, and one not done or archived gets ``body`` as one comment. A new card is made in the source
+    card's project, which anchors it under the project's primary folder, on ``branch``, the folder and branch
+    :func:`_return_branch` made at H, so H is its recorded base; anchored anywhere else, it refuses the pass."""
     from hermes_cli.owner_workspace import owner_title
 
     source = row["source_task_id"]
@@ -1147,11 +1155,12 @@ def _continuation(conn: sqlite3.Connection, db_path: Path, row: dict, body: str,
                                    task.reasoning_effort, task.execution_tier)
     item = kb.create_task(
         conn, title=owner_title(task.title), body=body, assignee=implementer, parents=[source], tenant=task.tenant,
-        workspace_kind="worktree", workspace_path=str(root), branch_name=name, owned_paths=task.owned_paths,
+        workspace_kind="worktree", project_id=task.project_id, branch_name=name, owned_paths=task.owned_paths,
         risk_tier=task.risk_tier, execution_tier=task.execution_tier, requires_review=task.requires_review,
         provider_override=task.provider_override, model_override=task.model_override,
         reasoning_effort=task.reasoning_effort, model_policy_lock=lock, board=_board_slug(db_path))
-    conn.execute("UPDATE tasks SET project_id = ? WHERE id = ?", (task.project_id, item))
+    if Path(kb.get_task(conn, item).workspace_path or "") != root / ".worktrees" / item:
+        raise PublishRefused("no_repository", f"the project of {source} no longer anchors its cards in {root}")
     kb.authorize_executable_transition(conn, item)  # its route, or the card parked with why
     kb._append_event(conn, source, "review_followup_recorded",
                      {"followup_task_id": item, "implementer": implementer, "identity": identity})

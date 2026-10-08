@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.hermes_cli import test_kanban_delivery_review_cards as review_cards
 from tests.hermes_cli.test_kanban_delivery import (  # noqa: F401  (board is a fixture)
     IMPLEMENTER, _approve, _git, board,
 )
@@ -20,7 +21,7 @@ from tests.hermes_cli.test_kanban_delivery_auto_merge import (  # noqa: F401  (a
 from tests.hermes_cli.test_kanban_delivery_github import REPO
 from tests.hermes_cli.test_kanban_delivery_publish_step import _events, _tick
 from tests.hermes_cli.test_kanban_delivery_review_cards import (  # noqa: F401  (world is a fixture)
-    _cards, _raw, _ready, _source, _state, world,
+    _cards, _raw, _source, _state, world,
 )
 
 # The source card's continuation: its task_links child that is none of its review cards.
@@ -33,6 +34,32 @@ BUILDER = "raphael-claude-worker"
 def _branch(tid, head):
     """Owner rule 2: the continuation's branch, named from the source card id and H only."""
     return f"delivery-return/{tid}-{head[:12]}"
+
+
+def _registered(db, tid, folder, home=None, project="delivery-project"):
+    """The source card of ``project``, whose primary folder in the project registry of ``home`` (the profile's
+    own when None) is ``folder``: the continuation's repository under the owner's rule of round 2."""
+    from hermes_cli import projects_db
+
+    with projects_db.connect_closing(home and home / "projects.db") as registry:
+        if projects_db.get_project(registry, project) is None:
+            projects_db.create_project(registry, name=project, id=project, primary_path=str(folder))
+    _raw(db, "UPDATE tasks SET project_id = ? WHERE id = ?", project, tid)
+
+
+def _ready(world, tier=2, name="feature"):
+    """H published, its source card of the project whose primary folder is the repository."""
+    kb, root, repo, gh = world
+    tid, head = review_cards._ready(world, tier, name)
+    _registered(kb.kanban_db_path(), tid, repo)
+    return tid, head
+
+
+def _clone(repo, name, repository=REPO):
+    """A clone of the repository beside it, so holding H, its origin naming ``repository``."""
+    _git(repo.parent, "clone", "-q", str(repo), name)
+    _git(repo.parent / name, "remote", "set-url", "origin", f"https://github.com/{repository}.git")
+    return repo.parent / name
 
 
 def _governed(kb, tid, tier):
@@ -103,18 +130,31 @@ def _branching(monkeypatch, change):
 
 def _checkout_elsewhere(kb, repo, tid, layout):
     """The source card's workspace: its branch checked out by git outside its repository, at an external path,
-    there advanced one commit past H, or in an external folder named .worktrees. Returns it."""
-    checkout = repo.parent / "elsewhere" / (".worktrees" if layout == "dot_worktrees" else "") / tid
+    there advanced one commit past H, or in an external folder named .worktrees; at an external path or under
+    another clone's .worktrees, then removed by native cleanup with H reachable from a remote-tracking ref; or
+    in the repository after git moved its Git directory to a separate folder. Returns it."""
+    folder = repo.parent / "elsewhere" / (".worktrees" if layout == "dot_worktrees" else "")
+    if layout == "other_clone":
+        folder = _clone(repo, "clone") / ".worktrees"
+    if layout == "separate_git_dir":
+        _git(repo, "init", "-q", "--separate-git-dir", str(repo.parent / "gitdata"))
+        folder = repo / ".worktrees"
+    checkout = folder / tid
     _git(repo, "worktree", "add", str(checkout), _source(kb, tid)["branch_name"])
     _raw(kb.kanban_db_path(), "UPDATE tasks SET workspace_path = ? WHERE id = ?", str(checkout), tid)
     if layout == "advanced":
         _git(checkout, "commit", "--allow-empty", "-qm", "past H")
+    if layout in ("removed", "other_clone"):
+        _git(repo, "update-ref", f"refs/remotes/origin/delivery/{tid}", _git(checkout, "rev-parse", "HEAD"))
+        with kb.connect_closing() as conn:
+            kb._cleanup_workspace(conn, tid)
+        assert not checkout.exists()
     return checkout
 
 
 def _claimed_apart(kb, root, repo, tid, head, source):
     """The kernel claims the continuation in a worktree of its own, not ``source``, on its branch at H in the
-    repository, H its recorded base."""
+    project's primary folder, the repository: Git's common directory is the repository's, H the recorded base."""
     (root / "profiles" / IMPLEMENTER).mkdir(parents=True)
     _tick(kb)
     (claimed,) = _raw(kb.kanban_db_path(), CONTINUED, tid)
@@ -122,6 +162,8 @@ def _claimed_apart(kb, root, repo, tid, head, source):
     assert (claimed["status"], claimed["branch_name"], claimed["base_commit"]) == ("running", _branch(tid, head), head)
     assert workspace.resolve() != source.resolve() and _git(workspace, "rev-parse", "HEAD") == head
     assert _git(repo, "rev-parse", f"refs/heads/{_branch(tid, head)}") == head
+    common = ("rev-parse", "--path-format=absolute", "--git-common-dir")
+    assert _git(workspace, *common) == _git(repo, *common)
 
 
 def test_a_returned_review_creates_one_claimable_continuation_with_its_findings_and_branch_at_h(armed):
@@ -318,11 +360,12 @@ def test_a_governed_sources_continuation_is_claimable_on_its_builders_route(arme
     assert (claimed["branch_name"], _git(Path(claimed["workspace_path"]), "rev-parse", "HEAD")) == (_branch(tid, head), head)
 
 
-@pytest.mark.parametrize("layout", ["external", "advanced", "dot_worktrees"])
+@pytest.mark.parametrize("layout", ["external", "advanced", "dot_worktrees", "removed", "other_clone", "separate_git_dir"])
 def test_a_source_checked_out_outside_its_repository_continues_in_a_worktree_of_its_own(armed, layout):
-    """The source card's checkout is linked from outside its repository, there advanced past H, or in an external
-    folder named .worktrees. The review return finds the repository through git's common directory and makes the
-    branch at H there; the kernel claims the continuation in a worktree of its own on that branch, H its base."""
+    """The source card's checkout is linked from outside its repository, there advanced past H, in an external
+    folder named .worktrees, removed from an external path or from under another clone, or in a repository whose
+    Git directory is separate. The review return makes the branch at H in the primary folder of the source card's
+    project; the kernel claims the continuation in a worktree of its own there on that branch, H its base."""
     kb, root, repo, gh = armed
     tid, head, cards = _changes_requested(armed)
     source = _checkout_elsewhere(kb, repo, tid, layout)

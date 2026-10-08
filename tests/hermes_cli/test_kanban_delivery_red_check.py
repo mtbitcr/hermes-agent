@@ -15,15 +15,16 @@ from tests.hermes_cli.test_kanban_delivery import (  # noqa: F401  (board is a f
     IMPLEMENTER, REVIEWER, _become, _git, _park, _rework, _spawned_worker_env, _write_config, board,
 )
 from tests.hermes_cli.test_kanban_delivery_auto_merge import (  # noqa: F401  (armed is a fixture)
-    OTHER, _done, _reviews, armed,
+    ELSEWHERE, OTHER, _done, _reviews, armed,
 )
 from tests.hermes_cli.test_kanban_delivery_github import REPO
 from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _events, _tick
 from tests.hermes_cli.test_kanban_delivery_review_cards import (  # noqa: F401  (world is a fixture)
-    CHECK, _cards, _project, _published, _raw, _ready, _state, world,
+    CHECK, _cards, _published, _raw, _state, world,
 )
 from tests.hermes_cli.test_kanban_delivery_review_return import (
-    BUILDER, CONTINUED, KEPT, _branch, _branching, _checkout_elsewhere, _claimed_apart, _governed, _run,
+    BUILDER, CONTINUED, KEPT, _branch, _branches, _branching, _changes_requested, _checkout_elsewhere,
+    _claimed_apart, _clone, _governed, _ready, _registered, _run,
 )
 
 FLAKY = ("tests/tools/test_zombie_process_cleanup.py::TestDelegationCleanup::"
@@ -362,11 +363,12 @@ def test_a_governed_sources_red_check_continuation_is_claimable_on_its_builders_
     assert (claimed["branch_name"], _git(Path(claimed["workspace_path"]), "rev-parse", "HEAD")) == (_branch(tid, head), head)
 
 
-@pytest.mark.parametrize("layout", ["external", "advanced", "dot_worktrees"])
+@pytest.mark.parametrize("layout", ["external", "advanced", "dot_worktrees", "other_clone", "separate_git_dir"])
 def test_a_red_check_of_a_source_checked_out_outside_its_repository_continues_in_a_worktree_of_its_own(red, layout):
     """The red check returns the work of a source whose checkout is linked from outside its repository, there
-    advanced past H, or in an external folder named .worktrees: the kernel claims the continuation in a worktree
-    of its own on its branch at H in the repository, H its recorded base."""
+    advanced past H, in an external folder named .worktrees, removed from under another clone, or in a repository
+    whose Git directory is separate: the kernel claims the continuation in a worktree of its own on its branch at
+    H in the primary folder of the source card's project, H its recorded base."""
     kb, root, repo, gh = red
     tid, head = _ready(red)
     gh["tests"] = [UNLISTED]
@@ -375,6 +377,34 @@ def test_a_red_check_of_a_source_checked_out_outside_its_repository_continues_in
     _tick(kb)
 
     _claimed_apart(kb, root, repo, tid, head, source)
+
+
+@pytest.mark.parametrize("project", ["elsewhere", "left"])
+@pytest.mark.parametrize("code", ["review_returned", "red_check_returned"])
+def test_a_project_folder_of_another_repository_or_a_project_gone_refuses_the_return(red, armed, monkeypatch, code,
+                                                                                      project):
+    """Owner rule of round 2: the primary folder of the source card's project holds H, but its origin names another
+    repository of the policy than the delivery's; or the project leaves the registry while the branch is made, so
+    kb.create_task anchors the card elsewhere. The return refuses on every pass: no continuation, no return record
+    and no branch, but for the one made at H before the project left."""
+    kb, root, repo, gh = red
+    db = kb.kanban_db_path()
+    if code == "review_returned":
+        gh["check"] = ("completed", "success")
+    tid, head = _changes_requested(red)[:2] if code == "review_returned" else _ready(red)
+    gh["tests"] = [UNLISTED]
+    folder = _clone(repo, "clone", ELSEWHERE)
+    if project == "elsewhere":
+        _registered(db, tid, folder, project="elsewhere-project")
+    else:
+        _branching(monkeypatch, lambda: _raw(root / "projects.db", "DELETE FROM projects WHERE id = 'delivery-project'"))
+
+    _tick(kb)
+    _tick(kb)
+
+    left = _branch(tid, head) if project == "left" else ""
+    assert (_raw(db, CONTINUED, tid), _waited(kb, tid, code), _branches(folder), _branches(repo)) == ([], [], "", left)
+    assert gh["reruns"] == []
 
 
 @pytest.mark.parametrize("left", ["ready", "archived", "done"])
@@ -429,6 +459,7 @@ def test_a_red_check_makes_its_own_continuation_beside_a_done_review_follow_up(r
     (followup,) = _raw(db, REWORK)
     assert followup["status"] == "done"
     _published(kb, repo, gh, tid, head)
+    _registered(db, tid, repo)
     gh["tests"] = [UNLISTED]
 
     _tick(kb)
@@ -478,7 +509,7 @@ def test_the_work_returns_on_the_ticked_board_under_the_worker_environment(red, 
     _write_config(profile_home, enabled=True)
     tid, head = _approved(kb, repo, "beta", board="other")
     _published(kb, repo, gh, tid, head, board="other")
-    _project(other_db, tid)
+    _registered(other_db, tid, repo, profile_home)  # the registry of the worker's own profile home
     conn = kb.connect(board="proj-a")
     try:
         claimed = kb.claim_task(conn, kb.create_task(conn, title="plain work", assignee=IMPLEMENTER))
