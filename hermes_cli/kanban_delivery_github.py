@@ -80,31 +80,18 @@ class Endpoint(NamedTuple):
 
 _TOKEN_ENDPOINT = Endpoint("POST", "/app/installations/{installation}/access_tokens", None)
 
-# GitHub's REST interface has no call that arms auto-merge, so this fixed mutation is the one GraphQL
-# document there is: a merge commit, only while the pull request still holds the head the caller names.
-# Only GitHubTransport.arm_auto_merge sends it, with variables it builds: request() never reaches it.
-AUTO_MERGE_MUTATION = (
-    "mutation($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) { enablePullRequestAutoMerge(input: "
-    "{pullRequestId: $pullRequestId, expectedHeadOid: $expectedHeadOid, mergeMethod: MERGE}) { clientMutationId } }")
-_NODE_ID = re.compile(r"[A-Za-z0-9_=-]{1,100}")
-
-
-def _arm_body(body) -> bool:
-    variables = body.get("variables") if isinstance(body, dict) else None
-    return (isinstance(body, dict) and body.keys() == {"query", "variables"} and body["query"] == AUTO_MERGE_MUTATION
-            and isinstance(variables, dict) and variables.keys() == {"pullRequestId", "expectedHeadOid"}
-            and isinstance(variables["pullRequestId"], str) and bool(_NODE_ID.fullmatch(variables["pullRequestId"]))
-            and _is_sha(variables["expectedHeadOid"]))
-
 
 def _close_body(body) -> bool:
     return isinstance(body, dict) and body == {"state": "closed"}
 
 
-GRAPHQL_ALLOWLIST = (Endpoint("POST", "/graphql", ("pull_requests", "write"), body=_arm_body),)
+def _merge_body(body) -> bool:
+    return (isinstance(body, dict) and body.keys() == {"sha", "merge_method"} and _is_sha(body["sha"])
+            and body["merge_method"] == "merge")
+
 
 # The plan's endpoint list and nothing else: no protection, rules, settings, hooks, collaborators,
-# keys or installation management, and no other GraphQL. Commit statuses are left out by the owner's call:
+# keys or installation management, and no GraphQL. Commit statuses are left out by the owner's call:
 # the required checks of both repositories are check runs and the App holds no commit-statuses
 # permission, so the transport offers no statuses read and a later merge fence takes an empty
 # statuses list.
@@ -115,7 +102,9 @@ REST_ALLOWLIST = (
     Endpoint("GET", "/repos/{repo}/pulls/{number}", ("pull_requests", "read")),
     # The close of a pull request a rework card replaced: its state, and no other field.
     Endpoint("PATCH", "/repos/{repo}/pulls/{number}", ("pull_requests", "write"), body=_close_body),
-    # The reviews auto-merge is armed on, read through this same fence.
+    # The merge, as a merge commit, of a pull request at exactly its approved head: that sha and method only.
+    Endpoint("PUT", "/repos/{repo}/pulls/{number}/merge", ("contents", "write"), body=_merge_body),
+    # The reviews a merge is decided on, read through this same fence.
     Endpoint("GET", "/repos/{repo}/pulls/{number}/reviews", ("pull_requests", "read"), MappingProxyType(_PAGE)),
     # T1's one branch read: the commit a head branch holds, and 404 when the branch does not exist.
     Endpoint("GET", "/repos/{repo}/git/ref/heads/{branch}", ("contents", "read")),
@@ -135,12 +124,11 @@ REST_ALLOWLIST = (
 
 # Fixed fields only: ids, SHAs, refs, states and counts, and of a user only its login (a review's
 # author). Titles, bodies (but a listed review's first line), messages (but a check run annotation's
-# title and message) and URLs never pass, nor headers.
+# title and message, and a merge's) and URLs never pass, nor headers.
 _FIELDS = frozenset({
     "id", "number", "name", "state", "status", "conclusion", "merged", "mergeable", "mergeable_state",
     "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app", "object",
-    "total_count", "check_runs", "workflow_runs", "jobs", "steps", "run_id", "run_attempt",
-    "node_id", "data", "errors", "enablePullRequestAutoMerge", "clientMutationId", "user", "login",
+    "total_count", "check_runs", "workflow_runs", "jobs", "steps", "run_id", "run_attempt", "user", "login",
 })
 _MAX_TEXT = 256
 
@@ -175,8 +163,8 @@ def _names_next_page(link: str | None) -> bool | None:
 
 
 def _exchange(method: str, target: str, authorization: str, payload=None) -> tuple[int, object, bool | None]:
-    """One request to GitHub: the status, the decoded body of a 2xx answer (else None), and whether
-    its Link header names a next page (:func:`_names_next_page`). No header is passed on."""
+    """One request to GitHub: the status, the decoded body of a 2xx answer (else its JSON object, if
+    any), and whether its Link header names a next page (:func:`_names_next_page`). No header is passed on."""
     body = None if payload is None else json.dumps(payload).encode()
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
                "User-Agent": "hermes-kanban-delivery", "Authorization": authorization}
@@ -198,12 +186,14 @@ def _exchange(method: str, target: str, authorization: str, payload=None) -> tup
     # carry the body, which for the token call holds the token.
     if status is None:
         raise GitHubTransportError("network_error")
-    if not 200 <= status < 300 or not raw:
-        return status, None, more  # GitHub's error text and redirect targets are never passed on
+    if not raw:
+        return status, None, more
     try:
         value = json.loads(raw)
     except ValueError:
         value = None
+    if not 200 <= status < 300:  # an error's JSON object; no redirect target, as no Location header is read
+        return status, value if isinstance(value, dict) else None, more
     if not isinstance(value, (dict, list)):
         raise GitHubTransportError("bad_response")
     return status, value, more
@@ -312,12 +302,12 @@ class GitHubTransport:
             get_default_hermes_root() / "secrets" / "github-app" / "raphael-agent-factory.pem")
         self._routes = [(e, _path_pattern(e.template, repository)) for e in REST_ALLOWLIST if e.permission]
         self._token: str | None = None
-        self._pull: tuple | None = None  # number, state, head and node id, as this transport last read them
 
     def request(self, method: str, path: str, *, query=None, body=None) -> dict:
         """Call one allowlisted endpoint. Returns {"status", "data"}, where data holds the fixed
         fields of a 2xx JSON answer and is None for anything else. A listed page of reviews also
-        says whether GitHub names a next page: "next_page" is True, False, or None when unknown."""
+        says whether GitHub names a next page: "next_page" is True, False, or None when unknown.
+        A merge's data, whatever the status, is whether GitHub merged and its message only."""
         endpoint = next((e for e, pattern in self._routes if e.method == method
                          and isinstance(path, str) and pattern.fullmatch(path)), None)
         if endpoint is None:
@@ -331,36 +321,17 @@ class GitHubTransport:
         if endpoint.body is not None and not endpoint.body(body):
             raise GitHubTransportError("body_not_allowed")
         target = f"{path}?{urlencode(values)}" if values else path
-        pull = (method, endpoint.template) == ("GET", "/repos/{repo}/pulls/{number}")
-        self._pull = None if pull else self._pull
         status, value, *paging = _exchange(method, target, f"Bearer {self._installation_token()}", body)
+        if endpoint.template.endswith("/merge"):
+            return {"status": status, "data": self._merge(value)}
+        value = value if 200 <= status < 300 else None  # no other error's body is passed on
         if endpoint.template.endswith("/reviews") and method == "GET" and isinstance(value, list):
             return {"status": status, "data": [self._review(review) for review in value],
                     "next_page": paging[0] if paging and isinstance(paging[0], bool) else None}
         if endpoint.template.endswith("/annotations") and isinstance(value, list):
             return {"status": status, "data": [self._annotation(annotation) for annotation in value]}
         data = None if value is None else self._project(value)
-        if pull and status == 200 and isinstance(data, dict) and isinstance(data.get("head"), dict):
-            self._pull = (data.get("number"), data.get("state"), data["head"].get("sha"), data.get("node_id"))
         return {"status": status, "data": data}
-
-    def arm_auto_merge(self, number: int, head: str) -> dict:
-        """The one GraphQL call: arm auto-merge, a merge commit, on pull request ``number`` of this
-        repository at ``head``, both from its delivery record. The document and its variables are
-        built here, never passed in. Nothing is read or minted here: the mutation goes, with the
-        token this transport's earlier reads minted, only when its latest read of that pull request
-        found it open at ``head``. Returns {"status", "data"} as :meth:`request` does."""
-        endpoint = GRAPHQL_ALLOWLIST[0]
-        if type(number) is not int or number < 1 or not _is_sha(head):
-            raise GitHubTransportError("bad_arm_target")
-        if not _holds(self._permissions, endpoint.permission):
-            raise GitHubTransportError("step_not_permitted")
-        held, state, pulled, node = self._pull or (None, None, None, None)
-        body = {"query": AUTO_MERGE_MUTATION, "variables": {"pullRequestId": node, "expectedHeadOid": head}}
-        if (held, state, pulled) != (number, "open", head) or not endpoint.body(body) or self._token is None:
-            raise GitHubTransportError("pull_request_not_at_head")
-        status, value, *_ = _exchange(endpoint.method, endpoint.template, f"Bearer {self._token}", body)
-        return {"status": status, "data": None if value is None else self._project(value)}
 
     def branch_head(self, branch: str) -> str | None:
         """The commit `branch` holds now, or None when GitHub answers 404: the branch does not exist."""
@@ -466,6 +437,11 @@ class GitHubTransport:
         """A check run's annotation: its title and message only."""
         annotation = annotation if isinstance(annotation, dict) else {}
         return {"title": self._project(annotation.get("title")), "message": self._project(annotation.get("message"))}
+
+    def _merge(self, answer) -> dict:
+        """A merge's answer, refused or not: whether GitHub merged, and its message only."""
+        answer = answer if isinstance(answer, dict) else {}
+        return {"merged": answer.get("merged") is True, "message": self._project(answer.get("message"))}
 
     def _project(self, value):
         if isinstance(value, dict):

@@ -268,7 +268,7 @@ def github(tmp_path):
     key_file.parent.mkdir()
     key_file.write_bytes(_pem(key))
     state = {"public": key.public_key(), "key_file": key_file, "jwts": [], "rejected_jwts": 0,
-             "token_requests": [], "calls": [], "token_reply": "minted"}
+             "token_requests": [], "calls": [], "token_reply": "minted", "merges": []}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -279,6 +279,9 @@ def github(tmp_path):
 
         def do_PATCH(self):
             self._route("PATCH")
+
+        def do_PUT(self):
+            self._route("PUT")
 
         def _reply(self, status, value=None, extra=(), raw=None, cut=0):
             data = raw if raw is not None else b"" if value is None else json.dumps(value).encode()
@@ -350,6 +353,10 @@ def github(tmp_path):
                     return self._reply(200, {"ref": "refs/heads/delivery/card-1", "node_id": TOKEN, "url": TOKEN,
                                              "object": {"sha": HEAD, "type": "commit", "url": TOKEN}})
                 return self._reply(404, {"message": f"Not Found {TOKEN}"})
+            if method == "PUT" and path.endswith("/merge"):  # each merge's body kept; the head has moved on
+                state["merges"].append(body)
+                return self._reply(409, {"message": f"Head branch was modified. Review and try the merge again. {TOKEN}",
+                                         "documentation_url": f"https://docs.example/{TOKEN}"})
             return self._reply(200, {})
 
         def log_message(self, *args):
@@ -1033,17 +1040,17 @@ def test_commit_statuses_are_refused_before_any_socket_or_token(monkeypatch, tmp
     assert opened == []
 
 
-def test_the_annotations_read_is_the_one_new_call_and_the_unused_merge_and_review_posts_are_gone(github, monkeypatch):
+def test_the_annotations_read_is_the_one_new_call_and_the_unused_review_post_is_gone(github, monkeypatch):
     """The red check card adds one read: the annotations of one check run in the bound repository, with
     checks read, each annotation's title and message only. The owner decisions of 2026-10-04 removed the
-    unused REST merge and review post, so no step reaches them, and every other path and method near the
+    unused review post, so no step reaches it, and every other path and method near the
     new read stays refused before any token or socket."""
     mod = _transport_module(monkeypatch, github)
     entries = {(e.method, e.template) for e in mod.REST_ALLOWLIST}
     assert ("GET", "/repos/{repo}/check-runs/{id}/annotations") in entries
-    assert not entries & {("PUT", "/repos/{repo}/pulls/{number}/merge"), ("POST", "/repos/{repo}/pulls/{number}/reviews")}
+    assert ("POST", "/repos/{repo}/pulls/{number}/reviews") not in entries
     path = f"/repos/{REPO}/check-runs/9/annotations"
-    outside = [("PUT", f"/repos/{REPO}/pulls/7/merge"), ("POST", f"/repos/{REPO}/pulls/7/reviews"),
+    outside = [("POST", f"/repos/{REPO}/pulls/7/reviews"),
                ("GET", f"/repos/{SIBLING}/check-runs/9/annotations"), ("GET", f"/repos/{REPO}/check-runs/09/annotations"),
                ("GET", f"/repos/{REPO}/check-runs/x/annotations"), ("GET", f"{path}/1"), ("GET", f"{path}/"),
                ("GET", f"/repos/{REPO}/check-runs/9"), ("GET", f"/repos/{REPO}/check-suites/9/annotations"),
@@ -1138,36 +1145,41 @@ def test_branch_head_is_none_when_github_answers_404(github, monkeypatch):
     assert github["calls"] == [("GET", f"/repos/{REPO}/git/ref/heads/delivery/card-2")]
 
 
-@pytest.mark.parametrize("read, sends", [({"state": "open", "head": {"sha": HEAD}}, True), (None, False),
-                                         ({"state": "closed", "head": {"sha": HEAD}}, False),
-                                         ({"state": "open", "head": {"sha": "f" * 40}}, False)])
-def test_the_arm_reads_nothing_and_sends_only_on_the_transports_own_read_of_the_open_head(monkeypatch, read, sends):
-    """Owner rule 2 of round 2: the arm makes no read and mints no token. It sends the one mutation, with the
-    token the transport's earlier reads minted, only when its own read of the pull request showed it open at
-    the head. A reviews read keeps each review's author login, state, commit and body's first line only."""
+def test_a_reviews_read_keeps_each_reviews_author_login_state_commit_and_first_line_only(monkeypatch):
     mod = _module()
-    sent, mints = [], []
-    answers = {f"/repos/{REPO}/pulls/41": dict(read or {}, number=41, node_id="PR_kw"),
-               f"/repos/{REPO}/pulls/41/reviews": [{"id": 3, "state": "APPROVED", "commit_id": HEAD, "html_url": STRAY,
-                                                    "body": "Review card t_1 \r\nfine", "user": {"login": "b", "id": 9}}]}
-    monkeypatch.setattr(mod, "_exchange", lambda method, target, authorization, payload=None: (
-        sent.append((method, target.split("?")[0], authorization)) or (200, answers.get(target.split("?")[0], {}))))
-    monkeypatch.setattr(mod.GitHubTransport, "_installation_token", lambda self: (
-        mints.append(self) or setattr(self, "_token", DUMMY) or DUMMY))
+    review = {"id": 3, "state": "APPROVED", "commit_id": HEAD, "html_url": STRAY, "body": "Review card t_1 \r\nfine",
+              "user": {"login": "b", "id": 9}}
+    monkeypatch.setattr(mod, "_exchange", lambda method, target, authorization, payload=None: (200, [review]))
+    monkeypatch.setattr(mod.GitHubTransport, "_installation_token", lambda self: setattr(self, "_token", DUMMY) or DUMMY)
     github = mod.GitHubTransport("publish", REPO)
     assert github.request("GET", f"/repos/{REPO}/pulls/41/reviews", query={"per_page": 100})["data"] == [
         {"user": {"login": "b"}, "state": "APPROVED", "commit_id": HEAD, "body": "Review card t_1"}]
-    if read is not None:
-        github.request("GET", f"/repos/{REPO}/pulls/41")
-    reads = len(sent)
 
-    if sends:
-        github.arm_auto_merge(41, HEAD)
-    for number, head in ((41, BASE), (42, HEAD)) + (() if sends else ((41, HEAD),)):
-        with pytest.raises(mod.GitHubTransportError):
-            github.arm_auto_merge(number, head)
 
-    assert sent[reads:] == ([("POST", "/graphql", f"Bearer {DUMMY}")] if sends else []) and len(mints) == reads
+def test_the_merge_takes_only_its_exact_body_and_passes_on_only_whether_it_merged_and_githubs_message(github,
+                                                                                                    monkeypatch):
+    """Card 5's one write: the merge of a pull request at exactly H, as a merge commit. Its one body is the
+    keys sha and merge_method only, the whole sha 40 lowercase hex and the method merge; any other body is
+    refused before any token or socket, for each step that may write contents. Of GitHub's answer, here a
+    moved head's 409, only whether it merged and its message pass, the token in neither."""
+    mod = _transport_module(monkeypatch, github)
+    path, merge = f"/repos/{REPO}/pulls/7/merge", {"sha": HEAD, "merge_method": "merge"}
+    bodies = [None, {}, {"sha": HEAD}, {"merge_method": "merge"}, dict(merge, commit_title="merged"),
+              *(dict(merge, merge_method=method) for method in ("squash", "rebase", "MERGE", None)),
+              *(dict(merge, sha=sha) for sha in ("g" * 40, HEAD.upper(), "a" * 39, "a" * 41, HEAD + "\n", None, 1,
+                                                 [HEAD]))]
+    for step in ("publish", "merge"):
+        for body in bodies:
+            with pytest.raises(mod.GitHubTransportError) as refused:
+                mod.GitHubTransport(step, REPO, key_path=github["key_file"]).request("PUT", path, body=body)
+            assert refused.value.reason == "body_not_allowed", (step, body)
+    assert github["calls"] == [] and github["token_requests"] == []
+
+    answer = mod.GitHubTransport("merge", REPO, key_path=github["key_file"]).request("PUT", path, body=merge)
+
+    assert github["calls"] == [("PUT", path)] and github["merges"] == [merge]
+    assert (answer["status"], sorted(answer["data"]), answer["data"]["merged"]) == (409, ["merged", "message"], False)
+    assert answer["data"]["message"].startswith("Head branch was modified.") and TOKEN not in repr(answer)
 
 
 def test_the_reviews_read_says_only_whether_github_names_a_next_page(github, monkeypatch):
