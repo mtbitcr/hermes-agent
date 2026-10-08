@@ -2,18 +2,18 @@
 
 The owner reads the waiting batch and the current or last release in plain
 words, and accepts, puts off or starts again without the operator. There is no
-reject. The release record is the authority. It is read only through the
-``release_ledger`` readers, on a read-only connection, so a read changes no
-byte of the live home. Each answer reads first, then takes one reservation,
+reject. The release record is the authority. It is read only through
+``release_cmd._record``, the reader of ``hermes release status``; a read never
+changes the database file. Each answer reads first, then takes one reservation,
 then takes one action. Accept and put off go through the decide step, bound to
 the version and digest the owner was shown: a stale answer records nothing,
 and a repeated one records no second answer. A recorded accept, and start
 again, run ``hermes release start BATCH`` once as a child process of the
 gateway, never the start function inside this process, because the start
 removes variables from its own environment; the start's own checks refuse
-while a release unit is at work. Once the child returns, one more read of the
+while a release unit is at work. After the action, one more read of the
 release record and the release units is the only source of the answer and of
-the decision returned with it; the child's exit code and every earlier read
+the decision returned with it; the request, the exit code and every earlier read
 decide nothing. Each title is shown as ``owner_title`` shows it, the one title
 boundary of every owner surface; the version and digest keep their own fields.
 """
@@ -23,14 +23,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import sqlite3
 import sys
 from typing import Any, Optional
 
 from aiohttp import web
 
 from gateway.platforms.api_server import _openai_error, _owner_workspace_toolset_enabled
-from hermes_cli import release_ledger, release_unit
+from hermes_cli import release_cmd, release_ledger, release_unit
 from hermes_cli.kanban_risk_tier import RISK_NOT_RECORDED
 
 logger = logging.getLogger(__name__)
@@ -69,8 +68,8 @@ _OUTCOMES = {
     "restored": "It was rolled back. Its changes went back to the waiting batch.",
     "refused": "It was refused before anything changed. Its changes went back to the waiting batch.",
 }
-# What an answer says. After the start child the final read alone picks it, alike on the accept and
-# the start route; a release that ended answers with its outcome sentence instead.
+# What an answer says. The final read alone picks it, after a put off and after the start child alike
+# on the accept and the start route; a release that ended answers with its outcome sentence instead.
 _ANSWERS = {
     "put_off": "Put off. The batch keeps waiting, and new changes join it.",
     "releasing": "The release is running.",
@@ -104,6 +103,9 @@ def route(adapter: Any, action: str):
                 if err:
                     return err
             return await _answer(request, action, body)
+        except release_cmd._UnreadableRecord as error:  # refused as hermes release status refuses it
+            logger.warning("[api_server] owner release %s refused: %s", action, error)
+            return _refusal(503, "The release record could not be read.", "release_record_unreadable")
         except Exception:
             logger.exception("[api_server] owner release %s failed", action)
             return _refusal(
@@ -141,7 +143,7 @@ async def _answer(request: web.Request, action: str, body: dict[str, Any]) -> we
     # One readback, for the answer and the decision it returns, so the two cannot disagree.
     batches, busy = await asyncio.to_thread(_read)
     if action == "defer":
-        answer, message = "put_off", _ANSWERS["put_off"]
+        answer, message = _after_put_off(batch_id, batches, busy)
     else:  # accept and start again alike, whatever the start child exited with
         answer, message = _after_start(batch_id, batches, busy)
     return web.json_response({
@@ -176,6 +178,20 @@ def _after_start(
     return ("stopped" if busy == [] else "unreadable"), words
 
 
+def _after_put_off(
+    batch_id: int, batches: list[dict[str, Any]], busy: Optional[list[tuple[str, str]]]
+) -> tuple[str, str]:
+    """The answer after the put off, as (answer, message), from the final read alone.
+
+    Another answer, as an accept, can land before that read; the request then decides nothing.
+    """
+    batch = next(batch for batch in batches if batch["batch_id"] == batch_id)
+    if batch["state"] == "deferred":  # still put off, and waiting
+        return "put_off", _ANSWERS["put_off"]
+    release = _release(batch, busy)  # no longer waiting: the words the decision gives it
+    return release["state"], f"{release['status']} {release['unit']} {release['outcome_text']}"
+
+
 def _refused(action, batch_id, version, digest, batches, busy) -> Optional[tuple[int, str, str]]:
     """Why the reads refuse the answer, as (status, message, code); None when it may go on."""
     if batch_id in _RESERVED:
@@ -199,15 +215,9 @@ def _refused(action, batch_id, version, digest, batches, busy) -> Optional[tuple
 
 
 def _read() -> tuple[list[dict[str, Any]], Optional[list[tuple[str, str]]]]:
-    """Every read: the release record, read-only, and the release units at work (None: unreadable)."""
-    path, batches = release_ledger.ledger_path(), []
-    if path.is_file():  # without a store nothing was merged yet, and none is made here
-        conn = sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True, isolation_level=None, timeout=1.0)
-        conn.row_factory = sqlite3.Row
-        try:
-            batches = release_ledger.list_batches(conn)
-        finally:
-            conn.close()
+    """Every read: the release record as ``hermes release status`` reads it, which refuses a record it
+    cannot read, and the release units at work (None: unreadable)."""
+    batches, _live, _finished = release_cmd._record()
     try:
         busy = release_unit.busy_units()
     except release_unit.UnitError as error:

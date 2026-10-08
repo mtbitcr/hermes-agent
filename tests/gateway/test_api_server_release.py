@@ -8,7 +8,9 @@ release unit or a real ``hermes release start``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -30,6 +32,14 @@ from hermes_cli.owner_workspace import owner_title
 KEY = "sk-owner-secret"
 VIEW = "/v1/owner-workspace/release"
 PAGE_REF = "decisions-page:release"
+UNREADABLE = {
+    "error": {
+        "message": "The release record could not be read.",
+        "type": "invalid_request_error",
+        "param": None,
+        "code": "release_record_unreadable",
+    }
+}
 
 
 @pytest.fixture
@@ -583,3 +593,89 @@ async def test_a_unit_of_another_batch_at_work_answers_another_release_without_s
     assert (release["batch_id"], release["state"]) == (batch["batch_id"], "accepted")
     # No start again is offered while another release is at work.
     assert (release["unit_running"], release["actions"]) == (False, [])
+
+
+@pytest.mark.asyncio
+async def test_a_put_off_while_another_accept_lands_first_answers_from_the_final_snapshot(
+    root, units, monkeypatch
+):
+    _merge("a", "Show the release decision")
+    decide = api_server_release._decide
+
+    def put_off_then_another_accept(*args):
+        decide(*args)  # the put off is recorded
+        _accepted(_ledger(ledger.list_batches)[0])  # an accept lands before the final read
+
+    monkeypatch.setattr(api_server_release, "_decide", put_off_then_another_accept)
+    async with _client() as client:
+        shown = (await (await client.get(VIEW)).json())["waiting"]
+        response = await client.post(f"{VIEW}/{shown['batch_id']}/defer", json=_shown(shown))
+        body = await response.json()
+
+    assert response.status == 200
+    assert _answers(root) == 2
+    assert units.started == []
+    # The final read alone gives the words and the actions: the batch is accepted, never put off.
+    words = "Accepted. Its release has not begun. Its release unit is not running. No outcome yet."
+    assert (body["answer"], body["message"]) == ("accepted", words)
+    assert body["decision"]["waiting"] is None
+    release = body["decision"]["release"]
+    assert (release["batch_id"], release["state"]) == (shown["batch_id"], "accepted")
+    assert (release["unit_running"], release["actions"]) == (False, ["start"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state", ["side-files", "folder", "pipe", "broken-link", "link-to-a-valid-record"]
+)
+async def test_a_record_that_is_not_a_regular_database_file_refuses_in_plain_words(
+    root, units, state
+):
+    path = root / "kanban" / "release_ledger.db"
+    if state == "link-to-a-valid-record":
+        _merge("a", "Show the release decision")
+        path.symlink_to(path.rename(path.with_name("moved.db")))
+    else:
+        path.parent.mkdir()
+    if state == "side-files":  # the database file is gone, and its -wal and -shm files are left
+        for side in ("-wal", "-shm"):
+            Path(f"{path}{side}").write_bytes(b"")
+    elif state == "folder":
+        path.mkdir()
+    elif state == "pipe":
+        os.mkfifo(path)
+    elif state == "broken-link":
+        path.symlink_to(path.with_name("moved.db"))
+    routes = [("GET", VIEW)] + [
+        ("POST", f"{VIEW}/1/{action}") for action in ("accept", "defer", "start")
+    ]
+    client = _client()
+    before = _bytes(root)
+    async with client:
+        for method, route in routes:
+            response = await client.request(method, route, json={"version": 1, "digest": "0" * 64})
+            # A plain refusal, never an empty history.
+            assert (response.status, await response.json()) == (503, UNREADABLE), (method, route)
+
+    assert _bytes(root) == before
+    assert units.started == []
+
+
+@pytest.mark.asyncio
+async def test_a_read_leaves_the_database_file_itself_byte_for_byte_unchanged(root):
+    _merge("a", "Show the release decision")
+    path = root / "kanban" / "release_ledger.db"
+    # The record in WAL mode, as a writer that stopped left it: the last change sits in the -wal alone.
+    with contextlib.closing(sqlite3.connect(path)) as writer:
+        writer.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("SELECT COUNT(*) FROM release_batches").fetchall()  # it now holds the -wal open
+        _merge("b", "Keep the owner page fast")
+    assert Path(f"{path}-wal").stat().st_size > 0
+    before = path.read_bytes()
+    async with _client() as client:
+        waiting = (await (await client.get(VIEW)).json())["waiting"]
+
+    assert waiting["count"] == 2  # the read saw the change in the -wal
+    # The -wal and -shm files may change on a read; the database file itself never does.
+    assert path.read_bytes() == before
