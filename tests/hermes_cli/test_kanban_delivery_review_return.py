@@ -360,6 +360,38 @@ def test_a_governed_sources_continuation_is_claimable_on_its_builders_route(arme
     assert (claimed["branch_name"], _git(Path(claimed["workspace_path"]), "rev-parse", "HEAD")) == (_branch(tid, head), head)
 
 
+@pytest.mark.parametrize("route", ["admitted", "incomplete", "unadmitted", "lock_only"])
+def test_a_governed_sources_continuation_keeps_its_receipt_binding_and_parks_with_why_when_unlockable(armed, route):
+    """Owner rule 3 of round 3: the source card is owner receipt-bound, on its builder's admitted route, on no
+    route at all or on a model not admitted; or it is governed by its lock alone, with no tier. The continuation
+    copies the source's owner_receipt_bound. Locked for its builder, it is ready; when its route cannot be locked,
+    it is created parked with the reason, and the return event names it. A governed source gives no manual card."""
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head, cards = _changes_requested(armed)
+    if route != "incomplete":
+        _governed(kb, tid, "routine")
+    change = {"lock_only": "execution_tier = NULL", "unadmitted": "owner_receipt_bound = 1, model_policy_lock = NULL, "
+              "model_override = 'claude-unadmitted'"}.get(route, "owner_receipt_bound = 1")
+    _raw(db, f"UPDATE tasks SET {change} WHERE id = ?", tid)
+
+    _tick(kb)
+
+    (card,) = _raw(db, CONTINUED, tid)
+    (returned,) = _returned(kb, tid)
+    parked = [json.loads(event["payload"])["detail"] for event in _raw(
+        db, "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'model_route_unapproved'", card["id"])]
+    assert (card["owner_receipt_bound"], returned["rework"]) == (int(route != "lock_only"), card["id"])
+    if route == "admitted":
+        assert (card["status"], card["execution_tier"], parked, "parked" in returned) == ("ready", "routine", [], False)
+        assert kb.policy_lock_error(card["model_policy_lock"], BUILDER, "anthropic", card["model_override"],
+                                    card["reasoning_effort"], "routine") is None
+        return
+    why = {"incomplete": "is incomplete", "unadmitted": "'claude-unadmitted'", "lock_only": "names no admitted"}[route]
+    assert (card["status"], card["block_kind"], card["model_policy_lock"]) == ("blocked", "needs_input", None)
+    assert parked == [returned["parked"]] and returned["parked"].startswith(f"policy-locked route {why}")
+
+
 @pytest.mark.parametrize("layout", ["external", "advanced", "dot_worktrees", "removed", "other_clone", "separate_git_dir"])
 def test_a_source_checked_out_outside_its_repository_continues_in_a_worktree_of_its_own(armed, layout):
     """The source card's checkout is linked from outside its repository, there advanced past H, in an external
@@ -396,6 +428,27 @@ def test_the_branch_named_from_the_source_and_h_is_reused_at_h_and_refuses_elsew
         return
     (card,) = _raw(db, CONTINUED, tid)
     assert card["branch_name"] == _branch(tid, head) and [p["rework"] for p in _returned(kb, tid)] == [card["id"]]
+
+
+@pytest.mark.parametrize("moved", [False, True], ids=["at_h", "moved"])
+def test_the_return_goes_ahead_only_while_its_branch_points_at_h_in_the_write_transaction(armed, monkeypatch, moved):
+    """Owner rule 1 of round 3: the branch proved at H before the write transaction is read once more inside it.
+    Still at H, the return goes ahead and its continuation records H as its expected base from its creation. Moved
+    to another commit after the proof, as the pull request is read again, it refuses: no card and no return on
+    this pass or the next, and the ref stays where it was moved."""
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head, cards = _changes_requested(armed)
+    ref, main = f"refs/heads/{_branch(tid, head)}", _git(repo, "rev-parse", "main")
+    if moved:
+        _branching(monkeypatch, lambda: gh["hooks"].update(PULL=lambda: _git(repo, "update-ref", ref, main)))
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_git(repo, "rev-parse", ref), gh["writes"]) == (main if moved else head, [])
+    based = [card["base_commit"] for card in _raw(db, CONTINUED, tid)]
+    assert (based, len(_returned(kb, tid))) == (([], 0) if moved else ([head], 1))
 
 
 def test_the_continuations_own_delivery_closes_the_earlier_pull_request(armed):

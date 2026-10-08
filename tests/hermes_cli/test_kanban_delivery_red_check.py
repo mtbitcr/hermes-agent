@@ -306,6 +306,42 @@ def test_a_refused_or_unanswered_rerun_returns_the_work_on_a_later_pass(red, mon
     assert (item["status"], item["branch_name"]) == ("ready", _branch(tid, head))
 
 
+@pytest.mark.parametrize("check", [("completed", "success"), ("in_progress", None)], ids=["green", "pending"])
+@pytest.mark.parametrize("answer, reason", [(403, "rerun_refused"), (None, "rerun_unknown")])
+def test_a_recorded_refused_or_unknown_rerun_returns_the_work_whatever_ci_shows_later(red, monkeypatch, answer,
+                                                                                     reason, check):
+    """Owner rule 2 of round 3: the rerun call is refused (403) or unanswered and the pull request read after it
+    fails, so that pass records the rerun's outcome and ends. CI on H then turns green or stays pending: the next
+    passes still record red_check_returned once for H, with that reason and the continuation, and the rerun call
+    is never sent again."""
+    from hermes_cli import kanban_delivery_github as transport
+
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    gh["rerun"] = answer
+    table, read = transport._exchange, []
+
+    def exchange(method, target, authorization, payload=None):
+        if gh["reruns"] and not read and urlsplit(target).path == f"/repos/{REPO}/pulls/41":
+            read.append(target)  # the one read after the rerun call fails
+            raise transport.GitHubTransportError("network_error")
+        return table(method, target, authorization, payload)
+
+    monkeypatch.setattr(transport, "_exchange", exchange)
+    _tick(kb)
+    assert [p["statuses"] for p in _waited(kb, tid, "red_check_rerun_outcome")] == [[answer]]
+    assert (len(read), _waited(kb, tid, "red_check_returned")) == (1, [])
+    gh["check"] = check
+
+    _tick(kb)
+    _tick(kb)
+
+    returned = _waited(kb, tid, "red_check_returned")
+    assert [(p["reason"], p["tests"]) for p in returned] == [(reason, [FLAKY])]
+    assert [card["id"] for card in _raw(kb.kanban_db_path(), CONTINUED, tid)] == [p["rework"] for p in returned]
+    assert gh["reruns"] == [RERUN]
+
+
 @pytest.mark.parametrize("after", ["moved", "closed", "failed"])
 @pytest.mark.parametrize("tests, answer", [([UNLISTED], 201), ([FLAKY], 403), ([FLAKY], None)],
                          ids=["returned", "refused", "unanswered"])
