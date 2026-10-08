@@ -20,10 +20,12 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
+from gateway.platforms import api_server_release
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_cli import release_ledger as ledger
 from hermes_cli import release_unit
 from hermes_cli.kanban_risk_tier import RISK_NOT_RECORDED
+from hermes_cli.owner_workspace import owner_title
 
 KEY = "sk-owner-secret"
 VIEW = "/v1/owner-workspace/release"
@@ -45,13 +47,17 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def units(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Fake release units, and a fake child for every process the gateway starts.
 
-    A child that exits 0 leaves its release unit running, as a real start does.
+    A child that exits 0 leaves its release unit running, as a real start does. Like the real
+    start, a child refuses while a release unit is at work.
     """
     fake = SimpleNamespace(busy=[], exits=[], started=[])
 
     async def child(*argv, **_options):
         fake.started.append(argv)
-        code = fake.exits.pop(0) if fake.exits else 0
+        if fake.busy:  # the start's own check, before it launches anything
+            code = 1
+        else:
+            code = fake.exits.pop(0) if fake.exits else 0
         if code == 0:
             fake.busy.append((release_unit.unit_name(int(argv[-1])), "active"))
         return SimpleNamespace(returncode=code, communicate=_no_output)
@@ -178,7 +184,7 @@ async def test_release_decision_lists_the_waiting_batch_in_plain_words(root):
         "titles": [
             "Show the release decision",
             "Keep the owner page fast",
-            "Fix the start … for … at … in …",
+            "Untitled work item",  # owner_title refuses a title that shows a path, as a whole
         ],
         "count": 3,
         "tier": 2,
@@ -391,3 +397,72 @@ async def test_routes_reach_the_root_release_store_under_a_worker_env(root, unit
     assert units.started == [_start_argv(first["batch_id"])]
     # No byte changed under the root, so no second store sits in the profile home or the board.
     assert _bytes(root) == before
+
+
+@pytest.mark.asyncio
+async def test_a_title_with_a_commit_shaped_word_is_shown_as_owner_title_shows_it(root):
+    # The commit-shaped words of the review. owner_title is the one boundary for a title.
+    words = ["abc1234", "deadbeef", "1A2B3C4D", "1" * 40, "abcdefab" * 5]
+    for word in words:
+        _merge(word, f"Fix release at {word}")
+    async with _client() as client:
+        waiting = (await (await client.get(VIEW)).json())["waiting"]
+
+    assert waiting["titles"] == [owner_title(f"Fix release at {word}") for word in words]
+
+
+@pytest.mark.asyncio
+async def test_accept_while_an_older_unit_is_busy_starts_once_and_answers_its_refusal(root, units):
+    older = _accepted(_merge("a", "Show the release decision"))
+    new = older["members"][-1]["merge_commit"]
+    _ledger(ledger.begin_release, older["batch_id"], prev=_commit("live"), new=new)
+    units.busy = [(release_unit.unit_name(older["batch_id"]), "active")]
+    _merge("b", "Keep the owner page fast")
+    async with _client() as client:
+        shown = (await (await client.get(VIEW)).json())["waiting"]
+        response = await client.post(f"{VIEW}/{shown['batch_id']}/accept", json=_shown(shown))
+        body = await response.json()
+
+    assert response.status == 200
+    states = _store(root, "SELECT id, state FROM release_batches ORDER BY id")
+    assert states == [(older["batch_id"], "releasing"), (shown["batch_id"], "accepted")]
+    # The start ran once, as a child, and its own check refused: another release is at work.
+    assert units.started == [_start_argv(shown["batch_id"])]
+    assert (body["answer"], body["message"]) == (
+        "accepted",
+        "Accepted. Another release is at work; start this one once it ends.",
+    )
+    # The decision returned with the answer shows that release at work.
+    release = body["decision"]["release"]
+    assert (release["batch_id"], release["unit_running"]) == (older["batch_id"], True)
+
+
+@pytest.mark.asyncio
+async def test_accept_as_the_older_release_finishes_starts_once_and_answers_started(
+    root, units, monkeypatch
+):
+    older = _accepted(_merge("a", "Show the release decision"))
+    new = older["members"][-1]["merge_commit"]
+    _ledger(ledger.begin_release, older["batch_id"], prev=_commit("live"), new=new)
+    units.busy = [(release_unit.unit_name(older["batch_id"]), "active")]
+    _merge("b", "Keep the owner page fast")
+    decide = api_server_release._decide
+
+    def decide_as_the_older_release_finishes(*args):
+        decide(*args)
+        _ledger(ledger.finish_release, older["batch_id"], outcome="released")
+        units.busy = []
+
+    monkeypatch.setattr(api_server_release, "_decide", decide_as_the_older_release_finishes)
+    async with _client() as client:
+        shown = (await (await client.get(VIEW)).json())["waiting"]
+        response = await client.post(f"{VIEW}/{shown['batch_id']}/accept", json=_shown(shown))
+        body = await response.json()
+
+    assert response.status == 200
+    # No release was at work once the accept was recorded: the start ran once, and started.
+    assert units.started == [_start_argv(shown["batch_id"])]
+    assert (body["answer"], body["message"]) == ("releasing", "Accepted. The release is running.")
+    release = body["decision"]["release"]
+    assert (release["batch_id"], release["state"]) == (shown["batch_id"], "accepted")
+    assert (release["unit_running"], release["actions"]) == (True, [])

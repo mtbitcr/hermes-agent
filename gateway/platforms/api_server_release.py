@@ -7,11 +7,13 @@ reject. The release record is the authority. It is read only through the
 byte of the live home. Each answer reads first, then takes one reservation,
 then takes one action. Accept and put off go through the decide step, bound to
 the version and digest the owner was shown: a stale answer records nothing,
-and a repeated one records no second answer. Accept and start again run
-``hermes release start BATCH`` as a child process of the gateway, never the
-start function inside this process, because the start removes variables from
-its own environment. Owner text carries no commit id, card id, pull request
-address or path.
+and a repeated one records no second answer. A recorded accept, and start
+again, run ``hermes release start BATCH`` once as a child process of the
+gateway, never the start function inside this process, because the start
+removes variables from its own environment; the start's own checks refuse
+while a release unit is at work. Each title is shown as ``owner_title`` shows
+it, the one title boundary of every owner surface; the version and digest keep
+their own fields.
 """
 
 from __future__ import annotations
@@ -37,11 +39,6 @@ _DECISIONS = {"accept": "accepted", "defer": "deferred"}
 _STARTABLE = ("accepted", "releasing", "failed")
 _BATCH_ID = re.compile(r"[1-9][0-9]{0,17}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-# A word of a title that would show a path, an address, a card id or a commit id.
-_NOT_PLAIN = re.compile(
-    r"[/\\]|#[0-9]|\bt_[0-9a-f]{8}\b|\w{2,}\.[A-Za-z]{1,5}(?!\w)"
-    r"|\b(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b"
-)
 _WAITING = {
     "open": "Waiting for your decision.",
     "deferred": "Put off by you. New changes still join it.",
@@ -130,23 +127,27 @@ async def _answer(request: web.Request, action: str, body: dict[str, Any]) -> we
     try:
         if action != "start":
             await asyncio.to_thread(_decide, batch_id, _DECISIONS[action], version, digest)
-        if action == "defer":
-            answer = "put_off"
-        elif busy:
-            answer = "accepted"
-        else:
-            answer = "releasing" if await _run_start(batch_id) else "could_not_start"
+        # Accept and start again run the start once; its own checks refuse while a release unit is at work.
+        started = action != "defer" and await _run_start(batch_id)
     except PermissionError:  # the decide step refuses a kanban worker
         return _refusal(403, "Only the owner decides a release. Nothing was recorded.", "release_decision_refused")
     except ValueError:  # the batch changed between the reads and the decide step
         return _refusal(409, _CHANGED, "release_changed", _view(*await asyncio.to_thread(_read)))
     finally:
         _RESERVED.discard(batch_id)
+    # One readback, for the answer and the decision it returns, so the two cannot disagree.
+    batches, busy = await asyncio.to_thread(_read)
+    if action == "defer":
+        answer = "put_off"
+    elif started:
+        answer = "releasing"
+    else:  # the start refused while another release is at work, or it could not start
+        answer = "accepted" if action == "accept" and busy else "could_not_start"
     return web.json_response({
         "object": "hermes.owner_workspace.release_answer",
         "answer": answer,
         "message": _ANSWERS[action, answer],
-        "decision": _view(*await asyncio.to_thread(_read)),
+        "decision": _view(batches, busy),
     })
 
 
@@ -249,6 +250,8 @@ def _current(batches: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
 
 
 def _waiting(batch: dict[str, Any]) -> dict[str, Any]:
+    from hermes_cli.owner_workspace import owner_title
+
     members = batch["members"]
     sentence = _TIERS.get(batch["tier"], _TIERS[2])
     if not all(member["tier_recorded"] for member in members):
@@ -256,7 +259,7 @@ def _waiting(batch: dict[str, Any]) -> dict[str, Any]:
     return {
         "batch_id": batch["batch_id"],
         "status": _WAITING[batch["state"]],
-        "titles": [_plain(member["title"]) for member in members],
+        "titles": [owner_title(member["title"]) for member in members],
         "count": len(members),
         "tier": batch["tier"],
         "tier_sentence": sentence,
@@ -279,13 +282,6 @@ def _release(batch: dict[str, Any], busy: Optional[list[tuple[str, str]]]) -> di
         # Start again: an accepted release that could not start, or one that stopped midway.
         "actions": ["start"] if busy == [] and batch["state"] in _STARTABLE else [],
     }
-
-
-def _plain(title: str) -> str:
-    """The title in plain words: a word that would show a path, an address, a card id or a
-    commit id reads as an ellipsis."""
-    words = ["…" if _NOT_PLAIN.search(word) else word for word in title.split()]
-    return re.sub(r"…( …)+", "…", " ".join(words)) or "A change without a title"
 
 
 def _batch_id(request: web.Request) -> Optional[int]:
