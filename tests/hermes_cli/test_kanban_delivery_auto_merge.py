@@ -279,7 +279,9 @@ def test_a_publish_arms_once_on_the_exact_head_and_a_second_pass_makes_no_call(a
     _tick(kb)
     _tick(kb)
 
-    assert (len(gh["calls"]), _events(kb, tid), _state(kb, head)) == (calls, events, "auto_merge_armed")
+    # Card 10: an armed pull request is read once a pass to see whether it merged; nothing else is sent.
+    assert gh["calls"][calls:] == [("GET", f"/repos/{REPO}/pulls/41")] * 2
+    assert (_events(kb, tid), _state(kb, head)) == (events, "auto_merge_armed")
 
 
 @pytest.mark.parametrize("answer, state", [
@@ -365,7 +367,11 @@ def test_every_review_page_is_read_up_to_ten_and_a_longer_history_refuses_h_once
     calls, events, arms, state = len(gh["calls"]), _events(kb, tid), _arms(gh), _state(kb, head)
     _tick(kb)
     assert (_events(kb, tid), _arms(gh), _state(kb, head)) == (events, arms, state)  # nothing more sent or recorded
-    assert (len(gh["calls"]) == calls) is (outcome is not None)  # only a waiting H is read again
+    new = gh["calls"][calls:]
+    if outcome == "armed":  # card 10: an armed pull request is read once a pass to see whether it merged
+        assert new == [("GET", f"/repos/{REPO}/pulls/41")]
+    else:
+        assert (new == []) is (outcome is not None)  # only a waiting H is read again
 
 
 @pytest.mark.parametrize("read", ["PULL", "GET"])  # changed while the pull request is read, or its reviews
@@ -410,7 +416,8 @@ def test_evidence_that_changes_while_github_is_read_sends_no_arm(armed, read, ch
 def test_a_new_head_is_never_pushed_to_an_armed_pull_request_and_stays_parked(armed, ended):
     """Owner rule 4 of round 2: H2, refused once because the pull request of H is armed, stays parked with that
     one refusal, whatever GitHub reports of that pull request and after H2 is approved again: nothing is read,
-    pushed or recorded for it. A later card owns its release."""
+    pushed or recorded for it. A later card owns its release. The armed pull request of H is only read, once a
+    pass, to see whether it merged into main (card 10)."""
     kb, root, repo, gh = armed
     tid, head = _ready(armed, tier=0)
     _tick(kb)
@@ -427,7 +434,11 @@ def test_a_new_head_is_never_pushed_to_an_armed_pull_request_and_stays_parked(ar
     _tick(kb)
     _tick(kb)
 
-    assert gh["calls"] == calls and _state(kb, head) == "auto_merge_armed"
+    new = gh["calls"][len(calls):]
+    assert gh["calls"][:len(calls)] == calls and new and set(new) == {("GET", f"/repos/{REPO}/pulls/41")}
+    # This stand-in's pull answer names no base and no merge commit, so H is never taken as merged into main
+    # and stays armed; tests/hermes_cli/test_release_intake.py covers a merge.
+    assert _state(kb, head) == "auto_merge_armed"
     assert [(p["code"], p["head"]) for kind, p in _events(kb, tid) if kind == "delivery_refused"] == [
         ("auto_merge_armed", second)]
     assert _raw(kb.kanban_db_path(), "SELECT publish_refusal FROM kanban_deliveries WHERE source_head = ?",
