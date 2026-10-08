@@ -944,7 +944,8 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
 _FAILED_TEST, _FAILED_COUNT = "Failed test", re.compile(r"count ([0-9]+)")
 _RED_REWORK_BODY = (
     "Rework of {source}: a required check is red on head {head} of pull request {number} on the code host, "
-    "and the delivery returned the work to its builder ({reason}: {detail}). {tests}"
+    "and the delivery returned the work to its builder ({reason}: {detail}). {tests} "
+    "The job's CI log has the complete list."
 )
 
 
@@ -1049,7 +1050,7 @@ def _rework_item(conn: sqlite3.Connection, db_path: Path, row: dict, decision, t
         return item
     task = conn.execute("SELECT title, tenant, project_id FROM tasks WHERE id = ?", (source,)).fetchone()
     implementer = kb._latest_review_provenance(conn, source)[0]
-    named = f"The failed tests are: {', '.join(tests)}." if tests else "No failed test was named."
+    named = f"CI named these failed tests: {', '.join(tests)}." if tests else "No failed test was named."
     item = kb.create_task(
         conn, triage=True, tenant=task["tenant"], title=f"Rework: {task['title']}"[:kb._REVIEW_FOLLOWUP_TITLE_MAX_CHARS],
         body=_RED_REWORK_BODY.format(source=source, head=head, number=row["pull_request_number"],

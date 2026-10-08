@@ -197,7 +197,8 @@ def test_an_unlisted_failure_returns_the_work_at_once(red):
     assert [(p["reason"], p["tests"], p["rework"]) for p in _waited(kb, tid, "red_check_returned")] == [
         ("not_flaky", [UNLISTED], item["id"])]
     assert (item["assignee"], item["status"]) == (IMPLEMENTER, "triage")
-    assert f"The failed tests are: {UNLISTED}." in item["body"] and head in item["body"]
+    assert head in item["body"] and item["body"].endswith(
+        f"CI named these failed tests: {UNLISTED}. The job's CI log has the complete list.")
     assert _raw(db, "SELECT parent_id FROM task_links WHERE child_id = ?", item["id"]) == [{"parent_id": tid}]
 
 
@@ -245,7 +246,7 @@ def test_a_refused_or_unanswered_rerun_call_returns_the_work_once(red, answer, r
         dict(outcome, code="red_check_rerun_outcome", jobs=[903], statuses=[answer]),
         dict(outcome, code="red_check_returned", reason=reason, tests=[FLAKY], rework=item["id"])]
     assert gh["reruns"] == [RERUN] and item["assignee"] == IMPLEMENTER
-    assert f"The failed tests are: {FLAKY}." in item["body"]
+    assert f"CI named these failed tests: {FLAKY}." in item["body"]
 
 
 def test_a_red_check_makes_its_own_rework_item_beside_a_done_review_follow_up(red):
@@ -274,7 +275,7 @@ def test_a_red_check_makes_its_own_rework_item_beside_a_done_review_follow_up(re
     (item,) = _raw(db, "SELECT * FROM tasks WHERE id = ?", returned["rework"])
     assert [other for other in _raw(db, REWORK) if other["id"] != item["id"]] == [followup]
     assert (item["assignee"], item["status"]) == (IMPLEMENTER, "triage")
-    assert f"The failed tests are: {UNLISTED}." in item["body"]
+    assert f"CI named these failed tests: {UNLISTED}." in item["body"]
     assert _raw(db, IDENTITY, tid, item["id"]) == _red_identity(kb, tid, head)
 
 
@@ -294,7 +295,8 @@ def test_the_count_0_notice_of_a_setup_error_names_no_failed_test(red):
 
     (item,) = _raw(kb.kanban_db_path(), REWORK)
     assert [(p["reason"], p["tests"]) for p in _waited(kb, tid, "red_check_returned")] == [("invalid_fact", [])]
-    assert "No failed test was named." in item["body"] and "count 0" not in item["body"] and gh["reruns"] == []
+    assert item["body"].endswith("No failed test was named. The job's CI log has the complete list.")
+    assert "count 0" not in item["body"] and gh["reruns"] == []
 
 
 def test_the_work_returns_on_the_ticked_board_under_the_worker_environment(red, monkeypatch):
@@ -343,6 +345,6 @@ def test_the_work_returns_on_the_ticked_board_under_the_worker_environment(red, 
     assert [(_raw(db, returned)[0]["n"], _raw(db, rework)[0]["n"]) for db in boards] == [(1, 1), (0, 0), (0, 0)]
     (item,) = _raw(other_db, REWORK)
     assert (item["assignee"], item["project_id"]) == (IMPLEMENTER, "delivery-project")
-    assert f"The failed tests are: {UNLISTED}." in item["body"]
+    assert f"CI named these failed tests: {UNLISTED}." in item["body"]
     assert _raw(other_db, IDENTITY, tid, item["id"]) == _red_identity(kb, tid, head)
     assert gh["reruns"] == [] and not (profile_home / "kanban.db").exists()
