@@ -1,4 +1,5 @@
-"""``hermes release``: check a release before it runs (release card 4), and run it (card 5).
+"""``hermes release``: check a release before it runs (release card 4), run it (card 5), and start
+its run as its own user service (card 6).
 
 ``prepare`` works out PREV and NEW (S-B), builds both live adapters from the ``release`` settings
 (S-E) and asks the host every merged guard, printing each result in plain words. It writes
@@ -6,7 +7,9 @@ nothing to the release state: config.yaml is read as it is on disk, the release 
 read-only, and the guards only read. ``status`` prints the waiting batch and the last
 outcome. ``run`` releases the accepted batch after the same preflight, under the pause (S-A), in
 the calling process: SIGINT or SIGTERM refuses a release until its runner starts; after that, only
-a hard kill ends it, and its recovery belongs to card 7. The release unit (S-F) belongs to card 6.
+a hard kill ends it, and its recovery belongs to card 7. ``start BATCH`` runs ``release run`` for
+that batch as the release unit (S-F), the transient user service of release_unit, so the release
+keeps running when the gateway stops; the start writes nothing to the release state either.
 
 Design rule (K6), as in the runner: everything ``run`` needs is imported when this module loads,
 so nothing is imported once the units stop and the checkout moves under the running process.
@@ -27,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from agent import estop
-from hermes_cli import release_guards, release_ledger
+from hermes_cli import release_guards, release_ledger, release_unit
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     _ENV_REF_RE,
@@ -56,6 +59,8 @@ _REQUIRED = {
 # its placeholder would reach the adapters, and G9 would look for NEW's state snapshot under it.
 _RESOLVED = {**_REQUIRED, "snapshot_dir": "the snapshot directory"}
 _WAITING = {"open": "waiting for the owner's decision", "deferred": "put off by the owner"}
+# The batches start runs: an accepted one, or one whose release began and has not ended (card 7).
+_STARTABLE = ("accepted", "releasing", "failed")
 _OUTCOMES = {
     "released": "was released",
     "restored": "was rolled back; its changes went back to the waiting decision",
@@ -80,7 +85,9 @@ class _UnreadableRecord(Exception):
 
 
 def cmd_release(args) -> int:
-    """``hermes release prepare``, ``hermes release status`` or ``hermes release run``."""
+    """``hermes release prepare``, ``status``, ``run`` or ``start BATCH``."""
+    if args.release_command == "start":
+        return start(args.batch)
     if args.release_command == "run":
         return run()
     return prepare() if args.release_command == "prepare" else status()
@@ -410,6 +417,71 @@ def _hold(token: str, stopped: bool = False) -> None:
     ``token``, is in place."""
     if stopped or _token() != token:
         raise _Stopped("stopped before cutover")
+
+
+def start(batch_id: int) -> int:
+    """Run ``release run`` for ``batch_id`` as its release unit, the transient user service of
+    S-F (card 6). The start writes nothing to the release state: the run in the unit begins the
+    release.
+
+    Every read comes first: systemd-run, the batches in the release record, and the release units
+    the user manager has loaded. A missing systemd-run, a batch that is not accepted, releasing or
+    failed, an accepted batch behind an older accepted one, which a release run releases first,
+    and a release unit at work each refuse. Then one action: systemd-run asks the user manager to
+    make the unit named for the batch and start it, in one call that also reserves the name. The
+    unit is read back until the user manager answers active, for at most
+    release_unit.READBACK_SECONDS; otherwise the release could not start.
+
+    Returns 0 once the unit answers active, 1 otherwise.
+    """
+    systemd_run = release_unit.find_systemd_run()
+    if systemd_run is None:  # fails closed, as update_abort_recovery does
+        return _refuse("systemd-run is missing, so the release cannot run as its own user service")
+    try:
+        batches, _live, _finished = _record()
+    except _UnreadableRecord as error:
+        return _refuse(str(error))
+    state = next((batch["state"] for batch in batches if batch["batch_id"] == batch_id), None)
+    accepted = [batch["batch_id"] for batch in batches if batch["state"] == "accepted"]
+    if state is None:
+        return _refuse(f"there is no batch {batch_id} in the release record")
+    if state not in _STARTABLE:
+        return _refuse(f"batch {batch_id} is {state}, not accepted, releasing or failed")
+    if state == "accepted" and accepted[0] != batch_id:
+        return _refuse(
+            f"batch {batch_id} is accepted after batch {accepted[0]}, which a release run"
+            " releases first"
+        )
+    try:
+        busy = release_unit.busy_units()
+    except release_unit.UnitError as error:
+        return _refuse(f"the release units could not be read ({error})")
+    if busy:
+        return _refuse(*(f"a release is already at work: {unit} is {now}" for unit, now in busy))
+    unit = release_unit.unit_name(batch_id)
+    try:
+        release_unit.launch(systemd_run, batch_id, get_default_hermes_root())
+    except release_unit.UnitError as error:
+        return _could_not_start(batch_id, str(error))
+    answer = release_unit.read_back(batch_id)
+    if answer != "active":
+        return _could_not_start(
+            batch_id,
+            f"the user manager did not answer active for {unit} within"
+            f" {release_unit.READBACK_SECONDS:g} seconds (its last answer: {answer})",
+        )
+    print(
+        f"Started the release of batch {batch_id} as the user service {unit}: the user manager"
+        " answers active."
+    )
+    print(f"Follow it with: journalctl --user -u {unit}")
+    return 0
+
+
+def _could_not_start(batch_id: int, reason: str) -> int:
+    print(f"The release of batch {batch_id} could not start: {reason.rstrip('.')}.")
+    print(f"Batch {batch_id} was left as it was: the start wrote nothing to the release state.")
+    return 1
 
 
 def status() -> int:
