@@ -544,7 +544,7 @@ def _recover(batch_id: int) -> int:
         actions.config_snapshot = pins.new  # the configuration snapshot the release saved (S-C)
         host = _Host(reader, actions, "")
         host.cut_over = True  # the release cut over before it stopped: every action goes through
-        result = release_runner.recover(host, pins)
+        result = release_runner.recover(host, pins, saved=_saved(root, settings, pins.new))
         if result.error:
             print(f"The checked-out version did not read back ({result.error}).")
             for error in result.restore_errors:
@@ -754,12 +754,11 @@ def _adapters(
     An empty ``snapshot_dir`` means release-snapshots under the root home, and the reader's
     named snapshot is NEW (S-C).
     """
-    snapshot_dir = Path(str(settings.get("snapshot_dir") or "").strip() or "release-snapshots")
     shared = {
         "checkout": get_project_root(),
         "root_home": root,
         "units": settings["units"],
-        "snapshot_root": root / snapshot_dir.expanduser(),
+        "snapshot_root": _snapshot_root(root, settings),
     }
     return (
         LiveHostReader(**shared, snapshot_name=new),
@@ -769,6 +768,24 @@ def _adapters(
             workspace_check_url=settings["workspace_check_url"],
         ),
     )
+
+
+def _snapshot_root(root: Path, settings: dict[str, Any]) -> Path:
+    """The snapshot root the adapters share (see _adapters)."""
+    snapshot_dir = Path(str(settings.get("snapshot_dir") or "").strip() or "release-snapshots")
+    return root / snapshot_dir.expanduser()
+
+
+def _saved(root: Path, settings: dict[str, Any], new: str) -> bool:
+    """Whether NEW's configuration snapshot may exist (S-C). The live reader reads one that is
+    empty or cannot be searched as missing, so only lstat finding no such name proves it absent."""
+    try:
+        os.lstat(_snapshot_root(root, settings) / "config" / new)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):  # no proof: the configuration is compared as before
+        pass
+    return True
 
 
 def _record() -> tuple[list[dict[str, Any]], str | None, int | None]:

@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from hermes_cli import release_runner, release_unit
 from hermes_cli.release_guards import Pins
 from hermes_cli.release_runner import PLATFORM_UNITS, SANDBOX_TUNNEL_UNIT
 from hermes_cli.subcommands.release import build_release_parser
+from tests.hermes_cli.test_release_cmd import _root_at, _unprivileged
 
 
 def _commit(label: str) -> str:
@@ -47,6 +49,7 @@ _REPO = Path(__file__).resolve().parents[2]
 # ``hermes release COMMAND BATCH`` in its own process, as _command runs it, on a host where
 # neither version reads back; its last line of output is its host's calls. Given "held", it says
 # ready as it is about to count its recovery attempt, and goes on once its input ends.
+# Given "at-prev", its host is PREV, healthy, with NEW's snapshot as the live reader reads it.
 _PROCESS = (
     "import json, sys\n"
     "import pytest\n"
@@ -57,6 +60,9 @@ _PROCESS = (
     "    print('ready', flush=True)\n"
     "    sys.stdin.read()\n"
     "    return begin(*args)\n"
+    "if sys.argv[1] == 'at-prev':\n"
+    "    saved = t._snapshots(t.Path.home() / '.hermes')\n"
+    "    host = t.FakeHost(head=t.PREV, running=t.PREV, saved=saved)\n"
     "if sys.argv.pop(1) == 'held':\n"
     "    t.ledger.begin_recovery = held\n"
     "code = t._command(pytest.MonkeyPatch(), host, *sys.argv[1:])\n"
@@ -241,16 +247,19 @@ def _at_attempt_two() -> int:
     return batch_id
 
 
-def _process(root: Path, command: str, batch_id: int, held: bool = False) -> subprocess.Popen:
+def _process(
+    root: Path, command: str, batch_id: int, mode: str = "free", user: tuple[int, int] | None = None
+) -> subprocess.Popen:
     """``hermes release COMMAND BATCH`` in its own process (see _PROCESS), on the root home
-    ``root`` and its release record."""
+    ``root`` and its release record, as ``user``'s uid and gid when given."""
+    as_user = {} if user is None else {"user": user[0], "group": user[1], "extra_groups": []}
     return subprocess.Popen(
-        [sys.executable, "-c", _PROCESS, str(Path(__file__).parent), "held" if held else "free",
+        [sys.executable, "-c", _PROCESS, str(Path(__file__).parent), mode,
          command, str(batch_id)],
         cwd=_REPO,
         env={**os.environ, "HOME": str(root.parent), "HERMES_HOME": str(root),
              "PYTHONPATH": str(_REPO), "PYTHONDONTWRITEBYTECODE": "1"},
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **as_user,
     )
 
 
@@ -352,6 +361,7 @@ def test_run_on_a_releasing_batch_recovers_and_resumes(
     """The release unit's ``release run BATCH`` on a releasing batch goes straight to recovery
     with the stored versions, records the outcome and lifts the release's own pause only."""
     batch_id, host = _stopped_midway(pause), host()
+    _snapshots(root, f"config/{NEW}")  # the release published it before its cutover (S-C)
     before = _sentinel()
 
     assert _command(monkeypatch, host, "run", str(batch_id)) == code
@@ -403,6 +413,7 @@ def test_recover_imports_nothing(root, monkeypatch):
     """K6: from the first unit stop to the pause's removal, recovery imports nothing, so no code
     loads from the checkout it moves."""
     batch_id, host = _stopped_midway(), _midway(NEW)
+    _snapshots(root, f"config/{NEW}")
 
     assert _command(monkeypatch, host, "recover", str(batch_id)) == 1
     assert host.calls == RESTORE and _sentinel() is None
@@ -417,7 +428,7 @@ def test_two_processes_never_count_past_three(root, first, second):
     the third attempt, and the count never exceeds three."""
     batch_id = _at_attempt_two()
 
-    with _process(root, first, batch_id, held=True) as waiting:
+    with _process(root, first, batch_id, "held") as waiting:
         assert waiting.stdout.readline() == "ready\n"
         code, _out, calls = _finish(_process(root, second, batch_id))
         first_code, _first_out, first_calls = _finish(waiting)
@@ -434,7 +445,7 @@ def test_a_second_recovery_refuses_at_once_and_writes_nothing(root):
     record, leaves the pause as it was and asks its host nothing."""
     batch_id = _stopped_midway()
 
-    with _process(root, "recover", batch_id, held=True) as waiting:
+    with _process(root, "recover", batch_id, "held") as waiting:
         assert waiting.stdout.readline() == "ready\n"
         before = _files(root)
         code, out, calls = _finish(_process(root, "recover", batch_id))
@@ -534,6 +545,35 @@ def test_a_published_snapshot_of_new_is_still_compared(root, monkeypatch, capsys
     assert (batch["outcome"], batch["recovery_attempts"]) == ("failed", 1)
     assert host.calls == RESTORE and _sentinel() == before
     assert f"(ReadbackFailed: configuration did not hold on {PREV})" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("files", "mode"), [([], 0o755), (["notes.txt"], 0o755), (["config.yaml"], 0)],
+    ids=["empty", "unrelated-files", "unreadable"],
+)
+def test_a_published_snapshot_of_new_read_as_empty_is_still_compared(monkeypatch, files, mode):
+    """Review finding of the earlier pass: NEW's published configuration snapshot is compared as
+    above when the live reader reads it as empty: empty, with no configuration file, or mode 000,
+    read as nobody when the tests run as root, which searches any folder. The outcome is failed."""
+    user = None if mode else _unprivileged()
+    with tempfile.TemporaryDirectory(prefix="release-recover-") as name:
+        top = Path(name)
+        top.chmod(0o755)
+        root = _root_at(top, monkeypatch)
+        batch_id, published = _stopped_midway(), root / "release-snapshots" / "config" / NEW
+        published.mkdir(parents=True)
+        for file in files:
+            (published / file).write_text(yaml.safe_dump({"release": SETTINGS}))
+        if user is not None:
+            for item in [top, *top.rglob("*")]:
+                os.chown(item, *user)
+        before = _sentinel()
+        published.chmod(mode)  # TemporaryDirectory's cleanup undoes it
+        code, out, calls = _finish(_process(root, "recover", batch_id, "at-prev", user))
+        batch = _batch(batch_id)
+        assert (batch["outcome"], batch["recovery_attempts"], code) == ("failed", 1, 1)
+        assert calls == RESTORE and _sentinel() == before
+        assert f"(ReadbackFailed: configuration did not hold on {PREV})" in "\n".join(out)
 
 
 def test_new_is_never_kept_without_its_configuration_snapshot(root, monkeypatch):
