@@ -27,6 +27,10 @@ FLAKY_46 = ("tests/tools/test_zombie_process_cleanup.py::TestDelegationCleanup::
             "test_timed_out_child_keeps_relay_session_until_its_turn_exits")
 FLAKY_100 = ("tests/tui_gateway/test_compute_host_turn_protocol.py::"
              "test_turn_start_streams_deltas_then_turn_end_with_history_identity")
+ROOM_DRIVER = "tests/tui_gateway/test_hosted_room_driver_runtime.py::"
+FLAKY_139 = (ROOM_DRIVER + "test_waiting_room_does_not_block_an_independent_local_room",
+             ROOM_DRIVER + "test_deadline_releases_worker_capacity_for_later_room",
+             ROOM_DRIVER + "test_rotated_bounded_scheduler_eventually_runs_later_room")
 UNLISTED = "tests/tools/test_example.py::test_unlisted"
 SECURITY = "security-reviewer"
 # Test data in the policy file's shape; only test 13 reads the real file.
@@ -395,7 +399,8 @@ def test_policy_file_loads_and_matches_exactly():
     text = Path(fences.__file__).with_name("kanban_delivery_policy.json").read_text(encoding="utf-8")
     loaded = fences.load_policy(text)
     assert loaded.required_checks == {PLATFORM: (GATE,), WORKSPACE: ("quality",)}
-    assert loaded.flaky_tests == {PLATFORM: {FLAKY_46: 46, FLAKY_100: 100}, WORKSPACE: {}}
+    assert loaded.flaky_tests == {PLATFORM: {FLAKY_46: 46, FLAKY_100: 100, **dict.fromkeys(FLAKY_139, 139)},
+                                  WORKSPACE: {}}
     seeded = json.loads(POLICY_TEXT)
     entry = seeded[PLATFORM]
     first = {"test": FLAKY_46, "finding": 46}
