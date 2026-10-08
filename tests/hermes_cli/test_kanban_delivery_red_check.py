@@ -6,12 +6,13 @@ table (the world of test_kanban_delivery_review_cards.py), so every call passes 
 
 from __future__ import annotations
 
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
 
 from tests.hermes_cli.test_kanban_delivery import (  # noqa: F401  (board is a fixture)
-    IMPLEMENTER, _become, _spawned_worker_env, _write_config, board,
+    IMPLEMENTER, REVIEWER, _become, _park, _rework, _spawned_worker_env, _write_config, board,
 )
 from tests.hermes_cli.test_kanban_delivery_github import REPO
 from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _events, _tick
@@ -24,6 +25,8 @@ FLAKY = ("tests/tools/test_zombie_process_cleanup.py::TestDelegationCleanup::"
 UNLISTED = "tests/hermes_cli/test_kanban_db.py::test_no_policy_lists_this_one"
 RERUN = f"/repos/{REPO}/actions/jobs/903/rerun"
 REWORK = "SELECT * FROM tasks WHERE title LIKE 'Rework:%'"
+IDENTITY = ("SELECT json_extract(payload, '$.identity') AS identity FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_followup_recorded' AND json_extract(payload, '$.followup_task_id') = ?")
 
 
 @pytest.fixture
@@ -33,17 +36,20 @@ def red(world, monkeypatch):
     slice 3 (903) failed at its test step, all at gh["attempt"], beside ci.yaml's timing report (904), which
     runs after the summary, at gh["timing"] (status, conclusion). Job 903's check run carries the count
     (gh["count"], else the number of gh["tests"]) and then each of gh["tests"] under the fixed title, beside
-    one annotation of another title. Each rerun call is answered 201 and kept in gh["reruns"]."""
+    one annotation of another title. Each rerun call is kept in gh["reruns"] and answered gh["rerun"] (201),
+    or not at all when None. With gh["closed"], the pull request is closed at H from gh["move_after"] on."""
     kb, root, repo, gh = world
     from hermes_cli import kanban_delivery_github as transport
 
     table = transport._exchange  # the world's: the pull request and H's check runs
     gh.update(check=("completed", "failure"), attempt=1, tests=[FLAKY], count=None, reruns=[],
-              timing=("completed", "success"))
+              timing=("completed", "success"), rerun=201, closed=False)
 
     def exchange(method, target, authorization, payload=None):
         status, value = table(method, target, authorization, payload)
         path, head = urlsplit(target).path, gh["head"]
+        if path == f"/repos/{REPO}/pulls/41" and gh["closed"] and gh["pull_head"]:
+            return 200, dict(value, state="closed", head={"sha": head})
         job = {"head_sha": head, "status": "completed", "conclusion": "failure", "run_attempt": gh["attempt"]}
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs"):
             return 200, {"total_count": 1, "workflow_runs": [{"id": 77, "head_sha": head}]}
@@ -67,7 +73,9 @@ def red(world, monkeypatch):
                           "title": "Process completed with exit code 1.", "message": UNLISTED}]
         if (method, path) == ("POST", RERUN):
             gh["reruns"].append(path)
-            return 201, None
+            if gh["rerun"] is None:  # what the real exchange raises when the call times out
+                raise transport.GitHubTransportError("network_error")
+            return gh["rerun"], None
         return status, value
 
     monkeypatch.setattr(transport, "_exchange", exchange)
@@ -77,6 +85,11 @@ def red(world, monkeypatch):
 def _waited(kb, tid, code, db=None):
     return [payload for kind, payload in _events(kb, tid, db)
             if kind == "delivery_review_waiting" and payload["code"] == code]
+
+
+def _red_identity(kb, tid, head):
+    """Owner rule 3: the red check's rework item has its own identity, of the source card, H and "red check"."""
+    return [{"identity": kb._review_followup_identity_key(reviewed_task_id=tid, candidate=f"{head} red check")}]
 
 
 def test_the_annotations_name_the_failed_tests_of_each_failed_test_job(red, monkeypatch):
@@ -106,8 +119,8 @@ def test_the_annotations_name_the_failed_tests_of_each_failed_test_job(red, monk
 
 def test_only_a_listed_flaky_failure_is_rerun_and_only_once(red):
     """A slice that failed only listed flaky tests: the failed job is rerun once through the rerun call,
-    recorded once for H before it is sent, with no rework item. A pass that still sees the first attempt
-    red sends nothing more, and the green rerun gets H its review cards."""
+    recorded once for H before it is sent and its accepted answer once after, with no rework item. A pass
+    that still sees the first attempt red sends nothing more, and the green rerun gets H its review cards."""
     kb, root, repo, gh = red
     tid, head = _ready(red)
     events = _events(kb, tid)
@@ -119,7 +132,8 @@ def test_only_a_listed_flaky_failure_is_rerun_and_only_once(red):
     assert _events(kb, tid)[len(events):] == [
         ("delivery_review_waiting", dict(outcome, code="red_check_waiting",
                                          check_runs=[{"id": 900, "conclusion": "failure"}])),
-        ("delivery_review_waiting", dict(outcome, code="red_check_rerun", jobs=[903], tests=[FLAKY], attempt=1))]
+        ("delivery_review_waiting", dict(outcome, code="red_check_rerun", jobs=[903], tests=[FLAKY], attempt=1)),
+        ("delivery_review_waiting", dict(outcome, code="red_check_rerun_outcome", jobs=[903], statuses=[201]))]
     assert gh["reruns"] == [RERUN] and _raw(kb.kanban_db_path(), REWORK) == []
     assert set(gh["steps"]) == {"read_checks", "rerun_flaky"}
     gh["check"] = ("completed", "success")
@@ -187,10 +201,107 @@ def test_an_unlisted_failure_returns_the_work_at_once(red):
     assert _raw(db, "SELECT parent_id FROM task_links WHERE child_id = ?", item["id"]) == [{"parent_id": tid}]
 
 
+@pytest.mark.parametrize("tests", [[FLAKY], [UNLISTED]], ids=["rerun", "return"])
+@pytest.mark.parametrize("closed", [False, True], ids=["moved", "closed"])
+@pytest.mark.parametrize("read", ["/actions/runs", "/jobs", "/annotations"])
+def test_nothing_is_recorded_or_sent_when_the_pull_request_leaves_h_during_a_new_read(red, read, closed, tests):
+    """Owner rule 1: the pull request moves off H, or closes at H, during the workflow-runs, the jobs or the
+    annotations read. The pull request, read again after the last of them, stops the pass on the rerun
+    branch and on the return branch: nothing is recorded, sent or made. A later pass reads again."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    gh.update(move_after=read, closed=closed, tests=tests)
+    events = _events(kb, tid)
+
+    _tick(kb)
+
+    assert [payload["code"] for _, payload in _events(kb, tid)[len(events):]] == ["red_check_waiting"]
+    assert [path for _, path in gh["calls"]][-2:] == [f"/repos/{REPO}/check-runs/903/annotations",
+                                                      f"/repos/{REPO}/pulls/41"]
+    assert {method for method, _ in gh["calls"]} == {"GET"} and _raw(kb.kanban_db_path(), REWORK) == []
+    gh.update(move_after=None, pull_head=None, closed=False)
+    _tick(kb)
+    assert len(_waited(kb, tid, "red_check_rerun" if tests == [FLAKY] else "red_check_returned")) == 1
+
+
+@pytest.mark.parametrize("answer, reason", [(403, "rerun_refused"), (None, "rerun_unknown")])
+def test_a_refused_or_unanswered_rerun_call_returns_the_work_once(red, answer, reason):
+    """Owner rule 2: the rerun call is refused (403), or gets no answer (a timeout). It is sent once, after
+    the rerun record; its outcome is recorded once in the same pass, and the work returns once with that
+    reason and one rework item naming the failed test. Later passes send nothing."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    gh["rerun"] = answer
+    events = _events(kb, tid)
+
+    for _ in range(3):
+        _tick(kb)
+
+    (item,) = _raw(kb.kanban_db_path(), REWORK)
+    outcome = {"delivery_id": 1, "head": head, "pull_request_number": 41}
+    assert [payload for _, payload in _events(kb, tid)[len(events):]] == [
+        dict(outcome, code="red_check_waiting", check_runs=[{"id": 900, "conclusion": "failure"}]),
+        dict(outcome, code="red_check_rerun", jobs=[903], tests=[FLAKY], attempt=1),
+        dict(outcome, code="red_check_rerun_outcome", jobs=[903], statuses=[answer]),
+        dict(outcome, code="red_check_returned", reason=reason, tests=[FLAKY], rework=item["id"])]
+    assert gh["reruns"] == [RERUN] and item["assignee"] == IMPLEMENTER
+    assert f"The failed tests are: {FLAKY}." in item["body"]
+
+
+def test_a_red_check_makes_its_own_rework_item_beside_a_done_review_follow_up(red):
+    """Owner rule 3: a review that returned changes on H made its follow-up, which the approval of the
+    unchanged H then closed. The red check on H leaves that item as it is and makes its own, of the
+    source card, H and "red check", naming the failed test."""
+    kb, root, repo, gh = red
+    conn = kb.connect()
+    try:
+        tid, head, _ = _park(kb, conn, repo)
+        review = kb.claim_review_task(conn, tid, claimer=f"{REVIEWER}:1")
+        assert kb.request_changes(conn, tid, reason="tighten it", expected_run_id=review.current_run_id)[0]
+    finally:
+        conn.close()
+    assert _rework(kb, repo, tid, commit=False) == head
+    db = kb.kanban_db_path()
+    (followup,) = _raw(db, REWORK)
+    assert followup["status"] == "done"
+    _published(kb, repo, gh, tid, head)
+    gh["tests"] = [UNLISTED]
+
+    _tick(kb)
+    _tick(kb)
+
+    (returned,) = _waited(kb, tid, "red_check_returned")
+    (item,) = _raw(db, "SELECT * FROM tasks WHERE id = ?", returned["rework"])
+    assert [other for other in _raw(db, REWORK) if other["id"] != item["id"]] == [followup]
+    assert (item["assignee"], item["status"]) == (IMPLEMENTER, "triage")
+    assert f"The failed tests are: {UNLISTED}." in item["body"]
+    assert _raw(db, IDENTITY, tid, item["id"]) == _red_identity(kb, tid, head)
+
+
+def test_the_count_0_notice_of_a_setup_error_names_no_failed_test(red):
+    """Owner rule 4: a pytest setup error fails slice 3 with no failed test, and tests.yml's step then
+    writes only its count notice, "count 0". That is count metadata and never a test id: no test is
+    invented, the unchanged policy refuses the rerun, and the rework body says "No failed test was named."
+    in its place."""
+    kb, root, repo, gh = red
+    workflow = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "tests.yml"
+    assert 'echo "::notice title=Failed test::count ${count:-0}"' in workflow.read_text(encoding="utf-8")
+    tid, head = _ready(red)
+    gh["tests"] = []  # job 903's check run then holds that notice, "count 0", and no test id
+
+    _tick(kb)
+    _tick(kb)
+
+    (item,) = _raw(kb.kanban_db_path(), REWORK)
+    assert [(p["reason"], p["tests"]) for p in _waited(kb, tid, "red_check_returned")] == [("invalid_fact", [])]
+    assert "No failed test was named." in item["body"] and "count 0" not in item["body"] and gh["reruns"] == []
+
+
 def test_the_work_returns_on_the_ticked_board_under_the_worker_environment(red, monkeypatch):
     """The dispatcher's worker environment for proj-a (its board pinned, its card set, a profile home under
     the root) ticks the board other: the root registry and every board still resolve, and the return and
-    its one rework item land on other and on no other board, by a count read past the kernel."""
+    its one rework item, of the red check's own identity (owner rule 3) and naming the failed test, land
+    on other and on no other board, by a count read past the kernel."""
     kb, root, repo, gh = red
     gh["tests"] = [UNLISTED]
     kb.create_board("proj-a")
@@ -230,6 +341,8 @@ def test_the_work_returns_on_the_ticked_board_under_the_worker_environment(red, 
     rework = "SELECT COUNT(*) AS n FROM tasks WHERE title LIKE 'Rework:%'"
     boards = (other_db, own_db, root / "kanban.db")
     assert [(_raw(db, returned)[0]["n"], _raw(db, rework)[0]["n"]) for db in boards] == [(1, 1), (0, 0), (0, 0)]
-    assert [(item["assignee"], item["project_id"]) for item in _raw(other_db, REWORK)] == [
-        (IMPLEMENTER, "delivery-project")]
+    (item,) = _raw(other_db, REWORK)
+    assert (item["assignee"], item["project_id"]) == (IMPLEMENTER, "delivery-project")
+    assert f"The failed tests are: {UNLISTED}." in item["body"]
+    assert _raw(other_db, IDENTITY, tid, item["id"]) == _red_identity(kb, tid, head)
     assert gh["reruns"] == [] and not (profile_home / "kanban.db").exists()

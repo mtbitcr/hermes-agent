@@ -939,8 +939,9 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
 
 
 # The one title tests.yml gives every annotation a failed slice job writes on its own check run: first
-# the count of failed tests ("count N"), then each failed test id. No other annotation is read.
-_FAILED_TEST, _FAILED_COUNT = "Failed test", re.compile(r"count ([1-9][0-9]{0,5})")
+# the count of failed tests ("count N"), then each failed test id. No other annotation is read. Owner
+# rule 4: "count" and a number, 0 included (a setup error's), is the count and never a test id.
+_FAILED_TEST, _FAILED_COUNT = "Failed test", re.compile(r"count ([0-9]+)")
 _RED_REWORK_BODY = (
     "Rework of {source}: a required check is red on head {head} of pull request {number} on the code host, "
     "and the delivery returned the work to its builder ({reason}: {detail}). {tests}"
@@ -986,9 +987,11 @@ def _failed_jobs(github, repository: str, head: str, red: set) -> Optional[list]
 def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: str, policy, red: set):
     """A red required check on H: ``decide_rerun``, given the latest jobs of H's run and the failed tests
     each failed slice names, either reruns the failed jobs once, recorded as red_check_rerun before the
-    rerun call is sent, or returns the work: red_check_returned and one rework item for the builder,
-    once for H. Until GitHub shows a newer attempt than the recorded rerun, the pass waits. Returns the
-    outcome recorded, if any."""
+    rerun calls are sent and as red_check_rerun_outcome with their answers after them, or returns the
+    work: red_check_returned and one rework item for the builder, once for H, also when a rerun call was
+    refused (rerun_refused) or got no answer (rerun_unknown). Nothing is recorded or sent unless the pull
+    request, read after H's run, jobs and annotations, is still open at H. Until GitHub shows a newer
+    attempt than the accepted rerun, the pass waits. Returns the outcome recorded, if any."""
     from hermes_cli.kanban_delivery_github import GitHubTransport
 
     source, head = row["source_task_id"], row["pull_request_head"]
@@ -1005,6 +1008,8 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
     decision = decide_rerun(policy, repository, head, jobs, {"reruns": [record["head"] for record in reruns]})
     if decision.allowed and decision.code != "rerun":
         return None
+    if not _open_at_head(github, repository, row):
+        return None  # owner rule 1: the pull request left H or closed while H's run was read
     code = "red_check_rerun" if decision.allowed else "red_check_returned"
     tests = [test for job in jobs for test in job.get("failed_tests") or () if isinstance(test, str)]
     ids = sorted({match["job_id"] for match in decision.matches})
@@ -1017,19 +1022,28 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
         else:
             _waiting(conn, row, code, reason=decision.code, tests=tests,
                      rework=_rework_item(conn, db_path, row, decision, tests))
-    if decision.allowed:  # sent once: only by the pass that recorded the rerun
-        rerun = GitHubTransport("rerun_flaky", repository)
-        for job in ids:
-            _sent(rerun, "request", "POST", f"/repos/{repository}/actions/jobs/{job}/rerun")
-    return code
+    if not decision.allowed:
+        return code
+    rerun = GitHubTransport("rerun_flaky", repository)  # sent once: only by the pass that recorded the rerun
+    statuses = [_sent(rerun, "request", "POST", f"/repos/{repository}/actions/jobs/{job}/rerun")["status"]
+                for job in ids]
+    reason = "rerun_refused" if set(statuses) - {201, None} else "rerun_unknown" if None in statuses else None
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):  # owner rule 2: once for H, in this pass
+        _waiting(conn, row, "red_check_rerun_outcome", jobs=ids, statuses=statuses)
+        if reason:
+            refusal = Decision(False, reason, f"the rerun calls of jobs {ids} were answered {statuses} (None: no answer)")
+            _waiting(conn, row, "red_check_returned", reason=reason, tests=tests,
+                     rework=_rework_item(conn, db_path, row, refusal, tests))
+    return "red_check_returned" if reason else code
 
 
 def _rework_item(conn: sqlite3.Connection, db_path: Path, row: dict, decision, tests: list) -> str:
     """H's one rework item for the source card's builder, made the way the review handback makes its
-    follow-up: a triage child of the source in its project, recorded on the source under the handback's
-    identity of the source and H, so a recorded item of that identity is reused."""
+    follow-up: a triage child of the source in its project, recorded on the source under the red check's
+    own identity of the source, H and "red check" (owner rule 3), so only an item of that identity is
+    reused and a review follow-up of the source and H stays as it is."""
     source, head = row["source_task_id"], row["pull_request_head"]
-    identity = kb._review_followup_identity_key(reviewed_task_id=source, candidate=head)
+    identity = kb._review_followup_identity_key(reviewed_task_id=source, candidate=f"{head} red check")
     item = kb._recorded_review_followup(conn, source, identity)
     if item is not None:
         return item
