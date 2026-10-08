@@ -1,4 +1,5 @@
-"""``hermes release``: check a release before it runs (release card 4), and run it (card 5).
+"""``hermes release``: check a release before it runs (release card 4), run it (card 5), and start
+its run as its own user service (card 6).
 
 ``prepare`` works out PREV and NEW (S-B), builds both live adapters from the ``release`` settings
 (S-E) and asks the host every merged guard, printing each result in plain words. It writes
@@ -6,7 +7,9 @@ nothing to the release state: config.yaml is read as it is on disk, the release 
 read-only, and the guards only read. ``status`` prints the waiting batch and the last
 outcome. ``run`` releases the accepted batch after the same preflight, under the pause (S-A), in
 the calling process: SIGINT or SIGTERM refuses a release until its runner starts; after that, only
-a hard kill ends it, and its recovery belongs to card 7. The release unit (S-F) belongs to card 6.
+a hard kill ends it, and its recovery belongs to card 7. ``start BATCH`` runs ``release run BATCH``
+as the release unit (S-F), the transient user service of release_unit, so the release keeps
+running when the gateway stops; the start writes nothing to the release state either.
 
 Design rule (K6), as in the runner: everything ``run`` needs is imported when this module loads,
 so nothing is imported once the units stop and the checkout moves under the running process.
@@ -27,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from agent import estop
-from hermes_cli import release_guards, release_ledger
+from hermes_cli import release_guards, release_ledger, release_unit
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     _ENV_REF_RE,
@@ -56,6 +59,8 @@ _REQUIRED = {
 # its placeholder would reach the adapters, and G9 would look for NEW's state snapshot under it.
 _RESOLVED = {**_REQUIRED, "snapshot_dir": "the snapshot directory"}
 _WAITING = {"open": "waiting for the owner's decision", "deferred": "put off by the owner"}
+# The batches start runs: an accepted one, or one whose release began and has not ended (card 7).
+_STARTABLE = ("accepted", "releasing", "failed")
 _OUTCOMES = {
     "released": "was released",
     "restored": "was rolled back; its changes went back to the waiting decision",
@@ -80,9 +85,11 @@ class _UnreadableRecord(Exception):
 
 
 def cmd_release(args) -> int:
-    """``hermes release prepare``, ``hermes release status`` or ``hermes release run``."""
+    """``hermes release prepare``, ``status``, ``run [BATCH]`` or ``start BATCH``."""
+    if args.release_command == "start":
+        return start(args.batch)
     if args.release_command == "run":
-        return run()
+        return run() if args.batch is None else run(args.batch)
     return prepare() if args.release_command == "prepare" else status()
 
 
@@ -102,11 +109,12 @@ def prepare() -> int:
     return 0
 
 
-def _inputs() -> int | tuple[
+def _inputs(batch_id: int | None = None) -> int | tuple[
     dict[str, Any], list[RecordedMerge], Pins, LiveHostReader, ReleaseHostActions, dict[str, Any]
 ]:
     """What prepare and run work on: the accepted batch, its changes, both versions, the live
-    reader and actions, and the release settings; or, once a refusal is printed, its exit code."""
+    reader and actions, and the release settings; or, once a refusal is printed, its exit code.
+    Given ``batch_id``, a batch that is not the accepted batch taken first refuses."""
     root, home = get_default_hermes_root(), get_hermes_home()
     if home.resolve() != root.resolve():  # S-A
         return _refuse(f"a release runs only from the root Hermes home {root}, not from {home}")
@@ -132,6 +140,11 @@ def _inputs() -> int | tuple[
     if not accepted:
         return _refuse("no batch is accepted, so there is nothing to release")
     batch = accepted[0]
+    if batch_id is not None and batch["batch_id"] != batch_id:
+        return _refuse(
+            f"batch {batch_id} is not the accepted batch a release run takes first"
+            f" (batch {batch['batch_id']} is)"
+        )
     # What the guards read from the record is decoded before the adapters are built or anything
     # is printed: the batch's changes, NEW, the last one's merge commit, and PREV, the NEW of the
     # last released batch once one was released (S-B).
@@ -177,8 +190,13 @@ def _preflight(
     return failed
 
 
-def run() -> int:
+def run(batch_id: int | None = None) -> int:
     """Release the accepted batch between a pause and a resume, in card 5's order.
+
+    First, before any other step, remove every HERMES_KANBAN variable from the run's environment,
+    so no board context reaches the release or a process it starts. Given ``batch_id``, as the
+    release unit gives it, the run releases only that batch, and refuses and writes nothing unless
+    it is the accepted batch a run takes first: a restart of the unit never takes another batch.
 
     Mark the batch releasing with both versions, fetch NEW and save the named configuration
     snapshot, and run prepare's preflight. A pause already in place, or a failed guard other than
@@ -197,7 +215,9 @@ def run() -> int:
     Returns 0 when the batch was released, 1 otherwise, and 1 when the release's own pause is
     still in place after its removal.
     """
-    inputs = _inputs()
+    for name in [name for name in os.environ if name.startswith("HERMES_KANBAN")]:
+        del os.environ[name]
+    inputs = _inputs(batch_id)
     if isinstance(inputs, int):  # refused before anything was written
         return inputs
     _batch, _merges, _pins, reader, actions, _settings = inputs
@@ -410,6 +430,96 @@ def _hold(token: str, stopped: bool = False) -> None:
     ``token``, is in place."""
     if stopped or _token() != token:
         raise _Stopped("stopped before cutover")
+
+
+def start(batch_id: int) -> int:
+    """Run ``release run`` for ``batch_id`` as its release unit, the transient user service of
+    S-F (card 6). The start writes nothing to the release state: the run in the unit begins the
+    release.
+
+    First, before any other step, remove every HERMES_KANBAN variable from the start's
+    environment, as the run does, so its reads of the release record, before the launch and after
+    a failed launch or readback, read the record of the root home the launch runs the unit from:
+    the record the run in the unit reads.
+
+    Every read comes first: systemd-run, the batches in the release record, and the release units
+    the user manager has loaded. A missing systemd-run, a batch that is not accepted, releasing or
+    failed, an accepted batch behind an older accepted one, which a release run releases first,
+    and a release unit at work each refuse. Then one action: systemd-run asks the user manager to
+    make the unit named for the batch and start it, in one call that also reserves the name. The
+    unit is read back until the user manager answers active, for at most
+    release_unit.READBACK_SECONDS; otherwise, or when the launch fails, the release could not
+    start: the start reads the record again and prints the user manager's last answer and the
+    batch's state as the record now shows it.
+
+    Returns 0 once the unit answers active, 1 otherwise.
+    """
+    for name in [name for name in os.environ if name.startswith("HERMES_KANBAN")]:
+        del os.environ[name]
+    systemd_run = release_unit.find_systemd_run()
+    if systemd_run is None:  # fails closed, as update_abort_recovery does
+        return _refuse("systemd-run is missing, so the release cannot run as its own user service")
+    try:
+        batches, _live, _finished = _record()
+    except _UnreadableRecord as error:
+        return _refuse(str(error))
+    state = next((batch["state"] for batch in batches if batch["batch_id"] == batch_id), None)
+    accepted = [batch["batch_id"] for batch in batches if batch["state"] == "accepted"]
+    if state is None:
+        return _refuse(f"there is no batch {batch_id} in the release record")
+    if state not in _STARTABLE:
+        return _refuse(f"batch {batch_id} is {state}, not accepted, releasing or failed")
+    if state == "accepted" and accepted[0] != batch_id:
+        return _refuse(
+            f"batch {batch_id} is accepted after batch {accepted[0]}, which a release run"
+            " releases first"
+        )
+    try:
+        busy = release_unit.busy_units()
+    except release_unit.UnitError as error:
+        return _refuse(f"the release units could not be read ({error})")
+    if busy:
+        return _refuse(*(f"a release is already at work: {unit} is {now}" for unit, now in busy))
+    unit = release_unit.unit_name(batch_id)
+    try:
+        release_unit.launch(systemd_run, batch_id, get_default_hermes_root())
+    except release_unit.UnitError as error:
+        return _could_not_start(batch_id, str(error), state)
+    answer = release_unit.read_back(batch_id)
+    if answer != "active":
+        return _could_not_start(
+            batch_id,
+            f"the user manager did not answer active for {unit} within"
+            f" {release_unit.READBACK_SECONDS:g} seconds (its last answer: {answer})",
+            state,
+        )
+    print(
+        f"Started the release of batch {batch_id} as the user service {unit}: the user manager"
+        " answers active."
+    )
+    print(f"Follow it with: journalctl --user -u {unit}")
+    return 0
+
+
+def _could_not_start(batch_id: int, reason: str, before: str) -> int:
+    """Print why the release could not start, and what became of the batch, which was ``before``
+    when the start read the record. The unit's run may have written to the record since: it is
+    read again, and the batch was left as it was only when its state is the same."""
+    print(f"The release of batch {batch_id} could not start: {reason.rstrip('.')}.")
+    try:
+        batches, _live, _finished = _record()
+    except _UnreadableRecord as error:
+        print(f"Batch {batch_id} was {before} before the start; its state now is unknown: {error}.")
+        return 1
+    now = next((batch["state"] for batch in batches if batch["batch_id"] == batch_id), "missing")
+    if now == before:
+        print(f"Batch {batch_id} was left as it was: the release record still shows it {now}.")
+    else:
+        print(
+            f"Batch {batch_id} was {before} before the start; the release record now shows it"
+            f" {now}."
+        )
+    return 1
 
 
 def status() -> int:
