@@ -11,12 +11,12 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from hermes_cli import release_ledger
+from hermes_cli import release_intake, release_ledger
 from tests.hermes_cli.test_kanban_delivery import (  # noqa: F401  (board is a fixture)
     IMPLEMENTER, _become, _git, _spawned_worker_env, _write_config, board,
 )
 from tests.hermes_cli.test_kanban_delivery_auto_merge import (  # noqa: F401  (armed is a fixture)
-    _continues, _done, _lenses, _published_as, _reviews, armed,
+    ELSEWHERE, _continues, _done, _lenses, _published_as, _reviews, armed,
 )
 from tests.hermes_cli.test_kanban_delivery_github import REPO
 from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _events, _tick
@@ -230,6 +230,91 @@ def test_intake_reaches_the_root_store_under_a_worker_env(merged, monkeypatch):
         (tid, "other", 1, gh["merges"][41]), (home, kb.DEFAULT_BOARD, 2, gh["merges"][44])])
     assert [path for path in root.rglob("*") if "release" in path.name] == [root / "kanban" / "release_ledger.db"]
     assert (_state(kb, head, other_db), _state(kb, home_head, root_db)) == ("merged", "merged")
+
+
+@pytest.mark.parametrize("waiting", [False, True], ids=["no_batch", "waiting_batch"])
+def test_an_owner_app_merge_writes_nothing_to_the_release_record(board, waiting):
+    """An owner app merge never joins the platform release batch, whose last change's merge commit is the NEW a
+    release run takes in the platform checkout: no batch is created, the waiting batch's row and changes stay as
+    they were, read straight from the store's file, and the answer is not recorded."""
+    kb, root, repo = board
+    if waiting:
+        conn = release_ledger.connect()
+        try:
+            release_ledger.record_merge(
+                conn, merge_commit="1" * 40, pr_url=f"https://github.com/{REPO}/pull/40", reviewed_base="2" * 40,
+                reviewed_head="3" * 40, reviewed_tree="4" * 40, tier=0, card_id="t_earlier", on_main=True)
+        finally:
+            conn.close()
+    record = ("SELECT * FROM release_batches ORDER BY id", "SELECT * FROM release_members ORDER BY rowid")
+    before = [_store(root, statement) for statement in record]
+    assert [len(rows) for rows in before] == [int(waiting)] * 2
+
+    answer = release_intake.record_merged_change(
+        repository=ELSEWHERE, number=7, merge_commit="5" * 40, reviewed_base="6" * 40, reviewed_head="7" * 40,
+        reviewed_tree="8" * 40, tier=2, card_id="t_app", title="build app", board="default")
+
+    assert (answer["recorded"], [_store(root, statement) for statement in record]) == (False, before)
+
+
+def test_a_platform_merge_is_recorded_as_before_beside_an_owner_app_merge_under_a_worker_env(merged, monkeypatch):
+    """The dispatcher's worker environment for proj-a (HERMES_KANBAN_DB, HERMES_KANBAN_BOARD and
+    HERMES_KANBAN_TASK pinned to proj-a, HERMES_HOME a profile home under the root) ticks the board other, where
+    pull request 41 of the platform merged, then the root board, where pull request 44 of the owner app merged
+    after it. The platform merge is recorded as before and answers recorded; as the batch's one change it is the
+    NEW a release run takes. The owner app merge answers not recorded and its row ends merged as today. The
+    release store is counted straight from its one file at the root."""
+    kb, root, repo, gh = merged
+    kb.create_board("proj-a")
+    kb.create_board("other")
+    own_db = root / "kanban" / "boards" / "proj-a" / "kanban.db"
+    other_db = root / "kanban" / "boards" / "other" / "kanban.db"
+    root_db = root / "kanban.db"
+    profile_home = root / "profiles" / IMPLEMENTER
+    profile_home.mkdir(parents=True)
+    _write_config(profile_home, enabled=True)
+    base = _git(repo, "rev-parse", "main")
+    tid, head = _approved(kb, repo, "beta", board="other")
+    _published(kb, repo, gh, tid, head, board="other")
+    _raw(other_db, "UPDATE tasks SET risk_tier = 1 WHERE id = ?", tid)
+    app, app_head = _approved(kb, repo, "app")
+    _published_as(root_db, gh, app, app_head, 44, ELSEWHERE)
+    _raw(root_db, "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'delivery_bound', ?, 0)",
+         app, json.dumps({"source_task_id": app, "head": app_head, "base_commit": base}))
+    _raw(root_db, "UPDATE kanban_deliveries SET pull_request_state = 'auto_merge_armed' WHERE source_head = ?",
+         app_head)  # armed directly: this world's checks table names only the platform's required check
+    _dispatch(kb, other_db, "other")
+    _done(other_db)
+    _reviews(gh, *_lenses(kb, head, db=other_db))
+    _dispatch(kb, other_db, "other")
+    gh["merges"].update({41: _merge(repo, head), 44: _merge(repo, app_head)})
+    conn = kb.connect(board="proj-a")
+    try:
+        claimed = kb.claim_task(conn, kb.create_task(conn, title="plain work", assignee=IMPLEMENTER))
+        workspace = kb.resolve_workspace(claimed, board="proj-a")
+        kb.set_workspace_path(conn, claimed.id, str(workspace))
+        env = _spawned_worker_env(kb, claimed, workspace, "proj-a", monkeypatch)
+    finally:
+        conn.close()
+    assert (env["HERMES_KANBAN_TASK"], env["HERMES_KANBAN_DB"], env["HERMES_KANBAN_BOARD"], env["HERMES_HOME"]) == (
+        claimed.id, str(own_db), "proj-a", str(profile_home))
+    assert (_state(kb, head, other_db), _state(kb, app_head, root_db)) == ("auto_merge_armed", "auto_merge_armed")
+
+    _become(env, monkeypatch)
+    for db, board_name in ((other_db, "other"), (root_db, kb.DEFAULT_BOARD)):
+        _dispatch(kb, db, board_name)
+
+    tree = _git(repo, "rev-parse", f"{head}^{{tree}}")
+    assert [(m["merge_commit"], m["pr_url"], m["reviewed_base"], m["reviewed_head"], m["reviewed_tree"], m["tier"],
+             m["tier_recorded"], m["card_id"], m["title"], m["board"], m["state"]) for m in _store(root)] == [
+        (gh["merges"][41], f"https://github.com/{REPO}/pull/41", base, head, tree, 1, 1, tid, "build beta", "other",
+         "open")]
+    assert _store(root, "SELECT version FROM release_batches") == [{"version": 1}]
+    assert [(p["repository"], p["merge_commit"], p["recorded"]) for db, card in ((other_db, tid), (root_db, app))
+            for kind, p in _events(kb, card, db) if kind == "delivery_merged"] == [
+        (REPO, gh["merges"][41], True), (ELSEWHERE, gh["merges"][44], False)]
+    assert [path for path in root.rglob("*") if "release" in path.name] == [root / "kanban" / "release_ledger.db"]
+    assert (_state(kb, head, other_db), _state(kb, app_head, root_db)) == ("merged", "merged")
 
 
 _READ = ("GET", f"/repos/{REPO}/pulls/41")  # one read of pull request 41
