@@ -38,7 +38,7 @@ def world(board, monkeypatch):
     gh["pad"] puts 100 other items after the real ones of a collection, so its total_count is over one page;
     gh["short"] states one more than it holds; gh["broken"] answers 502. gh["each"] runs at every request,
     gh["during"] at the check-runs request, the one CI read, and gh["move_after"] at the request whose path
-    ends with it."""
+    ends with it. gh["pull"] holds fields that replace the pull request's own, as GitHub shows it closed."""
     kb, root, repo = board
     from hermes_cli import kanban_delivery_github as transport
 
@@ -46,7 +46,7 @@ def world(board, monkeypatch):
     _write_config(root, enabled=True)
     gh = {"calls": [], "queries": [], "steps": [], "pull_head": None, "check": ("completed", "success"),
           "copies": None, "pad": None, "short": None, "broken": None, "move_after": None, "during": None,
-          "each": None}
+          "each": None, "pull": None}
 
     def listed(key, items, page):
         if gh["broken"] == key:
@@ -64,7 +64,7 @@ def world(board, monkeypatch):
         if gh["each"]:
             gh["each"]()
         if (method, path) == ("GET", f"/repos/{REPO}/pulls/41"):
-            return 200, {"number": 41, "state": "open", "head": {"sha": gh["pull_head"] or head}}
+            return 200, {"number": 41, "state": "open", "head": {"sha": gh["pull_head"] or head}, **(gh["pull"] or {})}
         if gh["move_after"] and path.endswith(gh["move_after"]):  # the pull request moves on while CI is read
             gh["pull_head"] = "f" * 40
         if gh["during"] and path.endswith(PAGED["check_runs"]):  # the source card changes while CI is read
@@ -353,6 +353,77 @@ def test_a_head_the_pull_request_left_gets_no_outcome(world, moved, conclusion):
     assert (_cards(kb), _state(kb, head), _events(kb, tid), _source(kb, tid)["status"]) == ([], "open", events, "done")
     pulls = [path for _, path in gh["calls"] if path.endswith("/pulls/41")]
     assert (len(pulls), len(gh["calls"]) > len(pulls)) == ((1, False) if moved == "before" else (2, True))
+
+
+@pytest.mark.parametrize("merged", [True, False], ids=["merged", "closed"])
+def test_a_pull_request_closed_outside_the_step_marks_its_row_closed_outside_once(world, merged):
+    """GitHub shows the open row's pull request closed outside the delivery step, merged by someone else or
+    closed unmerged: the pass marks the row closed outside, with exactly one event on the source card naming
+    the pull request, its head and whether GitHub shows it merged. No later pass reads that pull request
+    again, and the release record never holds the row."""
+    from hermes_cli import release_ledger
+
+    kb, root, repo, gh = world
+    db, every = kb.kanban_db_path(), "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ?"
+    tid, head = _ready(world)
+    gh["pull"] = {"state": "closed", "merged": merged,  # merged into main as GitHub shows a merge, or not merged
+                  **({"base": {"ref": "main"}, "merge_commit_sha": "d" * 40} if merged else {})}
+    events, count = _events(kb, tid), _raw(db, every, tid)[0]["n"]
+
+    _tick(kb)
+
+    assert (_cards(kb), _state(kb, head), _events(kb, tid)[len(events):]) == ([], "closed_outside", [
+        ("delivery_closed_outside", {"delivery_id": 1, "head": head, "pull_request_number": 41, "merged": merged})])
+    read = [("GET", f"/repos/{REPO}/pulls/41")]
+    assert (_raw(db, every, tid)[0]["n"], gh["calls"]) == (count + 1, read)
+    _tick(kb)
+    _tick(kb)
+    assert (gh["calls"], _state(kb, head), _raw(db, every, tid)[0]["n"]) == (read, "closed_outside", count + 1)
+    conn = release_ledger.connect()
+    try:
+        assert [member for batch in release_ledger.list_batches(conn) for member in batch["members"]] == []
+    finally:
+        conn.close()
+
+
+def test_a_pull_request_open_at_another_head_keeps_its_row_open_and_writes_nothing(world):
+    """A pull request still open but moved off H keeps today's behaviour exactly: the row stays open with no
+    new state, no event is appended, and each later pass reads that pull request again."""
+    kb, root, repo, gh = world
+    db, every = kb.kanban_db_path(), "SELECT * FROM task_events WHERE task_id = ? ORDER BY id"
+    tid, head = _ready(world)
+    gh["pull_head"] = "f" * 40
+    rows, events = _raw(db, "SELECT * FROM kanban_deliveries"), _raw(db, every, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_cards(kb), _raw(db, "SELECT * FROM kanban_deliveries"), _raw(db, every, tid)) == ([], rows, events)
+    assert _state(kb, head) == "open" and gh["calls"] == [("GET", f"/repos/{REPO}/pulls/41")] * 2
+
+
+@pytest.mark.parametrize("column, value", [
+    ("pull_request_state", "close_pending"), ("pull_request_head", "f" * 40), ("pull_request_number", 42)],
+    ids=["state", "head", "pull_request"])
+def test_a_row_changed_while_its_closed_pull_request_is_read_is_left_untouched(world, column, value):
+    """The row leaves open (here as the delivery step's own close reserves it), or names another head or pull
+    request, while GitHub is read: the one write transaction finds it changed, so nothing is written and no
+    event is appended."""
+    kb, root, repo, gh = world
+    db, every = kb.kanban_db_path(), "SELECT * FROM task_events WHERE task_id = ? ORDER BY id"
+    tid, head = _ready(world)
+    gh["pull"], changed, events = {"state": "closed", "merged": False}, [], _raw(db, every, tid)
+
+    def change():  # once, during the pull request read
+        if not changed:
+            _raw(db, f"UPDATE kanban_deliveries SET {column} = ? WHERE source_head = ?", value, head)
+            changed.extend(_raw(db, "SELECT * FROM kanban_deliveries"))
+
+    gh["each"] = change
+    _tick(kb)
+
+    assert (_raw(db, "SELECT * FROM kanban_deliveries"), _raw(db, every, tid)) == (changed, events)
+    assert gh["calls"] == [("GET", f"/repos/{REPO}/pulls/41")] and changed[0][column] == value
 
 
 @pytest.mark.parametrize("answer, conclusion", [
