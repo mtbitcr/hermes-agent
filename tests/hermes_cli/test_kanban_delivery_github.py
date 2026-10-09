@@ -746,12 +746,17 @@ def test_push_runs_no_git_hook(github, monkeypatch, tmp_path):
 @pytest.mark.parametrize("transport", ["ext", "ssh"])
 @pytest.mark.parametrize("scope", ["repository", "global", "system"])
 def test_push_ignores_configured_url_rewrites_and_transport_commands(github, monkeypatch, tmp_path,
-                                                                    scope, transport):
+                                                                    request, scope, transport):
     """A rewrite that sends the push through a helper program — named by the card repository's own
     configuration, by global configuration or by system configuration: the helper never runs, so it
     never sees the credential, and the leased push still reaches the intended remote. Each
     configuration is first shown to run the helper for a plain push that carries a credential of the
     control's own, so the regression cannot pass vacuously."""
+    shared_tmp = tempfile.gettempdir()  # read before any redirection
+    unrelated = tempfile.mkdtemp(prefix="hermes-delivery-push-", dir=shared_tmp)  # another test's push
+    request.addfinalizer(lambda: shutil.rmtree(unrelated, ignore_errors=True))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))  # this push's working folder lands here
+    monkeypatch.setenv("TMPDIR", str(tmp_path))  # and so does any child process's
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -785,7 +790,7 @@ def test_push_ignores_configured_url_rewrites_and_transport_commands(github, mon
     assert (held, stolen.exists()) == ([], False)  # no configured helper ran, and no file holds it
     assert outcome == {"state": "pushed", "branch": branch, "head": second}
     assert _remote_refs(bare) == [f"refs/heads/{branch}"]
-    assert list(Path(tempfile.gettempdir()).glob("hermes-delivery-push-*")) == []  # nothing left behind
+    assert list(tmp_path.glob("hermes-delivery-push-*")) == []  # nothing left behind
 
 
 def test_push_cannot_be_redirected_to_another_remote_of_the_same_scheme(github, monkeypatch, tmp_path):
