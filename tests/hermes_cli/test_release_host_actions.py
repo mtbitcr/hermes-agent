@@ -1,8 +1,8 @@
 """Card 3: the acting half of the release host, run against stand-ins in temporary directories.
 
-Each test drives ReleaseHostActions over things the test owns: a stand-in systemctl on PATH,
-temporary git repositories, temporary homes and databases, and a local HTTP server. Nothing here
-touches the real host, its units, its checkout or its homes.
+Each test drives ReleaseHostActions over things the test owns: a stand-in systemctl and a stand-in
+docker on PATH, temporary git repositories, temporary homes and databases, and a local HTTP
+server. Nothing here touches the real host, its units, its containers, its checkout or its homes.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def make_actions(tmp_path: Path, **values) -> ReleaseHostActions:
         "units": UNITS,
         "snapshot_root": tmp_path / "snapshots",
         "health_url": "",
-        "workspace_check_url": "",
+        "workspace_container": "stand-in-workspace",
     }
     return ReleaseHostActions(**{**settings, **values})
 
@@ -62,17 +62,37 @@ case "$*" in
 esac
 """
 
+# The stand-in docker records its arguments, each ended by a NUL, and runs the read as
+# STAND_IN_READ says. All it writes, the access file's content and response content among it, must
+# stay out of the journal: ok reads the projects list and the board, refused is the platform
+# turning the access file away, fails is a board read that breaks after the projects list, and
+# late answers only after five seconds.
+STAND_IN_DOCKER = """#!/bin/sh
+printf '%s\\0' "$@" >> "$STAND_IN_DOCKER_ARGS"
+echo 'stand-in access file content' >&2
+case "$STAND_IN_READ" in
+  ok) echo '{"projects": [{"slug": "stand-in-board"}]}'; echo '{"columns": []}' ;;
+  refused) echo '401 {"detail": "Unauthorized"}'; exit 1 ;;
+  fails) echo '{"projects": [{"slug": "stand-in-board"}]}'; echo 'board: 500' >&2; exit 1 ;;
+  late) echo '{"projects": [{"slug": "stand-in-board"}]}'; exec sleep 5 ;;
+esac
+"""
+
 
 @pytest.fixture(autouse=True)
 def calls(tmp_path, monkeypatch) -> Path:
-    """Every test runs with the stand-in user manager first on PATH, so none can reach a real
-    manager or unit: a state snapshot asks it first. Returns the file of its recorded calls."""
+    """Every test runs with the stand-in user manager and the stand-in docker first on PATH, so
+    none can reach a real manager, unit or container: a state snapshot asks the manager first.
+    Returns the file of the manager's recorded calls."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "systemctl").write_text(STAND_IN_SYSTEMCTL)
     (bin_dir / "systemctl").chmod(0o755)
+    (bin_dir / "docker").write_text(STAND_IN_DOCKER)
+    (bin_dir / "docker").chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("STAND_IN_CALLS", str(tmp_path / "calls"))
+    monkeypatch.setenv("STAND_IN_DOCKER_ARGS", str(tmp_path / "docker-args"))
     return tmp_path / "calls"
 
 
@@ -772,17 +792,17 @@ def refused_url() -> str:
     return f"http://127.0.0.1:{port}/ok"
 
 
-def test_health_and_owner_page_readbacks_fail_closed(tmp_path, server, monkeypatch):
+def test_health_readback_fails_closed(tmp_path, server, monkeypatch):
     monkeypatch.setattr(release_host_actions, "READBACK_TIMEOUT_SECONDS", SLOW_SECONDS / 5)
 
-    def readbacks(url: str) -> tuple[bool, bool] | str:
-        actions = make_actions(tmp_path, health_url=url, workspace_check_url=url)
+    def readback(url: str) -> bool | str:
+        actions = make_actions(tmp_path, health_url=url)
         try:
-            return actions.health_ok(), actions.workspace_reads_ok()
+            return actions.health_ok()
         except Exception as error:  # a readback never raises
             return repr(error)
 
-    assert readbacks(f"{server}/ok") == (True, True)
+    assert readback(f"{server}/ok") is True
     # So do a redirect to a login page that answers 200 and an address that is not HTTP.
     closed = (
         f"{server}/broken",
@@ -792,7 +812,51 @@ def test_health_and_owner_page_readbacks_fail_closed(tmp_path, server, monkeypat
         f"{server}/check",
         "data:text/plain,placeholder",
     )
-    assert {url: readbacks(url) for url in closed} == dict.fromkeys(closed, (False, False))
+    assert {url: readback(url) for url in closed} == dict.fromkeys(closed, False)
+
+
+# R6 runs its two reads inside a container through the stand-in docker. The container's name holds
+# a space and shell syntax, so it reaches docker intact only as one argument, never through a shell.
+CONTAINER = "stand-in workspace; echo shell"
+
+
+def read_in_container(tmp_path, monkeypatch, capfd, answer: str) -> tuple[bool | str, list, str]:
+    """R6 with the stand-in docker's read answering ``answer``: what R6 read back, the arguments
+    docker got, and all that reached this process's output, which is the release journal."""
+    monkeypatch.setenv("STAND_IN_READ", answer)
+    actions = make_actions(tmp_path, workspace_container=CONTAINER)
+    try:
+        held = actions.workspace_reads_ok()
+    except Exception as error:  # a readback never raises
+        held = repr(error)
+    recorded = Path(os.environ["STAND_IN_DOCKER_ARGS"])
+    args = recorded.read_text().split("\0")[:-1] if recorded.exists() else []
+    out, err = capfd.readouterr()
+    return held, args, out + err
+
+
+def one_read() -> list[str]:
+    """docker's arguments for R6's read: exec, the container's name, node and the fixed script."""
+    return ["exec", CONTAINER, "node", "-e", release_host_actions._WORKSPACE_READS]
+
+
+def test_r6_is_true_when_the_container_read_succeeds(tmp_path, monkeypatch, capfd):
+    assert read_in_container(tmp_path, monkeypatch, capfd, "ok") == (True, one_read(), "")
+
+
+def test_r6_is_false_when_the_container_read_is_refused(tmp_path, monkeypatch, capfd):
+    assert read_in_container(tmp_path, monkeypatch, capfd, "refused") == (False, one_read(), "")
+
+
+def test_r6_is_false_when_the_container_read_fails(tmp_path, monkeypatch, capfd):
+    assert read_in_container(tmp_path, monkeypatch, capfd, "fails") == (False, one_read(), "")
+
+
+def test_r6_is_false_when_the_container_read_is_late(tmp_path, monkeypatch, capfd):
+    monkeypatch.setattr(release_host_actions, "READBACK_TIMEOUT_SECONDS", SLOW_SECONDS / 5)
+    began = time.monotonic()
+    assert read_in_container(tmp_path, monkeypatch, capfd, "late") == (False, one_read(), "")
+    assert time.monotonic() - began < SLOW_SECONDS  # it gave up at the time limit
 
 
 def test_fleet_version_is_one_version_or_none(tmp_path, monkeypatch):

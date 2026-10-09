@@ -45,7 +45,6 @@ WORKER = {
 SETTINGS = {
     "units": {"sandbox-tunnel": "hermes-sandbox-tunnel"},
     "health_url": "http://127.0.0.1:8642/health",
-    "workspace_check_url": "http://127.0.0.1:8650/api/projects",
 }
 # The stand-in behind every name: it logs its name and arguments, then answers from answers.json.
 # git logs to git.jsonl with the HERMES_KANBAN variables it was given, answers the checkout's head

@@ -40,7 +40,6 @@ CONFIG = {"config.yaml": "digest"}
 SETTINGS = {
     "units": {"sandbox-tunnel": "hermes-sandbox-tunnel"}, "drain_poll_seconds": 45,
     "health_url": "http://127.0.0.1:8642/health",
-    "workspace_check_url": "http://127.0.0.1:8650/api/projects",
 }
 UNITS = ("hermes-gateway", "hermes-serve", "hermes-sandbox-tunnel")
 FORWARD_ONLY = ("guards", "stop", "snapshot", "forward", "readback", "start", "readback")
@@ -152,10 +151,10 @@ class FakeHost:
 
 @dataclass
 class Boundary:
-    """The live host's processes, faked: git in the checkout, the user manager and the board
-    reader's child. The checkout and the units move as the live adapters ask, each move noted, a
-    starting gateway stamps its record with the checkout's head, and the modules at the first stop
-    are kept."""
+    """The live host's processes, faked: git in the checkout, the user manager, the board reader's
+    child and docker, in whose default Workspace container R6's reads succeed. The checkout and the
+    units move as the live adapters ask, each move noted, a starting gateway stamps its record with
+    the checkout's head, and the modules at the first stop are kept."""
 
     root: Path
     head: str = PREV
@@ -168,6 +167,8 @@ class Boundary:
             return self._done(json.dumps([[] for _path in argv[6:]]))
         if argv[0] == "systemctl":
             return self._systemctl(*argv[2:])
+        if argv[0] == "docker":  # docker exec CONTAINER node -e SCRIPT
+            return self._done("", 0 if argv[2] == "raphael-workspace" else 1)
         skipped = ("--no-optional-locks", "--end-of-options")
         args = tuple(arg for arg in argv[3:] if arg not in skipped)
         if args[:2] == ("merge-base", "--is-ancestor"):
@@ -824,7 +825,7 @@ def test_a_refusal_at_the_first_unit_stop_is_final(root, monkeypatch, capsys, la
     args = _parsed_run()
     boundary, sentinel, reads = Boundary(root), estop.sentinel_path(), []
     boundary.stamp()  # the live gateway runs PREV
-    answer = SimpleNamespace(status=200)  # each readback address answers
+    answer = SimpleNamespace(status=200)  # the health address answers
     direct = SimpleNamespace(open=lambda url, timeout: contextlib.nullcontext(answer))
     read_text, restore = Path.read_text, release_host_actions.ReleaseHostActions.restore_config
 
@@ -885,7 +886,7 @@ def test_nothing_is_imported_after_the_units_stop(root, monkeypatch):
     args = _parsed_run()
     boundary = Boundary(root)
     boundary.stamp()  # the live gateway runs PREV
-    answer = SimpleNamespace(status=200)  # each readback address answers
+    answer = SimpleNamespace(status=200)  # the health address answers
     direct = SimpleNamespace(open=lambda url, timeout: contextlib.nullcontext(answer))
     monkeypatch.setattr(subprocess, "run", boundary.run)
     monkeypatch.setattr(build_info, "get_code_identity", lambda **_: {"sha": boundary.head})

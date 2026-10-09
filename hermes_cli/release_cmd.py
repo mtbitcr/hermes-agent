@@ -52,14 +52,13 @@ from hermes_cli.release_host_actions import ReleaseHostActions
 from hermes_cli.release_runner import SANDBOX_TUNNEL_UNIT, run_release
 from hermes_constants import get_default_hermes_root, get_hermes_home
 
-# The host's unit names and readback addresses are not in the repository, so an empty one refuses
+# The host's unit names and readback address are not in the repository, so an empty one refuses
 # here, before anything runs, instead of failing a readback after the cutover.
 _REQUIRED = {
     f"units.{GATEWAY_UNIT}": "the gateway unit",
     f"units.{SERVE_UNIT}": "the serve unit",
     f"units.{SANDBOX_TUNNEL_UNIT}": "the sandbox tunnel unit",
     "health_url": "the health address",
-    "workspace_check_url": "the owner-page check address",
 }
 # A required value or snapshot_dir that keeps a reference whose variable is not set refuses too:
 # its placeholder would reach the adapters, and G9 would look for NEW's state snapshot under it.
@@ -765,7 +764,7 @@ def _adapters(
         ReleaseHostActions(
             **shared,
             health_url=settings["health_url"],
-            workspace_check_url=settings["workspace_check_url"],
+            workspace_container=settings["workspace_container"],
         ),
     )
 
