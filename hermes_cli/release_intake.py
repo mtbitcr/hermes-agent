@@ -18,6 +18,11 @@ from typing import Any
 
 from hermes_cli import release_ledger
 
+# The release record keeps merges of the platform repository only, compared byte for byte:
+# a release run takes NEW, the last change's merge commit, in the platform checkout
+# (release_cmd), which holds no commit of another repository.
+_PLATFORM_REPOSITORY = "mtbitcr/hermes-agent"
+
 
 def record_merged_change(
     *,
@@ -35,7 +40,13 @@ def record_merged_change(
     """Add the merge of pull request ``number`` of ``repository`` to the waiting release
     decision. Called only after the caller's GitHub read showed it merged into main,
     which is the ``on_main`` confirmation. Returns :func:`release_ledger.record_merge`'s
-    answer; ``recorded`` is False for a repeat. Any failure raises, and nothing is written."""
+    answer; ``recorded`` is False for a repeat. Any failure raises, and nothing is written.
+
+    Only a platform merge is recorded: a merge of any other repository writes nothing
+    and answers ``recorded`` False, with no member and no batch, since the owner app
+    deploy releases it."""
+    if repository != _PLATFORM_REPOSITORY:
+        return {"recorded": False, "member": None, "batch": None}
     conn = release_ledger.connect()
     try:
         return release_ledger.record_merge(
