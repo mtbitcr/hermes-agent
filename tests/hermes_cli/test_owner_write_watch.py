@@ -53,6 +53,10 @@ def runs_probe():
     return next(probe for probe in watch.PROBES["default"] if probe.path.endswith("/v1/runs"))
 
 
+def release_probes():
+    return [probe for probe in watch.PROBES["default"] if "/owner-workspace/release/" in probe.path]
+
+
 class Host:
     """One profile's hourly job with a fake listener, page check, clock and delivery record."""
 
@@ -105,6 +109,18 @@ class Host:
 
 def messages(outcomes):
     return [outcome.text for outcome in outcomes if outcome.text]
+
+
+def test_default_profile_probes_the_three_release_routes():
+    """The default profile's table holds one probe for each owner release write route, with the
+    exact path under /p/default, the body {} and the healthy answer 400 invalid_argument."""
+    probes = release_probes()
+    assert [(probe.method, probe.path, probe.body, probe.status, probe.code) for probe in probes] == [
+        ("POST", f"/p/default/v1/owner-workspace/release/0/{action}", {}, 400, "invalid_argument")
+        for action in ("accept", "defer", "start")
+    ]
+    assert all(probe.message is None and probe.label for probe in probes)
+    assert len({probe.name for probe in watch.PROBES["default"]}) == len(watch.PROBES["default"])
 
 
 @pytest.mark.parametrize("status,code", REFUSALS)
