@@ -160,8 +160,8 @@ def _branches(repo):
 
 
 def _changes_requested(armed):
-    """H's cards done after their recorded runs; the bot's latest review on H of R12 requests changes, as R12's
-    own handback recorded, and that of R15 approves H after an earlier request. The title has an internal prefix."""
+    """H's card done after its recorded runs; the bot's latest review on H of R12 requests changes, as R12's
+    own handback recorded. The title has an internal prefix."""
     kb, root, repo, gh = armed
     db = kb.kanban_db_path()
     tid, head = _ready(armed)
@@ -170,11 +170,9 @@ def _changes_requested(armed):
     cards = {card["responsibility"]: card["id"] for card in _cards(kb)}
     _run(db, cards["R12"], 100, "an older finding")
     _run(db, cards["R12"], 200, "src/impl/feature.py: validate the input", {"severity": "high", "problem": "no check"})
-    _run(db, cards["R15"], 300, "a correctness note")
     _done(db)
     _raw(db, "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'changes_requested', 0)", cards["R12"])
-    _reviews(gh, ("CHANGES_REQUESTED", head, cards["R15"]), ("APPROVED", head, cards["R15"]),
-             ("CHANGES_REQUESTED", head, cards["R12"]))
+    _reviews(gh, ("CHANGES_REQUESTED", head, cards["R12"]))
     return tid, head, cards
 
 
@@ -252,7 +250,6 @@ def test_a_returned_review_creates_one_claimable_continuation_with_its_findings_
     assert f"head {head} of pull request 41" in card["body"]
     assert f"Review card {cards['R12']}:\nsrc/impl/feature.py: validate the input\n" in card["body"]
     assert '"problem": "no check"' in card["body"] and "an older finding" not in card["body"]
-    assert f"Review card {cards['R15']}:" not in card["body"] and "a correctness note" not in card["body"]
     assert card["branch_name"] == _branch(tid, head) and _git(repo, "rev-parse", f"refs/heads/{_branch(tid, head)}") == head
     assert gh["writes"] == [] and {method for method, _ in gh["calls"]} == {"GET"}
     assert _state(kb, head) == "review_cards_created"
@@ -270,22 +267,22 @@ def test_a_returned_review_creates_one_claimable_continuation_with_its_findings_
 
 
 def test_the_findings_are_bounded_to_8000_characters_in_all(armed):
-    """Required behavior 3: two returned cards' 6,000 characters each are cut to 8,000 in all, the first whole."""
+    """Required behavior 3: the returned card's two findings of 6,000 characters each are cut to 8,000 in all, the
+    first whole."""
     kb, root, repo, gh = armed
     db = kb.kanban_db_path()
     tid, head = _ready(armed)
     _tick(kb)
     cards = {card["responsibility"]: card["id"] for card in _cards(kb)}
-    _run(db, cards["R15"], 100, "¶" * 6000)
-    _run(db, cards["R12"], 100, "§" * 6000)
+    _run(db, cards["R12"], 100, "¶" * 6000, "§" * 6000)
     _done(db)
     _reviews(gh, *[("CHANGES_REQUESTED", head, card) for card in cards.values()])
 
     _tick(kb)
 
     (card,) = _raw(db, CONTINUED, tid)
-    assert [payload["cards"] for payload in _returned(kb, tid)] == [[cards["R15"], cards["R12"]]]
-    findings = card["body"][card["body"].index(f"Review card {cards['R15']}:"):]
+    assert [payload["cards"] for payload in _returned(kb, tid)] == [[cards["R12"]]]
+    findings = card["body"][card["body"].index(f"Review card {cards['R12']}:"):]
     assert len(findings) == 8000 and findings.count("¶") == 6000 and 0 < findings.count("§") < 2000
 
 
@@ -318,7 +315,7 @@ def test_nothing_returns_while_a_card_is_open_or_after_the_pull_request_leaves_h
     db = kb.kanban_db_path()
     tid, head, cards = _changes_requested(armed)
     if case == "card_open":
-        _raw(db, "UPDATE tasks SET status = 'ready' WHERE id = ?", cards["R15"])
+        _raw(db, "UPDATE tasks SET status = 'ready' WHERE id = ?", cards["R12"])
     else:
         gh["hooks"]["GET"] = lambda: gh["ended"].update({41: False}) if case == "closed" else gh.update(pull_head=OTHER)
 

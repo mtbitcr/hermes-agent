@@ -123,14 +123,15 @@ def _continues(db, rework, head, source=None):
 
 @pytest.mark.parametrize("case", ["open", "changes_on_github", "changes_on_card"])
 def test_no_arm_while_a_required_card_is_open_or_returned_changes(armed, case):
-    """One lens's card done, even with two approvals of H, arms nothing: each lens is its own card."""
+    """The security card open, even with the bot's approval of it on H, arms nothing: its approval never
+    stands in for the card."""
     kb, root, repo, gh = armed
     tid, head = _ready(armed)
     _tick(kb)
     cards = {c["responsibility"]: c["id"] for c in _cards(kb)}
-    _done(kb.kanban_db_path(), *([cards["R15"]] if case == "open" else cards.values()))
-    _reviews(gh, ("APPROVED", head, cards["R15"]),
-             ("CHANGES_REQUESTED" if case == "changes_on_github" else "APPROVED", head, cards["R12"]))
+    if case != "open":
+        _done(kb.kanban_db_path(), cards["R12"])
+    _reviews(gh, ("CHANGES_REQUESTED" if case == "changes_on_github" else "APPROVED", head, cards["R12"]))
     if case == "changes_on_card":
         conn = kb.connect()
         try:
@@ -152,20 +153,21 @@ def test_no_arm_while_a_required_card_is_open_or_returned_changes(armed, case):
 
 
 @pytest.mark.parametrize("reviews, arms", [
-    ([("APPROVED", "H", "R15"), ("CHANGES_REQUESTED", "H", "R12"), ("APPROVED", "H", None)], 0),
-    ([("APPROVED", "H", "R15"), ("APPROVED", OTHER, "R12"), ("APPROVED", "H", None)], 0),
-    ([("APPROVED", "H", "R15"), ("APPROVED", "H", "R15")], 0),  # security's card done, with no review of its own
-    ([("APPROVED", "H", "R12"), ("APPROVED", "H", "R15"), ("COMMENTED", "H", "R12"), ("APPROVED", "H", None)], 0),
-    ([("APPROVED", "H", "R15"), ("APPROVED", "H", "R12", "raphael-reviewer[bot]"), ("APPROVED", "H", "R12", "x")], 0),
-    ([("APPROVED", "H", "R15"), ("APPROVED", "H", "R122")], 0),  # whole lines: card t_1 is not card t_12
-    ([("APPROVED", "H", "R15"), ("APPROVED", "H", "R12"), ("COMMENTED", "H", None)], 0),  # the bot's latest
+    ([("CHANGES_REQUESTED", "H", "R12"), ("APPROVED", "H", None)], 0),
+    ([("APPROVED", OTHER, "R12"), ("APPROVED", "H", None)], 0),
+    ([("APPROVED", "H", None)], 0),  # security's card done, with no review of its own
+    ([("APPROVED", "H", "R12"), ("COMMENTED", "H", "R12"), ("APPROVED", "H", None)], 0),
+    ([("APPROVED", "H", None), ("APPROVED", "H", "R12", "raphael-reviewer[bot]"), ("APPROVED", "H", "R12", "x")], 0),
+    ([("APPROVED", "H", "R122")], 0),  # whole lines: card t_1 is not card t_12
+    ([("APPROVED", "H", "R12"), ("COMMENTED", "H", None)], 0),  # the bot's latest
     ([("CHANGES_REQUESTED", "H")], 0),
-    ([("APPROVED", "H", "R15"), ("APPROVED", "H", "R12"), ("CHANGES_REQUESTED", "H", "R12", "someone")], 1),
+    ([("APPROVED", "H", "R12"), ("CHANGES_REQUESTED", "H", "R12", "someone")], 1),
 ])
 def test_each_lens_is_approved_only_by_the_bots_latest_review_of_its_own_card_on_h(armed, reviews, arms):
     """Owner rule 1 of round 2: a lens approves H only when its card is done and the reviewer bot's latest
     review whose body starts with that card's line is APPROVED on H; the bot's latest review must also be
-    APPROVED on H. One lens never stands in for another, and any other account is ignored."""
+    APPROVED on H. The bot's approval of H never stands in for the card's own, and any other account is
+    ignored."""
     kb, root, repo, gh = armed
     tid, head = _ready(armed, tier=2)
     _tick(kb)
@@ -181,6 +183,21 @@ def test_each_lens_is_approved_only_by_the_bots_latest_review_of_its_own_card_on
     _reviews(gh, *given, *_lenses(kb, head))
     _tick(kb)
     assert [body["sha"] for body in _arms(gh)] == [head]
+
+
+def test_a_tier_2_delivery_merges_on_the_security_approval_alone(armed):
+    """The security card done and the reviewer bot's approval of it on H, and nothing else, merge a tier 2
+    delivery at exactly H."""
+    kb, root, repo, gh = armed
+    tid, head = _ready(armed, tier=2)
+    _tick(kb)
+    security = next(c["id"] for c in _cards(kb) if c["responsibility"] == "R12")
+    _done(kb.kanban_db_path(), security)
+    _reviews(gh, ("APPROVED", head, security))
+
+    _tick(kb)
+
+    assert _arms(gh) == [{"sha": head, "merge_method": "merge"}] and _state(kb, head) == "auto_merge_armed"
 
 
 def test_the_allowlist_holds_exactly_the_three_new_entries_and_refuses_every_other(monkeypatch):
@@ -701,8 +718,7 @@ def test_the_review_card_title_carries_the_source_title_and_no_raw_identifier(ar
     _tick(kb)
 
     cards = _cards(kb)
-    assert sorted(c["title"] for c in cards) == ["Review (correctness) of build feature",
-                                                 "Review (security) of build feature"]
+    assert sorted(c["title"] for c in cards) == ["Review (security) of build feature"]
     for card in cards:
         assert not [raw for raw in (tid, head, head[:7], "41", REPO, REPO.split("/")[1]) if raw in card["title"]]
         for reference in (f"Source card: {tid}", f"Head: {head}", f"Base commit: {_git(repo, 'rev-parse', 'main')}"):
