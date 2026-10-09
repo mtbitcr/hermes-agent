@@ -1116,8 +1116,8 @@ def _create_review_cards(db_path, row, read, repository, base, checks, reviewer,
 
 # Each mutation is first recorded as pending, in the write transaction that reads its
 # evidence a last time, and only the pass that wrote that sends it; its answer is then
-# recorded once. A head's arm, its merge, ends armed, refused (with GitHub's status and message) or unknown (no
-# answer), and is never sent again: a new head is a new row. GitHub may hold a pending,
+# recorded once. A head's arm, its merge, ends armed (200), refused (with GitHub's other status) or unknown (no
+# status), and is never sent again: a new head is a new row. GitHub may hold a pending,
 # armed or unknown arm, so no new head is pushed to that pull request. A close ends
 # replaced or close_refused (with GitHub's status), its delivery_close_pending event
 # the record that it was sent.
@@ -1226,8 +1226,8 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
     read comes first: the pull request, open at H, then its reviews, which approve H lens by
     lens. One write transaction then reads the complete evidence again, finds the pull request
     unclaimed and reserves the arm under this attempt. The arm, GitHub's merge of exactly H, is the one
-    call after it, and its answer is written to this attempt only: armed when GitHub merged, else refused
-    with its status and message, or unknown with no answer. A full tenth page of reviews that GitHub does not
+    call after it, and its status line alone, its body never read, is written to this attempt only: armed on
+    200, else refused with that status, or unknown with no status. A full tenth page of reviews that GitHub does not
     show to be the last refuses H once instead."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
@@ -1269,15 +1269,13 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
                      (_PENDING, attempt, row["id"]))
     answer = _sent(github, "request", "PUT", f"/repos/{repository}/pulls/{number}/merge",
                    body={"sha": head, "merge_method": "merge"})
-    data = answer["data"] if isinstance(answer["data"], dict) else {}
-    state = _ARM_UNKNOWN if answer["status"] is None else _ARMED if answer["status"] == 200 and (
-        data.get("merged") is True) else _ARM_REFUSED
+    state = _ARM_UNKNOWN if answer["status"] is None else _ARMED if answer["status"] == 200 else _ARM_REFUSED
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if conn.execute("UPDATE kanban_deliveries SET pull_request_state = ?, publish_lease = NULL "
                         "WHERE id = ? AND publish_lease = ?", (state, row["id"], attempt)).rowcount:
             kb._append_event(conn, source, f"delivery_{state}", _outcome(
                 row, repository=repository, status=answer["status"], reason=answer.get("reason"),
-                cards=[card[0] for card in evidence[2]], attempt=attempt, message=data.get("message")))
+                cards=[card[0] for card in evidence[2]], attempt=attempt))
     return state
 
 

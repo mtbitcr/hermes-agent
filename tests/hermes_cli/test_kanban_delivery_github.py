@@ -39,6 +39,7 @@ DUMMY = "ghs_" + "Nf64Jt8Yw2Qs" * 3  # a credential of the controls' own, so a c
 DUMMY_BASIC = base64.b64encode(f"x-access-token:{DUMMY}".encode()).decode()
 HEAD = "a" * 40
 BASE = "b" * 40
+NESTED = b"[" * 100000 + b"]" * 100000  # a JSON body nested deeper than any parser recurses
 SAMPLE = {"repo": REPO, "number": "7", "sha": HEAD, "id": "9", "head_sha": HEAD, "installation": str(INSTALLATION),
           "branch": "card-1"}
 SECTION_4_PERMISSIONS = {"contents", "pull_requests", "checks", "actions"}
@@ -268,7 +269,7 @@ def github(tmp_path):
     key_file.parent.mkdir()
     key_file.write_bytes(_pem(key))
     state = {"public": key.public_key(), "key_file": key_file, "jwts": [], "rejected_jwts": 0,
-             "token_requests": [], "calls": [], "token_reply": "minted", "merges": []}
+             "token_requests": [], "calls": [], "token_reply": "minted", "merges": [], "nested": None}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -324,6 +325,8 @@ def github(tmp_path):
             path = self.path.split("?")[0]
             if auth != f"Bearer {TOKEN}":
                 return self._reply(401, {"message": f"Bad credentials {TOKEN}"})
+            if state["nested"]:  # every call answered with this status and a body nested too deep to parse
+                return self._reply(state["nested"], raw=NESTED)
             if method == "GET" and path.endswith("/pulls/7"):
                 return self._reply(200, {
                     "number": 7, "state": "open", "title": TOKEN, "body": TOKEN, "token": TOKEN,
@@ -1156,12 +1159,11 @@ def test_a_reviews_read_keeps_each_reviews_author_login_state_commit_and_first_l
         {"user": {"login": "b"}, "state": "APPROVED", "commit_id": HEAD, "body": "Review card t_1"}]
 
 
-def test_the_merge_takes_only_its_exact_body_and_passes_on_only_whether_it_merged_and_githubs_message(github,
-                                                                                                    monkeypatch):
+def test_the_merge_takes_only_its_exact_body_and_passes_on_only_githubs_status(github, monkeypatch):
     """Card 5's one write: the merge of a pull request at exactly H, as a merge commit. Its one body is the
     keys sha and merge_method only, the whole sha 40 lowercase hex and the method merge; any other body is
     refused before any token or socket, for each step that may write contents. Of GitHub's answer, here a
-    moved head's 409, only whether it merged and its message pass, the token in neither."""
+    moved head's 409, only the status passes: its body is never read (owner rule 1 of round 2, card 142)."""
     mod = _transport_module(monkeypatch, github)
     path, merge = f"/repos/{REPO}/pulls/7/merge", {"sha": HEAD, "merge_method": "merge"}
     bodies = [None, {}, {"sha": HEAD}, {"merge_method": "merge"}, dict(merge, commit_title="merged"),
@@ -1174,12 +1176,31 @@ def test_the_merge_takes_only_its_exact_body_and_passes_on_only_whether_it_merge
                 mod.GitHubTransport(step, REPO, key_path=github["key_file"]).request("PUT", path, body=body)
             assert refused.value.reason == "body_not_allowed", (step, body)
     assert github["calls"] == [] and github["token_requests"] == []
+    reads, read = [], http.client.HTTPResponse.read  # the status of each answer whose body is read
+    monkeypatch.setattr(http.client.HTTPResponse, "read", lambda self, *a: reads.append(self.status) or read(self, *a))
 
     answer = mod.GitHubTransport("merge", REPO, key_path=github["key_file"]).request("PUT", path, body=merge)
 
     assert github["calls"] == [("PUT", path)] and github["merges"] == [merge]
-    assert (answer["status"], sorted(answer["data"]), answer["data"]["merged"]) == (409, ["merged", "message"], False)
-    assert answer["data"]["message"].startswith("Head branch was modified.") and TOKEN not in repr(answer)
+    assert (answer, reads) == ({"status": 409, "data": None}, [201])  # the token's answer read, the merge's never
+
+
+@pytest.mark.parametrize("status", [302, 404, 409, 422, 500])
+def test_a_non_2xx_answer_nested_too_deep_to_parse_returns_its_status_on_every_other_endpoint(github, monkeypatch,
+                                                                                               status):
+    """Owner rule 2 of round 2 (card 142): every endpoint but the merge keeps the base behaviour for an answer
+    that is not 2xx: the status decides first and the body is not parsed, so a JSON body nested deeper than any
+    parser recurses raises no error and passes nothing on."""
+    mod = _transport_module(monkeypatch, github)
+    transport = mod.GitHubTransport("publish", REPO, key_path=github["key_file"])
+    github["nested"] = status
+    sent = [("GET", f"/repos/{REPO}/pulls/7", None), ("PATCH", f"/repos/{REPO}/pulls/7", {"state": "closed"}),
+            ("GET", f"/repos/{REPO}/pulls/7/reviews", None), ("GET", f"/repos/{REPO}/git/ref/heads/card-1", None)]
+
+    answers = [transport.request(method, path, body=body) for method, path, body in sent]
+
+    assert answers == [{"status": status, "data": None}] * len(sent)
+    assert github["calls"] == [(method, path) for method, path, body in sent]
 
 
 def test_the_reviews_read_says_only_whether_github_names_a_next_page(github, monkeypatch):

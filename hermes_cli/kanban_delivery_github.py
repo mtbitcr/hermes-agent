@@ -124,7 +124,7 @@ REST_ALLOWLIST = (
 
 # Fixed fields only: ids, SHAs, refs, states and counts, and of a user only its login (a review's
 # author). Titles, bodies (but a listed review's first line), messages (but a check run annotation's
-# title and message, and a merge's) and URLs never pass, nor headers.
+# title and message) and URLs never pass, nor headers.
 _FIELDS = frozenset({
     "id", "number", "name", "state", "status", "conclusion", "merged", "mergeable", "mergeable_state",
     "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app", "object",
@@ -136,10 +136,9 @@ _MAX_TEXT = 256
 class GitHubTransportError(Exception):
     """A refusal or failure named by a fixed reason code, never by a request, response or token."""
 
-    def __init__(self, reason: str, status: int | None = None):
+    def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
-        self.status = status  # the HTTP status of an answer that came but could not be read
 
 
 def _connect() -> http.client.HTTPConnection:
@@ -164,8 +163,9 @@ def _names_next_page(link: str | None) -> bool | None:
 
 
 def _exchange(method: str, target: str, authorization: str, payload=None) -> tuple[int, object, bool | None]:
-    """One request to GitHub: the status, the decoded body of a 2xx answer (else its JSON object, if
-    any), and whether its Link header names a next page (:func:`_names_next_page`). No header is passed on."""
+    """One request to GitHub: the status, the decoded body of a 2xx answer (else None), and whether
+    its Link header names a next page (:func:`_names_next_page`). No header is passed on. A merge's
+    answer is its status line alone: its body is never read."""
     body = None if payload is None else json.dumps(payload).encode()
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
                "User-Agent": "hermes-kanban-delivery", "Authorization": authorization}
@@ -178,7 +178,9 @@ def _exchange(method: str, target: str, authorization: str, payload=None) -> tup
     try:
         connection.request(method, target, body=body, headers=headers)
         response = connection.getresponse()
-        status, raw, more = response.status, response.read(), _names_next_page(response.getheader("Link"))
+        status, raw, more = response.status, None, None  # kept before any body is read
+        if not (method == "PUT" and target.endswith("/merge")):
+            raw, more = response.read(), _names_next_page(response.getheader("Link"))
     except (OSError, http.client.HTTPException):
         status = raw = more = None
     finally:
@@ -187,16 +189,14 @@ def _exchange(method: str, target: str, authorization: str, payload=None) -> tup
     # carry the body, which for the token call holds the token.
     if status is None:
         raise GitHubTransportError("network_error")
-    if not raw:
-        return status, None, more
+    if not 200 <= status < 300 or not raw:
+        return status, None, more  # GitHub's error text and redirect targets are never passed on
     try:
         value = json.loads(raw)
     except ValueError:
         value = None
-    if not 200 <= status < 300:  # an error's JSON object; no redirect target, as no Location header is read
-        return status, value if isinstance(value, dict) else None, more
     if not isinstance(value, (dict, list)):
-        raise GitHubTransportError("bad_response", status)
+        raise GitHubTransportError("bad_response")
     return status, value, more
 
 
@@ -308,7 +308,7 @@ class GitHubTransport:
         """Call one allowlisted endpoint. Returns {"status", "data"}, where data holds the fixed
         fields of a 2xx JSON answer and is None for anything else. A listed page of reviews also
         says whether GitHub names a next page: "next_page" is True, False, or None when unknown.
-        A merge's data, whatever the status, is whether GitHub merged and its message only."""
+        A merge's answer is its status alone: its body is never read."""
         endpoint = next((e for e, pattern in self._routes if e.method == method
                          and isinstance(path, str) and pattern.fullmatch(path)), None)
         if endpoint is None:
@@ -322,16 +322,8 @@ class GitHubTransport:
         if endpoint.body is not None and not endpoint.body(body):
             raise GitHubTransportError("body_not_allowed")
         target = f"{path}?{urlencode(values)}" if values else path
-        authorization = f"Bearer {self._installation_token()}"  # minted first: its failure is no merge's answer
-        try:
-            status, value, *paging = _exchange(method, target, authorization, body)
-        except GitHubTransportError as error:  # a merge GitHub answered unreadably keeps its status, with the reason
-            if error.status is None or not endpoint.template.endswith("/merge"):
-                raise
-            return {"status": error.status, "data": self._merge(None), "reason": error.reason}
-        if endpoint.template.endswith("/merge"):
-            return {"status": status, "data": self._merge(value)}
-        value = value if 200 <= status < 300 else None  # no other error's body is passed on
+        status, value, *paging = _exchange(method, target, f"Bearer {self._installation_token()}", body)
+        value = value if 200 <= status < 300 else None  # no error's body is passed on
         if endpoint.template.endswith("/reviews") and method == "GET" and isinstance(value, list):
             return {"status": status, "data": [self._review(review) for review in value],
                     "next_page": paging[0] if paging and isinstance(paging[0], bool) else None}
@@ -444,11 +436,6 @@ class GitHubTransport:
         """A check run's annotation: its title and message only."""
         annotation = annotation if isinstance(annotation, dict) else {}
         return {"title": self._project(annotation.get("title")), "message": self._project(annotation.get("message"))}
-
-    def _merge(self, answer) -> dict:
-        """A merge's answer, refused or not: whether GitHub merged, and its message only."""
-        answer = answer if isinstance(answer, dict) else {}
-        return {"merged": answer.get("merged") is True, "message": self._project(answer.get("message"))}
 
     def _project(self, value):
         if isinstance(value, dict):

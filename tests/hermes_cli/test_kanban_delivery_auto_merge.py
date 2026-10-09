@@ -16,7 +16,7 @@ import pytest
 from tests.hermes_cli.test_kanban_delivery import (  # noqa: F401  (board is a fixture)
     IMPLEMENTER, _become, _git, _rework, _spawned_worker_env, _write_config, board,
 )
-from tests.hermes_cli.test_kanban_delivery_github import HEAD, REPO
+from tests.hermes_cli.test_kanban_delivery_github import HEAD, NESTED, REPO
 from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _events, _tick
 from tests.hermes_cli.test_kanban_delivery_review_cards import (  # noqa: F401  (world is a fixture)
     _cards, _published, _raw, _ready, _state, world,
@@ -311,10 +311,10 @@ def test_a_clean_pull_request_approved_on_h_is_merged_at_h_and_the_next_pass_rec
     ((409, {"message": "Head branch was modified. Review and try the merge again."}), "refused"),
     ((405, {"message": "Pull Request is not mergeable"}), "refused"), ("timeout", "unknown"),
 ], ids=["moved_head_409", "unmergeable_405", "no_answer"])
-def test_a_refused_or_unanswered_merge_is_recorded_once_with_githubs_status_and_message(armed, answer, state):
+def test_a_refused_or_unanswered_merge_is_recorded_once_with_githubs_status_and_no_body_text(armed, answer, state):
     """GitHub merges only a mergeable pull request still at the sha it is sent: a moved head answers 409 and an
-    unmergeable pull request 405, each recorded refused once with GitHub's status and message; no answer is
-    recorded unknown. Nothing is sent again."""
+    unmergeable pull request 405, each recorded refused once with GitHub's status and no body text (owner rule 1
+    of round 2, card 142); no answer is recorded unknown. Nothing is sent again."""
     kb, root, repo, gh = armed
     tid, head = _ready(armed)
     _tick(kb)
@@ -326,18 +326,19 @@ def test_a_refused_or_unanswered_merge_is_recorded_once_with_githubs_status_and_
     _tick(kb)
 
     assert (_arms(gh), _state(kb, head)) == ([{"sha": head, "merge_method": "merge"}], f"auto_merge_{state}")
-    status, message, reason = (None, None, "network_error") if answer == "timeout" else (
-        answer[0], answer[1]["message"], None)
-    assert [(kind, p["head"], p["status"], p["message"], p["reason"]) for kind, p in _events(kb, tid)
-            if "auto_merge" in kind] == [(f"delivery_auto_merge_{state}", head, status, message, reason)]
+    status, reason = (None, "network_error") if answer == "timeout" else (answer[0], None)
+    events = [(kind, p) for kind, p in _events(kb, tid) if "auto_merge" in kind]
+    assert [(kind, p["head"], p["status"], p["reason"]) for kind, p in events] == [
+        (f"delivery_auto_merge_{state}", head, status, reason)]
+    assert "message" not in str(events)
 
 
 @pytest.mark.parametrize("answer, state", [
-    ((200, {"sha": None, "merged": False, "message": "Pull Request is not mergeable"}), "refused"),
-    ((200, None), "refused"), ((201, ARMED), "refused"),
+    ((200, {"sha": None, "merged": False, "message": "Pull Request is not mergeable"}), "armed"),
+    ((200, None), "armed"), ((201, ARMED), "refused"),
     ((403, None), "refused"), ((422, None), "refused"), ((429, None), "refused"), ((500, None), "refused"),
     ((503, None), "refused"), ("timeout", "unknown")])
-def test_a_refused_arm_is_recorded_once_for_its_head(armed, answer, state):
+def test_an_arm_is_recorded_once_for_its_head_by_githubs_status_alone(armed, answer, state):
     kb, root, repo, gh = armed
     tid, head = _ready(armed)
     _tick(kb)
@@ -353,13 +354,17 @@ def test_a_refused_arm_is_recorded_once_for_its_head(armed, answer, state):
     refused = [(kind, p) for kind, p in _events(kb, tid) if "auto_merge" in kind]
     assert [(kind, p["head"], p.get("status")) for kind, p in refused] == [
         (f"delivery_auto_merge_{state}", head, None if answer == "timeout" else answer[0])]
-    assert [p["message"] for kind, p in refused] == [answer[1]["message"] if answer != "timeout" and answer[1] else None]
+    assert "message" not in str(refused)  # owner rule 1 of round 2 (card 142): the status line alone
 
 
-@pytest.mark.parametrize("status, raw", [(200, b"null"), (200, b"false"), (200, b'"merged"'), (200, b'{"merged": true'),
-                                         (202, b"null")], ids=["null", "false", "string", "malformed", "202_null"])
-def test_a_merge_answered_with_an_unreadable_body_is_refused_once_with_githubs_status(request, monkeypatch, status, raw):
-    """A received answer is never unknown: GitHub's status stands, whatever the body. Other endpoints still raise."""
+@pytest.mark.parametrize("status, body", [(status, body) for status in (200, 405, 409) for body in (
+    "truncated", "bad_chunk", "timeout", "nested")] + [(None, "disconnect")])
+def test_a_merge_is_recorded_by_its_status_line_alone_its_body_unread_and_it_is_sent_once(request, monkeypatch,
+                                                                                         status, body):
+    """Owner rule 1 of round 2 (card 142): a merge's outcome is GitHub's status line alone and its body is never
+    read or parsed, whether cut short, badly chunked, stalled past the timeout or nested too deep to parse: 200
+    records armed, any other status refused with that status and no body text, no status line unknown. The merge
+    is sent once."""
     from hermes_cli import kanban_delivery_github as transport
 
     exchange = transport._exchange  # the real one, taken before the armed world replaces it with a table
@@ -368,30 +373,38 @@ def test_a_merge_answered_with_an_unreadable_body_is_refused_once_with_githubs_s
     _tick(kb)
     _done(kb.kanban_db_path())
     _reviews(gh, *_lenses(kb, head))
-    calls, table = [], transport._exchange
+    calls, reads, table, read, ended = [], [], transport._exchange, http.client.HTTPResponse.read, threading.Event()
+    cut = b'Content-Length: 99\r\n\r\n{"message": "Head branch was'  # 99 bytes promised, fewer sent
+    wire = {"truncated": cut, "timeout": cut, "bad_chunk": b"Transfer-Encoding: chunked\r\n\r\nzz\r\n",
+            "nested": b"Content-Length: %d\r\n\r\n%s" % (len(NESTED), NESTED)}
 
-    class Handler(BaseHTTPRequestHandler):  # GitHub's whole answer, on the wire, to each request
+    class Handler(BaseHTTPRequestHandler):  # GitHub's answer to the merge, on the wire
         def do_PUT(self):
-            calls.append((self.command, self.path, self.rfile.read(int(self.headers.get("Content-Length", 0)))))
-            self.wfile.write(b"HTTP/1.0 %d Answer\r\nContent-Length: %d\r\n\r\n%s" % (status, len(raw), raw))
-        do_GET = do_PUT
+            calls.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+            if body != "disconnect":  # a disconnect closes the connection before any status line
+                self.wfile.write(b"HTTP/1.1 %d Answer\r\n%s" % (status, wire[body]))
+            ended.wait(30 if body == "timeout" else 0)  # a stalled body, until the test ends
+
+        def log_message(self, *args):
+            pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    request.addfinalizer(lambda: server.shutdown() or server.server_close())
-    monkeypatch.setattr(transport, "_connect", lambda: http.client.HTTPConnection(*server.server_address, timeout=10))
+    request.addfinalizer(lambda: ended.set() or server.shutdown() or server.server_close())
+    monkeypatch.setattr(transport, "_connect", lambda: http.client.HTTPConnection(*server.server_address, timeout=2))
     monkeypatch.setattr(transport, "_exchange", lambda *call: (exchange if call[0] == "PUT" else table)(*call))
+    monkeypatch.setattr(http.client.HTTPResponse, "read", lambda self, *a: reads.append(self.status) or read(self, *a))
 
     _tick(kb)
     _tick(kb)
-    monkeypatch.setattr(transport, "_exchange", exchange)
-    with pytest.raises(transport.GitHubTransportError, match="^bad_response$"):  # any other endpoint still raises
-        transport.GitHubTransport("publish", REPO).request("GET", f"/repos/{REPO}/pulls/41")
 
-    assert [c[:2] for c in calls] == [("PUT", f"/repos/{REPO}/pulls/41/merge"), ("GET", f"/repos/{REPO}/pulls/41")]
-    assert _state(kb, head) == "auto_merge_refused"
-    assert [(kind, p["head"], p["status"], p["reason"]) for kind, p in _events(kb, tid) if "auto_merge" in kind] == [
-        ("delivery_auto_merge_refused", head, status, "bad_response")]
+    state = "unknown" if status is None else "armed" if status == 200 else "refused"
+    assert (calls, reads, _state(kb, head)) == (
+        [(f"/repos/{REPO}/pulls/41/merge", {"sha": head, "merge_method": "merge"})], [], f"auto_merge_{state}")
+    events = [(kind, p) for kind, p in _events(kb, tid) if "auto_merge" in kind]
+    assert [(kind, p["head"], p["status"], p["reason"]) for kind, p in events] == [
+        (f"delivery_auto_merge_{state}", head, status, "network_error" if status is None else None)]
+    assert "message" not in str(events)
 
 
 def test_a_new_head_starts_fresh_after_a_refused_arm(armed):
